@@ -7140,7 +7140,7 @@
           "pool"
         ],
         "summary": "Describe a mutation plan.",
-        "description": "Its status, every step with where it stands, and — for a plan that deletes\ndata — the confirm token applying it needs.",
+        "description": "Its status, how many steps stand in each status, its first 100 steps, and\n— for a plan that deletes data — the confirm token applying it needs. The\nbody is bounded whatever the plan's size; `GET …/steps` pages through\nevery step.",
         "operationId": "get_plan",
         "parameters": [
           {
@@ -7588,6 +7588,297 @@
           {
             "bearer": [
               "write"
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/pool/plans/{plan_id}/steps": {
+      "get": {
+        "tags": [
+          "pool"
+        ],
+        "summary": "List a mutation plan's steps.",
+        "description": "Every step with where it stands, in the order an apply runs them, a page\nat a time: a plan over a large subtree has a step per file. A cursor is\nbound to its plan, and refused on another's steps.",
+        "operationId": "list_plan_steps",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "description": "The plan's id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Resume after the last step of the previous page, or after a plan's\ninline `steps`, with its `steps_next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Steps per page; 100 when absent.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "maximum": 1000.0,
+              "minimum": 1.0,
+              "format": "uint32"
+            }
+          }
+        ],
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request; Invalid cursor",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#invalid-cursor"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "OK",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanStepPage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The pool is not configured; Plan not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The pool is not configured"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#plan-not-found"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "Plan not found"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The request is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "read"
             ]
           }
         ]
@@ -11100,6 +11391,56 @@
         ],
         "description": "One page of plans, oldest first."
       },
+      "StepCounts": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Every step of the plan."
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Not attempted."
+          },
+          "in_progress": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Attempted and not finished."
+          },
+          "done": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Done."
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Failed."
+          },
+          "skipped": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Not attempted, deliberately."
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "pending",
+          "in_progress",
+          "done",
+          "failed",
+          "skipped"
+        ],
+        "description": "How many of a plan's steps stand in each status."
+      },
       "StepOp": {
         "type": "string",
         "enum": [
@@ -11190,19 +11531,30 @@
             "format": "date-time",
             "description": "When an apply last finished, successfully or not; `null` before."
           },
+          "step_counts": {
+            "$ref": "#/components/schemas/StepCounts",
+            "description": "How many steps the plan has, and how many stand in each status: the\nplan's progress, whatever its size."
+          },
           "steps": {
             "items": {
               "$ref": "#/components/schemas/PlanStep"
             },
             "type": "array",
-            "description": "Every step, in the order an apply runs them."
+            "description": "The plan's first steps, at most 100, in the order an apply runs them.\n`GET /v1/pool/plans/{plan_id}/steps` pages through all of them."
+          },
+          "steps_next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to `GET /v1/pool/plans/{plan_id}/steps` for the steps\nafter `steps`; `null` when `steps` holds every step."
           },
           "confirm_token": {
             "type": [
               "string",
               "null"
             ],
-            "description": "For a plan that deletes data, the token `POST …/apply` must repeat;\n`null` for any other. Derived from the steps, so it names this plan and\nno other."
+            "description": "For a plan that deletes data, the token `POST …/apply` must repeat;\n`null` for any other. Derived from every step, so it names this plan\nand no other."
           }
         },
         "type": "object",
@@ -11211,9 +11563,33 @@
           "kind",
           "status",
           "created_at",
+          "step_counts",
           "steps"
         ],
         "description": "A mutation plan: the exact diff an apply would make."
+      },
+      "PlanStepPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PlanStep"
+            },
+            "type": "array",
+            "description": "This page's items, in the collection's order."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to fetch the next page; `null` on the last one."
+          }
+        },
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "description": "One page of a plan's steps, in the order an apply runs them."
       },
       "CreateSession": {
         "properties": {

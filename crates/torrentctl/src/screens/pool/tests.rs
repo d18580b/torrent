@@ -119,6 +119,8 @@ fn delete_plan(status: &str) -> types::Plan {
             {"seq": 3, "op": "delete_file", "src": "stray/extras/cover.jpg", "dst": null,
              "status": "pending", "error": null},
         ],
+        "steps_next_cursor": null,
+        "step_counts": {"total": 3, "pending": 1, "in_progress": 0, "done": 1, "failed": 1, "skipped": 0},
     }))
 }
 
@@ -130,6 +132,8 @@ fn relocate_plan() -> types::Plan {
             {"seq": 1, "op": "move_torrent", "src": "a:movies/Film", "dst": "b:archive/Film",
              "status": "pending", "error": null},
         ],
+        "steps_next_cursor": null,
+        "step_counts": {"total": 1, "pending": 1, "in_progress": 0, "done": 0, "failed": 0, "skipped": 0},
     }))
 }
 

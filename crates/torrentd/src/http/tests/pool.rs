@@ -165,6 +165,7 @@ const OPERATIONS: &[(&str, &str)] = &[
     ("GET", "/v1/pool/plans"),
     ("POST", "/v1/pool/plans"),
     ("GET", "/v1/pool/plans/1"),
+    ("GET", "/v1/pool/plans/1/steps"),
     ("DELETE", "/v1/pool/plans/1"),
     ("POST", "/v1/pool/plans/1/apply"),
 ];
@@ -200,6 +201,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     adoption(cov).await;
     verification(cov).await;
     plans(cov).await;
+    large_plan(cov).await;
     unconfigured_and_unauthorised(cov).await;
     internal_failures(cov).await;
     malformed_requests(cov).await;
@@ -1708,9 +1710,17 @@ async fn plans(cov: &Arc<Coverage>) {
     assert_eq!(plan["steps"][0]["op"], "delete_file");
     assert_eq!(plan["steps"][0]["status"], "pending");
     assert_eq!(plan["steps"][0]["dst"], Value::Null);
+    assert_eq!(
+        plan["step_counts"],
+        json!({"total": 1, "pending": 1, "in_progress": 0, "done": 0, "failed": 0, "skipped": 0})
+    );
+    assert_eq!(plan["steps_next_cursor"], Value::Null);
     let token = plan["confirm_token"].as_str().unwrap().to_owned();
     let fetched: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
     assert_eq!(fetched, plan);
+    let steps: Value = h.read(&format!("/v1/pool/plans/{id}/steps")).await.json();
+    assert_eq!(steps["items"], plan["steps"]);
+    assert_eq!(steps["next_cursor"], Value::Null);
 
     // The planner's refusal is a 409 with its reason.
     let resp = h
@@ -1901,6 +1911,8 @@ async fn plans(cov: &Arc<Coverage>) {
     }
     let resp = h.read("/v1/pool/plans/abc").await;
     assert_eq!(resp.status().as_u16(), 400);
+    let resp = h.read(&format!("/v1/pool/plans/{id}/steps")).await;
+    assert_problem(&resp, 404, "plan-not-found");
 
     // The body of an apply is required, and closed.
     let resp = h
@@ -1948,6 +1960,101 @@ async fn plans(cov: &Arc<Coverage>) {
         .await;
     assert_problem(&resp, 403, "mutations-disabled");
     h.assert_conformance();
+}
+
+/// A plan of 10,000 steps: reading it is a bounded body carrying its counts,
+/// and its steps listing pages through every one exactly once.
+async fn large_plan(cov: &Arc<Coverage>) {
+    const STEPS: usize = 10_000;
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let root = pool.root_path_of(root_id).unwrap();
+    let (id, small) = pool.with_store_mut(|st| {
+        let mut add = |n: usize| {
+            let id = st.create_plan("delete_orphans", "{}", 0).unwrap();
+            let steps: Vec<torrentd_pool::model::PlanStep> = (0..n)
+                .map(|i| torrentd_pool::model::PlanStep {
+                    op: "delete_file".into(),
+                    src: root
+                        .join(format!(
+                            "orphans/a-fairly-long-directory-name/file-{i:05}.bin"
+                        ))
+                        .to_string_lossy()
+                        .into_owned(),
+                    dst: None,
+                })
+                .collect();
+            st.add_plan_steps(id, &steps).unwrap();
+            id
+        };
+        (add(STEPS), add(1))
+    });
+    pool.with_store_mut(|st| {
+        st.set_steps_status(id, &[(0, "done", None), (1, "failed", Some("boom"))])
+    })
+    .unwrap();
+    let h = Harness::authed(cov, |s| s.pool = Some(pool));
+
+    let resp = h.read(&format!("/v1/pool/plans/{id}")).await;
+    resp.assert_status(StatusCode::OK);
+    let body = resp.text();
+    assert!(
+        body.len() < 64 * 1024,
+        "a 10,000-step plan reads as {} bytes",
+        body.len()
+    );
+    let plan: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        plan["step_counts"],
+        json!({"total": STEPS, "pending": STEPS - 2, "in_progress": 0, "done": 1, "failed": 1, "skipped": 0})
+    );
+    assert_eq!(items_of(&plan["steps"]).len(), 100);
+    assert!(plan["confirm_token"].is_string());
+
+    // From the plan's own cursor, then a page at a time, every step once and
+    // in order.
+    let mut seqs: Vec<i64> = items_of(&plan["steps"])
+        .iter()
+        .map(|s| s["seq"].as_i64().unwrap())
+        .collect();
+    let mut cursor = plan["steps_next_cursor"].as_str().unwrap().to_owned();
+    let mut pages = 0;
+    loop {
+        let page: Value = h
+            .read(&format!(
+                "/v1/pool/plans/{id}/steps?limit=1000&cursor={cursor}"
+            ))
+            .await
+            .json();
+        pages += 1;
+        seqs.extend(items(&page).iter().map(|s| s["seq"].as_i64().unwrap()));
+        match page["next_cursor"].as_str() {
+            Some(next) => cursor = next.to_owned(),
+            None => break,
+        }
+    }
+    assert_eq!(seqs, (0..STEPS as i64).collect::<Vec<_>>());
+    assert_eq!(pages, 10);
+    let first: Value = h.read(&format!("/v1/pool/plans/{id}/steps")).await.json();
+    assert_eq!(first["items"], plan["steps"]);
+    assert_eq!(first["items"][1]["error"], "boom");
+
+    // A cursor is bound to its plan, and a page to its documented size.
+    let resp = h
+        .read(&format!("/v1/pool/plans/{small}/steps?cursor={cursor}"))
+        .await;
+    assert_problem(&resp, 400, "invalid-cursor");
+    let resp = h
+        .read(&format!("/v1/pool/plans/{id}/steps?cursor=!!"))
+        .await;
+    assert_problem(&resp, 400, "invalid-cursor");
+    let resp = h.read(&format!("/v1/pool/plans/{id}/steps?limit=0")).await;
+    assert_problem(&resp, 422, "validation-failed");
+    h.assert_conformance();
+}
+
+fn items_of(v: &Value) -> &Vec<Value> {
+    v.as_array().unwrap()
 }
 
 async fn unconfigured_and_unauthorised(cov: &Arc<Coverage>) {
@@ -2106,7 +2213,7 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let pool = service(dir.path(), true);
     let root_id = pool.roots()[0].0;
     const BAD: &str = "not-an-infohash";
-    pool.with_store_mut(|st| {
+    let bogus_step_plan = pool.with_store_mut(|st| {
         // Two files whose sizes sum past `i64::MAX`. The materialised tree
         // saturates rather than failing the scan over them; the reads fail
         // on the corrupt rows written below.
@@ -2137,8 +2244,20 @@ async fn internal_failures(cov: &Arc<Coverage>) {
             None,
         )
         .unwrap();
+        // A plan whose step is an operation this build has no name for.
+        let bogus_step = st.create_plan("relocate", "{}", 0).unwrap();
+        st.add_plan_steps(
+            bogus_step,
+            &[torrentd_pool::model::PlanStep {
+                op: "bogus".into(),
+                src: "/x".into(),
+                dst: None,
+            }],
+        )
+        .unwrap();
         // A plan of a kind this build has no name for.
         st.create_plan("bogus", "{}", 0).unwrap();
+        bogus_step
     });
     // Directory rows whose byte total does not read back as a number, as a
     // corrupt index would hold: the overview and both listings fail to load
@@ -2190,6 +2309,10 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     assert_internal(&h.write("POST", "/v1/pool/drift-check").await);
     assert_internal(&h.read("/v1/pool/plans").await);
     assert_internal(&h.read(&format!("/v1/pool/plans/{bogus_plan}")).await);
+    assert_internal(
+        &h.read(&format!("/v1/pool/plans/{bogus_step_plan}/steps"))
+            .await,
+    );
     assert_internal(
         &h.send(
             "POST",

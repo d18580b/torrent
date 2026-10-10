@@ -210,6 +210,14 @@ Collections that can be large page with **cursors**; none page with offsets.
 Small, bounded collections come back whole: `GET /v1/profiles`, a torrent's
 trackers.
 
+A mutation plan has a step per file it touches, so a `delete_orphans` plan
+over a large subtree can hold hundreds of thousands. `POST /v1/pool/plans` and
+`GET /v1/pool/plans/{plan_id}` answer with `step_counts`, how many steps stand
+in each status, and the plan's first 100 `steps`; its `steps_next_cursor`
+continues at `GET /v1/pool/plans/{plan_id}/steps`, which pages through every
+step. Poll the plan for progress and read `step_counts`; the body stays the
+same size whatever the plan's.
+
 ## Errors
 
 Every `4xx` and `5xx` is an RFC 9457 problem, `application/problem+json`, as
