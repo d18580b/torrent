@@ -53,11 +53,20 @@ use crate::profile::ProfileId;
 /// socket comes up on the same address, at any port: a NAT-PMP rebind moves
 /// the session to another port, and libtorrent closes the old socket without
 /// reporting it, so the old port's failure would otherwise be held forever.
-/// A failure with no address of its own (libtorrent reports an unparsable
-/// `listen_interfaces` entry, or interfaces it could not list, at
-/// `0.0.0.0:0`) is held until a socket comes up on `0.0.0.0`. One on an
-/// address the session stops listening on (a tunnel whose address changed)
-/// is held until the daemon restarts.
+/// The cost is that a profile listing several ports on one address
+/// (`0.0.0.0:6881,0.0.0.0:6882`) reads 0 when one port failed on an address
+/// and the other came up on it: the alerts do not say which ports the
+/// profile still lists.
+///
+/// A failure with no endpoint of its own, at port 0, is forgotten when any of
+/// the profile's sockets comes up. libtorrent reports interfaces or routes it
+/// could not list, an unparsable `listen_interfaces` entry, and an SSL
+/// listener it cannot open at `0.0.0.0:0`, before it opens any socket; and
+/// it never opens one on `0.0.0.0` itself (it expands the wildcard to
+/// each interface's address), so no address match would ever clear them. A
+/// socket coming up means a reopen got as far as opening sockets. A failure
+/// on an address the session stops listening on (a tunnel whose address
+/// changed) is held until the daemon restarts.
 #[derive(Debug, Default)]
 pub struct ListenFailures {
     failed: HashMap<ProfileId, BTreeSet<String>>,
@@ -75,13 +84,14 @@ impl ListenFailures {
     }
 
     /// Record `endpoint`'s socket as up, forgetting every failure on its
-    /// address. Returns whether any of `profile`'s sockets is still failed.
+    /// address and every failure with no endpoint (port 0). Returns whether
+    /// any of `profile`'s sockets is still failed.
     fn succeeded(&mut self, profile: &ProfileId, endpoint: &str) -> bool {
         let Some(failed) = self.failed.get_mut(profile) else {
             return false;
         };
         let address = address_of(endpoint);
-        failed.retain(|f| address_of(f) != address);
+        failed.retain(|f| address_of(f) != address && !has_no_endpoint(f));
         let any = !failed.is_empty();
         if !any {
             self.failed.remove(profile);
@@ -96,6 +106,15 @@ fn address_of(endpoint: &str) -> &str {
     endpoint
         .rsplit_once(':')
         .map_or(endpoint, |(address, _)| address)
+}
+
+/// Whether a failure's `address:port` is port 0: libtorrent's report of a
+/// failure that belongs to no socket (listing interfaces or routes, parsing
+/// `listen_interfaces`), which no socket of its own will ever clear.
+fn has_no_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port == "0")
 }
 
 /// One of this process's sockets bound to a given endpoint.
@@ -420,6 +439,42 @@ mod tests {
         assert_eq!(gauge["a"], 0.0);
     }
 
+    /// The accepted cost of the rule above: with two ports listed on one
+    /// address, one port's failure is hidden once the other is up there.
+    #[test]
+    fn a_failed_port_reads_0_once_another_port_is_up_on_its_address() {
+        let gauge = gauge_after(&[
+            ("a", failed("10.0.0.5:6881")),
+            ("a", succeeded("10.0.0.5:6882")),
+        ]);
+        assert_eq!(gauge["a"], 0.0);
+    }
+
+    /// libtorrent reports a failure to list interfaces or routes at
+    /// `0.0.0.0:0` before it opens any socket, and opens none on `0.0.0.0`
+    /// (it expands the wildcard to each interface's address); a socket up
+    /// anywhere in the profile clears it.
+    #[test]
+    fn a_failure_with_no_endpoint_clears_once_any_socket_comes_up() {
+        let gauge = gauge_after(&[("a", failed("0.0.0.0:0"))]);
+        assert_eq!(gauge["a"], 1.0, "held while no socket has come up");
+        let gauge = gauge_after(&[
+            ("a", failed("0.0.0.0:0")),
+            ("a", succeeded("192.168.1.20:6881")),
+        ]);
+        assert_eq!(gauge["a"], 0.0);
+    }
+
+    #[test]
+    fn a_failure_with_no_endpoint_does_not_clear_a_socket_s_failure() {
+        let gauge = gauge_after(&[
+            ("a", failed("0.0.0.0:0")),
+            ("a", failed("192.168.1.20:6881")),
+            ("a", succeeded("fe80::1%3:6881")),
+        ]);
+        assert_eq!(gauge["a"], 1.0, "192.168.1.20:6881 is still failed");
+    }
+
     #[test]
     fn one_profile_s_failure_is_not_another_s() {
         let gauge = gauge_after(&[
@@ -436,6 +491,14 @@ mod tests {
         assert_eq!(address_of("0.0.0.0:6881"), "0.0.0.0");
         assert_eq!(address_of(":::6881"), "::");
         assert_eq!(address_of("fe80::1%3:6881"), "fe80::1%3");
+    }
+
+    #[test]
+    fn only_port_0_is_a_failure_with_no_endpoint() {
+        assert!(has_no_endpoint("0.0.0.0:0"));
+        assert!(has_no_endpoint(":::0"));
+        assert!(!has_no_endpoint("0.0.0.0:6881"));
+        assert!(!has_no_endpoint("10.0.0.5:60"));
     }
 
     /// Both kinds of socket on one endpoint are found, each for what it is,
