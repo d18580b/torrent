@@ -1794,44 +1794,101 @@ pub fn spawn_resume_unfinished(
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
         let stop = || work.is_cancelled();
-        let unfinished = pool
-            .with_store(|s| s.unfinished_plans())
-            .map(|p| !p.is_empty())
-            .unwrap_or(true);
-        if unfinished && !await_loaded(&state, &loaded, REDRIVE_SETTLE_DEADLINE, &stop) {
-            if !stop() {
-                warn!(
-                    target: "torrentd::pool::apply",
-                    "not every torrent the boot loaded reached the state map in time; \
-                     interrupted plans are left applying for the next boot",
-                );
-            }
-            return;
-        }
-        resume_unfinished(&pool, &source, &state, &stop);
+        redrive_once_loaded(
+            &pool,
+            &source,
+            &state,
+            &loaded,
+            REDRIVE_SETTLE_DEADLINE,
+            &stop,
+        );
     })
 }
 
 /// How long the boot re-drive waits for the loaded torrents to appear.
 const REDRIVE_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Wait until every one of `loaded` is in `state`. `false` on the deadline
-/// or a stop.
+/// How many of the info-hashes that never reached the state map the
+/// give-up names in its log line; the rest are only counted.
+const REDRIVE_MISSING_LOGGED: usize = 16;
+
+/// The body of [`spawn_resume_unfinished`], with the settle deadline a
+/// parameter so a test can reach the give-up without waiting it out.
+///
+/// A give-up on the deadline counts
+/// `pool_plan_failures_total{kind="redrive_timed_out"}` and names the
+/// torrents still missing: the interrupted plans stay `applying`, and
+/// without the count nothing but a log line would say so. A stop is a
+/// shutdown, not a failure, and is not counted.
+fn redrive_once_loaded(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    loaded: &[libtorrent_safe::InfoHash],
+    within: std::time::Duration,
+    stop: StopCheck<'_>,
+) {
+    let unfinished = pool
+        .with_store(|s| s.unfinished_plans())
+        .map(|p| !p.is_empty())
+        .unwrap_or(true);
+    if unfinished {
+        match await_loaded(state, loaded, within, stop) {
+            Settled::Loaded => {}
+            Settled::Stopped => return,
+            Settled::TimedOut(missing) => {
+                let named: Vec<String> = missing
+                    .iter()
+                    .take(REDRIVE_MISSING_LOGGED)
+                    .map(|ih| ih.to_hex())
+                    .collect();
+                warn!(
+                    target: "torrentd::pool::apply",
+                    missing = missing.len(),
+                    infohashes = %named.join(","),
+                    "not every torrent the boot loaded reached the state map in time; \
+                     interrupted plans are left applying for the next boot",
+                );
+                pool.count("pool_plan_failures_total", &[("kind", "redrive_timed_out")]);
+                return;
+            }
+        }
+    }
+    resume_unfinished(pool, source, state, stop);
+}
+
+/// How [`await_loaded`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// Every loaded torrent is in the state map.
+    Loaded,
+    /// The stop latched first.
+    Stopped,
+    /// The deadline passed with these still missing from the state map.
+    TimedOut(Vec<libtorrent_safe::InfoHash>),
+}
+
+/// Wait until every one of `loaded` is in `state`, the stop latches, or
+/// `within` passes. A stop is checked before the deadline, so a shutdown
+/// that lands as the deadline passes is a stop.
 fn await_loaded(
     state: &StateMap,
     loaded: &[libtorrent_safe::InfoHash],
     within: std::time::Duration,
     stop: StopCheck<'_>,
-) -> bool {
+) -> Settled {
     let deadline = std::time::Instant::now() + within;
     let mut pending: Vec<_> = loaded.to_vec();
     loop {
         pending.retain(|ih| !state.contains(ih));
         if pending.is_empty() {
-            return true;
+            return Settled::Loaded;
         }
-        if stop() || std::time::Instant::now() >= deadline {
-            return false;
+        if stop() {
+            return Settled::Stopped;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Settled::TimedOut(pending);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -2956,18 +3013,68 @@ mod tests {
         task.await.unwrap();
         assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLYING);
 
-        assert!(await_loaded(
+        assert_eq!(
+            await_loaded(&state, &[], std::time::Duration::ZERO, &|| false),
+            Settled::Loaded,
+        );
+        assert_eq!(
+            await_loaded(&state, &[pending], std::time::Duration::ZERO, &|| false),
+            Settled::TimedOut(vec![pending]),
+        );
+        assert_eq!(
+            await_loaded(&state, &[pending], std::time::Duration::ZERO, &|| true),
+            Settled::Stopped,
+            "a stop as the deadline passes is a stop",
+        );
+    }
+
+    #[test]
+    fn a_redrive_that_times_out_waiting_for_the_state_map_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        let pool = service(dir.path(), true);
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+        pool.set_metrics(metrics.clone());
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+        pool.with_store(|s| s.claim_plan_for_apply(plan_id, false))
+            .unwrap();
+        let pending = libtorrent_safe::InfoHash([9; 20]);
+        let timed_out = "pool_plan_failures_total{kind=\"redrive_timed_out\"} 1";
+
+        // A shutdown during the wait gives up uncounted.
+        redrive_once_loaded(
+            &pool,
+            &source,
             &state,
-            &[],
-            std::time::Duration::ZERO,
-            &|| false
-        ));
-        assert!(!await_loaded(
+            &[pending],
+            std::time::Duration::from_secs(600),
+            &|| true,
+        );
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(!text.contains(timed_out), "{text}");
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLYING);
+
+        // The deadline passing with a loaded torrent still missing counts.
+        redrive_once_loaded(
+            &pool,
+            &source,
             &state,
             &[pending],
             std::time::Duration::ZERO,
-            &|| false
-        ));
+            &|| false,
+        );
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(text.contains(timed_out), "{text}");
+        assert!(!text.contains("kind=\"resume_failed\"} 1"), "{text}");
+        assert_eq!(
+            plan_state(&pool, plan_id).0,
+            plan_status::APPLYING,
+            "the plan is left for the next boot",
+        );
     }
 
     #[test]

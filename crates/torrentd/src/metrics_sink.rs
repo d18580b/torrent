@@ -301,9 +301,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "last_shutdown_kill_switch_removal_failed" Gauge Daemon Owner("always") =>
         "1 if the previous run could not remove the kill switch on its way out.";
     // pool
-    "pool_plan_failures_total" Counter Daemon ("kind": &["step_failed", "index_diverged", "resume_failed"]) Zero =>
+    "pool_plan_failures_total" Counter Daemon ("kind": &["step_failed", "index_diverged", "resume_failed", "redrive_timed_out"]) Zero =>
         "Pool plans that stopped: a step failed, the index stopped accounting for what is \
-         loaded, or re-driving an interrupted plan failed.";
+         loaded, re-driving an interrupted plan failed, or the boot re-drive gave up waiting \
+         for the loaded torrents to reach the state map and left interrupted plans applying.";
     "pool_scan_errors_total" Counter Daemon ("kind": &["walk", "stat", "path", "read", "parse"]) Zero =>
         "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or \
          unparseable .torrent files.";
