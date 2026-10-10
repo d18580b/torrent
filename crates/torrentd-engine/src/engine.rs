@@ -131,6 +131,20 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// nothing tracking it. A torrent whose removal the session accepted is
     /// not listed, though its `torrent_removed_alert` may still be queued.
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError>;
+    /// How many alerts this session popped from libtorrent and then lost
+    /// because the shim could not translate them. Each is dropped on its own
+    /// and the rest of its batch still delivered, so a rise is alerts lost one
+    /// at a time: possibly a `torrent_removed` or a `save_resume_data` answer
+    /// the state map then never sees.
+    ///
+    /// Monotonic for the session's lifetime, and only a [`pop_alerts`] moves
+    /// it. Never fails and never blocks behind other calls: the alert loop
+    /// asks after every drain. Once the session is closed it stays at what it
+    /// last read. No default, so a wrapping engine cannot forget to forward
+    /// it and report zero.
+    ///
+    /// [`pop_alerts`]: TorrentEngine::pop_alerts
+    fn alert_translate_errors(&self) -> u64;
     /// Destroy the session now, closing every peer and tracker socket, and
     /// answer every later call with [`EngineError::Shutdown`].
     ///
@@ -223,6 +237,9 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
         (**self).torrents()
+    }
+    fn alert_translate_errors(&self) -> u64 {
+        (**self).alert_translate_errors()
     }
     fn close(&self) {
         (**self).close()

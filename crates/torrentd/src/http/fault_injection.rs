@@ -212,6 +212,9 @@ impl TorrentEngine for FaultEngine {
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
         self.inner.torrents()
     }
+    fn alert_translate_errors(&self) -> u64 {
+        self.inner.alert_translate_errors()
+    }
     fn close(&self) {
         self.inner.close()
     }
