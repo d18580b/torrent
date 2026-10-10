@@ -1492,6 +1492,65 @@ async fn an_add_dropped_mid_call_still_releases_the_claim_when_the_add_fails() {
     .await;
 }
 
+/// Issue #167: two adds of one info-hash into one profile, where the second's
+/// lookup ran before the first's claim was visible. The first add's claim is
+/// written through a second handle on the same database, which is exactly what
+/// the second add's `assign` finds: a row naming its own profile that its
+/// lookup did not see.
+///
+/// The second add used to take that as its own claim, reach the session,
+/// fail on libtorrent's duplicate, and release the first add's claim, leaving
+/// the torrent seeding with no owner and free to be added into another
+/// profile.
+#[tokio::test]
+async fn a_same_profile_add_that_loses_the_claim_race_is_refused_and_keeps_the_winners_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg_path = dir.path().join("reg.db");
+    let (p, q) = (Arc::new(MockEngine::new()), Arc::new(MockEngine::new()));
+    let h = Harness::authed(&Coverage::new(), |s| {
+        s.profiles = Arc::new(ProfileRegistry::new(vec![
+            test_entry("p", ProfileStatus::Active),
+            test_entry("q", ProfileStatus::Active),
+        ]));
+        s.source = Arc::new(ProfileSource::new(vec![
+            (ProfileId::new("p"), p.clone() as Arc<dyn TorrentEngine>),
+            (ProfileId::new("q"), q.clone() as Arc<dyn TorrentEngine>),
+        ]));
+        s.registry = Arc::new(AssignmentRegistry::new_empty(&reg_path));
+        s.default_save_path = dir.path().to_path_buf();
+        s.torrent_dir = dir.path().to_path_buf();
+    });
+    let ih = InfoHash([1; 20]); // MAGNET's btih
+                                // The winning add's claim, and the duplicate the session would answer the
+                                // losing add with if it got that far.
+    AssignmentRegistry::new_empty(&reg_path)
+        .assign(ih, ProfileId::new("p"))
+        .unwrap();
+    p.inject_error(
+        "add_torrent",
+        EngineError::MockInjected {
+            op: "add_torrent",
+            message: "torrent already exists in session".into(),
+        },
+    );
+
+    let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
+    assert_problem(&resp, 409, "torrent-exists");
+    assert!(
+        !p.calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::AddTorrent(_))),
+        "the losing add reached the session: {:?}",
+        p.calls()
+    );
+    assert_eq!(h.state.registry.lookup(&ih), Some(ProfileId::new("p")));
+
+    let resp = h.write_json("POST", "/v1/torrents", magnet("q")).await;
+    assert_problem(&resp, 409, "torrent-exists");
+    assert!(q.calls().is_empty(), "{:?}", q.calls());
+    assert_eq!(h.state.registry.lookup(&ih), Some(ProfileId::new("p")));
+}
+
 #[tokio::test]
 async fn an_add_whose_profile_is_fenced_mid_add_pauses_the_torrent() {
     // The add passed the fence check, then the VPN monitor fenced the profile
