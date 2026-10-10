@@ -520,6 +520,10 @@ fn run(
                     fatal.get_or_insert(
                         "a listen socket is not held to its profile's tunnel device; shutting down",
                     );
+                    // Before the drain, which can last `shutdown_drain_secs`
+                    // (up to an hour), and before the failure is published,
+                    // which wakes a rebind waiting on it.
+                    take_profile_off_the_wire(&profile, &source);
                     wrong_device = Some(cause);
                 }
             }
@@ -615,6 +619,49 @@ fn run(
         if was_empty {
             clock.sleep(POLL_IDLE_INTERVAL);
         }
+    }
+}
+
+/// Close every listen socket of `profile`'s session, then pause the session,
+/// so a profile found sending by the wrong device sends nothing more while
+/// the daemon drains.
+///
+/// The order matters. A paused torrent sends libtorrent's `stopped` announce,
+/// and libtorrent announces once per listen socket, the wrong one included,
+/// so pausing first would announce through the socket being fenced. With
+/// `listen_interfaces` empty the session holds no listen socket, and so no
+/// uTP, UDP tracker or announce endpoint, and the pause then reaches no
+/// tracker. The two calls are queued on the session in that order.
+///
+/// Each refusal is logged and does not stop the other: the daemon is
+/// shutting down either way.
+fn take_profile_off_the_wire(profile: &ProfileId, source: &Arc<dyn AlertSource>) {
+    let Some(engine) = source.engine_for(profile) else {
+        return;
+    };
+    let close = libtorrent_safe::Settings {
+        listen_interfaces: Some(String::new()),
+        ..Default::default()
+    };
+    if let Err(e) = engine.apply_settings(&close) {
+        error!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile,
+            error.kind = "listen_close_failed",
+            error.cause = %e,
+            "could not close the profile's listen sockets; they stay open until the session \
+             closes at the end of the shutdown drain",
+        );
+    }
+    if let Err(e) = engine.pause_session() {
+        error!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile,
+            error.kind = "session_pause_failed",
+            error.cause = %e,
+            "could not pause the profile's session; its torrents keep running until the \
+             session closes at the end of the shutdown drain",
+        );
     }
 }
 
@@ -1657,19 +1704,29 @@ mod tests {
 
     /// A listen socket held to the wrong device stops the daemon even where
     /// other sessions are live (`fatal_listen_failure(false)`), and a rebind
-    /// waiting on that endpoint reads it as a failure, not a success.
+    /// waiting on that endpoint reads it as a failure, not a success. Before
+    /// the drain, the profile's listen sockets are closed and then its
+    /// session paused, so nothing, `stopped` announces included, leaves by
+    /// that device while the daemon saves resume data.
     #[test]
     fn a_listen_socket_on_the_wrong_device_is_fatal_with_any_number_of_sessions() {
+        use crate::mock::RecordedCall;
         use crate::port_forward::ListenConfirmation;
 
         let engine = Arc::new(MockEngine::new());
+        // A torrent, so the drain has a resume save to ask for, and the
+        // fence can be seen to come before it.
+        engine.push_alert(add_torrent_alert(0xAB, 1));
         engine.push_alert(listen_succeeded_alert("10.2.0.2:40001"));
+        let calls = Arc::clone(&engine);
         let events = Arc::new(ListenEvents::new());
         let cursor = events.cursor();
         let asked: Arc<parking_lot::Mutex<Vec<(ProfileId, String)>>> = Arc::default();
         let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
         let handle = builder_with(engine)
             .fatal_listen_failure(false)
+            // The mock never answers the save; the drain gives up on it.
+            .shutdown_deadline(Duration::from_millis(200))
             .listen_events(events.clone())
             .listen_device_check({
                 let asked = Arc::clone(&asked);
@@ -1702,6 +1759,22 @@ mod tests {
                 Duration::from_millis(10),
             ),
             ListenConfirmation::Failed("udp socket held to eth0, not wg0".into()),
+        );
+
+        let calls = calls.calls();
+        let at = |want: &dyn Fn(&RecordedCall) -> bool| calls.iter().position(want);
+        let closed = at(&|c| {
+            matches!(c, RecordedCall::ApplySettings(s)
+                if s.listen_interfaces.as_deref() == Some(""))
+        })
+        .expect("the profile's listen sockets are closed");
+        let paused = at(&|c| matches!(c, RecordedCall::PauseSession))
+            .expect("the profile's session is paused");
+        let saved = at(&|c| matches!(c, RecordedCall::SaveResumeData { .. }))
+            .expect("the drain asks for the torrent's resume data");
+        assert!(
+            closed < paused && paused < saved,
+            "sockets closed, then the session paused, then the drain: {calls:?}"
         );
     }
 
