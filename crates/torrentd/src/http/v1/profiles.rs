@@ -748,7 +748,20 @@ async fn for_each_torrent(
 ///
 /// On a task of its own, which the request only awaits, so a client that
 /// stops waiting does not leave the profile half resumed.
+///
+/// A pause of the profile while it runs stops it, and a torrent paused on its
+/// own is left out ([`crate::profile_registry::ResumeGate`]): the response
+/// then counts only what was resumed, and lists nothing in
+/// `skipped_profiles`, since the later pause is what the operator asked for.
 async fn resume_each(s: &AppState, profile_id: &ProfileId, out: &mut BulkOutcome) {
+    let Some(gate) = s
+        .profiles
+        .resolve(profile_id)
+        .active()
+        .map(|e| e.open_gate())
+    else {
+        return;
+    };
     let handles = s.state.handles_for_profile(profile_id);
     let (profiles, metrics, id) = (
         Arc::clone(&s.profiles),
@@ -767,15 +780,16 @@ async fn resume_each(s: &AppState, profile_id: &ProfileId, out: &mut BulkOutcome
             &handles,
             REANNOUNCE_PACE,
             || false,
+            gate,
             metrics,
             |h, _| reached.fail(h),
         )
         .await;
         reached.ok = u32::try_from(resumed.resumed).unwrap_or(u32::MAX);
         reached.keep_smallest();
-        (reached, resumed.not_reached)
+        (reached, resumed)
     });
-    let (reached, not_reached) = match task.await {
+    let (reached, resumed) = match task.await {
         Ok(v) => v,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         // Only a runtime shutting down cancels the task, and then the request
@@ -783,6 +797,19 @@ async fn resume_each(s: &AppState, profile_id: &ProfileId, out: &mut BulkOutcome
         Err(e) => panic!("resume task did not run: {e}"),
     };
     tally(out, reached);
+    if resumed.halted || resumed.excluded > 0 {
+        info!(
+            profile_id = %profile_id,
+            torrent_count = resumed.not_reached,
+            excluded_count = resumed.excluded,
+            halted = resumed.halted,
+            "torrents paused while a resume-all ran were left paused",
+        );
+        if resumed.halted {
+            return;
+        }
+    }
+    let not_reached = resumed.not_reached;
     if not_reached > 0 {
         warn!(
             profile_id = %profile_id,
@@ -821,6 +848,10 @@ fn tally(out: &mut BulkOutcome, reached: Reached) {
 /// paused, and pausing again is harmless. A profile that never came up has
 /// nothing loaded to pause and answers `409 profile-unavailable` with its
 /// bring-up failure. `failed_count` counts torrents the engine refused.
+///
+/// A paced resume still running in the profile, a lifted fence's or a
+/// resume-all's, is stopped first, so it does not resume torrents after this
+/// paused them.
 #[kynos::post("/profiles/{profile_id}/pause-all", tag = Profiles)]
 pub async fn pause_profile(
     _caller: Scoped<Bearer, Write>,
@@ -829,6 +860,9 @@ pub async fn pause_profile(
 ) -> Result<Json<BulkOutcome>, ProfileBulkError> {
     let profile_id = ProfileId::new(path.profile_id);
     let engine = engine_for(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
+    if let Some(entry) = s.profiles.resolve(&profile_id).active() {
+        entry.halt_resumes();
+    }
     let mut out = BulkOutcome::default();
     tally(
         &mut out,
@@ -909,6 +943,10 @@ fn skipped_failed(s: &AppState) -> Vec<SkippedProfile> {
 /// already paused, and pausing again is harmless. Profiles that never came up
 /// are listed in `skipped_profiles`, since nothing of theirs is loaded. A
 /// nonzero `failed_count` means some torrents are still running.
+///
+/// A paced resume still running in a profile, a lifted fence's or a
+/// resume-all's, is stopped first, so it does not resume torrents after this
+/// paused them.
 #[kynos::post("/torrents/pause-all", tag = Torrents)]
 pub async fn pause_all_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -919,6 +957,7 @@ pub async fn pause_all_torrents(
         ..BulkOutcome::default()
     };
     for entry in s.profiles.iter() {
+        entry.halt_resumes();
         let reached = for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), |e, h| {
             e.pause_torrent(h).is_ok()
         })

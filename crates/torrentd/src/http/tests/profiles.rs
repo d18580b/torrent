@@ -622,6 +622,86 @@ async fn bulk_operations_count_what_the_engine_refused() {
     h.assert_conformance();
 }
 
+/// A pause that lands while a lifted fence's paced resume is still going
+/// keeps: the profile's pause-all and the daemon's stop the run, and a
+/// torrent paused on its own is left out of it, so no later batch undoes the
+/// pause.
+#[tokio::test(start_paused = true)]
+async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let n = u8::try_from(REANNOUNCE_BATCH + 50).unwrap();
+    for pause in [
+        "/v1/profiles/acct_a/pause-all",
+        "/v1/torrents/pause-all",
+        "one torrent",
+    ] {
+        let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+        let h = Harness::authed(&Coverage::new(), |s| install(s, vec![a], vec![]));
+        let handles: Vec<TorrentHandle> = (1..=n).map(|b| load(&h.state, b, "acct_a")).collect();
+        let last = handles[handles.len() - 1];
+        let entry = h
+            .state
+            .profiles
+            .resolve(&ProfileId::new("acct_a"))
+            .active()
+            .unwrap();
+        let run = crate::vpn_monitor::spawn_lift(
+            &h.state.profiles,
+            &h.state.metrics,
+            entry,
+            handles,
+            crate::vpn_monitor::Lift::SetOnline,
+        );
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        let resumed = |only: Option<TorrentHandle>| {
+            calls(
+                &eng_a,
+                |c| matches!(c, RecordedCall::ResumeTorrent(x) if only.is_none_or(|o| o == *x)),
+            )
+        };
+        assert_eq!(resumed(None), REANNOUNCE_BATCH, "{pause}: the first batch");
+
+        let path = if pause == "one torrent" {
+            format!("/v1/torrents/{}/pause", last.infohash.to_hex())
+        } else {
+            pause.to_owned()
+        };
+        let resp = h.write("POST", &path).await;
+        assert!(resp.status().is_success(), "{pause}: {}", resp.status());
+
+        let out = run.await.unwrap();
+        assert_eq!(
+            resumed(Some(last)),
+            0,
+            "{pause}: the paused torrent stays paused"
+        );
+        if pause == "one torrent" {
+            assert_eq!(
+                (out.resumed, out.excluded, out.halted),
+                (u64::from(n) - 1, 1, false),
+                "{pause}: the run goes on without it",
+            );
+        } else {
+            assert_eq!(
+                (out.resumed, out.not_reached, out.halted),
+                (
+                    REANNOUNCE_BATCH as u64,
+                    usize::from(n) - REANNOUNCE_BATCH,
+                    true
+                ),
+                "{pause}: the run stops",
+            );
+            assert_eq!(resumed(None), REANNOUNCE_BATCH, "{pause}: nothing after");
+            assert!(
+                !entry.is_resuming(),
+                "{pause}: and is dropped from the profile"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_session_that_refuses_to_pause_is_reported_on_the_network() {
     let (a, eng_a) = live("acct_a", ProfileStatus::Active);

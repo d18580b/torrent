@@ -2250,7 +2250,7 @@
           "torrents"
         ],
         "summary": "Pause a torrent.",
-        "description": "Stops it announcing and serving peers until resumed. Allowed on a fenced\nprofile: pausing puts nothing back on the network.",
+        "description": "Stops it announcing and serving peers until resumed. Allowed on a fenced\nprofile: pausing puts nothing back on the network. A paced resume still\nrunning in the profile, a lifted fence's or a resume-all's, leaves it out.",
         "operationId": "pause_torrent",
         "parameters": [
           {
@@ -4498,7 +4498,7 @@
           "profiles"
         ],
         "summary": "Pause every torrent in one profile.",
-        "description": "A fenced (`vpn_down`) profile is paused too: its torrents are already\npaused, and pausing again is harmless. A profile that never came up has\nnothing loaded to pause and answers `409 profile-unavailable` with its\nbring-up failure. `failed_count` counts torrents the engine refused.",
+        "description": "A fenced (`vpn_down`) profile is paused too: its torrents are already\npaused, and pausing again is harmless. A profile that never came up has\nnothing loaded to pause and answers `409 profile-unavailable` with its\nbring-up failure. `failed_count` counts torrents the engine refused.\n\nA paced resume still running in the profile, a lifted fence's or a\nresume-all's, is stopped first, so it does not resume torrents after this\npaused them.",
         "operationId": "pause_profile",
         "parameters": [
           {
@@ -4900,7 +4900,7 @@
           "torrents"
         ],
         "summary": "Pause every torrent in every profile.",
-        "description": "Every live profile is reached, fenced ones included: their torrents are\nalready paused, and pausing again is harmless. Profiles that never came up\nare listed in `skipped_profiles`, since nothing of theirs is loaded. A\nnonzero `failed_count` means some torrents are still running.",
+        "description": "Every live profile is reached, fenced ones included: their torrents are\nalready paused, and pausing again is harmless. Profiles that never came up\nare listed in `skipped_profiles`, since nothing of theirs is loaded. A\nnonzero `failed_count` means some torrents are still running.\n\nA paced resume still running in a profile, a lifted fence's or a\nresume-all's, is stopped first, so it does not resume torrents after this\npaused them.",
         "operationId": "pause_all_torrents",
         "responses": {
           "401": {
