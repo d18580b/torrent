@@ -331,6 +331,38 @@ struct ListenEvent {
 struct ListenLog {
     next_seq: u64,
     recent: VecDeque<ListenEvent>,
+    /// The ports a rebind is moving a profile onto, one entry per
+    /// [`RebindInProgress`] held.
+    rebinding: Vec<(ProfileId, u16)>,
+}
+
+/// A rebind of `profile` onto `port`, in progress until dropped. While one
+/// is held, a `listen_failed` on that port, at any address, belongs to the
+/// rebind, which reverts to the previous port, and the alert loop does not
+/// read it as the session losing its listener
+/// ([`ListenEvents::rebind_in_progress`]). Any address, because the session
+/// listens on every address the tunnel device holds
+/// ([`crate::profile::bind_endpoint`]), IPv6 ones included, and each of
+/// them reports its own outcome for the new port.
+#[must_use = "the rebind is in progress only while this is held"]
+#[derive(Debug)]
+pub struct RebindInProgress<'a> {
+    events: &'a ListenEvents,
+    profile: ProfileId,
+    port: u16,
+}
+
+impl Drop for RebindInProgress<'_> {
+    fn drop(&mut self) {
+        let mut log = self.events.log.lock();
+        if let Some(i) = log
+            .rebinding
+            .iter()
+            .position(|(p, port)| *p == self.profile && *port == self.port)
+        {
+            log.rebinding.swap_remove(i);
+        }
+    }
 }
 
 /// Every profile's listen outcomes, published by the alert loop (the only
@@ -379,6 +411,32 @@ impl ListenEvents {
         });
         drop(log);
         self.published.notify_all();
+    }
+
+    /// Mark a rebind of `profile` onto `port` as in progress, until the
+    /// returned guard is dropped. Taken before the change is applied, so no
+    /// outcome of it can reach the alert loop unmarked.
+    pub fn begin_rebind(&self, profile: &ProfileId, port: u16) -> RebindInProgress<'_> {
+        self.log.lock().rebinding.push((profile.clone(), port));
+        RebindInProgress {
+            events: self,
+            profile: profile.clone(),
+            port,
+        }
+    }
+
+    /// Whether a rebind of `profile` onto the port of `endpoint` (a listen
+    /// alert's `address:port` text) is in progress, whatever its address.
+    /// An endpoint that does not parse is never one.
+    pub fn rebind_in_progress(&self, profile: &ProfileId, endpoint: &str) -> bool {
+        let Some(endpoint) = parse_listen_endpoint(endpoint) else {
+            return false;
+        };
+        self.log
+            .lock()
+            .rebinding
+            .iter()
+            .any(|(p, port)| p == profile && *port == endpoint.port())
     }
 
     /// A position in the stream: [`ListenEvents::wait_for`] considers only
@@ -499,7 +557,12 @@ pub struct Reannounce {
 /// `previous_port` and returns [`RenewOutcome::RebindFailed`]. The revert
 /// matters beyond tidiness: libtorrent reopens its sockets only when
 /// `listen_interfaces` changes, so a retry that re-applied the endpoint
-/// already set would never produce an outcome to wait for. A rebind is not
+/// already set would never produce an outcome to wait for. From before the
+/// new port is applied until the revert's outcome arrives (or
+/// `target.timeout` passes), the new port is marked as rebinding
+/// ([`ListenEvents::begin_rebind`]), so the alert loop does not read a
+/// `listen_failed` on it, at any of the device's addresses, as fatal and the
+/// revert gets to run. A rebind is not
 /// attempted at all while nothing publishes listen outcomes
 /// ([`ListenEvents::is_attached`]), nor once the profile has been fenced
 /// ([`RebindTarget::fenced`], [`RebindFailure::Fenced`]).
@@ -571,16 +634,25 @@ pub fn renew_and_rebind(
                 listen_interfaces: Some(crate::profile::bind_endpoint(iface, p)),
                 ..Default::default()
             };
+            let new_endpoint = SocketAddr::new(tunnel_ip, port);
+            // Held until the rebind is settled, so a `listen_failed` for the
+            // new port, on any of the device's addresses, is the rebind's to
+            // revert, not a fatal loss of the session's listener. Dropping it
+            // at the tunnel address's success leaves no failure of the reopen
+            // unmarked: libtorrent's `reopen_listen_sockets` posts every
+            // `listen_failed` while it sets the sockets up and its
+            // `listen_succeeded` alerts only after, and the alert loop reads
+            // them in order.
+            let _rebinding = target.listen.begin_rebind(target.profile, port);
             let cursor = target.listen.cursor();
             if engine.apply_settings(&listen_on(port)).is_err() {
                 return failed(RebindFailure::Apply);
             }
-            let reason = match target.listen.wait_for(
-                target.profile,
-                cursor,
-                SocketAddr::new(tunnel_ip, port),
-                target.timeout,
-            ) {
+            let confirmation =
+                target
+                    .listen
+                    .wait_for(target.profile, cursor, new_endpoint, target.timeout);
+            let reason = match confirmation {
                 ListenConfirmation::Succeeded => None,
                 ListenConfirmation::Failed(msg) => Some(RebindFailure::ListenFailed(msg)),
                 ListenConfirmation::TimedOut => Some(RebindFailure::TimedOut),
@@ -588,7 +660,23 @@ pub fn renew_and_rebind(
             if let Some(reason) = reason {
                 // Best effort: were this refused too, the next attempt's
                 // wait would time out and try the revert again.
-                let _ = engine.apply_settings(&listen_on(previous_port));
+                let cursor = target.listen.cursor();
+                if engine.apply_settings(&listen_on(previous_port)).is_ok() {
+                    // The rebind stays in progress until the revert's own
+                    // outcome arrives, bounded like the rebind's. libtorrent
+                    // posts every outcome of the reopen onto the new port
+                    // before any of the revert's, so by then no failure for
+                    // the new port is still queued for the alert loop to
+                    // read as fatal. A revert that fails is published for the
+                    // previous endpoint, which no rebind holds, so with one
+                    // live session it is still fatal.
+                    let _ = target.listen.wait_for(
+                        target.profile,
+                        cursor,
+                        SocketAddr::new(tunnel_ip, previous_port),
+                        target.timeout,
+                    );
+                }
                 return failed(reason);
             }
             RenewOutcome::Rebound {
@@ -796,6 +884,25 @@ mod tests {
             for (profile, endpoint, failure) in answers {
                 listen.publish(&profile, endpoint, failure.map(str::to_string));
             }
+        })
+    }
+
+    /// Stand in for the alert loop on a revert: once `eng` has been asked
+    /// for a second bind, publish `profile`'s success on `endpoint`.
+    fn answer_revert(
+        eng: &Arc<MockEngine>,
+        listen: &Arc<ListenEvents>,
+        profile: &ProfileId,
+        endpoint: &'static str,
+    ) -> std::thread::JoinHandle<()> {
+        let (eng, listen, profile) = (eng.clone(), listen.clone(), profile.clone());
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while applied_binds(&eng).len() < 2 {
+                assert!(Instant::now() < deadline, "no revert was attempted");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            listen.publish(&profile, endpoint, None);
         })
     }
 
@@ -1041,8 +1148,14 @@ mod tests {
                 (p.clone(), "10.2.0.2:40001", None),
             ],
         );
+        let revert = answer_revert(&eng, &listen, &p, "10.2.0.2:6881");
         let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), port_free);
         session.join().unwrap();
+        revert.join().unwrap();
+        assert!(
+            !listen.rebind_in_progress(&p, "10.2.0.2:40001"),
+            "the rebind is over once its revert is confirmed",
+        );
         assert!(
             matches!(
                 &out,
@@ -1060,6 +1173,28 @@ mod tests {
             vec!["wg0:40001".to_string(), "wg0:6881".to_string()],
         );
         assert!(reannounced(&eng).is_empty());
+    }
+
+    #[test]
+    fn a_rebind_is_in_progress_only_for_its_profile_and_port_while_held() {
+        let (p, listen) = (ProfileId::new("p"), ListenEvents::new());
+        assert!(!listen.rebind_in_progress(&p, "10.2.0.2:40001"));
+        let first = listen.begin_rebind(&p, 40001);
+        let second = listen.begin_rebind(&p, 40001);
+        assert!(listen.rebind_in_progress(&p, "10.2.0.2:40001"));
+        // The session listens on each of the device's addresses, IPv6 too.
+        assert!(listen.rebind_in_progress(&p, "fd00::2:40001"));
+        assert!(listen.rebind_in_progress(&p, "fe80::1%3:40001"));
+        assert!(!listen.rebind_in_progress(&ProfileId::new("other"), "10.2.0.2:40001"));
+        assert!(!listen.rebind_in_progress(&p, "10.2.0.2:6881"));
+        assert!(!listen.rebind_in_progress(&p, "not an endpoint"));
+        drop(first);
+        assert!(
+            listen.rebind_in_progress(&p, "10.2.0.2:40001"),
+            "each guard holds its own mark",
+        );
+        drop(second);
+        assert!(!listen.rebind_in_progress(&p, "10.2.0.2:40001"));
     }
 
     #[test]
