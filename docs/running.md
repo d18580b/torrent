@@ -876,8 +876,25 @@ So there are two safe shapes:
 
 | `http_listen` | `[auth]` | |
 | --- | --- | --- |
-| loopback | absent, `allow_unauthenticated = true` | access control is the proxy's job |
+| loopback | absent, `allow_unauthenticated = true` | access control is the proxy's job — on a single-user host only |
 | anything | configured | the daemon authenticates itself |
+
+**Loopback is not private to the daemon's user.** Every uid on the host can
+connect to `127.0.0.1`, and the daemon has no unix-socket listener and no
+peer-credential check, so it cannot tell the proxy from any other local
+process — and a local client does not go through the proxy at all. Without
+`[auth]`, any local user or service (another login, a web app, a CI runner)
+can pause, delete and reconfigure every profile, and with `[pool]`
+`allow_mutations` delete payload. The first shape is therefore safe only on a host where every
+local process belongs to you, or inside a network namespace or container that
+no other uid shares. Anywhere else, configure `[auth]` even on loopback.
+
+`[auth]` does not close the gap entirely: `http_listen` is a TCP port above
+1024, so while the daemon is stopped or restarting another local user can
+bind it, and the next `torrentctl` call sends its bearer token (or login
+password) to that listener — nothing authenticates the server end of a
+plain-HTTP loopback connection. On a shared host, keep a restart short and do
+not run `torrentctl` against a daemon you know to be down.
 
 **A proxy in front of an unauthenticated daemon must strip `Authorization`.**
 Without `[auth]` the daemon checks no credential, but it still reads the

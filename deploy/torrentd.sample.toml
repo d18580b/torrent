@@ -17,9 +17,12 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # The daemon refuses to start unless you either configure [auth] (see the
 # bottom of this file) or say here that you do not want authentication. This
 # sample takes the second option because it binds loopback, where access
-# control is the reverse proxy's job. Delete this line and configure [auth]
-# before exposing the API anywhere — a non-loopback bind without [auth] is
-# refused outright.
+# control is the reverse proxy's job. That holds only on a single-user host,
+# or in a network namespace or container no other uid shares: every local
+# user can reach 127.0.0.1, and without [auth] any of them controls the
+# daemon (docs/running.md §6). Delete this line and configure [auth] on a
+# shared host, and before exposing the API anywhere — a non-loopback bind
+# without [auth] is refused outright.
 #
 # Read once, at startup, like [auth], http_listen and trusted_proxies: editing
 # any of the four takes effect on restart, not on SIGHUP. A reload after such an
