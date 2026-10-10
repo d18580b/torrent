@@ -28,6 +28,7 @@ pub use openvpn::OpenvpnManager;
 pub use openvpn::Released as ReleasedOpenvpn;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
+pub use wireguard::endpoint_hosts as wireguard_endpoint_hosts;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::release_recorded as release_recorded_wireguard;
 pub use wireguard::sweep_raised_records;

@@ -414,6 +414,38 @@ fn profile_public_key(config_path: &Path) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
+/// The host of every `[Peer]`'s `Endpoint` in a WireGuard config: the server
+/// the tunnel's traffic leaves through, which is what a tracker sees as the
+/// account's address. Read the way [`native::parse`] reads keys: `#` starts a
+/// comment and keys match case-insensitively. `host:port` gives `host` and
+/// `[v6]:port` gives `v6`, lowercased so two spellings of one name compare
+/// equal. The host is not resolved, so two names for one server are two hosts
+/// here.
+pub fn endpoint_hosts(text: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let mut in_peer = false;
+    for line in text.lines() {
+        let stripped = line.split('#').next().unwrap_or_default();
+        let (key, value) = match stripped.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (stripped.trim(), ""),
+        };
+        if key.starts_with('[') {
+            in_peer = key.eq_ignore_ascii_case("[Peer]");
+        } else if in_peer && key.eq_ignore_ascii_case("Endpoint") && !value.is_empty() {
+            let host = match value.strip_prefix('[') {
+                Some(rest) => rest.split_once(']').map_or(rest, |(h, _)| h),
+                None => value.rsplit_once(':').map_or(value, |(h, _)| h),
+            };
+            let host = host.trim().to_ascii_lowercase();
+            if !host.is_empty() && !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
+}
+
 #[derive(Debug)]
 pub struct WireguardManager {
     /// Where this boot's raised-interface records live — `Config::state_dir()`,
@@ -2005,6 +2037,32 @@ Endpoint = 203.0.113.7:51820 # the exit
         ] {
             assert!(p.wg_conf.contains(kept), "{kept} is for wg:\n{}", p.wg_conf);
         }
+    }
+
+    /// The exit a tracker sees is the `[Peer]`'s `Endpoint` host: the port
+    /// and an IPv6 literal's brackets come off, a comment is not part of it,
+    /// case does not tell two hosts apart, and nothing outside `[Peer]`
+    /// counts.
+    #[test]
+    fn the_endpoint_host_is_read_from_each_peer_without_its_port() {
+        assert_eq!(super::endpoint_hosts(PROVIDER_CONF), ["203.0.113.7"]);
+        let two_peers = "\
+[Interface]
+Endpoint = 198.51.100.1:1
+[peer]
+endpoint = NL-FREE-7.Example.net:51820
+[Peer]
+Endpoint = [2001:DB8::1]:51820
+[Peer]
+Endpoint = nl-free-7.example.net:443
+[Peer]
+PublicKey = x
+";
+        assert_eq!(
+            super::endpoint_hosts(two_peers),
+            ["nl-free-7.example.net", "2001:db8::1"],
+        );
+        assert!(super::endpoint_hosts("[Interface]\nAddress = 10.0.0.2/32\n").is_empty());
     }
 
     /// Hooks are refused by name rather than skipped: the documented
