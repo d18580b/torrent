@@ -242,11 +242,16 @@ impl TorrentState {
 ///   dispatcher (`StateMap::dispatch_resume_saves`), because every request
 ///   becomes an alert, and a 100K-torrent burst into a bounded alert queue is
 ///   exactly how alerts get dropped.
+/// * `again` — in flight, and changed since that request was handed over: a
+///   recheck's verdict, a move's new save path or a pause landed after it. The
+///   answer already on its way may predate the change, so its settle queues
+///   one more save, unconditional.
 #[derive(Debug, Default)]
 struct ResumeSaves {
     queued: VecDeque<(InfoHash, ResumeFlags)>,
     queued_set: HashSet<InfoHash>,
     in_flight: HashMap<InfoHash, ResumeFlags>,
+    again: HashSet<InfoHash>,
 }
 
 /// Retry deadlines, earliest on top: `(next_attempt, infohash bytes)`.
@@ -627,6 +632,31 @@ impl StateMap {
         true
     }
 
+    /// Ask for a save of `ih` that holds its state as of now, because the
+    /// change just made is one a crash must not lose: a recheck's verdict, a
+    /// move's new save path, a pause the daemon issued. Until the next
+    /// periodic sweep, up to 30 minutes away, nothing else writes it.
+    ///
+    /// Always unconditional: libtorrent's modified bit is not what this
+    /// answers to. A save already queued for `ih` is raised to unconditional
+    /// rather than doubled. One already in flight may have been taken before
+    /// the change, so its settle queues one more
+    /// ([`StateMap::note_resume_settled`]).
+    pub fn queue_resume_save_now(&self, ih: InfoHash) {
+        let mut s = self.saves.lock();
+        if s.in_flight.contains_key(&ih) {
+            s.again.insert(ih);
+            return;
+        }
+        if s.queued_set.insert(ih) {
+            s.queued.push_back((ih, ResumeFlags::empty()));
+            return;
+        }
+        if let Some(queued) = s.queued.iter_mut().find(|(q, _)| *q == ih) {
+            queued.1 = ResumeFlags::empty();
+        }
+    }
+
     /// Move queued saves to in flight until `cap` are in flight, returning
     /// the ones moved for the caller to hand to libtorrent. The caller reports
     /// a request that never reached libtorrent through
@@ -650,8 +680,19 @@ impl StateMap {
     /// dispatched. Returns whether one was in flight; a settle for a torrent
     /// nobody asked about (a save the API's fault injection queued, or a
     /// duplicate answer to a re-request) changes nothing.
+    ///
+    /// A torrent that changed while this save was in flight
+    /// ([`StateMap::queue_resume_save_now`]) is queued again, unconditional:
+    /// the answer that settled it may hold the state from before the change.
     pub fn note_resume_settled(&self, ih: &InfoHash) -> bool {
-        self.saves.lock().in_flight.remove(ih).is_some()
+        let mut s = self.saves.lock();
+        if s.in_flight.remove(ih).is_none() {
+            return false;
+        }
+        if s.again.remove(ih) && s.queued_set.insert(*ih) {
+            s.queued.push_back((*ih, ResumeFlags::empty()));
+        }
+        true
     }
 
     /// Put every in-flight save back at the front of the queue, to be asked
@@ -662,10 +703,18 @@ impl StateMap {
     /// flight may be one whose answer is gone and will never settle. Asking
     /// again is cheap and idempotent; waiting is the shutdown deadline. Returns
     /// how many were re-queued.
+    ///
+    /// One that changed while in flight is asked for unconditionally whatever
+    /// `flags` says, and that one request answers its change.
     pub fn requeue_in_flight_resume_saves(&self, flags: ResumeFlags) -> usize {
         let mut s = self.saves.lock();
         let lost: Vec<InfoHash> = s.in_flight.drain().map(|(ih, _)| ih).collect();
         for ih in lost.iter().rev() {
+            let flags = if s.again.remove(ih) {
+                ResumeFlags::empty()
+            } else {
+                flags
+            };
             if s.queued_set.insert(*ih) {
                 s.queued.push_front((*ih, flags));
             }
@@ -759,6 +808,60 @@ mod tests {
         assert_eq!(
             m.dispatch_resume_saves(10),
             vec![(ih(1), ResumeFlags::empty())]
+        );
+    }
+
+    #[test]
+    fn a_save_now_is_unconditional_and_raises_a_queued_sweep_save() {
+        let m = StateMap::new();
+        m.queue_resume_save_now(ih(1));
+        assert!(m.queue_resume_save(ih(2), ResumeFlags::ONLY_IF_MODIFIED));
+        m.queue_resume_save_now(ih(2));
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty()), (ih(2), ResumeFlags::empty())],
+            "one request each, both unconditional",
+        );
+    }
+
+    #[test]
+    fn a_save_now_during_an_in_flight_save_asks_once_more_when_it_settles() {
+        // The answer on its way may have been taken before the change.
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
+        assert_eq!(m.dispatch_resume_saves(10).len(), 1);
+        m.queue_resume_save_now(ih(1));
+        m.queue_resume_save_now(ih(1));
+        assert_eq!(m.dispatch_resume_saves(10), vec![], "not doubled in flight");
+        assert!(m.note_resume_settled(&ih(1)));
+        assert_eq!(m.pending_resume_count(), 1);
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty())]
+        );
+        assert!(m.note_resume_settled(&ih(1)));
+        assert_eq!(m.pending_resume_count(), 0, "asked again once, not forever");
+    }
+
+    #[test]
+    fn a_lost_save_that_changed_in_flight_is_asked_for_unconditionally() {
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
+        m.dispatch_resume_saves(10);
+        m.queue_resume_save_now(ih(1));
+        assert_eq!(
+            m.requeue_in_flight_resume_saves(ResumeFlags::ONLY_IF_MODIFIED),
+            1
+        );
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty())]
+        );
+        assert!(m.note_resume_settled(&ih(1)));
+        assert_eq!(
+            m.pending_resume_count(),
+            0,
+            "the re-ask answered the change"
         );
     }
 
