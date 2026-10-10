@@ -144,7 +144,9 @@ pub const TRACKER_KINDS: &[&str] = &["error", "reply", "warning", "scrape_failed
 ///   in it at once, before the next state update says so.
 /// - `paused`: the last state update showed the torrent paused.
 /// - `removed`: the torrent is gone, so the handle carried no info-hash, or
-///   the state map no longer holds it. Every torrent in a session is in the
+///   the state map no longer holds it for this profile and handle (an entry
+///   for the same info-hash that another profile or handle holds is a later
+///   re-add, not this torrent). Every torrent in a session is in the
 ///   state map from its add alert on, and libtorrent posts that before any
 ///   announce the torrent makes.
 ///
@@ -165,7 +167,15 @@ fn stop_cause(
     let Some(ih) = hdr.infohash else {
         return Some("removed");
     };
-    match ctx.state.get(&ih).map(|st| st.phase) {
+    // The map is keyed by info-hash alone: an entry another profile (or
+    // another handle) inserted since this torrent was removed describes that
+    // torrent, not this one, so this one is gone.
+    let phase = ctx
+        .state
+        .get(&ih)
+        .filter(|st| st.profile_id == ctx.profile_id && hdr.handle.is_none_or(|h| h == st.handle))
+        .map(|st| st.phase);
+    match phase {
         None | Some(TorrentPhase::Removed) => Some("removed"),
         Some(TorrentPhase::Paused) => Some("paused"),
         Some(_) => None,
@@ -712,6 +722,71 @@ mod tests {
         }
         let (calls, _, _) = run_in(alert, Some(TorrentPhase::Seeding), None);
         assert_eq!(labels_of(&calls), kind_stopped());
+    }
+
+    /// The state map is keyed by info-hash alone: after one profile removes a
+    /// torrent and another adds the same one, the entry is the other
+    /// profile's, and the removed torrent's stopped-announce failure must not
+    /// be read against it.
+    #[test]
+    fn a_failure_read_against_another_profiles_or_handles_entry_is_stopped() {
+        let fenced: Option<ProfileFenced> = None;
+        let dispatch = |alert: &Alert, entry: TorrentState| {
+            let state = StateMap::new();
+            state.insert(IH, entry);
+            let resume = MemoryResumeStore::new();
+            let torrents = MemoryTorrentStore::new();
+            let metrics = RecordingSink::new();
+            let clock = MockClock::new();
+            let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+            let mut ctx = HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: &metrics,
+                clock: &clock,
+                engine: &engine,
+                profile_fenced: fenced.as_ref(),
+                profile_id: ProfileId::new("p"),
+                span: tracing::info_span!("test"),
+            };
+            let counter = Arc::new(WarnCounter::default());
+            tracing::subscriber::with_default(Arc::clone(&counter), || {
+                handle(alert, &mut ctx, &mut TrackerFailureLog::default());
+            });
+            (metrics.calls(), counter.warns.load(Ordering::Relaxed))
+        };
+        let entry = |profile: &str, id: u64| {
+            let mut st = TorrentState::newly_added(
+                TorrentHandle { id, infohash: IH },
+                ProfileId::new(profile),
+                Instant::now(),
+            );
+            st.phase = TorrentPhase::Seeding;
+            st
+        };
+        let mut alert = tracker_error(36, false);
+        if let Alert::TrackerError { hdr, .. } = &mut alert {
+            hdr.handle = Some(TorrentHandle {
+                id: 1,
+                infohash: IH,
+            });
+        }
+
+        // Another profile seeds the same info-hash.
+        let (calls, warns) = dispatch(&alert, entry("q", 1));
+        assert_eq!(labels_of(&calls), kind_stopped());
+        assert_eq!(warns, 0);
+
+        // This profile re-added it under another handle.
+        let (calls, warns) = dispatch(&alert, entry("p", 2));
+        assert_eq!(labels_of(&calls), kind_stopped());
+        assert_eq!(warns, 0);
+
+        // Its own entry, same handle: a real tracker failure.
+        let (calls, warns) = dispatch(&alert, entry("p", 1));
+        assert_eq!(labels_of(&calls)[0].1[1], pair("kind", "error"));
+        assert_eq!(warns, 1);
     }
 
     #[test]
