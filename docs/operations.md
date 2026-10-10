@@ -196,8 +196,9 @@ Before emptying `<root>/.torrentd-trash/<plan id>/`:
    A plan in `applying` is still running, or was interrupted and is re-driven
    at the next boot. A `failed` plan stopped part-way, and applying it again
    finishes the rest, unless a step is still `in_progress`: that step's
-   outcome is unknown, and applying again refuses until you have looked at its
-   path ([After a crash](#after-a-crash)).
+   outcome is unknown, nothing marks it resolved, and applying again always
+   refuses. Look at its path, rescan, discard the plan and build a new one
+   ([After a crash](#after-a-crash)).
 2. Check that everything that should still seed is seeding. To undo a
    deletion, move the file back to its original path and rescan.
 3. Then remove the directory, as a user that can write to the root:
@@ -306,8 +307,19 @@ A stop runs four stages, each with its own bound:
 
 1. **The HTTP drain,** 10 s. A client still connected after that is cut off,
    and the exit is still `0`.
-2. **Pool work,** up to 20 s. An apply stops at its next step boundary and
-   stays `applying`, and the next boot re-drives it from that step. A scan or
+2. **Pool work,** up to 20 s. An apply between steps stops at its next step
+   boundary and stays `applying`, and the next boot re-drives it from that
+   step. A relocate whose move libtorrent is still copying is not at a
+   boundary: it gets 15 s more to land, and one still copying then is cut
+   off. Its step stays `in_progress`, the plan is parked `failed`, and the
+   journal line `shutting down while libtorrent is still moving the payload`
+   names the torrent and its destination. The cut-off ends only the wait:
+   libtorrent goes on moving the payload through the resume drain, so the move
+   may still finish and delete the source before the sessions close, or stop
+   part way with a partial copy at the destination. Before removing anything,
+   find which of the source and the destination holds the complete payload,
+   then recover it as for a plan killed inside a step
+   ([After a crash](#after-a-crash)). A scan or
    drift check still running at the bound is cut off: run it again after the
    boot.
 3. **The resume drain,** `shutdown_drain_secs` (default 60). It saves resume
@@ -468,8 +480,16 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
 - A plan killed inside a step cannot be resumed. Whether that step happened is
   unknown, so the boot parks it as `failed` with that step still
   `in_progress`. The journal line `resume failed` names the step and its path,
-  and applying it again fails the same way. Look at that path, rescan,
-  discard the plan, and build a new one.
+  and applying it again fails the same way, since nothing marks the step
+  resolved. Look at that path, rescan, discard the plan, and build a new one.
+  For a relocate, look at its destination too, and find which of the two
+  holds the complete payload before removing anything: a move whose wait was
+  cut off can still finish and delete the source, so the destination may hold
+  the only whole copy, or the destination may hold a partial one. A new plan
+  refuses to move onto a file already there (`destination … already
+  contains`), so once you know which copy is complete, remove only the other
+  before building it. A relocate libtorrent never reported on within 600 s,
+  or one a stop cut off, is parked the same way.
 - With `[pool] allow_mutations` off, nothing is re-driven. The plan stays
   `applying` until a boot that allows mutations.
 
