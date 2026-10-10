@@ -949,10 +949,11 @@ mod tests {
         port.expect("listen port")
     }
 
-    /// libtorrent's own hybrid (v1+v2) test torrent.
+    /// A v1+v2 hybrid test torrent kept in the repository. Not one from the
+    /// `vendor/libtorrent` corpus: `cargo test` runs without the submodules.
     fn hybrid_torrent() -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/libtorrent/test/test_torrents/v2.torrent");
+            .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent");
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 

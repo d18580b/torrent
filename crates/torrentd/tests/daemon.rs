@@ -1772,11 +1772,13 @@ fn poll<T>(what: &str, within: Duration, mut f: impl FnMut() -> Option<T>) -> T 
 fn a_hybrid_torrent_added_by_a_v1_magnet_keeps_its_v1_key() {
     use libtorrent_safe::Alert;
 
+    // The repository's own hybrid fixture: CI runs this suite without the
+    // vendor submodules, so libtorrent's test corpus is not on disk.
     let torrent = std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/libtorrent/test/test_torrents/v2.torrent"),
+            .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent"),
     )
-    .expect("read libtorrent's hybrid test torrent");
+    .expect("read the hybrid test torrent");
     let hashes = libtorrent_safe::info_hashes_from_torrent(&torrent).unwrap();
     let v1 = hashes.v1.expect("hybrid has v1").to_hex();
     let v2 = hashes.v2.expect("hybrid has v2").truncated().to_hex();

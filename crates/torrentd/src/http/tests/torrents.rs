@@ -1974,10 +1974,11 @@ async fn a_torrent_re_added_to_another_profile_right_after_delete_stays_tracked(
     assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
 }
 
-/// libtorrent's own hybrid (v1+v2) test torrent, and its two hashes.
+/// The repository's own hybrid (v1+v2) test torrent, and its two hashes.
+/// `cargo test` runs without the vendor submodules, so not libtorrent's.
 fn hybrid_torrent() -> (Vec<u8>, InfoHash, InfoHash) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/libtorrent/test/test_torrents/v2.torrent");
+        .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent");
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let hashes = libtorrent_safe::info_hashes_from_torrent(&bytes).unwrap();
     let v1 = hashes.v1.expect("a hybrid has a v1 hash");
