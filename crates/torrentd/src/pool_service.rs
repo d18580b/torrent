@@ -917,6 +917,14 @@ fn verify_guard(
 /// it still names the item's profile, so a claim someone else has since taken
 /// is left alone.
 ///
+/// A claim naming the item's profile is the enqueue's own: the adoption queues
+/// an item only when its `assign` inserted the row, and every other runtime
+/// claimant - `POST /v1/torrents` and another adoption - refuses an info-hash
+/// that is already assigned, to this profile as to any other, rather than
+/// sharing the claim. Nobody else can therefore hold one under the same
+/// profile while the item waits, and releasing it cannot strand a torrent
+/// another add loaded.
+///
 /// The pool index's owner record the enqueue wrote goes too, while it still
 /// names the item's profile. Left behind, it made adoption into any other
 /// profile refuse the torrent, and `DELETE` could not clear it: with no

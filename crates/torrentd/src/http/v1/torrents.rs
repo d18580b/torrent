@@ -25,6 +25,7 @@ use libtorrent_safe::AddParams;
 use libtorrent_safe::InfoHash;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::Claim;
 use torrentd_engine::EngineError;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
@@ -834,9 +835,24 @@ pub async fn add_torrent(
         ));
     }
     // Reserve the assignment; assign() re-checks uniqueness to close any race.
-    if let Err(e) = s.registry.assign(infohash, profile_id.clone()) {
-        registry_error();
-        return Err(AddTorrentError::TorrentExists(e.to_string()));
+    //
+    // A claim already naming this profile is a concurrent add of the same
+    // info-hash that passed the lookup above first. It is that add's claim,
+    // not this one's: going on would have the session refuse the duplicate
+    // and the failure path below release the claim of the add that succeeded,
+    // leaving its torrent seeding with no registry owner.
+    match s.registry.assign(infohash, profile_id.clone()) {
+        Ok(Claim::New) => {}
+        Ok(Claim::AlreadyOurs) => {
+            registry_error();
+            return Err(AddTorrentError::TorrentExists(
+                "a torrent with this infohash is already assigned".to_owned(),
+            ));
+        }
+        Err(e) => {
+            registry_error();
+            return Err(AddTorrentError::TorrentExists(e.to_string()));
+        }
     }
 
     // Now hand the torrent to the session. Release the reservation if the add

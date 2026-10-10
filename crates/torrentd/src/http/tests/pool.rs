@@ -1165,6 +1165,109 @@ async fn a_deleted_adoption_adopts_again_into_another_profile() {
     );
 }
 
+/// Issue #167, for adoption: an adoption into `p` whose lookup ran before a
+/// concurrent add's claim into `p` was visible. The concurrent claim is
+/// written through a second handle on the same database, which is what the
+/// adoption's `assign` then finds.
+///
+/// The adoption used to take that claim as its own and hand the torrent to
+/// the session, which refuses the duplicate. The fast path then falls back to
+/// the verify queue, whose worker meets the same duplicate and releases the
+/// claim as its own, so the torrent seeded in `p` with no owner and could be
+/// adopted into `q`.
+#[tokio::test]
+async fn a_same_profile_adoption_that_loses_the_claim_race_is_refused_and_keeps_the_claim() {
+    const TRACKER: &str = "http://tracker.example/announce";
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let source = metainfo(TRACKER);
+    std::fs::write(library.join(format!("{IH_A}.torrent")), &source).unwrap();
+    let resume = library.join(format!("{IH_A}.fastresume"));
+    std::fs::write(&resume, fastresume(&source, None)).unwrap();
+    let mut row = torrent(dir.path(), IH_A, 96, 2);
+    row.fastresume_path = Some(resume);
+    index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+    let reg_path = dir.path().join("reg.db");
+    let (p, q) = (
+        Arc::new(torrentd_engine::MockEngine::new()),
+        Arc::new(torrentd_engine::MockEngine::new()),
+    );
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("p", ProfileStatus::Active),
+            test_entry("q", ProfileStatus::Active),
+        ]));
+        *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p", "q"]);
+        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![
+            (
+                torrentd_engine::ProfileId::new("p"),
+                p.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+            ),
+            (
+                torrentd_engine::ProfileId::new("q"),
+                q.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+            ),
+        ]));
+        s.registry = Arc::new(torrentd_engine::AssignmentRegistry::new_empty(&reg_path));
+        s.pool = Some(pool);
+    });
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    // The concurrent add's claim, and the duplicate the session would answer
+    // the adoption with if it got that far.
+    torrentd_engine::AssignmentRegistry::new_empty(&reg_path)
+        .assign(hash, torrentd_engine::ProfileId::new("p"))
+        .unwrap();
+    p.inject_error(
+        "add_torrent",
+        torrentd_engine::EngineError::MockInjected {
+            op: "add_torrent",
+            message: "torrent already exists in session".into(),
+        },
+    );
+    let w = h.tokens.write.clone();
+    let just_a = json!({"kind": "infohashes", "infohashes": [IH_A]});
+    let adopt_into = |profile: &'static str| {
+        let (w, just_a, h) = (w.clone(), just_a.clone(), &h);
+        async move {
+            let resp = h
+                .send(
+                    "POST",
+                    "/v1/pool/adoptions",
+                    Some(&w),
+                    adopt(profile, false, just_a),
+                )
+                .await;
+            resp.assert_status(StatusCode::OK);
+            resp.json::<Value>()
+        }
+    };
+
+    for profile in ["p", "q"] {
+        let r = adopt_into(profile).await;
+        assert_eq!(r["fast_path"], json!([]), "into {profile}: {r}");
+        assert_eq!(
+            r["queued_for_verification"],
+            json!([]),
+            "into {profile}: {r}"
+        );
+        assert_eq!(
+            r["refused"][0]["infohash"],
+            json!(IH_A),
+            "into {profile}: {r}"
+        );
+        assert_eq!(
+            h.state.registry.lookup(&hash),
+            Some(torrentd_engine::ProfileId::new("p")),
+            "after adopting into {profile}",
+        );
+    }
+    assert!(p.calls().is_empty(), "{:?}", p.calls());
+    assert!(q.calls().is_empty(), "{:?}", q.calls());
+}
+
 async fn verification(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let (pool, _) = fixture(dir.path(), false);

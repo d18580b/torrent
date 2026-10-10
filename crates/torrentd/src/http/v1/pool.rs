@@ -18,6 +18,7 @@ use kynos::schema::ParamValue;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::Claim;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use tracing::info;
@@ -1239,26 +1240,33 @@ fn bucket(resp: &mut AdoptionResult, verifies: bool) -> &mut Vec<InfoHashHex> {
 /// warning, because the registry is the only thing that can see across
 /// profiles. `assign` re-checks uniqueness under its own lock, which closes the
 /// gap between the lookup and the insert.
+///
+/// `Ok` means this call inserted the claim, so it is this adoption's to
+/// release. A claim that already names `profile` is refused like any other: it
+/// belongs to a concurrent add or adoption of the same info-hash that passed
+/// the lookup first, and releasing it when this adoption fails would leave
+/// that torrent seeding with no registry owner.
 fn claim_in_registry(
     s: &AppState,
     infohash: InfoHashHex,
     profile: &ProfileId,
 ) -> Result<(), String> {
     let ih = infohash.get();
+    let refused = |reason: String| {
+        s.metrics.inc_counter(
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", profile.as_str())],
+        );
+        Err(reason)
+    };
     if let Some(existing) = s.registry.lookup(&ih) {
-        s.metrics.inc_counter(
-            "profile_assignment_registry_errors_total",
-            &[("profile_id", profile.as_str())],
-        );
-        return Err(format!("info-hash already loaded in profile {existing}"));
+        return refused(format!("info-hash already loaded in profile {existing}"));
     }
-    s.registry.assign(ih, profile.clone()).map_err(|e| {
-        s.metrics.inc_counter(
-            "profile_assignment_registry_errors_total",
-            &[("profile_id", profile.as_str())],
-        );
-        format!("{e}")
-    })
+    match s.registry.assign(ih, profile.clone()) {
+        Ok(Claim::New) => Ok(()),
+        Ok(Claim::AlreadyOurs) => refused(format!("info-hash already loaded in profile {profile}")),
+        Err(e) => refused(format!("{e}")),
+    }
 }
 
 /// Refuse a torrent the pool index says another profile owns.

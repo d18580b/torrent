@@ -1096,7 +1096,7 @@ pub async fn boot(
             // Unless it is already this profile's, claim it.
             let claimed = match existing {
                 Some(_) => Ok(()),
-                None => registry.assign(ih, profile.clone()),
+                None => registry.assign(ih, profile.clone()).map(drop),
             };
             if let Err(e) = claimed {
                 // Rule 4 makes the registry the gate every load passes. An
