@@ -477,7 +477,12 @@ file at all:
 - **Added through `POST /v1/torrents` or adopted from the pool.** The boot
   finds its `.torrent` and re-adds it at the save path recorded beside it
   (the `save_path` it was added with, or the library path it was adopted
-  at), hashing it there. Where that record is missing, because its write
+  at). It is added in seed mode, as `POST /v1/torrents` adds, so its payload
+  is not hashed first. An adoption still waiting in the verify queue is
+  added by the queue after the scans instead, hashed. One the pool index
+  records `drifted` stays unloaded, because its verification failed or its
+  files changed: it is one of the unloaded claims above, so `DELETE` it and
+  adopt it again to verify it. Where that record is missing, because its write
   failed (`torrentd_torrent_file_persist_errors_total`) or the torrent
   predates it, the boot re-adds it at `default_save_path` instead, logs a
   warning, and counts it in `torrentd_boot_save_path_fallbacks_total`. If its

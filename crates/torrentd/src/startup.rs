@@ -1100,6 +1100,10 @@ pub async fn boot(
     // What the scans add, so a profile the VPN monitor or the kill-switch
     // watch fences mid-scan has it paused.
     let mut scan_fence = ScanFence::new(kill_switch.clone());
+    // Each info-hash the resume scan found in a profile the registry does not
+    // assign it to, and counted. The torrent-dir scan finds the same torrent
+    // again by its `.torrent` beside it, and counts it only once per boot.
+    let mut misplaced: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
 
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call, and
@@ -1162,6 +1166,7 @@ pub async fn boot(
                         "profile_assignment_registry_errors_total",
                         &[("profile_id", profile.as_str())],
                     );
+                    misplaced.insert((profile.clone(), ih));
                     continue;
                 }
             }
@@ -1355,19 +1360,22 @@ pub async fn boot(
                         existing_profile = %owner,
                         ".torrent in wrong profile; skipping (operator must reconcile)",
                     );
-                    metrics.inc_counter(
-                        "profile_assignment_registry_errors_total",
-                        &[("profile_id", profile.as_str())],
-                    );
+                    // Counted once: the resume scan counted it already where
+                    // its resume file sits in this profile too.
+                    if !misplaced.contains(&(profile.clone(), ih)) {
+                        metrics.inc_counter(
+                            "profile_assignment_registry_errors_total",
+                            &[("profile_id", profile.as_str())],
+                        );
+                    }
                     continue;
                 }
             };
             // An adoption waiting for verification is the verify queue's to
-            // add; see `verify_queued`.
+            // add, and one the pool recorded `drifted` stays unloaded; see
+            // `pool_holds_back`.
             if claimed_here
-                && verify_queued
-                    .as_ref()
-                    .is_none_or(|queued| queued.contains(&ih))
+                && pool_holds_back(pool.as_deref(), verify_queued.as_ref(), &profile, &ih)
             {
                 continue;
             }
@@ -2059,6 +2067,56 @@ fn torrent_dir_save_path(
         &[("profile_id", profile.as_str())],
     );
     default.to_owned()
+}
+
+/// Whether the boot torrent-dir scan must leave a torrent this profile has
+/// claimed unloaded rather than re-add it in seed mode.
+///
+/// - An adoption `pool.db` holds in its verify queue (`verify_queued`) is the
+///   queue's to add after the scans, hashed.
+/// - One the pool index records `drifted` failed its verification, or changed
+///   on disk since, and was paused for it: a seed-mode add would announce a
+///   payload its piece hashes rejected. Adopting it again verifies it.
+/// - Where either cannot be read, none can be told apart from these, so the
+///   torrent stays unloaded, as every claimed torrent did before the scan
+///   re-added any.
+fn pool_holds_back(
+    pool: Option<&crate::pool_service::PoolService>,
+    verify_queued: Option<&HashSet<libtorrent_safe::InfoHash>>,
+    profile: &ProfileId,
+    ih: &libtorrent_safe::InfoHash,
+) -> bool {
+    let Some(queued) = verify_queued else {
+        return true;
+    };
+    if queued.contains(ih) {
+        return true;
+    }
+    let Some(pool) = pool else {
+        return false;
+    };
+    match pool.with_store(|s| s.adoption_state(&ih.to_hex())) {
+        Ok(Some(torrentd_pool::AdoptionState::Drifted)) => {
+            warn!(
+                profile_id = %profile,
+                infohash = %ih,
+                "torrent-dir scan: a claimed torrent with no resume file is recorded drifted; \
+                 leaving it unloaded (adopt it again to verify it)",
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            warn!(
+                profile_id = %profile,
+                infohash = %ih,
+                error.cause = %e,
+                "torrent-dir scan: could not read a claimed torrent's adoption state; \
+                 leaving it unloaded rather than risk seeding a drifted payload",
+            );
+            true
+        }
+    }
 }
 
 /// What the boot torrent-dir scan hands a session for a `.torrent` no resume
