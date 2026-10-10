@@ -214,6 +214,7 @@ authentication posture, and at least one `[[profile]]`:
 | --- | --- |
 | `http_listen` | `127.0.0.1:8080`. A non-loopback value requires `[auth]` — §6. |
 | `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
+| `allowed_hosts` | `[]`, so a daemon without `[auth]` answers only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`). List the names a reverse proxy passes through as `Host`, as bare names or addresses with no scheme, port or path. Refused beside `[auth]` — §6. Read once, at startup. |
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
@@ -740,12 +741,25 @@ The daemon refuses to start unless you have either configured `[auth]` or
 written `allow_unauthenticated = true`.
 
 Without `[auth]` it authenticates nothing: every route, including every
-mutating one, is open to anyone who can reach the port. That is a legitimate
-posture behind a reverse proxy that does its own access control — it is just
-not one to arrive at by omission, which is what it was. The opt-out does not
-extend to a routable address, either: `allow_unauthenticated` with a
-non-loopback `http_listen` is refused outright, because that is an
-unauthenticated mutating API on the network.
+mutating one, is open to any client that can reach the port and is not a
+browser on another site's behalf. That is a legitimate posture behind a
+reverse proxy that does its own access control — it is just not one to arrive
+at by omission, which is what it was. The opt-out does not extend to a
+routable address, either: `allow_unauthenticated` with a non-loopback
+`http_listen` is refused outright, because that is an unauthenticated mutating
+API on the network.
+
+Loopback keeps out the network, not the operator's own browser, so a daemon
+without `[auth]` answers `403` to a request whose `Host` is neither loopback
+nor listed in `allowed_hosts` (a DNS-rebound page), and to a state-changing
+request that `Sec-Fetch-Site`, a foreign `Origin` or a form `Content-Type`
+marks as sent from another site. `curl` and `torrentctl` send none of those
+and are unaffected. A proxy in front must pass the client's `Host` through
+(nginx: `proxy_set_header Host $host;`), and that name goes in
+`allowed_hosts`. Each refusal counts in
+`torrentd_auth_cross_site_refusals_total` by the header that refused it, and
+is logged as a `warn` on `torrentd::auth` at most once a minute. The full
+rules are in [`docs/api/README.md`](api/README.md).
 
 So there are two safe shapes:
 
@@ -771,10 +785,11 @@ config tells you to do.
 
 `http_listen` defaults to `127.0.0.1:8080`.
 
-**Restart, not reload.** `[auth]`, `allow_unauthenticated`, `http_listen` and
-`trusted_proxies` are read once, at startup: the session store is built, the
-listener bound and the trusted-proxy set parsed before anything is served, and
-none of them can change under a live server. Editing any of them and then
+**Restart, not reload.** `[auth]`, `allow_unauthenticated`, `http_listen`,
+`trusted_proxies` and `allowed_hosts` are read once, at startup: the session
+store is built, the listener bound and the trusted-proxy and allowed-host sets
+parsed before anything is served, and none of them can change under a live
+server. Editing any of them and then
 sending `SIGHUP` or calling `POST /v1/config/reload` logs
 
 ```
