@@ -25,6 +25,8 @@ use libtorrent_safe::AddParams;
 use libtorrent_safe::InfoHash;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::handlers::add::delete_removed_files;
+use torrentd_engine::handlers::add::Tombstone;
 use torrentd_engine::Claim;
 use torrentd_engine::EngineError;
 use torrentd_engine::MetricsSink;
@@ -1173,7 +1175,9 @@ torrent_error! {
 /// Remove a torrent.
 ///
 /// Removes it from its session and clears its assignment, so the infohash can
-/// be added again. `delete_files=true` also moves the payload into the trash
+/// be added again. Its resume file, `.torrent` and recorded save path are
+/// deleted before the answer, so a restart after a `204` does not load it
+/// again. `delete_files=true` also moves the payload into the trash
 /// of the managed root it lies in, never unlinking it, and needs `[pool]
 /// allow_mutations` and `confirm` repeating the infohash. It is refused,
 /// changing nothing, unless every file is under a managed root, claimed by
@@ -1272,6 +1276,17 @@ pub async fn delete_torrent(
                 } else {
                     None
                 };
+                // Written before the torrent leaves its session, so the
+                // delete is durable from the moment it is acted on: a crash,
+                // or a file below that will not delete, leaves a tombstone
+                // the next boot honours by deleting the files rather than
+                // loading the torrent. Until the assignment is cleared the
+                // boot reads it as a delete that never answered, and keeps
+                // the torrent.
+                let tombstoned = settler.resume.write_tombstone(&profile, &ih);
+                if let Err(e) = &tombstoned {
+                    count_cleanup_error(&settler, &ih, &profile, "tombstone", e);
+                }
                 // Recorded before the session is asked, so the alert that
                 // settles it finds the record: the assignment is cleared below
                 // as soon as the session accepts, and an add of the same
@@ -1282,12 +1297,35 @@ pub async fn delete_torrent(
                 // trash below, where an operator can take them back.
                 engine.remove_torrent(st.handle, false).map_err(|e| {
                     settler.state.abandon_removal(&profile, st.handle);
+                    if tombstoned.is_ok() {
+                        if let Err(e) = settler.resume.clear_tombstone(&profile, &ih) {
+                            count_cleanup_error(&settler, &ih, &profile, "tombstone", &e);
+                        }
+                    }
                     DeleteTorrentError::Internal {
                         detail: internal("removing the torrent from its session", e),
                     }
                 })?;
+                // Deleted before the assignment is cleared, which is the
+                // first moment an add of the same info-hash can write files
+                // of its own, and before the answer, so neither a restart nor
+                // a power loss after a 204 finds them to load. The tombstone
+                // stays: a resume save libtorrent queued before the removal
+                // can still be written, and the removal alert's handler, the
+                // last of this torrent's, deletes that and settles it.
+                let left = delete_removed_files(
+                    &*settler.resume,
+                    &*settler.torrents,
+                    &*settler.metrics,
+                    &profile,
+                    &ih,
+                    false,
+                    Tombstone::Keep,
+                );
+                let resurrects = tombstoned.is_err() && left.files_left();
                 let Some(payload) = payload else {
-                    return clear_assignment(&settler, &ih, &profile, false);
+                    clear_assignment(&settler, &ih, &profile, false)?;
+                    return report_unfinished_cleanup(&ih, resurrects);
                 };
                 let bucket = format!("torrent-{}-{}", ih.to_hex(), unix_now());
                 let outcome = crate::pool_apply::trash_torrent_payload(&payload, &bucket);
@@ -1308,7 +1346,7 @@ pub async fn delete_torrent(
                         ),
                     });
                 }
-                Ok(())
+                report_unfinished_cleanup(&ih, resurrects)
             })
             .await?;
         }
@@ -1482,6 +1520,52 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Log and count a failure to write or clear `(profile, ih)`'s tombstone, as
+/// `delete_removed_files` counts the deletes it makes.
+fn count_cleanup_error(
+    s: &AppState,
+    ih: &InfoHash,
+    profile: &ProfileId,
+    store: &str,
+    e: &dyn fmt::Display,
+) {
+    warn!(
+        target: "torrentd::http",
+        infohash = %ih,
+        profile_id = %profile,
+        store,
+        error.cause = %e,
+        "failed to write or clear a removed torrent's tombstone",
+    );
+    s.metrics.inc_counter(
+        torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS,
+        &[("profile_id", profile.as_str()), ("store", store)],
+    );
+}
+
+/// Answer a delete that removed the torrent but left a file the next boot
+/// would load it from, with no tombstone to stop that, as the failure it is.
+///
+/// The torrent is out of its session and its assignment is cleared by now,
+/// so a retry answers `404`; the removal alert's handler deletes the files
+/// again, and writes the tombstone where they still will not go. The detail
+/// says so, rather than a 204 claiming a delete the next restart undoes.
+fn report_unfinished_cleanup(ih: &InfoHash, resurrects: bool) -> Result<(), DeleteTorrentError> {
+    if !resurrects {
+        return Ok(());
+    }
+    Err(DeleteTorrentError::Internal {
+        detail: format!(
+            "torrent {ih} was removed from its session and its assignment cleared, but its \
+             resume file or .torrent could not be deleted and no tombstone could be written to \
+             stop the next start loading it again; see \
+             torrentd_torrent_remove_cleanup_errors_total and the daemon log. The daemon \
+             retries the delete as the session confirms the removal. If the torrent is listed \
+             after a restart, delete it again."
+        ),
+    })
+}
+
 /// Clear `ih`'s assignment to `profile` once no session holds it.
 /// `payload_deleted` says its session deleted its files as it removed it.
 fn clear_assignment(
@@ -1586,8 +1670,9 @@ fn clear_unheld(
     // `<resume_dir>/<id>` and `<torrent_dir>/<id>` at the next start and
     // re-`assign`s every info-hash it finds, so the operator's clear would be
     // silently undone the first time the daemon restarts. The engine-backed
-    // path gets this for free through `TorrentRemoved` -> `handlers/add.rs`;
-    // with no session there is no alert, so it is done here.
+    // path deletes them in the request too, under a tombstone, and again in
+    // `TorrentRemoved` -> `handlers/add.rs`; with no session there is no
+    // removal to race and no alert, so the deletes alone are done here.
     //
     // The order is what makes the advice below true. Clearing the registry
     // first and deleting after would mean a failed delete tells the operator

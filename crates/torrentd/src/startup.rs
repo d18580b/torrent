@@ -1135,6 +1135,9 @@ pub async fn boot(
     // assign it to, and counted. The torrent-dir scan finds the same torrent
     // again by its `.torrent` beside it, and counts it only once per boot.
     let mut misplaced: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
+    // Each torrent a tombstone says was removed, which neither scan loads
+    // (`honour_tombstones`).
+    let mut removed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
 
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call, and
@@ -1156,6 +1159,15 @@ pub async fn boot(
         let Some(profile_cfg) = profile_registry.config(&profile) else {
             continue;
         };
+        // Removals first: a torrent `DELETE` removed is not loaded again,
+        // whether its files were left by a failed delete or by a crash.
+        for ih in honour_tombstones(&*resume_store, &*torrent_store, &*metrics, &profile, |ih| {
+            registry.lookup(ih)
+        })
+        .context("read the resume dir's tombstones")?
+        {
+            removed_at_boot.insert((profile.clone(), ih));
+        }
         // A file that cannot be read is skipped, logged and counted by the
         // store; only the directory itself failing to open stops the boot.
         let scan = resume_store.scan(&profile).context("scan resume dir")?;
@@ -1182,6 +1194,9 @@ pub async fn boot(
                 }
                 scan_fence.enforce_all(&profile_registry, &metrics);
                 profile_source.hold_alerts(&profile);
+            }
+            if removed_at_boot.contains(&(profile.clone(), ih)) {
+                continue;
             }
             // Cross-check the registry; the spec aborts the profile on
             // mismatch. A resume file under one profile's directory that the
@@ -1377,8 +1392,9 @@ pub async fn boot(
                 scan_fence.enforce_all(&profile_registry, &metrics);
                 profile_source.hold_alerts(&profile);
             }
-            // Resume data already loaded this torrent — skip.
-            if loaded.contains(&ih) {
+            // Resume data already loaded this torrent, or it was removed and
+            // its tombstone stands — skip.
+            if loaded.contains(&ih) || removed_at_boot.contains(&(profile.clone(), ih)) {
                 continue;
             }
             // A claim does not mean a load: `POST /v1/torrents` claims before
@@ -1849,6 +1865,59 @@ fn session_settings(cfg: &Config) -> torrentd_engine::Settings {
         tracing::Level::DEBUG
     ));
     s
+}
+
+/// Honour `profile`'s tombstones before the boot scans read its stores, and
+/// return the info-hashes neither scan may load.
+///
+/// `DELETE` writes a tombstone before it removes a torrent, and the removal
+/// alert's handler clears it once the torrent's files are gone. One still
+/// standing is a delete a crash cut short or a file that would not delete:
+/// its resume file, `.torrent` and save path are deleted now, and the torrent
+/// is not loaded, whatever of them is left. The tombstone is cleared once they
+/// are gone, and kept for the next boot otherwise; each failure is counted
+/// under `torrent_remove_cleanup_errors_total`.
+///
+/// Where `claimed_by` says the registry assigns the info-hash to `profile`,
+/// the tombstone is spent instead and the torrent loads: it was added to the
+/// profile again after the delete, or the delete never cleared its
+/// assignment and so never answered.
+fn honour_tombstones(
+    resume: &dyn ResumeStore,
+    torrents: &dyn TorrentStore,
+    metrics: &dyn MetricsSink,
+    profile: &ProfileId,
+    claimed_by: impl Fn(&libtorrent_safe::InfoHash) -> Option<ProfileId>,
+) -> anyhow::Result<HashSet<libtorrent_safe::InfoHash>> {
+    let mut removed = HashSet::new();
+    for ih in resume.tombstones(profile)? {
+        if claimed_by(&ih).as_ref() == Some(profile) {
+            info!(profile_id = %profile, infohash = %ih,
+                  "a removed torrent was assigned to this profile again; loading it");
+            if let Err(e) = resume.clear_tombstone(profile, &ih) {
+                warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
+                      "could not clear the tombstone of a torrent assigned again");
+                metrics.inc_counter(
+                    torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS,
+                    &[("profile_id", profile.as_str()), ("store", "tombstone")],
+                );
+            }
+            continue;
+        }
+        let left = torrentd_engine::handlers::add::delete_removed_files(
+            resume,
+            torrents,
+            metrics,
+            profile,
+            &ih,
+            false,
+            torrentd_engine::handlers::add::Tombstone::Settle,
+        );
+        info!(profile_id = %profile, infohash = %ih, files_left = left.files_left(),
+              "finished the delete of a removed torrent; not loading it");
+        removed.insert(ih);
+    }
+    Ok(removed)
 }
 
 /// What the boot resume scan hands a session for one saved torrent.

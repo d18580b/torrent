@@ -425,7 +425,8 @@ pub fn dir_fsync_errors() -> u64 {
     DIR_FSYNC_ERRORS.load(Ordering::Relaxed)
 }
 
-/// `fsync` `dir`, so a rename into it survives a power loss.
+/// `fsync` `dir`, so a rename into it, or an unlink from it, survives a power
+/// loss.
 ///
 /// Best effort: a failure does not fail the write. The renamed file's data is
 /// already on disk, and a filesystem that refuses to fsync a directory refuses
@@ -434,7 +435,7 @@ pub fn dir_fsync_errors() -> u64 {
 /// previous file, or to none. That is logged, once per directory until it next
 /// syncs, so a rename that may not be durable no longer looks like one that is.
 /// Every failure, logged or not, is counted in [`dir_fsync_errors`].
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
     let r = fs::File::open(dir).and_then(|d| d.sync_all());
     if r.is_err() {
         DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);

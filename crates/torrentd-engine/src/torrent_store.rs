@@ -56,7 +56,8 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     fn flush(&self) {}
 
     /// Delete the `.torrent` file for `(profile, ih)`, and the save path
-    /// recorded beside it. Missing files are not an error.
+    /// recorded beside it, durably before returning: a crash after this
+    /// returns does not bring them back. Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError>;
 
     /// Atomically record, durably before returning, the save path

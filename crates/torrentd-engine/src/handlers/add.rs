@@ -4,6 +4,7 @@ use std::sync::atomic::fence;
 use std::sync::atomic::Ordering;
 
 use libtorrent_safe::Alert;
+use libtorrent_safe::InfoHash;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::TorrentHandle;
 use tracing::error;
@@ -11,6 +12,11 @@ use tracing::info;
 use tracing::warn;
 
 use crate::handlers::HandlerCtx;
+use crate::metrics::MetricsSink;
+use crate::metrics::REMOVE_CLEANUP_ERRORS;
+use crate::profile::ProfileId;
+use crate::resume_store::ResumeStore;
+use crate::torrent_store::TorrentStore;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
@@ -77,30 +83,27 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 // the next add of the info-hash in this profile still gets
                 // its first save rather than leaving the removed torrent's
                 // save path and state for the next boot to load.
-                let (resume, torrents, profile) = (ctx.resume, ctx.torrents, &ctx.profile_id);
-                let state = ctx.state;
+                //
+                // `DELETE` already deleted these files before it answered,
+                // and left the tombstone it wrote standing: this is the
+                // fallback that deletes whatever a resume save landing after
+                // that wrote, and the point where the tombstone is settled,
+                // since no alert of this torrent's follows this one. A delete
+                // that fails here keeps the tombstone, so the next boot
+                // deletes the file rather than loading the torrent again.
+                let (resume, torrents, metrics) = (ctx.resume, ctx.torrents, ctx.metrics);
+                let (profile, state) = (&ctx.profile_id, ctx.state);
                 let settled = ctx.state.settle_removal(profile, &ih, |readded| {
-                    let deleted = resume.delete(profile, &ih);
-                    state.set_stale_resume_file(profile, &ih, deleted.is_err());
-                    if let Err(e) = deleted {
-                        warn!(
-                            target: "torrentd_engine::handler::add",
-                            infohash = %ih,
-                            error.cause = %e,
-                            "failed to delete resume file on remove",
-                        );
-                    }
-                    if readded {
-                        return;
-                    }
-                    if let Err(e) = torrents.delete(profile, &ih) {
-                        warn!(
-                            target: "torrentd_engine::handler::add",
-                            infohash = %ih,
-                            error.cause = %e,
-                            "failed to delete torrent file on remove",
-                        );
-                    }
+                    let left = delete_removed_files(
+                        resume,
+                        torrents,
+                        metrics,
+                        profile,
+                        &ih,
+                        readded,
+                        Tombstone::Settle,
+                    );
+                    state.set_stale_resume_file(profile, &ih, left.resume_failed);
                 });
                 // Settle a save that was in flight when the torrent went: its
                 // answer arrives with no info-hash (the shim skips an invalid
@@ -126,6 +129,94 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         }
         _ => unreachable!("add::handle called with non-add alert"),
     }
+}
+
+/// What [`delete_removed_files`] could not delete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemovalCleanup {
+    /// The resume file is still there.
+    pub resume_failed: bool,
+    /// The `.torrent` or its save path is still there.
+    pub torrent_failed: bool,
+    /// The tombstone could not be written or cleared, as asked.
+    pub tombstone_failed: bool,
+}
+
+impl RemovalCleanup {
+    /// Whether a file the next boot would load the torrent from is left.
+    pub fn files_left(&self) -> bool {
+        self.resume_failed || self.torrent_failed
+    }
+}
+
+/// What [`delete_removed_files`] does with the tombstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tombstone {
+    /// Leave it as it is.
+    Keep,
+    /// Clear it once every file asked for is gone. Where one is left, write
+    /// it (it may never have been written, or its write failed), so the next
+    /// boot deletes what is left rather than loading it.
+    Settle,
+}
+
+/// Delete what would bring `(profile, ih)` back at the next boot: its resume
+/// file, and its `.torrent` and save path unless `keep_torrent` (they are a
+/// re-add's). Each delete that fails is logged and counted under
+/// [`REMOVE_CLEANUP_ERRORS`].
+///
+/// For `DELETE`, which runs this before it answers and keeps the tombstone it
+/// wrote: a resume save libtorrent queued before the removal can still be
+/// written after it, and only this torrent's `torrent_removed_alert`, the
+/// last alert it posts, settles that. For that alert's handler, and for the
+/// boot honouring a tombstone, both of which settle it: cleared once the
+/// files are gone, written where one is left.
+pub fn delete_removed_files(
+    resume: &dyn ResumeStore,
+    torrents: &dyn TorrentStore,
+    metrics: &dyn MetricsSink,
+    profile: &ProfileId,
+    ih: &InfoHash,
+    keep_torrent: bool,
+    tombstone: Tombstone,
+) -> RemovalCleanup {
+    let failed = |store: &str, e: &dyn std::fmt::Display| {
+        warn!(
+            target: "torrentd_engine::handler::add",
+            profile_id = %profile,
+            infohash = %ih,
+            store,
+            error.cause = %e,
+            "failed to delete a removed torrent's file, or to settle its tombstone",
+        );
+        metrics.inc_counter(
+            REMOVE_CLEANUP_ERRORS,
+            &[("profile_id", profile.as_str()), ("store", store)],
+        );
+    };
+    let mut out = RemovalCleanup::default();
+    if let Err(e) = resume.delete(profile, ih) {
+        failed("resume", &e);
+        out.resume_failed = true;
+    }
+    if !keep_torrent {
+        if let Err(e) = torrents.delete(profile, ih) {
+            failed("torrent", &e);
+            out.torrent_failed = true;
+        }
+    }
+    if tombstone == Tombstone::Settle {
+        let settled = if out.files_left() {
+            resume.write_tombstone(profile, ih)
+        } else {
+            resume.clear_tombstone(profile, ih)
+        };
+        if let Err(e) = settled {
+            failed("tombstone", &e);
+            out.tombstone_failed = true;
+        }
+    }
+    out
 }
 
 /// Take a torrent the session added into the state map, hold it if its
