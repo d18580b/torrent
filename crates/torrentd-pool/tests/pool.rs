@@ -2095,6 +2095,143 @@ fn an_unclaimed_file_the_size_of_a_missing_one_is_held_back() {
     assert!(steps[0].src.ends_with("junk/really-junk.txt"));
 }
 
+/// `aa`, one file `T/a.bin`, complete both at the root (`T/`) and under
+/// `seed/` (`seed/T/a.bin`), adopted at `seed` — where a relocate, or an
+/// adoption of the second copy, left it — plus an unrelated loose file.
+fn adopted_at_the_second_copy(root: &Path) -> (PoolStore, i64) {
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "seed/T/a.bin", 64);
+    write_file(root, "elsewhere/loose.bin", 5);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "aa", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    // Cost order places it at the root first.
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, String::new()))
+    );
+    store
+        .set_adoption(
+            "aa",
+            AdoptionState::Adopted,
+            Some(root_id),
+            Some("seed"),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+    (store, root_id)
+}
+
+#[test]
+fn a_rescan_keeps_an_adopted_torrent_at_its_recorded_base() {
+    // The rescan used to re-place it on the first complete candidate, the
+    // copy at `T/`, and the copy the session seeds from read as orphans.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, root_id) = adopted_at_the_second_copy(dir.path());
+    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, "seed".to_owned()))
+    );
+    let orphans = store.orphan_files(root_id, "").unwrap();
+    assert!(!orphans.contains(&"seed/T/a.bin".to_owned()), "{orphans:?}");
+    assert!(orphans.contains(&"T/a.bin".to_owned()), "{orphans:?}");
+
+    // With no view of the sessions the `adopted` verdict stands, and so
+    // does the base it is served from.
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, "seed".to_owned()))
+    );
+}
+
+#[test]
+fn a_rescan_moves_an_adopted_torrent_off_a_recorded_base_that_is_no_longer_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (mut store, root_id) = adopted_at_the_second_copy(root);
+    std::fs::remove_file(root.join("seed/T/a.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, String::new()))
+    );
+}
+
+#[test]
+fn a_delete_plan_refuses_every_copy_of_a_torrent_complete_more_than_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (mut store, root_id) = adopted_at_the_second_copy(root);
+    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+
+    // `T` holds the unclaimed copy, `seed` the claimed one; neither is
+    // provably the one nobody reads.
+    for prefix in ["", "T", "T/a.bin", "seed", "seed/T"] {
+        let e = build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("aa") && e.contains("more than one complete copy"),
+            "{prefix:?}: got {e}"
+        );
+    }
+    // Somewhere no copy is is still fine.
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "elsewhere".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+
+    // The executor's guard holds the copy too, and leaves the loose file.
+    let guard = torrentd_pool::plan::DeleteGuard::load(&store, root_id, root).unwrap();
+    let e = guard.refusal("T/a.bin", 64).expect("the copy is held back");
+    assert!(e.contains("more than one complete copy"), "{e}");
+    assert_eq!(guard.refusal("elsewhere/loose.bin", 5), None);
+
+    // A matched torrent nothing serves is guarded the same way: which copy
+    // it will be adopted from is the operator's call, not the planner's.
+    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
+    let guard = torrentd_pool::plan::DeleteGuard::load(&store, root_id, root).unwrap();
+    assert!(guard.refusal("T/a.bin", 64).is_some());
+    assert!(guard.refusal("seed/T/a.bin", 64).is_some());
+
+    // Once one copy is gone, the other is the only one and nothing near it
+    // is refused for this reason.
+    std::fs::remove_file(root.join("seed/T/a.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    let guard = torrentd_pool::plan::DeleteGuard::load(&store, root_id, root).unwrap();
+    assert_eq!(guard.refusal("seed/other.bin", 3), None);
+}
+
 #[test]
 fn is_orphan_refuses_paths_the_index_has_never_seen() {
     // The last-moment check before an irreversible delete. A path outside the
