@@ -1063,15 +1063,19 @@ The daemon sets none of these itself.
   deadline). A `408` does not undo what the request already
   started: an add may still complete (a retry then gets `409`
   `torrent-exists`; re-read the torrent), and a pool verification's
-  rechecks may still start. **Two idle cases are not bounded:** a connection that
-  sends no byte at all (or stops partway through the HTTP/2 preface), and an
-  HTTP/2 connection that answers pings but sends no request. 256 such sockets
+  rechecks may still start. **Three idle cases are not bounded:** a connection
+  that sends no byte at all (or stops partway through the HTTP/2 preface), an
+  HTTP/2 connection that answers pings but sends no request, and a request to
+  adopt, create a plan or apply one whose body stops arriving. The last needs
+  no token: a body sent without `Content-Length` is read whole before the
+  token is checked. 256 such sockets
   hold every API connection, and `/healthz` and `/metrics` stop answering
   until they close. The default loopback bind keeps them out of reach of
   anyone who cannot already run code on the host; a non-loopback
   `http_listen` belongs behind the proxy of §6 with its own client idle
-  timeouts (nginx `client_header_timeout`, Caddy `timeouts.read_header`),
-  which close such a connection before it reaches the daemon.
+  timeouts (nginx `client_header_timeout` and `client_body_timeout`, Caddy
+  `timeouts.read_header` and `timeouts.read_body`), which close such a
+  connection before it reaches the daemon.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on

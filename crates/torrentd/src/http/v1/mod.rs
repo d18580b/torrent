@@ -123,8 +123,12 @@ pub struct Testing;
 /// mounted with `untimed`: applying a plan, and adopting or creating a plan,
 /// which wait on the pool index's writer that a scan holds for its whole run.
 /// A deadline there answers `408` while the work goes on to completion, and
-/// the client never learns its outcome. Each needs `write`, so an
-/// unauthenticated slow body never reaches one.
+/// the client never learns its outcome. Nothing bounds how long their body
+/// takes to arrive either, and needing `write` does not change that: a body
+/// with no `Content-Length` is read whole by `BodySize` before the handler's
+/// `Scoped` extractor checks the token, so an unauthenticated chunked body
+/// that stalls holds its connection for as long as the peer keeps it open.
+/// `docs/running.md` §7 lists it among the cases left to a proxy's timeouts.
 macro_rules! v1_group {
     () => {
         kynos::router::group::Group::new(crate::http::v1::PREFIX)
