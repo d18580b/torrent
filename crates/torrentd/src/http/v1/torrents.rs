@@ -29,6 +29,7 @@ use torrentd_engine::Claim;
 use torrentd_engine::EngineError;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
+use torrentd_engine::RegistryError;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -665,7 +666,8 @@ torrent_error! {
         #[error("{0}")]
         #[problem(status = 409, title = "Torrent exists")]
         TorrentExists(String),
-        /// The session refused the torrent.
+        /// The session refused the torrent, or the assignment registry could
+        /// not record it.
         #[error("{detail}")]
         #[problem(status = 500, title = "Internal error")]
         Internal { detail: String },
@@ -854,9 +856,20 @@ pub async fn add_torrent(
                 "a torrent with this infohash is already assigned".to_owned(),
             ));
         }
-        Err(e) => {
+        Err(e @ RegistryError::Conflict { .. }) => {
             registry_error();
             return Err(AddTorrentError::TorrentExists(e.to_string()));
+        }
+        // The registry could not be written (a full or read-only state
+        // directory, a lock held past the busy timeout) or holds a row it
+        // cannot use. Nothing is assigned, so this is not a duplicate: a
+        // client told `torrent-exists` would stop retrying an add that never
+        // happened.
+        Err(e) => {
+            registry_error();
+            return Err(AddTorrentError::Internal {
+                detail: internal("writing the torrent's assignment to the registry", e),
+            });
         }
     }
 

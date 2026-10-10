@@ -167,7 +167,9 @@ member says why:
 
 **409**, from `POST /v1/torrents`. A torrent with this infohash is already
 assigned, to this profile or another. An infohash belongs to exactly one
-profile.
+profile. An assignment registry that cannot be written — a full or read-only
+state directory, say — is not a duplicate and answers
+[`internal`](#internal) instead: nothing was added, so retry the add.
 
 ## `torrent-adding`
 
@@ -298,9 +300,9 @@ stream you no longer read, or retry in a few seconds.
 
 ## `internal`
 
-**500.** Something failed inside the daemon, most often the torrent engine or
-the pool index. `detail` says what was being attempted. The cause is logged at
-`ERROR`, just before the trace line for the response, which carries its
+**500.** Something failed inside the daemon, most often the torrent engine,
+the pool index or the assignment registry. `detail` says what was being
+attempted. The cause is logged at `ERROR`, just before the trace line for the response, which carries its
 `X-Request-Id`.
 
 [RFC 9457]: https://www.rfc-editor.org/rfc/rfc9457
