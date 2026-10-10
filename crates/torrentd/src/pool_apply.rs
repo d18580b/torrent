@@ -386,10 +386,15 @@ fn apply_inner(
         //
         // Park it in `failed` rather than leaving it `applying`: a human has
         // to look either way, and `failed` is a state they can discard.
+        //
+        // Nothing marks the step resolved, so this refusal repeats on every
+        // apply and every re-drive; the message says so, and names the only
+        // way forward, rather than inviting a resume that cannot happen.
         let msg = format!(
-            "step {} ({}) was interrupted and its outcome is unknown; inspect {} before \
-             resuming this plan",
-            stuck.seq, stuck.op, stuck.src,
+            "step {} ({}) was interrupted and its outcome is unknown. {}",
+            stuck.seq,
+            stuck.op,
+            unknown_outcome_remedy(&stuck.src, stuck.dst.as_deref()),
         );
         if let Err(e) = pool.with_store(|s| s.set_plan_status(plan_id, plan_status::FAILED, None)) {
             pool.note_store_error("set_plan_status", &e);
@@ -529,7 +534,7 @@ fn apply_inner(
             break;
         }
         let result = match step.op.as_str() {
-            ops::MOVE_TORRENT => move_torrent(pool, source, state, &step),
+            ops::MOVE_TORRENT => move_torrent(pool, source, state, &step, stop),
             ops::DELETE_FILE => delete_file(pool, Path::new(&step.src), plan_id, &mut guards)
                 .map_err(StepFailure::Failed),
             other => Err(StepFailure::Failed(format!(
@@ -633,12 +638,37 @@ impl From<&str> for StepFailure {
     }
 }
 
-/// Relocate an adopted torrent by asking libtorrent to move its storage.
+/// What an operator can do about a step whose outcome is unknown, for a step
+/// from `src` to `dst` (`None` for a delete).
+///
+/// Such a step stays `in_progress`, and no request marks it resolved, so
+/// every later apply and boot re-drive refuses the plan. The only way on is
+/// to look, rescan, discard and rebuild, and this says exactly that, so no
+/// message invites a resume the daemon then refuses.
+fn unknown_outcome_remedy(src: &str, dst: Option<&str>) -> String {
+    let look = match dst {
+        Some(dst) => format!(
+            "Look at {src} and {dst} to find where the payload is. A new plan refuses to \
+             move onto a file already at the destination, such as the partial copy a move \
+             cut off mid-copy leaves there, so remove what does not belong."
+        ),
+        None => format!("Look at {src} to find what happened to it."),
+    };
+    format!(
+        "This plan cannot be applied or resumed again: its step stays in_progress, and \
+         nothing marks it resolved. {look} Then rescan (POST /v1/pool/scan), discard this \
+         plan (DELETE /v1/pool/plans/{{plan_id}}), and build a new one"
+    )
+}
+
+/// Relocate an adopted torrent by asking libtorrent to move its storage,
+/// waiting for libtorrent's verdict until `stop` says to give up on it.
 fn move_torrent(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
     step: &PlanStepRow,
+    stop: StopCheck<'_>,
 ) -> Result<(), StepFailure> {
     let dst = step
         .dst
@@ -756,7 +786,7 @@ fn move_torrent(
     // `move_storage` returns as soon as the move is queued. Treating that as
     // success reported a *failed* move as a completed plan step, and the
     // resume path then never retried it because the step said done.
-    let moved_to = await_storage_move(state, &hash, dst)?;
+    let moved_to = await_storage_move(state, &hash, &step.src, dst, stop)?;
     record_new_base(pool, &infohash, Path::new(&moved_to));
     // The save path recorded beside the `.torrent` is where the boot scan
     // re-adds a torrent whose resume file is lost; it follows the payload.
@@ -810,9 +840,9 @@ fn arrived(present: &[String], src: &Path, dst: &str) -> Result<(), StepFailure>
     };
     Err(StepFailure::Unknown(format!(
         "outcome unknown: libtorrent reported the torrent moved to {dst}, but {rel}, which \
-         was at {} before the move, is not there. Find where the payload is before resuming \
-         or discarding this plan",
+         was at {} before the move, is not there. {}",
         src.display(),
+        unknown_outcome_remedy(&src.display().to_string(), Some(dst)),
     )))
 }
 
@@ -839,8 +869,9 @@ fn left_behind(
         .map_err(|e| {
             StepFailure::Unknown(format!(
                 "outcome unknown: libtorrent moved the torrent to {dst}, but its file list \
-                 could not be read to confirm nothing was left at {}: {e}",
+                 could not be read to confirm nothing was left at {}: {e}. {}",
                 src.display(),
+                unknown_outcome_remedy(&src.display().to_string(), Some(dst)),
             ))
         })?;
     let Some(rel) = files.into_iter().find_map(|f| {
@@ -853,8 +884,9 @@ fn left_behind(
         "outcome unknown: libtorrent moved the torrent to {dst} but left {rel} at {}, \
          most likely because a file of that name was already at the destination. The \
          payload is split between the two places and libtorrent is rechecking against \
-         the destination; reconcile them before resuming or discarding this plan",
+         the destination. {}",
         src.display(),
+        unknown_outcome_remedy(&src.display().to_string(), Some(dst)),
     )))
 }
 
@@ -908,23 +940,50 @@ fn record_new_base(pool: &PoolService, infohash: &str, dir: &Path) {
 const STORAGE_MOVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 const STORAGE_MOVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Block until libtorrent reports the move done, failed, or the deadline runs
-/// out. `Ok` carries the save path libtorrent reported.
+/// How much longer a move is waited for once a shutdown is latched.
+///
+/// The latch is set as the server sees the stop, and teardown gives pool work
+/// the HTTP drain and then `POOL_WORK_DRAIN` (20 s) before closing the
+/// sessions under it. A move that lands in this window is recorded done; one
+/// still copying at its end is cut off, recorded as such, and its step
+/// released before the teardown gives up on it.
+const STORAGE_MOVE_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Block until libtorrent reports the move from `src` done or failed, the
+/// deadline runs out, or a shutdown latched in `stop` outlasts
+/// [`STORAGE_MOVE_STOP_GRACE`]. `Ok` carries the save path libtorrent
+/// reported.
 fn await_storage_move(
     state: &StateMap,
     hash: &libtorrent_safe::InfoHash,
+    src: &str,
     dst: &str,
+    stop: StopCheck<'_>,
 ) -> Result<String, StepFailure> {
-    await_storage_move_within(state, hash, dst, STORAGE_MOVE_DEADLINE)
+    await_storage_move_within(
+        state,
+        hash,
+        src,
+        dst,
+        STORAGE_MOVE_DEADLINE,
+        STORAGE_MOVE_STOP_GRACE,
+        stop,
+    )
 }
 
 fn await_storage_move_within(
     state: &StateMap,
     hash: &libtorrent_safe::InfoHash,
+    src: &str,
     dst: &str,
     within: std::time::Duration,
+    stop_grace: std::time::Duration,
+    stop: StopCheck<'_>,
 ) -> Result<String, StepFailure> {
     let deadline = std::time::Instant::now() + within;
+    // When the grace a latched shutdown gives the move runs out; `None`
+    // until the latch is seen.
+    let mut cut_off_at: Option<std::time::Instant> = None;
     loop {
         match state.get(hash).and_then(|s| s.storage_move) {
             Some(StorageMove::Moved { path }) => {
@@ -943,12 +1002,43 @@ fn await_storage_move_within(
             }
             _ => {}
         }
+        // The shutdown does not wait out a cross-device copy: teardown gives
+        // pool work a bounded drain and then closes the session under it.
+        // Waiting on regardless only meant the cut-off went unrecorded, the
+        // step left `in_progress` with nothing saying why. Give the move a
+        // short grace, then stop, say so, and park the step with the reason.
+        if cut_off_at.is_none() && stop() {
+            cut_off_at = Some(std::time::Instant::now() + stop_grace);
+            info!(
+                target: "torrentd::pool::apply",
+                infohash = %hash,
+                dst,
+                grace_secs = stop_grace.as_secs(),
+                "shutting down while libtorrent is still moving the payload; waiting \
+                 briefly for it to land",
+            );
+        }
+        if cut_off_at.is_some_and(|at| std::time::Instant::now() >= at) {
+            warn!(
+                target: "torrentd::pool::apply",
+                infohash = %hash,
+                src,
+                dst,
+                "shutting down while libtorrent is still moving the payload; the move \
+                 is cut off and its step's outcome is unknown",
+            );
+            return Err(StepFailure::Unknown(format!(
+                "outcome unknown: the daemon shut down while libtorrent was still moving the \
+                 payload from {src} to {dst}, so the wait for it was cut off. {}",
+                unknown_outcome_remedy(src, Some(dst)),
+            )));
+        }
         if std::time::Instant::now() >= deadline {
             return Err(StepFailure::Unknown(format!(
-                "outcome unknown: libtorrent has not reported the move to {dst} after {}s. \
-                 It may still be copying; check where the payload is before resuming or \
-                 discarding this plan",
+                "outcome unknown: libtorrent has not reported the move to {dst} after {}s, \
+                 and may still be copying. {}",
                 within.as_secs(),
+                unknown_outcome_remedy(src, Some(dst)),
             )));
         }
         std::thread::sleep(STORAGE_MOVE_POLL);
@@ -2629,6 +2719,11 @@ mod tests {
             e.contains("interrupted and its outcome is unknown"),
             "got {e}"
         );
+        // The remedy the message gives is the one the docs give, and it is
+        // the only one there is: applying again refuses the same way.
+        assert_names_the_unknown_outcome_remedy(&e);
+        let again = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert_eq!(again, e);
 
         // Parked in `failed`, not stranded in `applying`: an operator can now
         // discard it, which `delete_plan` refuses for `applying`.
@@ -3321,11 +3416,144 @@ mod tests {
     fn a_storage_move_libtorrent_never_reports_on_is_unknown_not_failed() {
         let state = StateMap::new();
         let hash = libtorrent_safe::InfoHash([3; 20]);
-        match await_storage_move_within(&state, &hash, "/x", std::time::Duration::ZERO) {
-            Err(StepFailure::Unknown(e)) => assert!(e.contains("outcome unknown"), "{e}"),
+        match await_storage_move_within(
+            &state,
+            &hash,
+            "/w",
+            "/x",
+            std::time::Duration::ZERO,
+            STORAGE_MOVE_STOP_GRACE,
+            &|| false,
+        ) {
+            Err(StepFailure::Unknown(e)) => {
+                assert!(e.contains("outcome unknown"), "{e}");
+                assert_names_the_unknown_outcome_remedy(&e);
+            }
             Err(StepFailure::Failed(e)) => panic!("recorded as failed: {e}"),
             Ok(p) => panic!("reported moved to {p}"),
         }
+    }
+
+    /// A message for a step left `in_progress` names what an operator can
+    /// actually do, which is what `docs/operations.md`'s After a crash
+    /// documents: look, rescan, discard and rebuild. Never a resume, which
+    /// every later apply and re-drive refuses.
+    fn assert_names_the_unknown_outcome_remedy(e: &str) {
+        for needle in [
+            "cannot be applied or resumed again",
+            "POST /v1/pool/scan",
+            "DELETE /v1/pool/plans/{plan_id}",
+            "build a new one",
+        ] {
+            assert!(e.contains(needle), "{needle:?} missing from: {e}");
+        }
+        assert!(!e.contains("before resuming"), "invites a resume: {e}");
+    }
+
+    /// A state map holding one torrent, at `hash`, with no move reported.
+    fn state_with(hash: libtorrent_safe::InfoHash) -> StateMap {
+        let state = StateMap::new();
+        state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                torrentd_engine::ProfileId::new("p"),
+                std::time::Instant::now(),
+            ),
+        );
+        state.update(&hash, |s| s.storage_move = Some(StorageMove::Pending));
+        state
+    }
+
+    #[test]
+    fn a_shutdown_cuts_off_a_storage_move_still_copying_as_unknown() {
+        // A cross-device copy outlasts the shutdown's pool drain. Waiting on
+        // regardless left the step `in_progress` with nothing saying why;
+        // the latch now cuts the wait off, long before the 600 s deadline,
+        // with the reason recorded.
+        let hash = libtorrent_safe::InfoHash([4; 20]);
+        let state = state_with(hash);
+        let started = std::time::Instant::now();
+        match await_storage_move_within(
+            &state,
+            &hash,
+            "/pool/old/T",
+            "/pool/new/T",
+            STORAGE_MOVE_DEADLINE,
+            std::time::Duration::ZERO,
+            &|| true,
+        ) {
+            Err(StepFailure::Unknown(e)) => {
+                assert!(
+                    e.contains("shut down while libtorrent was still moving"),
+                    "{e}"
+                );
+                assert!(
+                    e.contains("/pool/old/T") && e.contains("/pool/new/T"),
+                    "{e}"
+                );
+                assert_names_the_unknown_outcome_remedy(&e);
+            }
+            Err(StepFailure::Failed(e)) => panic!("recorded as failed: {e}"),
+            Ok(p) => panic!("reported moved to {p}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_storage_move_that_landed_is_recorded_done_even_under_a_shutdown() {
+        // The verdict is read before the latch: a move libtorrent finished is
+        // done, and cutting it off would park a plan whose step happened.
+        let hash = libtorrent_safe::InfoHash([5; 20]);
+        let state = state_with(hash);
+        state.update(&hash, |s| {
+            s.storage_move = Some(StorageMove::Moved {
+                path: "/pool/new/T".into(),
+            })
+        });
+        let moved = await_storage_move_within(
+            &state,
+            &hash,
+            "/pool/old/T",
+            "/pool/new/T",
+            STORAGE_MOVE_DEADLINE,
+            std::time::Duration::ZERO,
+            &|| true,
+        );
+        assert!(matches!(moved, Ok(ref p) if p == "/pool/new/T"));
+    }
+
+    #[test]
+    fn a_shutdown_gives_a_storage_move_its_grace_before_cutting_it_off() {
+        // The latch is set as the server sees the stop, well before teardown
+        // closes the session: a move that lands inside the grace is done.
+        let hash = libtorrent_safe::InfoHash([6; 20]);
+        let state = std::sync::Arc::new(state_with(hash));
+        let landing = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                state.update(&hash, |s| {
+                    s.storage_move = Some(StorageMove::Moved {
+                        path: "/pool/new/T".into(),
+                    })
+                });
+            })
+        };
+        let moved = await_storage_move_within(
+            &state,
+            &hash,
+            "/pool/old/T",
+            "/pool/new/T",
+            STORAGE_MOVE_DEADLINE,
+            std::time::Duration::from_secs(30),
+            &|| true,
+        );
+        landing.join().unwrap();
+        assert!(matches!(moved, Ok(ref p) if p == "/pool/new/T"));
     }
 
     #[test]
