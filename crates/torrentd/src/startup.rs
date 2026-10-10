@@ -2829,7 +2829,8 @@ impl DaemonHandle {
         // disarmed its cleanup guard, so this function is the only thing left
         // that removes the kill switch and brings the tunnels down. It skips
         // the server and falls through to the same drain and teardown a
-        // signalled shutdown runs, exiting 70.
+        // signalled shutdown runs, exiting 70, after `run_http_stage` has told
+        // the background tasks to stop.
         let listener = match tokio::net::TcpListener::bind(http_listen).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -2837,8 +2838,10 @@ impl DaemonHandle {
                 None
             }
         };
-        let mut exit_code = match listener.zip(app) {
-            Some((listener, app)) => {
+        let mut exit_code = run_http_stage(
+            listener,
+            app,
+            |listener, app| {
                 serve_until_shutdown(
                     listener,
                     app,
@@ -2849,10 +2852,10 @@ impl DaemonHandle {
                     &alert_loop,
                     &work,
                 )
-                .await
-            }
-            None => 70,
-        };
+            },
+            &shutdown_tx,
+        )
+        .await;
         // Already latched when the server saw the shutdown; this covers the
         // bind failure, which never served.
         work.cancel();
@@ -3000,6 +3003,39 @@ async fn wait_for_pool_work(work: &crate::app_state::WorkGate, bound: std::time:
         );
     }
     idle
+}
+
+/// Serve the API through `serve`, or skip it when the listener could not be
+/// bound or the router built (exiting 70), and make sure every task
+/// subscribed to `shutdown_tx` hears that the daemon is stopping before the
+/// drain and teardown that follow.
+///
+/// A signalled stop needs nothing here: the server exits 0 only once its
+/// graceful-shutdown future has received a reason on this channel, which
+/// every subscriber received too. A server that never ran, or stopped on a
+/// failure of its own (`http_exit_code` 70), had no such send, and without
+/// one the VPN and port-forward monitors, the kill-switch watch and the
+/// verify queue ran on through the teardown: fencing profiles while the
+/// kill switch came down, admitting adoptions into sessions being closed.
+async fn run_http_stage<L, A, S, F>(
+    listener: Option<L>,
+    app: Option<A>,
+    serve: S,
+    shutdown_tx: &broadcast::Sender<ShutdownReason>,
+) -> i32
+where
+    S: FnOnce(L, A) -> F,
+    F: std::future::Future<Output = i32>,
+{
+    let exit_code = match listener.zip(app) {
+        Some((listener, app)) => serve(listener, app).await,
+        None => 70,
+    };
+    if exit_code != 0 {
+        // No receiver is not an error: nothing is left to stop.
+        let _ = shutdown_tx.send(ShutdownReason::ListenFailed);
+    }
+    exit_code
 }
 
 /// Serve the API on a bound listener until a shutdown is signalled, returning
@@ -3687,6 +3723,67 @@ mod shutdown_report_tests {
             kynos::server::error::ServerError::NoListeners,
         ));
         assert_eq!(http_exit_code(broken), 70, "a real server failure stays 70");
+    }
+
+    /// A stand-in for a monitor: runs until its shutdown receiver hears.
+    fn subscribed_task(
+        tx: &broadcast::Sender<ShutdownReason>,
+    ) -> tokio::task::JoinHandle<ShutdownReason> {
+        let mut rx = tx.subscribe();
+        tokio::spawn(async move { rx.recv().await.expect("a reason, not a closed channel") })
+    }
+
+    #[tokio::test]
+    async fn a_bind_failure_stops_the_subscribed_tasks_before_the_teardown() {
+        let (tx, _keep) = broadcast::channel(8);
+        let monitor = subscribed_task(&tx);
+        let code = run_http_stage(
+            None::<()>,
+            Some(()),
+            |(), ()| async { unreachable!("nothing to serve on") },
+            &tx,
+        )
+        .await;
+        assert_eq!(code, 70);
+        // Returned means the teardown may start; the monitor must already
+        // have been told.
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(5), monitor)
+            .await
+            .expect("the monitor stops")
+            .unwrap();
+        assert_eq!(reason, ShutdownReason::ListenFailed);
+    }
+
+    #[tokio::test]
+    async fn a_router_build_or_accept_failure_stops_the_subscribed_tasks() {
+        // The router failed to build: nothing served.
+        let (tx, _keep) = broadcast::channel(8);
+        let monitor = subscribed_task(&tx);
+        let code = run_http_stage(
+            Some(()),
+            None::<()>,
+            |(), ()| async { unreachable!("nothing to serve") },
+            &tx,
+        )
+        .await;
+        assert_eq!(code, 70);
+        assert_eq!(monitor.await.unwrap(), ShutdownReason::ListenFailed);
+
+        // The server ran and stopped on its own failure.
+        let monitor = subscribed_task(&tx);
+        let code = run_http_stage(Some(()), Some(()), |(), ()| async { 70 }, &tx).await;
+        assert_eq!(code, 70);
+        assert_eq!(monitor.await.unwrap(), ShutdownReason::ListenFailed);
+    }
+
+    #[tokio::test]
+    async fn a_signalled_http_stop_sends_nothing_more() {
+        // The signal that stopped the server already reached every
+        // subscriber; a second reason would only be noise.
+        let (tx, mut rx) = broadcast::channel(8);
+        let code = run_http_stage(Some(()), Some(()), |(), ()| async { 0 }, &tx).await;
+        assert_eq!(code, 0);
+        assert!(!shutdown_requested(&mut rx));
     }
 
     #[test]
