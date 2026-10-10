@@ -488,8 +488,18 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
     // mistake to make. A dedicated uid with `CAP_NET_ADMIN` raises its
     // WireGuard links itself with `ip` and `wg`, and the ruleset exempts
     // their transport — see this module's documentation.
-    (uid == 0).then(|| {
-        io::Error::other(
+    (uid == 0).then(|| io::Error::other(RootRefused))
+}
+
+/// The error [`refusal_for_uid`] carries, so a caller can tell the refusal —
+/// which no restart changes — apart from an `nft` failure that one might
+/// ([`is_uid_refusal`]).
+#[derive(Debug)]
+struct RootRefused;
+
+impl std::fmt::Display for RootRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
             "network_kill_switch = true requires a dedicated non-root user: the ruleset \
              confines the daemon's uid to loopback and its tunnels, and as uid 0 that \
              would drop every root-owned process's traffic on this host. Run the daemon \
@@ -497,7 +507,15 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
              and `wg` (see docs/running.md, \"Kill switch\"); otherwise unset \
              network_kill_switch.",
         )
-    })
+    }
+}
+
+impl std::error::Error for RootRefused {}
+
+/// Whether `e` is [`refusal_for_uid`]'s refusal, as [`enable`] returns it.
+pub(crate) fn is_uid_refusal(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<RootRefused>().is_some())
 }
 
 /// Install the kill switch for the current process's uid, confining egress to
@@ -1544,6 +1562,11 @@ mod tests {
             e.to_string().contains("non-root user"),
             "the refusal has to say what to do instead; got {e}",
         );
+        assert!(
+            is_uid_refusal(&e),
+            "boot tells this refusal apart from an nft failure by it"
+        );
+        assert!(!is_uid_refusal(&io::Error::other("nft: permission denied")));
         assert!(
             !called.get(),
             "the refusal comes before anything is handed to nft — so a refused \
