@@ -507,7 +507,11 @@ network throughout.
 
 Lifting the fence resumes **every** torrent in the profile, including any you
 had paused on purpose before the fence, because the fence did not record which
-ones it paused. Pause those again afterwards. While `offline_all` is on, the
+ones it paused. Pause those again afterwards. The torrents are resumed 100 a
+second after the request returns, since each one announces to its trackers,
+so a profile of 20,000 takes over three minutes; a fence that lands meanwhile
+stops it. `resume-all` is paced the same way and answers once its last torrent
+is resumed. While `offline_all` is on, the
 lifted profile stays offline, its session paused, until
 `POST /v1/profiles/online-all`.
 
