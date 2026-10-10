@@ -391,6 +391,10 @@ impl VpnManager for OpenvpnManager {
         Ok(IpAddr::V4(v4))
     }
 
+    fn global_ipv6(&self, iface: &str) -> Result<Vec<std::net::Ipv6Addr>, VpnError> {
+        super::ip_lookup::global_ipv6(iface).map_err(VpnError::Io)
+    }
+
     /// Stop the openvpn daemon running `iface`, and only then drop its pid
     /// file.
     ///

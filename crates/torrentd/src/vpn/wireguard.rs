@@ -769,6 +769,10 @@ impl VpnManager for WireguardManager {
         Ok(IpAddr::V4(v4))
     }
 
+    fn global_ipv6(&self, iface: &str) -> Result<Vec<std::net::Ipv6Addr>, VpnError> {
+        super::ip_lookup::global_ipv6(iface).map_err(VpnError::Io)
+    }
+
     fn bring_down(&self, iface: &str) {
         let live = interface_public_key(iface);
         if !self.native_teardown_permitted(iface, live.as_deref()) {

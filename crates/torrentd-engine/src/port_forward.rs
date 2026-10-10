@@ -420,10 +420,13 @@ impl ListenEvents {
 }
 
 /// Parse a listen alert's endpoint, which the shim formats as
-/// `address:port` with no brackets around an IPv6 address.
-fn parse_listen_endpoint(s: &str) -> Option<SocketAddr> {
+/// `address:port` with no brackets around an IPv6 address. A link-local
+/// IPv6 address carries its scope (`fe80::1%3`), which is dropped: the
+/// address and port are what a listen socket is found by.
+pub fn parse_listen_endpoint(s: &str) -> Option<SocketAddr> {
     let (host, port) = s.rsplit_once(':')?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.split_once('%').map_or(host, |(addr, _scope)| addr);
     Some(SocketAddr::new(host.parse().ok()?, port.parse().ok()?))
 }
 
@@ -433,6 +436,9 @@ fn parse_listen_endpoint(s: &str) -> Option<SocketAddr> {
 pub struct RebindTarget<'a> {
     /// The profile's VPN tunnel address, which the session listens on.
     pub tunnel_ip: IpAddr,
+    /// The profile's tunnel device, which the listen sockets are bound to
+    /// ([`crate::profile::bind_endpoint`]).
+    pub iface: &'a str,
     /// The profile whose listen outcomes to wait for.
     pub profile: &'a ProfileId,
     pub listen: &'a ListenEvents,
@@ -450,6 +456,7 @@ impl std::fmt::Debug for RebindTarget<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebindTarget")
             .field("tunnel_ip", &self.tunnel_ip)
+            .field("iface", &self.iface)
             .field("profile", &self.profile)
             .field("listen", &self.listen)
             .field("timeout", &self.timeout)
@@ -519,6 +526,7 @@ pub fn renew_and_rebind(
     port_taken: impl Fn(u16) -> bool,
 ) -> RenewOutcome {
     let tunnel_ip = target.tunnel_ip;
+    let iface = target.iface;
     match forwarder.map(req) {
         Ok(MapResult {
             port,
@@ -560,7 +568,7 @@ pub fn renew_and_rebind(
                 return failed(RebindFailure::Unobserved);
             }
             let listen_on = |p: u16| Settings {
-                listen_interfaces: Some(crate::profile::bind_endpoint(tunnel_ip, p)),
+                listen_interfaces: Some(crate::profile::bind_endpoint(iface, p)),
                 ..Default::default()
             };
             let cursor = target.listen.cursor();
@@ -743,6 +751,7 @@ mod tests {
     fn target<'a>(profile: &'a ProfileId, listen: &'a ListenEvents) -> RebindTarget<'a> {
         RebindTarget {
             tunnel_ip: TUNNEL,
+            iface: "wg0",
             profile,
             listen,
             timeout: Duration::from_secs(5),
@@ -871,8 +880,9 @@ mod tests {
             ),
             "expected a rebind, got {out:?}"
         );
-        // Exactly one apply_settings carrying the new tunnel_ip:port bind.
-        assert_eq!(applied_binds(&eng), vec!["10.2.0.2:40001".to_string()]);
+        // Exactly one apply_settings, binding the new port on the tunnel
+        // device rather than its address.
+        assert_eq!(applied_binds(&eng), vec!["wg0:40001".to_string()]);
         assert!(
             reannounced(&eng).is_empty(),
             "the reannounce is paced by the caller, after the rebind returns",
@@ -1047,7 +1057,7 @@ mod tests {
         // Put back on the old port, so the retry is a change libtorrent acts on.
         assert_eq!(
             applied_binds(&eng),
-            vec!["10.2.0.2:40001".to_string(), "10.2.0.2:6881".to_string()],
+            vec!["wg0:40001".to_string(), "wg0:6881".to_string()],
         );
         assert!(reannounced(&eng).is_empty());
     }
@@ -1080,7 +1090,7 @@ mod tests {
         ));
         assert_eq!(
             applied_binds(&eng),
-            vec!["10.2.0.2:40001".to_string(), "10.2.0.2:6881".to_string()],
+            vec!["wg0:40001".to_string(), "wg0:6881".to_string()],
         );
     }
 
@@ -1142,6 +1152,12 @@ mod tests {
         assert_eq!(
             parse_listen_endpoint("fd00::2:40001"),
             Some("[fd00::2]:40001".parse().unwrap()),
+        );
+        // A link-local one with its scope, which a device-named listen
+        // opens wherever the tunnel device has one.
+        assert_eq!(
+            parse_listen_endpoint("fe80::1%3:40001"),
+            Some("[fe80::1]:40001".parse().unwrap()),
         );
         assert_eq!(parse_listen_endpoint(":0"), None);
     }

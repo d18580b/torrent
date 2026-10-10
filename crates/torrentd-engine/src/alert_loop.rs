@@ -115,8 +115,16 @@ pub struct AlertLoopBuilder {
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
     listen_events: Option<Arc<ListenEvents>>,
+    listen_device_check: Option<ListenDeviceCheck>,
     shutdown_deadline: Duration,
 }
+
+/// "Are this profile's sockets on this listen endpoint held to the right
+/// device?" — supplied by the daemon, which knows each profile's tunnel.
+/// Asked with the profile and the `listen_succeeded` alert's `address:port`
+/// text; `Err` carries what is wrong, and makes the loop shut the daemon
+/// down as it does for a fatal listen failure.
+pub type ListenDeviceCheck = Arc<dyn Fn(&ProfileId, &str) -> Result<(), String> + Send + Sync>;
 
 /// Invoked once, from the loop thread, when a fatal condition is detected —
 /// torrentd wires this to the shutdown broadcast so the HTTP server unwinds.
@@ -155,6 +163,7 @@ impl AlertLoopBuilder {
             on_fatal: None,
             profile_fenced: None,
             listen_events: None,
+            listen_device_check: None,
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
         }
     }
@@ -168,6 +177,17 @@ impl AlertLoopBuilder {
     /// rebind's outcome would queue behind it and could outlast the wait.
     pub fn listen_events(mut self, events: Arc<ListenEvents>) -> Self {
         self.listen_events = Some(events);
+        self
+    }
+
+    /// Ask `check` about every `listen_succeeded` alert, before the alert is
+    /// published or handled. A socket held to a device other than its
+    /// profile's tunnel sends where no route probe looks, so an `Err` is
+    /// fatal whatever the number of live sessions: the loop logs it, signals
+    /// [`ShutdownReason::ListenFailed`] and drains, and
+    /// [`AlertLoopHandle::listen_failed`] reads `true`.
+    pub fn listen_device_check(mut self, check: ListenDeviceCheck) -> Self {
+        self.listen_device_check = Some(check);
         self
     }
 
@@ -241,6 +261,7 @@ impl AlertLoopBuilder {
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
                 let listen_events = self.listen_events.clone();
+                let listen_device_check = self.listen_device_check.clone();
                 let shutdown_deadline = self.shutdown_deadline;
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
@@ -269,6 +290,7 @@ impl AlertLoopBuilder {
                                 profile_fenced,
                                 unsaved_at_shutdown,
                                 listen_events,
+                                listen_device_check,
                                 shutdown_deadline,
                             },
                         );
@@ -329,7 +351,9 @@ impl AlertLoopHandle {
         Arc::clone(&self.heartbeat)
     }
 
-    /// Whether the loop terminated because a listen socket failed fatally.
+    /// Whether the loop terminated because a listen socket failed fatally,
+    /// or came up held to the wrong device
+    /// ([`AlertLoopBuilder::listen_device_check`]).
     /// Read before [`AlertLoopHandle::join`], which consumes the handle.
     pub fn listen_failed(&self) -> bool {
         self.listen_failed.load(Ordering::Relaxed)
@@ -407,6 +431,7 @@ struct LoopHooks {
     profile_fenced: Option<ProfileFenced>,
     unsaved_at_shutdown: Arc<AtomicU64>,
     listen_events: Option<Arc<ListenEvents>>,
+    listen_device_check: Option<ListenDeviceCheck>,
     shutdown_deadline: Duration,
 }
 
@@ -451,7 +476,7 @@ fn run(
         // 2) Drain alerts.
         let drained = source.drain();
         let was_empty = drained.is_empty();
-        let mut fatal = false;
+        let mut fatal: Option<&'static str> = None;
         for (profile, alert) in drained {
             // A listen socket that fails when this is the only live session
             // is fatal — there is no other session to carry the load, so
@@ -459,7 +484,9 @@ fn run(
             // (so the failure is logged and counted), then unwind.
             if matches!(alert, Alert::ListenFailed { .. }) {
                 if hooks.fatal_listen_failure {
-                    fatal = true;
+                    fatal.get_or_insert(
+                        "the only live session's listen socket failed; shutting down",
+                    );
                 } else {
                     // Not fatal, and previously visible only as a Prometheus
                     // counter. A session that accepts no incoming connections
@@ -473,10 +500,39 @@ fn run(
                     );
                 }
             }
+            // A socket held to the wrong device is fatal with any number of
+            // sessions: its uTP and tracker traffic leaves outside the
+            // tunnel, and the route probe, which asks the routing table,
+            // cannot see it.
+            let mut wrong_device = None;
+            if let (Alert::ListenSucceeded { endpoint, .. }, Some(check)) =
+                (&alert, &hooks.listen_device_check)
+            {
+                if let Err(cause) = check(&profile, endpoint) {
+                    error!(
+                        target: "torrentd_engine::alert_loop",
+                        profile_id = %profile,
+                        endpoint = %endpoint,
+                        error.kind = "listen_wrong_device",
+                        error.cause = %cause,
+                        "a listen socket is not held to the profile's tunnel device",
+                    );
+                    fatal.get_or_insert(
+                        "a listen socket is not held to its profile's tunnel device; shutting down",
+                    );
+                    // Before the drain, which can last `shutdown_drain_secs`
+                    // (up to an hour), and before the failure is published,
+                    // which wakes a rebind waiting on it.
+                    take_profile_off_the_wire(&profile, &source);
+                    wrong_device = Some(cause);
+                }
+            }
             if let Some(events) = &hooks.listen_events {
                 match &alert {
+                    // Published as the failure it is, so a rebind waiting on
+                    // it reverts instead of announcing the new port.
                     Alert::ListenSucceeded { endpoint, .. } => {
-                        events.publish(&profile, endpoint, None)
+                        events.publish(&profile, endpoint, wrong_device)
                     }
                     Alert::ListenFailed {
                         endpoint, message, ..
@@ -496,12 +552,9 @@ fn run(
                 hooks.profile_fenced.as_ref(),
             );
         }
-        if fatal {
+        if let Some(why) = fatal {
             hooks.listen_failed.store(true, Ordering::Relaxed);
-            error!(
-                target: "torrentd_engine::alert_loop",
-                "the only live session's listen socket failed; shutting down",
-            );
+            error!(target: "torrentd_engine::alert_loop", "{why}");
             if let Some(cb) = &hooks.on_fatal {
                 cb(ShutdownReason::ListenFailed);
             }
@@ -566,6 +619,49 @@ fn run(
         if was_empty {
             clock.sleep(POLL_IDLE_INTERVAL);
         }
+    }
+}
+
+/// Close every listen socket of `profile`'s session, then pause the session,
+/// so a profile found sending by the wrong device sends nothing more while
+/// the daemon drains.
+///
+/// The order matters. A paused torrent sends libtorrent's `stopped` announce,
+/// and libtorrent announces once per listen socket, the wrong one included,
+/// so pausing first would announce through the socket being fenced. With
+/// `listen_interfaces` empty the session holds no listen socket, and so no
+/// uTP, UDP tracker or announce endpoint, and the pause then reaches no
+/// tracker. The two calls are queued on the session in that order.
+///
+/// Each refusal is logged and does not stop the other: the daemon is
+/// shutting down either way.
+fn take_profile_off_the_wire(profile: &ProfileId, source: &Arc<dyn AlertSource>) {
+    let Some(engine) = source.engine_for(profile) else {
+        return;
+    };
+    let close = libtorrent_safe::Settings {
+        listen_interfaces: Some(String::new()),
+        ..Default::default()
+    };
+    if let Err(e) = engine.apply_settings(&close) {
+        error!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile,
+            error.kind = "listen_close_failed",
+            error.cause = %e,
+            "could not close the profile's listen sockets; they stay open until the session \
+             closes at the end of the shutdown drain",
+        );
+    }
+    if let Err(e) = engine.pause_session() {
+        error!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile,
+            error.kind = "session_pause_failed",
+            error.cause = %e,
+            "could not pause the profile's session; its torrents keep running until the \
+             session closes at the end of the shutdown drain",
+        );
     }
 }
 
@@ -1590,6 +1686,117 @@ mod tests {
             "the loop attaches once its queue is empty",
         );
 
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
+    }
+
+    fn listen_succeeded_alert(endpoint: &str) -> Alert {
+        Alert::ListenSucceeded {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenSucceeded,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            endpoint: endpoint.into(),
+        }
+    }
+
+    /// A listen socket held to the wrong device stops the daemon even where
+    /// other sessions are live (`fatal_listen_failure(false)`), and a rebind
+    /// waiting on that endpoint reads it as a failure, not a success. Before
+    /// the drain, the profile's listen sockets are closed and then its
+    /// session paused, so nothing, `stopped` announces included, leaves by
+    /// that device while the daemon saves resume data.
+    #[test]
+    fn a_listen_socket_on_the_wrong_device_is_fatal_with_any_number_of_sessions() {
+        use crate::mock::RecordedCall;
+        use crate::port_forward::ListenConfirmation;
+
+        let engine = Arc::new(MockEngine::new());
+        // A torrent, so the drain has a resume save to ask for, and the
+        // fence can be seen to come before it.
+        engine.push_alert(add_torrent_alert(0xAB, 1));
+        engine.push_alert(listen_succeeded_alert("10.2.0.2:40001"));
+        let calls = Arc::clone(&engine);
+        let events = Arc::new(ListenEvents::new());
+        let cursor = events.cursor();
+        let asked: Arc<parking_lot::Mutex<Vec<(ProfileId, String)>>> = Arc::default();
+        let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
+        let handle = builder_with(engine)
+            .fatal_listen_failure(false)
+            // The mock never answers the save; the drain gives up on it.
+            .shutdown_deadline(Duration::from_millis(200))
+            .listen_events(events.clone())
+            .listen_device_check({
+                let asked = Arc::clone(&asked);
+                Arc::new(move |p: &ProfileId, ep: &str| {
+                    asked.lock().push((p.clone(), ep.to_string()));
+                    Err("udp socket held to eth0, not wg0".to_string())
+                }) as ListenDeviceCheck
+            })
+            .on_fatal({
+                let seen = Arc::clone(&seen);
+                Arc::new(move |r| seen.lock().push(r)) as FatalCallback
+            })
+            .spawn();
+
+        assert!(
+            wait_for(|| handle.listen_failed()),
+            "a wrong device binding is fatal"
+        );
+        handle.join().expect("loop thread panicked");
+        assert_eq!(*seen.lock(), vec![ShutdownReason::ListenFailed]);
+        assert_eq!(
+            *asked.lock(),
+            vec![(ProfileId::new("p"), "10.2.0.2:40001".to_string())],
+        );
+        assert_eq!(
+            events.wait_for(
+                &ProfileId::new("p"),
+                cursor,
+                "10.2.0.2:40001".parse().unwrap(),
+                Duration::from_millis(10),
+            ),
+            ListenConfirmation::Failed("udp socket held to eth0, not wg0".into()),
+        );
+
+        let calls = calls.calls();
+        let at = |want: &dyn Fn(&RecordedCall) -> bool| calls.iter().position(want);
+        let closed = at(&|c| {
+            matches!(c, RecordedCall::ApplySettings(s)
+                if s.listen_interfaces.as_deref() == Some(""))
+        })
+        .expect("the profile's listen sockets are closed");
+        let paused = at(&|c| matches!(c, RecordedCall::PauseSession))
+            .expect("the profile's session is paused");
+        let saved = at(&|c| matches!(c, RecordedCall::SaveResumeData { .. }))
+            .expect("the drain asks for the torrent's resume data");
+        assert!(
+            closed < paused && paused < saved,
+            "sockets closed, then the session paused, then the drain: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_listen_socket_on_the_right_device_keeps_the_loop_running() {
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(listen_succeeded_alert("10.2.0.2:40001"));
+        let asked = Arc::new(AtomicU64::new(0));
+        let handle = builder_with(engine)
+            .fatal_listen_failure(true)
+            .listen_device_check({
+                let asked = Arc::clone(&asked);
+                Arc::new(move |_: &ProfileId, _: &str| {
+                    asked.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }) as ListenDeviceCheck
+            })
+            .spawn();
+
+        assert!(wait_for(|| asked.load(Ordering::Relaxed) == 1));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!handle.listen_failed());
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread panicked");
     }
