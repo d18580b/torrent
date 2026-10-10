@@ -1490,7 +1490,9 @@ pub enum PlanStatus {
     /// Every step is done.
     Applied,
     /// Applying stopped at a failed step. Applying it again retries from the
-    /// first step not done.
+    /// first step not done, unless a step is still `in_progress`: then every
+    /// apply refuses it, and the only way on is to rescan, discard it, and
+    /// build a new plan.
     Failed,
     /// Discarded without being applied.
     Cancelled,
@@ -1513,8 +1515,11 @@ pub enum StepOp {
 pub enum StepStatus {
     /// Not attempted.
     Pending,
-    /// Attempted and not finished. Found on a plan nothing is applying, it
-    /// means a run died mid-step and a human must inspect `src`.
+    /// Attempted and not finished. Found on a plan nothing is applying, its
+    /// outcome is unknown: a run died mid-step, or a move's wait was cut off.
+    /// Nothing marks it resolved, so every apply refuses the plan; a human
+    /// inspects `src` (and `dst` for a move), rescans, discards the plan, and
+    /// builds a new one.
     InProgress,
     /// Done.
     Done,
@@ -2068,7 +2073,10 @@ pub enum ApplyPlanError {
 /// Whether a plan in `status` can be claimed for an apply.
 ///
 /// `failed` can: applying again retries from the first step not done, which is
-/// how an operator continues after fixing what stopped it.
+/// how an operator continues after fixing what stopped it. A `failed` plan
+/// with a step still `in_progress` is claimable here but refused by the
+/// executor on every apply; it can only be discarded and rebuilt after a
+/// rescan.
 fn applicable(status: PlanStatus) -> bool {
     matches!(status, PlanStatus::Draft | PlanStatus::Failed)
 }
@@ -2079,7 +2087,10 @@ fn applicable(status: PlanStatus) -> bool {
 /// large delete or a cross-device move can run for minutes. Each step is
 /// journalled before it is attempted, and applying stops at the first failure
 /// — answering `200` with `status: failed` and the plan's steps saying which
-/// and why. A `failed` plan can be applied again to retry.
+/// and why. A `failed` plan can be applied again to retry, unless a step is
+/// still `in_progress`: its outcome is unknown, nothing marks it resolved, and
+/// every apply refuses the plan with `409`. Rescan, discard the plan, and
+/// build a new one.
 ///
 /// A plan that deletes data applies only with its `confirm_token`: not a
 /// security control, but a guard against applying the wrong plan id. Refused
