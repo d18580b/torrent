@@ -100,6 +100,18 @@ groups:
         annotations:
           summary: "The WireGuard handshake probe cannot run for {{ $labels.profile_id }} (wg missing or unprivileged); only IP presence is checked"
 
+      - alert: TorrentdRouteProbeUnavailable
+        # While the route probe cannot run (ip missing, denied, or timing out,
+        # or the address probe failing so it is never asked) route loss is not
+        # detected, and a route change that sends the tunnel's traffic out the
+        # host route never fences the profile.
+        expr: torrentd_profile_vpn_route_probe_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The route probe cannot run for {{ $labels.profile_id }}; the tunnel's routing is not being checked, so route loss will not fence it"
+
       - alert: TorrentdHandshakeAgeRising
         # The trend before the fence. WireGuard re-handshakes every two
         # minutes while traffic flows, so a healthy tunnel's handshake age is

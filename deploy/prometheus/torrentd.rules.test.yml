@@ -183,6 +183,30 @@ tests:
             exp_annotations:
               summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); only IP presence is checked"
 
+  # A route probe that recovers before the hold stays quiet; one that stays
+  # down fires.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_route_probe_ok{profile_id="acct_a"}'
+        values: '0 0 0 1 0x10'
+      - series: 'torrentd_profile_vpn_route_probe_ok{profile_id="acct_b"}'
+        values: '1x14'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdRouteProbeUnavailable
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: TorrentdRouteProbeUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: TorrentdRouteProbeUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The route probe cannot run for acct_a; the tunnel's routing is not being checked, so route loss will not fence it"
+
   # Handshakes landing late, over and over, without yet crossing the fence:
   # one every five minutes.
   - interval: 1m
