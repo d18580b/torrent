@@ -10,10 +10,17 @@
 #   info      worth knowing; routine on some trackers
 #
 # `increase(x[15m]) > 0` fires on the first evaluation after an event and
-# resolves 15 minutes after the last one. It needs a sample from before the
-# event, which is why the daemon writes every series these read at zero at
-# boot. A series that appears only with its first event is matched on its
-# appearance as well (`or (x unless x offset 15m)`).
+# resolves 15 minutes after the last one. It needs a scraped sample from
+# before the event. The daemon writes every series these read at zero at
+# boot, but nothing can scrape it until /metrics is served, after the boot
+# scans and the alert loop's first stretch: whatever those count is already in
+# the first sample, and a zero nobody scraped is no sample. So for each counter
+# a boot moves, the daemon also exports what it had counted at the first
+# scrape as a `torrentd_boot_*` gauge, and the rule fires on that being above
+# zero too (`or torrentd_boot_x > 0`). Such an alert holds for the life of the
+# process, as TorrentdBootLoadFailures does; a restart clears it. A series
+# that appears only with its first event is matched on its appearance as well
+# (`or (x unless x offset 15m)`).
 
 groups:
   - name: torrentd_runtime
@@ -253,7 +260,9 @@ groups:
       # offline or online) raises a tracker alert per torrent within a second
       # or so, more than the queue holds. Bulk resumes are paced and do not.
       - alert: TorrentdAlertQueueOverflow
-        expr: increase(torrentd_alert_queue_overflows_total[15m]) > 0
+        expr: >
+          increase(torrentd_alert_queue_overflows_total[15m]) > 0
+          or torrentd_boot_alert_queue_overflows > 0
         labels:
           severity: warning
         annotations:
@@ -283,7 +292,9 @@ groups:
           summary: "Trackers returned {{ $labels.kind }} for profile {{ $labels.profile_id }}"
 
       - alert: TorrentdSessionErrors
-        expr: increase(torrentd_session_alerts_total{kind=~"portmap_error|udp_error|fastresume_rejected"}[15m]) > 0
+        expr: >
+          increase(torrentd_session_alerts_total{kind=~"portmap_error|udp_error|fastresume_rejected"}[15m]) > 0
+          or torrentd_boot_session_alerts > 0
         labels:
           severity: warning
         annotations:
@@ -332,7 +343,9 @@ groups:
           summary: "The registry claims {{ $value }} torrents for profile {{ $labels.profile_id }} that no session loaded"
 
       - alert: TorrentdRegistryErrors
-        expr: increase(torrentd_profile_assignment_registry_errors_total[15m]) > 0
+        expr: >
+          increase(torrentd_profile_assignment_registry_errors_total[15m]) > 0
+          or torrentd_boot_registry_errors > 0
         labels:
           severity: warning
         annotations:
@@ -346,14 +359,18 @@ groups:
           summary: "A .torrent for profile {{ $labels.profile_id }} could not be written ({{ $labels.source }})"
 
       - alert: TorrentdStoreWriteFailed
-        expr: increase(torrentd_store_write_errors_total[15m]) > 0
+        expr: >
+          increase(torrentd_store_write_errors_total[15m]) > 0
+          or torrentd_boot_store_write_errors > 0
         labels:
           severity: warning
         annotations:
           summary: "A write to the {{ $labels.store }} failed; it no longer matches what the daemon did"
 
       - alert: TorrentdDirFsyncFailed
-        expr: increase(torrentd_dir_fsync_errors_total[15m]) > 0
+        expr: >
+          increase(torrentd_dir_fsync_errors_total[15m]) > 0
+          or torrentd_boot_dir_fsync_errors > 0
         labels:
           severity: warning
         annotations:
