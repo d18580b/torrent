@@ -193,9 +193,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "profile_vpn_tunnel_ip_changes_total" Counter VpnProfile Owner("live vpn profiles") =>
         "Tunnel address losses or changes.";
     "profile_vpn_fenced_total" Counter VpnProfile
-        ("reason": &["ip_lost_or_changed", "route_mismatch", "handshake_stale", "no_handshake"])
+        ("reason": &["ip_lost_or_changed", "route_mismatch", "handshake_stale", "no_handshake", "kill_switch"])
         Owner("live vpn profiles") =>
-        "Times the VPN monitor fenced the profile, by reason.";
+        "Times the VPN monitor fenced the profile, by reason; kill_switch when the kill-switch \
+         watch fenced it because the nftables table was missing or drifted.";
     "profile_vpn_handshake_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
         "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or \
          unprivileged).";
@@ -246,6 +247,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Runtime kill-switch checks that could not run: nft could not list the nftables tables \
          or the kill switch's table as JSON, its output could not be read, or the check task \
          itself failed (it panicked or was cancelled).";
+    "kill_switch_lost_total" Counter Daemon ("outcome": &["reinstalled", "lost"]) Zero =>
+        "Times a runtime check found the kill switch's nftables table missing or drifted, by \
+         whether the one reinstall checked intact (reinstalled) or not (lost). Each loss counts \
+         once; the checks that repeat while it stays lost do not.";
     // the previous run's shutdown
     "last_shutdown_unsaved_resumes" Gauge Daemon Owner("always") =>
         "Resume saves the previous run's shutdown drain left unsaved; 0 if unknown.";
