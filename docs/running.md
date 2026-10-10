@@ -1107,8 +1107,9 @@ The daemon sets none of these itself.
   connection until the deadline nor make the daemon buffer its body. A body
   sent without `Content-Length` (chunked, or HTTP/2 without the header) is
   held in memory as it arrives, up to the operation's limit — 64 KiB, or
-  96 MiB for `POST /v1/torrents` — so only a credential holder can make the
-  daemon spend that. **Two idle cases are not bounded:** a connection that
+  96 MiB for `POST /v1/torrents` — so with `[auth]` configured only a
+  credential holder can make the daemon spend that. Without `[auth]`, any
+  same-site caller is admitted as anonymous and can. **Two idle cases are not bounded:** a connection that
   sends no byte at all (or stops partway through the HTTP/2 preface), and an
   HTTP/2 connection that answers pings but sends no request. 256 such
   sockets hold every API connection, and `/healthz` and `/metrics` stop
