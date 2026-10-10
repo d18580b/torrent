@@ -392,6 +392,17 @@ mod tests {
             let st = state.get(&h.infohash).expect("tracked");
             assert_eq!((st.handle, &st.profile_id), (*h, &p));
         }
+        // Tracking each torrent asked for its first resume save, and those
+        // 1 500 answers still overflow a queue of 100: one could crowd out
+        // the `torrent_removed_alert` the removal below waits for. Give the
+        // queue the default's room before removing, so that alert arrives.
+        let roomy = Settings {
+            alert_queue_size: Some(10_000),
+            ..Settings::default()
+        };
+        engine
+            .apply_settings(&roomy)
+            .expect("raise the alert queue");
         engine.remove_torrent(added[0], false).expect("remove");
         let deadline = Instant::now() + Duration::from_secs(10);
         while state.contains(&added[0].infohash) && Instant::now() < deadline {
