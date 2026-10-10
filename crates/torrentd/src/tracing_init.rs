@@ -33,10 +33,13 @@
 //!
 //! The hash is stable across runs, so two announce URLs on one host stay
 //! distinguishable in a log without the secret. URLs that carry none of these
-//! pass through unchanged — except in libtorrent's own log messages, which
-//! quote tracker URLs in every shape a tracker invents: there every URL is cut
-//! at its host unless it is a bare `scheme://host[:port]/announce`-style URL,
-//! the same fail-closed rule the API applies to announce URLs.
+//! pass through unchanged — except under the targets in `HOST_ONLY_TARGETS`:
+//! libtorrent's own log messages, and the tracker warning, scrape-failed and
+//! announce-failed lines under `torrentd_engine::handler::tracker`, whose
+//! messages libtorrent builds from the announce URL. These quote tracker URLs
+//! in every shape a tracker invents, so there every URL is cut at its host
+//! unless it is a bare `scheme://host[:port]/announce`-style URL, the same
+//! fail-closed rule the API applies to announce URLs.
 //! `CONTRIBUTING.md` § Reporting bugs promises this to bug reporters; change
 //! the two together.
 
