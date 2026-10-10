@@ -2038,8 +2038,8 @@ where
                     tunnel_ip = %ip,
                     other_profile_id = %owner,
                     "tunnel came up with an address another profile's tunnel already has; \
-                     profile disabled, since a session bound by address cannot be kept \
-                     out of the other account's tunnel",
+                     profile disabled, since a tunnel is routed by its address and a \
+                     session on one cannot be kept out of the other account's tunnel",
                 );
                 let reason = format!(
                     "tunnel address {ip} is also profile {owner}'s, so neither session can \
