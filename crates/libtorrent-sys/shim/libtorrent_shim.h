@@ -11,6 +11,14 @@
  *   libtorrent::torrent_handle copies. `0` is the null sentinel. The mapping
  *   is stable for the lifetime of the torrent in the session.
  *
+ * Torrent key
+ *   Every 20-byte infohash the shim reports for a torrent (an add's
+ *   infohash_out, an alert's infohash, a status view's) is its key: the v1
+ *   SHA-1 whenever the torrent has one, else the v2 SHA-256 truncated to 20
+ *   bytes. Not libtorrent's get_best(), which prefers v2: a torrent added from
+ *   a btih-only magnet gains a v2 hash when hybrid metadata arrives, and its
+ *   get_best() would change mid-life. A v1 hash, once present, stays.
+ *
  * Buffer ownership
  *   Functions returning heap buffers (uint8_t** + size_t*) hand ownership to
  *   the caller. The caller MUST call lt_buf_free(buf) when done.
@@ -215,10 +223,10 @@ int         lt_session_is_paused(lt_session* s);
 /* ------------------------------------------------------------------ */
 
 /* Add a torrent from a .torrent file buffer.
- * infohash_out: optional 20-byte buffer; if non-NULL, the torrent's best
- *               infohash (`info_hashes().get_best()`) is written here on
- *               success: the v1 SHA-1 for a v1 torrent, and the v2 SHA-256
- *               truncated to 20 bytes for a v2 or hybrid one.
+ * infohash_out: optional 20-byte buffer; if non-NULL, the torrent's key (see
+ *               "Torrent key" above) is written here on success: the v1
+ *               SHA-1 for a v1 or hybrid torrent, and the v2 SHA-256
+ *               truncated to 20 bytes for a v2-only one.
  * tracker_urls / tracker_tiers / num_trackers:
  *               optional; when num_trackers > 0, these trackers (URL i in
  *               tier tracker_tiers[i]) replace the .torrent's announce list,
@@ -290,16 +298,27 @@ int         lt_torrent_set_upload_limit(lt_session* s, lt_handle h, int bytes_pe
 int         lt_torrent_set_file_priority(lt_session* s, lt_handle h,
                                          int file_idx, uint8_t priority);
 
-/* Compute the best (v1, or v2-truncated) info-hash of a .torrent buffer
- * without adding it to any session. Writes 20 bytes to out20. Used to
- * enforce registry uniqueness before the session sees the torrent
- *. Returns LT_OK / LT_ERR (err_out populated). */
-int         lt_torrent_info_hash(const uint8_t* data, size_t len,
-                                 uint8_t* out20, char* err_out, int err_len);
+/* Every info-hash a torrent carries. A hybrid torrent has both. */
+struct lt_info_hashes {
+    uint8_t  has_v1;
+    uint8_t  has_v2;
+    uint8_t  _pad[2];
+    uint8_t  v1[20];              /* zeroed when has_v1 == 0 */
+    uint8_t  v2[32];              /* zeroed when has_v2 == 0 */
+};
 
-/* Same, for the info-hash encoded in a magnet URI. */
-int         lt_magnet_info_hash(const char* uri,
-                                uint8_t* out20, char* err_out, int err_len);
+/* The info-hashes of a .torrent buffer, without adding it to any session.
+ * Used to enforce registry uniqueness before the session sees the torrent.
+ * Returns LT_OK / LT_ERR (err_out populated; *out zeroed). */
+int         lt_torrent_info_hashes(const uint8_t* data, size_t len,
+                                   struct lt_info_hashes* out,
+                                   char* err_out, int err_len);
+
+/* Same, for the hashes a magnet URI names: v1 from `xt=urn:btih`, v2 from
+ * `xt=urn:btmh`. */
+int         lt_magnet_info_hashes(const char* uri,
+                                  struct lt_info_hashes* out,
+                                  char* err_out, int err_len);
 
 /* ------------------------------------------------------------------ */
 /* Torrent metadata extraction (no session required)                   */

@@ -36,6 +36,51 @@ impl InfoHashV2 {
     }
 }
 
+/// Every info-hash a torrent carries: a hybrid torrent has both.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct InfoHashes {
+    pub v1: Option<InfoHash>,
+    pub v2: Option<InfoHashV2>,
+}
+
+impl InfoHashes {
+    /// The 20-byte hash the torrent is keyed by everywhere in the daemon: its
+    /// v1 hash whenever it has one, else its v2 hash truncated.
+    ///
+    /// The shim's `torrent_key` applies the same rule to every hash it
+    /// reports. It is not libtorrent's `info_hash_t::get_best()`, which
+    /// prefers v2: a torrent added from a btih-only magnet gains a v2 hash
+    /// when hybrid metadata arrives, and a key that followed `get_best()`
+    /// would change under every record the daemon keeps.
+    pub fn key(&self) -> Option<InfoHash> {
+        match (self.v1, self.v2) {
+            (Some(v1), _) => Some(v1),
+            (None, Some(v2)) => Some(v2.truncated()),
+            (None, None) => None,
+        }
+    }
+
+    /// Every 20-byte hash the torrent could be keyed by: [`Self::key`], then
+    /// the truncated v2 hash where that is a different one. A registry check
+    /// that looked at the key alone would miss the same torrent recorded under
+    /// the other.
+    pub fn keys(&self) -> impl Iterator<Item = InfoHash> {
+        let key = self.key();
+        let alias = self
+            .v2
+            .map(InfoHashV2::truncated)
+            .filter(|a| Some(*a) != key);
+        key.into_iter().chain(alias)
+    }
+
+    pub(crate) fn from_raw(raw: &ffi::lt_info_hashes) -> Self {
+        Self {
+            v1: (raw.has_v1 != 0).then_some(InfoHash(raw.v1)),
+            v2: (raw.has_v2 != 0).then_some(InfoHashV2(raw.v2)),
+        }
+    }
+}
+
 impl std::fmt::Display for InfoHashV2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.to_hex())
@@ -77,19 +122,20 @@ pub struct TorrentMeta {
 }
 
 impl TorrentMeta {
-    /// The 20-byte hash this torrent is keyed by everywhere in the daemon.
-    ///
-    /// Mirrors libtorrent's `info_hash_t::get_best()`, which prefers the
-    /// **truncated v2** hash when one exists and only falls back to v1. That
-    /// ordering is easy to get backwards; `info_hash_from_torrent` and the
-    /// assignment registry both depend on it, so a divergence here would key
-    /// hybrid torrents under two different hashes.
-    pub fn best_infohash(&self) -> Option<InfoHash> {
-        match (self.infohash_v2, self.infohash_v1) {
-            (Some(v2), _) => Some(v2.truncated()),
-            (None, Some(v1)) => Some(v1),
-            (None, None) => None,
+    /// Both of this torrent's info-hashes.
+    pub fn info_hashes(&self) -> InfoHashes {
+        InfoHashes {
+            v1: self.infohash_v1,
+            v2: self.infohash_v2,
         }
+    }
+
+    /// The 20-byte hash this torrent is keyed by everywhere in the daemon:
+    /// [`InfoHashes::key`], v1 whenever there is one. `info_hash_from_torrent`
+    /// and the assignment registry both depend on it, so a divergence here
+    /// would key hybrid torrents under two different hashes.
+    pub fn best_infohash(&self) -> Option<InfoHash> {
+        self.info_hashes().key()
     }
 
     /// Whether this torrent carries v2 per-file merkle roots.
@@ -182,6 +228,34 @@ fn err_to_string(buf: &[std::os::raw::c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_torrent_is_keyed_by_v1_whenever_it_has_one() {
+        let (v1, v2) = (InfoHash([1; 20]), InfoHashV2([2; 32]));
+        let hybrid = InfoHashes {
+            v1: Some(v1),
+            v2: Some(v2),
+        };
+        assert_eq!(hybrid.key(), Some(v1));
+        assert_eq!(hybrid.keys().collect::<Vec<_>>(), [v1, v2.truncated()]);
+
+        let v1_only = InfoHashes {
+            v1: Some(v1),
+            v2: None,
+        };
+        assert_eq!(v1_only.key(), Some(v1));
+        assert_eq!(v1_only.keys().collect::<Vec<_>>(), [v1]);
+
+        let v2_only = InfoHashes {
+            v1: None,
+            v2: Some(v2),
+        };
+        assert_eq!(v2_only.key(), Some(v2.truncated()));
+        assert_eq!(v2_only.keys().collect::<Vec<_>>(), [v2.truncated()]);
+
+        assert_eq!(InfoHashes::default().key(), None);
+        assert_eq!(InfoHashes::default().keys().count(), 0);
+    }
 
     fn bstr(out: &mut Vec<u8>, s: &[u8]) {
         out.extend_from_slice(format!("{}:", s.len()).as_bytes());

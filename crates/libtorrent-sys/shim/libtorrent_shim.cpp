@@ -382,6 +382,27 @@ std::int64_t timestamp_us(const lt::alert* a) {
     return std::chrono::duration_cast<std::chrono::microseconds>(since_epoch).count();
 }
 
+// The 20-byte hash a torrent is keyed by, here and in the daemon: its v1
+// hash whenever it has one, else its v2 hash truncated to 20 bytes.
+//
+// Not info_hash_t::get_best(), which prefers v2. A torrent added from a
+// btih-only magnet holds only its v1 hash until the metadata arrives, and
+// when that metadata is hybrid libtorrent replaces the torrent's hashes with
+// v1+v2 (torrent::set_metadata), so get_best() would switch to the truncated
+// v2 hash mid-life and orphan every record kept under the v1 one. A v1 hash,
+// once present, never goes away.
+lt::sha1_hash torrent_key(lt::info_hash_t const& ih) {
+    return ih.has_v1() ? ih.v1 : ih.get_best();
+}
+
+void fill_info_hashes(lt_info_hashes* out, lt::info_hash_t const& ih) {
+    std::memset(out, 0, sizeof(*out));
+    out->has_v1 = ih.has_v1() ? 1 : 0;
+    out->has_v2 = ih.has_v2() ? 1 : 0;
+    if (ih.has_v1()) std::memcpy(out->v1, ih.v1.data(), 20);
+    if (ih.has_v2()) std::memcpy(out->v2, ih.v2.data(), 32);
+}
+
 }  // namespace
 
 // -------------------------------------------------------------------------
@@ -422,7 +443,7 @@ struct lt_session {
     // resolves to the live torrent that replaced it, rather than displacing it.
     std::uintptr_t register_handle(const lt::torrent_handle& h, bool authoritative = false) {
         if (!h.is_valid()) return 0;
-        auto ih = h.info_hashes().get_best();
+        auto ih = torrent_key(h.info_hashes());
         std::lock_guard<std::mutex> lk(handle_mutex);
         auto it = ids_by_ih.find(ih);
         if (it != ids_by_ih.end()) {
@@ -451,7 +472,7 @@ struct lt_session {
 
     void unregister(const lt::torrent_handle& h) {
         if (!h.is_valid()) return;
-        auto ih = h.info_hashes().get_best();
+        auto ih = torrent_key(h.info_hashes());
         std::lock_guard<std::mutex> lk(handle_mutex);
         auto it = ids_by_ih.find(ih);
         if (it == ids_by_ih.end()) return;
@@ -489,14 +510,14 @@ void zero_init(lt_alert_union& u) {
 void fill_torrent_scope(lt_alert_union& u, lt_session* s, const lt::torrent_handle& h) {
     if (!h.is_valid()) return;
     u.handle = s->register_handle(h);
-    auto ih = h.info_hashes().get_best();
+    auto ih = torrent_key(h.info_hashes());
     std::memcpy(u.infohash, ih.data(), 20);
 }
 
 void fill_state_view(lt_torrent_status_view& v, lt_session* s, const lt::torrent_status& st) {
     if (st.handle.is_valid()) {
         v.handle = s->register_handle(st.handle);
-        auto ih = st.handle.info_hashes().get_best();
+        auto ih = torrent_key(st.handle.info_hashes());
         std::memcpy(v.infohash, ih.data(), 20);
     }
     v.state = static_cast<std::uint32_t>(st.state);
@@ -541,7 +562,7 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         // invalid here. Forget the id: an alert the torrent posted before its
         // removal may have registered it again after lt_remove_torrent
         // unregistered it.
-        auto ih = x->info_hashes.get_best();
+        auto ih = torrent_key(x->info_hashes);
         std::memcpy(out.infohash, ih.data(), 20);
         s->unregister_removed(ih, x->handle);
         return true;
@@ -1039,7 +1060,7 @@ extern "C" lt_handle lt_add_torrent_file(lt_session* s,
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
     if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }
     if (infohash_out) {
-        auto ih = h.info_hashes().get_best();
+        auto ih = torrent_key(h.info_hashes());
         std::memcpy(infohash_out, ih.data(), 20);
     }
     return s->register_handle(h, /*authoritative=*/true);
@@ -1063,7 +1084,7 @@ extern "C" lt_handle lt_add_torrent_magnet(lt_session* s,
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
     if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }
     if (infohash_out) {
-        auto ih = h.info_hashes().get_best();
+        auto ih = torrent_key(h.info_hashes());
         std::memcpy(infohash_out, ih.data(), 20);
     }
     return s->register_handle(h, /*authoritative=*/true);
@@ -1119,35 +1140,37 @@ extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
     if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }
     if (infohash_out) {
-        auto ih = h.info_hashes().get_best();
+        auto ih = torrent_key(h.info_hashes());
         std::memcpy(infohash_out, ih.data(), 20);
     }
     return s->register_handle(h, /*authoritative=*/true);
     LT_SHIM_CATCH(err_out, err_len, 0)
 }
 
-extern "C" int lt_torrent_info_hash(const uint8_t* data, size_t len,
-                                    uint8_t* out20, char* err_out, int err_len)
+extern "C" int lt_torrent_info_hashes(const uint8_t* data, size_t len,
+                                      struct lt_info_hashes* out,
+                                      char* err_out, int err_len)
 {
-    if (!data || !out20) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    if (!data || !out) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
     LT_SHIM_TRY
+    std::memset(out, 0, sizeof(*out));
     lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(len));
-    auto ih = ti.info_hashes().get_best();
-    std::memcpy(out20, ih.data(), 20);
+    fill_info_hashes(out, ti.info_hashes());
     return LT_OK;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
 }
 
-extern "C" int lt_magnet_info_hash(const char* uri,
-                                   uint8_t* out20, char* err_out, int err_len)
+extern "C" int lt_magnet_info_hashes(const char* uri,
+                                     struct lt_info_hashes* out,
+                                     char* err_out, int err_len)
 {
-    if (!uri || !out20) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    if (!uri || !out) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
     LT_SHIM_TRY
+    std::memset(out, 0, sizeof(*out));
     lt::error_code ec;
     lt::add_torrent_params atp = lt::parse_magnet_uri(uri, ec);
     if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
-    auto ih = atp.info_hashes.get_best();
-    std::memcpy(out20, ih.data(), 20);
+    fill_info_hashes(out, atp.info_hashes);
     return LT_OK;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
 }

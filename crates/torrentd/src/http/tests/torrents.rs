@@ -1973,3 +1973,104 @@ async fn a_torrent_re_added_to_another_profile_right_after_delete_stays_tracked(
     assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
     assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
 }
+
+/// The repository's own hybrid (v1+v2) test torrent, and its two hashes.
+/// `cargo test` runs without the vendor submodules, so not libtorrent's.
+fn hybrid_torrent() -> (Vec<u8>, InfoHash, InfoHash) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let hashes = libtorrent_safe::info_hashes_from_torrent(&bytes).unwrap();
+    let v1 = hashes.v1.expect("a hybrid has a v1 hash");
+    let v2 = hashes.v2.expect("a hybrid has a v2 hash").truncated();
+    assert_ne!(v1, v2);
+    (bytes, v1, v2)
+}
+
+#[tokio::test]
+async fn a_hybrid_torrent_is_added_and_found_under_its_v1_infohash() {
+    // The infohash a tracker site shows, and the one a btih-only magnet for
+    // the same torrent carries: a key of the truncated v2 hash was a 404 for
+    // it, and let the magnet into a second profile.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let (bytes, v1, v2) = hybrid_torrent();
+
+    let resp = h
+        .write_json("POST", "/v1/torrents", metainfo("p", &bytes))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    resp.assert_header("location", &format!("/v1/torrents/{}", hex(v1)));
+    assert_eq!(resp.json::<Value>()["infohash"], hex(v1));
+    assert_eq!(h.state.registry.lookup(&v1).unwrap().as_str(), "p");
+    assert_eq!(h.state.registry.lookup(&v2), None);
+
+    let resp = h.read(&format!("/v1/torrents/{}", hex(v1))).await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["infohash"], hex(v1));
+
+    // A btih-only magnet for it is the same torrent.
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "magnet",
+                   "uri": format!("magnet:?xt=urn:btih:{}", hex(v1))}}),
+        )
+        .await;
+    assert_problem(&resp, 409, "torrent-exists");
+}
+
+#[tokio::test]
+async fn a_hybrid_torrent_recorded_under_its_truncated_v2_infohash_is_a_duplicate() {
+    // An earlier build keyed hybrid torrents by the truncated v2 hash, and the
+    // registry may still hold one under it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+    });
+    let e = engine.unwrap();
+    let (bytes, v1, v2) = hybrid_torrent();
+    h.state.registry.assign(v2, ProfileId::new("f")).unwrap();
+
+    let before = e.calls().len();
+    let resp = h
+        .write_json("POST", "/v1/torrents", metainfo("p", &bytes))
+        .await;
+    assert_problem(&resp, 409, "torrent-exists");
+    assert_eq!(e.calls().len(), before, "the session never sees it");
+    assert_eq!(h.state.registry.lookup(&v1), None);
+}
+
+#[tokio::test]
+async fn a_magnet_without_a_v1_infohash_is_refused() {
+    // Its key would be the truncated v2 hash until the metadata arrived, and
+    // the v1 hash after, if that metadata is hybrid.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let v2 = "5c".repeat(32);
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "magnet",
+                   "uri": format!("magnet:?xt=urn:btmh:1220{v2}")}}),
+        )
+        .await;
+    assert_problem(&resp, 422, "invalid-metainfo");
+    assert!(resp.json::<Value>()["detail"]
+        .as_str()
+        .unwrap()
+        .contains("xt=urn:btih"));
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(&v2[..40]).unwrap()),
+        None
+    );
+}

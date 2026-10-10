@@ -1337,7 +1337,7 @@
           "torrents"
         ],
         "summary": "Add a torrent.",
-        "description": "From a magnet URI, a `.torrent` on the daemon's filesystem, or a\n`.torrent` in the request (base64). The infohash is computed before any\nsession sees the torrent, so an infohash already assigned anywhere is\n`409 torrent-exists` and the session never receives a duplicate. When the\nprofile sets `allowed_tracker_domains`, every tracker the torrent announces\nto — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and\nthere must be at least one. The response is the torrent as its session first reports\nit; its `phase` is `unknown` until the first state update.",
+        "description": "From a magnet URI, a `.torrent` on the daemon's filesystem, or a\n`.torrent` in the request (base64). The infohash is computed before any\nsession sees the torrent, so an infohash already assigned anywhere is\n`409 torrent-exists` and the session never receives a duplicate; a hybrid\ntorrent is checked under its truncated v2 infohash as well as its v1 one.\nA magnet must carry the torrent's v1 infohash (`xt=urn:btih:`): one with\nonly `xt=urn:btmh:` is `422 invalid-metainfo`. When the\nprofile sets `allowed_tracker_domains`, every tracker the torrent announces\nto — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and\nthere must be at least one. The response is the torrent as its session first reports\nit; its `phase` is `unknown` until the first state update.",
         "operationId": "add_torrent",
         "requestBody": {
           "content": {
@@ -1749,7 +1749,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -1926,7 +1926,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -2256,7 +2256,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -2450,7 +2450,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -2666,7 +2666,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -2882,7 +2882,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -3098,7 +3098,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -3389,7 +3389,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -7884,7 +7884,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -8195,7 +8195,7 @@
           {
             "name": "infohash",
             "in": "path",
-            "description": "The torrent's v1 infohash, 40 hex digits in either case.",
+            "description": "The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex\ndigits in either case.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/InfoHashHex"
@@ -9962,13 +9962,13 @@
         "maxLength": 40,
         "minLength": 40,
         "pattern": "^[0-9a-fA-F]{40}$",
-        "description": "A torrent's v1 infohash as the API spells it: 40 hex digits.\n\nEmitted lowercase; accepted in either case, in a path and in a body alike.\nAnything else is refused where it is parsed — a `400` in a path, a `422`\nin a body — before a handler sees it."
+        "description": "A torrent's infohash as the API spells it: 40 hex digits.\n\nA torrent is named by its v1 infohash, a hybrid (v1+v2) torrent's\nincluded; only a v2-only torrent, which has none, is named by its v2\ninfohash truncated to its first 20 bytes.\n\nEmitted lowercase; accepted in either case, in a path and in a body alike.\nAnything else is refused where it is parsed — a `400` in a path, a `422`\nin a body — before a handler sees it."
       },
       "TorrentSummary": {
         "properties": {
           "infohash": {
             "$ref": "#/components/schemas/InfoHashHex",
-            "description": "The torrent's v1 infohash."
+            "description": "The torrent's v1 infohash, or for a v2-only torrent its v2 infohash\ntruncated to 20 bytes."
           },
           "profile_id": {
             "type": "string",
