@@ -119,10 +119,12 @@ pub struct Testing;
 /// wraps the body read as well as the handler — kynos runs interceptors in the
 /// order they are added, outermost first, and a timeout mounted after
 /// `BodySize` would bound the handler alone. It bounds the handler's awaits
-/// too, which is why the one operation that awaits minutes of work,
-/// `POST /v1/pool/plans/{plan_id}/apply`, is mounted with `untimed`: every
-/// other part of it needs `write`, so an unauthenticated slow body never
-/// reaches it.
+/// too, which is why the operations that may await minutes of work are
+/// mounted with `untimed`: applying a plan, and adopting or creating a plan,
+/// which wait on the pool index's writer that a scan holds for its whole run.
+/// A deadline there answers `408` while the work goes on to completion, and
+/// the client never learns its outcome. Each needs `write`, so an
+/// unauthenticated slow body never reaches one.
 macro_rules! v1_group {
     () => {
         kynos::router::group::Group::new(crate::http::v1::PREFIX)

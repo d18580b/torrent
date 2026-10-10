@@ -6808,7 +6808,7 @@
           "pool"
         ],
         "summary": "Compute a mutation plan.",
-        "description": "Works out every step the change would take and stores them as a `draft`,\ntouching nothing on disk; `POST …/apply` performs it. The planner refuses\nwith `409 plan-refused` when the change is unsafe as the index stands — an\noverlap, drift, an occupied destination, a torrent not in the index.\n\nRefused with `403 mutations-disabled` unless `[pool] allow_mutations` is\nset. Creating a plan touches nothing, but a plan that can never be applied\nis a trap, and refusing where the operator asks is the clearer signal.",
+        "description": "Works out every step the change would take and stores them as a `draft`,\ntouching nothing on disk; `POST …/apply` performs it. The planner refuses\nwith `409 plan-refused` when the change is unsafe as the index stands — an\noverlap, drift, an occupied destination, a torrent not in the index.\n\nRefused with `403 mutations-disabled` unless `[pool] allow_mutations` is\nset. Creating a plan touches nothing, but a plan that can never be applied\nis a trap, and refusing where the operator asks is the clearer signal.\n\nThe request has no deadline: the plan is written to the index, so it\nwaits for a running scan to finish before it answers.",
         "operationId": "create_plan",
         "requestBody": {
           "content": {
@@ -7072,28 +7072,6 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
                         }
                       }
                     }
@@ -8549,13 +8527,298 @@
         ]
       }
     },
+    "/v1/pool/verifications": {
+      "post": {
+        "tags": [
+          "pool"
+        ],
+        "summary": "Re-hash loaded torrents.",
+        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session, or paused (libtorrent does\nnot hash a paused torrent), is skipped with the reason. Only a torrent in\nthe pool index has its outcome recorded: a pass marks it `adopted`, a\nfailure marks it `drifted` and pauses it.",
+        "operationId": "verify_pool_torrents",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Entity; The request is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "the request was accepted, and the processing it asked for has not completed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The pool is not configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          }
+        ]
+      }
+    },
     "/v1/pool/adoptions": {
       "post": {
         "tags": [
           "pool"
         ],
         "summary": "Adopt existing payload.",
-        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.",
+        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.\n\nThe request has no deadline and answers once every target is adopted or\nrefused: a large subtree, or a running scan holding the index, keeps it\nopen for as long as that takes.",
         "operationId": "adopt_pool_torrents",
         "requestBody": {
           "content": {
@@ -8853,313 +9116,6 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer": [
-              "write"
-            ]
-          }
-        ]
-      }
-    },
-    "/v1/pool/verifications": {
-      "post": {
-        "tags": [
-          "pool"
-        ],
-        "summary": "Re-hash loaded torrents.",
-        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session, or paused (libtorrent does\nnot hash a paused torrent), is skipped with the reason. Only a torrent in\nthe pool index has its outcome recorded: a pass marks it `adopted`, a\nfailure marks it `drifted` and pauses it.",
-        "operationId": "verify_pool_torrents",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/VerifyRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "401": {
-            "description": "Unauthorized",
-            "headers": {
-              "WWW-Authenticate": {
-                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
-                "schema": {
-                  "type": "string"
-                },
-                "example": "Bearer"
-              }
-            },
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "oneOf": [
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "about:blank"
-                            }
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad Request",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Unsupported Media Type",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Unprocessable Entity; The request is invalid",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "oneOf": [
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "about:blank"
-                            }
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "202": {
-            "description": "the request was accepted, and the processing it asked for has not completed",
-            "headers": {
-              "X-Request-Id": {
-                "description": "The identifier this request is correlated by",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
-                "required": true,
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
-                "required": true,
-                "schema": {
-                  "type": "string"
-                }
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/VerifyResult"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "The pool is not configured",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
                         }
                       }
                     }
@@ -11287,6 +11243,75 @@
         ],
         "description": "The state to set a profile to."
       },
+      "VerifyRequest": {
+        "properties": {
+          "infohashes": {
+            "items": {
+              "$ref": "#/components/schemas/InfoHashHex"
+            },
+            "type": "array",
+            "maxItems": 1000,
+            "minItems": 1,
+            "description": "Between 1 and 1000 loaded torrents."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "infohashes"
+        ],
+        "description": "Torrents to re-hash."
+      },
+      "RefusedTorrent": {
+        "properties": {
+          "infohash": {
+            "$ref": "#/components/schemas/InfoHashHex",
+            "description": "The torrent."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it was not acted on, in prose for an operator."
+          }
+        },
+        "type": "object",
+        "required": [
+          "infohash",
+          "reason"
+        ],
+        "description": "A torrent an adoption or verification did not act on, and why."
+      },
+      "VerifyResult": {
+        "properties": {
+          "requested": {
+            "type": "integer",
+            "maximum": 4294967295.0,
+            "minimum": 0.0,
+            "format": "uint32",
+            "description": "How many infohashes the request named."
+          },
+          "started": {
+            "items": {
+              "$ref": "#/components/schemas/InfoHashHex"
+            },
+            "type": "array",
+            "description": "Torrents libtorrent is now re-hashing."
+          },
+          "skipped": {
+            "items": {
+              "$ref": "#/components/schemas/RefusedTorrent"
+            },
+            "type": "array",
+            "description": "Torrents not re-hashed, each with the reason."
+          }
+        },
+        "type": "object",
+        "required": [
+          "requested",
+          "started",
+          "skipped"
+        ],
+        "description": "Which re-hashes started."
+      },
       "AdoptSelector": {
         "oneOf": [
           {
@@ -11367,24 +11392,6 @@
         ],
         "description": "A request to adopt existing payload into a profile."
       },
-      "RefusedTorrent": {
-        "properties": {
-          "infohash": {
-            "$ref": "#/components/schemas/InfoHashHex",
-            "description": "The torrent."
-          },
-          "reason": {
-            "type": "string",
-            "description": "Why it was not acted on, in prose for an operator."
-          }
-        },
-        "type": "object",
-        "required": [
-          "infohash",
-          "reason"
-        ],
-        "description": "A torrent an adoption or verification did not act on, and why."
-      },
       "AdoptionResult": {
         "properties": {
           "dry_run": {
@@ -11428,57 +11435,6 @@
           "verify_bytes"
         ],
         "description": "What an adoption did, or would do."
-      },
-      "VerifyRequest": {
-        "properties": {
-          "infohashes": {
-            "items": {
-              "$ref": "#/components/schemas/InfoHashHex"
-            },
-            "type": "array",
-            "maxItems": 1000,
-            "minItems": 1,
-            "description": "Between 1 and 1000 loaded torrents."
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "infohashes"
-        ],
-        "description": "Torrents to re-hash."
-      },
-      "VerifyResult": {
-        "properties": {
-          "requested": {
-            "type": "integer",
-            "maximum": 4294967295.0,
-            "minimum": 0.0,
-            "format": "uint32",
-            "description": "How many infohashes the request named."
-          },
-          "started": {
-            "items": {
-              "$ref": "#/components/schemas/InfoHashHex"
-            },
-            "type": "array",
-            "description": "Torrents libtorrent is now re-hashing."
-          },
-          "skipped": {
-            "items": {
-              "$ref": "#/components/schemas/RefusedTorrent"
-            },
-            "type": "array",
-            "description": "Torrents not re-hashed, each with the reason."
-          }
-        },
-        "type": "object",
-        "required": [
-          "requested",
-          "started",
-          "skipped"
-        ],
-        "description": "Which re-hashes started."
       },
       "CreatePlanRequest": {
         "oneOf": [
