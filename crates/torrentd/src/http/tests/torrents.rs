@@ -1252,6 +1252,51 @@ async fn files(h: &Harness, e: &Engines) {
         .await;
     assert_problem(&resp, 404, "torrent-not-found");
     body_framework_rejections(h, "PUT", &priority(0), crate::http::v1::REQUEST_DEADLINE).await;
+
+    // A page of the largest torrent the shim admits copies that page out of
+    // the session, not the whole list: every engine call and the alert loop
+    // wait on the session lock while it copies.
+    const LARGE: u32 = 250_000;
+    let large: Vec<TorrentFile> = (0..LARGE).map(|i| file(i, &format!("d/f{i}"))).collect();
+    e.p.set_torrent_files(loaded, Some(large));
+    let mid = crate::http::page::encode(&format!("files:{}", hex(LOADED)), &file_key(124_999));
+    let page: Value = h.read(&format!("{list}?cursor={mid}")).await.json();
+    let indices: Vec<u64> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["index"].as_u64().unwrap())
+        .collect();
+    assert_eq!(indices, (125_000..125_100).collect::<Vec<u64>>());
+    assert!(page["next_cursor"].is_string());
+    // Every earlier call in this fixture read at most a dozen files.
+    assert_eq!(e.p.largest_files_copy(), 100, "copied past the page");
+    // The priority route reads the count alone.
+    h.write_json("PUT", &priority(LARGE - 1), json!({"priority": 1}))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_problem(
+        &h.write_json("PUT", &priority(LARGE), json!({"priority": 1}))
+            .await,
+        404,
+        "file-not-found",
+    );
+    assert_eq!(e.p.largest_files_copy(), 100);
+    // The last page has no cursor, and a cursor past every file, which a
+    // ten-digit key can name, is an empty last page.
+    let last = crate::http::page::encode(&format!("files:{}", hex(LOADED)), &file_key(LARGE - 3));
+    let page: Value = h.read(&format!("{list}?cursor={last}")).await.json();
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+    assert!(page["next_cursor"].is_null());
+    let past = crate::http::page::encode(&format!("files:{}", hex(LOADED)), "9999999999");
+    let page: Value = h.read(&format!("{list}?cursor={past}")).await.json();
+    assert_eq!(page["items"], json!([]));
+    assert!(page["next_cursor"].is_null());
+}
+
+/// A file listing's cursor key, as the handler spells it.
+fn file_key(index: u32) -> String {
+    format!("{index:010}")
 }
 
 async fn trackers(h: &Harness, e: &Engines) {
