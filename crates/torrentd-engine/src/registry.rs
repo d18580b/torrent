@@ -60,6 +60,22 @@ const SCHEMA_VERSION: i64 = 1;
 /// scan` opening the registry while the daemon runs — before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What a successful [`AssignmentRegistry::assign`] did.
+///
+/// A caller that goes on to load the torrent must tell the two apart: only a
+/// claim this call inserted is the caller's to release when the load fails.
+/// Releasing an [`Claim::AlreadyOurs`] claim deletes one a concurrent load of
+/// the same info-hash into the same profile made, and leaves that torrent
+/// seeding with no owner the uniqueness rule can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// This call inserted the assignment.
+    New,
+    /// The info-hash was already assigned to this same profile; nothing was
+    /// written.
+    AlreadyOurs,
+}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error(transparent)]
@@ -386,12 +402,14 @@ impl AssignmentRegistry {
     }
 
     /// Atomically assign an infohash to a profile. Conflict iff the infohash
-    /// is already mapped to *any* profile.
+    /// is already mapped to *another* profile; [`Claim::AlreadyOurs`] when it
+    /// is already mapped to this one, so a caller can tell a claim it made from
+    /// one somebody else in the same profile holds.
     ///
     /// Persisted before it is visible: a write that fails leaves the infohash
     /// unassigned in memory as on disk, so a caller that sees `Err` holds no
     /// claim to release.
-    pub fn assign(&self, ih: InfoHash, profile: ProfileId) -> Result<(), RegistryError> {
+    pub fn assign(&self, ih: InfoHash, profile: ProfileId) -> Result<Claim, RegistryError> {
         let mut conn = self.writer.lock();
         if let Some(existing) = self.inner.read().get(&ih) {
             if *existing == profile {
@@ -401,7 +419,7 @@ impl AssignmentRegistry {
                     profile_id = %profile,
                     "assign no-op (already assigned to same profile)",
                 );
-                return Ok(());
+                return Ok(Claim::AlreadyOurs);
             }
             return Err(RegistryError::Conflict {
                 infohash: ih,
@@ -443,7 +461,7 @@ impl AssignmentRegistry {
             let existing = ProfileId::new(existing);
             self.inner.write().insert(ih, existing.clone());
             if existing == profile {
-                return Ok(());
+                return Ok(Claim::AlreadyOurs);
             }
             return Err(RegistryError::Conflict {
                 infohash: ih,
@@ -459,7 +477,7 @@ impl AssignmentRegistry {
             profile_id = %profile,
             "assigned",
         );
-        Ok(())
+        Ok(Claim::New)
     }
 
     /// Remove an assignment. No-op if the infohash isn't present.
@@ -742,8 +760,9 @@ mod tests {
         let r = AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([3u8; 20]);
         let profile = ProfileId::new("x");
-        r.assign(ih, profile.clone()).unwrap();
-        r.assign(ih, profile).unwrap(); // OK, same profile
+        assert_eq!(r.assign(ih, profile.clone()).unwrap(), Claim::New);
+        // Same profile: not an error, but not this call's claim either.
+        assert_eq!(r.assign(ih, profile).unwrap(), Claim::AlreadyOurs);
         assert_eq!(r.len(), 1);
     }
 
@@ -1006,6 +1025,28 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(r.lookup(&ih), Some(ProfileId::new("other")));
+    }
+
+    /// The same row naming the caller's own profile is not a claim this call
+    /// made: the caller must not release it if its load then fails.
+    #[test]
+    fn a_row_another_process_wrote_for_the_same_profile_is_not_a_new_claim() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("registry.db");
+        let r = AssignmentRegistry::open(&db, None).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO assignment VALUES ('0101010101010101010101010101010101010101', 'mine')",
+                [],
+            )
+            .unwrap();
+        let ih = InfoHash([1u8; 20]);
+        assert_eq!(
+            r.assign(ih, ProfileId::new("mine")).unwrap(),
+            Claim::AlreadyOurs
+        );
+        assert_eq!(r.lookup(&ih), Some(ProfileId::new("mine")));
     }
 
     #[test]
