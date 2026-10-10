@@ -2307,6 +2307,10 @@ fn pool_holds_back(
 
 /// What the boot torrent-dir scan hands a session for a `.torrent` no resume
 /// data covered.
+///
+/// Hash-checked before it seeds: with no resume data nothing vouches for the
+/// payload, which may be missing or truncated, and `SEED_MODE` would announce
+/// it complete until a peer's request failed a piece.
 fn torrent_dir_scan_params(
     profile: &ProfileConfig,
     bytes: Vec<u8>,
@@ -2315,7 +2319,7 @@ fn torrent_dir_scan_params(
     AddParams::File {
         bytes,
         save_path,
-        flags: torrentd_engine::seed_flags(profile),
+        flags: torrentd_engine::verify_flags(profile),
         trackers: Vec::new(),
     }
 }

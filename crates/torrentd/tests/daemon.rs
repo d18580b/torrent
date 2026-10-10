@@ -1862,6 +1862,128 @@ fn torrent_phase(addr: &str, ih: &str) -> Option<String> {
     v["phase"].as_str().map(str::to_owned)
 }
 
+/// Issue #215's acceptance: a `.torrent` added over the API, or found in the
+/// profile's `torrent_dir` at boot, is hash-checked before it seeds.
+///
+/// Both paths used to add in libtorrent's seed mode, which assumes every
+/// piece is correct and checks no more than file sizes, so a torrent whose
+/// payload was the right length but not yet written reported `seeding` and
+/// announced itself complete until a peer's request failed a piece. Here a
+/// complete payload still reaches `seeding`; an absent, a truncated and an
+/// unwritten one over the API, and an unwritten one from the torrent-dir
+/// scan, settle `incomplete` and are never `seeding`.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn an_add_whose_payload_is_absent_or_wrong_is_never_reported_seeding() {
+    use base64::Engine as _;
+    use sha1::Digest;
+
+    // A one-file, one-piece `.torrent` named `name` over `payload`.
+    let torrent = |name: &str, payload: &[u8]| {
+        let mut t = format!(
+            "d4:infod6:lengthi{}e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+            payload.len(),
+            name.len()
+        )
+        .into_bytes();
+        t.extend_from_slice(&sha1::Sha1::digest(payload));
+        t.extend_from_slice(b"ee");
+        t
+    };
+    let hex = |t: &[u8]| libtorrent_safe::info_hash_from_torrent(t).unwrap().to_hex();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let data = p.join("data");
+    let complete = torrent("complete", b"xy");
+    std::fs::write(data.join("complete"), b"xy").unwrap();
+    let absent = torrent("absent", b"xy");
+    let truncated = torrent("truncated", b"xy");
+    std::fs::write(data.join("truncated"), b"x").unwrap();
+    // Full length, wrong bytes: a copy still in flight into a preallocated
+    // file. A size check passes it, and only hashing finds it out.
+    let unwritten = torrent("unwritten", b"xy");
+    std::fs::write(data.join("unwritten"), [0u8; 2]).unwrap();
+    let dir_unwritten = torrent("dir_unwritten", b"xy");
+    std::fs::write(data.join("dir_unwritten"), [0u8; 2]).unwrap();
+    let torrents = p.join("torrents").join(PROFILE);
+    std::fs::create_dir_all(&torrents).unwrap();
+    std::fs::write(
+        torrents.join(format!("{}.torrent", hex(&dir_unwritten))),
+        &dir_unwritten,
+    )
+    .unwrap();
+
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    for t in [&complete, &absent, &truncated, &unwritten] {
+        let (code, body) = http(
+            addr,
+            "POST",
+            "/v1/torrents",
+            Some(&format!(
+                "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"metainfo\",\
+                 \"data\":\"{}\"}}}}",
+                base64::engine::general_purpose::STANDARD.encode(t),
+            )),
+        );
+        assert_eq!(code, 201, "{body}");
+    }
+
+    let unverifiable = [
+        ("absent", hex(&absent)),
+        ("truncated", hex(&truncated)),
+        ("unwritten", hex(&unwritten)),
+        ("dir_unwritten", hex(&dir_unwritten)),
+    ];
+    let complete = hex(&complete);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut settled = torrent_phase(addr, &complete).as_deref() == Some("seeding");
+        for (name, ih) in &unverifiable {
+            let phase = torrent_phase(addr, ih);
+            assert_ne!(
+                phase.as_deref(),
+                Some("seeding"),
+                "{name}: reported seeding with its payload unverifiable",
+            );
+            settled &= phase.as_deref() == Some("incomplete");
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not settled within 60s: complete {:?}, {:?}",
+            torrent_phase(addr, &complete),
+            unverifiable
+                .iter()
+                .map(|(name, ih)| (name, torrent_phase(addr, ih)))
+                .collect::<Vec<_>>(),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
+
 /// The adoption state `GET /v1/pool/torrents` reports for `ih`.
 fn pool_state(addr: &str, ih: &str) -> Option<String> {
     let (code, body) = http(addr, "GET", "/v1/pool/torrents?limit=1000", None);

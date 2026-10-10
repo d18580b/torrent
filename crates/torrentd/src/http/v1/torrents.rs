@@ -807,11 +807,16 @@ pub async fn add_torrent(
             },
             None,
         ),
+        // Nothing vouches for a payload named only by a `.torrent`: it may be
+        // absent, still copying or truncated. Hash it before it seeds, as
+        // pool adoption does without a complete `.fastresume`; `SEED_MODE`
+        // would announce it complete (`left=0`) until a peer's request
+        // failed a piece.
         AddSource::File(bytes) => (
             AddParams::File {
                 bytes: bytes.clone(),
                 save_path,
-                flags: torrentd_engine::seed_flags(profile_cfg),
+                flags: torrentd_engine::verify_flags(profile_cfg),
                 trackers: Vec::new(),
             },
             Some(bytes),
