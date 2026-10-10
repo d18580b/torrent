@@ -949,6 +949,39 @@ fn an_adoption_lost_in_transit_is_not_offered_again() {
     };
     send(&mut state, Msg::Adopt(answer), true);
     assert!(state.adopt.is_none());
+
+    // And so is a `408`: a deadline cut the request off, not the work. The
+    // daemon's own carries `about:blank`.
+    let mut state = with_library(1, None);
+    press(&mut state, KeyCode::Char('a'), true);
+    let serial = state.adopt.as_ref().unwrap().serial;
+    send(
+        &mut state,
+        Msg::Adopt(adopt::Msg::Profiles {
+            serial,
+            result: Ok(profiles()),
+        }),
+        true,
+    );
+    press(&mut state, KeyCode::Char('j'), true);
+    press(&mut state, KeyCode::Enter, true);
+    let preview = adopt::Msg::Answered {
+        serial,
+        dry_run: true,
+        result: Ok(adoption(true)),
+    };
+    send(&mut state, Msg::Adopt(preview), true);
+    press(&mut state, KeyCode::Enter, true);
+    let answer = adopt::Msg::Answered {
+        serial,
+        dry_run: false,
+        result: Err(problem(408, "about:blank", None)),
+    };
+    assert_eq!(send(&mut state, Msg::Adopt(answer), true), 1, "a toast");
+    assert!(
+        state.adopt.is_none(),
+        "a 408 is not offered again as a refusal"
+    );
 }
 
 #[test]
