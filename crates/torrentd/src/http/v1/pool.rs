@@ -1028,6 +1028,10 @@ from_profile_problem!(AdoptError);
 ///
 /// Not gated on `[pool] allow_mutations`: adoption records an existing file's
 /// ownership and moves nothing on disk.
+///
+/// The request has no deadline and answers once every target is adopted or
+/// refused: a large subtree, or a running scan holding the index, keeps it
+/// open for as long as that takes.
 #[kynos::post("/pool/adoptions", tag = Pool)]
 pub async fn adopt_pool_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -1829,6 +1833,9 @@ pub enum CreatePlanError {
 /// Refused with `403 mutations-disabled` unless `[pool] allow_mutations` is
 /// set. Creating a plan touches nothing, but a plan that can never be applied
 /// is a trap, and refusing where the operator asks is the clearer signal.
+///
+/// The request has no deadline: the plan is written to the index, so it
+/// waits for a running scan to finish before it answers.
 #[kynos::post("/pool/plans", tag = Pool)]
 pub async fn create_plan(
     _caller: Scoped<Bearer, Write>,
@@ -2188,20 +2195,23 @@ pub(crate) use bodyless_routes;
 /// bounded by `REQUEST_DEADLINE`.
 macro_rules! body_routes {
     ($group:expr) => {
-        $group.mount(kynos::routes![
-            crate::http::v1::pool::adopt_pool_torrents,
-            crate::http::v1::pool::verify_pool_torrents,
-            crate::http::v1::pool::create_plan,
-        ])
+        $group.mount(kynos::routes![crate::http::v1::pool::verify_pool_torrents,])
     };
 }
 pub(crate) use body_routes;
 
 /// Operations whose body is bounded by `MAX_BODY_BYTES` and that may run for
-/// minutes, so carry no deadline: applying a plan waits for every step.
+/// minutes, so carry no deadline: applying a plan waits for every step, and
+/// adopting or creating a plan waits on the index's writer, which a scan
+/// holds for its whole run. Cut off by a deadline, each would answer `408`
+/// and then run to completion anyway, its outcome lost to the client.
 macro_rules! long_body_routes {
     ($group:expr) => {
-        $group.mount(kynos::routes![crate::http::v1::pool::apply_plan])
+        $group.mount(kynos::routes![
+            crate::http::v1::pool::adopt_pool_torrents,
+            crate::http::v1::pool::create_plan,
+            crate::http::v1::pool::apply_plan,
+        ])
     };
 }
 pub(crate) use long_body_routes;

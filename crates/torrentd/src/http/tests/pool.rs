@@ -169,6 +169,13 @@ const OPERATIONS: &[(&str, &str)] = &[
     ("POST", "/v1/pool/plans/1/apply"),
 ];
 
+/// The body-taking operations mounted without `REQUEST_DEADLINE`.
+const UNTIMED: &[(&str, &str)] = &[
+    ("POST", "/v1/pool/adoptions"),
+    ("POST", "/v1/pool/plans"),
+    ("POST", "/v1/pool/plans/1/apply"),
+];
+
 /// A well-formed body for each body-taking operation.
 fn body_for(method: &str, path: &str) -> Option<Value> {
     match (method, path) {
@@ -496,6 +503,80 @@ async fn every_read_answers_while_a_scan_holds_the_writer() {
 
     release_tx.send(()).unwrap();
     holder.join().unwrap();
+}
+
+#[tokio::test]
+async fn an_adoption_or_plan_waiting_on_a_scan_answers_with_its_outcome_past_the_deadline() {
+    // Adopting and creating a plan wait on the writer, which a scan holds
+    // for its whole run. Under `REQUEST_DEADLINE` either answered `408`
+    // after 30 s and then ran to completion all the same, so the client
+    // never saw the outcome and torrentctl offered the adoption again.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let held = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let w = h.tokens.write.clone();
+
+    for (path, body) in [
+        (
+            "/v1/pool/adoptions",
+            adopt(
+                "p",
+                false,
+                json!({"kind": "infohashes", "infohashes": [IH_A]}),
+            ),
+        ),
+        (
+            "/v1/pool/plans",
+            Some(json!({"kind": "delete_orphans", "root_id": root_id, "prefix": "junk"})),
+        ),
+    ] {
+        // A scan in progress.
+        let held = Arc::clone(&held);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            held.with_store_mut(|st| {
+                st.in_transaction(|_| {
+                    locked_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    Ok::<(), torrentd_pool::PoolError>(())
+                })
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        // Run the clock past the deadline while the request waits on the
+        // writer, then let the scan finish.
+        tokio::time::pause();
+        let (resp, ()) = tokio::join!(h.send("POST", path, Some(&w), body), async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(crate::http::v1::REQUEST_DEADLINE + Duration::from_secs(1)).await;
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            release_tx.send(()).unwrap();
+        });
+        tokio::time::resume();
+        holder.join().unwrap();
+
+        assert!(
+            resp.status().is_success(),
+            "{path}: answered {} once the scan finished",
+            resp.status()
+        );
+    }
+    let a = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    assert_eq!(
+        h.state.registry.lookup(&a),
+        Some(torrentd_engine::ProfileId::new("p")),
+        "adopted, and said so",
+    );
 }
 
 #[tokio::test]
@@ -1717,10 +1798,11 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
             .send(method, path, Some(&w), Some(json!({"pad": huge})))
             .await;
         assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
-        // Applying a plan waits for every step and carries no deadline, so
-        // a stalled body there is bounded by nothing but `write`; every
-        // other operation cuts one off.
-        if !path.ends_with("/apply") {
+        // Applying a plan waits for every step, and adopting or creating a
+        // plan waits on a scan, so the three carry no deadline: a stalled
+        // body there is bounded by nothing, with or without a token
+        // (`docs/running.md` §7). Every other operation cuts one off.
+        if !UNTIMED.contains(&(*method, *path)) {
             let (status, _) = h.slow_body(method, path, Some(&w)).await;
             assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
         }
