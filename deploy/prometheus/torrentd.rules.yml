@@ -233,7 +233,9 @@ groups:
 
       # ---- resume data -------------------------------------------------
       - alert: TorrentdResumeWriteErrors
-        expr: increase(torrentd_resume_write_errors_total[15m]) > 0
+        expr: >
+          increase(torrentd_resume_write_errors_total[15m]) > 0
+          or torrentd_boot_resume_write_errors > 0
         labels:
           severity: critical
         annotations:
@@ -287,7 +289,9 @@ groups:
         # torrents fails on every retry forever, while the rest keep replying.
         # This fires only when most announces fail, as in a tracker outage or
         # a tunnel that blocks them. No announces at all divides 0 by 0 and
-        # stays silent.
+        # stays silent. It reads no boot gauge: an outage keeps failing the
+        # announces that follow the first scrape, which the fraction sees, and
+        # a count fixed at boot would skew the fraction for the process's life.
         expr: |
           sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind="error"}[30m]))
             / sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind=~"error|reply"}[30m]))
@@ -299,7 +303,9 @@ groups:
           summary: "Most tracker announces for profile {{ $labels.profile_id }} have been failing for 30 minutes"
 
       - alert: TorrentdTrackerWarnings
-        expr: increase(torrentd_tracker_alerts_total{kind=~"warning|scrape_failed"}[1h]) > 0
+        expr: >
+          increase(torrentd_tracker_alerts_total{kind=~"warning|scrape_failed"}[1h]) > 0
+          or torrentd_boot_tracker_alerts > 0
         labels:
           severity: info
         annotations:
@@ -327,15 +333,22 @@ groups:
           or increase(torrentd_torrent_add_errors_total[15m]) > 0
           or increase(torrentd_storage_move_failures_total[15m]) > 0
           or increase(torrentd_disk_error_retry_errors_total[15m]) > 0
+          or torrentd_boot_torrent_errors > 0
+          or torrentd_boot_torrent_add_errors > 0
         labels:
           severity: warning
         annotations:
           summary: "Torrents in profile {{ $labels.profile_id }} are failing"
 
       - alert: TorrentdDiskErrors
+        # The appearance clause misses a boot that restarts within 15 minutes
+        # of the last: the previous run's series, under the same labels, is
+        # still there at the offset. The boot gauge carries what the boot
+        # counted whatever ran before it.
         expr: >
           increase(torrentd_disk_errors_total[15m]) > 0
           or (torrentd_disk_errors_total unless torrentd_disk_errors_total offset 15m)
+          or torrentd_boot_disk_errors > 0
         labels:
           severity: warning
         annotations:

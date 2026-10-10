@@ -209,6 +209,21 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_dir_fsync_errors" Gauge Daemon Owner("always") =>
         "dir_fsync_errors_total as of the first scrape, which already holds what the boot \
          counted; fixed for the life of the process.";
+    "boot_torrent_add_errors" Gauge Profile Owner("always") =>
+        "torrent_add_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_torrent_errors" Gauge Profile Owner("always") =>
+        "torrent_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_resume_write_errors" Gauge Profile Owner("always") =>
+        "resume_write_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_tracker_alerts" Gauge Profile ("kind": BOOT_TRACKER_KINDS) Owner("always") =>
+        "tracker_alerts_total for these kinds as of the first scrape, which already holds what \
+         the boot counted; fixed for the life of the process.";
+    "boot_disk_errors" Gauge Profile ("op": &[]) OnFirstEvent =>
+        "disk_errors_total as of the first scrape, for each operation the boot counted one \
+         under; fixed for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -338,6 +353,13 @@ pub const CATALOGUE: &[Series] = catalogue! {
 /// reads, and so the ones `boot_session_alerts` carries.
 pub const BOOT_SESSION_KINDS: &[&str] = &["portmap_error", "udp_error", "fastresume_rejected"];
 
+/// The `kind` values of `tracker_alerts_total` that `TorrentdTrackerWarnings`
+/// reads, and so the ones `boot_tracker_alerts` carries. `error` and `reply`
+/// are left out: `TorrentdTrackerErrors` reads them only as a fraction of
+/// announces over half an hour, which the announces after the first scrape
+/// carry on their own, and a fixed boot count would skew.
+pub const BOOT_TRACKER_KINDS: &[&str] = &["warning", "scrape_failed"];
+
 /// A counter an alert reads that a boot moves before anything can scrape it,
 /// and the gauge [`PromSink::render`] exports its first-scrape count as.
 #[derive(Clone, Copy, Debug)]
@@ -352,7 +374,14 @@ pub struct BootCount {
 /// See the module docs. The registry is written by both boot scans, the
 /// alert loop starts before the first scrape and counts overflows, alerts it
 /// could not translate, and session alerts from the scans' backlog, and the stores and their
-/// directory fsyncs are written by both.
+/// directory fsyncs are written by both. The same backlog holds the adds
+/// libtorrent rejected, the torrents that entered its error state, the file
+/// errors it raised, the resume data it produced that could not be written,
+/// and the trackers' first answers.
+///
+/// `disk_errors_total` appears with its first event, so its gauge does too:
+/// only for the operations the boot counted one under. `tracker_alerts_total`
+/// is mirrored only for the kinds in [`BOOT_TRACKER_KINDS`].
 pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: "profile_assignment_registry_errors_total",
@@ -382,6 +411,31 @@ pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: DIR_FSYNC_ERRORS,
         gauge: "boot_dir_fsync_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "torrent_add_errors_total",
+        gauge: "boot_torrent_add_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "torrent_errors_total",
+        gauge: "boot_torrent_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "resume_write_errors_total",
+        gauge: "boot_resume_write_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "tracker_alerts_total",
+        gauge: "boot_tracker_alerts",
+        only: Some(("kind", BOOT_TRACKER_KINDS)),
+    },
+    BootCount {
+        counter: "disk_errors_total",
+        gauge: "boot_disk_errors",
         only: None,
     },
 ];
@@ -523,8 +577,10 @@ impl PromSink {
     /// Run once, by the first render: everything counted before it is in the
     /// first sample of the counter, where `increase()` cannot see it, and
     /// everything after it is a rise from that sample, where it can. Each
-    /// counter was seeded at boot for every configured profile and label
-    /// value, so every gauge is written, at zero where nothing was counted.
+    /// seeded counter was written at boot for every configured profile and
+    /// label value, so its gauge is written for each, at zero where nothing
+    /// was counted. A first-event counter has children only where something
+    /// was counted, and so its gauge too.
     fn export_boot_counts(&self) {
         for b in BOOT_COUNTS {
             let Some(counter) = self.counters.lock().get(b.counter).cloned() else {
@@ -935,14 +991,20 @@ mod tests {
     }
 
     #[test]
-    fn every_boot_count_mirrors_a_catalogued_counter_with_a_gauge_present_from_boot() {
+    fn every_boot_count_mirrors_a_catalogued_counter_with_a_gauge_present_as_it_is() {
         for b in BOOT_COUNTS {
             let counter = catalogued(b.counter).expect("counter catalogued");
             let gauge = catalogued(b.gauge).expect("gauge catalogued");
             assert_eq!(counter.kind, MetricType::Counter, "{}", b.counter);
-            assert_eq!(counter.seed, Seed::Zero, "{} is seeded", b.counter);
             assert_eq!(gauge.kind, MetricType::Gauge, "{}", b.gauge);
-            assert_eq!(gauge.seed, Seed::Owner("always"), "{}", b.gauge);
+            // Present from boot where the counter is seeded; where it appears
+            // with its first event, so does the gauge.
+            let present = match counter.seed {
+                Seed::Zero => Seed::Owner("always"),
+                Seed::OnFirstEvent => Seed::OnFirstEvent,
+                Seed::Owner(_) => panic!("{} is neither seeded nor first-event", b.counter),
+            };
+            assert_eq!(gauge.seed, present, "{}", b.gauge);
             assert_eq!(gauge.scope, counter.scope, "{}", b.gauge);
             // The gauge carries the counter's label, with the values `only`
             // keeps where it keeps some.
@@ -981,6 +1043,15 @@ mod tests {
         // test above.
         let fsyncs = torrentd_engine::batch_writer::dir_fsync_errors() + 4;
         sink.export_dir_fsync_errors(fsyncs);
+        sink.inc_counter("torrent_add_errors_total", &p);
+        sink.add_counter("torrent_errors_total", 3, &p);
+        sink.add_counter("resume_write_errors_total", 2, &p);
+        let tracker = |k| [("profile_id", "a"), ("kind", k)];
+        sink.add_counter("tracker_alerts_total", 4, &tracker("warning"));
+        sink.inc_counter("tracker_alerts_total", &tracker("scrape_failed"));
+        sink.add_counter("tracker_alerts_total", 9, &tracker("error"));
+        let disk = |op| [("profile_id", "a"), ("op", op)];
+        sink.add_counter("disk_errors_total", 2, &disk("file_open"));
 
         let first = String::from_utf8(sink.render()).unwrap();
         let a = "{profile_id=\"a\"}";
@@ -1011,6 +1082,20 @@ mod tests {
                 "0",
             ),
             ("boot_dir_fsync_errors", String::new(), &fsyncs.to_string()),
+            ("boot_torrent_add_errors", a.to_string(), "1"),
+            ("boot_torrent_add_errors", b.to_string(), "0"),
+            ("boot_torrent_errors", a.to_string(), "3"),
+            ("boot_torrent_errors", b.to_string(), "0"),
+            ("boot_resume_write_errors", a.to_string(), "2"),
+            ("boot_resume_write_errors", b.to_string(), "0"),
+            ("boot_tracker_alerts", session("a", "warning"), "4"),
+            ("boot_tracker_alerts", session("a", "scrape_failed"), "1"),
+            ("boot_tracker_alerts", session("b", "warning"), "0"),
+            (
+                "boot_disk_errors",
+                "{op=\"file_open\",profile_id=\"a\"}".to_string(),
+                "2",
+            ),
         ];
         for (name, labels, value) in &expected {
             assert_eq!(
@@ -1029,13 +1114,35 @@ mod tests {
             None,
             "{first}"
         );
+        // Nor one the tracker-warnings alert reads.
+        assert_eq!(
+            sample(&first, "boot_tracker_alerts", &session("a", "error")),
+            None,
+            "{first}"
+        );
+        // A first-event counter's gauge exists only where it counted.
+        assert!(
+            !first.contains("torrentd_boot_disk_errors{op=\"file_open\",profile_id=\"b\"}"),
+            "{first}"
+        );
 
         // What is counted after the first scrape rises from its sample, where
         // increase() sees it; the boot gauges stay as they were.
         sink.add_counter("profile_assignment_registry_errors_total", 5, &p);
         sink.add_counter("session_alerts_total", 5, &kind("fastresume_rejected"));
         sink.export_dir_fsync_errors(fsyncs + 1);
+        sink.inc_counter("resume_write_errors_total", &p);
+        sink.inc_counter("disk_errors_total", &disk("file_write"));
         let later = String::from_utf8(sink.render()).unwrap();
+        assert_eq!(
+            sample(
+                &later,
+                "boot_disk_errors",
+                "{op=\"file_write\",profile_id=\"a\"}"
+            ),
+            None,
+            "a first event after the first scrape is increase()'s to see:\n{later}"
+        );
         for (name, labels, value) in &expected {
             assert_eq!(
                 sample(&later, name, labels).as_deref(),
