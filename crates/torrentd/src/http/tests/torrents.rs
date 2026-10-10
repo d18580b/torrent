@@ -2015,6 +2015,96 @@ async fn one_foreign_tracker_refuses_a_torrent_whatever_else_it_announces_to() {
     );
 }
 
+/// A one-file `.torrent` announcing to `url` alone; `name` sets its infohash.
+fn announcing(url: &str, name: char) -> Vec<u8> {
+    let mut t = format!(
+        "d8:announce{}:{url}4:infod6:lengthi1e4:name1:{name}12:piece lengthi16384e6:pieces20:",
+        url.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// Issue 166: account B's profile, bound to B's passkey, refuses account A's
+/// torrent on every source `POST /v1/torrents` takes — a `.torrent` in the
+/// body, one on disk (`server_path`), a magnet's `tr=` — though A's tracker
+/// is on B's domain list, and says why in the detail. B's own is added.
+#[tokio::test]
+async fn another_accounts_passkey_is_refused_on_every_api_source() {
+    const A: &str = "https://tracker.allowed.example/PASS-A/announce";
+    const B: &str = "https://tracker.allowed.example/PASS-B/announce";
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(MockEngine::new());
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let mut b = test_host_entry("acct_b").config;
+        b.allowed_tracker_domains = vec!["tracker.allowed.example".to_owned()];
+        b.allowed_tracker_urls = vec!["https://tracker.allowed.example/PASS-B/".to_owned()];
+        s.profiles = Arc::new(ProfileRegistry::new(vec![ProfileEntry::new(
+            b,
+            engine.clone(),
+            None,
+            None,
+            0,
+        )]));
+        s.source = Arc::new(ProfileSource::new(vec![(
+            ProfileId::new("acct_b"),
+            engine.clone() as Arc<dyn TorrentEngine>,
+        )]));
+        s.registry = Arc::new(AssignmentRegistry::new_empty(dir.path().join("reg.json")));
+        s.default_save_path = dir.path().to_path_buf();
+        s.torrent_dir = dir.path().to_path_buf();
+    });
+    let foreign_account = |resp: &TestResponse| {
+        assert_problem(resp, 422, "tracker-not-allowed");
+        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        assert!(detail.contains("allowed_tracker_urls"), "{detail}");
+    };
+
+    foreign_account(
+        &h.write_json(
+            "POST",
+            "/v1/torrents",
+            metainfo("acct_b", &announcing(A, 'a')),
+        )
+        .await,
+    );
+    let on_disk = dir.path().join("a.torrent");
+    std::fs::write(&on_disk, announcing(A, 'd')).unwrap();
+    foreign_account(
+        &h.write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "acct_b", "source": {"kind": "server_path", "path": on_disk}}),
+        )
+        .await,
+    );
+    let tr = A.replace(':', "%3A").replace('/', "%2F");
+    foreign_account(
+        &h.write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "acct_b", "source": {"kind": "magnet", "uri": format!("{MAGNET}&tr={tr}")}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap()),
+        None
+    );
+
+    h.write_json(
+        "POST",
+        "/v1/torrents",
+        metainfo("acct_b", &announcing(B, 'b')),
+    )
+    .await
+    .assert_status(StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn a_server_path_that_is_a_symlink_is_refused_even_to_a_real_torrent() {
     // The path is opened once, refusing a symlink at the last component, and

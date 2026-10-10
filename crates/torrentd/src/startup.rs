@@ -5596,6 +5596,94 @@ mod tests {
         }
     }
 
+    /// Issue 166: both boot scans hold what they add to the profile's account
+    /// binding. Account A's torrent, in account B's resume directory (with
+    /// and without its `.torrent`) or torrent directory, is refused and
+    /// counted though A's tracker is on B's domain list; B's own loads.
+    #[test]
+    fn both_boot_scans_refuse_another_accounts_passkey() {
+        let mut profile =
+            crate::profile_registry::test_entry("acct_b", ProfileStatus::Active).config;
+        profile.allowed_tracker_domains = vec!["tracker.example".to_owned()];
+        profile.allowed_tracker_urls = vec!["https://tracker.example/PASS-B/".to_owned()];
+        let torrent = |passkey: &str| {
+            let url = format!("https://tracker.example/{passkey}/announce");
+            let mut t = format!(
+                "d8:announce{}:{url}4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:",
+                url.len()
+            )
+            .into_bytes();
+            t.extend_from_slice(&[0u8; 20]);
+            t.extend_from_slice(b"ee");
+            t
+        };
+        let resume = |torrent: &[u8], trackers: Option<&str>| {
+            let ih = libtorrent_safe::info_hash_from_torrent(torrent).unwrap();
+            let mut r = b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:"
+                .to_vec();
+            r.extend_from_slice(&ih.0);
+            if let Some(url) = trackers {
+                r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
+            }
+            r.push(b'e');
+            (ih, r)
+        };
+        let metrics = PromSink::new();
+        let (a, b) = (torrent("PASS-A"), torrent("PASS-B"));
+        let a_url = "https://tracker.example/PASS-A/announce";
+
+        let (ih, data) = resume(&a, None);
+        let scans = [
+            (
+                ih,
+                resume_scan_params(&profile, data, Some(a.clone())),
+                "resume",
+            ),
+            (
+                ih,
+                resume_scan_params(&profile, resume(&b, Some(a_url)).1, None),
+                "resume",
+            ),
+            (
+                ih,
+                torrent_dir_scan_params(&profile, a.clone(), "/data".into()),
+                "torrent_dir",
+            ),
+        ];
+        for (ih, params, scan) in &scans {
+            assert!(
+                matches!(
+                    boot_scan_guard(&metrics, &profile, ih, params, scan),
+                    Err(torrentd_engine::TrackerRefusal::ForeignAccount)
+                ),
+                "{scan}"
+            );
+        }
+        let (ih, data) = resume(&b, None);
+        boot_scan_guard(
+            &metrics,
+            &profile,
+            &ih,
+            &resume_scan_params(&profile, data, Some(b.clone())),
+            "resume",
+        )
+        .unwrap();
+        boot_scan_guard(
+            &metrics,
+            &profile,
+            &ih,
+            &torrent_dir_scan_params(&profile, b, "/data".into()),
+            "torrent_dir",
+        )
+        .unwrap();
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            text.lines().any(|l| l
+                .ends_with("profile_assignment_registry_errors_total{profile_id=\"acct_b\"} 3")),
+            "{text}"
+        );
+    }
+
     /// The kill-switch watch, started before the scans, fencing on a check
     /// that finds the ruleset flushed mid-scan (`Fence::fence_all`, as its
     /// check does on `Absent`): what the scans added is paused, though its
