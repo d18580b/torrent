@@ -937,7 +937,7 @@ pub async fn run_verify_queue(
         // 1) Retire anything that finished hashing.
         retire_in_flight(&pool, &*source, &state);
         // 1a) Free the slots of re-hashes whose check has ended.
-        retire_checking(q, &state);
+        retire_checking(q, &state, RECHECK_EXPIRY);
         // 1b) Retire re-hashes of loaded torrents, once a check that finished
         //     after the request is in. One that finished before it is the
         //     previous check, and says nothing about this one.
@@ -988,6 +988,9 @@ fn admit(
     // otherwise be met again in the same tick.
     let mut recheck_budget = q.pending_rechecks.len();
     let mut recheck_next = false;
+    // Profiles whose held re-hashes this tick has logged already: one line
+    // per profile per tick, not one per re-hash it holds.
+    let mut held_logged = std::collections::HashSet::new();
     while (adoptions || rechecks) && q.in_flight() < q.limit {
         if rechecks && (recheck_next || !adoptions) {
             if recheck_budget == 0 {
@@ -995,7 +998,7 @@ fn admit(
                 continue;
             }
             recheck_budget -= 1;
-            match admit_recheck(q, &**source, state, profiles) {
+            match admit_recheck(q, &**source, state, profiles, &mut held_logged) {
                 Admission::Admitted => recheck_next = false,
                 Admission::Skipped => {}
                 Admission::Stop => rechecks = false,
@@ -1017,12 +1020,14 @@ fn admit(
 /// loaded, paused, or without metadata is dropped, since libtorrent would not
 /// hash it and it would hold a slot for nothing. One whose profile went off
 /// the network is put back, as an adoption is held, because a re-hash puts
-/// the torrent back on the network once it ends.
+/// the torrent back on the network once it ends. The hold is logged once per
+/// profile per tick: `held_logged` names the profiles already logged.
 fn admit_recheck(
     q: &VerifyQueue,
     source: &dyn AlertSource,
     state: &StateMap,
     profiles: &crate::profile_registry::ProfileRegistry,
+    held_logged: &mut std::collections::HashSet<ProfileId>,
 ) -> Admission {
     let Some(r) = q.pending_rechecks.lock().pop_front() else {
         return Admission::Stop;
@@ -1041,13 +1046,15 @@ fn admit_recheck(
         .active()
         .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
     if fenced || profiles.held_offline(&st.profile_id) {
-        warn!(
-            target: "torrentd::pool",
-            profile_id = %st.profile_id,
-            infohash = %r.infohash,
-            reason = if fenced { "vpn_down" } else { "offline" },
-            "re-hash held: profile is off the network",
-        );
+        if held_logged.insert(st.profile_id.clone()) {
+            warn!(
+                target: "torrentd::pool",
+                profile_id = %st.profile_id,
+                infohash = %r.infohash,
+                reason = if fenced { "vpn_down" } else { "offline" },
+                "re-hash held: profile is off the network",
+            );
+        }
         q.pending_rechecks.lock().push_back(r);
         return Admission::Skipped;
     }
@@ -1274,25 +1281,27 @@ fn retire_in_flight(pool: &PoolService, source: &dyn AlertSource, state: &StateM
 /// ones whose verdict is recorded to [`retire_rechecks`].
 ///
 /// A check has ended once one finished after the re-hash started. One paused
-/// while it checked stops hashing, so it frees its slot too, and its verdict
-/// is still waited for: libtorrent finishes the check once it is resumed. One
-/// removed has nothing left to hash. One older than [`RECHECK_EXPIRY`] lost
-/// its check, and is forgotten rather than hold a slot for the life of the
+/// while it checked keeps its slot, as a paused adoption does: libtorrent
+/// goes on with the check once the torrent is resumed (a fence lifting,
+/// resume-all, a disk-error retry), and a slot freed at the pause would let
+/// that check run beside `limit` others. One removed has nothing left to
+/// hash. One older than `expiry` ([`RECHECK_EXPIRY`] in the worker) lost its
+/// check, and is forgotten rather than hold a slot for the life of the
 /// process.
-fn retire_checking(q: &VerifyQueue, state: &StateMap) {
+fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
     let mut ended = Vec::new();
     q.checking.lock().retain(|(r, started)| {
         let Some(st) = libtorrent_safe::InfoHash::from_hex(&r.infohash).and_then(|h| state.get(&h))
         else {
             return false;
         };
-        if st.checked_at.is_some_and(|t| t > *started) || st.phase == TorrentPhase::Paused {
+        if st.checked_at.is_some_and(|t| t > *started) {
             if r.record {
                 ended.push((r.infohash.clone(), *started));
             }
             return false;
         }
-        if started.elapsed() >= RECHECK_EXPIRY {
+        if started.elapsed() >= expiry {
             warn!(
                 target: "torrentd::pool",
                 infohash = %r.infohash,
@@ -3257,7 +3266,7 @@ mod tests {
 
         /// One verify tick's slot accounting and admission.
         fn tick(&self, pool: &super::PoolService) {
-            super::retire_checking(pool.verify_queue(), &self.state);
+            super::retire_checking(pool.verify_queue(), &self.state, super::RECHECK_EXPIRY);
             super::admit(
                 pool,
                 &self.source,
@@ -3360,7 +3369,8 @@ mod tests {
     /// The worker checks a waiting re-hash again when it starts it: one
     /// whose profile is fenced is held, and one no longer loaded, paused, or
     /// without metadata is dropped, none of them taking a slot. One paused
-    /// while it checks frees its slot, and its verdict is still waited for.
+    /// while it checks keeps its slot until the check ends, and its verdict
+    /// is waited for.
     #[test]
     fn a_rechecks_admission_holds_or_drops_what_libtorrent_would_not_hash() {
         let dir = tempfile::tempdir().unwrap();
@@ -3391,12 +3401,176 @@ mod tests {
         assert_eq!(w.rechecked(), [ok]);
         assert_eq!(q.depth(), 1);
 
-        // Paused mid-check: the slot is free, the verdict still awaited.
+        // Paused mid-check: libtorrent goes on with the check once the
+        // torrent is resumed, so the slot stays taken until it ends.
         let mut st = w.state.get(&ok).unwrap();
         st.phase = TorrentPhase::Paused;
         w.state.insert(ok, st);
         w.tick(&pool);
+        assert_eq!(q.in_flight(), 1, "a paused check keeps its slot");
+        // Resumed, and the check it went on with ends: the slot is free, and
+        // the verdict awaited.
+        let mut st = w.state.get(&ok).unwrap();
+        st.phase = TorrentPhase::Seeding;
+        w.state.insert(ok, st);
+        w.finish_check(ok);
+        w.tick(&pool);
         assert_eq!(q.in_flight(), 0);
         assert!(q.tracks_recheck(&ok.to_hex()));
+    }
+
+    /// A re-hash paused while it checks holds its slot, so with
+    /// `max_concurrent_verify = 1` the next waits for it: a pause and resume
+    /// cannot put a second check beside it.
+    #[test]
+    fn a_rehash_paused_mid_check_keeps_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(1);
+        let w = Worker::new(dir.path());
+        let [first, second] = [0xE1, 0xE2].map(|b| InfoHash([b; 20]));
+        w.load(first, 1, "p", TorrentPhase::Seeding);
+        w.load(second, 2, "p", TorrentPhase::Seeding);
+        let q = pool.verify_queue();
+        q.enqueue_recheck(first.to_hex(), false);
+        q.enqueue_recheck(second.to_hex(), false);
+
+        w.tick(&pool);
+        assert_eq!(w.rechecked(), [first]);
+        let mut st = w.state.get(&first).unwrap();
+        st.phase = TorrentPhase::Paused;
+        w.state.insert(first, st);
+        for _ in 0..3 {
+            w.tick(&pool);
+        }
+        assert_eq!(
+            w.rechecked(),
+            [first],
+            "the second waits for the paused check"
+        );
+        assert_eq!((q.in_flight(), q.depth()), (1, 1));
+
+        w.finish_check(first);
+        w.tick(&pool);
+        assert_eq!(w.rechecked(), [first, second]);
+        assert_eq!((q.in_flight(), q.depth()), (1, 0));
+    }
+
+    /// A started re-hash whose torrent is removed frees its slot with no
+    /// verdict left to await, and one whose check never reports its end
+    /// frees it once the expiry passes, and not before.
+    #[test]
+    fn a_rehash_frees_its_slot_when_removed_or_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let [removed, silent] = [0xF1, 0xF2].map(|b| InfoHash([b; 20]));
+        w.load(removed, 1, "p", TorrentPhase::Seeding);
+        w.load(silent, 2, "p", TorrentPhase::Seeding);
+        let q = pool.verify_queue();
+        q.enqueue_recheck(removed.to_hex(), true);
+        q.enqueue_recheck(silent.to_hex(), true);
+        w.tick(&pool);
+        assert_eq!(w.rechecked(), [removed, silent]);
+        assert_eq!(q.in_flight(), 2);
+
+        w.state.remove(&removed, &ProfileId::new("p"), None);
+        super::retire_checking(q, &w.state, super::RECHECK_EXPIRY);
+        assert_eq!(q.in_flight(), 1, "the removed torrent's slot is free");
+        assert!(
+            !q.tracks_recheck(&removed.to_hex()),
+            "nothing left to record"
+        );
+
+        // Inside the expiry, the silent check keeps its slot.
+        super::retire_checking(q, &w.state, Duration::from_secs(3600));
+        assert_eq!(q.in_flight(), 1);
+        // Past it, the slot is freed and the re-hash forgotten.
+        std::thread::sleep(Duration::from_millis(2));
+        super::retire_checking(q, &w.state, Duration::from_millis(1));
+        assert_eq!(q.in_flight(), 0);
+        assert!(!q.tracks_recheck(&silent.to_hex()));
+    }
+
+    /// With adoptions and re-hashes both waiting, the worker admits them in
+    /// turn, so neither backlog starves the other: each free slot goes to
+    /// the other kind than the last one admitted.
+    #[test]
+    fn adoptions_and_rehashes_waiting_together_are_admitted_in_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let q = pool.verify_queue();
+        for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+            let mut t =
+                format!("d4:infod6:lengthi1e4:name1:{name}12:piece lengthi16384e6:pieces20:")
+                    .into_bytes();
+            t.extend_from_slice(&[0u8; 20]);
+            t.extend_from_slice(b"ee");
+            let path = dir.path().join(format!("{name}.torrent"));
+            std::fs::write(&path, t).unwrap();
+            q.enqueue(super::PendingVerify {
+                torrent_path: path,
+                save_path: dir.path().to_path_buf(),
+                ..pending(InfoHash([0xA0 + i as u8; 20]), "p")
+            });
+        }
+        let rehashes = [0xB0, 0xB1, 0xB2].map(|b| InfoHash([b; 20]));
+        for (i, ih) in rehashes.iter().enumerate() {
+            w.load(*ih, i as u64 + 1, "p", TorrentPhase::Seeding);
+            q.enqueue_recheck(ih.to_hex(), false);
+        }
+        let order = || {
+            w.engine
+                .calls()
+                .iter()
+                .filter_map(|c| match c {
+                    torrentd_engine::RecordedCall::AddTorrent(_) => Some('A'),
+                    torrentd_engine::RecordedCall::ForceRecheck(_) => Some('R'),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+
+        w.tick(&pool);
+        assert_eq!(order(), "ARAR", "the four slots split between the kinds");
+        assert_eq!((q.in_flight(), q.depth()), (4, 2));
+
+        // Every slot frees: the rest go in turn too.
+        q.in_flight.lock().clear();
+        for ih in &rehashes[..2] {
+            w.finish_check(*ih);
+        }
+        w.tick(&pool);
+        assert_eq!(order(), "ARARAR");
+        assert_eq!(q.depth(), 0);
+    }
+
+    /// Re-hashes held for a fenced profile log the hold once per profile per
+    /// tick, not once per re-hash, while each stays queued.
+    #[test]
+    fn rehashes_held_for_a_fenced_profile_log_once_per_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let q = pool.verify_queue();
+        for i in 0..20u8 {
+            let ih = InfoHash([0x90 + i; 20]);
+            w.load(ih, u64::from(i) + 1, "down", TorrentPhase::Seeding);
+            q.enqueue_recheck(ih.to_hex(), false);
+        }
+        let mut logged = std::collections::HashSet::new();
+        for _ in 0..20 {
+            assert_eq!(
+                super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged),
+                super::Admission::Skipped,
+            );
+        }
+        assert_eq!(logged.len(), 1, "one profile, logged once");
+        assert_eq!(q.depth(), 20, "every held re-hash stays queued");
+        assert!(w.rechecked().is_empty());
     }
 }

@@ -310,7 +310,10 @@ changing it needs a restart).
   verify`, or reads `verify dropped: …` or `verify add failed`.
 - **A fenced or offline profile** holds the queue: nothing is admitted for it
   until it is back (`verify held: profile is off the network`, or `re-hash
-  held: …` for a queued re-hash).
+  held: …` for a queued re-hash, logged once per profile each second).
+- **A re-hash paused while it checks** keeps its slot until the check ends,
+  because libtorrent goes on with it once the torrent is resumed. Resume or
+  remove the torrent to free the slot; otherwise it is freed after 24 hours.
 - **A dropped re-hash** never started: by the time a slot was free its
   torrent had been removed, paused, or had no metadata, or libtorrent refused
   the request. The log reads `re-hash dropped: …`, or ends `dropping the
