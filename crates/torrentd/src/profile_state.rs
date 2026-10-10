@@ -233,6 +233,14 @@ impl PacedHolds {
             .collect()
     }
 
+    /// Whether `id` holds `ih`.
+    pub fn holds(&self, id: &ProfileId, ih: &InfoHash) -> bool {
+        self.held
+            .lock()
+            .get(id.as_str())
+            .is_some_and(|set| set.contains(&ih.to_hex()))
+    }
+
     /// Add `ihs` to what `id` holds, durably, before the caller pauses them.
     pub fn hold(&self, id: &ProfileId, ihs: impl IntoIterator<Item = InfoHash>) -> io::Result<()> {
         self.edit(|held| {

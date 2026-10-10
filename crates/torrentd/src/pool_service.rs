@@ -1234,8 +1234,11 @@ fn admit(
 /// loaded, paused, or without metadata is dropped, since libtorrent would not
 /// hash it and it would hold a slot for nothing. One whose profile went off
 /// the network is put back, as an adoption is held, because a re-hash puts
-/// the torrent back on the network once it ends. The hold is logged once per
-/// profile per tick: `held_logged` names the profiles already logged.
+/// the torrent back on the network once it ends. So is one whose torrent a
+/// paced set-online holds paused until its batch comes
+/// ([`crate::profile_state::PacedHolds`]): it is not paused for good. The
+/// hold is logged once per profile per tick: `held_logged` names the profiles
+/// already logged.
 fn admit_recheck(
     q: &VerifyQueue,
     source: &dyn AlertSource,
@@ -1267,6 +1270,22 @@ fn admit_recheck(
                 infohash = %r.infohash,
                 reason = if fenced { "vpn_down" } else { "offline" },
                 "re-hash held: profile is off the network",
+            );
+        }
+        q.pending_rechecks.lock().push_back(r);
+        return Admission::Skipped;
+    }
+    // A paced set-online pauses each running torrent until its batch, and
+    // holds it meanwhile: it is paused by the daemon, not the operator, and
+    // runs again once its batch comes, so its re-hash waits for that.
+    if profiles.holds().holds(&st.profile_id, &st.handle.infohash) {
+        if held_logged.insert(st.profile_id.clone()) {
+            info!(
+                target: "torrentd::pool",
+                profile_id = %st.profile_id,
+                infohash = %r.infohash,
+                reason = "paced_resume",
+                "re-hash held: the profile's paced resume has not reached the torrent yet",
             );
         }
         q.pending_rechecks.lock().push_back(r);
