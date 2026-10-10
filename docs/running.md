@@ -1425,7 +1425,9 @@ On a scratch pool, not your real one.
    address. The monitor logs `address probe unavailable` at warn with the
    error, sets `torrentd_profile_vpn_addr_probe_ok` to 0, and leaves the
    verdict to the handshake check (the route probe needs the address, so it
-   is not asked either). Setting a fenced profile online on such a poll keeps
+   is not asked either, and `torrentd_profile_vpn_route_probe_ok` reads 0).
+   An `ip` killed by a signal, such as the OOM killer, counts as one that
+   could not run. Setting a fenced profile online on such a poll keeps
    the fence: lifting it needs the bound address seen on the interface.
 
    **Then take its route away and leave the tunnel up.** Each poll also asks

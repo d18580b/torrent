@@ -773,7 +773,16 @@ async fn run_with(
                     );
                     None
                 }
-                None => None,
+                // Not asked. With the address unknown the route probe is not
+                // running either, so its gauge says so rather than keeping the
+                // last poll's 1. An address `ip` answered is absent fences on
+                // the address check below.
+                None => {
+                    if matches!(current, Address::Unknown) {
+                        metrics.set_gauge("profile_vpn_route_probe_ok", 0.0, &labels);
+                    }
+                    None
+                }
             };
             let handshake_age = if let Some(probe) = handshake_probe {
                 match probe {
@@ -1227,6 +1236,18 @@ mod tests {
         polls: u32,
         offline: bool,
     ) -> (ProfileStatus, String) {
+        let (health, exported) = poll_acct_a_health(state, max_age, probe, polls, offline).await;
+        (health.status, exported)
+    }
+
+    /// [`poll_acct_a_held`], returning the profile's whole health.
+    async fn poll_acct_a_health(
+        state: StateMap,
+        max_age: Duration,
+        probe: Prober,
+        polls: u32,
+        offline: bool,
+    ) -> (crate::profile_registry::ProfileHealth, String) {
         use crate::profile_registry::test_entry;
 
         let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
@@ -1259,9 +1280,9 @@ mod tests {
         tokio::time::sleep(POLL_INTERVAL * polls + Duration::from_secs(1)).await;
         tx.send(ShutdownReason::Test).unwrap();
         task.await.unwrap();
-        let status = profiles.iter().next().unwrap().health().status;
+        let health = profiles.iter().next().unwrap().health();
         let exported = String::from_utf8(metrics.render()).expect("utf-8");
-        (status, exported)
+        (health, exported)
     }
 
     fn fenced_once_for(exported: &str, reason: &str) -> bool {
@@ -1331,6 +1352,10 @@ mod tests {
             "{exported}"
         );
         assert!(
+            exported.contains("torrentd_profile_vpn_route_probe_ok{profile_id=\"acct_a\"} 0"),
+            "with no address known the route probe is not running either: {exported}"
+        );
+        assert!(
             exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
             "{exported}"
         );
@@ -1352,12 +1377,19 @@ mod tests {
             "at warn, with the cause: {log}"
         );
 
-        // Still fenced on a stale handshake: the other checks decide.
+        // Still fenced on a stale handshake: the other checks decide. The
+        // fence keeps the address the profile was last seen with, since
+        // nobody saw it go.
         let stale = Ok(Some(Duration::from_secs(600)));
-        let (status, exported) =
-            poll_acct_a(StateMap::new(), MAX, addr_unavailable(stale), 1).await;
-        assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
+        let (health, exported) =
+            poll_acct_a_health(StateMap::new(), MAX, addr_unavailable(stale), 1, false).await;
+        assert_eq!(health.status, ProfileStatus::VpnDown, "{exported}");
         assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
+        assert_eq!(
+            health.tunnel_ip,
+            ip(2),
+            "a fence on an unknown address records the last known one"
+        );
 
         // `ip` ran and the link has no address: fenced, as before.
         let absent: Prober = Arc::new(move |_, is_wg| TunnelProbes {
@@ -1621,6 +1653,18 @@ mod tests {
             "there is no handshake to probe on an OpenVPN profile, failed or \
              live, so no constant is asserted for one; got:\n{exported}",
         );
+        assert!(
+            exported.contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"account_a\"} 1"),
+            "a live vpn profile baselines the address probe at 1; got:\n{exported}",
+        );
+        for failed in ["account_c", "account_d"] {
+            assert!(
+                !exported.contains(&format!("addr_probe_ok{{profile_id=\"{failed}\"}}")),
+                "`addr_probe_ok = 0` means `ip` could not run on this host, which \
+                 a profile that never booted is not, and no poll visits it to \
+                 measure; got:\n{exported}",
+            );
+        }
     }
 
     /// A host profile has no tunnel, so it carries none of the tunnel series.
@@ -1721,10 +1765,26 @@ mod tests {
             ),
             Err(DownReason::RouteMismatch),
         );
+        let log = crate::tracing_init::Buf::default();
+        let (_reload, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let refused = tracing::subscriber::with_default(subscriber, || {
+            recovery_check(&entry, &addr_unavailable(Ok(stale)))
+        });
         assert_eq!(
-            recovery_check(&entry, &addr_unavailable(Ok(stale))),
+            refused,
             Err(DownReason::IpLostOrChanged),
             "an address nobody could read does not lift the fence",
+        );
+        let log = log.text();
+        let warned = log
+            .lines()
+            .filter(|l| l.contains("address probe unavailable"))
+            .collect::<Vec<_>>();
+        assert_eq!(warned.len(), 1, "the refusal is logged once: {log}");
+        assert!(
+            warned[0].contains("\"level\":\"WARN\"") && warned[0].contains("Too many open files"),
+            "at warn, with the cause: {log}"
         );
         let host = crate::profile_registry::test_host_entry("public");
         assert_eq!(
