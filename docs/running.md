@@ -1458,9 +1458,15 @@ On a scratch pool, not your real one.
    to the tunnel device too. Where the device binding takes, that traffic
    keeps leaving by the tunnel. Where it is refused, libtorrent binds the
    socket to the address alone, for TCP as for the listen sockets. The
-   traffic then follows the routing table and can leave by the physical
-   interface, with the tunnel's source address, until the next poll fences
-   the profile. With `network_kill_switch = true` the kill switch drops it.
+   traffic then follows the routing table. From the tunnel's IPv4 address it
+   can leave by the physical interface, with that source address, until the
+   next poll fences the profile. The route probe asks only from the IPv4
+   address, so it would never fence that path for an IPv6 address. A listen
+   socket on an IPv6 address that is bound to no device therefore stops the
+   daemon, as a wrong device does (below). On such a kernel, a tunnel that
+   holds an IPv6 address runs only once the unit grants `CAP_NET_RAW` or the
+   address is dropped from the tunnel's config. With
+   `network_kill_switch = true` the kill switch drops this traffic.
 
    A socket bound to the **wrong** device is a different case. A device
    binding overrides policy routing, so its traffic leaves by that device
@@ -1477,9 +1483,13 @@ On a scratch pool, not your real one.
    sessions are up. It logs `a listen socket is not held to the profile's
    tunnel device`, closes that profile's listen sockets and then pauses its
    session, so nothing more (its `stopped` announces included) leaves by
-   that device during the shutdown drain, and exits non-zero. A socket bound
-   to no device is logged
-   as a warning and left to the route probe.
+   that device during the shutdown drain, and exits non-zero. A socket on an
+   IPv6 address bound to no device does the same. A socket on an IPv4
+   address bound to no device is logged as a warning and left to the route
+   probe. So is a listen endpoint at which the daemon finds no socket, which
+   it logs as `found no socket of this process at a listen endpoint`. A check
+   that cannot run (the daemon cannot read its own sockets) stops the daemon
+   too.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
    a dead endpoint — is fenced with `reason=no_handshake` once it has gone

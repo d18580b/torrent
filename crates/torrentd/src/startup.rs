@@ -1471,9 +1471,20 @@ pub async fn boot(
 /// A socket held to another device is the failure this exists for: its uTP
 /// and UDP and HTTP tracker traffic leaves by that device with the tunnel's
 /// address, and `vpn_monitor`'s route probe, which asks the routing table,
-/// reports the tunnel healthy. A socket held to no device, where the kernel
-/// refused the binding, follows the routing table, which that probe does
-/// watch, so it is logged and not fatal. A host profile is not checked.
+/// reports the tunnel healthy.
+///
+/// A socket held to no device, where the kernel refused the binding, follows
+/// the source-address rules. On an IPv4 endpoint that is the path the route
+/// probe asks about, from the tunnel's IPv4 address, so it is logged and not
+/// fatal. On an IPv6 endpoint it is fatal too: the probe never asks from an
+/// IPv6 address, so a lost `ip -6` source rule would send that socket's
+/// traffic by the main IPv6 route with nothing to fence it.
+///
+/// A check that cannot run (an endpoint that does not parse, or a failed read
+/// of this process's sockets) is fatal as well, unlike the route and
+/// handshake probes: those run again next poll, and this check runs once per
+/// listen socket. An endpoint at which no socket is found has nothing to
+/// check; that is logged. A host profile is not checked.
 fn listen_device_check(
     profiles: Arc<ProfileRegistry>,
 ) -> torrentd_engine::alert_loop::ListenDeviceCheck {
@@ -1508,7 +1519,27 @@ fn listen_device_check_with(
         let sockets = sockets_at(at).map_err(|e| {
             format!("could not list this process's sockets to check {at}'s device: {e}")
         })?;
+        if sockets.is_empty() {
+            warn!(
+                profile_id = %id,
+                endpoint = %at,
+                vpn_iface = %iface,
+                "found no socket of this process at a listen endpoint libtorrent reported \
+                 open, so which device it is held to was not checked; it may have closed \
+                 since",
+            );
+            return Ok(());
+        }
         let unbound = listen_device_verdict(&iface, &sockets)?;
+        if unbound > 0 && at.is_ipv6() {
+            return Err(format!(
+                "{unbound} socket(s) at the IPv6 endpoint {at} held to no device, not the \
+                 tunnel device {iface}: the kernel refused the binding (SO_BINDTODEVICE needs \
+                 CAP_NET_RAW before Linux 5.7), and the route probe asks only from the \
+                 tunnel's IPv4 address, so nothing fences this traffic if its source rule \
+                 is lost"
+            ));
+        }
         if unbound > 0 {
             warn!(
                 profile_id = %id,
@@ -3498,18 +3529,38 @@ mod tests {
             socket("tcp", Some("wg-acct_a")),
             socket("udp", None),
         ]));
+        let check = listen_device_check_with(profiles.clone(), read);
         assert_eq!(
-            listen_device_check_with(profiles, read)(&acct_a, "10.2.0.2:6881"),
+            check(&acct_a, "10.2.0.2:6881"),
             Ok(()),
             "a socket held to no device follows the routing table, which the route probe \
              watches"
         );
-        let log = log.text();
+        let text = log.text();
         assert!(
-            log.contains("\"level\":\"WARN\"")
-                && log.contains("a listen socket is held to no device")
-                && log.contains("\"sockets\":1"),
-            "{log}"
+            text.contains("\"level\":\"WARN\"")
+                && text.contains("a listen socket is held to no device")
+                && text.contains("\"sockets\":1"),
+            "{text}"
+        );
+        let err = check(&acct_a, "[2001:db8::2]:6881").unwrap_err();
+        assert!(
+            err.contains("1 socket(s) at the IPv6 endpoint [2001:db8::2]:6881 held to no device")
+                && err.contains("asks only from the tunnel's IPv4 address"),
+            "an unbound IPv6 socket is on a path the route probe never asks about: {err}"
+        );
+
+        let (_, read) = scripted_sockets(Ok(Vec::new()));
+        assert_eq!(
+            listen_device_check_with(profiles, read)(&acct_a, "10.2.0.2:6883"),
+            Ok(()),
+            "an endpoint with no socket left on it has nothing to check"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("found no socket of this process at a listen endpoint")
+                && text.contains("10.2.0.2:6883"),
+            "{text}"
         );
     }
 
