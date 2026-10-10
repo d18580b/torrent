@@ -1572,7 +1572,11 @@ On a scratch pool, not your real one.
    a TCP reset or an ICMP error, which the kernel builds with no socket of
    the daemon's attached; with a tunnel's `from <address>` rule lost, its
    answer to a probe of the tunnel address arriving on the physical link
-   used to leave by that link from the tunnel address (drill 8).
+   used to leave by that link from the tunnel address (drill 8). Each global
+   IPv6 address the link holds when the switch is installed gets the same
+   fence as `ip6 saddr <address> oifname != { … } drop`; one added to the
+   link later is not fenced until the next start, and a link whose IPv6
+   addresses cannot be read gets no IPv6 fence (the warning above).
 
    What that leaves:
 
@@ -1646,9 +1650,13 @@ On a scratch pool, not your real one.
    same table and rule: `openvpn` runs with `--route-noexec --pull-filter
    ignore redirect-gateway`, so it installs no routes and never takes the
    host's default route, and the daemon routes the tunnel (a routed `tun`
-   device; a bridged `tap` profile is not supported) once it has its address.
-   It also runs with `--persist-tun`, because the table is keyed on the
-   device's ifindex and its routes go with the device: a `ping-restart` or
+   device; a bridged `tap` profile is not supported) once it has its address,
+   with a `from` rule for its IPv4 address and for each global IPv6 address
+   on the device, a pushed `ifconfig-ipv6` address included. An IPv6 address
+   openvpn assigns after that read gets its rule when startup reads the
+   device's IPv6 addresses for the kill switch, and the profile is disabled
+   if the rule will not add. It also runs
+   with `--persist-tun`, because the table is keyed on the device's ifindex and its routes go with the device: a `ping-restart` or
    `SIGUSR1` reconnect keeps the device and its routing. A reconnect that
    recreates the device anyway — the server pushed different options — is
    fenced as a route mismatch or an address change, and routing is not

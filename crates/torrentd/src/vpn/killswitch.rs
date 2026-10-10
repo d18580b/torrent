@@ -2526,4 +2526,31 @@ table inet torrentd_ks {
         disable().expect("remove");
         assert_eq!(verify(&installed).unwrap(), Verdict::Absent);
     }
+
+    /// #178 against a real `nft`: a tunnel holding an IPv6 address installs
+    /// its `ip6 saddr` fence, the live table verifies intact with it, and a
+    /// table without it is drift. Run it as [`disable_against_real_nft`]
+    /// says, with `--test-threads=1` beside the others.
+    #[test]
+    #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+    fn an_ipv6_fence_against_real_nft() {
+        let installed = Installed::render(
+            998,
+            vec![tunnel("wg-a").with_v6([ADDR_A6])],
+            vec![("wg-a".to_string(), two_peer_transport())],
+        )
+        .unwrap();
+        apply(&installed.script()).expect("install");
+        let listed = exec::run_ok("nft", &["list", "table", "inet", TABLE], None, exec::QUICK)
+            .expect("list the table");
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.contains("ip6 saddr 2001:db8::2 oifname != { \"lo\", \"wg-a\" } drop"),
+            "the IPv6 fence is installed: {listed}"
+        );
+        assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
+        apply(&self::installed().script()).expect("install the table without it");
+        assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));
+        disable().expect("remove");
+    }
 }
