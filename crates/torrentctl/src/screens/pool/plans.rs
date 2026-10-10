@@ -616,38 +616,30 @@ fn ask_apply(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
             plan.id, plan.status
         )))];
     }
-    let pending = plan
-        .steps
-        .iter()
-        .filter(|s| s.status != types::StepStatus::Done)
-        .count();
+    // From the counts, not `plan.steps`: that holds only the plan's first page
+    // of steps, and an apply runs all of them.
+    let counts = &plan.step_counts;
+    let pending = counts.total.saturating_sub(counts.done);
     let title = format!("Apply plan #{}", plan.id);
     let confirm = match &plan.confirm_token {
-        Some(token) => {
-            let deletes = plan
-                .steps
-                .iter()
-                .filter(|s| {
-                    s.op == types::StepOp::DeleteFile && s.status != types::StepStatus::Done
-                })
-                .count();
-            Confirm::new(
-                title,
-                format!(
-                    "This moves {deletes} files to the pool's trash; they can be restored from \
-                     .torrentd-trash/{}-{}. The daemon waits until every step has run.",
-                    plan.id,
-                    plan.created_at.0.unix_timestamp()
-                ),
-            )
-            .typed(token.clone())
-        }
+        // Only a `delete_orphans` plan carries a token, and its every step is
+        // a `delete_file`, so each step still to do moves one file.
+        Some(token) => Confirm::new(
+            title,
+            format!(
+                "This moves {pending} files to the pool's trash; they can be restored from \
+                 .torrentd-trash/{}-{}. The daemon waits until every step has run.",
+                plan.id,
+                plan.created_at.0.unix_timestamp()
+            ),
+        )
+        .typed(token.clone()),
         None => Confirm::new(
             title,
             format!(
                 "Run its {} still to do ({})? A cross-device move can take minutes; each step \
                  is journalled first.",
-                steps(pending),
+                steps(usize::try_from(pending).unwrap_or(usize::MAX)),
                 plan.kind
             ),
         ),

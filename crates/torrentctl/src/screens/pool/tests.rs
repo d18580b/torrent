@@ -1274,6 +1274,39 @@ fn a_deleting_plan_applies_only_with_its_token_typed_back() {
 }
 
 #[test]
+fn the_apply_confirmation_counts_every_step_not_the_first_page() {
+    // A plan carries only its first page of steps inline; the apply runs all
+    // of them, so the dialog counts from `step_counts`.
+    let mut plan = delete_plan("draft");
+    plan.step_counts = testing::from_json(json!({"total": 10_000, "pending": 9_998,
+        "in_progress": 0, "done": 1, "failed": 1, "skipped": 0}));
+    let mut state = with_detail(plan);
+    press(&mut state, KeyCode::Char('x'), true);
+    let Some(plans::Pending::Apply { confirm, .. }) = state.plans.confirm.as_ref() else {
+        panic!("an apply confirmation");
+    };
+    assert!(
+        confirm.body.starts_with("This moves 9999 files "),
+        "{}",
+        confirm.body
+    );
+
+    let mut plan = relocate_plan();
+    plan.step_counts = testing::from_json(json!({"total": 250, "pending": 248,
+        "in_progress": 0, "done": 2, "failed": 0, "skipped": 0}));
+    let mut state = with_detail(plan);
+    press(&mut state, KeyCode::Char('x'), true);
+    let Some(plans::Pending::Apply { confirm, .. }) = state.plans.confirm.as_ref() else {
+        panic!("an apply confirmation");
+    };
+    assert!(
+        confirm.body.starts_with("Run its 248 steps still to do "),
+        "{}",
+        confirm.body
+    );
+}
+
+#[test]
 fn a_moving_plan_applies_on_a_yes_from_the_list() {
     let mut state = with_plans();
     state.plans.selected = 2;
