@@ -297,6 +297,9 @@ before the first adopt (§2: changing it needs a restart).
 **The queue survives a restart.** It is kept in `pool.db`, and the boot
 queues every torrent still waiting in it again, in order, so
 `torrentd_pool_verify_queue_depth` goes on draining after a restart or crash.
+A torrent that was still hashing comes back from its `.torrent`, is hashed
+again, and has that check's verdict recorded: a failure is paused and marked
+`drifted` exactly as without the restart.
 [After a crash](operations.md#after-a-crash) covers the rare claim a crash
 can still leave with nothing behind it.
 
