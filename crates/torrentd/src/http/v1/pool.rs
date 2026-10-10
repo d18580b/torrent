@@ -1470,11 +1470,11 @@ pub enum PlanKind {
     /// Move one torrent's payload to another directory under a managed root.
     Relocate,
     /// Delete every file under a subtree that no torrent claims, by moving it
-    /// into `<root>/.torrentd-trash/<plan id>/`. Refused where a torrent the
-    /// matcher could not fully place expects its files, and a file the size
-    /// of one the library is still missing is left out. Destructive: applying
-    /// it needs the plan's `confirm_token`, which changes whenever the pool is
-    /// rescanned.
+    /// into `<root>/.torrentd-trash/<plan id>-<created_at>/`, `created_at` in
+    /// unix seconds. Refused where a torrent the matcher could not fully place
+    /// expects its files, and a file the size of one the library is still
+    /// missing is left out. Destructive: applying it needs the plan's
+    /// `confirm_token`, which changes whenever the pool is rescanned.
     DeleteOrphans,
 }
 

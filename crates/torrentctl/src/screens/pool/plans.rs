@@ -635,8 +635,9 @@ fn ask_apply(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
                 title,
                 format!(
                     "This moves {deletes} files to the pool's trash; they can be restored from \
-                     .torrentd-trash/{}. The daemon waits until every step has run.",
-                    plan.id
+                     .torrentd-trash/{}-{}. The daemon waits until every step has run.",
+                    plan.id,
+                    plan.created_at.0.unix_timestamp()
                 ),
             )
             .typed(token.clone())
