@@ -87,6 +87,15 @@ pub fn with_ctx<R>(server: Option<&types::ServerInfo>, f: impl FnOnce(&Ctx<'_>) 
     f(&ctx)
 }
 
+/// The message an effect that needs no daemon — an `Effect::now`, such as a
+/// toast — delivers.
+pub fn deliver(effect: crate::app::Effect) -> crate::app::Msg {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a test runtime")
+        .block_on(effect.0)
+}
+
 /// A key press.
 pub fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
