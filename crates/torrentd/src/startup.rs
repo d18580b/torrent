@@ -193,6 +193,10 @@ struct BootCleanup {
     /// Every session boot built, closed before any tunnel goes.
     sessions: Vec<Arc<dyn TorrentEngine>>,
     kill_switch: bool,
+    /// The kill-switch watch, stopped before the switch is removed: left
+    /// running, its next check would read the removal as a flush and install
+    /// the table again.
+    kill_switch_watch: Option<tokio::task::AbortHandle>,
     armed: bool,
 }
 
@@ -227,6 +231,7 @@ impl BootCleanup {
             tunnels: Vec::new(),
             sessions: Vec::new(),
             kill_switch: false,
+            kill_switch_watch: None,
             armed: true,
         }
     }
@@ -241,6 +246,11 @@ impl BootCleanup {
 
     fn note_kill_switch(&mut self) {
         self.kill_switch = true;
+    }
+
+    /// Record the kill-switch watch, for the drop guard to stop first.
+    fn note_kill_switch_watch(&mut self, watch: tokio::task::AbortHandle) {
+        self.kill_switch_watch = Some(watch);
     }
 
     /// Record the sessions boot built, for the drop guard to close before it
@@ -328,6 +338,12 @@ impl Drop for BootCleanup {
     fn drop(&mut self) {
         if !self.armed {
             return;
+        }
+        // The watch first: it fences the sessions and reinstalls the table
+        // this guard is about to remove. A check already running on the
+        // blocking pool finishes; aborting stops every one after it.
+        if let Some(watch) = self.kill_switch_watch.take() {
+            watch.abort();
         }
         // Sessions, then tunnels, then the kill switch, as `teardown_network`
         // does: no socket outlives its route, and the switch confines the uid
@@ -596,9 +612,9 @@ pub struct DaemonHandle {
     pool: Option<Arc<crate::pool_service::PoolService>>,
     registry: Arc<AssignmentRegistry>,
     profile_registry: Arc<ProfileRegistry>,
-    /// The nftables kill switch, where it was installed: watched while the
-    /// daemon runs, and torn down on graceful shutdown.
-    kill_switch: Option<crate::vpn::killswitch::Installed>,
+    /// Whether the nftables kill switch was installed, so graceful shutdown
+    /// tears it down. `boot` started its watch.
+    kill_switch_active: bool,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: torrentd_engine::AlertLoopHandle,
     /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
@@ -1029,7 +1045,32 @@ pub async fn boot(
         }
         metrics.set_gauge("kill_switch_active", 1.0, &[]);
         info!(uid = installed.uid, tunnels = ?tunnels, "network kill switch active");
-        kill_switch = Some(installed);
+        // The watch, started here for the reason the monitors above are: the
+        // scans below run for minutes on a large pool, and a firewall reload
+        // that flushes the ruleset during them has to fence every vpn profile
+        // then, not at the first check after boot. Its fence walks the state
+        // map, which the scans do not fill, so the scans record what they
+        // pause under it themselves (`ScanFence`). A failed boot stops it
+        // before its guard removes the table, which it would otherwise
+        // install again.
+        let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+            profile_registry.clone(),
+            state.clone(),
+            metrics.clone(),
+            crate::vpn_monitor::host_prober(),
+        ));
+        let watch = spawn_supervised(
+            "kill_switch_watch",
+            metrics.clone(),
+            vpn::killswitch::watch(
+                installed,
+                fence.clone(),
+                metrics.clone(),
+                shutdown_tx.subscribe(),
+            ),
+        );
+        cleanup.note_kill_switch_watch(watch);
+        kill_switch = Some(fence);
     }
 
     /// The two store directories a profile's sessions actually read, from the
@@ -1056,9 +1097,9 @@ pub async fn boot(
     // incremented and `increase()` would never see it move.
     let mut load_failures: std::collections::HashMap<ProfileId, BootLoadFailures> =
         std::collections::HashMap::new();
-    // What the scans add, so a profile the VPN monitor fences mid-scan has
-    // it paused.
-    let mut scan_fence = ScanFence::default();
+    // What the scans add, so a profile the VPN monitor or the kill-switch
+    // watch fences mid-scan has it paused.
+    let mut scan_fence = ScanFence::new(kill_switch.clone());
 
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call, and
@@ -1551,7 +1592,7 @@ pub async fn boot(
         pool,
         registry,
         profile_registry,
-        kill_switch,
+        kill_switch_active: kill_switch.is_some(),
         log_handle,
         alert_loop,
         unloaded_at_boot,
@@ -1718,9 +1759,17 @@ fn resume_scan_params(
 /// mid-scan would otherwise be marked down with nothing paused, and every
 /// torrent the scans went on to add to it would seed over whatever route was
 /// left.
+///
+/// The kill-switch watch fences the same way and, unlike the monitor, lifts
+/// its own fence once the ruleset checks intact again, resuming only what it
+/// recorded. What this pauses under that fence is recorded with it, so the
+/// lift resumes it too, and a profile lifted mid-scan has all of it paused
+/// again by a later fence.
 #[derive(Default)]
 struct ScanFence {
     profiles: std::collections::HashMap<ProfileId, ScanFenced>,
+    /// The kill-switch watch's fence, where the kill switch is on.
+    kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
 }
 
 #[derive(Default)]
@@ -1732,6 +1781,15 @@ struct ScanFenced {
 }
 
 impl ScanFence {
+    /// A fence over the scans, recording what it pauses under the kill-switch
+    /// watch's fence `kill_switch` where the kill switch is on.
+    fn new(kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>) -> Self {
+        Self {
+            profiles: Default::default(),
+            kill_switch,
+        }
+    }
+
     /// Record a torrent a scan just added to `profile`, pausing it, and
     /// everything added before it, where the profile is fenced.
     fn added(
@@ -1743,36 +1801,75 @@ impl ScanFence {
     ) {
         let fenced = self.profiles.entry(profile.clone()).or_default();
         fenced.handles.push(h);
-        Self::enforce(profiles, metrics, profile, fenced);
+        Self::enforce(
+            profiles,
+            metrics,
+            self.kill_switch.as_deref(),
+            profile,
+            fenced,
+        );
     }
 
     /// Pause what the scans have added to every profile fenced since.
     /// Between scan batches, so a profile whose own scan has finished is
     /// still reached, and once after both.
     fn enforce_all(&mut self, profiles: &ProfileRegistry, metrics: &PromSink) {
+        let kill_switch = self.kill_switch.as_deref();
         for (profile, fenced) in &mut self.profiles {
-            Self::enforce(profiles, metrics, profile, fenced);
+            Self::enforce(profiles, metrics, kill_switch, profile, fenced);
         }
     }
 
+    /// [`Self::pause_if_fenced`], under the kill-switch fence's lock where
+    /// there is one, so that fence cannot mark or lift the profile between
+    /// the read of its status and the record of what was paused.
     fn enforce(
+        profiles: &ProfileRegistry,
+        metrics: &PromSink,
+        kill_switch: Option<&crate::vpn_monitor::KillSwitchFence>,
+        profile: &ProfileId,
+        fenced: &mut ScanFenced,
+    ) {
+        match kill_switch {
+            Some(ks) => ks.with_record(profile, |record| {
+                Self::pause_if_fenced(profiles, metrics, profile, fenced, record);
+            }),
+            None => Self::pause_if_fenced(profiles, metrics, profile, fenced, None),
+        }
+    }
+
+    /// Pause what the scans added to `profile` since the last pause, where it
+    /// is fenced, adding it to `record`: the kill-switch fence's record of
+    /// what its lift resumes, where that fence holds the profile.
+    fn pause_if_fenced(
         profiles: &ProfileRegistry,
         metrics: &PromSink,
         profile: &ProfileId,
         fenced: &mut ScanFenced,
+        record: Option<&mut Vec<torrentd_engine::TorrentHandle>>,
     ) {
-        if fenced.paused == fenced.handles.len() {
-            return;
-        }
         let Some(entry) = profiles.resolve(profile).active() else {
             return;
         };
         if entry.health().status != ProfileStatus::VpnDown {
+            // Lifted since, which during boot only the kill-switch watch
+            // does, resuming what it recorded: everything paused so far is
+            // running again, and a later fence has all of it to pause.
+            fenced.paused = 0;
+            return;
+        }
+        if fenced.paused == fenced.handles.len() {
             return;
         }
         let labels = [("profile_id", profile.as_str())];
         let mut paused = 0u64;
-        for &h in &fenced.handles[fenced.paused..] {
+        let pending = &fenced.handles[fenced.paused..];
+        // Recorded whether or not the pause takes: one that failed leaves the
+        // torrent running, and resuming it on the lift changes nothing.
+        if let Some(record) = record {
+            record.extend_from_slice(pending);
+        }
+        for &h in pending {
             match entry.engine.pause_torrent(h) {
                 Ok(()) => paused += 1,
                 // As in the monitor's own fence: a torrent left running on a
@@ -2413,7 +2510,7 @@ impl DaemonHandle {
             pool,
             registry,
             profile_registry,
-            kill_switch,
+            kill_switch_active,
             log_handle,
             alert_loop,
             unloaded_at_boot,
@@ -2423,33 +2520,8 @@ impl DaemonHandle {
             instance_lock: _instance_lock,
         } = self;
 
-        // The VPN health and port-forward monitors are not here: `boot`
-        // starts both as soon as the profiles are built.
-
-        // The kill switch was checked once, at install. Anything that flushes
-        // the ruleset afterwards — an `nft flush ruleset` from a firewall
-        // reload, another service replacing the tables — removed the backstop
-        // with nothing noticing. The watch compares it with what was rendered,
-        // and fences every vpn profile while it is not in force.
-        let kill_switch_active = kill_switch.is_some();
-        if let Some(installed) = kill_switch {
-            let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
-                profile_registry.clone(),
-                state.clone(),
-                metrics.clone(),
-                crate::vpn_monitor::host_prober(),
-            ));
-            spawn_supervised(
-                "kill_switch_watch",
-                metrics.clone(),
-                crate::vpn::killswitch::watch(
-                    installed,
-                    fence,
-                    metrics.clone(),
-                    shutdown_tx.subscribe(),
-                ),
-            );
-        }
+        // The VPN health and port-forward monitors and the kill-switch watch
+        // are not here: `boot` starts each before the scans.
 
         // Long-running pool work and the shutdown latch it checks; the
         // teardown below waits for it before stopping the alert loop.
@@ -3176,17 +3248,24 @@ fn export_shutdown_report(metrics: &PromSink, report: &ShutdownReport) {
 /// that panicked left the daemon healthy by every signal it has — `/healthz`
 /// reads the alert loop only — with its tunnels unwatched. A task that returns
 /// is also logged: each of these returns only on shutdown, and at shutdown
-/// the gauge going to 0 is harmless.
-fn spawn_supervised<F>(task: &'static str, metrics: Arc<PromSink>, fut: F)
+/// the gauge going to 0 is harmless. The handle returned stops the task, for
+/// a failed boot to stop what it started.
+fn spawn_supervised<F>(
+    task: &'static str,
+    metrics: Arc<PromSink>,
+    fut: F,
+) -> tokio::task::AbortHandle
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let labels = [("task", task)];
     metrics.set_gauge("task_up", 1.0, &labels);
     let handle = tokio::spawn(fut);
+    let abort = handle.abort_handle();
     tokio::spawn(async move {
         match handle.await {
             Ok(()) => info!(task, "background task exited"),
+            Err(e) if e.is_cancelled() => info!(task, "background task stopped"),
             Err(e) => error!(
                 task,
                 error.cause = %e,
@@ -3195,6 +3274,7 @@ where
         }
         metrics.set_gauge("task_up", 0.0, &[("task", task)]);
     });
+    abort
 }
 
 /// What a daemon running without `[auth]` says about itself at boot.

@@ -566,6 +566,25 @@ impl KillSwitchFence {
             fenced: Default::default(),
         }
     }
+
+    /// Run `hold` with this fence's record of what its lift resumes in
+    /// `profile_id`: `Some` while this fence holds the profile, `None` while
+    /// it does not.
+    ///
+    /// For the boot scans (`startup::ScanFence`), which add torrents no
+    /// state-map walk reaches: a fence that lands mid-scan records none of
+    /// them, so its lift would leave paused every one the scans paused for it.
+    /// `hold` runs under the lock [`vpn::killswitch::Fence::fence_all`] and
+    /// [`vpn::killswitch::Fence::lift`] each hold from their first mark to
+    /// their last, so this fence neither marks nor lifts the profile between
+    /// `hold`'s read of its status and its record.
+    pub(crate) fn with_record<R>(
+        &self,
+        profile_id: &ProfileId,
+        hold: impl FnOnce(Option<&mut Vec<TorrentHandle>>) -> R,
+    ) -> R {
+        hold(self.fenced.lock().get_mut(profile_id))
+    }
 }
 
 impl vpn::killswitch::Fence for KillSwitchFence {
@@ -620,8 +639,17 @@ impl vpn::killswitch::Fence for KillSwitchFence {
     }
 
     fn lift(&self) {
-        let fenced = std::mem::take(&mut *self.fenced.lock());
-        for (profile_id, handles) in fenced {
+        // Held to the end, not taken and released: a boot scan recording what
+        // it paused for this fence (`with_record`) between the take and the
+        // mark below would find no record, and its torrents would stay paused
+        // in a profile lifted around them.
+        let mut fenced = self.fenced.lock();
+        for (profile_id, mut handles) in fenced.drain() {
+            // A torrent the scans paused again after a lift stopped part-way
+            // can be in the record twice: once from the fence's take of the
+            // unfinished lift, once from the scans.
+            let mut seen = std::collections::HashSet::with_capacity(handles.len());
+            handles.retain(|h| seen.insert(*h));
             let resolved = self.profiles.resolve(&profile_id);
             let Some(entry) = resolved
                 .active()
