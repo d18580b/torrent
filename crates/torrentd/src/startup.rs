@@ -4696,6 +4696,144 @@ mod tests {
             "{exported}"
         );
     }
+
+    /// The kill-switch watch, started before the scans, fencing on a check
+    /// that finds the ruleset flushed mid-scan (`Fence::fence_all`, as its
+    /// check does on `Absent`): what the scans added is paused, though its
+    /// fence's walk of the still-empty state map finds none of it. Its lift,
+    /// once a check finds the ruleset intact again, resumes all of it, and a
+    /// second loss pauses all of it again, along with what was added between.
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_watch_fences_and_lifts_what_the_boot_scans_added() {
+        use std::net::Ipv4Addr;
+
+        use torrentd_engine::RecordedCall;
+
+        use crate::profile_registry::test_vpn_entry;
+        use crate::vpn::killswitch::Fence;
+
+        let bound = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
+        let engine = Arc::new(torrentd_engine::MockEngine::new());
+        let dyn_engine: Arc<dyn TorrentEngine> = engine.clone();
+        let entry = ProfileEntry::new(
+            test_vpn_entry("acct_a", ProfileStatus::Active).config,
+            dyn_engine,
+            Some(bound),
+            None,
+            0,
+        );
+        let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+        let metrics = Arc::new(PromSink::new());
+        // A tunnel that passes the lift's health check.
+        let probe: crate::vpn_monitor::Prober =
+            Arc::new(move |_, _| crate::vpn_monitor::TunnelProbes {
+                ip: Ok(Some(bound)),
+                route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
+                handshake: Some(Ok(None)),
+            });
+        let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+            profiles.clone(),
+            Arc::new(StateMap::new()),
+            metrics.clone(),
+            probe,
+        ));
+        let a = ProfileId::new("acct_a");
+        let h = |n: u8| engine.register_handle(libtorrent_safe::InfoHash([n; 20]));
+        let calls = |want: fn(&RecordedCall) -> Option<torrentd_engine::TorrentHandle>| {
+            engine.calls().iter().filter_map(want).collect::<Vec<_>>()
+        };
+        let pauses = || {
+            calls(|c| match c {
+                RecordedCall::PauseTorrent(h) => Some(*h),
+                _ => None,
+            })
+        };
+        let resumes = || {
+            calls(|c| match c {
+                RecordedCall::ResumeTorrent(h) => Some(*h),
+                _ => None,
+            })
+        };
+        let status = || profiles.resolve(&a).active().unwrap().health().status;
+        let settle = || async {
+            for _ in 0..100_000 {
+                if !profiles.iter().any(|e| e.is_resuming()) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("a paced resume never ended");
+        };
+
+        let mut scan = ScanFence::new(Some(fence.clone()));
+        let (h1, h2, h3, h4) = (h(1), h(2), h(3), h(4));
+        scan.added(&profiles, &metrics, &a, h1);
+        scan.added(&profiles, &metrics, &a, h2);
+        assert!(pauses().is_empty(), "nothing is fenced yet");
+
+        // The ruleset is flushed mid-scan: the watch fences the profile, and
+        // the scans pause everything they added to it.
+        fence.fence_all();
+        assert_eq!(status(), ProfileStatus::VpnDown);
+        assert!(pauses().is_empty(), "the fence's walk finds no torrent");
+        scan.added(&profiles, &metrics, &a, h3);
+        assert_eq!(pauses(), vec![h1, h2, h3]);
+        assert_eq!(
+            profiles
+                .resolve(&a)
+                .active()
+                .unwrap()
+                .health()
+                .paused_for_vpn,
+            3
+        );
+
+        // Intact again: the lift resumes what the scans paused for it.
+        fence.lift();
+        settle().await;
+        assert_eq!(status(), ProfileStatus::Active);
+        assert_eq!(resumes(), vec![h1, h2, h3]);
+
+        // Lifted, so the next add runs; a second loss pauses everything again.
+        scan.added(&profiles, &metrics, &a, h4);
+        assert_eq!(pauses().len(), 3, "an add to a lifted profile runs");
+        fence.fence_all();
+        scan.enforce_all(&profiles, &metrics);
+        assert_eq!(pauses()[3..], [h1, h2, h3, h4]);
+
+        fence.lift();
+        settle().await;
+        assert_eq!(resumes()[3..], [h1, h2, h3, h4], "each resumed once");
+    }
+
+    /// A failed boot stops the kill-switch watch it started, which would
+    /// otherwise read the guard's removal of the table as a flush and install
+    /// it again; a boot that succeeded leaves it running.
+    #[tokio::test]
+    async fn a_failed_boot_stops_the_kill_switch_watch() {
+        let watch = |cleanup: &mut BootCleanup| {
+            let task = tokio::spawn(std::future::pending::<()>());
+            cleanup.note_kill_switch_watch(task.abort_handle());
+            task
+        };
+
+        let mut failed = cleanup_with(MockVpn::new());
+        let stopped = watch(&mut failed);
+        drop(failed);
+        let joined = stopped.await.expect_err("the watch was stopped");
+        assert!(joined.is_cancelled(), "{joined}");
+
+        let mut booted = cleanup_with(MockVpn::new());
+        let running = watch(&mut booted);
+        booted.disarm();
+        drop(booted);
+        tokio::task::yield_now().await;
+        assert!(
+            !running.is_finished(),
+            "a booted daemon's watch keeps running"
+        );
+        running.abort();
+    }
 }
 
 /// `build_profiles`, driven end to end with `MockVpn`, `MockForwarder` and
