@@ -175,8 +175,13 @@ pub async fn run(
         let next = match Config::load(&config_path) {
             Ok(c) => c,
             Err(e) => {
+                // `{e:#}`, not `%e`: `Config::load` wraps the toml or
+                // validation error in `parse <path>`, and an anyhow error's
+                // plain Display prints only that outermost context, so the
+                // journal named the file and not the key, line or reason the
+                // operator needs to fix it.
                 warn!(
-                    error.cause = %e,
+                    error.cause = %format_args!("{e:#}"),
                     "SIGHUP: failed to reload config; keeping current settings",
                 );
                 failed("load");
@@ -225,7 +230,10 @@ pub async fn run(
                     info!(new_log_level = level.as_str(), "SIGHUP: log level applied");
                 }
                 Err(e) => {
-                    warn!(error.cause = %e, "SIGHUP: failed to apply log level");
+                    warn!(
+                        error.cause = %format_args!("{e:#}"),
+                        "SIGHUP: failed to apply log level",
+                    );
                     failed("log_level");
                 }
             }
@@ -268,7 +276,11 @@ pub async fn run(
                     .apply_settings(&patch.settings)
                     .context("apply_settings")
                 {
-                    warn!(profile_id = %profile, error.cause = %e, "SIGHUP: apply_settings failed");
+                    warn!(
+                        profile_id = %profile,
+                        error.cause = %format_args!("{e:#}"),
+                        "SIGHUP: apply_settings failed",
+                    );
                     failed("apply_settings");
                     settings_applied = false;
                 } else {
@@ -805,6 +817,10 @@ listen_interfaces = "0.0.0.0:6881"
         let log = log.text();
         let count = |line: &str| log.matches(line).count();
         assert_eq!(count("SIGHUP: apply_settings failed"), 1, "{log}");
+        assert!(
+            log.contains("boom"),
+            "the engine's own error, under the `apply_settings` context, is logged: {log}",
+        );
         assert_eq!(count("SIGHUP: settings applied"), 1, "{log}");
         assert_eq!(
             count("SIGHUP: log level applied"),
@@ -812,6 +828,47 @@ listen_interfaces = "0.0.0.0:6881"
             "an applied level advances and is not set again on the retry: {log}",
         );
         assert_eq!(count("SIGHUP: config unchanged"), 1, "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_an_unparseable_config_logs_the_toml_error() {
+        // `Config::load` wraps the toml error as `parse <path>`, and an anyhow
+        // error's plain Display prints only that outermost context: the
+        // journal named the file and nothing an operator could act on. The
+        // reason the toml parser gave has to reach the log.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.toml");
+        let boot = Config::minimal_for_tests(dir.path(), true);
+        // A value toml reads and the schema refuses: the reason names it,
+        // and holds no character the JSON log would escape, so it can be
+        // matched verbatim.
+        std::fs::write(&path, "connections_limit = -1\n").unwrap();
+        let root = Config::load(&path).unwrap_err().root_cause().to_string();
+        let reason = root.lines().last().unwrap().to_owned();
+        assert!(reason.contains("-1"), "{root}");
+
+        let registry = Arc::new(crate::profile_registry::ProfileRegistry::new(vec![]));
+        let source: Arc<dyn AlertSource> = Arc::new(torrentd_engine::ProfileSource::new(vec![]));
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+
+        let log = crate::tracing_init::Buf::default();
+        let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(()).unwrap();
+        drop(tx);
+        run(path, boot, source, registry, rx, log_handle, metrics).await;
+
+        let log = log.text();
+        assert!(
+            log.contains("SIGHUP: failed to reload config; keeping current settings"),
+            "{log}",
+        );
+        assert!(
+            log.contains(&reason),
+            "the toml error's reason {reason:?} is logged: {log}"
+        );
     }
 
     #[test]
