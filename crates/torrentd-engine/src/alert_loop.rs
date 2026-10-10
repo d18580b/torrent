@@ -1759,11 +1759,6 @@ mod tests {
         late: Vec<Alert>,
         revert: Alert,
     ) -> crate::port_forward::RenewOutcome {
-        use crate::port_forward::renew_and_rebind;
-        use crate::port_forward::MockForwarder;
-        use crate::port_forward::PortMapRequest;
-        use crate::port_forward::RebindTarget;
-
         assert!(
             wait_for(|| events.is_attached()),
             "the loop attaches once its queue is empty",
@@ -1786,9 +1781,26 @@ mod tests {
                 engine.push_alert(revert);
             })
         };
+        let out = renew_onto_40001(engine, events);
+        session.join().expect("session thread panicked");
+        out
+    }
+
+    /// Run a NAT-PMP renewal of profile `p` from port 6881 to 40001 against
+    /// `engine`, waiting on `events` for the session's outcomes, and return
+    /// its outcome.
+    fn renew_onto_40001(
+        engine: &Arc<MockEngine>,
+        events: &Arc<ListenEvents>,
+    ) -> crate::port_forward::RenewOutcome {
+        use crate::port_forward::renew_and_rebind;
+        use crate::port_forward::MockForwarder;
+        use crate::port_forward::PortMapRequest;
+        use crate::port_forward::RebindTarget;
+
         let p = ProfileId::new("p");
         let tunnel_ip: std::net::IpAddr = "10.2.0.2".parse().unwrap();
-        let out = renew_and_rebind(
+        renew_and_rebind(
             &MockForwarder::with_ports([40001]),
             &**engine,
             &PortMapRequest {
@@ -1809,9 +1821,7 @@ mod tests {
                 fenced: &|| false,
             },
             |_| false,
-        );
-        session.join().expect("session thread panicked");
-        out
+        )
     }
 
     /// With one live session, a `listen_failed` on the port a NAT-PMP rebind
@@ -1925,6 +1935,71 @@ mod tests {
         // Once the revert's outcome is in, the rebind is over.
         engine.push_alert(listen_failed_on("fd00::2:40001"));
         assert!(wait_for(|| handle.listen_failed()));
+        handle.join().expect("loop thread panicked");
+    }
+
+    /// A reopen onto the new port where the IPv6 address fails and the
+    /// tunnel address binds. libtorrent's `reopen_listen_sockets` posts every
+    /// `listen_failed` of the reopen while it sets the sockets up, and its
+    /// `listen_succeeded` alerts only after that loop, so the IPv6 failure
+    /// is read while the rebind is marked: the rebind is `Rebound` on the
+    /// IPv4 listener and the only session keeps running. A `listen_failed`
+    /// for the new port read after the tunnel address's success is no
+    /// outcome of that reopen, so it follows the ordinary rule and, with
+    /// `fatal_listen_failure(true)`, is fatal.
+    #[test]
+    fn an_ipv6_failure_beside_an_ipv4_success_on_the_new_port_is_rebound_and_not_fatal() {
+        use crate::port_forward::RenewOutcome;
+
+        let engine = Arc::new(MockEngine::new());
+        let events = Arc::new(ListenEvents::new());
+        let handle = builder_with(Arc::clone(&engine))
+            .fatal_listen_failure(true)
+            .listen_events(Arc::clone(&events))
+            .spawn();
+        assert!(
+            wait_for(|| events.is_attached()),
+            "the loop attaches once its queue is empty",
+        );
+        let session = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                assert!(wait_for(|| applied_binds(&engine).len() == 1));
+                engine.push_alert(listen_failed_on("fd00::2:40001"));
+                engine.push_alert(listen_succeeded_alert("10.2.0.2:40001"));
+            })
+        };
+        let out = renew_onto_40001(&engine, &events);
+        session.join().expect("session thread panicked");
+        assert!(
+            matches!(
+                &out,
+                RenewOutcome::Rebound {
+                    previous: 6881,
+                    new: 40001,
+                    ..
+                }
+            ),
+            "got {out:?}",
+        );
+        assert_eq!(
+            applied_binds(&engine),
+            vec!["wg0:40001".to_string()],
+            "nothing is reverted",
+        );
+        assert!(!events.rebind_in_progress(&ProfileId::new("p"), "10.2.0.2:40001"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !handle.listen_failed(),
+            "the reopen's IPv6 failure, read ahead of its success, is the rebind's",
+        );
+
+        // An IPv6 failure for the new port read after the IPv4 success.
+        engine.push_alert(listen_failed_on("fd00::2:40001"));
+        assert!(
+            wait_for(|| handle.listen_failed()),
+            "a failure after the reopen's successes is no outcome of the rebind",
+        );
         handle.join().expect("loop thread panicked");
     }
 

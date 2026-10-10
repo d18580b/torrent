@@ -637,7 +637,12 @@ pub fn renew_and_rebind(
             let new_endpoint = SocketAddr::new(tunnel_ip, port);
             // Held until the rebind is settled, so a `listen_failed` for the
             // new port, on any of the device's addresses, is the rebind's to
-            // revert, not a fatal loss of the session's listener.
+            // revert, not a fatal loss of the session's listener. Dropping it
+            // at the tunnel address's success leaves no failure of the reopen
+            // unmarked: libtorrent's `reopen_listen_sockets` posts every
+            // `listen_failed` while it sets the sockets up and its
+            // `listen_succeeded` alerts only after, and the alert loop reads
+            // them in order.
             let _rebinding = target.listen.begin_rebind(target.profile, port);
             let cursor = target.listen.cursor();
             if engine.apply_settings(&listen_on(port)).is_err() {
