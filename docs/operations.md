@@ -287,8 +287,9 @@ done < retire.txt
 This works the same when the profile's session failed to come up: each `DELETE`
 clears the claim and deletes the resume and `.torrent` files. Only
 `delete_files` is refused (`profile-unavailable`), because no session can reach
-the payload. Every caveat from retiring a torrent applies to each of these:
-adopted torrents stay `adopted` (#111).
+the payload. Everything [Retiring a torrent](#retiring-a-torrent) says stays
+behind applies to each of these: an adopted torrent's index entry is reset
+from `adopted`, so it can be adopted again into another profile.
 
 Then:
 
@@ -429,10 +430,13 @@ which is exactly what a crash leaves. A 0 does not prove the last exit was
 graceful. `journalctl -u torrentd -b -1` (or without `-b -1` if the host did
 not reboot) shows how it ended.
 
-Adopted torrents come back with no metadata after any restart (#108), because
-adoption never writes their `.torrent` into the profile's `torrent_dir`. They
-sit in `awaiting_metadata`, and on a private profile they stay there. The boot
-warns `resume entries with no .torrent on disk`.
+Adopted torrents come back with their metadata after a restart: adoption
+writes each one's `.torrent` and its save path into the profile's
+`torrent_dir`, as `POST /v1/torrents` does. For a torrent adopted by a build
+that predates that, the boot falls back to the library `.torrent` the pool
+index names, when it still describes the torrent, and copies it into the
+store. One with neither comes back in `awaiting_metadata`, and the boot warns
+`resume entries with no .torrent on disk`.
 
 ### After a crash
 
