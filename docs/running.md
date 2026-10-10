@@ -228,7 +228,7 @@ authentication posture, and at least one `[[profile]]`:
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
 | `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
 | `unchoke_slots_limit` | unset: libtorrent's rate-based choker, which unchokes as many peers as the achieved upload rate supports. Set, it unchokes exactly that many per session (fixed-slots choker). Read once, at startup. |
-| `peer_fingerprint`, `user_agent` | libtorrent's own; a profile may override |
+| `peer_fingerprint`, `user_agent` | libtorrent's own; a profile may override. Only the prefix and the strings change; the wire behaviour stays libtorrent's, so name a libtorrent-based client — see the `vpn` profile row below. |
 
 Numeric overrides are range-checked at startup, so `aio_threads = 0` is refused
 rather than producing a daemon that starts and cannot seed.
@@ -251,7 +251,7 @@ Every profile takes `id` plus `network`, and then:
 | `vpn_type`, `vpn_config`, `vpn_interface` | **required**. For WireGuard, `vpn_config` must be `/etc/wireguard/<vpn_interface>.conf`, the file `wg-quick` reads for that interface (§5). |
 | `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
-| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client, so the two must name the same client: `"-qB5030-"` with `"qBittorrent/5.0.3"`, not a prefix of one client beside another's user agent. Nothing checks the pairing. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters — in the same form as the top-level key it overrides, and never libtorrent's own `-LT` code. |
+| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client, so the two must name the same client: `"-qB5030-"` with `"qBittorrent/5.0.3"`, not a prefix of one client beside another's user agent. Nothing checks the pairing. Only the prefix and the strings change: the rest of the peer id, the extension handshake, the announce parameters and the rest of the wire behaviour stay libtorrent's. Name a client built on libtorrent 2.0, in a version that ships on it — qBittorrent, or Deluge (`"-DE211s-"` with `"Deluge/2.1.1 libtorrent/2.0.14.0"`) — never Transmission or rTorrent, whose identity a tracker comparing the wire with the claimed client sees through. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters — in the same form as the top-level key it overrides, and never libtorrent's own `-LT` code. |
 | `allowed_tracker_domains` | **required**, non-empty: the domains of this account's trackers — see [Account isolation](#account-isolation). |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
