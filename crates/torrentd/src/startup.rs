@@ -1778,6 +1778,9 @@ struct ScanFenced {
     handles: Vec<torrentd_engine::TorrentHandle>,
     /// How many of `handles`, from the front, have been paused.
     paused: usize,
+    /// The kill-switch fence's mark (`FenceRecord::mark`) those were paused
+    /// under, `None` where it held no record of the profile then.
+    mark: Option<u64>,
 }
 
 impl ScanFence {
@@ -1846,7 +1849,7 @@ impl ScanFence {
         metrics: &PromSink,
         profile: &ProfileId,
         fenced: &mut ScanFenced,
-        record: Option<&mut Vec<torrentd_engine::TorrentHandle>>,
+        record: Option<&mut crate::vpn_monitor::FenceRecord>,
     ) {
         let Some(entry) = profiles.resolve(profile).active() else {
             return;
@@ -1858,6 +1861,17 @@ impl ScanFence {
             fenced.paused = 0;
             return;
         }
+        // Fenced, but not by the fence those were paused under: the
+        // kill-switch watch lifted that one and a fence has landed since,
+        // with no call here in between to see the profile lifted. The lift
+        // resumed them, so all of it is paused again. A kill-switch lift that
+        // left the profile fenced for a failing tunnel also drops its record,
+        // and reads the same: what it re-pauses was paused already.
+        let mark = record.as_ref().map(|r| r.mark);
+        if fenced.mark != mark {
+            fenced.mark = mark;
+            fenced.paused = 0;
+        }
         if fenced.paused == fenced.handles.len() {
             return;
         }
@@ -1867,7 +1881,7 @@ impl ScanFence {
         // Recorded whether or not the pause takes: one that failed leaves the
         // torrent running, and resuming it on the lift changes nothing.
         if let Some(record) = record {
-            record.extend_from_slice(pending);
+            record.handles.extend_from_slice(pending);
         }
         for &h in pending {
             match entry.engine.pause_torrent(h) {

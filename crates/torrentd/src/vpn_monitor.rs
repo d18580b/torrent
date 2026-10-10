@@ -548,7 +548,25 @@ pub(crate) struct KillSwitchFence {
     probe: Prober,
     /// The profiles this fence marked `vpn_down`, each with the torrents it
     /// found running and paused.
-    fenced: parking_lot::Mutex<std::collections::HashMap<ProfileId, Vec<TorrentHandle>>>,
+    fenced: parking_lot::Mutex<Fenced>,
+}
+
+/// [`KillSwitchFence`]'s record, under its lock.
+#[derive(Default)]
+struct Fenced {
+    /// How many profiles it has ever marked, the last mark's number.
+    marks: u64,
+    profiles: std::collections::HashMap<ProfileId, FenceRecord>,
+}
+
+/// One profile [`KillSwitchFence`] holds fenced.
+pub(crate) struct FenceRecord {
+    /// Which mark put the profile under this fence, unique to it: a record
+    /// with a number its reader has not seen is a fence that landed since,
+    /// though a lift came and went between the two reads.
+    pub(crate) mark: u64,
+    /// What its lift resumes.
+    pub(crate) handles: Vec<TorrentHandle>,
 }
 
 impl KillSwitchFence {
@@ -577,13 +595,16 @@ impl KillSwitchFence {
     /// `hold` runs under the lock [`vpn::killswitch::Fence::fence_all`] and
     /// [`vpn::killswitch::Fence::lift`] each hold from their first mark to
     /// their last, so this fence neither marks nor lifts the profile between
-    /// `hold`'s read of its status and its record.
+    /// `hold`'s read of its status and its record. The record's
+    /// [`FenceRecord::mark`] tells `hold` whether the fence is the one it saw
+    /// last, so a lift and a new fence between two calls are not mistaken for
+    /// the fence still standing.
     pub(crate) fn with_record<R>(
         &self,
         profile_id: &ProfileId,
-        hold: impl FnOnce(Option<&mut Vec<TorrentHandle>>) -> R,
+        hold: impl FnOnce(Option<&mut FenceRecord>) -> R,
     ) -> R {
-        hold(self.fenced.lock().get_mut(profile_id))
+        hold(self.fenced.lock().profiles.get_mut(profile_id))
     }
 }
 
@@ -621,7 +642,15 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             let paused = fence(e, &self.state, health.tunnel_ip, self.metrics.as_ref());
             // Not fenced now, so any earlier record is one the operator's lift
             // already undid: what is running now replaces it.
-            fenced.insert(e.id().clone(), running);
+            fenced.marks += 1;
+            let mark = fenced.marks;
+            fenced.profiles.insert(
+                e.id().clone(),
+                FenceRecord {
+                    mark,
+                    handles: running,
+                },
+            );
             self.metrics.inc_counter(
                 "profile_vpn_fenced_total",
                 &[
@@ -644,7 +673,7 @@ impl vpn::killswitch::Fence for KillSwitchFence {
         // mark below would find no record, and its torrents would stay paused
         // in a profile lifted around them.
         let mut fenced = self.fenced.lock();
-        for (profile_id, mut handles) in fenced.drain() {
+        for (profile_id, FenceRecord { mut handles, .. }) in fenced.profiles.drain() {
             // A torrent the scans paused again after a lift stopped part-way
             // can be in the record twice: once from the fence's take of the
             // unfinished lift, once from the scans.
