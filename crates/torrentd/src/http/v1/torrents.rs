@@ -555,7 +555,11 @@ pub struct AddTorrentRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TorrentSource {
     /// A magnet URI. The torrent has no name, size or file list until its
-    /// metadata arrives from peers.
+    /// metadata arrives from peers. Whether it is private is unknown until
+    /// then too, so a magnet is added with DHT, PEX and LSD disabled on every
+    /// profile, and keeps them disabled: its metadata and peers come from its
+    /// trackers, and a magnet with no `tr=` only from a peer its `x.pe`
+    /// names.
     Magnet {
         /// The magnet URI, `magnet:?…`.
         #[schema(pattern = "^magnet:\\?")]
@@ -742,7 +746,6 @@ pub async fn add_torrent(
     let Some(profile_cfg) = s.profile_config(&profile_id) else {
         return Err(ProfileProblem::NotFound.into());
     };
-    let flags = torrentd_engine::seed_flags(profile_cfg);
 
     let source = match source {
         Ok(bytes) => {
@@ -790,11 +793,13 @@ pub async fn add_torrent(
     // What the session will be handed, built before the guard so the guard
     // reads exactly that.
     let (params, torrent_bytes) = match source {
+        // A magnet's `private` bit is unknown until its metadata arrives, so
+        // it never touches DHT, PEX or LSD, whatever the profile allows.
         AddSource::Magnet(uri) => (
             AddParams::Magnet {
                 uri,
                 save_path,
-                flags,
+                flags: torrentd_engine::policy::magnet_flags(profile_cfg),
             },
             None,
         ),
@@ -802,7 +807,7 @@ pub async fn add_torrent(
             AddParams::File {
                 bytes: bytes.clone(),
                 save_path,
-                flags,
+                flags: torrentd_engine::seed_flags(profile_cfg),
                 trackers: Vec::new(),
             },
             Some(bytes),

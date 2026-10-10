@@ -24,6 +24,7 @@ use torrentd_engine::RecordedCall;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentFile;
+use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentHandle;
 use torrentd_engine::TorrentPhase;
 use torrentd_engine::TorrentState;
@@ -1767,8 +1768,9 @@ async fn a_magnet_whose_trackers_are_all_allowed_is_added() {
     // if a magnet naming nothing but allowed ones still gets through,
     // whichever spelling of `tr` it uses.
     let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
     let h = Harness::authed(&Coverage::new(), |s| {
-        fixture(s, dir.path());
+        engine = Some(fixture(s, dir.path()).p);
     });
     let allowed = format!(
         "{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce\
@@ -1790,6 +1792,27 @@ async fn a_magnet_whose_trackers_are_all_allowed_is_added() {
             .as_str(),
         "strict"
     );
+
+    // `strict` is a host profile set up for a tracker account, so it trusts
+    // a torrent's own `private` bit, and a magnet has none until its
+    // metadata arrives: the add itself keeps it off DHT, PEX and LSD.
+    let adds: Vec<_> = engine
+        .unwrap()
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            RecordedCall::AddTorrent(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(adds.len(), 1, "{adds:?}");
+    assert!(
+        adds[0].flags_set().contains(
+            TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_LSD
+        ),
+        "{adds:?}"
+    );
+    assert!(adds[0].forbids_downloading(), "{adds:?}");
 }
 
 #[tokio::test]
