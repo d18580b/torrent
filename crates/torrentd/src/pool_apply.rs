@@ -726,7 +726,7 @@ fn sync_parents(paths: &[&Path]) -> Result<(), String> {
 /// Delete a file, re-proving at the last moment that nothing is using it.
 ///
 /// "Unclaimed" is a statement about the index, and the index is a snapshot.
-/// Three things have to hold, because an irreversible operation should not
+/// Five things have to hold, because an irreversible operation should not
 /// rest on any one of them:
 ///
 /// 1. No torrent claims the file *now*, not when the plan was drafted.
@@ -742,6 +742,11 @@ fn sync_parents(paths: &[&Path]) -> Result<(), String> {
 ///    size — the planner's guards ([`torrentd_pool::plan::DeleteGuard`]),
 ///    re-read whenever the index generation moves, since a rescan after the
 ///    plan was built can make a torrent partial over these very files.
+/// 5. The file is not another path to a claimed file: its indexed `(device,
+///    inode)` is no claimed file's, under any root. Claims are by path, so a
+///    hard link, or a root that aliases another through a bind mount, reads
+///    as unclaimed while renaming it moves claimed bytes. The stamp check in
+///    (3) ties that indexed identity to the file actually moved.
 ///
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, so a directory swapped for a symlink after planning stops the
@@ -788,6 +793,15 @@ fn delete_file(
     }
     if let Some(why) = guards.refusal(pool, root_id, &root, &rel, row.size)? {
         return Err(format!("{}: {why}", path.display()));
+    }
+    if guards.shares_a_claimed_inode(pool, row.dev, row.ino)? {
+        return Err(format!(
+            "{} is the same file (device {}, inode {}) as one a torrent claims: a hard \
+             link, or the claimed file seen through another root",
+            path.display(),
+            row.dev,
+            row.ino,
+        ));
     }
 
     let stamp = (row.size, row.mtime_ns, row.ino, row.dev);
@@ -1085,17 +1099,53 @@ pub fn trash_torrent_payload(payload: &TorrentPayload, bucket: &str) -> TrashOut
     out
 }
 
-/// The planner's unresolved-payload guards, per root, as of one index
-/// generation. Read on first use and again whenever a rescan moves the
-/// generation, so a delete plan over many files reads them once per root
-/// rather than once per file.
+/// The planner's unresolved-payload guards, per root, and the identities of
+/// every claimed file, as of one index generation. Read on first use and
+/// again whenever a rescan moves the generation, so a delete plan over many
+/// files reads them once per root rather than once per file.
 #[derive(Default)]
 struct DeleteGuards {
     generation: Option<i64>,
     by_root: std::collections::HashMap<i64, torrentd_pool::plan::DeleteGuard>,
+    claimed: Option<std::collections::HashSet<(u64, u64)>>,
 }
 
 impl DeleteGuards {
+    /// Drop everything read under an earlier index generation.
+    fn refresh(&mut self, pool: &PoolService) -> Result<(), String> {
+        let generation = pool
+            .with_store(|s| s.index_generation())
+            .map_err(|e| e.to_string())?;
+        if self.generation != Some(generation) {
+            self.by_root.clear();
+            self.claimed = None;
+            self.generation = Some(generation);
+        }
+        Ok(())
+    }
+
+    /// Whether `(dev, ino)` is the indexed identity of a file some torrent
+    /// claims, under any root: the file to delete is then another path to
+    /// claimed bytes — a hard link, or the same file through an aliased root.
+    fn shares_a_claimed_inode(
+        &mut self,
+        pool: &PoolService,
+        dev: u64,
+        ino: u64,
+    ) -> Result<bool, String> {
+        self.refresh(pool)?;
+        if self.claimed.is_none() {
+            let claimed = pool
+                .with_store(|s| s.claimed_identities())
+                .map_err(|e| e.to_string())?;
+            self.claimed = Some(claimed);
+        }
+        Ok(self
+            .claimed
+            .as_ref()
+            .is_some_and(|c| c.contains(&(dev, ino))))
+    }
+
     fn refusal(
         &mut self,
         pool: &PoolService,
@@ -1104,13 +1154,7 @@ impl DeleteGuards {
         rel: &str,
         size: u64,
     ) -> Result<Option<String>, String> {
-        let generation = pool
-            .with_store(|s| s.index_generation())
-            .map_err(|e| e.to_string())?;
-        if self.generation != Some(generation) {
-            self.by_root.clear();
-            self.generation = Some(generation);
-        }
+        self.refresh(pool)?;
         if let std::collections::hash_map::Entry::Vacant(e) = self.by_root.entry(root_id) {
             let guard = pool
                 .with_store(|s| torrentd_pool::plan::DeleteGuard::load(s, root_id, root))
@@ -2233,6 +2277,51 @@ mod tests {
         let e = delete_file(&pool, &escaping, 1, &mut Default::default()).unwrap_err();
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
+    }
+
+    /// A second root that reaches claimed bytes by another path — a hard link
+    /// here, standing in for a bind mount or union view of the first root —
+    /// indexes them as an orphan there, since claims are by path. The delete
+    /// step compares the file's identity with every claimed file's and
+    /// refuses; an ordinary orphan beside it still goes to the trash.
+    #[test]
+    fn deleting_refuses_a_file_that_is_a_claimed_file_under_another_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("pool");
+        let second = dir.path().join("alias");
+        let claimed_file = write(&first, "T/a.bin", 16);
+        std::fs::create_dir_all(second.join("T")).unwrap();
+        let alias = second.join("T/a.bin");
+        std::fs::hard_link(&claimed_file, &alias).unwrap();
+        let orphan = write(&second, "T/extra.bin", 8);
+
+        let mut cfg = Config::minimal_for_tests(dir.path(), true);
+        cfg.pool.as_mut().unwrap().roots.push(second.clone());
+        let pool = PoolService::open(&cfg).unwrap().unwrap();
+        pool.scan().unwrap();
+        let root_id = |p: &Path| pool.roots().iter().find(|(_, r)| r == p).unwrap().0;
+        let (first_id, second_id) = (root_id(&first), root_id(&second));
+        claimed(&pool, dir.path(), &"ab".repeat(20), "T/a.bin");
+        assert_eq!(
+            pool.roots()[0].0,
+            first_id,
+            "`claimed` claims under the first root"
+        );
+        let unclaimed = pool
+            .with_store(|s| s.is_orphan(second_id, "T/a.bin"))
+            .unwrap();
+        assert!(unclaimed, "by path, the alias reads as an orphan");
+
+        let mut guards = DeleteGuards::default();
+        let e = delete_file(&pool, &alias, 1, &mut guards).unwrap_err();
+        assert!(
+            e.contains("same file") && e.contains("a torrent claims"),
+            "got {e}"
+        );
+        assert!(alias.exists() && claimed_file.exists());
+
+        delete_file(&pool, &orphan, 1, &mut guards).expect("an unrelated orphan is deleted");
+        assert!(!orphan.exists());
     }
 
     /// A file of the torrent that lands at the destination between planning

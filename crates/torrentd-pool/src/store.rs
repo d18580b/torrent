@@ -20,6 +20,7 @@
 //! one.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -1941,6 +1942,23 @@ impl PoolStore {
             |r| r.get(0),
         )?;
         Ok(known != 0)
+    }
+
+    /// The indexed `(dev, ino)` of every claimed file, under every root.
+    ///
+    /// A path is not the only way to reach a file: a hard link, or the same
+    /// directory listed twice through a bind mount, is a second path to the
+    /// claimed bytes that [`PoolStore::is_orphan`] reads as unclaimed. The
+    /// delete step refuses any file whose identity is in this set.
+    pub fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT f.dev, f.ino FROM claim c
+             JOIN file f ON f.root_id = c.root_id AND f.rel_path = c.rel_path",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+        })?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
 
     /// Distinct adoption states of every torrent claiming a file under
