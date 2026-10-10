@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -571,8 +572,11 @@ pub struct ScanSummary {
 /// seeding, so only a bounded number are in flight and the rest wait.
 #[derive(Debug)]
 pub struct VerifyQueue {
-    pending: Mutex<VecDeque<PendingVerify>>,
-    in_flight: Mutex<Vec<InFlight>>,
+    /// Both lists keep their length beside them, so [`VerifyQueue::depth`]
+    /// and [`VerifyQueue::in_flight`] - read by `GET /v1/pool` and the event
+    /// stream on runtime workers - never wait on a lock.
+    pending: Counted<VecDeque<PendingVerify>>,
+    in_flight: Counted<Vec<InFlight>>,
     /// Loaded torrents `POST /v1/pool/verifications` asked libtorrent to
     /// re-hash, with when. Their outcome is recorded like an adopt's — which
     /// is the only way a loaded `drifted` torrent is ever cleared — once a
@@ -587,6 +591,72 @@ pub struct VerifyQueue {
     /// `_total` series that `rate()` and `increase()` read as a gauge.
     exported_completed: AtomicU64,
     exported_failed: AtomicU64,
+}
+
+/// A list behind a lock whose length can be read without taking it.
+///
+/// The length is stored each time a [`CountedGuard`] is dropped, so every
+/// change made through [`Counted::lock`] is reflected once the guard goes,
+/// and [`Counted::len`] reads the length as of the last guard released.
+#[derive(Debug, Default)]
+struct Counted<V> {
+    items: Mutex<V>,
+    len: AtomicUsize,
+}
+
+/// A collection with a length, for [`Counted`].
+trait Len {
+    fn len(&self) -> usize;
+}
+
+impl<T> Len for Vec<T> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+
+impl<T> Len for VecDeque<T> {
+    fn len(&self) -> usize {
+        VecDeque::len(self)
+    }
+}
+
+impl<V: Len> Counted<V> {
+    fn lock(&self) -> CountedGuard<'_, V> {
+        CountedGuard {
+            items: self.items.lock(),
+            len: &self.len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+}
+
+/// The lock on a [`Counted`] list; stores the list's length when dropped.
+struct CountedGuard<'a, V: Len> {
+    items: parking_lot::MutexGuard<'a, V>,
+    len: &'a AtomicUsize,
+}
+
+impl<V: Len> std::ops::Deref for CountedGuard<'_, V> {
+    type Target = V;
+    fn deref(&self) -> &V {
+        &self.items
+    }
+}
+
+impl<V: Len> std::ops::DerefMut for CountedGuard<'_, V> {
+    fn deref_mut(&mut self) -> &mut V {
+        &mut self.items
+    }
+}
+
+impl<V: Len> Drop for CountedGuard<'_, V> {
+    fn drop(&mut self) {
+        self.len.store(self.items.len(), Ordering::Relaxed);
+    }
 }
 
 /// A torrent in a session that the verify queue is waiting on.
@@ -642,8 +712,8 @@ impl PendingVerify {
 impl VerifyQueue {
     fn new(limit: usize) -> Self {
         Self {
-            pending: Mutex::new(VecDeque::new()),
-            in_flight: Mutex::new(Vec::new()),
+            pending: Counted::default(),
+            in_flight: Counted::default(),
             rechecks: Mutex::new(Vec::new()),
             limit: limit.max(1),
             completed: AtomicU64::new(0),
@@ -686,12 +756,14 @@ impl VerifyQueue {
         self.rechecks.lock().iter().any(|(ih, _)| ih == infohash)
     }
 
+    /// Items waiting to be admitted. Never waits on a lock.
     pub fn depth(&self) -> usize {
-        self.pending.lock().len()
+        self.pending.len()
     }
 
+    /// Torrents in a session the queue is waiting on. Never waits on a lock.
     pub fn in_flight(&self) -> usize {
-        self.in_flight.lock().len()
+        self.in_flight.len()
     }
 
     /// Increments since the last call, for counter export.
@@ -738,37 +810,11 @@ pub async fn run_verify_queue(
         // 1b) Retire re-hashes of loaded torrents, once a check that finished
         //     after the request is in. One that finished before it is the
         //     previous check, and says nothing about this one.
-        {
-            let mut rechecks = q.rechecks.lock();
-            rechecks.retain(|(ih, started)| {
-                let Some(hash) = libtorrent_safe::InfoHash::from_hex(ih) else {
-                    return false;
-                };
-                let entry = state.get(&hash);
-                let Some(st) = entry.as_ref() else {
-                    // Removed while checking: nothing left to record.
-                    return false;
-                };
-                match recheck_step(
-                    recheck_outcome(st, *started, VERIFY_SETTLE),
-                    started.elapsed(),
-                ) {
-                    RecheckStep::Hold => true,
-                    RecheckStep::Forget => false,
-                    RecheckStep::Record(outcome) => {
-                        record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
-                        false
-                    }
-                }
-            });
-        }
+        retire_rechecks(&pool, &*source, &state);
 
         // 2) Admit up to the limit.
         loop {
-            let room = {
-                let in_flight = q.in_flight.lock();
-                q.limit.saturating_sub(in_flight.len())
-            };
+            let room = q.limit.saturating_sub(q.in_flight());
             if room == 0 {
                 break;
             }
@@ -905,12 +951,20 @@ pub async fn run_verify_queue(
 /// landed yet by having been seen there before. Its persisted entry goes
 /// with it, so a later restart does not wait on a re-add of the info-hash
 /// as though it were this adoption.
+///
+/// The finished entries are taken off the list under its lock, and their
+/// store writes made only after it is released: a write waits out a running
+/// scan, and the lock held through that wait blocked every reader of the
+/// list with it.
 fn retire_in_flight(pool: &PoolService, source: &dyn AlertSource, state: &StateMap) {
-    let q = pool.verify_queue();
-    let mut in_flight = q.in_flight.lock();
-    in_flight.retain_mut(|f| {
+    enum Retired {
+        Forget(String),
+        Record(libtorrent_safe::InfoHash, String, VerifyOutcome),
+    }
+    let mut retired = Vec::new();
+    pool.verify_queue().in_flight.lock().retain_mut(|f| {
         let Some(hash) = libtorrent_safe::InfoHash::from_hex(&f.infohash) else {
-            pool.forget_queued(&f.infohash);
+            retired.push(Retired::Forget(f.infohash.clone()));
             return false;
         };
         let entry = state.get(&hash);
@@ -922,7 +976,7 @@ fn retire_in_flight(pool: &PoolService, source: &dyn AlertSource, state: &StateM
                     infohash = %f.infohash,
                     "a torrent was removed while it was being verified; forgetting it",
                 );
-                pool.forget_queued(&f.infohash);
+                retired.push(Retired::Forget(f.infohash.clone()));
                 return false;
             }
             (false, false) => {}
@@ -931,9 +985,50 @@ fn retire_in_flight(pool: &PoolService, source: &dyn AlertSource, state: &StateM
         if outcome == VerifyOutcome::Waiting {
             return true;
         }
-        record_verify_outcome(pool, source, state, &hash, &f.infohash, outcome);
+        retired.push(Retired::Record(hash, f.infohash.clone(), outcome));
         false
     });
+    for r in retired {
+        match r {
+            Retired::Forget(ih) => pool.forget_queued(&ih),
+            Retired::Record(hash, ih, outcome) => {
+                record_verify_outcome(pool, source, state, &hash, &ih, outcome);
+            }
+        }
+    }
+}
+
+/// Record the outcome of every re-hash of a loaded torrent whose check
+/// finished after the request, and forget those removed or given up on.
+///
+/// As in [`retire_in_flight`], the store writes are made after the list's
+/// lock is released.
+fn retire_rechecks(pool: &PoolService, source: &dyn AlertSource, state: &StateMap) {
+    let mut finished = Vec::new();
+    pool.verify_queue().rechecks.lock().retain(|(ih, started)| {
+        let Some(hash) = libtorrent_safe::InfoHash::from_hex(ih) else {
+            return false;
+        };
+        let entry = state.get(&hash);
+        let Some(st) = entry.as_ref() else {
+            // Removed while checking: nothing left to record.
+            return false;
+        };
+        match recheck_step(
+            recheck_outcome(st, *started, VERIFY_SETTLE),
+            started.elapsed(),
+        ) {
+            RecheckStep::Hold => true,
+            RecheckStep::Forget => false,
+            RecheckStep::Record(outcome) => {
+                finished.push((hash, ih.clone(), outcome));
+                false
+            }
+        }
+    });
+    for (hash, ih, outcome) in finished {
+        record_verify_outcome(pool, source, state, &hash, &ih, outcome);
+    }
 }
 
 /// Hold the bytes the verify worker is about to add to the account-isolation
@@ -1983,6 +2078,104 @@ mod tests {
             .map(|r| r.infohash)
             .collect();
         assert_eq!(kept, [waiting.to_hex(), loaded.to_hex()]);
+    }
+
+    /// A finished verification whose store write waits out a scan does not
+    /// hold the queue's lists while it waits: `GET /v1/pool` and the event
+    /// stream read `depth()` and `in_flight()` on runtime workers, and a
+    /// reader blocked behind the scan pinned its worker until the scan
+    /// committed. Here the writer is held from another thread, an in-flight
+    /// torrent and a re-hash both finish, and one verify tick runs; a task
+    /// must read the queue's counts while that tick is still waiting, and
+    /// the verdicts land once the writer is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_verdict_waiting_on_the_writer_does_not_block_the_queue_readers() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        use torrentd_engine::AlertSource;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::StateMap;
+        use torrentd_pool::AdoptionState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let adopted = InfoHash([0x81; 20]);
+        let rehashed = InfoHash([0x82; 20]);
+        let pool = Arc::new(pool_with(dir.path(), adopted, Some("p")));
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            ProfileId::new("p"),
+            engine as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+        let state = Arc::new(StateMap::new());
+
+        pool.verify_queue().track_in_flight(adopted.to_hex());
+        pool.verify_queue().track_recheck(rehashed.to_hex());
+        assert_eq!(pool.verify_queue().in_flight(), 1);
+        // The adoption's check fails, and the re-hash, finishing after it was
+        // asked for, passes: each verdict is a store write.
+        std::thread::sleep(Duration::from_millis(10));
+        state.insert(adopted, st(TorrentPhase::Incomplete, Some(SETTLE)));
+        let mut seeding = st(TorrentPhase::Seeding, Some(Duration::ZERO));
+        seeding.phase_since_check = true;
+        state.insert(rehashed, seeding);
+
+        // A scan holds the writer until told to stop.
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let _store = pool.store.lock();
+                held_tx.send(()).unwrap();
+                // Released when told, or when the test fails and drops the
+                // sender.
+                let _ = release_rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+
+        // The verify tick's two retirements, each waiting on the writer to
+        // record its verdict.
+        let retire = |f: fn(&super::PoolService, &dyn AlertSource, &StateMap)| {
+            let (pool, source, state) =
+                (Arc::clone(&pool), Arc::clone(&source), Arc::clone(&state));
+            std::thread::spawn(move || f(&pool, &*source, &state))
+        };
+        let in_flight = retire(super::retire_in_flight);
+        let rechecks = retire(super::retire_rechecks);
+
+        // A reader on a runtime worker sees both finished entries gone while
+        // their verdicts are still waiting, rather than waiting with them.
+        let reader = {
+            let pool = Arc::clone(&pool);
+            let rehashed = rehashed.to_hex();
+            tokio::spawn(async move {
+                let q = pool.verify_queue();
+                while q.in_flight() != 0 || q.tracks_recheck(&rehashed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                q.depth()
+            })
+        };
+        let read = tokio::time::timeout(Duration::from_secs(5), reader).await;
+        assert!(
+            matches!(read, Ok(Ok(0))),
+            "a queue reader blocked behind the writer: {read:?}",
+        );
+        assert!(!in_flight.is_finished() && !rechecks.is_finished());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        in_flight.join().unwrap();
+        rechecks.join().unwrap();
+        let got = pool
+            .with_store(|s| s.adoption_state(&adopted.to_hex()))
+            .unwrap();
+        assert_eq!(got, Some(AdoptionState::Drifted));
+        assert_eq!(pool.verify_queue().failed.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.verify_queue().completed(), 1);
     }
 
     /// The in-flight half of a restart mid-verify: a loaded adoption put
