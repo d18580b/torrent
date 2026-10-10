@@ -137,6 +137,31 @@ fn relocate_plan() -> types::Plan {
     }))
 }
 
+fn step_json(seq: usize) -> serde_json::Value {
+    json!({"seq": seq, "op": "delete_file", "src": format!("stray/{seq:04}.mkv"), "dst": null,
+           "status": "pending", "error": null})
+}
+
+/// A page of steps `from..=to`, continuing at `next`.
+fn steps_page(from: usize, to: usize, next: Option<&str>) -> types::PlanStepPage {
+    let items: Vec<_> = (from..=to).map(step_json).collect();
+    testing::from_json(json!({"items": items, "next_cursor": next}))
+}
+
+/// A 250-step deleting plan, of which the body carries the first 100.
+fn big_plan() -> types::Plan {
+    let steps: Vec<_> = (1..=100).map(step_json).collect();
+    testing::from_json(json!({
+        "id": 8, "kind": "delete_orphans", "status": "draft",
+        "created_at": "2026-09-27T10:00:00Z", "applied_at": null,
+        "confirm_token": "7f3a-9c21",
+        "steps": steps,
+        "steps_next_cursor": "after-100",
+        "step_counts": {"total": 250, "pending": 247, "in_progress": 1, "done": 1, "failed": 1,
+                        "skipped": 0},
+    }))
+}
+
 fn adoption(dry_run: bool) -> types::AdoptionResult {
     testing::from_json(json!({
         "dry_run": dry_run,
@@ -1304,6 +1329,169 @@ fn the_apply_confirmation_counts_every_step_not_the_first_page() {
         "{}",
         confirm.body
     );
+}
+
+/// The open plan's `(opening, steps generation)`, to answer its page with.
+fn steps_tag(state: &State) -> (u64, u64) {
+    let detail = state.plans.detail.as_ref().unwrap();
+    (detail.opening, detail.steps.generation)
+}
+
+fn steps_answer(state: &mut State, first: bool, page: types::PlanStepPage) -> usize {
+    let (opening, generation) = steps_tag(state);
+    send(
+        state,
+        Msg::Plans(plans::Msg::StepsPage {
+            opening,
+            generation,
+            first,
+            result: Ok(page),
+        }),
+        true,
+    )
+}
+
+#[test]
+fn the_step_table_pages_past_the_plans_inline_steps() {
+    let mut state = with_detail(big_plan());
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 100, "the inline steps");
+    assert!(!detail.steps.complete);
+    let screen = shot(&state, 160, 48, true);
+    assert!(
+        screen.contains("250 steps · 1 done · 1 running · 1 failed"),
+        "counted from step_counts: {screen}"
+    );
+    assert!(screen.contains(" steps · 100 of 250 "), "{screen}");
+
+    assert_eq!(
+        press(&mut state, KeyCode::Char('G'), true),
+        1,
+        "the page after the inline steps"
+    );
+    assert_eq!(state.plans.detail.as_ref().unwrap().selected, 99);
+    assert_eq!(
+        press(&mut state, KeyCode::Char('G'), true),
+        0,
+        "one page at a time"
+    );
+
+    // A page answering an earlier opening of this same plan is dropped.
+    let (opening, generation) = steps_tag(&state);
+    send(
+        &mut state,
+        Msg::Plans(plans::Msg::StepsPage {
+            opening: opening - 1,
+            generation,
+            first: false,
+            result: Ok(steps_page(101, 200, None)),
+        }),
+        true,
+    );
+    assert_eq!(state.plans.detail.as_ref().unwrap().steps.items.len(), 100);
+
+    assert_eq!(
+        steps_answer(&mut state, false, steps_page(101, 200, Some("after-200"))),
+        0
+    );
+    assert_eq!(press(&mut state, KeyCode::Char('G'), true), 1);
+    assert_eq!(
+        steps_answer(&mut state, false, steps_page(201, 250, None)),
+        0
+    );
+    press(&mut state, KeyCode::Char('G'), true);
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 250);
+    assert!(detail.steps.complete);
+    assert_eq!(detail.selected, 249, "the last step, not the 100th");
+    let screen = shot(&state, 160, 48, true);
+    assert!(screen.contains("stray/0250.mkv"), "{screen}");
+    assert!(!screen.contains(" of 250 "), "every step is loaded");
+
+    // A refresh fetches as many steps as were loaded rather than falling back
+    // to the inline 100, so the selection keeps its place.
+    let server = testing::server(true, true);
+    assert_eq!(
+        testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx).len()),
+        2,
+        "the list and the plan"
+    );
+    let stale = steps_tag(&state);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a test runtime");
+    let (url, daemon) = runtime.block_on(testing::serve_once(
+        "200 OK",
+        json!({"items": [], "next_cursor": null}).to_string(),
+    ));
+    let api = crate::api::Api::new(&url, Some("tdp_test")).expect("a valid URL");
+    let theme = testing::theme();
+    let ctx = Ctx {
+        api: &api,
+        server: Some(&server),
+        theme: &theme,
+        tick: 0,
+    };
+    let mut effects = update(
+        &mut state,
+        Msg::Plans(plans::Msg::DetailLoaded {
+            id: 8,
+            result: Ok(big_plan()),
+        }),
+        &ctx,
+    );
+    assert_eq!(effects.len(), 1, "every loaded step, again");
+    runtime.block_on(effects.remove(0).0);
+    let request = runtime.block_on(daemon).expect("the request");
+    let line = request.lines().next().unwrap_or_default();
+    assert!(
+        line.starts_with("GET /v1/pool/plans/8/steps?") && line.contains("limit=300"),
+        "the 250 loaded steps rounded up to a page, not the default 100: {line}"
+    );
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 250, "kept until the answer");
+    assert_eq!(detail.selected, 249);
+    send(
+        &mut state,
+        Msg::Plans(plans::Msg::StepsPage {
+            opening: stale.0,
+            generation: stale.1,
+            first: false,
+            result: Ok(steps_page(251, 260, None)),
+        }),
+        true,
+    );
+    assert_eq!(
+        state.plans.detail.as_ref().unwrap().steps.items.len(),
+        250,
+        "a page from before the refresh is dropped"
+    );
+    assert_eq!(steps_answer(&mut state, true, steps_page(1, 250, None)), 0);
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 250);
+    assert_eq!(detail.selected, 249);
+}
+
+#[test]
+fn a_drafted_plan_is_counted_from_step_counts() {
+    let mut state = with_plans();
+    let server = testing::server(true, true);
+    let effects = testing::with_ctx(Some(&server), |ctx| {
+        update(
+            &mut state,
+            Msg::Plans(plans::Msg::Created(Ok(big_plan()))),
+            ctx,
+        )
+    });
+    let toast = effects.into_iter().next().map(testing::deliver);
+    let Some(crate::app::Msg::Toast(toast)) = toast else {
+        panic!("a toast first, got {toast:?}");
+    };
+    assert_eq!(toast.text, "plan #8 drafted: 250 steps — x applies it");
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 100);
+    assert_eq!(detail.steps.next_cursor.as_deref(), Some("after-100"));
 }
 
 #[test]

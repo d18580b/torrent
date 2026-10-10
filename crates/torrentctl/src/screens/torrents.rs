@@ -2078,7 +2078,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_files_sends_the_infohash_as_confirm() {
-        let (url, server) = add::wire_tests::serve_once("204 No Content", String::new()).await;
+        let (url, server) = crate::testing::serve_once("204 No Content", String::new()).await;
         let api = Api::new(&url, Some("tdp_wire")).unwrap();
         let msg = perform(&api, Action::RemoveFiles, hash(1)).0.await;
         assert!(

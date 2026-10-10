@@ -37,6 +37,7 @@ use super::when;
 use super::wrap;
 use super::Motion;
 use super::MUTATIONS_OFF;
+use crate::api::generated::ListPlanStepsParams;
 use crate::api::generated::ListPlansParams;
 use crate::api::types;
 use crate::api::Failure;
@@ -81,6 +82,9 @@ pub struct State {
     pub confirm: Option<Pending>,
     /// The plan being applied.
     pub applying: Option<i64>,
+    /// How many plans have been opened, so a page of steps answering one
+    /// opening is not taken by the next — even of the same plan.
+    pub opened: u64,
 }
 
 impl State {
@@ -98,7 +102,13 @@ impl State {
 #[derive(Debug, Default)]
 pub struct Detail {
     pub id: i64,
+    /// Which opening this is: see [`State::opened`].
+    pub opening: u64,
+    /// The plan, its `steps` moved into [`Detail::steps`].
     pub plan: Option<types::Plan>,
+    /// The steps loaded so far: the plan's inline first page, then the pages
+    /// after it from `GET /v1/pool/plans/{plan_id}/steps`.
+    pub steps: Paged<types::PlanStep>,
     pub loading: bool,
     pub error: Option<String>,
     /// What the last apply of this plan reported.
@@ -278,6 +288,13 @@ pub enum Msg {
         id: i64,
         result: Result<types::Plan, Failure>,
     },
+    /// A page of the open plan's steps.
+    StepsPage {
+        opening: u64,
+        generation: u64,
+        first: bool,
+        result: Result<types::PlanStepPage, Failure>,
+    },
     AskCreate(Prefill),
     /// A key for the form or the confirmation.
     Key(KeyEvent),
@@ -376,9 +393,84 @@ fn load_detail(detail: &mut Detail, ctx: &Ctx<'_>) -> Effect {
     })
 }
 
+/// Fetch the open plan's steps from `cursor`, or from its first step with
+/// `limit` of them when `first`.
+fn fetch_steps(
+    detail: &Detail,
+    ctx: &Ctx<'_>,
+    cursor: Option<String>,
+    limit: Option<i64>,
+    generation: u64,
+    first: bool,
+) -> Effect {
+    let (id, opening) = (detail.id, detail.opening);
+    let api = ctx.api.clone();
+    Effect::new(async move {
+        let params = ListPlanStepsParams { cursor, limit };
+        let result = crate::api::call(api.client.list_plan_steps(id, params)).await;
+        wrap(super::Msg::Plans(Msg::StepsPage {
+            opening,
+            generation,
+            first,
+            result,
+        }))
+    })
+}
+
+/// The next page of the open plan's steps, when its selection nears the end
+/// of what is loaded.
+fn more_steps(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
+    if !detail.steps.wants_more(detail.selected) {
+        return Vec::new();
+    }
+    match detail.steps.begin_more() {
+        Some((cursor, generation)) => {
+            vec![fetch_steps(
+                detail,
+                ctx,
+                Some(cursor),
+                None,
+                generation,
+                false,
+            )]
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Show `plan` in `detail`. Its inline steps replace those loaded, unless
+/// more than them were loaded: then the steps are fetched again, as many as
+/// were loaded, so a refresh keeps the selection where it was.
+fn show(detail: &mut Detail, mut plan: types::Plan, ctx: &Ctx<'_>) -> Vec<Effect> {
+    let inline = std::mem::take(&mut plan.steps);
+    let next = plan.steps_next_cursor.clone();
+    detail.plan = Some(plan);
+    let generation = detail.steps.reload();
+    let loaded = detail.steps.items.len();
+    if loaded > inline.len() {
+        if let Some(limit) = refresh_limit(loaded) {
+            return vec![fetch_steps(
+                detail,
+                ctx,
+                None,
+                Some(limit),
+                generation,
+                true,
+            )];
+        }
+    }
+    detail.steps.receive(generation, true, inline, next);
+    detail.selected = detail
+        .selected
+        .min(detail.steps.items.len().saturating_sub(1));
+    more_steps(detail, ctx)
+}
+
 fn open(state: &mut State, id: i64, then_apply: bool, ctx: &Ctx<'_>) -> Vec<Effect> {
+    state.opened += 1;
     let mut detail = Detail {
         id,
+        opening: state.opened,
         then_apply,
         ..Detail::default()
     };
@@ -420,9 +512,8 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         }
         Msg::Move(motion) => match state.detail.as_mut() {
             Some(detail) => {
-                let len = detail.plan.as_ref().map_or(0, |p| p.steps.len());
-                detail.selected = motion.apply(detail.selected, len);
-                Vec::new()
+                detail.selected = motion.apply(detail.selected, detail.steps.items.len());
+                more_steps(detail, ctx)
             }
             None => {
                 state.selected = motion.apply(state.selected, state.list.items.len());
@@ -461,16 +552,43 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             match result {
                 Ok(plan) => {
                     detail.error = None;
-                    detail.selected = detail.selected.min(plan.steps.len().saturating_sub(1));
-                    detail.plan = Some(plan);
+                    let mut effects = show(detail, plan, ctx);
                     if std::mem::take(&mut detail.then_apply) {
-                        return ask_apply(state, ctx);
+                        effects.extend(ask_apply(state, ctx));
                     }
-                    Vec::new()
+                    effects
                 }
                 Err(failure) => {
                     detail.then_apply = false;
                     detail.error = Some(failure.message());
+                    signed_out(&failure)
+                }
+            }
+        }
+        Msg::StepsPage {
+            opening,
+            generation,
+            first,
+            result,
+        } => {
+            let Some(detail) = state.detail.as_mut().filter(|d| d.opening == opening) else {
+                return Vec::new();
+            };
+            match result {
+                Ok(page) => {
+                    if generation != detail.steps.generation {
+                        return Vec::new();
+                    }
+                    detail
+                        .steps
+                        .receive(generation, first, page.items, page.next_cursor);
+                    detail.selected = detail
+                        .selected
+                        .min(detail.steps.items.len().saturating_sub(1));
+                    more_steps(detail, ctx)
+                }
+                Err(failure) => {
+                    detail.steps.fail(generation, failure.message());
                     signed_out(&failure)
                 }
             }
@@ -494,14 +612,17 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             let toast = Toast::success(format!(
                 "plan #{} drafted: {} — x applies it",
                 plan.id,
-                steps(plan.steps.len())
+                steps(count(plan.step_counts.total))
             ));
-            state.detail = Some(Detail {
+            state.opened += 1;
+            let mut detail = Detail {
                 id: plan.id,
-                plan: Some(plan),
+                opening: state.opened,
                 ..Detail::default()
-            });
+            };
             let mut effects = vec![Effect::toast(toast)];
+            effects.extend(show(&mut detail, plan, ctx));
+            state.detail = Some(detail);
             effects.extend(reload(state, ctx, refresh_limit(state.list.items.len())));
             effects
         }
@@ -639,7 +760,7 @@ fn ask_apply(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
             format!(
                 "Run its {} still to do ({})? A cross-device move can take minutes; each step \
                  is journalled first.",
-                steps(usize::try_from(pending).unwrap_or(usize::MAX)),
+                steps(count(pending)),
                 plan.kind
             ),
         ),
@@ -659,6 +780,31 @@ fn steps(n: usize) -> String {
     } else {
         format!("{n} steps")
     }
+}
+
+/// A step count from `step_counts`, for [`steps`]. The document declares
+/// them unsigned; the generated type is `i64`, so a negative one reads as 0.
+fn count(n: i64) -> usize {
+    usize::try_from(n.max(0)).unwrap_or(usize::MAX)
+}
+
+/// The open plan's size and progress, from its counts: `3 steps · 1 done ·
+/// 1 failed`, naming only the statuses some step stands in.
+fn progress<'a>(theme: &Theme, counts: &types::StepCounts) -> Vec<Span<'a>> {
+    let mut spans = vec![Span::styled(
+        format!("  {}", steps(count(counts.total))),
+        theme.fg(Tone::Muted),
+    )];
+    for (n, what, tone) in [
+        (counts.done, "done", Tone::Muted),
+        (counts.in_progress, "running", Tone::Accent),
+        (counts.failed, "failed", Tone::Bad),
+    ] {
+        if n > 0 {
+            spans.push(Span::styled(format!(" · {n} {what}"), theme.fg(tone)));
+        }
+    }
+    spans
 }
 
 fn confirm_key(state: &mut State, key: KeyEvent, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -878,17 +1024,15 @@ fn draw_detail(state: &State, detail: &Detail, ctx: &Ctx<'_>, frame: &mut Frame,
     };
 
     let label = |text: &str| Span::styled(format!("{text:>13}  "), theme.fg(Tone::Muted));
+    let mut head_line = vec![
+        label("plan"),
+        strong(theme, format!("#{}", plan.id), Tone::Accent),
+        Span::raw(format!("  {}  ", plan.kind)),
+        state_span(theme, &plan.status.to_string()),
+    ];
+    head_line.extend(progress(theme, &plan.step_counts));
     let mut lines = vec![
-        Line::from(vec![
-            label("plan"),
-            strong(theme, format!("#{}", plan.id), Tone::Accent),
-            Span::raw(format!("  {}  ", plan.kind)),
-            state_span(theme, &plan.status.to_string()),
-            Span::styled(
-                format!("  {}", steps(plan.steps.len())),
-                theme.fg(Tone::Muted),
-            ),
-        ]),
+        Line::from(head_line),
         Line::from(vec![
             label("created"),
             Span::raw(format!("{} UTC", when(plan.created_at.0))),
@@ -952,7 +1096,7 @@ fn draw_detail(state: &State, detail: &Detail, ctx: &Ctx<'_>, frame: &mut Frame,
         head,
     );
 
-    let rows = plan.steps.iter().map(|s| {
+    let rows = detail.steps.items.iter().map(|s| {
         let path = match &s.dst {
             Some(dst) => format!("{} → {dst}", s.src),
             None => s.src.clone(),
@@ -979,7 +1123,28 @@ fn draw_detail(state: &State, detail: &Detail, ctx: &Ctx<'_>, frame: &mut Frame,
         Constraint::Length(14),
         Constraint::Fill(1),
     ];
-    let block = panel(theme, " steps ", true).title_bottom(plan_hints(theme, ctx, true));
+    // Until every step is loaded, say how many of them are.
+    let name = if detail.steps.complete {
+        "steps".to_owned()
+    } else {
+        format!(
+            "steps · {} of {}",
+            detail.steps.items.len(),
+            plan.step_counts.total
+        )
+    };
+    let block = panel(
+        theme,
+        title(
+            theme,
+            name,
+            detail.steps.loading,
+            detail.steps.error.as_deref(),
+            ctx.tick,
+        ),
+        true,
+    )
+    .title_bottom(plan_hints(theme, ctx, true));
     let visible = block.inner(steps_area).height.saturating_sub(1) as usize;
     let offset = scroll(&detail.offset, detail.selected, visible);
     let mut table_state = TableState::default()
