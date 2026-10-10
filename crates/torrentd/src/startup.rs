@@ -949,7 +949,10 @@ pub async fn boot(
             .with_states(desired_states),
     );
     profile_registry.export_offline(&*metrics);
-    let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
+    // Kept as itself too: the scans below hold each session's alerts on it
+    // between batches (`ProfileSource::hold_alerts`).
+    let profile_source = Arc::new(ProfileSource::new(source_entries));
+    let source: Arc<dyn AlertSource> = profile_source.clone();
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
     // session if the forwarded port changes, and reannounces. Started as soon
     // as the profiles are built, so a 60 s lease is not left unrenewed through
@@ -1149,6 +1152,7 @@ pub async fn boot(
                     anyhow::bail!("shutdown requested during the resume scan");
                 }
                 scan_fence.enforce_all(&profile_registry, &metrics);
+                profile_source.hold_alerts(&profile);
             }
             // Cross-check the registry; the spec aborts the profile on
             // mismatch. A resume file under one profile's directory that the
@@ -1269,6 +1273,7 @@ pub async fn boot(
                 }
             }
         }
+        profile_source.hold_alerts(&profile);
         if from_library > 0 {
             info!(
                 profile_id = %profile,
@@ -1340,6 +1345,7 @@ pub async fn boot(
                     anyhow::bail!("shutdown requested during the torrent-dir scan");
                 }
                 scan_fence.enforce_all(&profile_registry, &metrics);
+                profile_source.hold_alerts(&profile);
             }
             // Resume data already loaded this torrent — skip.
             if loaded.contains(&ih) {
@@ -1458,6 +1464,7 @@ pub async fn boot(
                 }
             }
         }
+        profile_source.hold_alerts(&profile);
         if added > 0 {
             info!(profile_id = %profile, torrent_count = added, "torrent dir scan: added new torrents");
         }
@@ -1467,10 +1474,17 @@ pub async fn boot(
             .or_insert(added);
     }
 
+    // Track what the scans loaded from the handles the sessions returned, not
+    // only from their add alerts: an alert libtorrent dropped would leave its
+    // torrent seeding with no fence, save or `DELETE` reaching it. The alert
+    // loop's handling of each add alert, held above, keeps these entries.
+    scan_fence.track_all(&state);
+
     // A profile fenced after its own scan's last add would otherwise keep
-    // what that scan loaded running until the alert loop below has put it in
-    // the state map, where the monitor no longer looks: a fenced profile is
-    // skipped from then on.
+    // what that scan loaded running: a fenced profile is skipped by the
+    // monitor from then on, so a fence that landed before the tracking above
+    // walked a state map without them. One that lands after it finds them.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     scan_fence.enforce_all(&profile_registry, &metrics);
 
     // Every configured profile, so a failed one reads zero rather than absent.
@@ -1898,6 +1912,17 @@ impl ScanFence {
             profile,
             fenced,
         );
+    }
+
+    /// Put every torrent the scans added into `state`, under the handle its
+    /// session returned. An entry already there for that torrent is kept.
+    fn track_all(&self, state: &StateMap) {
+        let now = std::time::Instant::now();
+        for (profile, fenced) in &self.profiles {
+            for &h in &fenced.handles {
+                state.track_added(h, profile, now);
+            }
+        }
     }
 
     /// Pause what the scans have added to every profile fenced since.
@@ -4846,6 +4871,89 @@ mod tests {
             exported.contains("torrentd_profile_torrents_paused_vpn_down{profile_id=\"acct_a\"} 3"),
             "{exported}"
         );
+    }
+
+    /// A boot scan of more torrents than the session's alert queue holds,
+    /// as `boot` runs one: an add per entry, the session's alerts held at
+    /// each `SCAN_SHUTDOWN_CHECK_EVERY`, and the scans' torrents tracked
+    /// before the alert loop starts. No add alert is dropped, every torrent
+    /// is in the state map under the handle its session returned — what the
+    /// fences walk and `DELETE` removes — before the loop runs, and the loop's
+    /// handling of the held alerts keeps those entries.
+    #[test]
+    fn a_boot_scan_past_the_alert_queue_tracks_every_torrent() {
+        use torrentd_engine::AlertLoopBuilder;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordingSink;
+
+        const LOADED: usize = 8 * SCAN_SHUTDOWN_CHECK_EVERY + 17;
+        let engine = Arc::new(
+            MockEngine::new()
+                .without_recording()
+                .with_alert_capacity(SCAN_SHUTDOWN_CHECK_EVERY)
+                .with_add_alerts(true),
+        );
+        let p = ProfileId::new("p");
+        let source = Arc::new(ProfileSource::new(vec![(
+            p.clone(),
+            engine.clone() as Arc<dyn TorrentEngine>,
+        )]));
+        let state = Arc::new(StateMap::new());
+        let mut scan = ScanFence::default();
+        let mut loaded = Vec::with_capacity(LOADED);
+        for i in 0..LOADED {
+            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 {
+                source.hold_alerts(&p);
+            }
+            let mut bytes = vec![0u8; 20];
+            bytes[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+            let h = engine
+                .add_torrent(AddParams::File {
+                    bytes,
+                    save_path: "/data".into(),
+                    flags: torrentd_engine::TorrentFlags::empty(),
+                    trackers: Vec::new(),
+                })
+                .expect("add");
+            scan.profiles.entry(p.clone()).or_default().handles.push(h);
+            loaded.push(h);
+        }
+        source.hold_alerts(&p);
+        scan.track_all(&state);
+        let tracked_before_the_loop = state.len();
+
+        let metrics = Arc::new(RecordingSink::new());
+        let alert_loop = AlertLoopBuilder::new(
+            source.clone(),
+            state.clone(),
+            Arc::new(torrentd_engine::MemoryResumeStore::new()),
+            Arc::new(torrentd_engine::MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(SystemClock),
+        )
+        .shutdown_deadline(std::time::Duration::from_millis(100))
+        .spawn();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while metrics.count_for("torrents_added_total") < LOADED as u64
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        alert_loop.signal_shutdown(ShutdownReason::Test);
+        alert_loop.join().expect("alert loop");
+
+        assert_eq!(tracked_before_the_loop, LOADED);
+        assert_eq!(
+            metrics.count_for("torrents_added_total"),
+            LOADED as u64,
+            "every add alert reached the loop",
+        );
+        assert_eq!(metrics.count_for("alert_queue_overflows_total"), 0);
+        assert_eq!(state.handles_for_profile(&p).len(), LOADED);
+        for h in loaded {
+            let st = state.get(&h.infohash).expect("tracked");
+            assert_eq!((st.handle, &st.profile_id), (h, &p));
+        }
     }
 
     /// The kill-switch watch, started before the scans, fencing on a check
