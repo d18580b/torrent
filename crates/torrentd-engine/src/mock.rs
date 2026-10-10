@@ -12,6 +12,8 @@
 //!   - Per-handle query data: `set_torrent_details` / `set_torrent_files` /
 //!     `set_torrent_trackers` preload what the matching query returns; an
 //!     unset handle gets a metadata-less default.
+//!   - Session counters: `set_alert_translate_errors(n)` sets the shim's
+//!     count of alerts it could not translate.
 //!   - Fault injection beyond errors: `inject_panic(op)` makes the next call
 //!     to that op panic, and `stall_next_pop(d)` makes the next `pop_alerts`
 //!     block for `d`, which wedges whatever loop is draining it.
@@ -275,6 +277,9 @@ pub struct MockEngine {
     trackers: DashMap<InfoHash, Vec<TrackerEntry>>,
     /// Whether `pause_session` is in force.
     session_paused: AtomicBool,
+    /// What `alert_translate_errors` returns. See
+    /// [`MockEngine::set_alert_translate_errors`].
+    translate_errors: AtomicU64,
 }
 
 impl Default for MockEngine {
@@ -305,6 +310,7 @@ impl MockEngine {
             largest_files_copy: AtomicUsize::new(0),
             trackers: DashMap::new(),
             session_paused: AtomicBool::new(false),
+            translate_errors: AtomicU64::new(0),
         }
     }
 
@@ -427,6 +433,13 @@ impl MockEngine {
 
     pub fn handle_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// What `alert_translate_errors` returns from now on: the shim's count of
+    /// alerts it popped and could not translate. A test raises it to model
+    /// alerts lost that way.
+    pub fn set_alert_translate_errors(&self, n: u64) {
+        self.translate_errors.store(n, Ordering::SeqCst);
     }
 
     /// What `torrent_details(h)` returns from now on.
@@ -761,6 +774,12 @@ impl TorrentEngine for MockEngine {
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
         self.check_error("torrents")?;
         Ok(self.handles.iter().map(|e| *e.value()).collect())
+    }
+
+    /// What `set_alert_translate_errors` last set. Not recorded: the alert
+    /// loop asks after every drain.
+    fn alert_translate_errors(&self) -> u64 {
+        self.translate_errors.load(Ordering::SeqCst)
     }
 
     fn close(&self) {

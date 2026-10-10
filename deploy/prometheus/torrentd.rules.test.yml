@@ -540,6 +540,54 @@ tests:
             exp_annotations:
               summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
 
+  # One alert lost in the running daemon fires it. acct_b lost none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_a"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_b"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdAlertTranslateErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The daemon dropped libtorrent alerts for profile acct_a it could not translate; a torrent's removal or resume save may have gone unseen"
+
+  # Lost while the boot's backlog drained: the counter's first sample is
+  # already 2 and never moves, so increase() is 0. The boot gauge fires it,
+  # past the 15-minute window too. acct_b's boot lost none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_alert_translate_errors{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_alert_translate_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdAlertTranslateErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The daemon dropped libtorrent alerts for profile acct_a it could not translate; a torrent's removal or resume save may have gone unseen"
+      - eval_time: 30m
+        alertname: TorrentdAlertTranslateErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The daemon dropped libtorrent alerts for profile acct_a it could not translate; a torrent's removal or resume save may have gone unseen"
+
   # The alert is a fraction of announces held for 30 minutes.
   #   acct_a: three of every four announces fail (a tracker outage). Fires.
   #   acct_b: one dead tracker failing every minute, forever, among torrents
