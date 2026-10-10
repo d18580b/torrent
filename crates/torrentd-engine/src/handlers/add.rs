@@ -78,9 +78,17 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 // The entry is dropped only if it is this profile's, and the
                 // removed torrent's where the removal was recorded: another
                 // profile may hold the info-hash by now.
+                //
+                // A resume file the delete leaves behind is marked stale, so
+                // the next add of the info-hash in this profile still gets
+                // its first save rather than leaving the removed torrent's
+                // save path and state for the next boot to load.
                 let (resume, torrents, profile) = (ctx.resume, ctx.torrents, &ctx.profile_id);
+                let state = ctx.state;
                 let settled = ctx.state.settle_removal(profile, &ih, |readded| {
-                    if let Err(e) = resume.delete(profile, &ih) {
+                    let deleted = resume.delete(profile, &ih);
+                    state.set_stale_resume_file(profile, &ih, deleted.is_err());
+                    if let Err(e) = deleted {
                         warn!(
                             target: "torrentd_engine::handler::add",
                             infohash = %ih,
@@ -141,12 +149,15 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
 /// queue's place against the shutdown drain's `ONLY_IF_MODIFIED` requests, so
 /// a stop soon after a boot would spend its deadline on them. A re-add after
 /// a removal is not skipped: the removal's alert, handled first, deleted the
-/// old torrent's file. A store that cannot answer gets the save.
+/// old torrent's file. Where that delete failed, the file left behind is the
+/// removed torrent's, marked stale, and the re-add is saved over it. A store
+/// that cannot answer gets the save.
 fn queue_first_resume_save(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
     let ih = handle.infohash;
+    let stale = ctx.state.take_stale_resume_file(&ctx.profile_id, &ih);
     match ctx.resume.exists(&ctx.profile_id, &ih) {
-        Ok(true) => return,
-        Ok(false) => {}
+        Ok(true) if !stale => return,
+        Ok(_) => {}
         Err(e) => warn!(
             target: "torrentd_engine::handler::add",
             infohash = %ih,
@@ -615,6 +626,92 @@ mod tests {
             state.dispatch_resume_saves(8),
             vec![(ih, ResumeFlags::empty())],
         );
+    }
+
+    /// The removal's delete fails, so the removed torrent's resume file is
+    /// still there when the same profile's re-add is handled. It is the old
+    /// torrent's, so the re-add is saved over it, whether the re-add was
+    /// accepted before the removal's alert or after it, and the mark is
+    /// spent on that save.
+    #[test]
+    fn a_re_add_over_a_resume_file_the_removal_failed_to_delete_is_saved() {
+        use crate::resume_store::ResumeStoreError;
+        use crate::resume_store::Scan;
+
+        #[derive(Debug, Default)]
+        struct UndeletableResume(MemoryResumeStore);
+        impl ResumeStore for UndeletableResume {
+            fn scan(
+                &self,
+                p: &ProfileId,
+            ) -> Result<Scan<libtorrent_safe::ResumeData>, ResumeStoreError> {
+                self.0.scan(p)
+            }
+            fn write(
+                &self,
+                p: &ProfileId,
+                ih: &InfoHash,
+                d: &[u8],
+            ) -> Result<(), ResumeStoreError> {
+                self.0.write(p, ih, d)
+            }
+            fn delete(&self, _: &ProfileId, _: &InfoHash) -> Result<(), ResumeStoreError> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+            }
+            fn exists(&self, p: &ProfileId, ih: &InfoHash) -> Result<bool, ResumeStoreError> {
+                self.0.exists(p, ih)
+            }
+        }
+
+        for readded_before_alert in [true, false] {
+            let ih = InfoHash([0x81; 20]);
+            let profile = ProfileId::new("p");
+            let state = StateMap::new();
+            let resume = UndeletableResume::default();
+            let torrents = MemoryTorrentStore::new();
+            let metrics = NoopSink;
+            let clock = MockClock::new();
+            let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+            let old = TorrentHandle {
+                id: 1,
+                infohash: ih,
+            };
+            state.insert(
+                ih,
+                TorrentState::newly_added(old, profile.clone(), clock.now()),
+            );
+            resume.write(&profile, &ih, b"old-resume").unwrap();
+            state.begin_removal(&profile, old);
+            if readded_before_alert {
+                state.note_readded(&profile, &ih);
+            }
+
+            let mut ctx = HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: &metrics,
+                clock: &clock,
+                engine: &engine,
+                profile_fenced: None,
+                profile_id: profile.clone(),
+                span: tracing::info_span!("test"),
+            };
+            handle(&removed_alert(ih), &mut ctx);
+            assert!(resume.exists(&profile, &ih).unwrap());
+            let new = TorrentHandle {
+                id: 2,
+                infohash: ih,
+            };
+            handle(&add_alert(ih, Some(new), 0), &mut ctx);
+
+            assert_eq!(
+                state.dispatch_resume_saves(8),
+                vec![(ih, ResumeFlags::empty())],
+                "re-added before the alert: {readded_before_alert}",
+            );
+            assert!(!state.take_stale_resume_file(&profile, &ih));
+        }
     }
 
     /// A store that cannot say whether the file exists gets the save: an

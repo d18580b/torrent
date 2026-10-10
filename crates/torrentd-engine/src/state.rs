@@ -306,6 +306,10 @@ pub struct StateMap {
     /// removal's file deletes, so an add that marks one re-added either lands
     /// before them (and they are skipped) or after them.
     removals: Mutex<HashMap<(ProfileId, InfoHash), PendingRemoval>>,
+    /// Resume files a removal failed to delete. Each is the removed torrent's,
+    /// not whichever torrent the profile adds under the info-hash next, so
+    /// that add's first save must not be skipped for finding it.
+    stale_resume_files: Mutex<HashSet<(ProfileId, InfoHash)>>,
 }
 
 impl Default for StateMap {
@@ -315,6 +319,7 @@ impl Default for StateMap {
             saves: Mutex::new(ResumeSaves::default()),
             retry_heap: Mutex::new(BinaryHeap::new()),
             removals: Mutex::new(HashMap::new()),
+            stale_resume_files: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -447,6 +452,27 @@ impl StateMap {
             entry_released: !self.inner.contains_key(ih),
             readded,
         }
+    }
+
+    /// Record whether `profile`'s resume file for `ih` is a removed torrent's
+    /// left behind: `true` where the removal's delete failed, `false` where a
+    /// later one succeeded.
+    pub fn set_stale_resume_file(&self, profile: &ProfileId, ih: &InfoHash, stale: bool) {
+        let mut stale_files = self.stale_resume_files.lock();
+        let key = (profile.clone(), *ih);
+        if stale {
+            stale_files.insert(key);
+        } else {
+            stale_files.remove(&key);
+        }
+    }
+
+    /// Whether `profile`'s resume file for `ih` was left behind by a removal,
+    /// forgetting it: the caller is about to replace it.
+    pub fn take_stale_resume_file(&self, profile: &ProfileId, ih: &InfoHash) -> bool {
+        self.stale_resume_files
+            .lock()
+            .remove(&(profile.clone(), *ih))
     }
 
     pub fn get(&self, ih: &InfoHash) -> Option<TorrentState> {
