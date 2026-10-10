@@ -175,20 +175,8 @@ fn build_relocate(
         return Ok(Err(Refused("destination is the current location".into())));
     }
 
-    // Refuse rather than merge: an existing destination file is either a
-    // different copy of this payload or someone else's data, and both are
-    // reasons to stop and let a person look.
-    for f in store.torrent_files(infohash)? {
-        if !f.is_on_disk() {
-            continue;
-        }
-        let candidate = dest_dir.join(&f.rel_path);
-        if candidate.exists() {
-            return Ok(Err(Refused(format!(
-                "destination already contains {}",
-                f.rel_path,
-            ))));
-        }
+    if let Some(rel) = existing_destination_file(store, infohash, &dest_dir)? {
+        return Ok(Err(Refused(format!("destination already contains {rel}"))));
     }
 
     // One step. libtorrent moves the payload itself so the session's storage
@@ -201,6 +189,37 @@ fn build_relocate(
         src: src_dir.to_string_lossy().into_owned(),
         dst: Some(dest_dir.to_string_lossy().into_owned()),
     }]))
+}
+
+/// The first of `infohash`'s files that already has an entry under
+/// `dest_dir`, as its torrent-relative path.
+///
+/// A relocate refuses on one rather than merging: an existing destination
+/// file is either a different copy of this payload or someone else's data,
+/// and both are reasons to stop and let a person look. The planner asks when
+/// the plan is built and the executor asks again just before the move, since
+/// a file can land there in between and libtorrent's `dont_replace` skips it
+/// silently, leaving the payload split between the two places.
+///
+/// Any directory entry counts, a dangling symlink included: a move onto one
+/// replaces it, which is still an overwrite. So does a path that cannot be
+/// examined for any reason but its absence, since nothing then shows the way
+/// is clear.
+pub fn existing_destination_file(
+    store: &PoolStore,
+    infohash: &str,
+    dest_dir: &Path,
+) -> Result<Option<String>, PoolError> {
+    for f in store.torrent_files(infohash)? {
+        if !f.is_on_disk() {
+            continue;
+        }
+        match dest_dir.join(&f.rel_path).symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Ok(Some(f.rel_path)),
+        }
+    }
+    Ok(None)
 }
 
 fn build_delete_orphans(
