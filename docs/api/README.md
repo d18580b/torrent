@@ -126,8 +126,9 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   names its methods after.
 - **Actions** are `POST` on a verb under the resource, as in
   `POST /v1/torrents/{infohash}/recheck`. A single settable property is `PUT`
-  on a sub-resource, as in `PUT /v1/torrents/{infohash}/upload-limit`. `v1`
-  has no `PATCH`.
+  on a sub-resource, as in `PUT /v1/torrents/{infohash}/upload-limit`. The
+  one `PATCH` is `PATCH /v1/profiles/{profile_id}`, which sets a profile
+  online or offline.
 - **Status codes.**
   - `200` carries a result.
   - `201` creates something, and `Location` names it.
@@ -302,4 +303,5 @@ change.
   freshness.
 - **`Idempotency-Key`.** Adding a torrent is naturally idempotent: a repeat
   answers `409` [`torrent-exists`](problems.md#torrent-exists).
-- **`PATCH`**, field selection, and CORS.
+- **`PATCH`** beyond `PATCH /v1/profiles/{profile_id}`, field selection, and
+  CORS.

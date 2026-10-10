@@ -115,6 +115,13 @@ is never silently treated as the first page.
 
 **404.** No torrent with this infohash is assigned to any profile.
 
+The operations that act through the torrent's session — `pause`, `resume`,
+`recheck`, `reannounce`, `upload-limit`, `files`, a file's `priority`, and
+`trackers` — also answer this for a torrent that is assigned but not loaded in
+a session: one still being added, or one the boot left unloaded.
+`GET /v1/torrents` and `GET /v1/torrents/{infohash}` still list such a
+torrent, with phase `unknown`.
+
 ## `file-not-found`
 
 **404**, from `PUT /v1/torrents/{infohash}/files/{index}/priority`. The torrent
@@ -174,7 +181,9 @@ state directory, say — is not a duplicate and answers
 ## `torrent-adding`
 
 **409**, from `DELETE /v1/torrents/{infohash}`. The torrent is still being
-added to its session. Retry once it appears in `GET /v1/torrents`.
+added to its session. It is listed by `GET /v1/torrents` from the start, with
+phase `unknown`, so its appearing there is not the signal: retry once it lists
+a phase other than `unknown`.
 
 ## `payload-shared`
 
@@ -267,14 +276,18 @@ plan's steps show how far it got. Apply it again to retry.
 ## `confirm-token-required`
 
 **422**, from `POST /v1/pool/plans/{plan_id}/apply`. The plan deletes data, so
-it applies only when `confirm_token` repeats the token the plan was created
-with.
+it applies only when `confirm_token` repeats the token
+`GET /v1/pool/plans/{plan_id}` currently reports for it.
 
 ## `confirm-token-mismatch`
 
 **422**, from `POST /v1/pool/plans/{plan_id}/apply`. The `confirm_token` is not
-this plan's. Tokens are derived from the plan's steps, so a token cannot be
-carried over from another plan.
+this plan's current token. A token is derived from the plan's id, its steps,
+and the pool index's generation, which every rescan advances. So a token read
+before a rescan no longer matches, even for the same plan, and that is the
+usual cause; a token from another plan never matches. Re-read the plan with
+`GET /v1/pool/plans/{plan_id}`, check that its steps are still the ones to
+apply, and re-send its fresh token.
 
 ## `delete-unconfirmed`
 
