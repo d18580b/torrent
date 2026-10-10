@@ -46,6 +46,134 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 /// enough for that at about 330 KB/s.
 pub const ADD_REQUEST_DEADLINE: Duration = Duration::from_secs(300);
 
+/// How long the body of an operation mounted `untimed` has to arrive.
+///
+/// Those operations may await minutes of work, so nothing bounds their
+/// handler; [`TimedBody`] bounds the read of their body alone. The same
+/// thirty seconds as [`REQUEST_DEADLINE`], for the same 64 KiB.
+pub const BODY_DEADLINE: Duration = REQUEST_DEADLINE;
+
+/// A body limit whose read has a deadline, and whose handler has none.
+///
+/// kynos' `Timeout` wraps everything after it, handler included, and its
+/// `BodySize` reads a body with no clock. An operation that may await minutes
+/// of work — applying a plan — cannot take the first and must not be left
+/// with only the second, or a body that stalls holds its connection for as
+/// long as the peer keeps it open. So this reads the whole body itself,
+/// declared length or not, refusing it with `413` past `limit` and `408`
+/// past `deadline`, and hands the handler the bytes. The limits it is used
+/// with are 64 KiB, so holding the body costs no more than `BodySize` already
+/// spends on a chunked one.
+pub struct TimedBody {
+    pub limit: u64,
+    pub deadline: Duration,
+}
+
+/// What [`TimedBody`] answers with.
+pub enum BodyRefused {
+    TooLarge(kynos::middleware::limits::BodySizeExceeded),
+    TooSlow(Duration),
+}
+
+impl kynos::response::IntoResponse for BodyRefused {
+    fn into_response(self) -> kynos::http::Response {
+        match self {
+            Self::TooLarge(exceeded) => exceeded.into_response(),
+            Self::TooSlow(after) => {
+                kynos::error::problem::Problem::new(kynos::http::StatusCode::REQUEST_TIMEOUT)
+                    .with_detail(format!(
+                        "the request body did not arrive within {} seconds",
+                        after.as_secs()
+                    ))
+                    .into_response()
+            }
+        }
+    }
+}
+
+impl kynos::response::ShortCircuit for BodyRefused {
+    const STATUSES: &'static [u16] = &[408, 413];
+}
+
+impl kynos::response::Responses for BodyRefused {
+    fn responses(registry: &mut kynos::schema::registry::Registry) -> kynos::openapi::Responses {
+        let mut responses = kynos::middleware::limits::BodySizeExceeded::<()>::responses(registry);
+        let timed_out = kynos::middleware::limits::TimedOut::<()>::responses(registry);
+        for (status, mut response) in timed_out.responses {
+            if let kynos::openapi::RefOr::Item(item) = &mut response {
+                item.description =
+                    Some("the request body did not arrive within the configured limit".to_owned());
+            }
+            responses.responses.insert(status, response);
+        }
+        responses
+    }
+}
+
+/// The length the request declared, when it declared one.
+fn declared_length(headers: &kynos::http::HeaderMap) -> Option<u64> {
+    headers
+        .get(kynos::http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Reads `body` while the running total stays within `limit`; `None` once it
+/// passes it. A read that fails yields what arrived before it did, as
+/// `BodySize` does: the extractor then rejects the truncated payload with the
+/// status it already declares.
+async fn read_capped(mut body: kynos::http::body::Body, limit: u64) -> Option<bytes::Bytes> {
+    use http_body::Body as _;
+
+    let mut collected = bytes::BytesMut::new();
+    while let Some(frame) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+    {
+        let Ok(frame) = frame else { break };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let total = collected.len().saturating_add(data.len());
+        if u64::try_from(total).unwrap_or(u64::MAX) > limit {
+            return None;
+        }
+        collected.extend_from_slice(&data);
+    }
+    Some(collected.freeze())
+}
+
+impl<C: Sync + 'static> kynos::middleware::Interceptor<C> for TimedBody {
+    type Reads = ();
+    type Adds = ();
+    type Short = BodyRefused;
+
+    async fn intercept(
+        &self,
+        request: kynos::http::Request,
+        (): (),
+        _context: &C,
+        next: kynos::middleware::Next<'_, C>,
+    ) -> Result<kynos::middleware::Continued<()>, BodyRefused> {
+        let too_large =
+            || BodyRefused::TooLarge(kynos::middleware::limits::BodySizeExceeded::new(self.limit));
+        if declared_length(request.headers()).is_some_and(|declared| declared > self.limit) {
+            return Err(too_large());
+        }
+        let (parts, body) = request.into_parts();
+        let bytes = tokio::time::timeout(self.deadline, read_capped(body, self.limit))
+            .await
+            .map_err(|_| BodyRefused::TooSlow(self.deadline))?
+            .ok_or_else(too_large)?;
+        let body = kynos::http::body::Body::from_bytes(bytes);
+        Ok(next
+            .run(kynos::http::Request::from_parts(parts, body))
+            .await)
+    }
+}
+
 /// The daemon: identity, status, change notifications and reload.
 #[derive(Tag)]
 #[tag(
@@ -103,17 +231,27 @@ pub struct Operations;
 )]
 pub struct Testing;
 
-/// A `/v1` group, with the body limit its operations admit and the deadline
-/// the body has to arrive by.
+/// A `/v1` group, with the body limit its operations admit, the deadline the
+/// body has to arrive by, and the credential checked before it is read.
 ///
 /// The interceptors every routed response shares — the request id and the API
 /// headers — sit on the router, not here: per group they would give each
-/// group its own id counter and leave the root routes without them. Four
-/// groups share the prefix, differing only in what body they admit and how
-/// long it may take: operations that take no body declare no `413` and no
-/// `408`, so the document does not promise a failure they cannot produce. A
-/// macro rather than a function because each interceptor changes the group's
-/// type.
+/// group its own id counter and leave the root routes without them. The
+/// groups share the prefix, differing only in what body they admit, how long
+/// it may take, and whether a credential is needed to send one: operations
+/// that take no body declare no `413` and no `408`, so the document does not
+/// promise a failure they cannot produce. A macro rather than a function
+/// because each interceptor changes the group's type.
+///
+/// Every group whose operations take a body and need `write` checks the
+/// credential first, with [`Authorized`](crate::http::security::Authorized),
+/// before anything reads the body. The handler's `Scoped` extractor runs only
+/// after every interceptor, and kynos' `BodySize` reads a body that declares
+/// no length whole, so without it an unauthenticated chunked body is buffered
+/// up to the group's limit — 96 MiB for `POST /v1/torrents` — and may stall
+/// for as long as the deadline allows before it is answered `401`.
+/// `POST /v1/sessions` is the one body operation that takes no credential,
+/// so it has a group of its own (`open`).
 ///
 /// The deadline is kynos' `Timeout`, mounted *before* `BodySize` so that it
 /// wraps the body read as well as the handler — kynos runs interceptors in the
@@ -123,22 +261,43 @@ pub struct Testing;
 /// mounted with `untimed`: applying a plan, and adopting or creating a plan,
 /// which wait on the pool index's writer that a scan holds for its whole run.
 /// A deadline there answers `408` while the work goes on to completion, and
-/// the client never learns its outcome. Nothing bounds how long their body
-/// takes to arrive either, and needing `write` does not change that: a body
-/// with no `Content-Length` is read whole by `BodySize` before the handler's
-/// `Scoped` extractor checks the token, so an unauthenticated chunked body
-/// that stalls holds its connection for as long as the peer keeps it open.
-/// `docs/running.md` §7 lists it among the cases left to a proxy's timeouts.
+/// the client never learns its outcome. Their body still has one:
+/// [`TimedBody`] reads it under [`BODY_DEADLINE`] and leaves the handler
+/// unbounded.
 macro_rules! v1_group {
     () => {
         kynos::router::group::Group::new(crate::http::v1::PREFIX)
     };
+    (open $max_body:expr, $deadline:expr) => {
+        v1_group!()
+            .intercept(kynos::middleware::limits::Timeout::new($deadline))
+            .intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
+    };
     (untimed $max_body:expr) => {
-        v1_group!().intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
+        v1_group!()
+            .intercept(crate::http::security::Authorized::<
+                crate::http::security::Write,
+            >::new())
+            .intercept(crate::http::v1::TimedBody {
+                limit: $max_body as u64,
+                deadline: crate::http::v1::BODY_DEADLINE,
+            })
+    };
+    // The alert drill's test surface: no deadline at all, which would add a
+    // `408` to it that only a drill could exercise.
+    (unbounded $max_body:expr) => {
+        v1_group!()
+            .intercept(crate::http::security::Authorized::<
+                crate::http::security::Write,
+            >::new())
+            .intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
     };
     ($max_body:expr, $deadline:expr) => {
         v1_group!()
             .intercept(kynos::middleware::limits::Timeout::new($deadline))
+            .intercept(crate::http::security::Authorized::<
+                crate::http::security::Write,
+            >::new())
             .intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
     };
 }
@@ -162,17 +321,26 @@ macro_rules! mount {
         let bodyless = pool::bodyless_routes!(profiles::bodyless_routes!(
             torrents::bodyless_routes!(bodyless)
         ));
-        let body = v1_group!(MAX_BODY_BYTES, REQUEST_DEADLINE)
+        let open = v1_group!(open MAX_BODY_BYTES, REQUEST_DEADLINE)
             .mount(kynos::routes![sessions::create_session]);
-        let body = pool::body_routes!(profiles::body_routes!(torrents::body_routes!(body)));
+        let body = pool::body_routes!(profiles::body_routes!(torrents::body_routes!(
+            v1_group!(MAX_BODY_BYTES, REQUEST_DEADLINE)
+        )));
         let long = pool::long_body_routes!(v1_group!(untimed MAX_BODY_BYTES));
-        // The alert drill's fault injection, in a `fault-injection` build
-        // only. Untimed: it is a test surface, and a deadline would add a
-        // `408` to it that only a drill could exercise.
-        #[cfg(feature = "fault-injection")]
-        let long = crate::http::fault_injection::fault_routes!(long);
         let add = torrents::add_routes!(v1_group!(MAX_ADD_BODY_BYTES, ADD_REQUEST_DEADLINE));
-        $router.group(bodyless).group(body).group(long).group(add)
+        let router = $router
+            .group(bodyless)
+            .group(open)
+            .group(body)
+            .group(long)
+            .group(add);
+        // The alert drill's fault injection, in a `fault-injection` build
+        // only.
+        #[cfg(feature = "fault-injection")]
+        let router = router.group(crate::http::fault_injection::fault_routes!(
+            v1_group!(unbounded MAX_BODY_BYTES)
+        ));
+        router
     }};
 }
 pub(crate) use mount;

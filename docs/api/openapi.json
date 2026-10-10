@@ -6808,7 +6808,7 @@
           "pool"
         ],
         "summary": "Compute a mutation plan.",
-        "description": "Works out every step the change would take and stores them as a `draft`,\ntouching nothing on disk; `POST …/apply` performs it. The planner refuses\nwith `409 plan-refused` when the change is unsafe as the index stands — an\noverlap, drift, an occupied destination, a torrent not in the index.\n\nRefused with `403 mutations-disabled` unless `[pool] allow_mutations` is\nset. Creating a plan touches nothing, but a plan that can never be applied\nis a trap, and refusing where the operator asks is the clearer signal.\n\nThe request has no deadline: the plan is written to the index, so it\nwaits for a running scan to finish before it answers.",
+        "description": "Works out every step the change would take and stores them as a `draft`,\ntouching nothing on disk; `POST …/apply` performs it. The planner refuses\nwith `409 plan-refused` when the change is unsafe as the index stands — an\noverlap, drift, an occupied destination, a torrent not in the index.\n\nRefused with `403 mutations-disabled` unless `[pool] allow_mutations` is\nset. Creating a plan touches nothing, but a plan that can never be applied\nis a trap, and refusing where the operator asks is the clearer signal.\n\nThe work has no deadline: the plan is written to the index, so it waits\nfor a running scan to finish before it answers. Only the body has one: a\nbody that has not arrived within 30 seconds is answered `408`.",
         "operationId": "create_plan",
         "requestBody": {
           "content": {
@@ -7082,6 +7082,28 @@
           },
           "413": {
             "description": "the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the request body did not arrive within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8818,7 +8840,7 @@
           "pool"
         ],
         "summary": "Adopt existing payload.",
-        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.\n\nThe request has no deadline and answers once every target is adopted or\nrefused: a large subtree, or a running scan holding the index, keeps it\nopen for as long as that takes.",
+        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.\n\nThe work has no deadline and the request answers once every target is\nadopted or refused: a large subtree, or a running scan holding the index,\nkeeps it open for as long as that takes. Only the body has one: a body\nthat has not arrived within 30 seconds is answered `408`.",
         "operationId": "adopt_pool_torrents",
         "requestBody": {
           "content": {
@@ -9126,6 +9148,28 @@
           },
           "413": {
             "description": "the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the request body did not arrive within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9519,6 +9563,28 @@
           },
           "413": {
             "description": "the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the request body did not arrive within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {

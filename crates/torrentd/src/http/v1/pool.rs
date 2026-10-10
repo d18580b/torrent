@@ -1031,9 +1031,10 @@ from_profile_problem!(AdoptError);
 /// Not gated on `[pool] allow_mutations`: adoption records an existing file's
 /// ownership and moves nothing on disk.
 ///
-/// The request has no deadline and answers once every target is adopted or
-/// refused: a large subtree, or a running scan holding the index, keeps it
-/// open for as long as that takes.
+/// The work has no deadline and the request answers once every target is
+/// adopted or refused: a large subtree, or a running scan holding the index,
+/// keeps it open for as long as that takes. Only the body has one: a body
+/// that has not arrived within 30 seconds is answered `408`.
 #[kynos::post("/pool/adoptions", tag = Pool)]
 pub async fn adopt_pool_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -1845,8 +1846,9 @@ pub enum CreatePlanError {
 /// set. Creating a plan touches nothing, but a plan that can never be applied
 /// is a trap, and refusing where the operator asks is the clearer signal.
 ///
-/// The request has no deadline: the plan is written to the index, so it
-/// waits for a running scan to finish before it answers.
+/// The work has no deadline: the plan is written to the index, so it waits
+/// for a running scan to finish before it answers. Only the body has one: a
+/// body that has not arrived within 30 seconds is answered `408`.
 #[kynos::post("/pool/plans", tag = Pool)]
 pub async fn create_plan(
     _caller: Scoped<Bearer, Write>,
@@ -2212,10 +2214,11 @@ macro_rules! body_routes {
 pub(crate) use body_routes;
 
 /// Operations whose body is bounded by `MAX_BODY_BYTES` and that may run for
-/// minutes, so carry no deadline: applying a plan waits for every step, and
-/// adopting or creating a plan waits on the index's writer, which a scan
-/// holds for its whole run. Cut off by a deadline, each would answer `408`
-/// and then run to completion anyway, its outcome lost to the client.
+/// minutes, so carry no deadline on their handler: applying a plan waits for
+/// every step, and adopting or creating a plan waits on the index's writer,
+/// which a scan holds for its whole run. Cut off by a deadline, each would
+/// answer `408` and then run to completion anyway, its outcome lost to the
+/// client. Their body still has to arrive within `BODY_DEADLINE`.
 macro_rules! long_body_routes {
     ($group:expr) => {
         $group.mount(kynos::routes![

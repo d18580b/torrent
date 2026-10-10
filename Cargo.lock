@@ -3526,6 +3526,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hex",
+ "http-body",
  "jiff",
  "kynos",
  "libc",
