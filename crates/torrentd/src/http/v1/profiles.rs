@@ -38,6 +38,7 @@ use crate::http::v1::Torrents;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::Resolution;
+use crate::profile_registry::ResumeGate;
 
 /// Operations that take no request body.
 macro_rules! bodyless_routes {
@@ -753,15 +754,14 @@ async fn for_each_torrent(
 /// own is left out ([`crate::profile_registry::ResumeGate`]): the response
 /// then counts only what was resumed, and lists nothing in
 /// `skipped_profiles`, since the later pause is what the operator asked for.
-async fn resume_each(s: &AppState, profile_id: &ProfileId, out: &mut BulkOutcome) {
-    let Some(gate) = s
-        .profiles
-        .resolve(profile_id)
-        .active()
-        .map(|e| e.open_gate())
-    else {
-        return;
-    };
+/// `gate` is the run's, opened with [`ProfileEntry::open_gate`] when the
+/// request began, so a pause that lands before this profile's turn holds too.
+async fn resume_each(
+    s: &AppState,
+    profile_id: &ProfileId,
+    gate: Arc<ResumeGate>,
+    out: &mut BulkOutcome,
+) {
     let handles = s.state.handles_for_profile(profile_id);
     let (profiles, metrics, id) = (
         Arc::clone(&s.profiles),
@@ -906,7 +906,14 @@ pub async fn resume_profile(
     let profile_id = ProfileId::new(path.profile_id);
     unfenced_engine(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
     let mut out = BulkOutcome::default();
-    resume_each(&s, &profile_id, &mut out).await;
+    if let Some(gate) = s
+        .profiles
+        .resolve(&profile_id)
+        .active()
+        .map(ProfileEntry::open_gate)
+    {
+        resume_each(&s, &profile_id, gate, &mut out).await;
+    }
     if out.failed_count > 0 {
         warn!(
             profile_id = %profile_id,
@@ -991,7 +998,11 @@ pub async fn pause_all_torrents(
 /// once the last is: about a second per 100 torrents in the daemon. The
 /// resume goes on if the client stops waiting. A profile fenced while its
 /// torrents are being resumed is listed in `skipped_profiles` (`vpn_down`)
-/// with how many stayed paused.
+/// with how many stayed paused. A pause that lands while it runs is kept in
+/// every profile, including those not reached yet: the daemon's pause-all
+/// stops it, a profile's pause-all stops it in that profile, and a torrent
+/// paused on its own is left out. A profile so paused is not listed in
+/// `skipped_profiles`.
 #[kynos::post("/torrents/resume-all", tag = Torrents)]
 pub async fn resume_all_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -1001,7 +1012,16 @@ pub async fn resume_all_torrents(
         skipped_profiles: skipped_failed(&s),
         ..BulkOutcome::default()
     };
-    for entry in s.profiles.iter() {
+    // Every profile's gate opens before the first is resumed, so a pause that
+    // lands while an earlier profile is resuming also holds in the later ones:
+    // the daemon's pause-all stops the whole request, and a profile's pause-all
+    // or a single torrent's pause is kept when the loop reaches it.
+    let gates: Vec<_> = s
+        .profiles
+        .iter()
+        .map(|entry| (entry, entry.open_gate()))
+        .collect();
+    for (entry, gate) in gates {
         let held = if entry.health().status == EngineProfileStatus::VpnDown {
             Some(ProfileProblem::vpn_down())
         } else if s.profile_offline(entry.id()) {
@@ -1020,7 +1040,7 @@ pub async fn resume_all_torrents(
             });
             continue;
         }
-        resume_each(&s, entry.id(), &mut out).await;
+        resume_each(&s, entry.id(), gate, &mut out).await;
     }
     if out.failed_count > 0 {
         warn!(
