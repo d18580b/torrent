@@ -535,14 +535,7 @@ pub fn enable(tunnels: &[String]) -> io::Result<Installed> {
             uid = installed.uid,
             "removed a kill-switch table an earlier release left under the shared name",
         ),
-        Err(e) => tracing::warn!(
-            target: "torrentd::vpn::killswitch",
-            table = TABLE_PREFIX,
-            error.cause = %e,
-            "could not check for, or remove, a kill-switch table an earlier release left under \
-             the shared name. If it confines this daemon's uid, remove it with \
-             `nft delete table inet {TABLE_PREFIX}`",
-        ),
+        Err(e) => warn_legacy_failure(&e),
     }
     Ok(installed)
 }
@@ -760,6 +753,13 @@ pub fn remove_table_for(uid: u32) -> io::Result<bool> {
 /// between them is reachable by a test on a host without `nft` or
 /// `CAP_NET_ADMIN`: `list` is `nft list tables`, `list_json` lists one table
 /// as JSON, and `delete` deletes one table, each by name.
+///
+/// A failure on the legacy table is reported apart from this uid's own. Once
+/// the own table is deleted it is a warning, and the call succeeds: the
+/// caller's failure report says the uid stays confined by its own table,
+/// which is gone. With no own table to delete, the legacy table is the only
+/// one left that may confine this uid, so its failure is the call's error,
+/// and the error names it.
 pub(crate) fn disable_with(
     uid: u32,
     list: impl Fn() -> io::Result<String>,
@@ -773,7 +773,30 @@ pub(crate) fn disable_with(
         delete(&own)?;
         removed = true;
     }
-    Ok(remove_legacy_with(uid, &listing, list_json, delete)? || removed)
+    match remove_legacy_with(uid, &listing, list_json, delete) {
+        Ok(legacy) => Ok(legacy || removed),
+        Err(e) if removed => {
+            warn_legacy_failure(&e);
+            Ok(true)
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("the table an earlier release left under the shared name {TABLE_PREFIX}: {e}"),
+        )),
+    }
+}
+
+/// Log a failure to read or delete the table an earlier release left under
+/// the shared name, after this uid's own table was dealt with.
+fn warn_legacy_failure(e: &io::Error) {
+    tracing::warn!(
+        target: "torrentd::vpn::killswitch",
+        table = TABLE_PREFIX,
+        error.cause = %e,
+        "could not check for, or remove, a kill-switch table an earlier release left under \
+         the shared name. If it confines this daemon's uid, remove it with \
+         `nft delete table inet {TABLE_PREFIX}`",
+    );
 }
 
 /// Delete the table an earlier release installed under the single shared
@@ -2111,6 +2134,50 @@ table inet torrentd_ks_998 {
         )
         .expect_err("a legacy table that could not be read is not taken for absent");
         assert!(e.to_string().contains("nft -j list table"), "got {e}");
+        assert!(
+            e.to_string().contains("shared name torrentd_ks:"),
+            "the error names the legacy table, not this uid's: {e}"
+        );
+    }
+
+    /// Once this uid's own table is deleted, a legacy table that cannot be
+    /// read or deleted is a warning, not the call's failure: shutdown would
+    /// otherwise report this uid's table as still confining it.
+    #[test]
+    fn a_legacy_failure_after_the_own_table_is_removed_is_a_warning() {
+        let listing = || Ok(format!("table inet torrentd_ks\ntable inet {TABLE}\n"));
+
+        let deleted = std::cell::RefCell::new(Vec::new());
+        let removed = disable_with(
+            998,
+            listing,
+            |_| Err(io::Error::other("nft -j list table exited 1")),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+        .expect("the own table is gone, so the call succeeds");
+        assert!(removed);
+        assert_eq!(*deleted.borrow(), [TABLE], "only the own table is deleted");
+
+        let deleted = std::cell::RefCell::new(Vec::new());
+        let removed = disable_with(
+            998,
+            listing,
+            |_| Ok(legacy_listing(998)),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                if name == TABLE_PREFIX {
+                    Err(io::Error::other("nft delete table exited 1: busy"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("a legacy delete that failed does not fail the own table's removal");
+        assert!(removed);
+        assert_eq!(*deleted.borrow(), [TABLE, TABLE_PREFIX]);
     }
 
     #[test]
