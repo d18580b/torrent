@@ -292,9 +292,11 @@ pub struct PoolOverview {
     /// Library torrents by adoption state. A torrent never matched has no
     /// state and is in none of these.
     pub states: AdoptionCounts,
-    /// Adopted torrents waiting for a verification slot.
+    /// Adopted torrents, and re-hashes `POST /v1/pool/verifications` queued,
+    /// waiting for a verification slot.
     pub verify_queue_depth: u32,
-    /// Adopted torrents libtorrent is hashing now.
+    /// Adopted torrents and re-hashes libtorrent is hashing now: at most
+    /// `[pool] max_concurrent_verify`.
     pub verify_in_flight: u32,
 }
 
@@ -1327,12 +1329,14 @@ impl Validate for VerifyRequest {
     }
 }
 
-/// Which re-hashes started.
+/// Which re-hashes were queued.
 #[derive(Debug, Schema, Serialize)]
 pub struct VerifyResult {
     /// How many infohashes the request named.
     pub requested: u32,
-    /// Torrents libtorrent is now re-hashing.
+    /// Torrents queued for a re-hash. Each starts once the verify queue has
+    /// a slot free: `[pool] max_concurrent_verify` bounds re-hashes and
+    /// adoptions' verifications together.
     pub started: Vec<InfoHashHex>,
     /// Torrents not re-hashed, each with the reason.
     pub skipped: Vec<RefusedTorrent>,
@@ -1362,21 +1366,27 @@ from_invalid!(VerifyError);
 ///
 /// Asks libtorrent to check each torrent's payload against its piece hashes
 /// (v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.
-/// `202` means the checks started; each torrent reports `checking` until it
-/// finishes. A torrent not loaded in any session, or paused (libtorrent does
-/// not hash a paused torrent), is skipped with the reason. Only a torrent in
-/// the pool index has its outcome recorded: a pass marks it `adopted`, a
-/// failure marks it `drifted` and pauses it.
+/// `202` means the checks are queued: the verify queue starts them as slots
+/// free up, at most `[pool] max_concurrent_verify` at once together with
+/// adoptions' verifications, and `GET /v1/pool` counts them in
+/// `verify_queue_depth` while they wait and `verify_in_flight` while they
+/// hash. Each torrent reports `checking` from when its check starts until it
+/// finishes. A torrent not loaded in any session, paused (libtorrent does not
+/// hash a paused torrent), or without metadata yet is skipped with the
+/// reason. The queue is held in memory: a restart drops the re-hashes that
+/// had not started. Only a torrent in the pool index has its outcome
+/// recorded: a pass marks it `adopted`, a failure marks it `drifted` and
+/// pauses it.
 #[kynos::post("/pool/verifications", tag = Pool)]
 pub async fn verify_pool_torrents(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Accepted<Json<VerifyResult>>, VerifyError> {
-    s.pool.as_ref().ok_or(VerifyError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(VerifyError::PoolNotConfigured)?;
     req.validate()?;
-    // On the blocking pool: each recheck takes its session's lock, and a
-    // request may name thousands of torrents.
+    // On the blocking pool: each torrent reads the pool index, and a request
+    // may name a thousand torrents.
     let resp = crate::http::v1::common::blocking(move || {
         let mut resp = VerifyResult {
             requested: count(req.infohashes.len()),
@@ -1393,9 +1403,10 @@ pub async fn verify_pool_torrents(
             };
             // A recheck resumes the torrent's network activity once it ends,
             // so a fenced or offline profile is skipped as resume-all skips
-            // it: its torrents wait for the operator to set it online.
-            let engine = match unfenced_engine(&s, &st.profile_id) {
-                Ok(engine) => engine,
+            // it: its torrents wait for the operator to set it online. The
+            // verify queue checks again when it starts the re-hash.
+            match unfenced_engine(&s, &st.profile_id) {
+                Ok(_) => {}
                 Err(crate::http::v1::common::ProfileProblem::Unavailable { detail, .. }) => {
                     skip(&mut resp, detail);
                     continue;
@@ -1404,7 +1415,7 @@ pub async fn verify_pool_torrents(
                     skip(&mut resp, "engine missing".to_owned());
                     continue;
                 }
-            };
+            }
             // libtorrent does not hash a paused torrent: the check waits for a
             // resume that nothing here issues, so reporting it started would
             // be false. A torrent paused by a failed verification is the
@@ -1419,27 +1430,27 @@ pub async fn verify_pool_torrents(
                 );
                 continue;
             }
-            // Tracked before it is asked for, so the check it starts finishes
-            // after the mark; the verify queue then records its outcome, which
-            // is what clears a drifted torrent or pauses one that failed.
-            // Only a torrent the pool index holds has an adoption to record:
-            // anything else is re-hashed and left alone, neither paused on a
-            // failure nor written into the index.
-            if let Some(pool) = s.pool.as_ref() {
-                let ih = infohash.to_string();
-                let indexed = pool.with_reader(|st| st.torrent(&ih).map(|t| t.is_some()));
-                match indexed {
-                    Ok(true) => pool.verify_queue().track_recheck(ih),
-                    Ok(false) => {}
-                    Err(e) => {
-                        skip(&mut resp, format!("pool index unreadable: {e}"));
-                        continue;
-                    }
-                }
+            // libtorrent has nothing to hash a magnet against until its
+            // metadata arrives, and ignores the request.
+            if st.phase == torrentd_engine::TorrentPhase::AwaitingMetadata {
+                skip(
+                    &mut resp,
+                    "no metadata yet, so there is nothing to hash against".to_owned(),
+                );
+                continue;
             }
-            match engine.force_recheck(st.handle) {
-                Ok(()) => resp.started.push(infohash),
-                Err(e) => skip(&mut resp, e.to_string()),
+            // The verify queue starts the re-hash once a slot is free, and
+            // records its outcome, which is what clears a drifted torrent or
+            // pauses one that failed. Only a torrent the pool index holds has
+            // an adoption to record: anything else is re-hashed and left
+            // alone, neither paused on a failure nor written into the index.
+            let ih = infohash.to_string();
+            match pool.with_reader(|st| st.torrent(&ih).map(|t| t.is_some())) {
+                Ok(indexed) => {
+                    pool.verify_queue().enqueue_recheck(ih, indexed);
+                    resp.started.push(infohash);
+                }
+                Err(e) => skip(&mut resp, format!("pool index unreadable: {e}")),
             }
         }
         resp

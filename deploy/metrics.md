@@ -110,8 +110,8 @@ hold.
 | `torrentd_pool_scan_errors_total` | counter | `kind`: `walk`, `stat`, `path`, `read`, `parse` | daemon | from boot, at 0 | Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or unparseable .torrent files. |
 | `torrentd_pool_verify_completed_total` | counter | — | daemon | from boot, at 0 | Adopted torrents that verified and are seeding. |
 | `torrentd_pool_verify_failed_total` | counter | — | daemon | from boot, at 0 | Adopted torrents whose verification failed or was dropped. |
-| `torrentd_pool_verify_queue_depth` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions waiting to verify. |
-| `torrentd_pool_verify_in_flight` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions verifying now. |
+| `torrentd_pool_verify_queue_depth` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions waiting to verify, and re-hashes POST /v1/pool/verifications queued that have not started. |
+| `torrentd_pool_verify_in_flight` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions verifying and re-hashes checking now, together bounded by [pool] max_concurrent_verify. |
 | `torrentd_pool_index_profile_disagreements` | gauge | — | daemon | from boot: pool configured | Torrents whose pool-index profile disagrees with the assignment registry at boot. |
 | `torrentd_dir_fsync_errors_total` | counter | — | daemon | from boot, at 0 | Directory fsyncs after a rename that failed, every one rather than only the logged first; the renamed file is on disk, but a power loss may revert its name. |
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |
