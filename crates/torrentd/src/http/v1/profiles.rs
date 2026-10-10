@@ -1067,6 +1067,54 @@ mod tests {
         assert!(d.contains("restart the daemon"));
     }
 
+    /// A WireGuard profile that fails on a malformed private key is listed
+    /// with a `failure_reason` that does not carry the key: the list is
+    /// read scope, served to the anonymous caller in unauthenticated mode.
+    /// The reason is built the way startup builds it, from the real
+    /// manager's refusal of a config whose key is quoted.
+    #[test]
+    fn a_failure_reason_never_carries_the_profiles_private_key() {
+        use torrentd_engine::VpnManager;
+        use torrentd_engine::VpnTunnel;
+        use torrentd_engine::VpnType;
+
+        use crate::app_state::build_test_state_with_sessions;
+        use crate::profile_registry::test_failed_profile;
+        use crate::profile_registry::ProfileRegistry;
+        use crate::vpn::WireguardManager;
+
+        const KEY: &str = "SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=";
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tdnx-k230.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[Interface]\nPrivateKey = \"{KEY}\"\nAddress = 10.2.0.2/32\n\n\
+                 [Peer]\nPublicKey = 9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=\n\
+                 AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.7:51820\n"
+            ),
+        )
+        .unwrap();
+        let e = WireguardManager::new(dir.path().join("state"))
+            .bring_up(&VpnTunnel {
+                r#type: VpnType::Wireguard,
+                config_path,
+                interface: "tdnx-k230".to_string(),
+            })
+            .expect_err("a quoted key does not come up");
+
+        let reg = Arc::new(
+            ProfileRegistry::new(vec![]).with_failed(vec![test_failed_profile(
+                "acct_a",
+                &format!("VPN bring-up failed: {e}"),
+            )]),
+        );
+        let s = build_test_state_with_sessions(Some(reg), &[]);
+        let listed = serde_json::to_string(&profile_list(&s)).unwrap();
+        assert!(listed.contains("VPN bring-up failed"), "listed: {listed}");
+        assert!(!listed.contains(&KEY[..43]), "the key leaked: {listed}");
+    }
+
     #[test]
     fn failures_are_counted_exactly_and_named_up_to_the_cap_smallest_first() {
         use torrentd_engine::InfoHash;

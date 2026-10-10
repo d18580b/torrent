@@ -1019,27 +1019,114 @@ mod native {
             .map(str::to_string)
     }
 
+    /// Which section of the config a line is in.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        /// Before the first section header.
+        None,
+        Interface,
+        Peer,
+    }
+
+    /// The keys `wg setconf` reads in each section, lowercased. Anything
+    /// else it rejects by echoing the whole line, value included, on stderr.
+    const WG_INTERFACE_KEYS: &[&str] = &["privatekey", "listenport", "fwmark"];
+    const WG_PEER_KEYS: &[&str] = &[
+        "publickey",
+        "presharedkey",
+        "allowedips",
+        "endpoint",
+        "persistentkeepalive",
+    ];
+
+    /// How an error names the key on line `n`: by name where it reads as one
+    /// (letters only, no longer than any key `wg` knows), otherwise by line
+    /// number alone. A line such as `PrivateKey KCNt…=` splits on the key's
+    /// own padding, so what sits left of the `=` can be the secret itself.
+    fn named(key: &str, n: usize) -> String {
+        if !key.is_empty() && key.len() <= 24 && key.bytes().all(|b| b.is_ascii_alphabetic()) {
+            format!("line {n}: {key}")
+        } else {
+            format!("line {n}")
+        }
+    }
+
+    /// Whether `value` is a key `wg` accepts: 44 characters of base64, the
+    /// last of them `=`, decoding to 32 bytes. Whitespace inside it is
+    /// ignored, as `wg` strips it. The bits the last character leaves over
+    /// are not checked, because `wg` does not check them either.
+    fn is_wg_key(value: &str) -> bool {
+        let key: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        key.len() == 44
+            && key[43] == b'='
+            && key[..43]
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    }
+
     /// Split a config the way `wg-quick`'s `parse_options` does: `#` starts a
     /// comment, keys match case-insensitively, and the `wg-quick` keys are
     /// taken only inside `[Interface]`.
+    ///
+    /// What is left for `wg setconf` is checked here too, because `wg`
+    /// reports a line it cannot read by echoing it on stderr, private key
+    /// and all. A `PrivateKey` or `PresharedKey` that is not a key, a key
+    /// `wg` does not read, a line outside any section and a line that is not
+    /// `Key = value` are each refused with an error that names the line and
+    /// the key, never the value.
     pub(super) fn parse(text: &str) -> Result<Parsed, String> {
         let mut p = Parsed {
             route: true,
             ..Parsed::default()
         };
-        let mut in_interface = false;
-        for line in text.lines() {
+        let mut section = Section::None;
+        for (i, line) in text.lines().enumerate() {
+            let n = i + 1;
             let stripped = line.split('#').next().unwrap_or_default();
-            let (key, value) = match stripped.split_once('=') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => (stripped.trim(), ""),
+            if stripped.trim().is_empty() {
+                p.wg_conf.push_str(line);
+                p.wg_conf.push('\n');
+                continue;
+            }
+            let Some((key, value)) = stripped.split_once('=') else {
+                section = match stripped.trim().to_ascii_lowercase().as_str() {
+                    "[interface]" => Section::Interface,
+                    "[peer]" => Section::Peer,
+                    _ => {
+                        return Err(format!(
+                            "line {n} is neither [Interface], [Peer] nor `Key = value`; \
+                             its text is not shown, as it may hold a key"
+                        ));
+                    }
+                };
+                p.wg_conf.push_str(line);
+                p.wg_conf.push('\n');
+                continue;
             };
-            if key.starts_with('[') {
-                in_interface = key.eq_ignore_ascii_case("[Interface]");
-            } else if key.eq_ignore_ascii_case("AllowedIPs") {
+            let (key, value) = (key.trim(), value.trim());
+            let lower = key.to_ascii_lowercase();
+            let known = match section {
+                Section::None => {
+                    return Err(format!(
+                        "{} comes before any [Interface] or [Peer] section",
+                        named(key, n),
+                    ));
+                }
+                Section::Interface => WG_INTERFACE_KEYS,
+                Section::Peer => WG_PEER_KEYS,
+            };
+            if matches!(lower.as_str(), "privatekey" | "presharedkey") && !is_wg_key(value) {
+                return Err(format!(
+                    "{} is not a WireGuard key: it must be 44 characters of base64 \
+                     encoding 32 bytes, with no quotes or other text around it; its value \
+                     is not shown",
+                    named(key, n),
+                ));
+            }
+            if section == Section::Peer && lower == "allowedips" {
                 p.allowed_ips.extend(list(value));
-            } else if in_interface {
-                match key.to_ascii_lowercase().as_str() {
+            } else if section == Section::Interface {
+                match lower.as_str() {
                     "address" => {
                         p.addresses.extend(list(value));
                         continue;
@@ -1080,6 +1167,13 @@ mod native {
                     _ => {}
                 }
             }
+            if !known.contains(&lower.as_str()) {
+                return Err(format!(
+                    "{} is not a key `wg` reads in this section, so `wg setconf` would \
+                     refuse it; its value is not shown",
+                    named(key, n),
+                ));
+            }
             p.wg_conf.push_str(line);
             p.wg_conf.push('\n');
         }
@@ -1110,8 +1204,10 @@ mod native {
     }
 
     /// [`exec::run_ok`], with the error as the text a refusal carries. The
-    /// error names the command and what it printed; `stdin` — which carries
-    /// the private key — never appears in it.
+    /// error names the command and what it printed on stderr. `stdin` is not
+    /// copied into it, but a program that echoes its input on stderr puts it
+    /// there: `wg setconf` does, which is why [`configure_with`] passes its
+    /// error through [`redact_echo`].
     fn run(program: &str, args: &[&str], stdin: Option<&str>) -> Result<(), String> {
         exec::run_ok(program, args, stdin.map(str::as_bytes), exec::CHANGE)
             .map(|_| ())
@@ -1157,6 +1253,40 @@ mod native {
         )
     }
 
+    /// `wg setconf`'s error with what it echoed of the config removed.
+    ///
+    /// `wg` quotes the input it cannot read as `` `…' `` — "Key is not the
+    /// correct length or format: `<key>'", "Line unrecognized: `<line>'" —
+    /// and the config is what carries the private key. [`parse`] refuses
+    /// every line known to reach those paths, so this is the second guard:
+    /// from each backtick on a line through the last apostrophe on it (or the
+    /// end of the line, where there is none) becomes `` `<redacted>' ``. The
+    /// one span kept is the command [`exec::run_ok`] names at the very start,
+    /// `` `wg setconf <iface> /dev/stdin` ``, which carries no config.
+    pub(super) fn redact_echo(err: &str) -> String {
+        let (head, rest) = match err.strip_prefix('`').and_then(|r| r.find('`')) {
+            Some(end) => err.split_at(end + 2),
+            None => ("", err),
+        };
+        let mut out = head.to_string();
+        for (i, line) in rest.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            match line.find('`') {
+                Some(open) => {
+                    out.push_str(&line[..open]);
+                    out.push_str("`<redacted>'");
+                    if let Some(close) = line.rfind('\'').filter(|&c| c > open) {
+                        out.push_str(&line[close + 1..]);
+                    }
+                }
+                None => out.push_str(line),
+            }
+        }
+        out
+    }
+
     /// [`configure`] over the commands it runs, the route install and the
     /// route probe, so which failure is which can be tested without a link.
     pub(super) fn configure_with(
@@ -1167,7 +1297,7 @@ mod native {
         probe: impl FnOnce(&str, IpAddr) -> Result<RouteProbe, RouteProbeUnavailable>,
     ) -> Result<(), UpFailure> {
         run("wg", &["setconf", iface, "/dev/stdin"], Some(&p.wg_conf))
-            .map_err(UpFailure::Refused)?;
+            .map_err(|e| UpFailure::Refused(redact_echo(&e)))?;
         for addr in &p.addresses {
             run(
                 "ip",
@@ -2081,6 +2211,118 @@ PublicKey = x
         let e = native::parse(&PROVIDER_CONF.replace("Address = 10.2.0.2/32, fd00::2/128", ""))
             .expect_err("no Address, nothing to bind a profile to");
         assert!(e.contains("Address"), "got {e}");
+    }
+
+    /// The private key in [`PROVIDER_CONF`], whose every malformed spelling
+    /// below must be refused without the refusal carrying it.
+    const KEY: &str = "SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=";
+
+    /// A secret key `wg` cannot read is refused at parse, by name and line,
+    /// never by value: handed on, `wg setconf` echoes it on stderr into the
+    /// profile's failure reason. A misspelt key, a line outside a section
+    /// and a line with no `=` are refused the same way, since `wg` echoes the
+    /// whole line for those.
+    #[test]
+    fn a_key_wg_cannot_read_is_refused_without_its_value() {
+        let private = |line: &str| PROVIDER_CONF.replace(&format!("PrivateKey = {KEY}"), line);
+        for (line, names) in [
+            (format!("PrivateKey = \"{KEY}\""), "line 3: PrivateKey"),
+            (format!("privatekey = {KEY}x"), "line 3: privatekey"),
+            (format!("PrivateKey = {KEY};"), "line 3: PrivateKey"),
+            (format!("PrivateKey = {}", &KEY[..43]), "line 3: PrivateKey"),
+            ("PrivateKey =".to_string(), "line 3: PrivateKey"),
+            (format!("PrivteKey = {KEY}"), "line 3: PrivteKey"),
+            (format!("PrivateKey: {KEY}"), "line 3"),
+            (format!("PrivateKey {KEY}"), "line 3"),
+            (format!("PrivateKey\t{}", &KEY[..43]), "line 3 is neither"),
+        ] {
+            let e = native::parse(&private(&line)).expect_err(&line);
+            assert!(!e.contains(&KEY[..43]), "{line:?} leaked the key: {e}");
+            assert!(e.contains(names), "{line:?} should name {names:?}: {e}");
+        }
+        let e = native::parse(&format!("PrivateKey = \"{KEY}\"\n{PROVIDER_CONF}"))
+            .expect_err("a key before any section");
+        assert!(
+            e.contains("line 1: PrivateKey") && !e.contains(&KEY[..43]),
+            "got {e}"
+        );
+
+        let psk = PROVIDER_CONF.replace(
+            "AllowedIPs = 0.0.0.0/0,::/0",
+            &format!("AllowedIPs = 0.0.0.0/0,::/0\nPresharedKey = '{KEY}'"),
+        );
+        let e = native::parse(&psk).expect_err("a quoted preshared key");
+        assert!(
+            e.contains("PresharedKey") && !e.contains(&KEY[..43]),
+            "got {e}"
+        );
+
+        // What `wg` does accept still parses: a preshared key, the other keys
+        // it reads, whitespace inside the value, and sections in any case.
+        let full = PROVIDER_CONF
+            .replace("[Interface]", "[interface]")
+            .replace(
+                &format!("PrivateKey = {KEY}"),
+                &format!(
+                    "PrivateKey = {} {}\nListenPort = 51820\nFwMark = 0x1",
+                    &KEY[..20],
+                    &KEY[20..]
+                ),
+            )
+            .replace(
+                "AllowedIPs = 0.0.0.0/0,::/0",
+                &format!(
+                    "AllowedIPs = 0.0.0.0/0,::/0\nPresharedKey = {KEY}\nPersistentKeepalive = 25"
+                ),
+            );
+        native::parse(&full).unwrap_or_else(|e| panic!("{e}\n{full}"));
+    }
+
+    /// The second guard: whatever `wg setconf` echoes of its input is cut
+    /// out of the refusal. This is `wg`'s own stderr for a quoted key, as
+    /// `exec::run_ok` reports it.
+    #[test]
+    fn what_wg_setconf_echoes_never_reaches_the_refusal() {
+        let echoed = format!(
+            "`wg setconf wg-a /dev/stdin` exited exit status: 1: Key is not the correct length \
+             or format: `\"{KEY}\"'\nConfiguration parsing error"
+        );
+        let refused = native::configure_with(
+            "wg-a",
+            &parsed(false),
+            |p: &str, _: &[&str], _: Option<&str>| {
+                if p == "wg" {
+                    Err(echoed.clone())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| Ok(()),
+            |_, _| Ok(super::super::route::RouteProbe::ViaTunnel),
+        );
+        let Err(native::UpFailure::Refused(why)) = refused else {
+            panic!("a wg setconf failure is a refusal: {refused:?}");
+        };
+        assert!(!why.contains(&KEY[..43]), "leaked the key: {why}");
+        assert_eq!(
+            why,
+            "`wg setconf wg-a /dev/stdin` exited exit status: 1: Key is not the correct length \
+             or format: `<redacted>'\nConfiguration parsing error",
+        );
+
+        for (stderr, want) in [
+            (
+                format!("Line unrecognized: `PrivateKey={KEY}'"),
+                "Line unrecognized: `<redacted>'",
+            ),
+            // A key holding an apostrophe or a backtick is cut through the
+            // last apostrophe on its line, so no part of it is left behind.
+            (format!("bad: `ab'c{KEY}' tail"), "bad: `<redacted>' tail"),
+            (format!("bad: `a`b{KEY}"), "bad: `<redacted>'"),
+            ("no quotes here".to_string(), "no quotes here"),
+        ] {
+            assert_eq!(native::redact_echo(&stderr), want);
+        }
     }
 
     /// A split `AllowedIPs` is refused before anything is created: the
