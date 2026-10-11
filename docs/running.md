@@ -116,6 +116,31 @@ sudo install -d -o torrentd -g torrentd -m0750 /etc/torrentd /var/lib/torrentd
 sudo install -d -o torrentd -g torrentd -m0755 /data/torrents
 ```
 
+**On the compose stack, the payload directory belongs to uid 1000 instead.**
+`deploy/compose.yaml` bind-mounts the host's `/data/torrents`, which hides the
+image's own copy, and the image runs as `USER 1000:1000`. A host directory
+created as above belongs to `torrentd`'s uid, and one Docker creates because
+it was missing belongs to root; either way every download and every plan step
+fails with `EACCES`. Before the first `compose up`:
+
+```bash
+sudo install -d -o 1000 -g 1000 -m0755 /data/torrents
+```
+
+Rootless podman maps the container's uid 1000 to one of your subordinate
+uids, and `podman unshare chown` can only change a directory your own uid
+already owns: on one created as host uid 1000 above, it fails with `EPERM`
+unless your uid is 1000. Create the directory as yourself instead, then hand
+it to the container's uid:
+
+```bash
+sudo install -d -o "$USER" -g "$USER" -m0755 /data/torrents
+podman unshare chown 1000:1000 /data/torrents
+```
+
+Changing `user:` to match the host directory's owner instead is no shortcut:
+the state volume's directories belong to uid 1000 too.
+
 What the daemon does and does not create:
 
 - **Creates on first write:** `resume_dir`, `torrent_dir`, and the parent of the
@@ -797,8 +822,12 @@ Metrics were renamed with it: every `slot_*` series is now `profile_*`, and the
 `slot_id` label is `profile_id`. There is no alias and no dual-emission period,
 so any dashboard or alert rule built on the old names stops firing silently
 rather than erroring. `/healthz`'s path is unchanged; its response keys
-`slots` / `slots_fenced` / `all_slots_fenced` are now `profiles` /
-`profiles_fenced` / `all_profiles_fenced`.
+`slots` / `slots_fenced` are now `profiles` / `profiles_fenced`. There is no
+key in place of `all_slots_fenced`: every live profile fenced is now a 503
+answer whose `reason` is `"all_profiles_fenced"`, so a check on
+`.all_slots_fenced == true` becomes the status code, or
+`.reason == "all_profiles_fenced"`. `profiles_failed`, the configured profiles
+that never came up, is new.
 
 **A WireGuard profile's `vpn_config` must be `/etc/wireguard/<vpn_interface>.conf`
 — exactly that directory, and a file name matching the interface.** This is
