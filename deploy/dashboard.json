@@ -281,7 +281,7 @@
       "id": 19,
       "type": "timeseries",
       "title": "Tunnel up",
-      "description": "1 while the profile's tunnel is healthy; 0 once fenced, or if it never came up. A fenced profile seeds nothing until the daemon restarts (TorrentdVpnTunnelDown). vpn profiles only.",
+      "description": "1 while the profile's tunnel is healthy; 0 once fenced, or if it never came up. A fenced profile seeds nothing until it is set online on a healthy tunnel (PATCH /v1/profiles/{id} state=online, no restart); one that never came up needs a restart (TorrentdVpnTunnelDown). vpn profiles only.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 44 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
