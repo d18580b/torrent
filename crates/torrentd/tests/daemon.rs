@@ -24,19 +24,30 @@ fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, Strin
 
 /// As [`http`], naming `host` as the request's `Host`.
 fn http_as(addr: &str, method: &str, path: &str, body: Option<&str>, host: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    try_http_as(addr, method, path, body, host)
+        .unwrap_or_else(|e| panic!("{method} {path} on {addr}: {e}"))
+}
+
+/// As [`http_as`], returning a failure to connect, write or read instead of
+/// panicking on it.
+fn try_http_as(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    host: &str,
+) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(req.as_bytes())?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).unwrap();
+    stream.read_to_end(&mut buf)?;
     let resp = String::from_utf8_lossy(&buf);
     let status = resp
         .lines()
@@ -49,7 +60,7 @@ fn http_as(addr: &str, method: &str, path: &str, body: Option<&str>, host: &str)
         .map(|(_, b)| b)
         .unwrap_or("")
         .to_string();
-    (status, body)
+    Ok((status, body))
 }
 
 /// The `POST /v1/torrents` body adding `magnet` to the test profile.
@@ -60,14 +71,74 @@ fn add_magnet(magnet: &str) -> String {
 }
 
 fn wait_healthy(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() && http(addr, "GET", "/healthz", None).0 == 200 {
-            return;
+    wait_healthy_within(addr, Duration::from_secs(30));
+}
+
+/// As [`wait_healthy`], with a boot deadline of `budget`. The panic names the
+/// last `/healthz` answer, or the error that kept one from arriving, so a boot
+/// that never came up says whether nothing listened or what it answered.
+fn wait_healthy_within(addr: &str, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    let last = loop {
+        let last = match try_http_as(addr, "GET", "/healthz", None, "localhost") {
+            Ok((200, _)) => return,
+            Ok((status, body)) => format!("the last /healthz answered {status}: {body}"),
+            Err(e) => format!("the last /healthz attempt failed: {e}"),
+        };
+        if Instant::now() >= deadline {
+            break last;
         }
         std::thread::sleep(Duration::from_millis(200));
+    };
+    panic!("daemon on {addr} did not become healthy within {budget:?}; {last}");
+}
+
+/// The daemon's stdout and stderr, written to `daemon.log` in a test's
+/// tempdir, whose tail is printed if the test panics.
+///
+/// The daemon logs to stdout, so a test that discarded it lost the reason a
+/// boot failed. Declare the guard before the child it captures, so the child
+/// is killed first and the log is complete when it is read, and after the
+/// tempdir, so the file is still there.
+struct DaemonLog(std::path::PathBuf);
+
+impl DaemonLog {
+    /// Lines of the log printed on a panic.
+    const TAIL: usize = 200;
+
+    fn new(dir: &std::path::Path) -> Self {
+        let path = dir.join("daemon.log");
+        std::fs::File::create(&path).expect("create daemon.log");
+        Self(path)
     }
-    panic!("daemon did not become healthy within 30s");
+
+    /// A handle for the child's stdout or stderr. Opened for append, so the
+    /// two streams interleave rather than overwrite each other.
+    fn stdio(&self) -> std::process::Stdio {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.0)
+            .expect("open daemon.log")
+            .into()
+    }
+}
+
+impl Drop for DaemonLog {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let text = std::fs::read_to_string(&self.0)
+            .unwrap_or_else(|e| format!("<could not read {}: {e}>", self.0.display()));
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(Self::TAIL)..];
+        eprintln!(
+            "--- the last {} of {} lines of the daemon's output ---\n{}\n--- end of the daemon's output ---",
+            tail.len(),
+            lines.len(),
+            tail.join("\n")
+        );
+    }
 }
 
 /// The profile every torrent in these tests belongs to.
@@ -847,18 +918,18 @@ fn a_config_that_fails_to_load_exits_ex_config() {
 
     // An operator subcommand is not the daemon: `vpn check` documents only
     // 0/1/2, and a config it cannot load is its 1.
-    let status = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+    let out = Command::new(env!("CARGO_BIN_EXE_torrentd"))
         .arg("--config")
         .arg(&cfg)
         .args(["vpn", "check"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .expect("spawn torrentd vpn check");
     assert_eq!(
-        status.code(),
+        out.status.code(),
         Some(1),
-        "vpn check on a config that fails to load"
+        "vpn check on a config that fails to load; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -1583,6 +1654,9 @@ fn a_million_file_scan_leaves_the_daemon_responsive() {
             let _ = self.0.wait();
         }
     }
+    // Its output, printed if anything below panics: declared before `child`,
+    // so it is read once the daemon is dead.
+    let log = DaemonLog::new(p);
     let mut child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_torrentd"))
             .arg("--config")
@@ -1590,11 +1664,15 @@ fn a_million_file_scan_leaves_the_daemon_responsive() {
             .env("NOTIFY_SOCKET", &sock_path)
             .env("WATCHDOG_USEC", WATCHDOG_USEC.to_string())
             .env_remove("WATCHDOG_PID")
-            .stdout(std::process::Stdio::null())
+            .stdout(log.stdio())
+            .stderr(log.stdio())
             .spawn()
             .expect("spawn daemon"),
     );
-    wait_healthy(addr);
+    // A longer boot deadline than the other tests': this one boots while the
+    // rest of Layer 3 starts its own daemons and libtorrent sessions on the
+    // same runner, and 30s once proved too little on CI (issue #359).
+    wait_healthy_within(addr, Duration::from_secs(120));
 
     // The library alone, so the index the second scan replaces holds it.
     let (code, body) = http_within(addr, "POST", "/v1/pool/scan", Duration::from_secs(600));
