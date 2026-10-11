@@ -1172,6 +1172,10 @@ pub async fn boot(
     // Each torrent a tombstone says was removed, which neither scan loads
     // (`honour_tombstones`).
     let mut removed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
+    // Each info-hash the resume scan refused because its torrent's session key
+    // is another one (`rekeyed`), and counted. The torrent-dir scan finds the
+    // `.torrent` filed beside it under the same name, and counts it only once.
+    let mut rekeyed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
 
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call, and
@@ -1307,6 +1311,25 @@ pub async fn boot(
                 }
                 (torrent, _) => torrent,
             };
+            // A torrent filed under a key its session would not give it: a
+            // hybrid an earlier build keyed by its truncated v2 hash, which
+            // its session now keys by its v1 hash. Loaded, every alert would
+            // name a key the registry, the save queue and the stores do not
+            // hold, so it is refused, before anything is claimed, for the
+            // operator to reconcile.
+            if let Some(key) = torrent.as_deref().and_then(|t| rekeyed(t, &ih)) {
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    session_infohash = %key,
+                    scan = "resume",
+                    "boot scan: torrent filed under an infohash its session does not key it by; \
+                     not loaded (operator must reconcile: re-add it under the session's infohash)",
+                );
+                load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                rekeyed_at_boot.insert((profile.clone(), ih));
+                continue;
+            }
             if torrent.is_none() {
                 missing_metadata += 1;
             }
@@ -1356,6 +1379,82 @@ pub async fn boot(
                 continue;
             }
             match engine.add_torrent(params) {
+                // The session keyed it by another infohash than the one it was
+                // filed under, which the check above cannot see where the
+                // metadata is the resume data's own, or there is none. Taken
+                // back out where nothing else of this profile's is filed under
+                // the session's key, and refused either way.
+                Ok(h) if h.infohash != ih => {
+                    let may_unload = may_unload_rekeyed(
+                        &registry,
+                        &*resume_store,
+                        &*torrent_store,
+                        &profile,
+                        &h.infohash,
+                    );
+                    let mut unloaded = may_unload
+                        && unload_rekeyed(&profile_source, &state, &*engine, &profile, h);
+                    // Left in the session, it is claimed under the key the
+                    // session gave it, as rule 4 requires of every torrent a
+                    // session holds. Where it cannot be (another profile
+                    // holds the key, or the claim did not persist), it is
+                    // taken back out even at the cost of this profile's files
+                    // under that key, rather than seeded with no claim.
+                    let mut claimed = false;
+                    if !unloaded {
+                        claimed = match registry.assign(h.infohash, profile.clone()) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                warn!(profile_id = %profile, infohash = %h.infohash,
+                                      error.cause = %e,
+                                      "could not claim a torrent its session keys by another \
+                                       infohash than the one it is filed under");
+                                metrics.inc_counter(
+                                    "profile_assignment_registry_errors_total",
+                                    &[("profile_id", profile.as_str())],
+                                );
+                                false
+                            }
+                        };
+                        if !claimed && !may_unload {
+                            unloaded =
+                                unload_rekeyed(&profile_source, &state, &*engine, &profile, h);
+                        }
+                    }
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        session_infohash = %h.infohash,
+                        scan = "resume",
+                        unloaded,
+                        "boot scan: torrent filed under an infohash its session does not key it by; \
+                         refused (operator must reconcile: re-add it under the session's infohash)",
+                    );
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                    rekeyed_at_boot.insert((profile.clone(), ih));
+                    // The claim this scan made names a torrent no session
+                    // holds under it.
+                    if existing.is_none() {
+                        if let Err(e) = registry.remove(&ih) {
+                            warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
+                                  "could not release the claim of a torrent filed under another \
+                                   infohash");
+                            metrics
+                                .inc_counter("store_write_errors_total", &[("store", "registry")]);
+                        }
+                    }
+                    // Left in the session, it is held to the fence like any
+                    // other, under the key the session gave it, and counted
+                    // loaded where the profile's claim on that key is what
+                    // the unloaded-claims gauge compares it with.
+                    if !unloaded {
+                        loaded.insert(h.infohash);
+                        if claimed {
+                            added_from_resume += 1;
+                        }
+                        scan_fence.added(&profile_registry, &metrics, &profile, h);
+                    }
+                }
                 Ok(h) => {
                     added_from_resume += 1;
                     loaded.insert(ih);
@@ -1474,6 +1573,27 @@ pub async fn boot(
             // Resume data already loaded this torrent, or it was removed and
             // its tombstone stands — skip.
             if loaded.contains(&ih) || removed_at_boot.contains(&(profile.clone(), ih)) {
+                continue;
+            }
+            // Filed under a key its session would not give it, as in the
+            // resume scan; counted there already where it refused the resume
+            // file beside this one.
+            if let Some(key) = rekeyed(&bytes, &ih) {
+                if rekeyed_at_boot.insert((profile.clone(), ih)) {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        session_infohash = %key,
+                        scan = "torrent_dir",
+                        "boot scan: torrent filed under an infohash its session does not key it \
+                         by; not loaded (operator must reconcile: re-add it under the session's \
+                         infohash)",
+                    );
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
+                }
                 continue;
             }
             // A claim does not mean a load: `POST /v1/torrents` claims before
@@ -2400,6 +2520,77 @@ fn boot_scan_guard(
         );
     }
     Err(refusal)
+}
+
+/// The infohash a session keys the `.torrent` `bytes` by, where that is not
+/// `filed`, the one the stores file it under.
+///
+/// `None` where they agree, and where libtorrent cannot read `bytes`, which
+/// the add then refuses on its own. A hybrid (v1+v2) torrent an earlier build
+/// filed under its truncated v2 hash is keyed by its v1 hash now.
+fn rekeyed(bytes: &[u8], filed: &libtorrent_safe::InfoHash) -> Option<libtorrent_safe::InfoHash> {
+    let key = libtorrent_safe::info_hashes_from_torrent(bytes)
+        .ok()?
+        .key()?;
+    (key != *filed).then_some(key)
+}
+
+/// Whether the resume scan may take a torrent its session keyed by `key`,
+/// rather than by the infohash it was filed under, back out of `profile`'s
+/// session.
+///
+/// Its `torrent_removed_alert` deletes `profile`'s resume file and `.torrent`
+/// under `key`, and drops its state-map entry, so not where `profile` holds
+/// any of those under `key` itself: a claim, a resume file or a `.torrent`.
+/// Those are another filing of the same torrent, which the session's
+/// `duplicate_is_error` refuses once this one holds the key, and the torrent
+/// stays where it is. One a resume file names that is unreadable reads as
+/// held.
+fn may_unload_rekeyed(
+    registry: &AssignmentRegistry,
+    resume: &dyn ResumeStore,
+    torrents: &dyn TorrentStore,
+    profile: &ProfileId,
+    key: &libtorrent_safe::InfoHash,
+) -> bool {
+    registry.lookup(key).as_ref() != Some(profile)
+        && !resume.exists(profile, key).unwrap_or(true)
+        && !torrents.exists(profile, key)
+}
+
+/// Take `profile`'s torrent `h`, which its session keyed by another infohash
+/// than the one it was filed under, back out of its session, keeping its
+/// files. Whether the session accepted.
+///
+/// The removal is recorded first (`StateMap::begin_removal`), as `DELETE`
+/// records its own: the boot holds the profile's alerts, and an add of the
+/// same infohash accepted before the removal's alert is handled must keep the
+/// `.torrent` and save path it wrote, which an unrecorded removal deletes.
+///
+/// The profile's alerts are popped and held first, so the add's alert is
+/// translated while the shim still knows the torrent as `h`. A recorded
+/// removal drops only the entry of the handle it names, and an add alert
+/// translated after the removal names a handle the shim issued anew
+/// (`register_handle`), whose entry would outlive the torrent and hold the
+/// shutdown drain.
+fn unload_rekeyed(
+    profile_source: &ProfileSource,
+    state: &StateMap,
+    engine: &dyn TorrentEngine,
+    profile: &ProfileId,
+    h: torrentd_engine::TorrentHandle,
+) -> bool {
+    profile_source.hold_alerts(profile);
+    state.begin_removal(profile, h);
+    match engine.remove_torrent(h, false) {
+        Ok(()) => true,
+        Err(e) => {
+            state.abandon_removal(profile, h);
+            warn!(profile_id = %profile, infohash = %h.infohash, error.cause = %e,
+                  "could not take a torrent filed under another infohash back out of its session");
+            false
+        }
+    }
 }
 
 /// Where the boot torrent-dir scan re-adds a `.torrent` no resume data
@@ -3864,11 +4055,14 @@ fn load_session_state(path: &std::path::Path) -> Option<Vec<u8>> {
 /// `boot_torrent_load_failures`.
 #[derive(Clone, Copy, Debug, Default)]
 struct BootLoadFailures {
-    /// A resume file that read but libtorrent refused to add.
+    /// A resume file that read but libtorrent refused to add, or whose
+    /// torrent its session keys by another infohash than the one it is filed
+    /// under (`rekeyed`).
     resume_add: u64,
     /// A `.torrent` that could not be read to re-attach metadata.
     torrent_read: u64,
-    /// A torrent-dir `.torrent` libtorrent refused to add.
+    /// A torrent-dir `.torrent` libtorrent refused to add, or that its
+    /// session keys by another infohash than the one it is filed under.
     torrent_dir_add: u64,
     /// A resume file the scan could not read at all, skipped.
     resume_file: u64,

@@ -2199,6 +2199,46 @@ fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
     }
 }
 
+/// Refuse an adoption whose `.torrent` its session would key by another
+/// infohash than the one the pool index records it under: a hybrid (v1+v2)
+/// torrent an index written by an earlier build keyed by its truncated v2
+/// hash. Every record the adoption keeps is under the index's key, and every
+/// alert of the torrent's would name the other.
+///
+/// Only a row filed under one of the torrent's own hashes is refused here: a
+/// `.torrent` that names another torrent altogether is the library changing
+/// under the index, which the drift pass and the verify path deal with. One
+/// that cannot be read or parsed passes too: the paths after this one refuse
+/// it on their own.
+fn refuse_if_rekeyed(infohash: &str, torrent_path: &std::path::Path) -> Result<(), AdoptRefusal> {
+    let Some(filed) = libtorrent_safe::InfoHash::from_hex(infohash) else {
+        return Ok(());
+    };
+    let Ok(bytes) = std::fs::read(torrent_path) else {
+        return Ok(());
+    };
+    let Ok(hashes) = libtorrent_safe::info_hashes_from_torrent(&bytes) else {
+        return Ok(());
+    };
+    match hashes.key() {
+        Some(key) if key != filed && hashes.keys().any(|k| k == filed) => {
+            warn!(
+                target: "torrentd::pool",
+                infohash = %infohash,
+                session_infohash = %key,
+                "adoption refused: the pool index records this torrent under an infohash its \
+                 session does not key it by",
+            );
+            Err(format!(
+                "the pool index records this torrent under an infohash its session does not key \
+                 it by ({key}); rescan the library to index it under that one"
+            )
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Adopt one torrent: execute whatever `torrentd_pool::adopt::plan` decided.
 ///
 /// The fast path adds immediately in seed mode. The verify path only enqueues —
@@ -2233,6 +2273,7 @@ pub fn execute_adopt(
             save_path,
             files_renamed,
         } => {
+            refuse_if_rekeyed(infohash, &torrent_path)?;
             let verify = |torrent_path, save_path, profile| {
                 enqueue_verify(
                     pool,
@@ -2388,16 +2429,19 @@ pub fn execute_adopt(
             torrent_path,
             save_path,
             resume_path,
-        } => enqueue_verify(
-            pool,
-            profiles,
-            infohash,
-            torrent_path,
-            save_path,
-            resume_path.as_deref(),
-            profile,
-            dry_run,
-        ),
+        } => {
+            refuse_if_rekeyed(infohash, &torrent_path)?;
+            enqueue_verify(
+                pool,
+                profiles,
+                infohash,
+                torrent_path,
+                save_path,
+                resume_path.as_deref(),
+                profile,
+                dry_run,
+            )
+        }
     }
 }
 
@@ -3608,6 +3652,27 @@ mod tests {
         std::fs::write(dir.path().join("library/t.torrent"), other).unwrap();
         assert_eq!(pool.library_torrent(&hash), None);
         assert_eq!(pool.library_torrent(&InfoHash([0x77; 20])), None);
+    }
+
+    /// Issue #251: an index row an earlier build keyed by a hybrid torrent's
+    /// truncated v2 hash is refused before either adoption path adds it,
+    /// since its session keys it by its v1 hash. Its v1 key passes, and so
+    /// does a `.torrent` that cannot be read, which the paths after refuse.
+    #[test]
+    fn an_adoption_filed_under_a_hybrids_truncated_v2_hash_is_refused() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent");
+        let hashes =
+            libtorrent_safe::info_hashes_from_torrent(&std::fs::read(&path).unwrap()).unwrap();
+        let v1 = hashes.v1.expect("hybrid has v1").to_hex();
+        let v2 = hashes.v2.expect("hybrid has v2").truncated().to_hex();
+
+        let refusal = super::refuse_if_rekeyed(&v2, &path).unwrap_err();
+        assert!(refusal.reason.contains(&v1), "{}", refusal.reason);
+        assert!(!refusal.isolation);
+        assert!(super::refuse_if_rekeyed(&v1, &path).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(super::refuse_if_rekeyed(&v2, &dir.path().join("missing.torrent")).is_ok());
     }
 
     /// Persisting an adopted torrent writes its save path, then its
