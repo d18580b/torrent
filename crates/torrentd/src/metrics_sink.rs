@@ -181,7 +181,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
          written.";
     "profile_fence_pause_errors_total" Counter Profile Zero =>
         "Torrents the daemon failed to pause in a fenced profile: while the VPN monitor fenced \
-         it, or as one being added landed after the fence.";
+         it, as one being added landed after the fence, or as the disk-error retry resumed one \
+         after the fence.";
     // boot
     "profile_boot_failed" Gauge Profile Owner("always") =>
         "1 if the profile got no session at boot (tunnel, port forward, or session \
