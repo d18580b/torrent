@@ -645,9 +645,10 @@ pub struct DaemonHandle {
     pool: Option<Arc<crate::pool_service::PoolService>>,
     registry: Arc<AssignmentRegistry>,
     profile_registry: Arc<ProfileRegistry>,
-    /// Whether the nftables kill switch was installed, so graceful shutdown
-    /// tears it down. `boot` started its watch.
-    kill_switch_active: bool,
+    /// The kill-switch watch's fence, where the nftables kill switch was
+    /// installed: graceful shutdown tears the table down, and the API's adds
+    /// record what they pause with the fence. `boot` started its watch.
+    kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: torrentd_engine::AlertLoopHandle,
     /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
@@ -1183,6 +1184,9 @@ pub async fn boot(
         pool.set_source(Arc::clone(&source));
         pool.set_registry(Arc::clone(&registry));
         pool.set_torrent_store(Arc::clone(&torrent_store));
+        if let Some(fence) = kill_switch.as_ref() {
+            pool.set_kill_switch(Arc::clone(fence));
+        }
     }
 
     // Resume scan: load every saved resume file per profile. The shim
@@ -1776,6 +1780,11 @@ pub async fn boot(
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
+    // The kill-switch watch lifts its own fence by resuming only what it
+    // recorded, and its walk of the state map misses a torrent whose add
+    // alert lands after it: the add handler's pause of that torrent is
+    // recorded with the fence, under its lock, so the lift resumes it too.
+    .fence_hold(crate::vpn_monitor::fence_hold(kill_switch.clone()))
     // A magnet is added with DHT, PEX and LSD disabled because its `private`
     // bit is unknown; once its metadata shows it public, the engine lifts
     // what the profile's own posture does not keep. A profile the registry
@@ -1817,7 +1826,7 @@ pub async fn boot(
         pool,
         registry,
         profile_registry,
-        kill_switch_active: kill_switch.is_some(),
+        kill_switch,
         log_handle,
         alert_loop,
         unloaded_at_boot,
@@ -2947,7 +2956,7 @@ impl DaemonHandle {
             pool,
             registry,
             profile_registry,
-            kill_switch_active,
+            kill_switch,
             log_handle,
             alert_loop,
             unloaded_at_boot,
@@ -3032,6 +3041,7 @@ impl DaemonHandle {
             work: Arc::clone(&work),
             events: Arc::default(),
             tunnel_probe: crate::vpn_monitor::host_prober(),
+            kill_switch: kill_switch.clone(),
         };
 
         // The trust set the process runs with, once: effective blocks, and
@@ -3244,7 +3254,7 @@ impl DaemonHandle {
             })
             .collect();
         teardown_network(engines, tunnels, || {
-            if kill_switch_active {
+            if kill_switch.is_some() {
                 finish_kill_switch_removal(
                     crate::vpn::killswitch::disable(),
                     &metrics,

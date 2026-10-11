@@ -980,7 +980,14 @@ fn add_and_settle(
     };
     // `unfenced_engine` let this add through, but a fence can have landed
     // between that check and the add.
-    crate::vpn_monitor::hold_if_fenced(&s.profiles, profile_id, engine, handle, &*s.metrics);
+    crate::vpn_monitor::hold_if_fenced(
+        &s.profiles,
+        s.kill_switch.as_deref(),
+        profile_id,
+        engine,
+        handle,
+        &*s.metrics,
+    );
 
     // A `DELETE` of this info-hash whose removal alert is still queued would
     // otherwise delete the two files written below when it is handled.
