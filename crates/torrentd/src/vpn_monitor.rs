@@ -3499,21 +3499,25 @@ mod tests {
     }
 
     /// `POST /v1/torrents/{infohash}/pause`'s steps on `h`, in its order:
-    /// note it paused, leave it out of every open gate, pause it.
+    /// note it paused, leave it out of every open gate, note it paused again,
+    /// pause it.
     fn pause_by_hand(fence: &KillSwitchFence, h: TorrentHandle) {
         let entry = fence.profiles.iter().next().unwrap();
         entry.note_running(h, false);
         entry.exclude_from_resumes(h);
+        entry.note_running(h, false);
         entry.engine.pause_torrent(h).unwrap();
     }
 
     /// `POST /v1/profiles/{profile_id}/pause-all`'s steps, in its order: note
-    /// every torrent paused, halt the open gates, pause each.
+    /// every torrent paused, halt the open gates, note them paused again,
+    /// pause each.
     fn pause_all_by_hand(fence: &KillSwitchFence) {
         let entry = fence.profiles.iter().next().unwrap();
         let handles = fence.state.handles_for_profile(entry.id());
         entry.note_paused(&handles);
         entry.halt_resumes();
+        entry.note_paused(&handles);
         for h in handles {
             entry.engine.pause_torrent(h).unwrap();
         }
@@ -3641,6 +3645,146 @@ mod tests {
         entry.note_running(handle(2), true);
         super::fence(entry, &fence.state, ip(2), fence.metrics.as_ref());
         assert_eq!(online_running(&fence), [1], "the state map's word stands");
+    }
+
+    /// A lift's resume that takes the gate between the pause route's first
+    /// note and its exclusion notes the torrent running; the route's note
+    /// after the exclusion puts the pause back, so the next lift leaves the
+    /// torrent paused though the state map still reads it as the fence left
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn a_lift_resume_between_a_pauses_note_and_its_exclusion_does_not_outlast_the_pause() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(2);
+        fence.fence_all();
+        for id in 1..=2 {
+            loaded(&fence.state, id, "acct_a", TorrentPhase::Paused);
+        }
+        let entry = fence.profiles.iter().next().unwrap();
+        // `POST /v1/torrents/{infohash}/pause`, its first note; the lift's
+        // resume of the torrent lands before its exclusion.
+        entry.note_running(handle(2), false);
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(sorted_ids(&resumes(&engine)), [1, 2]);
+        entry.exclude_from_resumes(handle(2));
+        entry.note_running(handle(2), false);
+        entry.engine.pause_torrent(handle(2)).unwrap();
+
+        fence.fence_all();
+        let before = resumes(&engine).len();
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(
+            sorted_ids(&resumes(&engine)[before..]),
+            [1],
+            "the pause stands"
+        );
+    }
+
+    /// As [`a_lift_resume_between_a_pauses_note_and_its_exclusion_does_not_outlast_the_pause`],
+    /// for a pause-all whose halt comes after the lift's resume.
+    #[tokio::test(start_paused = true)]
+    async fn a_lift_resume_between_a_pause_alls_note_and_its_halt_does_not_outlast_the_pause() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(2);
+        fence.fence_all();
+        for id in 1..=2 {
+            loaded(&fence.state, id, "acct_a", TorrentPhase::Paused);
+        }
+        let entry = fence.profiles.iter().next().unwrap();
+        let handles = fence.state.handles_for_profile(entry.id());
+        entry.note_paused(&handles);
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(sorted_ids(&resumes(&engine)), [1, 2]);
+        entry.halt_resumes();
+        entry.note_paused(&handles);
+        for h in handles {
+            entry.engine.pause_torrent(h).unwrap();
+        }
+
+        fence.fence_all();
+        let before = resumes(&engine).len();
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(resumes(&engine).len(), before, "the pause-all stands");
+    }
+
+    /// What `entry` reads as running among `ids`, each reported as `reported`.
+    fn noted_running(entry: &ProfileEntry, ids: &[u64], reported: bool) -> Vec<u64> {
+        entry
+            .running(ids.iter().map(|&id| (handle(id), reported)).collect())
+            .into_iter()
+            .filter_map(|(h, running)| running.then_some(h.id))
+            .collect()
+    }
+
+    /// A paced resume the session refuses puts back what was noted before
+    /// it: a pause's note stands, and a torrent noted nothing is not left
+    /// noted running.
+    #[test]
+    fn a_paced_resume_the_session_refuses_restores_the_note_before_it() {
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let profiles = ProfileRegistry::new(vec![entry]);
+        let id = ProfileId::new("acct_a");
+        let entry = profiles.iter().next().unwrap();
+        entry.note_running(handle(1), false);
+        for h in [handle(1), handle(2)] {
+            engine.inject_error("resume_torrent", torrentd_engine::EngineError::Shutdown);
+            let batch = resume_batch(
+                &profiles,
+                &id,
+                vec![h],
+                &ResumeGate::default(),
+                &PromSink::new(),
+            );
+            assert!(
+                matches!(batch, Batch::Done { resumed: 0, ref refused, .. } if refused.len() == 1),
+                "{h:?} refused",
+            );
+        }
+        assert_eq!(
+            noted_running(entry, &[1, 2], true),
+            [2],
+            "the pause's note stands, and nothing is noted for the other",
+        );
+        // Reported paused: a stale running note would read it as running.
+        entry.note_running(handle(3), false);
+        engine.inject_error("resume_torrent", torrentd_engine::EngineError::Shutdown);
+        resume_batch(
+            &profiles,
+            &id,
+            vec![handle(3)],
+            &ResumeGate::default(),
+            &PromSink::new(),
+        );
+        assert!(noted_running(entry, &[3], false).is_empty());
+    }
+
+    /// A hand resume the session refuses puts back what was noted before it.
+    #[test]
+    fn a_hand_resume_the_session_refuses_restores_the_note_before_it() {
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let profiles = ProfileRegistry::new(vec![entry]);
+        let id = ProfileId::new("acct_a");
+        let entry = profiles.iter().next().unwrap();
+        entry.note_running(handle(1), false);
+        for h in [handle(1), handle(2)] {
+            engine.inject_error("resume_torrent", torrentd_engine::EngineError::Shutdown);
+            let resumed =
+                resume_unless_fenced(&profiles, &id, engine.as_ref(), h, &PromSink::new());
+            assert!(resumed.is_err(), "{h:?} refused");
+        }
+        assert_eq!(
+            noted_running(entry, &[1, 2], true),
+            [2],
+            "the pause's note stands, and nothing is noted for the other",
+        );
+        assert!(
+            noted_running(entry, &[2], false).is_empty(),
+            "no running note is left for the refused resume",
+        );
     }
 
     fn status_of(fence: &KillSwitchFence) -> ProfileStatus {
