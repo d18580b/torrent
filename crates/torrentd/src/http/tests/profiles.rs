@@ -840,22 +840,35 @@ fn left_paused(engine: &MockEngine, h: TorrentHandle) -> bool {
 
 /// Mark `profile` fenced while the next `resume_torrent` its session sees is
 /// going out, as the VPN monitor's fence does when its walk has already
-/// passed that torrent. Returns once the resume has been let go.
-async fn fence_during_next_resume(h: &Harness, engine: &MockEngine, profile: &str) {
+/// passed that torrent. The future returned completes once the resume has
+/// been let go.
+///
+/// The hold is armed when this is called, not when the future is first
+/// polled: `tokio::join!` polls the request beside it first, and that
+/// request's blocking resume can reach the session before a hold armed on
+/// the first poll exists. It then goes out unheld, and the future waits for
+/// a held call that never comes.
+fn fence_during_next_resume(
+    h: &Harness,
+    engine: &MockEngine,
+    profile: &str,
+) -> impl std::future::Future<Output = ()> {
     let held = engine.hold_next("resume_torrent");
     let profiles = Arc::clone(&h.state.profiles);
     let id = ProfileId::new(profile);
-    tokio::task::spawn_blocking(move || {
-        held.wait_entered();
-        profiles
-            .resolve(&id)
-            .active()
-            .unwrap()
-            .update_health(|hl| hl.status = ProfileStatus::VpnDown);
-        held.release();
-    })
-    .await
-    .unwrap();
+    async move {
+        tokio::task::spawn_blocking(move || {
+            held.wait_entered();
+            profiles
+                .resolve(&id)
+                .active()
+                .unwrap()
+                .update_health(|hl| hl.status = ProfileStatus::VpnDown);
+            held.release();
+        })
+        .await
+        .unwrap();
+    }
 }
 
 /// A fence that lands while a resume is going out wins: the single resume,
