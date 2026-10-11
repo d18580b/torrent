@@ -244,6 +244,23 @@ tests:
             exp_annotations:
               summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); only IP presence is checked"
 
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_transfer_probe_ok{profile_id="acct_a"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdTransferProbeUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: TorrentdTransferProbeUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The WireGuard transfer probe cannot run for acct_a; an aged handshake is not judged on the link's traffic, so a dead peer may not fence it"
+
   # A route probe that recovers before the hold stays quiet; one that stays
   # down fires.
   - interval: 1m

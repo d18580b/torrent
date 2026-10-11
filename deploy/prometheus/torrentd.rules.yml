@@ -112,6 +112,17 @@ groups:
         annotations:
           summary: "The WireGuard handshake probe cannot run for {{ $labels.profile_id }} (wg missing or unprivileged); only IP presence is checked"
 
+      - alert: TorrentdTransferProbeUnavailable
+        # While the transfer probe cannot run after it has read the link's
+        # counters once in the run, an aged handshake gets no verdict, so a
+        # tunnel whose peer went away is not fenced handshake_stale.
+        expr: torrentd_profile_vpn_transfer_probe_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The WireGuard transfer probe cannot run for {{ $labels.profile_id }}; an aged handshake is not judged on the link's traffic, so a dead peer may not fence it"
+
       - alert: TorrentdRouteProbeUnavailable
         # While the route probe cannot run (ip missing, denied, or timing out,
         # or the address probe failing so it is never asked) route loss is not

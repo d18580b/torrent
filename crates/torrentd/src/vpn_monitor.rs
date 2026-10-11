@@ -236,6 +236,9 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
         // the `continue` in the poll loop running before the probe does.
         if e.config.vpn_type() == Some(VpnType::Wireguard) {
             metrics.set_gauge("profile_vpn_handshake_probe_ok", 1.0, &labels);
+            // The byte counters the aged-handshake rule reads, on the same
+            // terms: a `0` is a host-tooling fault, never a boot failure.
+            metrics.set_gauge("profile_vpn_transfer_probe_ok", 1.0, &labels);
         }
         // The route and address probes run for both tunnel types. Same
         // reasoning as the handshake series: `0` means the probe could not run
@@ -1397,8 +1400,15 @@ async fn run_with(
                 }
             };
             let transfer = match transfer_probe {
-                Some(Ok(t)) => Some(t),
+                Some(Ok(t)) => {
+                    metrics.set_gauge("profile_vpn_transfer_probe_ok", 1.0, &labels);
+                    Some(t)
+                }
                 Some(Err(why)) => {
+                    // After one good reading in the run, an aged handshake
+                    // gets no verdict while this fails, so the fence on it is
+                    // off. A log line alone left that silent to alerting.
+                    metrics.set_gauge("profile_vpn_transfer_probe_ok", 0.0, &labels);
                     warn!(
                         target: "torrentd::vpn_monitor",
                         profile_id = %profile_id,
@@ -2325,6 +2335,19 @@ mod tests {
             exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
             "{exported}"
         );
+        assert!(
+            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"acct_a\"} 1"),
+            "the counters were read: {exported}"
+        );
+
+        // A transfer probe that cannot run says so on its gauge, not only in
+        // a log line.
+        let (_, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), no_counters(), 1, false).await;
+        assert!(
+            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"acct_a\"} 0"),
+            "{exported}"
+        );
 
         let (health, exported) =
             poll_acct_a_counted(seeding(), max_age, stale(), counting(64, 512), 8, false).await;
@@ -2554,6 +2577,16 @@ mod tests {
                 .contains("torrentd_profile_vpn_handshake_probe_ok{profile_id=\"account_a\"} 1"),
             "a live WireGuard profile still baselines at 1; got:\n{exported}",
         );
+        assert!(
+            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"account_a\"} 1"),
+            "and so does its transfer probe; got:\n{exported}",
+        );
+        for absent in ["account_c", "account_d"] {
+            assert!(
+                !exported.contains(&format!("transfer_probe_ok{{profile_id=\"{absent}\"}}")),
+                "a boot-failed or OpenVPN profile has no transfer probe; got:\n{exported}",
+            );
+        }
         assert!(
             !exported.contains("handshake_probe_ok{profile_id=\"account_d\"}"),
             "there is no handshake to probe on an OpenVPN profile, failed or \

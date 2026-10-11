@@ -1828,7 +1828,9 @@ On a scratch pool, not your real one.
    the clock it starts at the next poll.
 
    A poll whose transfer probe could not run logs `wireguard transfer probe
-   unavailable` at warn. After an earlier poll read the counters it leaves
+   unavailable` at warn and sets `torrentd_profile_vpn_transfer_probe_ok`
+   to 0, which `TorrentdTransferProbeUnavailable` alerts on after 5 minutes.
+   After an earlier poll read the counters it leaves
    the clock where it was; where none has, the threshold runs from the first
    poll that saw a torrent there that can send, as if every such profile
    sent, so a quiet seed may then be fenced. `PersistentKeepalive = 25` in
