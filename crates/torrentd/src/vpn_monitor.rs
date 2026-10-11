@@ -336,7 +336,16 @@ struct Unanswered {
     /// The first poll of this run that saw the tunnel send (`tx` grew) with
     /// nothing received (`rx` still), since the last poll that saw `rx` grow.
     sent_unanswered_since: Option<Instant>,
+    /// How many polls in a row, ending with the latest, could not read the
+    /// counters. A reading resets it.
+    unread_polls: u32,
 }
+
+/// How many polls in a row may fail to read a WireGuard link's byte counters
+/// before [`unanswered_clock`] judges an aged handshake on the time the
+/// profile has carried traffic instead: a poll that fails once in a while,
+/// with readings either side, is not a probe that has stopped working.
+const TRANSFER_PROBE_GRACE_POLLS: u32 = 2;
 
 /// Advance one profile's unanswered clock and read it
 /// ([`Observation::unanswered_for`]).
@@ -362,16 +371,21 @@ struct Unanswered {
 ///   Counters that dropped (the link was re-raised and they restarted) are a
 ///   new baseline with nothing outstanding. The first poll of a run that
 ///   reads them is a baseline too, since what was sent before it is unknown.
-/// - **Handshaked, counters unreadable:** the clock reads the time since the
-///   profile started carrying, capped at the handshake's age, whether or not
-///   an earlier poll in the run read the counters: a quiet seed may then be
-///   fenced, but a dead tunnel still is. The run's start is never later than
-///   a clock the counters started, so this never reads less than that clock
-///   would. The poll leaves the counters' baseline and that clock as they
-///   stand, so a later reading picks up where the last one left off.
-///   Reading zero here instead, after one good reading, let a transfer probe
-///   that failed steadily switch the stale-handshake fence off for as long
-///   as it failed, however old the handshake grew.
+/// - **Handshaked, counters unreadable:** for the first
+///   [`TRANSFER_PROBE_GRACE_POLLS`] polls in a row that cannot read them, the
+///   clock reads as the counters last left it (zero where none started it),
+///   so one transient failure does not fence a quiet seed whose handshake and
+///   carrying run are both past the threshold. From the next failed poll on,
+///   it reads the time since the profile started carrying, capped at the
+///   handshake's age, whether or not an earlier poll in the run read the
+///   counters: a quiet seed may then be fenced, but a dead tunnel still is.
+///   The run's start is never later than a clock the counters started, so
+///   this never reads less than that clock would. An unread poll leaves the
+///   counters' baseline and that clock as they stand, so a later reading
+///   picks up where the last one left off. Reading zero for as long as the
+///   probe failed, after one good reading, let a transfer probe that failed
+///   steadily switch the stale-handshake fence off however old the handshake
+///   grew.
 ///
 /// A poll whose handshake probe could not run ([`Handshake::NoSignal`]) says
 /// nothing about the handshake, so while the profile carries traffic it leaves
@@ -395,7 +409,13 @@ fn unanswered_clock(
         never_since: None,
         counters: None,
         sent_unanswered_since: None,
+        unread_polls: 0,
     });
+    if transfer.is_some() {
+        clock.unread_polls = 0;
+    } else {
+        clock.unread_polls = clock.unread_polls.saturating_add(1);
+    }
     if let Some(seen) = transfer {
         if let Some(last) = clock.counters.replace(seen) {
             if seen.rx != last.rx || seen.tx < last.tx {
@@ -409,9 +429,10 @@ fn unanswered_clock(
         Handshake::Never => now.saturating_duration_since(*clock.never_since.get_or_insert(now)),
         Handshake::Age(age) => {
             clock.never_since = None;
-            let since = match transfer {
-                Some(_) => clock.sent_unanswered_since,
-                None => Some(clock.carrying_since),
+            let since = if clock.unread_polls > TRANSFER_PROBE_GRACE_POLLS {
+                Some(clock.carrying_since)
+            } else {
+                clock.sent_unanswered_since
             };
             since.map_or(Duration::ZERO, |since| {
                 now.saturating_duration_since(since).min(age)
@@ -1566,7 +1587,8 @@ async fn run_with(
                     Some(t)
                 }
                 Some(Err(why)) => {
-                    // While this fails, an aged handshake is judged on the time
+                    // Once this has failed more than TRANSFER_PROBE_GRACE_POLLS
+                    // polls in a row, an aged handshake is judged on the time
                     // the profile has carried traffic, not on the link's
                     // traffic, so a quiet seed may be fenced handshake_stale.
                     // A log line alone left that silent to alerting.
@@ -1923,7 +1945,8 @@ mod tests {
     /// With no byte counters to read, an aged handshake counts only from when
     /// the profile started carrying: a handshake older than that predates any
     /// traffic it could have answered. Within the run the clock is the
-    /// handshake's age.
+    /// handshake's age. The first [`TRANSFER_PROBE_GRACE_POLLS`] unread polls
+    /// in a row read zero.
     #[test]
     fn an_aged_handshake_counts_only_from_when_the_profile_started_carrying() {
         let id = torrentd_engine::ProfileId::new("acct_a");
@@ -1940,6 +1963,11 @@ mod tests {
             unanswered_clock(&mut since, &id, ancient, None, true, t0),
             Duration::ZERO,
             "starts when the first torrent that can send is there",
+        );
+        assert_eq!(
+            unanswered_clock(&mut since, &id, ancient, None, true, t0 + MAX),
+            Duration::ZERO,
+            "the second unread poll in a row is still inside the grace",
         );
         let then = t0 + MAX + Duration::from_secs(1);
         assert_eq!(
@@ -2000,8 +2028,8 @@ mod tests {
         assert_eq!(clock(seen(11, 40), at(760)), Duration::ZERO);
         assert_eq!(
             clock(None, at(790)),
-            Duration::from_secs(790),
-            "counters unread after a reading: judged from when the run began",
+            Duration::from_secs(30),
+            "one unread poll after a reading: the counters' clock as it stood",
         );
         assert_eq!(
             clock(seen(11, 40), at(800)),
@@ -2081,6 +2109,56 @@ mod tests {
             verdict,
             Err(DownReason::HandshakeStale),
             "a handshake aged past the threshold while the probe fails is fenced",
+        );
+    }
+
+    /// A transfer probe that fails now and then, with readings between, does
+    /// not fence a quiet seed whose handshake and carrying run are both past
+    /// the threshold: only a failure that outlasts
+    /// [`TRANSFER_PROBE_GRACE_POLLS`] polls in a row fails safe. Before the
+    /// grace, one failed poll fenced it, and only an operator could lift that.
+    #[test]
+    fn a_transient_transfer_probe_failure_does_not_fence_a_quiet_seed() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let flat = Some(vpn::WireguardTransfer { rx: 10, tx: 10 });
+        let mut poll = |s: u64, transfer| {
+            let handshake = Handshake::Age(Duration::from_secs(600 + s));
+            let unanswered_for = unanswered_clock(
+                &mut since,
+                &id,
+                handshake,
+                transfer,
+                true,
+                t0 + Duration::from_secs(s),
+            );
+            evaluate(
+                &Observation {
+                    handshake,
+                    unanswered_for,
+                    ..healthy()
+                },
+                MAX,
+            )
+        };
+
+        let mut s = 0;
+        while s <= MAX.as_secs() + 60 {
+            assert_eq!(poll(s, flat), Ok(()), "quiet with readings at {s}s");
+            s += 30;
+        }
+        assert_eq!(poll(s, None), Ok(()), "one failed poll is in the grace");
+        assert_eq!(poll(s + 30, flat), Ok(()), "a reading ends the streak");
+        for n in 1..=TRANSFER_PROBE_GRACE_POLLS {
+            let at = s + 30 + 30 * u64::from(n);
+            assert_eq!(poll(at, None), Ok(()), "failed poll {n} in a row");
+        }
+        let past = s + 30 + 30 * u64::from(TRANSFER_PROBE_GRACE_POLLS + 1);
+        assert_eq!(
+            poll(past, None),
+            Err(DownReason::HandshakeStale),
+            "a failure that outlasts the grace fails safe",
         );
     }
 

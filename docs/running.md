@@ -1884,8 +1884,10 @@ On a scratch pool, not your real one.
    A poll whose transfer probe could not run logs `wireguard transfer probe
    unavailable` at warn and sets `torrentd_profile_vpn_transfer_probe_ok`
    to 0, which `TorrentdTransferProbeUnavailable` alerts on after 5 minutes.
-   While it fails the fence fails safe, whether or not an earlier poll read
-   the counters: the threshold runs from the first poll that saw a torrent
+   One or two failed polls in a row are a grace: the clock reads as the last
+   reading left it. From the third in a row the fence fails safe, whether or
+   not an earlier poll read the counters: the threshold runs from the first
+   poll that saw a torrent
    there that can send, capped at the handshake's age, as if every such
    profile sent, so a quiet seed may then be fenced `handshake_stale`. A
    later poll that reads the counters again judges on them as before.
