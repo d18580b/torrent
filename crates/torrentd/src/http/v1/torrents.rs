@@ -1933,24 +1933,28 @@ pub async fn resume_torrent(
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
     let state = Arc::clone(&s);
     let resumed = blocking(move || {
-        let resumed = crate::vpn_monitor::resume_unless_fenced(
-            &state.profiles,
-            &st.profile_id,
-            engine.as_ref(),
-            st.handle,
-            &*state.metrics,
-        )?;
+        let resume = || {
+            crate::vpn_monitor::resume_unless_fenced(
+                &state.profiles,
+                &st.profile_id,
+                engine.as_ref(),
+                st.handle,
+                &*state.metrics,
+            )
+        };
         // Running now by the operator's hand: a paced set-online that still
         // held it (one whose paced resume was refused, say) no longer pauses
         // it, so the hold is released, and a re-hash the hold kept queued
         // starts ([`crate::profile_state::PacedHolds`]). Released after the
-        // resume, so a failed one leaves the torrent held.
-        if resumed == crate::vpn_monitor::SingleResume::Resumed {
-            if let Some(entry) = state.profiles.resolve(&st.profile_id).active() {
-                entry.release_holds(&[st.handle]);
-            }
+        // resume, so a failed one leaves the torrent held, and serialised
+        // with a set-online's hold-and-pause, so the hold and the torrent's
+        // pause cannot part.
+        match state.profiles.resolve(&st.profile_id).active() {
+            Some(entry) => entry.resume_by_hand(st.handle, resume, |r| {
+                *r == crate::vpn_monitor::SingleResume::Resumed
+            }),
+            None => resume(),
         }
-        Ok::<_, torrentd_engine::EngineError>(resumed)
     })
     .await
     .map_err(|e| UnfencedControlError::Internal {

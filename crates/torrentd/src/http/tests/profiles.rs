@@ -840,22 +840,35 @@ fn left_paused(engine: &MockEngine, h: TorrentHandle) -> bool {
 
 /// Mark `profile` fenced while the next `resume_torrent` its session sees is
 /// going out, as the VPN monitor's fence does when its walk has already
-/// passed that torrent. Returns once the resume has been let go.
-async fn fence_during_next_resume(h: &Harness, engine: &MockEngine, profile: &str) {
+/// passed that torrent. The future returned completes once the resume has
+/// been let go.
+///
+/// The hold is armed when this is called, not when the future is first
+/// polled: `tokio::join!` polls the request beside it first, and that
+/// request's blocking resume can reach the session before a hold armed on
+/// the first poll exists. It then goes out unheld, and the future waits for
+/// a held call that never comes.
+fn fence_during_next_resume(
+    h: &Harness,
+    engine: &MockEngine,
+    profile: &str,
+) -> impl std::future::Future<Output = ()> {
     let held = engine.hold_next("resume_torrent");
     let profiles = Arc::clone(&h.state.profiles);
     let id = ProfileId::new(profile);
-    tokio::task::spawn_blocking(move || {
-        held.wait_entered();
-        profiles
-            .resolve(&id)
-            .active()
-            .unwrap()
-            .update_health(|hl| hl.status = ProfileStatus::VpnDown);
-        held.release();
-    })
-    .await
-    .unwrap();
+    async move {
+        tokio::task::spawn_blocking(move || {
+            held.wait_entered();
+            profiles
+                .resolve(&id)
+                .active()
+                .unwrap()
+                .update_health(|hl| hl.status = ProfileStatus::VpnDown);
+            held.release();
+        })
+        .await
+        .unwrap();
+    }
 }
 
 /// A fence that lands while a resume is going out wins: the single resume,
@@ -1207,6 +1220,177 @@ async fn a_torrent_the_session_refuses_to_resume_stays_held() {
         h.state.profiles.holds().held(&id).is_empty(),
         "a hand resume releases the hold",
     );
+}
+
+/// A hand resume going out as a set-online holds and pauses the profile's
+/// running torrents does not release the hold that set-online records: the
+/// two are serialised, so the set-online's pause of the torrent comes with
+/// its hold, which stands until the pace resumes it. Unserialised, the
+/// set-online recorded the hold, the hand resume released it, and the
+/// set-online then paused the torrent: paused by the pace, held by nothing.
+#[tokio::test]
+async fn a_hand_resume_racing_a_set_online_leaves_its_pause_held() {
+    let id = ProfileId::new("acct_a");
+    let (h, eng, handles) = paced_profile(2);
+    let t = handles[1];
+    let uri = format!("/v1/torrents/{}/resume", t.infohash.to_hex());
+    let set = |state: &str| {
+        let token = h.tokens.write.clone();
+        let body = json!({ "state": state });
+        let h = &h;
+        async move {
+            h.send("PATCH", "/v1/profiles/acct_a", Some(&token), Some(body))
+                .await
+                .assert_status(kynos::http::StatusCode::OK);
+        }
+    };
+
+    // The hand resume passes its offline check, then parks as it goes out.
+    let hand = eng.hold_next("resume_torrent");
+    let (online_tx, online_rx) = tokio::sync::oneshot::channel::<()>();
+    let (hand_done_tx, hand_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let hand_resume = async {
+        h.write("POST", &uri)
+            .await
+            .assert_status(kynos::http::StatusCode::NO_CONTENT);
+        hand_done_tx.send(()).unwrap();
+    };
+    let set_online = async {
+        online_rx.await.unwrap();
+        set("online").await;
+    };
+    let drive = async {
+        let hand = tokio::task::spawn_blocking(move || {
+            hand.wait_entered();
+            hand
+        })
+        .await
+        .unwrap();
+        set("offline").await;
+        let pause = eng.hold_next("pause_torrent");
+        online_tx.send(()).unwrap();
+        // Give the set-online the time to record its hold and reach its
+        // pause of the torrent while the hand resume is still going out.
+        // Serialised, it waits for the hand resume instead, and this times
+        // out.
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::thread::spawn(move || {
+            pause.wait_entered();
+            let _ = reached_tx.send(());
+            let _ = go_rx.recv();
+            pause.release();
+        });
+        let _ = tokio::task::spawn_blocking(move || {
+            reached_rx.recv_timeout(std::time::Duration::from_millis(500))
+        })
+        .await
+        .unwrap();
+        hand.release();
+        hand_done_rx.await.unwrap();
+        // The pace parks on its resume of the torrent, before it would
+        // release the hold, so the hold is read as the set-online left it.
+        let pace = eng.hold_next("resume_torrent");
+        go_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || parked.join().unwrap())
+            .await
+            .unwrap();
+        pace
+    };
+    let ((), (), pace) = tokio::join!(hand_resume, set_online, drive);
+
+    let mine: Vec<bool> = eng
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            RecordedCall::PauseTorrent(x) if x == t => Some(true),
+            RecordedCall::ResumeTorrent(x) if x == t => Some(false),
+            _ => None,
+        })
+        .take(2)
+        .collect();
+    assert_eq!(
+        mine,
+        [false, true],
+        "the hand resume, then the set-online's pause"
+    );
+    assert!(
+        h.state.profiles.holds().held(&id).contains(&t.infohash),
+        "the set-online's pause of the torrent is held",
+    );
+    pace.release();
+}
+
+/// A hand resume that does not leave the torrent running releases nothing: one
+/// the session refuses, and one the profile is fenced during, so it is paused
+/// again, each leave the torrent held, as a set-online's pace left it.
+#[tokio::test(start_paused = true)]
+async fn a_hand_resume_that_does_not_leave_it_running_keeps_it_held() {
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let id = ProfileId::new("acct_a");
+    for case in ["refused", "fenced"] {
+        let (h, eng, _) = paced_profile(5);
+        for state in ["offline", "online"] {
+            if state == "online" {
+                // The pace's first resume is refused, so that torrent stays
+                // held once the pace ends.
+                eng.inject_error(
+                    "resume_torrent",
+                    EngineError::MockInjected {
+                        op: "resume_torrent",
+                        message: "boom".into(),
+                    },
+                );
+            }
+            let token = h.tokens.write.clone();
+            h.send(
+                "PATCH",
+                "/v1/profiles/acct_a",
+                Some(&token),
+                Some(json!({ "state": state })),
+            )
+            .await
+            .assert_status(kynos::http::StatusCode::OK);
+        }
+        tokio::time::sleep(2 * REANNOUNCE_PACE).await;
+        let held = eng
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                RecordedCall::ResumeTorrent(x) => Some(x),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            h.state.profiles.holds().held(&id),
+            std::collections::HashSet::from([held.infohash]),
+            "{case}: the refused one is held before the hand resume",
+        );
+
+        let uri = format!("/v1/torrents/{}/resume", held.infohash.to_hex());
+        if case == "refused" {
+            eng.inject_error(
+                "resume_torrent",
+                EngineError::MockInjected {
+                    op: "resume_torrent",
+                    message: "boom".into(),
+                },
+            );
+            assert_problem(&h.write("POST", &uri).await, 500, "internal");
+        } else {
+            let (resp, ()) = tokio::join!(
+                h.write("POST", &uri),
+                fence_during_next_resume(&h, &eng, "acct_a"),
+            );
+            assert_problem(&resp, 409, "profile-unavailable");
+            assert!(left_paused(&eng, held), "{case}: it was paused again");
+        }
+        assert!(
+            h.state.profiles.holds().held(&id).contains(&held.infohash),
+            "{case}: a hand resume that left it not running keeps it held",
+        );
+    }
 }
 
 /// A run a set-offline stopped notices it only at its next batch. A

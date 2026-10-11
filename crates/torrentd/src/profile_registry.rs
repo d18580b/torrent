@@ -69,6 +69,11 @@ pub struct ProfileEntry {
     /// The torrents a paced set-online paused and has not resumed yet, shared
     /// by every profile ([`ProfileRegistry::with_holds`]).
     holds: Arc<PacedHolds>,
+    /// Taken across a paced set-online's hold-and-pause of this profile
+    /// ([`ProfileRegistry::hold_running`]) and across a hand resume and the
+    /// release of its hold ([`ProfileEntry::resume_by_hand`]), so neither
+    /// lands inside the other.
+    holding: Mutex<()>,
 }
 
 /// What the operator paused while one paced resume runs: a pause of the whole
@@ -184,6 +189,7 @@ impl ProfileEntry {
             resuming: Mutex::new(None),
             gates: Mutex::new(Vec::new()),
             holds: Arc::new(PacedHolds::in_memory()),
+            holding: Mutex::new(()),
         }
     }
 
@@ -287,6 +293,36 @@ impl ProfileEntry {
         {
             self.holds_unwritten(&err);
         }
+    }
+
+    /// Resume `h` by the operator's hand through `resume`, then, where
+    /// `running` says the outcome left it running, release it from what a
+    /// paced set-online holds ([`ProfileEntry::release_holds`]). A failed
+    /// resume releases nothing, so the torrent stays held.
+    ///
+    /// Both steps run under the lock a paced set-online holds while it records
+    /// and pauses this profile's running torrents
+    /// ([`ProfileRegistry::hold_running`]). Without it a set-online could read
+    /// the torrent as running once the resume went out, record its hold, and
+    /// pause it only after this released that hold: the torrent would be
+    /// paused by the pace and held by nothing, so a re-hash queued before its
+    /// batch would start on a stale running phase, and a restart before it
+    /// would load it paused as if the operator had paused it. Serialised, the
+    /// set-online either holds and pauses the torrent before this resumes it
+    /// and releases the hold, or after, when its hold stands until the pace
+    /// resumes it.
+    pub fn resume_by_hand<T, E>(
+        &self,
+        h: TorrentHandle,
+        resume: impl FnOnce() -> Result<T, E>,
+        running: impl FnOnce(&T) -> bool,
+    ) -> Result<T, E> {
+        let _holding = self.holding.lock();
+        let outcome = resume()?;
+        if running(&outcome) {
+            self.release_holds(&[h]);
+        }
+        Ok(outcome)
     }
 
     /// Log a [`PacedHolds`] release that could not be written. The record
@@ -712,11 +748,16 @@ impl ProfileRegistry {
     /// resume data, and it is what lets the boot load them unpaused if the
     /// daemon stops before the pace reaches them. A failed write pauses
     /// nothing, and the caller leaves the session paused.
+    ///
+    /// Runs under `e`'s hold lock, from reading what runs to the last pause,
+    /// so a hand resume and the release of its hold
+    /// ([`ProfileEntry::resume_by_hand`]) land wholly before or after it.
     fn hold_running(
         &self,
         e: &ProfileEntry,
         pacing: &dyn OnlinePacing,
     ) -> Result<Vec<TorrentHandle>, Refusal> {
+        let _holding = e.holding.lock();
         let held = self.holds.held(e.id());
         let mut running = Vec::new();
         let mut paced = Vec::new();
