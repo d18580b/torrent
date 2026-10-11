@@ -492,9 +492,10 @@ daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 > it resolve on a healthy daemon rather than on the first event ever to occur.
 > That is tunnel health and fencing on every profile, and port-forward state —
 > `profile_vpn_gateway_reboots_total` included — on every profile that
-> negotiates over NAT-PMP. `profile_vpn_handshake_probe_ok` is seeded at 1 on
-> every live WireGuard profile, so an alert on it reads "no" from a cold start;
-> it is never seeded on a profile that is not WireGuard, nor on one whose tunnel
+> negotiates over NAT-PMP. `profile_vpn_handshake_probe_ok` and
+> `profile_vpn_transfer_probe_ok` are seeded at 1 on
+> every live WireGuard profile, so an alert on either reads "no" from a cold
+> start; neither is ever seeded on a profile that is not WireGuard, nor on one whose tunnel
 > never came up, where a 0 would wrongly blame the host's `wg` tooling.
 > `profile_vpn_handshake_age_seconds` is the exception, because it registers on
 > the first probe rather than when the monitor starts: an alert on it reads "no

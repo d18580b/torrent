@@ -281,6 +281,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "profile_vpn_handshake_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
         "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or \
          unprivileged).";
+    "profile_vpn_transfer_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
+        "1 while the WireGuard transfer probe (wg show transfer) runs; 0 when it cannot, and an \
+         aged handshake is not judged on the link's byte counters.";
     "profile_vpn_route_probe_ok" Gauge VpnProfile Owner("live vpn profiles") =>
         "1 while the route probe (ip route get from the tunnel address) runs; 0 when it \
          cannot, or is not asked because the address probe cannot run, and the tunnel's \
