@@ -247,6 +247,13 @@ pub const CATALOGUE: &[Series] = catalogue! {
         Owner("always") =>
         "pool_plan_failures_total as of the first scrape, which already holds what the boot \
          counted; fixed for the life of the process.";
+    "boot_torrent_remove_cleanup_errors" Gauge Profile
+        ("store": torrentd_engine::metrics::REMOVE_CLEANUP_STORES) Owner("always") =>
+        "torrent_remove_cleanup_errors_total as of the first scrape, which already holds what \
+         the boot counted; fixed for the life of the process.";
+    "boot_pool_verify_failed" Gauge Daemon Owner("always") =>
+        "pool_verify_failed_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
     "boot_metrics_dropped_samples" Gauge Daemon ("reason": &["registration", "labels"]) Owner("always") =>
         "metrics_dropped_samples_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
@@ -421,10 +428,14 @@ pub struct BootCount {
 /// The boot re-drive of interrupted pool plans starts before the HTTP server
 /// and races the first scrape: where the boot's torrents settle quickly, a
 /// re-drive that fails, or a re-driven step whose storage move fails, is
-/// counted before it. An exporter's dropped sample can come from any
-/// emission, the boot's included. Each is mirrored whole: whatever a counter
-/// an alert reads had counted at the first scrape is beyond `increase()`,
-/// whether it raced the scrape or always precedes it.
+/// counted before it. The boot deletes what each tombstone names before the
+/// HTTP server starts, so a cleanup that fails there is always counted before
+/// the first scrape. The verify queue starts before the HTTP server too, and
+/// a re-queued adoption whose disk is not there can fail before it. An
+/// exporter's dropped sample can come from any emission, the boot's included.
+/// Each is mirrored whole: whatever a counter an alert reads had counted at
+/// the first scrape is beyond `increase()`, whether it raced the scrape or
+/// always precedes it.
 ///
 /// `disk_errors_total` appears with its first event, so its gauge does too:
 /// only for the operations the boot counted one under. `tracker_alerts_total`
@@ -518,6 +529,16 @@ pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: "pool_plan_failures_total",
         gauge: "boot_pool_plan_failures",
+        only: None,
+    },
+    BootCount {
+        counter: torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS,
+        gauge: "boot_torrent_remove_cleanup_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "pool_verify_failed_total",
+        gauge: "boot_pool_verify_failed",
         only: None,
     },
     // Last, so its gauge also holds any sample the rows above dropped as
@@ -1151,6 +1172,12 @@ mod tests {
         sink.inc_counter("disk_error_retry_errors_total", &p);
         sink.add_counter("storage_move_failures_total", 2, &p);
         sink.inc_counter("pool_plan_failures_total", &[("kind", "resume_failed")]);
+        sink.add_counter(
+            "torrent_remove_cleanup_errors_total",
+            2,
+            &[("profile_id", "a"), ("store", "tombstone")],
+        );
+        sink.inc_counter("pool_verify_failed_total", &[]);
         // A label mismatch, as an emission at boot could make.
         sink.inc_counter("pool_plan_failures_total", &[("phase", "redrive")]);
 
@@ -1233,6 +1260,22 @@ mod tests {
                 "0",
             ),
             (
+                "boot_torrent_remove_cleanup_errors",
+                "{profile_id=\"a\",store=\"tombstone\"}".to_string(),
+                "2",
+            ),
+            (
+                "boot_torrent_remove_cleanup_errors",
+                "{profile_id=\"a\",store=\"resume\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_torrent_remove_cleanup_errors",
+                "{profile_id=\"b\",store=\"torrent\"}".to_string(),
+                "0",
+            ),
+            ("boot_pool_verify_failed", String::new(), "1"),
+            (
                 "boot_metrics_dropped_samples",
                 "{reason=\"labels\"}".to_string(),
                 "1",
@@ -1281,6 +1324,11 @@ mod tests {
         sink.inc_counter("disk_errors_total", &disk("file_write"));
         sink.inc_counter("pool_plan_failures_total", &[("kind", "resume_failed")]);
         sink.inc_counter("pool_plan_failures_total", &[("phase", "redrive")]);
+        sink.inc_counter(
+            "torrent_remove_cleanup_errors_total",
+            &[("profile_id", "a"), ("store", "tombstone")],
+        );
+        sink.inc_counter("pool_verify_failed_total", &[]);
         let later = String::from_utf8(sink.render()).unwrap();
         assert_eq!(
             sample(
