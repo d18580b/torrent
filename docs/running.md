@@ -548,8 +548,10 @@ as routing domains, with its own table number and its own provider's
 resolver:
 
 - A profile only takes torrents whose trackers are all on its list (§5,
-  "Account isolation"), so its lookups fall under its own link's domains, and
-  each provider sees only its own account's tracker hostnames.
+  "Account isolation"), so the announce URLs it looks up fall under its own
+  link's domains, and each provider sees only its own account's tracker
+  hostnames. A tracker's redirect is the exception: see "What it does not
+  cover" below.
 - A domain on **two** profiles' lists is routed to both links: resolved sends
   the query to every link that ties for the best match, so both providers see
   it. Keep the lists disjoint where that matters.
@@ -569,7 +571,16 @@ resolver:
   each account's `resolvectl query`.
 
 **What it does not cover.** A name outside every link's routing domains, a
-DHT bootstrap node for example, still goes to the host's resolvers. While a
+DHT bootstrap node for example, still goes to the host's resolvers. So does
+the target of a tracker's HTTP redirect: libtorrent follows an announce's
+redirect to any host, the domain list is checked only against the announce
+URLs a torrent is added with, and a redirect to a name under none of the
+profile's domains is looked up by the host's resolver, beside the profile's
+own announces. Keep a tracker that redirects off-domain out of a `vpn`
+profile, or add the target's domain to its link's routing domains. Web seeds are not among
+these lookups: the daemon drops a torrent's web seeds (a `.torrent`'s
+`url-list` and `httpseeds`, a magnet's `ws=`, a resume file's `url-list` and
+`httpseeds`) on every add, so it never looks their hosts up. While a
 link stands, a tunnel that has stopped carrying traffic makes its lookups time
 out rather than leak. A link that is **removed** takes its settings with it,
 and from then its tracker names fall back to the host's resolvers; the VPN

@@ -1007,12 +1007,29 @@ extern "C" int lt_session_is_paused(lt_session* s) {
 
 namespace {
 
+// Drop every web seed the params would give the torrent: a .torrent's
+// `url-list` and `httpseeds`, a magnet's `ws=`, a resume file's `url-list` and
+// `httpseeds`. A seeding-only daemon downloads nothing from them, yet
+// libtorrent resolves a web seed's host on every retry while the torrent is
+// not finished — before upload mode refuses the connection — and that lookup
+// is a name under none of the profile's `allowed_tracker_domains`, so it
+// leaves by the host's resolver rather than the profile's tunnel.
+// `override_web_seeds` keeps torrent::torrent() from reloading the metadata's
+// own list. Applied after any flags assignment, which would otherwise reset it.
+void drop_web_seeds(lt::add_torrent_params& atp)
+{
+    atp.url_seeds.clear();
+    atp.http_seeds.clear();
+    atp.flags |= lt::torrent_flags::override_web_seeds;
+}
+
 void apply_add_params_common(lt::add_torrent_params& atp,
                              const char* save_path,
                              std::uint32_t flags)
 {
     if (save_path && *save_path) atp.save_path = save_path;
     atp.flags = build_torrent_flags(flags);
+    drop_web_seeds(atp);
 }
 
 // Replace the metadata's trackers with the caller's, the way read_resume_data
@@ -1125,6 +1142,10 @@ extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
     // would come back invisible to the status pipeline: seeding correctly, but
     // reporting zero progress and never advancing out of its initial state.
     atp.flags |= lt::torrent_flags::update_subscribe;
+
+    // After flags_set/flags_clear, so neither can bring the metadata's web
+    // seeds back by clearing override_web_seeds.
+    drop_web_seeds(atp);
 
     // Last, so neither the resume data nor flags_set can undo it. A foreign
     // .fastresume carrying auto_managed=1 would otherwise have libtorrent lift
