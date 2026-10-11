@@ -16,6 +16,7 @@ use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode as EnginePortForwardMode;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus as EngineProfileStatus;
+use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use tracing::info;
 use tracing::warn;
@@ -738,9 +739,10 @@ async fn for_each_torrent(
     s: &AppState,
     profile_id: &ProfileId,
     engine: Arc<dyn TorrentEngine>,
-    op: fn(&dyn TorrentEngine, torrentd_engine::TorrentHandle) -> bool,
+    op: fn(&StateMap, &dyn TorrentEngine, torrentd_engine::TorrentHandle) -> bool,
 ) -> Reached {
     let handles = s.state.handles_for_profile(profile_id);
+    let state = Arc::clone(&s.state);
     blocking(move || {
         let mut reached = Reached {
             ok: 0,
@@ -748,7 +750,7 @@ async fn for_each_torrent(
             failed: Vec::new(),
         };
         for h in handles {
-            if op(engine.as_ref(), h) {
+            if op(&state, engine.as_ref(), h) {
                 reached.ok = reached.ok.saturating_add(1);
             } else {
                 reached.fail(h);
@@ -758,6 +760,21 @@ async fn for_each_torrent(
         reached
     })
     .await
+}
+
+/// Pause `h`, and once it is paused, queue its resume save now rather than at
+/// the next 30-minute sweep: a crash before that would bring it back running.
+/// A torrent the engine refused keeps whatever save it already had queued.
+fn pause_and_save(
+    state: &StateMap,
+    e: &dyn TorrentEngine,
+    h: torrentd_engine::TorrentHandle,
+) -> bool {
+    let paused = e.pause_torrent(h).is_ok();
+    if paused {
+        state.queue_resume_save_now(h.infohash);
+    }
+    paused
 }
 
 /// Resume every torrent `profile_id` holds, through the shared pacer
@@ -884,7 +901,7 @@ pub async fn pause_profile(
     let mut out = BulkOutcome::default();
     tally(
         &mut out,
-        for_each_torrent(&s, &profile_id, engine, |e, h| e.pause_torrent(h).is_ok()).await,
+        for_each_torrent(&s, &profile_id, engine, pause_and_save).await,
     );
     if out.failed_count > 0 {
         warn!(
@@ -983,10 +1000,8 @@ pub async fn pause_all_torrents(
     };
     for entry in s.profiles.iter() {
         entry.halt_resumes();
-        let reached = for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), |e, h| {
-            e.pause_torrent(h).is_ok()
-        })
-        .await;
+        let reached =
+            for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), pause_and_save).await;
         tally(&mut out, reached);
     }
     if out.failed_count > 0 {
