@@ -771,18 +771,49 @@ impl vpn::killswitch::Fence for KillSwitchFence {
     }
 
     fn lift(&self) {
-        // Held to the end, not taken and released: a boot scan recording what
-        // it paused for this fence (`with_record`) between the take and the
-        // mark below would find no record, and its torrents would stay paused
-        // in a profile lifted around them.
+        // The tunnel checks run first, outside the lock: each shells out to
+        // `ip` (up to its timeout), and every add alert on the alert loop's
+        // one thread waits on this lock (`hold_recorded`), so probing under
+        // it would stall the loop for as long as the probes take. Each
+        // verdict is kept with the record's mark, and applied below only to
+        // the record it was taken for.
+        let marked: Vec<(ProfileId, u64)> = self
+            .fenced
+            .lock()
+            .profiles
+            .iter()
+            .map(|(id, record)| (id.clone(), record.mark))
+            .collect();
+        let checked: Vec<_> = marked
+            .into_iter()
+            .map(|(id, mark)| {
+                let healthy = self
+                    .profiles
+                    .resolve(&id)
+                    .active()
+                    .filter(|e| e.health().status == ProfileStatus::VpnDown)
+                    .map(|e| recovery_check(e, &self.probe));
+                (id, mark, healthy)
+            })
+            .collect();
+        // Held from the take of each record to its mark, not taken and
+        // released: a boot scan or an add recording what it paused for this
+        // fence (`with_record`) between the take and the mark below would
+        // find no record, and its torrents would stay paused in a profile
+        // lifted around them.
         let mut fenced = self.fenced.lock();
-        for (
-            profile_id,
-            FenceRecord {
+        for (profile_id, mark, healthy) in checked {
+            // A record whose mark is not the one checked above is a fence
+            // that landed since; it stays, unchecked, for the next lift.
+            if fenced.profiles.get(&profile_id).map(|r| r.mark) != Some(mark) {
+                continue;
+            }
+            let Some(FenceRecord {
                 mut handles, gate, ..
-            },
-        ) in fenced.profiles.drain()
-        {
+            }) = fenced.profiles.remove(&profile_id)
+            else {
+                continue;
+            };
             // A torrent the scans paused again after a lift stopped part-way
             // can be in the record twice: once from the fence's take of the
             // unfinished lift, once from the scans.
@@ -801,7 +832,12 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             else {
                 continue;
             };
-            if let Err(reason) = recovery_check(entry, &self.probe) {
+            // Not checked: the profile did not read fenced when the checks
+            // ran, so whatever fenced it since (the monitor) owns that fence.
+            let Some(healthy) = healthy else {
+                continue;
+            };
+            if let Err(reason) = healthy {
                 warn!(
                     target: "torrentd::vpn_monitor",
                     profile_id = %profile_id,
@@ -3594,6 +3630,112 @@ mod tests {
             "the second lift resumes it once"
         );
         assert_eq!(resumes_of(&engine, handle(1)), 2, "as it does the walk's");
+    }
+
+    /// The lift's tunnel check runs with the fence's lock free, so an add
+    /// alert's hold (`hold_recorded`, on the alert loop's one thread) never
+    /// waits out the `ip` probes. The lift still resumes what the add
+    /// recorded.
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_lift_checks_each_tunnel_without_holding_the_fence_lock() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let probed_free = Arc::new(AtomicUsize::new(0));
+        let probed_held = Arc::new(AtomicUsize::new(0));
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            let (free, held) = (probed_free.clone(), probed_held.clone());
+            move |iface: &str, wg: bool| {
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let counter = if fence.fenced.try_lock().is_some() {
+                    &free
+                } else {
+                    &held
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        let added = handle(3);
+        fence.fence_all();
+        deliver_add(&fence, engine.clone(), added);
+
+        fence.lift();
+        assert_eq!(
+            probed_free.load(Ordering::SeqCst),
+            1,
+            "probed once, unlocked"
+        );
+        assert_eq!(
+            probed_held.load(Ordering::SeqCst),
+            0,
+            "never under the lock"
+        );
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(sorted_ids(&resumes(&engine)), [1, 3]);
+    }
+
+    /// A fence that lands between the lift's tunnel check and its take of
+    /// the records is not lifted on that check: its record stays for the
+    /// next lift.
+    #[test]
+    fn a_record_marked_after_the_lifts_check_stays_for_the_next_lift() {
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            move |iface: &str, wg: bool| {
+                // Stands in for a fence landing mid-check: the record now
+                // carries a mark the lift did not check.
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let mut fenced = fence.fenced.lock();
+                fenced.marks += 1;
+                let mark = fenced.marks;
+                for record in fenced.profiles.values_mut() {
+                    record.mark = mark;
+                }
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        fence.fence_all();
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown, "still fenced");
+        assert!(resumes(&engine).is_empty());
+        assert!(
+            fence.with_record(&ProfileId::new("acct_a"), |r| r.is_some()),
+            "the record stays for the next lift",
+        );
     }
 
     /// Without the kill switch no fence lifts by its own record, so the add

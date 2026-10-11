@@ -6425,12 +6425,15 @@ mod tests {
         assert_eq!(t.resumes(), hs, "each resumed once");
     }
 
-    /// A scan that reaches the kill-switch fence while its lift is running
-    /// waits for the lift, rather than finding the record already taken and
-    /// the profile not yet marked: that would pause its torrent with nothing
-    /// to resume it. Here it finds the profile lifted, and its torrent runs.
+    /// A scan that reaches the kill-switch fence while its lift is checking
+    /// the tunnel does not wait out the check, which runs with the fence's
+    /// lock free: it finds the profile still fenced and its record still
+    /// there, pauses its torrent and records it, and the lift, which takes
+    /// the record only after the check, resumes it with the rest. Never the
+    /// record already taken and the profile not yet marked: that would pause
+    /// its torrent with nothing to resume it.
     #[tokio::test(start_paused = true)]
-    async fn a_scan_that_reaches_the_kill_switch_fence_mid_lift_waits_for_the_lift() {
+    async fn a_scan_that_reaches_the_kill_switch_fence_mid_lift_is_resumed_by_the_lift() {
         use crate::vpn::killswitch::Fence as _;
 
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
@@ -6459,27 +6462,23 @@ mod tests {
             }
         });
         entered_rx.recv().unwrap();
-        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
-        let adding = std::thread::spawn({
-            let (profiles, metrics, a) = (t.profiles.clone(), t.metrics.clone(), t.a.clone());
-            move || {
-                reached_tx.send(()).unwrap();
-                scan.added(&profiles, &metrics, &a, h2);
-            }
-        });
-        reached_rx.recv().unwrap();
-        // Long enough for the add to reach the fence's lock. Were the lock
-        // not held across the lift, the add would be done by now.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!adding.is_finished(), "the add waits for the lift");
+        // The add completes while the lift's check is still held: were the
+        // lock held across the check, this join would never return.
+        let (profiles, metrics, a) = (t.profiles.clone(), t.metrics.clone(), t.a.clone());
+        std::thread::spawn(move || scan.added(&profiles, &metrics, &a, h2))
+            .join()
+            .unwrap();
+        assert_eq!(t.pauses(), [h1, h2], "the add finds the profile fenced");
 
         release_tx.send(()).unwrap();
         lifting.join().unwrap();
-        adding.join().unwrap();
         t.settle().await;
         assert_eq!(t.status(), ProfileStatus::Active);
-        assert_eq!(t.pauses(), [h1], "an add to a lifted profile runs");
-        assert_eq!(t.resumes(), [h1]);
+        assert_eq!(
+            t.resumes(),
+            [h1, h2],
+            "the lift resumes what the add recorded"
+        );
     }
 
     /// A supervised task stopped through the handle `spawn_supervised`
