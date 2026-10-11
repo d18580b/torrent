@@ -2539,6 +2539,34 @@ fn a_rescan_with_no_session_view_keeps_an_owned_drifted_torrent_at_its_recorded_
 }
 
 #[test]
+fn a_rescan_keeps_a_torrent_the_caller_says_is_owned_at_its_recorded_base() {
+    // Not `adopted`, no owner in the index, and no session loads it: only the
+    // caller's `owned` set - a registry assignment or a verify-queue item -
+    // says it is served, and so which of its two copies is claimed.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, root_id) = drifted_at_the_second_copy(dir.path());
+    assert_eq!(store.profile_of("aa").unwrap(), None);
+    let owned = std::collections::HashSet::from(["aa".to_owned()]);
+
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &owned).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, "seed".to_owned()))
+    );
+    let orphans = store.orphan_files(root_id, "").unwrap();
+    assert!(!orphans.contains(&"seed/T/a.bin".to_owned()), "{orphans:?}");
+
+    // Not listed in `owned`: nothing serves it, and it is placed by cost
+    // order again.
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default()).unwrap();
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, String::new()))
+    );
+}
+
+#[test]
 fn a_delete_plan_refuses_every_copy_of_a_torrent_complete_more_than_once() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
