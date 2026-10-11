@@ -1879,6 +1879,89 @@ async fn an_add_whose_profile_is_fenced_mid_add_pauses_the_torrent() {
 }
 
 #[tokio::test]
+async fn an_add_the_kill_switch_fences_mid_add_is_resumed_by_the_fences_lift() {
+    // The kill-switch fence lands while `add_torrent` runs: its walk of the
+    // state map misses the torrent, so the add's own re-check pauses it, and
+    // has to record it with the fence through `AppState::kill_switch`, or
+    // the lift resumes the rest and leaves this one paused in a profile that
+    // reads active.
+    use crate::vpn::killswitch::Fence as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut wired = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let engines = fixture(s, dir.path());
+        // `p`'s entry fences and lifts through the engine its session adds
+        // through, as the daemon's do.
+        let p = test_entry("p", ProfileStatus::Active);
+        let p = ProfileEntry::new(p.config, engines.p.clone(), p.session_ip, None, 0);
+        s.profiles = Arc::new(ProfileRegistry::new(vec![p]));
+        let healthy: crate::vpn_monitor::Prober =
+            Arc::new(|_, _| crate::vpn_monitor::TunnelProbes {
+                ip: Ok(Some(std::net::IpAddr::from([10, 2, 0, 2]))),
+                route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
+                handshake: None,
+            });
+        let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+            s.profiles.clone(),
+            s.state.clone(),
+            s.metrics.clone(),
+            healthy,
+        ));
+        s.kill_switch = Some(fence.clone());
+        wired = Some((engines.p, fence));
+    });
+    let (engine, fence) = wired.unwrap();
+    let held = engine.hold_next("add_torrent");
+    let entered = tokio::task::spawn_blocking(move || {
+        held.wait_entered();
+        held
+    });
+    let req = h.write_json("POST", "/v1/torrents", magnet("p"));
+    let fence_mid_add = async {
+        let held = entered.await.unwrap();
+        fence.fence_all();
+        held.release();
+    };
+    let (resp, ()) = tokio::join!(req, fence_mid_add);
+    resp.assert_status(StatusCode::CREATED);
+    // The mock derives the handle's infohash from the magnet's first 20 bytes.
+    let mut synthetic = [0u8; 20];
+    synthetic.copy_from_slice(&MAGNET.as_bytes()[..20]);
+    let th = handle(&engine, InfoHash(synthetic));
+    assert!(
+        !h.state.state.contains(&th.infohash),
+        "the fence's walk cannot have found it"
+    );
+    assert!(
+        called(&engine, &RecordedCall::PauseTorrent(th)),
+        "the add pauses it: {:?}",
+        engine.calls()
+    );
+
+    fence.lift();
+    eventually("the lift resumes the added torrent", || {
+        called(&engine, &RecordedCall::ResumeTorrent(th))
+    })
+    .await;
+    let loaded = handle(&engine, LOADED);
+    eventually("and the torrent its walk paused", || {
+        called(&engine, &RecordedCall::ResumeTorrent(loaded))
+    })
+    .await;
+    assert_eq!(
+        h.state
+            .profiles
+            .resolve(&ProfileId::new("p"))
+            .active()
+            .unwrap()
+            .health()
+            .status,
+        ProfileStatus::Active
+    );
+}
+
+#[tokio::test]
 async fn a_delete_dropped_mid_call_still_clears_the_assignment() {
     // The torrent leaves its session whatever happens to the request; were
     // the assignment cleared only after the await, it would stay on a torrent
