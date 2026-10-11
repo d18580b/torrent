@@ -3002,3 +3002,103 @@ fn a_hybrid_torrent_added_by_a_v1_magnet_keeps_its_v1_key() {
     assert!(!body.contains(&v1), "the deleted torrent came back: {body}");
     daemon.stop();
 }
+
+/// Issue #251: a hybrid torrent an earlier build filed under its truncated v2
+/// hash — `<v2>.resume` and `<v2>.torrent` — is keyed by its v1 hash by the
+/// session now. The boot refuses it and counts it, rather than loading a
+/// torrent every alert of which names a key no record is kept under.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_hybrid_torrent_filed_under_its_truncated_v2_hash_is_refused_at_boot() {
+    boot_a_hybrid_filed_under_its_truncated_v2_hash(true);
+}
+
+/// The same with no `.torrent` beside the resume file, so nothing tells the
+/// scan the session's key before the add: the session's own key is compared,
+/// and the torrent taken back out of the session.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_hybrid_resume_file_filed_under_its_truncated_v2_hash_is_taken_back_out_at_boot() {
+    boot_a_hybrid_filed_under_its_truncated_v2_hash(false);
+}
+
+fn boot_a_hybrid_filed_under_its_truncated_v2_hash(with_torrent: bool) {
+    let torrent = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent"),
+    )
+    .expect("read the hybrid test torrent");
+    let hashes = libtorrent_safe::info_hashes_from_torrent(&torrent).unwrap();
+    let v1 = hashes.v1.expect("hybrid has v1");
+    let v2 = hashes.v2.expect("hybrid has v2");
+    let filed = v2.truncated().to_hex();
+
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let resumes = p.join("resume").join(PROFILE);
+    let torrents = p.join("torrents").join(PROFILE);
+    std::fs::create_dir_all(&resumes).unwrap();
+    std::fs::create_dir_all(&torrents).unwrap();
+    // Resume data as libtorrent writes it for a hybrid: both hashes and a save
+    // path, no info dict.
+    let mut resume =
+        b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+    resume.extend_from_slice(&v1.0);
+    resume.extend_from_slice(b"10:info-hash232:");
+    resume.extend_from_slice(&v2.0);
+    let save_path = p.join("data").display().to_string();
+    resume.extend_from_slice(format!("9:save_path{}:{save_path}e", save_path.len()).as_bytes());
+    let resume_file = resumes.join(format!("{filed}.resume"));
+    let torrent_file = torrents.join(format!("{filed}.torrent"));
+    std::fs::write(&resume_file, &resume).unwrap();
+    if with_torrent {
+        std::fs::write(&torrent_file, &torrent).unwrap();
+    }
+
+    let daemon = Running(spawn_daemon(p, free_port(), addr));
+    wait_healthy(addr);
+
+    // In no session under either key, once a removal has landed.
+    poll(
+        "the torrent out of the session",
+        Duration::from_secs(10),
+        || {
+            let (code, list) = http(addr, "GET", "/v1/torrents", None);
+            assert_eq!(code, 200, "{list}");
+            (!list.contains(&v1.to_hex()) && !list.contains(&filed)).then_some(())
+        },
+    );
+    // Counted once, by the resume scan, and not again by the torrent-dir scan
+    // that finds the `.torrent` beside it.
+    let (code, metrics) = http(addr, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    for (source, n) in [("resume_add", 1), ("torrent_dir_add", 0)] {
+        assert!(
+            metrics.lines().any(|l| {
+                l.starts_with("torrentd_boot_torrent_load_failures{")
+                    && l.contains(&format!("profile_id=\"{PROFILE}\""))
+                    && l.contains(&format!("source=\"{source}\""))
+                    && l.ends_with(&format!(" {n}"))
+            }),
+            "boot_torrent_load_failures{{source={source}}} should read {n}:\n{metrics}"
+        );
+    }
+    // Nothing is claimed for it: the claim the resume scan made before the
+    // add is released with the refusal.
+    let unloaded =
+        format!("torrentd_profile_unloaded_registry_torrents{{profile_id=\"{PROFILE}\"}} 0");
+    assert!(
+        metrics.lines().any(|l| l == unloaded),
+        "the registry should claim nothing unloaded ({unloaded}):\n{metrics}"
+    );
+    daemon.stop();
+
+    // Left for the operator to reconcile: nothing is deleted, and nothing
+    // written under the session's key.
+    assert!(resume_file.exists(), "the refused resume file is kept");
+    assert_eq!(torrent_file.exists(), with_torrent);
+    assert!(!resumes.join(format!("{}.resume", v1.to_hex())).exists());
+    assert!(!torrents.join(format!("{}.torrent", v1.to_hex())).exists());
+}
