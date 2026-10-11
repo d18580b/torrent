@@ -311,15 +311,18 @@ groups:
         # stays silent. It reads no boot gauge: an outage keeps failing the
         # announces that follow the first scrape, which the fraction sees, and
         # a count fixed at boot would skew the fraction for the process's life.
+        # Per host, as every other per-profile rule here: hosts commonly share
+        # a profile_id, and summed across them one host's outage is diluted by
+        # the others' replies and fires, if at all, without naming the host.
         expr: |
-          sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind="error"}[30m]))
-            / sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind=~"error|reply"}[30m]))
+          sum by (instance, job, profile_id) (increase(torrentd_tracker_alerts_total{kind="error"}[30m]))
+            / sum by (instance, job, profile_id) (increase(torrentd_tracker_alerts_total{kind=~"error|reply"}[30m]))
             > 0.5
         for: 30m
         labels:
           severity: warning
         annotations:
-          summary: "Most tracker announces for profile {{ $labels.profile_id }} have been failing for 30 minutes"
+          summary: "Most tracker announces for profile {{ $labels.profile_id }} on {{ $labels.instance }} have been failing for 30 minutes"
 
       - alert: TorrentdTrackerWarnings
         expr: >

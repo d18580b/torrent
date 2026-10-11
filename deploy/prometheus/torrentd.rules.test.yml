@@ -754,17 +754,17 @@ tests:
   #   acct_c: one failed announce among steady replies. Never fires.
   - interval: 1m
     input_series:
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="error"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_a", kind="error"}'
         values: '0+3x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="reply"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_a", kind="reply"}'
         values: '0+1x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="error"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_b", kind="error"}'
         values: '0+1x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="reply"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_b", kind="reply"}'
         values: '0+4x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="error"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_c", kind="error"}'
         values: '0 1x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="reply"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_c", kind="reply"}'
         values: '0+2x90'
     alert_rule_test:
       - eval_time: 10m
@@ -775,17 +775,47 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+              job: torrentd
+              instance: seedbox:8080
               profile_id: acct_a
             exp_annotations:
-              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
+              summary: "Most tracker announces for profile acct_a on seedbox:8080 have been failing for 30 minutes"
       - eval_time: 90m
         alertname: TorrentdTrackerErrors
         exp_alerts:
           - exp_labels:
               severity: warning
+              job: torrentd
+              instance: seedbox:8080
               profile_id: acct_a
             exp_annotations:
-              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
+              summary: "Most tracker announces for profile acct_a on seedbox:8080 have been failing for 30 minutes"
+
+  # Two hosts run the same profile_id. Every announce fails on host-a (its
+  # tunnel blocks the tracker) and every announce replies on host-b. Summed
+  # across both, the fraction was 0.5 and never fired; per host, it fires for
+  # host-a alone and names it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-a:8080", profile_id="acct_a", kind="error"}'
+        values: '0+2x90'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-a:8080", profile_id="acct_a", kind="reply"}'
+        values: '0x90'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-b:8080", profile_id="acct_a", kind="error"}'
+        values: '0x90'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-b:8080", profile_id="acct_a", kind="reply"}'
+        values: '0+2x90'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TorrentdTrackerErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: torrentd
+              instance: host-a:8080
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Most tracker announces for profile acct_a on host-a:8080 have been failing for 30 minutes"
 
   - interval: 1m
     input_series:
