@@ -1149,13 +1149,13 @@ pub async fn run_verify_queue(
         let q = pool.verify_queue();
 
         // 1) Retire anything that finished hashing.
-        retire_in_flight(&pool, &*source, &state);
+        retire_in_flight(&pool, &*source, &state, &profiles);
         // 1a) Free the slots of re-hashes whose check has ended.
         retire_checking(q, &state, RECHECK_EXPIRY);
         // 1b) Retire re-hashes of loaded torrents, once a check that finished
         //     after the request is in. One that finished before it is the
         //     previous check, and says nothing about this one.
-        retire_rechecks(&pool, &*source, &state);
+        retire_rechecks(&pool, &*source, &state, &profiles);
 
         // 2) Admit up to the limit, adoptions and re-hashes together.
         admit(&pool, &source, &state, &metrics, &profiles, &registry);
@@ -1515,7 +1515,12 @@ fn admit_adoption(
 /// store writes made only after it is released: a write waits out a running
 /// scan, and the lock held through that wait blocked every reader of the
 /// list with it.
-fn retire_in_flight(pool: &PoolService, source: &dyn AlertSource, state: &StateMap) {
+fn retire_in_flight(
+    pool: &PoolService,
+    source: &dyn AlertSource,
+    state: &StateMap,
+    profiles: &crate::profile_registry::ProfileRegistry,
+) {
     enum Retired {
         Forget(String),
         Record(libtorrent_safe::InfoHash, String, VerifyOutcome),
@@ -1551,7 +1556,7 @@ fn retire_in_flight(pool: &PoolService, source: &dyn AlertSource, state: &StateM
         match r {
             Retired::Forget(ih) => pool.forget_queued(&ih),
             Retired::Record(hash, ih, outcome) => {
-                record_verify_outcome(pool, source, state, &hash, &ih, outcome);
+                record_verify_outcome(pool, source, state, profiles, &hash, &ih, outcome);
             }
         }
     }
@@ -1601,7 +1606,12 @@ fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
 ///
 /// As in [`retire_in_flight`], the store writes are made after the list's
 /// lock is released.
-fn retire_rechecks(pool: &PoolService, source: &dyn AlertSource, state: &StateMap) {
+fn retire_rechecks(
+    pool: &PoolService,
+    source: &dyn AlertSource,
+    state: &StateMap,
+    profiles: &crate::profile_registry::ProfileRegistry,
+) {
     let mut finished = Vec::new();
     pool.verify_queue().rechecks.lock().retain(|(ih, started)| {
         let Some(hash) = libtorrent_safe::InfoHash::from_hex(ih) else {
@@ -1625,7 +1635,7 @@ fn retire_rechecks(pool: &PoolService, source: &dyn AlertSource, state: &StateMa
         }
     });
     for (hash, ih, outcome) in finished {
-        record_verify_outcome(pool, source, state, &hash, &ih, outcome);
+        record_verify_outcome(pool, source, state, profiles, &hash, &ih, outcome);
     }
 }
 
@@ -1726,7 +1736,9 @@ fn release_dropped_claim(pool: &PoolService, registry: &AssignmentRegistry, item
 /// drift. `Failed` records `drifted` and **pauses** the torrent: under forced
 /// upload mode it would otherwise sit in its session announcing a payload the
 /// piece hashes just rejected, and an operator reading `drifted` would find it
-/// still on the network.
+/// still on the network. It is left out of every paced resume in its profile
+/// first ([`crate::profile_registry::ProfileEntry::exclude_from_resumes`]), so
+/// no lift resumes it after.
 ///
 /// Either verdict forgets the info-hash's persisted verify-queue entry: an
 /// adoption keeps it until here, so a restart before the verdict is recorded
@@ -1735,6 +1747,7 @@ fn record_verify_outcome(
     pool: &PoolService,
     source: &dyn AlertSource,
     state: &StateMap,
+    profiles: &crate::profile_registry::ProfileRegistry,
     hash: &libtorrent_safe::InfoHash,
     ih: &str,
     outcome: VerifyOutcome,
@@ -1756,6 +1769,13 @@ fn record_verify_outcome(
                 "verification did not leave the torrent seeding; pausing it",
             );
             if let Some(st) = state.get(hash) {
+                // Left out first, as the operator's pause does: a paced
+                // resume running in the profile, or a kill-switch fence's
+                // lift, would otherwise resume it, and a paced set-online's
+                // hold would load it unpaused at the next boot.
+                if let Some(entry) = profiles.resolve(&st.profile_id).active() {
+                    entry.exclude_from_resumes(st.handle);
+                }
                 let paused = source
                     .engine_for(&st.profile_id)
                     .map(|e| e.pause_torrent(st.handle));
@@ -2893,10 +2913,20 @@ mod tests {
 
         // The verify tick's two retirements, each waiting on the writer to
         // record its verdict.
-        let retire = |f: fn(&super::PoolService, &dyn AlertSource, &StateMap)| {
-            let (pool, source, state) =
-                (Arc::clone(&pool), Arc::clone(&source), Arc::clone(&state));
-            std::thread::spawn(move || f(&pool, &*source, &state))
+        let profiles = Arc::new(crate::profile_registry::ProfileRegistry::new(vec![]));
+        let retire = |f: fn(
+            &super::PoolService,
+            &dyn AlertSource,
+            &StateMap,
+            &crate::profile_registry::ProfileRegistry,
+        )| {
+            let (pool, source, state, profiles) = (
+                Arc::clone(&pool),
+                Arc::clone(&source),
+                Arc::clone(&state),
+                Arc::clone(&profiles),
+            );
+            std::thread::spawn(move || f(&pool, &*source, &state, &profiles))
         };
         let in_flight = retire(super::retire_in_flight);
         let rechecks = retire(super::retire_rechecks);
@@ -2987,13 +3017,13 @@ mod tests {
         // Both are in their sessions, still hashing.
         state.insert(checked, st(TorrentPhase::Checking, None));
         state.insert(removed, st(TorrentPhase::Checking, None));
-        super::retire_in_flight(&pool, &source, &state);
+        super::retire_in_flight(&pool, &source, &state, &profiles);
         assert_eq!(pool.verify_queue().in_flight(), 2);
 
         // One finishes its check without seeding; the other is removed.
         state.insert(checked, st(TorrentPhase::Incomplete, Some(SETTLE)));
         state.remove(&removed, &ProfileId::new("p"), None);
-        super::retire_in_flight(&pool, &source, &state);
+        super::retire_in_flight(&pool, &source, &state, &profiles);
 
         assert_eq!(pool.verify_queue().in_flight(), 0);
         assert!(engine
@@ -3657,10 +3687,12 @@ mod tests {
         })
         .unwrap();
 
+        let profiles = crate::profile_registry::ProfileRegistry::new(vec![]);
         super::record_verify_outcome(
             &pool,
             &source,
             &state,
+            &profiles,
             &hash,
             &ih,
             VerifyOutcome::Failed("bad"),
@@ -3682,7 +3714,15 @@ mod tests {
         assert_eq!(got, Some(AdoptionState::Drifted));
         assert!(drift.is_some());
 
-        super::record_verify_outcome(&pool, &source, &state, &hash, &ih, VerifyOutcome::Verified);
+        super::record_verify_outcome(
+            &pool,
+            &source,
+            &state,
+            &profiles,
+            &hash,
+            &ih,
+            VerifyOutcome::Verified,
+        );
         let (got, drift) = pool
             .with_store(|s| {
                 Ok::<_, torrentd_pool::PoolError>((s.adoption_state(&ih)?, s.drift_at(&ih)?))
@@ -3690,6 +3730,95 @@ mod tests {
             .unwrap();
         assert_eq!(got, Some(AdoptionState::Adopted));
         assert_eq!(drift, None);
+    }
+
+    /// A failed verification leaves the torrent out of every paced resume in
+    /// its profile before pausing it, as the operator's pause does: a lift
+    /// still running does not resume it, a kill-switch fence that takes the
+    /// run back does not record it, and a gate opened before the failure,
+    /// as a kill-switch fence opens one, refuses it to that fence's lift.
+    /// Set offline instead, the profile holds the rest of the run for the
+    /// next set-online, and not it.
+    #[test]
+    fn a_failed_verify_leaves_the_torrent_out_of_every_paced_resume() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::StateMap;
+
+        use crate::profile_registry::test_host_entry;
+        use crate::profile_registry::Gated;
+        use crate::profile_registry::NoTorrents;
+        use crate::profile_registry::ProfileRegistry;
+
+        let failed = TorrentHandle {
+            id: 1,
+            infohash: InfoHash([0x11; 20]),
+        };
+        let other = TorrentHandle {
+            id: 2,
+            infohash: InfoHash([0x22; 20]),
+        };
+        let id = ProfileId::new("p");
+        let verify = |profiles: &ProfileRegistry| {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+            let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+            let engine = Arc::new(MockEngine::new());
+            let source = torrentd_engine::ProfileSource::new(vec![(
+                id.clone(),
+                engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+            )]);
+            let state = StateMap::new();
+            state.insert(failed.infohash, st(TorrentPhase::Incomplete, Some(SETTLE)));
+            super::record_verify_outcome(
+                &pool,
+                &source,
+                &state,
+                profiles,
+                &failed.infohash,
+                &failed.infohash.to_hex(),
+                VerifyOutcome::Failed("bad"),
+            );
+            assert!(engine
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PauseTorrent(h) if *h == failed)));
+        };
+
+        // A lift run open, and a fence's gate standing.
+        let profiles = ProfileRegistry::new(vec![test_host_entry("p")]);
+        let entry = profiles.resolve(&id).active().unwrap();
+        let fence_gate = entry.open_gate();
+        let run = entry.begin_resume(vec![failed, other]);
+        verify(&profiles);
+        assert_eq!(run.gate().resume(failed, || ()), Err(Gated::Excluded));
+        assert_eq!(fence_gate.resume(failed, || ()), Err(Gated::Excluded));
+        assert_eq!(fence_gate.resume(other, || ()), Ok(()));
+        assert_eq!(entry.take_resume(), Some(vec![other]));
+
+        // A lift run open, then a set-offline: what it holds for the next
+        // set-online is the rest of the run.
+        let profiles = ProfileRegistry::new(vec![test_host_entry("p")]);
+        let entry = profiles.resolve(&id).active().unwrap();
+        let run = entry.begin_resume(vec![failed, other]);
+        verify(&profiles);
+        profiles
+            .change_states(
+                |rec| rec.set(&id, DesiredState::Offline),
+                &crate::metrics_sink::PromSink::new(),
+                &NoTorrents,
+            )
+            .unwrap();
+        assert!(run.cancelled());
+        assert_eq!(
+            profiles.holds().held(&id),
+            HashSet::from([other.infohash]),
+            "the failed torrent is not held to be resumed",
+        );
     }
 
     /// What the verify worker needs besides the pool: a session for `p`, a

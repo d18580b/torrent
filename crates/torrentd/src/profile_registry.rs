@@ -214,10 +214,26 @@ impl ProfileEntry {
     /// are not lost to the next lift: they read as paused when the fence
     /// looks for what is running.
     pub fn begin_resume(&self, handles: Vec<TorrentHandle>) -> Arc<PacedResume> {
+        self.begin_resume_with(handles, self.open_gate())
+    }
+
+    /// [`ProfileEntry::begin_resume`], keeping to `gate`, one opened on this
+    /// entry ([`ProfileEntry::open_gate`]) before the run began, rather than
+    /// a new one: what a pause in the profile closed it with since it opened
+    /// holds for the run too.
+    ///
+    /// For a kill-switch fence's lift, whose gate opened when the fence
+    /// landed, so a torrent the operator paused while the fence stood, or a
+    /// pause of the whole profile then, is not resumed by its lift.
+    pub fn begin_resume_with(
+        &self,
+        handles: Vec<TorrentHandle>,
+        gate: Arc<ResumeGate>,
+    ) -> Arc<PacedResume> {
         let run = Arc::new(PacedResume {
             handles,
             cancelled: AtomicBool::new(false),
-            gate: self.open_gate(),
+            gate,
         });
         if let Some(before) = self.resuming.lock().replace(run.clone()) {
             before.cancelled.store(true, Ordering::SeqCst);
@@ -227,10 +243,14 @@ impl ProfileEntry {
 
     /// Stop the paced resume running in this profile before its next batch,
     /// and hand back every torrent it was asked to resume, less those the
-    /// operator paused while it ran. `None` when none is running.
+    /// operator paused while it ran: none of them where the operator paused
+    /// the whole profile. `None` when none is running.
     pub fn take_resume(&self) -> Option<Vec<TorrentHandle>> {
         let run = self.resuming.lock().take()?;
         run.cancelled.store(true, Ordering::SeqCst);
+        if run.gate.halted() {
+            return Some(Vec::new());
+        }
         Some(
             run.handles
                 .iter()
@@ -254,7 +274,10 @@ impl ProfileEntry {
     /// whole profile walks it. Once this returns no run resumes another
     /// torrent, so the walk's pauses stand. A lift's run is also dropped from
     /// the entry, so a kill-switch fence does not take it back and the next
-    /// lift does not resume what the operator paused.
+    /// lift does not resume what the operator paused. A kill-switch fence
+    /// standing over the profile holds a gate of its own from the moment it
+    /// fenced (`vpn_monitor::KillSwitchFence`), which this halts too, so its
+    /// lift resumes nothing.
     ///
     /// What a paced set-online still holds ([`PacedHolds`]) is released too:
     /// the operator's pause now stands over it, so the next boot does not load
@@ -273,7 +296,9 @@ impl ProfileEntry {
 
     /// Leave `h` out of every paced resume running in this profile, before a
     /// pause of that one torrent. Once this returns none of them resumes it,
-    /// and the next boot does not load it unpaused ([`PacedHolds`]).
+    /// nor does the lift of a kill-switch fence standing over the profile,
+    /// whose gate opened when it fenced (`vpn_monitor::KillSwitchFence`), and
+    /// the next boot does not load it unpaused ([`PacedHolds`]).
     pub fn exclude_from_resumes(&self, h: TorrentHandle) {
         for gate in self.live_gates() {
             gate.exclude(h);
@@ -1315,5 +1340,26 @@ mod tests {
         entry.end_resume(&newer, &[handle(1)]);
         assert_eq!(r.holds().held(&id), HashSet::from([handle(2).infohash]));
         assert!(!entry.is_resuming());
+    }
+
+    /// A run begun on a gate opened before it keeps to what a pause closed
+    /// that gate with since: a torrent paused alone is not taken back, and a
+    /// pause of the whole profile leaves none of it to take back.
+    #[test]
+    fn a_run_on_an_earlier_gate_keeps_the_pauses_made_since_it_opened() {
+        let r = ProfileRegistry::new(vec![test_host_entry("p")]);
+        let entry = r.resolve(&ProfileId::new("p")).active().unwrap();
+
+        let gate = entry.open_gate();
+        entry.exclude_from_resumes(handle(2));
+        let run = entry.begin_resume_with(vec![handle(1), handle(2)], gate);
+        assert_eq!(run.gate().resume(handle(2), || ()), Err(Gated::Excluded));
+        assert_eq!(entry.take_resume(), Some(vec![handle(1)]));
+
+        let gate = entry.open_gate();
+        entry.halt_resumes();
+        let run = entry.begin_resume_with(vec![handle(1), handle(2)], gate);
+        assert_eq!(run.gate().resume(handle(1), || ()), Err(Gated::Halted));
+        assert_eq!(entry.take_resume(), Some(vec![]));
     }
 }
