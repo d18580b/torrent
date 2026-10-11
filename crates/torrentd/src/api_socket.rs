@@ -365,13 +365,22 @@ async fn serve_connection(
 async fn read_body(
     body: hyper::body::Incoming,
 ) -> Result<bytes::Bytes, (kynos::http::StatusCode, String)> {
+    // A declared length over the cap is refused before a byte is read.
+    let too_large = || {
+        (
+            kynos::http::StatusCode::PAYLOAD_TOO_LARGE,
+            format!("the request body is larger than {MAX_ADD_BODY_BYTES} bytes"),
+        )
+    };
+    if usize::try_from(http_body::Body::size_hint(&body).lower())
+        .map_or(true, |declared| declared > MAX_ADD_BODY_BYTES)
+    {
+        return Err(too_large());
+    }
     let limited = http_body_util::Limited::new(body, MAX_ADD_BODY_BYTES);
     match tokio::time::timeout(BODY_DEADLINE, limited.collect()).await {
         Ok(Ok(collected)) => Ok(collected.to_bytes()),
-        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => Err((
-            kynos::http::StatusCode::PAYLOAD_TOO_LARGE,
-            format!("the request body is larger than {MAX_ADD_BODY_BYTES} bytes"),
-        )),
+        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => Err(too_large()),
         Ok(Err(e)) => Err((
             kynos::http::StatusCode::BAD_REQUEST,
             format!("the request body could not be read: {e}"),
@@ -531,6 +540,27 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 4"), "got: {response:.300}");
         assert!(
             !response.starts_with("HTTP/1.1 408") && !response.starts_with("HTTP/1.1 413"),
+            "got: {response:.300}"
+        );
+
+        // A declared length over the cap is refused without its body being
+        // sent at all: the exchange would otherwise wait out the deadline.
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            exchange(
+                &path,
+                &format!(
+                    "POST /v1/torrents HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                     Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    MAX_ADD_BODY_BYTES + 1
+                ),
+            ),
+        )
+        .await
+        .expect("refused at once");
+        assert!(response.starts_with("HTTP/1.1 413"), "got: {response:.300}");
+        assert!(
+            response.contains("application/problem+json"),
             "got: {response:.300}"
         );
 
