@@ -1308,6 +1308,78 @@ async fn a_hand_resume_racing_a_set_online_leaves_its_pause_held() {
     pace.release();
 }
 
+/// A hand resume that does not leave the torrent running releases nothing: one
+/// the session refuses, and one the profile is fenced during, so it is paused
+/// again, each leave the torrent held, as a set-online's pace left it.
+#[tokio::test(start_paused = true)]
+async fn a_hand_resume_that_does_not_leave_it_running_keeps_it_held() {
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let id = ProfileId::new("acct_a");
+    for case in ["refused", "fenced"] {
+        let (h, eng, _) = paced_profile(5);
+        for state in ["offline", "online"] {
+            if state == "online" {
+                // The pace's first resume is refused, so that torrent stays
+                // held once the pace ends.
+                eng.inject_error(
+                    "resume_torrent",
+                    EngineError::MockInjected {
+                        op: "resume_torrent",
+                        message: "boom".into(),
+                    },
+                );
+            }
+            let token = h.tokens.write.clone();
+            h.send(
+                "PATCH",
+                "/v1/profiles/acct_a",
+                Some(&token),
+                Some(json!({ "state": state })),
+            )
+            .await
+            .assert_status(kynos::http::StatusCode::OK);
+        }
+        tokio::time::sleep(2 * REANNOUNCE_PACE).await;
+        let held = eng
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                RecordedCall::ResumeTorrent(x) => Some(x),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            h.state.profiles.holds().held(&id),
+            std::collections::HashSet::from([held.infohash]),
+            "{case}: the refused one is held before the hand resume",
+        );
+
+        let uri = format!("/v1/torrents/{}/resume", held.infohash.to_hex());
+        if case == "refused" {
+            eng.inject_error(
+                "resume_torrent",
+                EngineError::MockInjected {
+                    op: "resume_torrent",
+                    message: "boom".into(),
+                },
+            );
+            assert_problem(&h.write("POST", &uri).await, 500, "internal");
+        } else {
+            let (resp, ()) = tokio::join!(
+                h.write("POST", &uri),
+                fence_during_next_resume(&h, &eng, "acct_a"),
+            );
+            assert_problem(&resp, 409, "profile-unavailable");
+            assert!(left_paused(&eng, held), "{case}: it was paused again");
+        }
+        assert!(
+            h.state.profiles.holds().held(&id).contains(&held.infohash),
+            "{case}: a hand resume that left it not running keeps it held",
+        );
+    }
+}
+
 /// A run a set-offline stopped notices it only at its next batch. A
 /// set-online before then holds and pauses again the torrents that run
 /// reached, and the stopped run must not release them when it notices:
