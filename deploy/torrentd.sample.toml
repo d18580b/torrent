@@ -17,9 +17,12 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # The daemon refuses to start unless you either configure [auth] (see the
 # bottom of this file) or say here that you do not want authentication. This
 # sample takes the second option because it binds loopback, where access
-# control is the reverse proxy's job. Delete this line and configure [auth]
-# before exposing the API anywhere — a non-loopback bind without [auth] is
-# refused outright.
+# control is the reverse proxy's job. That holds only on a single-user host,
+# or in a network namespace or container no other uid shares: every local
+# user can reach 127.0.0.1, and without [auth] any of them controls the
+# daemon (docs/running.md §6). Delete this line and configure [auth] on a
+# shared host, and before exposing the API anywhere — a non-loopback bind
+# without [auth] is refused outright.
 #
 # Read once, at startup, like [auth], http_listen and trusted_proxies: editing
 # any of the four takes effect on restart, not on SIGHUP. A reload after such an
@@ -403,8 +406,13 @@ dht               = true
 # with a non-loopback `http_listen` is refused, because that is an
 # unauthenticated mutating API on the network. So the two safe shapes are:
 #
-#   loopback + allow_unauthenticated   access control is the proxy's job
+#   loopback + allow_unauthenticated   access control is the proxy's job;
+#                                      single-user host only
 #   any bind + [auth]                  the daemon authenticates itself
+#
+# Every local uid can reach 127.0.0.1, so on a shared host the first shape
+# hands every local user full control of the daemon: use the second there
+# (docs/running.md §6).
 #
 # This sample ships the first, because it binds loopback: see
 # `allow_unauthenticated` in the daemon-wide block at the top. Configure [auth]

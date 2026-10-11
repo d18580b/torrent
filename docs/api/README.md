@@ -81,8 +81,11 @@ request forgery. A daemon without `[auth]` does, and has one (below).
 
 **A daemon without `[auth]`.** With `allow_unauthenticated = true`, which the
 daemon permits only on a loopback `http_listen`, every operation admits every
-request, with or without a token. An `Authorization` header that is present
-but is not a well-formed bearer credential is still a `401`: a client that
+request, with or without a token. Every local user can reach `127.0.0.1`, so
+this is safe only on a single-user host, or in a network namespace or
+container no other uid shares; anywhere else, configure `[auth]`
+([running.md §6](../running.md#6-authentication--required-one-way-or-the-other)).
+An `Authorization` header that is present but is not a well-formed bearer credential is still a `401`: a client that
 sent a credential nobody checked is not an anonymous one. That includes any
 other scheme — a `Basic` header a reverse proxy adds or passes through from
 its own login is a `401` on every operation — so a proxy in front of such a
