@@ -85,10 +85,9 @@ typedef uintptr_t lt_handle;
 /* Upper bound on the file count `lt_torrent_metadata` and
  * `lt_torrent_status_files` will materialise.
  *
- * Each `lt_torrent_status_files` entry carries a fixed LT_PATH_MAX buffer, so
- * that array costs ~1 KiB per file whatever the paths actually are. 250k files
- * is far past any real torrent (a 100 TiB release is thousands, not millions)
- * and caps the allocation at ~256 MiB. */
+ * 250k files is far past any real torrent (a 100 TiB release is thousands,
+ * not millions), and caps the entry arrays both allocate. The paths they
+ * carry are bounded separately, by LT_MAX_TORRENT_PATH_BYTES. */
 #define LT_MAX_TORRENT_FILES 250000u
 
 /* Upper bound on the bytes of path and name text `lt_torrent_metadata`
@@ -435,29 +434,48 @@ int         lt_announce_url_has_prefix(const char* url, const char* prefix);
 
 /* Point-in-time details of one torrent in a session.
  *
- * Strings are NUL-terminated and truncated to fit (at a UTF-8 character
- * boundary). `name` is empty when libtorrent has no name yet (a magnet without
- * `dn=` before its metadata arrives). */
+ * `name` and `save_path` are at their full length: `name_len` /
+ * `save_path_len` bytes, each followed by a NUL. Both point into `strings`,
+ * which the struct owns until lt_torrent_details_free(). A save path cut
+ * short names another directory, and the delete and relocation guards act on
+ * this one, so neither is ever truncated. `name` is empty when libtorrent has
+ * no name yet (a magnet without `dn=` before its metadata arrives). */
 struct lt_torrent_details {
-    char     name[LT_PATH_MAX];
-    char     save_path[LT_PATH_MAX];
+    const char* name;
+    size_t   name_len;
+    const char* save_path;
+    size_t   save_path_len;
     uint64_t total_size;          /* 0 when has_metadata == 0 */
     int64_t  added_time;          /* unix seconds; 0 when unknown */
     uint32_t upload_limit;        /* bytes/sec; 0 = unlimited */
     uint8_t  has_metadata;
     uint8_t  _pad[3];
+    char*    strings;
 };
 
 /* Fill *out with the details of torrent `h`. Returns LT_OK / LT_ERR (err_out
- * populated; LT_ERR_UNKNOWN_HANDLE_MSG for an unknown handle). Nothing to
- * free: the struct holds no heap memory. */
+ * populated; LT_ERR_UNKNOWN_HANDLE_MSG for an unknown handle). On LT_OK the
+ * caller MUST call lt_torrent_details_free(out); on LT_ERR *out is zeroed and
+ * owns nothing. */
 int         lt_torrent_details(lt_session* s, lt_handle h,
                                struct lt_torrent_details* out,
                                char* err_out, int err_len);
 
-/* One file of a torrent in a session, in file-index order. */
+/* Release the details' strings. Idempotent; safe on a zero-initialized
+ * struct. */
+void        lt_torrent_details_free(struct lt_torrent_details* d);
+
+/* One file of a torrent in a session, in file-index order.
+ *
+ * `path` is torrent-relative and '/'-separated, at its full length:
+ * `path_len` bytes followed by a NUL. It points into the enclosing
+ * lt_torrent_file_list's `strings` and is valid until
+ * lt_torrent_file_list_free(). A path cut short names a file that is not the
+ * torrent's, and the delete guards join these onto the save path, so it is
+ * never truncated. */
 struct lt_torrent_file_entry {
-    char     path[LT_PATH_MAX];   /* torrent-relative, '/'-separated */
+    const char* path;
+    size_t   path_len;
     uint64_t size;
     /* Bytes of this file covered by pieces the torrent has. Piece
      * granularity: a piece spanning two files counts toward both only once
@@ -467,12 +485,15 @@ struct lt_torrent_file_entry {
     uint8_t  _pad[7];
 };
 
-/* One page of a torrent's file list. `files` is heap-allocated; release the
- * whole struct with lt_torrent_file_list_free(). */
+/* One page of a torrent's file list. `files` and `strings` are
+ * heap-allocated; release the whole struct with lt_torrent_file_list_free().
+ * `strings` holds every path of the page; it is the shim's, and only
+ * lt_torrent_file_list_free() releases it. */
 struct lt_torrent_file_list {
     /* files[i] is the file at index first_index + i. */
     struct lt_torrent_file_entry* files;
     size_t   num_files;
+    char*    strings;
     /* How many files the whole torrent has, whatever page was asked for. */
     size_t   total_files;
     /* The index of files[0]: the requested start, or total_files when the
@@ -484,21 +505,24 @@ struct lt_torrent_file_list {
 
 /* Fill *out with at most `limit` files of torrent `h`, from file index
  * `start` on. Only the page is copied, so a caller listing a large torrent
- * page by page copies each entry (with its LT_PATH_MAX path) once rather than
- * the whole list per page. `limit` 0 copies nothing and still reports
- * total_files; a `start` at or past the end is an empty page, not an error.
+ * page by page copies each entry (with its path) once rather than the whole
+ * list per page. `limit` 0 copies nothing and still reports total_files; a
+ * `start` at or past the end is an empty page, not an error.
  *
  * A torrent without metadata (a magnet still fetching it) is not an error:
- * LT_OK with has_metadata = 0 and no files. Refuses (LT_ERR) a page of more
- * than LT_MAX_TORRENT_FILES entries, the bound lt_torrent_metadata applies to
- * a whole torrent. On LT_OK the caller MUST call
- * lt_torrent_file_list_free(out); on LT_ERR nothing was allocated. */
+ * LT_OK with has_metadata = 0 and no files. Paths are never truncated.
+ * Refuses (LT_ERR) a page of more than LT_MAX_TORRENT_FILES entries, or whose
+ * paths together exceed LT_MAX_TORRENT_PATH_BYTES: the bounds
+ * lt_torrent_metadata applies to a whole torrent. On LT_OK the caller MUST
+ * call lt_torrent_file_list_free(out); on LT_ERR *out is zeroed and owns
+ * nothing. */
 int         lt_torrent_files(lt_session* s, lt_handle h,
                              size_t start, size_t limit,
                              struct lt_torrent_file_list* out,
                              char* err_out, int err_len);
 
-/* Release the heap file list. Idempotent; safe on a zero-initialized struct. */
+/* Release the heap file list and its paths. Idempotent; safe on a
+ * zero-initialized struct. */
 void        lt_torrent_file_list_free(struct lt_torrent_file_list* l);
 
 /* One tracker (announce_entry) of a torrent in a session.

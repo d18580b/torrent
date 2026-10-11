@@ -23,6 +23,7 @@ use crate::settings::MoveFlags;
 use crate::settings::ResumeFlags;
 use crate::settings::Settings;
 use crate::settings::TorrentFlags;
+use crate::torrent_info::DetailsGuard;
 use crate::torrent_info::FileListGuard;
 use crate::torrent_info::FilePage;
 use crate::torrent_info::TorrentDetails;
@@ -449,14 +450,13 @@ impl Session {
     /// Name, size, save path, upload limit and added time of one torrent.
     /// Synchronous: libtorrent answers from its network thread.
     pub fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails> {
-        // SAFETY: all-zero is a valid lt_torrent_details (plain data).
-        let mut raw: ffi::lt_torrent_details = unsafe { std::mem::zeroed() };
+        let mut raw = DetailsGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
             ffi::lt_torrent_details(
                 self.ptr,
                 h.id as ffi::lt_handle,
-                &mut raw,
+                &mut raw.0,
                 err.ptr(),
                 err.len() as i32,
             )
@@ -464,7 +464,7 @@ impl Session {
         if rc != ffi::LT_OK as i32 {
             return Err(query_error(h, err));
         }
-        Ok(TorrentDetails::from_raw(&raw))
+        Ok(raw.details())
     }
 
     /// The torrent's files in index order, or `None` while its metadata has
@@ -641,7 +641,9 @@ impl RawFileList {
             total,
             files: (first..)
                 .zip(self.0.entries())
-                .map(|(i, f)| TorrentFile::from_raw(i, f))
+                // SAFETY: the shim filled these entries, and their paths
+                // live in the list until the guard drops, after this copy.
+                .map(|(i, f)| unsafe { TorrentFile::from_raw(i, f) })
                 .collect(),
         })
     }

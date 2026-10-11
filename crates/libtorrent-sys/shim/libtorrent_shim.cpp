@@ -1693,8 +1693,23 @@ extern "C" int lt_torrent_details(lt_session* s, lt_handle h,
                               | lt::torrent_handle::query_save_path);
     auto const ti = th.torrent_file();
     std::string const& name = (st.name.empty() && ti) ? ti->name() : st.name;
-    copy_utf8_truncated(out->name, LT_PATH_MAX, name);
-    copy_utf8_truncated(out->save_path, LT_PATH_MAX, st.save_path);
+    auto const upload_limit = normalise_rate_limit(th.upload_limit());
+
+    // Both strings come back whole, in one block: a save path cut short
+    // names another directory, and the delete guards join the torrent's
+    // files onto it. Everything that can throw runs before anything is
+    // published to *out, and the unique_ptr releases the block if it does.
+    std::size_t const bytes = name.size() + 1 + st.save_path.size() + 1;
+    std::unique_ptr<char, decltype(&std::free)> strings(
+        static_cast<char*>(std::malloc(bytes)), &std::free);
+    if (!strings) throw std::bad_alloc{};
+    char* const name_ptr = strings.get();
+    std::memcpy(name_ptr, name.data(), name.size());
+    name_ptr[name.size()] = '\0';
+    char* const save_ptr = name_ptr + name.size() + 1;
+    std::memcpy(save_ptr, st.save_path.data(), st.save_path.size());
+    save_ptr[st.save_path.size()] = '\0';
+
     // has_metadata and torrent_file() are read separately, so require both:
     // a torrent_info without metadata reports a size of 0 anyway, but the
     // flag is what the caller branches on.
@@ -1702,10 +1717,25 @@ extern "C" int lt_torrent_details(lt_session* s, lt_handle h,
         out->has_metadata = 1;
         out->total_size = static_cast<std::uint64_t>(ti->total_size());
     }
-    out->upload_limit = normalise_rate_limit(th.upload_limit());
+    out->upload_limit = upload_limit;
     out->added_time = static_cast<std::int64_t>(st.added_time);
+    out->name = name_ptr;
+    out->name_len = name.size();
+    out->save_path = save_ptr;
+    out->save_path_len = st.save_path.size();
+    out->strings = strings.release();
     return LT_OK;
     LT_SHIM_CATCH_HANDLE(err_out, err_len, LT_ERR)
+}
+
+extern "C" void lt_torrent_details_free(struct lt_torrent_details* d) {
+    if (!d) return;
+    std::free(d->strings);
+    d->strings = nullptr;
+    d->name = nullptr;
+    d->name_len = 0;
+    d->save_path = nullptr;
+    d->save_path_len = 0;
 }
 
 extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
@@ -1726,17 +1756,31 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
     auto const total = static_cast<std::size_t>(fs.num_files());
     auto const first = std::min(start, total);
     auto const n = std::min(limit, total - first);
-    // Same bound, for the same reason, as lt_torrent_metadata: each entry
-    // carries a fixed LT_PATH_MAX buffer. Applied to the page, which is all
-    // that is copied.
+    // Same bounds, for the same reasons, as lt_torrent_metadata. Applied to
+    // the page, which is all that is copied.
     if (n > LT_MAX_TORRENT_FILES) {
         set_err(err_out, err_len, "torrent declares an implausible number of files");
         return LT_ERR;
     }
-    out->has_metadata = 1;
-    out->total_files = total;
-    out->first_index = first;
-    if (n == 0) return LT_OK;
+    // Paths come back whole: the delete guards join each onto the save
+    // path, and a path cut short names a file that is not the torrent's, so
+    // the guard would skip the real one as never written. One block holds
+    // every path, sized by a first pass so that a page past the bound is
+    // refused before anything is allocated for it.
+    std::size_t bytes = 0;
+    for (std::size_t j = 0; j < n; ++j) {
+        bytes += fs.file_path(lt::file_index_t{static_cast<int>(first + j)}).size() + 1;
+        if (bytes > LT_MAX_TORRENT_PATH_BYTES) {
+            set_err(err_out, err_len, "torrent file paths exceed the metadata size bound");
+            return LT_ERR;
+        }
+    }
+    if (n == 0) {
+        out->has_metadata = 1;
+        out->total_files = total;
+        out->first_index = first;
+        return LT_OK;
+    }
     // piece_granularity counts only completed pieces, which is cheap (no
     // per-block walk) and is what "downloaded" means for a seeding client.
     // Both cover the whole torrent (libtorrent has no ranged form); only the
@@ -1744,18 +1788,31 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
     auto const progress = th.file_progress(lt::torrent_handle::piece_granularity);
     auto const prios = th.get_file_priorities();
 
-    // Published to *out only once fully built; the unique_ptr releases it if
-    // anything below throws, so LT_ERR never leaves an allocation behind.
+    // Published to *out only once fully built; the unique_ptrs release both
+    // blocks if anything below throws, so LT_ERR never leaves an allocation
+    // behind.
+    std::unique_ptr<char, decltype(&std::free)> strings(
+        static_cast<char*>(std::malloc(bytes)), &std::free);
+    if (!strings) throw std::bad_alloc{};
     std::unique_ptr<lt_torrent_file_entry, decltype(&std::free)> arr(
         static_cast<lt_torrent_file_entry*>(std::calloc(n, sizeof(lt_torrent_file_entry))),
         &std::free);
     if (!arr) throw std::bad_alloc{};
+    std::size_t used = 0;
     for (std::size_t j = 0; j < n; ++j) {
         auto& e = arr.get()[j];
         auto const i = first + j;
         auto const idx = lt::file_index_t{static_cast<int>(i)};
         // Empty save_path: the torrent-relative path, like lt_torrent_metadata.
-        copy_utf8_truncated(e.path, LT_PATH_MAX, fs.file_path(idx));
+        std::string const path = fs.file_path(idx);
+        if (path.size() + 1 > bytes - used)
+            throw std::logic_error("torrent file paths changed between passes");
+        char* const dst = strings.get() + used;
+        std::memcpy(dst, path.data(), path.size());
+        dst[path.size()] = '\0';
+        used += path.size() + 1;
+        e.path = dst;
+        e.path_len = path.size();
         e.size = static_cast<std::uint64_t>(fs.file_size(idx));
         if (i < progress.size() && progress[i] > 0)
             e.downloaded = static_cast<std::uint64_t>(progress[i]);
@@ -1764,8 +1821,12 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
         e.priority = static_cast<std::uint8_t>(
             i < prios.size() ? prios[i] : lt::default_priority);
     }
+    out->has_metadata = 1;
+    out->total_files = total;
+    out->first_index = first;
     out->files = arr.release();
     out->num_files = n;
+    out->strings = strings.release();
     return LT_OK;
     LT_SHIM_CATCH_HANDLE(err_out, err_len, LT_ERR)
 }
@@ -1773,8 +1834,10 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
 extern "C" void lt_torrent_file_list_free(struct lt_torrent_file_list* l) {
     if (!l) return;
     std::free(l->files);
+    std::free(l->strings);
     l->files = nullptr;
     l->num_files = 0;
+    l->strings = nullptr;
 }
 
 extern "C" int lt_torrent_trackers(lt_session* s, lt_handle h,

@@ -156,7 +156,7 @@ pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
 /// # Safety
 ///
 /// `ptr` is null, or points at `len` readable bytes that outlive the call.
-unsafe fn sized_str(ptr: *const std::os::raw::c_char, len: usize) -> String {
+pub(crate) unsafe fn sized_str(ptr: *const std::os::raw::c_char, len: usize) -> String {
     if ptr.is_null() {
         return String::new();
     }

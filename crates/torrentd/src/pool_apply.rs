@@ -4330,6 +4330,85 @@ mod tests {
         );
     }
 
+    /// A torrent-relative path past the 1 023 bytes the shim once cut file
+    /// paths at, and the directory it lies in: six 200-byte directories
+    /// under `T`, each within the 255-byte file-name limit.
+    fn long_rel_path() -> (String, String) {
+        let dirs: Vec<String> = (0..6).map(|i| format!("{i}{}", "d".repeat(199))).collect();
+        let dir = format!("T/{}", dirs.join("/"));
+        let rel = format!("{dir}/leaf.bin");
+        assert!(rel.len() > 1_023, "{}", rel.len());
+        (dir, rel)
+    }
+
+    #[test]
+    fn a_payload_with_a_long_file_path_goes_to_the_trash_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let (_, rel) = long_rel_path();
+        let long = write(&root, &rel, 16);
+        let short = write(&root, "T/a.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        pool.with_store_mut(|st| {
+            st.replace_claims(
+                &ih,
+                &[
+                    (pool.roots()[0].0, "T/a.bin".to_owned()),
+                    (pool.roots()[0].0, rel.clone()),
+                ],
+            )
+        })
+        .unwrap();
+
+        // The session's file list holds the long path whole: the file is
+        // proven and moved, not skipped as never written.
+        let files = ["T/a.bin".to_owned(), rel.clone()];
+        let payload = torrent_payload(&pool, &ih, &root, &files).unwrap();
+        assert_eq!(payload.file_count(), 2);
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert!(out.failed.is_none(), "{:?}", out.failed);
+        assert_eq!(out.moved, 2);
+        assert!(!long.exists() && !short.exists());
+        assert_eq!(
+            std::fs::read(root.join(".torrentd-trash/torrent-x-1").join(&rel)).unwrap(),
+            vec![7u8; 16]
+        );
+    }
+
+    #[test]
+    fn a_payload_is_shared_with_a_live_torrent_through_its_long_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let (deep, rel) = long_rel_path();
+        let leaf = write(&root, &rel, 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, &rel);
+        // This torrent reaches the file through a deep save path and a short
+        // relative one.
+        let payload =
+            torrent_payload(&pool, &ih, &root.join(&deep), &["leaf.bin".to_owned()]).unwrap();
+        assert_eq!(payload.file_count(), 1);
+
+        // Another reaches the same file through the root and the long
+        // relative path, which the session reports whole.
+        let other = LiveTorrent {
+            save_path: root.clone(),
+            files: Some(vec![rel.clone()]),
+        };
+        assert_eq!(payload.shared_with(&other), Some(leaf.as_path()));
+        // A sibling at the same depth is not the same file.
+        let sibling = LiveTorrent {
+            save_path: root.clone(),
+            files: Some(vec![format!("{deep}/other.bin")]),
+        };
+        assert_eq!(payload.shared_with(&sibling), None);
+    }
+
     #[test]
     fn a_file_that_changes_after_the_proof_stops_the_move_there() {
         let dir = tempfile::tempdir().unwrap();
