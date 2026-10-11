@@ -59,8 +59,10 @@ pub(crate) enum DownReason {
     /// wins the lookup.
     RouteMismatch,
     /// The address is intact but the WireGuard handshake is older than
-    /// allowed, and its profile has had torrents to carry for longer than
-    /// that: traffic went into the tunnel and no handshake answered it.
+    /// allowed, and the link has sent bytes nothing answered for longer than
+    /// that: its `tx` counter grew while its `rx` stayed still. Where the
+    /// link's counters were never readable in the run, the time its profile
+    /// has had torrents to carry stands in for that.
     HandshakeStale,
     /// A WireGuard tunnel that has never handshaked, for longer than the
     /// handshake threshold while its profile had torrents to carry: wrong key,
