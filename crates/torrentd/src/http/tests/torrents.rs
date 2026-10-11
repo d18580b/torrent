@@ -2649,6 +2649,37 @@ async fn every_pause_the_api_takes_queues_an_unconditional_resume_save() {
 }
 
 #[tokio::test]
+async fn a_pause_the_engine_refuses_restores_the_note_before_it() {
+    // A refused pause leaves the torrent as it was, so what the kill-switch
+    // fence and a set-online read as running is put back too: here the
+    // running note a resume left, which a refused pause must not turn into a
+    // paused one.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engines = None;
+    let h = Harness::authed(&Coverage::new(), |s| engines = Some(fixture(s, dir.path())));
+    let e = engines.unwrap();
+    let loaded = handle(&e.p, LOADED);
+    let entry = h
+        .state
+        .profiles
+        .resolve(&ProfileId::new("p"))
+        .active()
+        .unwrap();
+    entry.note_running(loaded, true);
+
+    e.p.inject_error("pause_torrent", injected("pause_torrent"));
+    let resp = h
+        .write("POST", &format!("/v1/torrents/{}/pause", hex(LOADED)))
+        .await;
+    assert_problem(&resp, 500, "internal");
+    assert_eq!(
+        entry.running(vec![(loaded, false)]),
+        [(loaded, true)],
+        "the resume's note stands",
+    );
+}
+
+#[tokio::test]
 async fn a_torrent_outside_the_allow_list_is_counted_as_a_registry_error() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::authed(&Coverage::new(), |s| {
