@@ -1212,7 +1212,14 @@ fn admit(
                 continue;
             }
             recheck_budget -= 1;
-            match admit_recheck(q, &**source, state, profiles, &mut held_logged) {
+            match admit_recheck(
+                q,
+                &**source,
+                state,
+                metrics.as_ref(),
+                profiles,
+                &mut held_logged,
+            ) {
                 Admission::Admitted => recheck_next = false,
                 Admission::Skipped => {}
                 Admission::Stop => rechecks = false,
@@ -1278,17 +1285,25 @@ pub(crate) fn force_recheck_marking_checking(
 /// the network is put back, as an adoption is held, because a re-hash puts
 /// the torrent back on the network once it ends. So is one whose torrent a
 /// paced set-online holds paused until its batch comes
-/// ([`crate::profile_state::PacedHolds`]): it is not paused for good. A
-/// torrent the operator resumes by hand is no longer held, so its re-hash
-/// starts. The hold is logged once per profile per tick: `held_logged` names the profiles
-/// already logged.
+/// ([`crate::profile_state::PacedHolds`]), and one paused that a fence's lift
+/// has yet to resume ([`crate::profile_registry::ProfileEntry::resume_pending`]):
+/// neither is paused for good. A torrent the operator resumes by hand is no
+/// longer held, so its re-hash starts. The hold is logged once per profile per
+/// tick: `held_logged` names the profiles already logged.
+///
+/// Every re-hash dropped here is counted in `pool_recheck_dropped_total` by
+/// why, since `POST /v1/pool/verifications` answered that it started.
 fn admit_recheck(
     q: &VerifyQueue,
     source: &dyn AlertSource,
     state: &StateMap,
+    metrics: &dyn MetricsSink,
     profiles: &crate::profile_registry::ProfileRegistry,
     held_logged: &mut std::collections::HashSet<ProfileId>,
 ) -> Admission {
+    let dropped = |reason: &str| {
+        metrics.inc_counter("pool_recheck_dropped_total", &[("reason", reason)]);
+    };
     let Some(r) = q.pending_rechecks.lock().pop_front() else {
         return Admission::Stop;
     };
@@ -1299,6 +1314,7 @@ fn admit_recheck(
             infohash = %r.infohash,
             "a torrent queued for a re-hash is no longer loaded; dropping the re-hash",
         );
+        dropped("not_loaded");
         return Admission::Skipped;
     };
     let fenced = profiles
@@ -1338,18 +1354,46 @@ fn admit_recheck(
         q.pending_rechecks.lock().push_back(r);
         return Admission::Skipped;
     }
+    // A fence's lift marks the profile active, then resumes what the fence
+    // paused a batch at a time, holding nothing in `PacedHolds`: a torrent it
+    // has not reached yet reads as paused in an active profile, paused by
+    // the daemon and not the operator, so its re-hash waits for its batch.
+    // Read only while it reads as paused: one the run has resumed is hashed
+    // at once. One the operator pauses while the run goes is left out of it,
+    // and its re-hash is dropped below.
+    if st.phase == TorrentPhase::Paused
+        && profiles
+            .resolve(&st.profile_id)
+            .active()
+            .is_some_and(|e| e.resume_pending(&st.handle.infohash))
+    {
+        if held_logged.insert(st.profile_id.clone()) {
+            info!(
+                target: "torrentd::pool",
+                profile_id = %st.profile_id,
+                infohash = %r.infohash,
+                reason = "fence_lift",
+                "re-hash held: the lift of the profile's fence has not resumed the torrent yet",
+            );
+        }
+        q.pending_rechecks.lock().push_back(r);
+        return Admission::Skipped;
+    }
     let unhashable = match st.phase {
-        TorrentPhase::Paused => Some("it was paused while it waited"),
-        TorrentPhase::AwaitingMetadata => Some("it has no metadata to hash against"),
+        TorrentPhase::Paused => Some(("paused", "it was paused while it waited")),
+        TorrentPhase::AwaitingMetadata => {
+            Some(("no_metadata", "it has no metadata to hash against"))
+        }
         _ => None,
     };
-    if let Some(why) = unhashable {
+    if let Some((reason, why)) = unhashable {
         warn!(
             target: "torrentd::pool",
             infohash = %r.infohash,
             reason = why,
             "re-hash dropped: libtorrent would not hash it",
         );
+        dropped(reason);
         return Admission::Skipped;
     }
     let Some(engine) = source.engine_for(&st.profile_id) else {
@@ -1359,6 +1403,7 @@ fn admit_recheck(
             infohash = %r.infohash,
             "no engine for profile; dropping the re-hash",
         );
+        dropped("no_engine");
         return Admission::Skipped;
     };
     // Marked before it is asked for, so the check it starts finishes after
@@ -1374,6 +1419,7 @@ fn admit_recheck(
             error.cause = %e,
             "re-hash failed to start; dropping it",
         );
+        dropped("start_failed");
         return Admission::Skipped;
     }
     info!(target: "torrentd::pool", infohash = %r.infohash, "re-hashing");
@@ -4000,6 +4046,9 @@ mod tests {
         for dropped in [gone, paused, magnet] {
             assert!(!q.tracks_recheck(&dropped.to_hex()));
         }
+        for reason in ["not_loaded", "paused", "no_metadata"] {
+            assert_eq!(rechecks_dropped(&w, reason), 1, "{reason}: counted");
+        }
         // Still fenced on the next tick: held again, not started.
         w.tick(&pool);
         assert_eq!(w.rechecked(), [ok]);
@@ -4072,13 +4121,135 @@ mod tests {
 
         let mut logged = std::collections::HashSet::new();
         assert_eq!(
-            super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged),
+            super::admit_recheck(
+                q,
+                &*w.source,
+                &w.state,
+                &*w.metrics,
+                &w.profiles,
+                &mut logged
+            ),
             super::Admission::Skipped,
         );
         assert!(logged.contains(&id), "the hold was logged");
         assert!(w.rechecked().is_empty(), "no check started");
         assert_eq!(q.depth(), 1, "held by the pace: it waits");
         assert_eq!(q.in_flight(), 0, "and holds no slot");
+    }
+
+    /// How many re-hashes the queue dropped for `reason`, as `/metrics`
+    /// renders it.
+    fn rechecks_dropped(w: &Worker, reason: &str) -> u64 {
+        let text = String::from_utf8(w.metrics.render()).unwrap();
+        let series = format!("torrentd_pool_recheck_dropped_total{{reason=\"{reason}\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&series))
+            .map_or(0, |v| v.parse().unwrap())
+    }
+
+    /// The kill-switch watch lifts its fence: it records the lift's run with
+    /// `begin_resume`, marks the profile active, and the run resumes the
+    /// torrents a batch at a time (`KillSwitchFence::lift`). A
+    /// re-hash that reaches a torrent the run has not resumed yet waits for
+    /// it rather than being dropped as paused, and starts once it is resumed.
+    #[test]
+    fn a_rehash_waits_while_a_kill_switch_lift_has_not_resumed_its_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let id = ProfileId::new("p");
+        let ih = InfoHash([0xE1; 20]);
+        w.load(ih, 1, "p", TorrentPhase::Paused);
+        let entry = w.profiles.resolve(&id).active().unwrap();
+        let run = entry.begin_resume(vec![w.state.get(&ih).unwrap().handle]);
+        let q = pool.verify_queue();
+        q.enqueue_recheck(ih.to_hex(), true);
+
+        w.tick(&pool);
+        assert!(w.rechecked().is_empty(), "no check on a paused torrent");
+        assert_eq!(q.depth(), 1, "the lift has yet to resume it: it waits");
+        assert!(q.tracks_recheck(&ih.to_hex()));
+        assert_eq!(rechecks_dropped(&w, "paused"), 0);
+
+        // Its batch comes, and the run ends.
+        let mut st = w.state.get(&ih).unwrap();
+        st.phase = TorrentPhase::Seeding;
+        w.state.insert(ih, st.clone());
+        entry.end_resume(&run, &[st.handle]);
+        w.tick(&pool);
+        assert_eq!(w.rechecked(), [ih]);
+    }
+
+    /// The operator sets a fenced profile online: the fence is lifted and
+    /// every torrent in the profile is resumed by a paced run, as
+    /// `lift_fence` does. A re-hash held while the profile was fenced is
+    /// still held between the lift and the run reaching its torrent, then
+    /// starts.
+    #[test]
+    fn a_rehash_waits_while_a_set_online_lift_has_not_resumed_its_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let id = ProfileId::new("p");
+        let entry = w.profiles.resolve(&id).active().unwrap();
+        entry.update_health(|h| h.status = ProfileStatus::VpnDown);
+        let ih = InfoHash([0xE2; 20]);
+        w.load(ih, 1, "p", TorrentPhase::Paused);
+        let q = pool.verify_queue();
+        q.enqueue_recheck(ih.to_hex(), true);
+
+        w.tick(&pool);
+        assert_eq!(q.depth(), 1, "fenced: it waits");
+
+        // Set online: the run is recorded, then the profile marked active,
+        // then its torrents resumed a batch at a time. A tick between the
+        // two steps finds it still fenced.
+        let run = entry.begin_resume(w.state.handles_for_profile(&id));
+        w.tick(&pool);
+        assert_eq!(q.depth(), 1, "run recorded, still fenced: it waits");
+        entry.update_health(|h| h.status = ProfileStatus::Active);
+        w.tick(&pool);
+        assert!(w.rechecked().is_empty());
+        assert_eq!(q.depth(), 1, "the lift has yet to resume it: it waits");
+        assert_eq!(rechecks_dropped(&w, "paused"), 0);
+
+        let mut st = w.state.get(&ih).unwrap();
+        st.phase = TorrentPhase::Seeding;
+        w.state.insert(ih, st.clone());
+        entry.end_resume(&run, &[st.handle]);
+        w.tick(&pool);
+        assert_eq!(w.rechecked(), [ih]);
+    }
+
+    /// A torrent the operator pauses while a lift's run goes is left out of
+    /// the run, so it is paused for good: its re-hash is dropped, and the
+    /// drop is counted. The rest of the run's torrents still wait.
+    #[test]
+    fn a_rehash_of_a_torrent_paused_out_of_a_lift_is_dropped_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let id = ProfileId::new("p");
+        let (paused, waiting) = (InfoHash([0xE3; 20]), InfoHash([0xE4; 20]));
+        w.load(paused, 1, "p", TorrentPhase::Paused);
+        w.load(waiting, 2, "p", TorrentPhase::Paused);
+        let entry = w.profiles.resolve(&id).active().unwrap();
+        let _run = entry.begin_resume(w.state.handles_for_profile(&id));
+        entry.exclude_from_resumes(w.state.get(&paused).unwrap().handle);
+        let q = pool.verify_queue();
+        for ih in [paused, waiting] {
+            q.enqueue_recheck(ih.to_hex(), true);
+        }
+
+        w.tick(&pool);
+        assert!(w.rechecked().is_empty());
+        assert!(!q.tracks_recheck(&paused.to_hex()), "the operator's pause");
+        assert!(q.tracks_recheck(&waiting.to_hex()), "the lift's to resume");
+        assert_eq!(q.depth(), 1);
+        assert_eq!(rechecks_dropped(&w, "paused"), 1);
     }
 
     /// A re-hash paused while it checks holds its slot, so with
@@ -4227,7 +4398,14 @@ mod tests {
         let mut logged = std::collections::HashSet::new();
         for _ in 0..20 {
             assert_eq!(
-                super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged),
+                super::admit_recheck(
+                    q,
+                    &*w.source,
+                    &w.state,
+                    &*w.metrics,
+                    &w.profiles,
+                    &mut logged
+                ),
                 super::Admission::Skipped,
             );
         }
@@ -4255,7 +4433,14 @@ mod tests {
         let admitted = std::thread::scope(|s| {
             let admit = s.spawn(|| {
                 let mut logged = std::collections::HashSet::new();
-                super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged)
+                super::admit_recheck(
+                    q,
+                    &*w.source,
+                    &w.state,
+                    &*w.metrics,
+                    &w.profiles,
+                    &mut logged,
+                )
             });
             held.wait_entered();
             assert_eq!(
@@ -4288,7 +4473,14 @@ mod tests {
 
         let mut logged = std::collections::HashSet::new();
         assert_eq!(
-            super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged),
+            super::admit_recheck(
+                q,
+                &*w.source,
+                &w.state,
+                &*w.metrics,
+                &w.profiles,
+                &mut logged
+            ),
             super::Admission::Skipped,
         );
         assert_eq!(w.state.get(&ih).unwrap().phase, TorrentPhase::DiskError);

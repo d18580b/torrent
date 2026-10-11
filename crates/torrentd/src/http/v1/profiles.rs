@@ -541,6 +541,11 @@ fn set_state(
 /// request is answered ([`crate::vpn_monitor::spawn_lift`]).
 fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     let profile_id = entry.id();
+    let handles = s.state.handles_for_profile(profile_id);
+    let torrent_count = handles.len();
+    // Recorded before the profile reads active, so a queued re-hash never
+    // finds it active with no run to resume its torrents.
+    let run = entry.begin_resume(handles);
     entry.update_health(|h| {
         h.status = EngineProfileStatus::Active;
         h.tunnel_ip = entry.session_ip;
@@ -550,18 +555,17 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     s.metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
     s.metrics
         .set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
-    let handles = s.state.handles_for_profile(profile_id);
     info!(
         profile_id = %profile_id,
-        torrent_count = handles.len(),
+        torrent_count,
         "fence lifted: the tunnel checked healthy and the profile was set online; resuming \
          its torrents a batch at a time",
     );
-    crate::vpn_monitor::spawn_lift(
+    crate::vpn_monitor::spawn_run(
         &s.profiles,
         &s.metrics,
         entry,
-        handles,
+        run,
         crate::vpn_monitor::Lift::SetOnline,
     );
 }
@@ -1146,6 +1150,57 @@ mod tests {
         let listed = serde_json::to_string(&profile_list(&s)).unwrap();
         assert!(listed.contains("VPN bring-up failed"), "listed: {listed}");
         assert!(!listed.contains(&KEY[..43]), "the key leaked: {listed}");
+    }
+
+    /// Lifting a fence on set-online marks the profile active before its
+    /// paced run resumes the torrents, so the run is what tells a queued
+    /// re-hash that a torrent still paused is the lift's to resume
+    /// ([`ProfileEntry::resume_pending`]): it names every torrent in the
+    /// profile until the run ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_lifted_fence_names_what_its_run_has_yet_to_resume() {
+        use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+        use torrentd_engine::InfoHash;
+        use torrentd_engine::TorrentHandle;
+        use torrentd_engine::TorrentState;
+
+        use crate::app_state::build_test_state;
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "p",
+            EngineProfileStatus::VpnDown,
+        )]));
+        let s = build_test_state(Some(reg));
+        let id = ProfileId::new("p");
+        let n = u8::try_from(REANNOUNCE_BATCH + 1).unwrap();
+        for b in 1..=n {
+            let ih = InfoHash([b; 20]);
+            let h = TorrentHandle {
+                id: u64::from(b),
+                infohash: ih,
+            };
+            s.state.insert(
+                ih,
+                TorrentState::newly_added(h, id.clone(), std::time::Instant::now()),
+            );
+        }
+        let last = InfoHash([n; 20]);
+        let entry = s.profiles.resolve(&id).active().unwrap();
+        assert!(!entry.resume_pending(&last), "no run before the lift");
+
+        lift_fence(&s, entry);
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        assert_eq!(entry.health().status, EngineProfileStatus::Active);
+        assert!(
+            entry.resume_pending(&last),
+            "the first batch went out; the last torrent is still the run's to resume",
+        );
+
+        tokio::time::sleep(REANNOUNCE_PACE * 3).await;
+        assert!(!entry.is_resuming(), "the run ended");
+        assert!(!entry.resume_pending(&last));
     }
 
     #[test]

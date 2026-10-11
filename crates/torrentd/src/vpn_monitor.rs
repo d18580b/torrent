@@ -781,6 +781,10 @@ impl vpn::killswitch::Fence for KillSwitchFence {
                 continue;
             }
             let labels = [("profile_id", profile_id.as_str())];
+            let torrent_count = handles.len();
+            // Recorded before the profile reads active, so a queued re-hash
+            // never finds it active with no run to resume its torrents.
+            let run = entry.begin_resume_with(handles, gate);
             entry.update_health(|h| {
                 h.status = ProfileStatus::Active;
                 h.paused_for_vpn = 0;
@@ -790,17 +794,11 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             info!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %profile_id,
-                torrent_count = handles.len(),
+                torrent_count,
                 "network kill switch back in force; lifted the profile's fence, and resuming \
                  its torrents a batch at a time",
             );
-            spawn_run(
-                &self.profiles,
-                &self.metrics,
-                entry,
-                entry.begin_resume_with(handles, gate),
-                Lift::KillSwitch,
-            );
+            spawn_run(&self.profiles, &self.metrics, entry, run, Lift::KillSwitch);
         }
     }
 }
@@ -869,7 +867,8 @@ impl crate::profile_registry::OnlinePacing for OnlinePace<'_> {
 /// `entry`, from a task on the runtime through [`resume_paced`]: a batch per
 /// [`REANNOUNCE_PACE`], since each one resumed sends its trackers a `started`
 /// announce. The profile is marked lifted, or its session resumed, by the
-/// caller, before this.
+/// caller, before this. A fence's lift instead records its run first and
+/// drives it through [`spawn_run`].
 ///
 /// The run is recorded on the entry ([`ProfileEntry::begin_resume`]), so a
 /// fence that lands before it ends stops it and takes back what it had not
@@ -888,12 +887,16 @@ pub(crate) fn spawn_lift(
     handles: Vec<TorrentHandle>,
     lift: Lift,
 ) -> tokio::task::JoinHandle<Resumed> {
-    spawn_run(profiles, metrics, entry, entry.begin_resume(handles), lift)
+    let run = entry.begin_resume(handles);
+    spawn_run(profiles, metrics, entry, run, lift)
 }
 
-/// [`spawn_lift`], for `run`, a paced resume already recorded on `entry`
-/// ([`ProfileEntry::begin_resume_with`]).
-fn spawn_run(
+/// Drive `run`, already recorded on `entry` by [`ProfileEntry::begin_resume`]
+/// or [`ProfileEntry::begin_resume_with`], as [`spawn_lift`] does. A fence's
+/// lift records its run before it marks the profile active, so a profile that
+/// reads active while its torrents still read paused always has the run that
+/// will resume them ([`ProfileEntry::resume_pending`]).
+pub(crate) fn spawn_run(
     profiles: &Arc<ProfileRegistry>,
     metrics: &Arc<PromSink>,
     entry: &ProfileEntry,
