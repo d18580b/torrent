@@ -10,9 +10,17 @@
 //! When they include `add_torrent_alert`, the session's torrents are compared
 //! against the state map and every one it is missing is tracked, since the
 //! map learns of a torrent from that alert.
+//!
+//! When they include `torrent_removed_alert`, every entry of the profile's
+//! whose torrent the daemon asked to remove and the session no longer holds
+//! is settled as that alert would have settled it, since only that alert
+//! drops a torrent from the map.
+
+use std::collections::HashSet;
 
 use libtorrent_safe::Alert;
 use libtorrent_safe::ResumeFlags;
+use libtorrent_safe::TorrentHandle;
 use tracing::error;
 use tracing::warn;
 
@@ -28,6 +36,9 @@ const SAVE_RESUME_DATA_TYPE: u32 = 37;
 const SAVE_RESUME_DATA_FAILED_TYPE: u32 = 38;
 /// `add_torrent_alert::alert_type` in libtorrent 2.0.
 const ADD_TORRENT_TYPE: u32 = 67;
+/// `torrent_removed_alert::alert_type` in libtorrent 2.0. Critical priority
+/// only raises the queue limit it is held to, so it can be dropped too.
+const TORRENT_REMOVED_TYPE: u32 = 4;
 
 /// Whether alert type `ty` is set in a `dropped_alerts` bitset.
 fn dropped(bits: &[u64; 2], ty: u32) -> bool {
@@ -69,8 +80,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             &[("profile_id", ctx.profile_id.as_str())],
         );
     }
-    if dropped(bits, ADD_TORRENT_TYPE) {
-        reconcile_session(ctx);
+    let (adds, removals) = (
+        dropped(bits, ADD_TORRENT_TYPE),
+        dropped(bits, TORRENT_REMOVED_TYPE),
+    );
+    if adds || removals {
+        reconcile_session(ctx, adds, removals);
     }
     // One per overflow. libtorrent reports *which alert types* it dropped, as
     // a bitset, and never how many alerts; this used to add the bitset's
@@ -83,17 +98,31 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     );
 }
 
-/// Track every torrent the session holds that the state map does not, for an
-/// overflow that dropped `add_torrent_alert`s.
+/// Compare the session's torrents with the state map, for an overflow that
+/// dropped `add_torrent_alert`s (`adds`) or `torrent_removed_alert`s
+/// (`removals`). libtorrent names the lost types and never the torrents, so
+/// the whole session is compared.
+///
+/// Removals first: an entry the session no longer holds is settled
+/// ([`reconcile_removals`]) before a torrent re-added under its info-hash
+/// takes the map's place for it, which would leave the removal unsettled.
 ///
 /// A torrent enters the map from its add alert, so one whose alert was lost
 /// would seed with nothing tracking it: no fence pauses it, no sweep or drain
-/// saves it, and `DELETE` refuses it. libtorrent names the lost type and never
-/// the torrents, so the whole session is compared against the map, and each
-/// torrent missing from it gets what its alert would have given it
-/// (`add::track`). An add alert that was not lost and is still queued finds
-/// its torrent tracked and keeps the entry.
-fn reconcile_session(ctx: &HandlerCtx<'_>) {
+/// saves it, and `DELETE` refuses it. Each torrent the session holds that the
+/// map is missing gets what its alert would have given it (`add::track`). An
+/// add alert that was not lost and is still queued finds its torrent tracked
+/// and keeps the entry.
+fn reconcile_session(ctx: &HandlerCtx<'_>, adds: bool, removals: bool) {
+    // The profile's entries as they stood before the session was listed. A
+    // torrent the boot scan adds meanwhile is in the session before it is in
+    // the map, so an entry taken from a later look could be one the listing
+    // missed, and would read as removed.
+    let entries = if removals {
+        ctx.state.handles_for_profile(&ctx.profile_id)
+    } else {
+        Vec::new()
+    };
     let held = match ctx.engine.torrents() {
         Ok(held) => held,
         Err(e) => {
@@ -101,12 +130,21 @@ fn reconcile_session(ctx: &HandlerCtx<'_>) {
                 target: "torrentd_engine::handler::dropped",
                 op = "torrents",
                 error.cause = %e,
-                "add-torrent alerts were dropped and the session's torrents could not be listed; \
-                 torrents whose alert was lost stay untracked",
+                adds,
+                removals,
+                "add-torrent or torrent-removed alerts were dropped and the session's torrents \
+                 could not be listed; torrents whose add alert was lost stay untracked, and ones \
+                 whose removal alert was lost stay in the state map",
             );
             return;
         }
     };
+    if removals {
+        reconcile_removals(ctx, entries, &held);
+    }
+    if !adds {
+        return;
+    }
     let mut recovered = 0u64;
     for h in held {
         // Only the missing: a tracked torrent's add was handled, or seeded by
@@ -128,6 +166,58 @@ fn reconcile_session(ctx: &HandlerCtx<'_>) {
     );
 }
 
+/// Settle every one of `entries`, the profile's state-map entries, that the
+/// session no longer holds (`held`) and whose removal the daemon asked for,
+/// as its lost `torrent_removed_alert` would have: drop the entry, delete
+/// the stores' files a re-add does not own, settle the tombstone, and settle
+/// a resume save in flight for it.
+///
+/// Without this a lost alert leaves the entry until a restart, and the
+/// overlap guards of `DELETE ?delete_files=true` and of a pool delete plan,
+/// which read the map, refuse every request on the host for a torrent they
+/// cannot read from its session.
+///
+/// An entry the session no longer holds and whose removal nobody asked for
+/// is left, and counted in the log: only `DELETE` removes a torrent from a
+/// session, so it is not a lost removal, and deleting its files would be.
+fn reconcile_removals(ctx: &HandlerCtx<'_>, entries: Vec<TorrentHandle>, held: &[TorrentHandle]) {
+    let held: HashSet<_> = held.iter().copied().collect();
+    let (mut settled, mut unrecorded) = (0u64, 0u64);
+    for h in entries.into_iter().filter(|h| !held.contains(h)) {
+        let outcome = ctx.state.reconcile_removal(&ctx.profile_id, h, |readded| {
+            add::settle_removed_files(ctx, &h.infohash, readded);
+        });
+        match outcome {
+            Some(s) => {
+                // As the alert's handler does: a save in flight for the
+                // removed torrent is never answered with its info-hash.
+                if s.entry_released {
+                    ctx.state.note_resume_settled(&h.infohash);
+                }
+                settled += 1;
+            }
+            // Its entry went meanwhile, or no removal of it was recorded.
+            None if ctx.state.get(&h.infohash).is_some_and(|st| st.handle == h) => {
+                unrecorded += 1;
+            }
+            None => {}
+        }
+    }
+    warn!(
+        target: "torrentd_engine::handler::dropped",
+        torrent_count = settled,
+        unrecorded_count = unrecorded,
+        "torrent-removed alerts were among the dropped alerts; settled the removals of the \
+         torrents the session no longer holds",
+    );
+    // Under the profile whose queue overflowed, like the other counters here.
+    ctx.metrics.add_counter(
+        "removals_reconciled_total",
+        settled,
+        &[("profile_id", ctx.profile_id.as_str())],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -144,8 +234,10 @@ mod tests {
     use crate::mock::MockEngine;
     use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
+    use crate::resume_store::ResumeStore;
     use crate::state::StateMap;
     use crate::torrent_store::MemoryTorrentStore;
+    use crate::torrent_store::TorrentStore;
 
     fn overflow(bits: [u64; 2]) -> Alert {
         Alert::AlertsDropped {
@@ -304,8 +396,187 @@ mod tests {
         let metrics = RecordingSink::new();
         let mut bits = [u64::MAX, u64::MAX];
         bits[1] &= !ADD_DROPPED[1];
+        bits[0] &= !REMOVED_DROPPED[0];
         run_on(mock, &state, &metrics, bits);
         assert!(!state.contains(&h.infohash));
+    }
+
+    const REMOVED_DROPPED: [u64; 2] = [1u64 << TORRENT_REMOVED_TYPE, 0];
+
+    /// Handle an overflow with `bits` against `engine`, in profile `p`, with
+    /// the stores the caller reads afterwards.
+    fn run_with(
+        engine: Arc<dyn TorrentEngine>,
+        state: &StateMap,
+        resume: &MemoryResumeStore,
+        torrents: &MemoryTorrentStore,
+        metrics: &RecordingSink,
+        bits: [u64; 2],
+    ) {
+        let clock = MockClock::new();
+        let mut ctx = HandlerCtx {
+            state,
+            resume,
+            torrents,
+            metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            fence_hold: None,
+            profile_id: ProfileId::new("p"),
+            span: tracing::info_span!("test"),
+        };
+        handle(&overflow(bits), &mut ctx);
+    }
+
+    /// `p` tracks `ih`, holds its files and the tombstone `DELETE` leaves
+    /// standing, and `DELETE` has removed it from the session.
+    fn removed_by_delete(
+        mock: &MockEngine,
+        state: &StateMap,
+        resume: &MemoryResumeStore,
+        torrents: &MemoryTorrentStore,
+        ih: InfoHash,
+    ) -> TorrentHandle {
+        let p = ProfileId::new("p");
+        let h = mock.register_handle(ih);
+        assert!(state.track_added(h, &p, std::time::Instant::now()));
+        resume.write(&p, &ih, b"old-resume").unwrap();
+        torrents.write(&p, &ih, b"old-torrent").unwrap();
+        resume.write_tombstone(&p, &ih).unwrap();
+        state.begin_removal(&p, h);
+        mock.remove_torrent(h, false).unwrap();
+        h
+    }
+
+    fn reconciled(metrics: &RecordingSink) -> Vec<(u64, Vec<(String, String)>)> {
+        metrics
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::metrics::MetricCall::AddCounter {
+                    name,
+                    value,
+                    labels,
+                } if name == "removals_reconciled_total" => Some((value, labels)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dropped_removal_alert_is_settled_from_the_session() {
+        let mock = Arc::new(MockEngine::new());
+        let (state, resume, torrents) = (
+            StateMap::new(),
+            MemoryResumeStore::new(),
+            MemoryTorrentStore::new(),
+        );
+        let metrics = RecordingSink::new();
+        let p = ProfileId::new("p");
+        let ih = InfoHash([6; 20]);
+        // A save in flight when it went, which will never be answered with
+        // its info-hash.
+        state.queue_resume_save(ih, ResumeFlags::empty());
+        state.dispatch_resume_saves(usize::MAX);
+        removed_by_delete(&mock, &state, &resume, &torrents, ih);
+        // Still held, and tracked: untouched.
+        let kept = mock.register_handle(InfoHash([7; 20]));
+        assert!(state.track_added(kept, &p, std::time::Instant::now()));
+
+        run_with(
+            mock.clone(),
+            &state,
+            &resume,
+            &torrents,
+            &metrics,
+            REMOVED_DROPPED,
+        );
+
+        assert!(!state.contains(&ih), "the removed torrent's entry is gone");
+        assert!(state.contains(&kept.infohash));
+        assert!(resume.snapshot(&p).is_empty());
+        assert!(torrents.load_all(&p).unwrap().is_empty());
+        assert!(resume.tombstones(&p).unwrap().is_empty(), "settled");
+        assert_eq!(state.resume_saves_in_flight(), 0);
+        assert_eq!(
+            reconciled(&metrics),
+            vec![(1, vec![("profile_id".to_string(), "p".to_string())])],
+        );
+        // A second overflow finds nothing left to settle.
+        run_with(mock, &state, &resume, &torrents, &metrics, REMOVED_DROPPED);
+        assert_eq!(metrics.count_for("removals_reconciled_total"), 1);
+    }
+
+    #[test]
+    fn a_dropped_removal_alert_keeps_a_torrent_re_added_under_its_infohash() {
+        let p = ProfileId::new("p");
+        let ih = InfoHash([8; 20]);
+        // The re-add's own add alert handled, or lost in the same overflow.
+        for (bits, readd_tracked) in [
+            (REMOVED_DROPPED, true),
+            ([REMOVED_DROPPED[0], ADD_DROPPED[1]], false),
+        ] {
+            let mock = Arc::new(MockEngine::new());
+            let (state, resume, torrents) = (
+                StateMap::new(),
+                MemoryResumeStore::new(),
+                MemoryTorrentStore::new(),
+            );
+            let metrics = RecordingSink::new();
+            let old = removed_by_delete(&mock, &state, &resume, &torrents, ih);
+            // The same profile adds it again: a new handle, and its files.
+            state.note_readded(&p, &ih);
+            let new = mock.register_handle(ih);
+            assert_ne!(new, old);
+            torrents.write(&p, &ih, b"new-torrent").unwrap();
+            if readd_tracked {
+                assert!(state.track_added(new, &p, std::time::Instant::now()));
+            }
+
+            run_with(mock, &state, &resume, &torrents, &metrics, bits);
+
+            let st = state.get(&ih).expect("the re-add's entry");
+            assert_eq!((st.handle, &st.profile_id), (new, &p), "{bits:?}");
+            assert_eq!(
+                torrents.load_all(&p).unwrap(),
+                vec![(ih, b"new-torrent".to_vec())],
+                "{bits:?}",
+            );
+            // Settled only where the removed torrent's entry was still there.
+            let settled = u64::from(!readd_tracked);
+            assert_eq!(
+                metrics.count_for("removals_reconciled_total"),
+                settled,
+                "{bits:?}",
+            );
+            if !readd_tracked {
+                assert!(resume.tombstones(&p).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_the_session_lost_without_a_recorded_removal_is_left() {
+        let mock = Arc::new(MockEngine::new());
+        let (state, resume, torrents) = (
+            StateMap::new(),
+            MemoryResumeStore::new(),
+            MemoryTorrentStore::new(),
+        );
+        let metrics = RecordingSink::new();
+        let p = ProfileId::new("p");
+        let ih = InfoHash([9; 20]);
+        let h = mock.register_handle(ih);
+        assert!(state.track_added(h, &p, std::time::Instant::now()));
+        torrents.write(&p, &ih, b"torrent").unwrap();
+        mock.remove_torrent(h, false).unwrap();
+
+        run_with(mock, &state, &resume, &torrents, &metrics, REMOVED_DROPPED);
+
+        assert!(state.contains(&ih));
+        assert_eq!(torrents.load_all(&p).unwrap().len(), 1);
+        assert_eq!(metrics.count_for("removals_reconciled_total"), 0);
     }
 
     #[test]
