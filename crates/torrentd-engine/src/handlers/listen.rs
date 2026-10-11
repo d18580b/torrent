@@ -43,8 +43,11 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
+use std::time::Duration;
+use std::time::Instant;
 
 use libtorrent_safe::Alert;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -93,13 +96,32 @@ use crate::profile::ProfileId;
 /// `session_stats` and the failure is not yet forgotten, so it holds the
 /// failure as a reopen that lost it would: the gauge stays at 1 until a
 /// socket comes up, which errs toward reporting a failure.
+///
+/// It also keeps, per profile, when the last accept `EMFILE`
+/// ([`is_accept_emfile`]) arrived, so [`handle`] warns once per streak of
+/// them rather than once per alert.
 #[derive(Debug, Default)]
 pub struct ListenFailures {
     failed: HashMap<ProfileId, BTreeSet<String>>,
     up: HashMap<ProfileId, BTreeSet<String>>,
+    accept_emfile_at: HashMap<ProfileId, Instant>,
 }
 
+/// How long a profile must go without an accept `EMFILE` before the next
+/// one starts a new streak and is warned again. libtorrent re-arms the
+/// accept at once, so a shortage that lasts posts these back to back, and a
+/// gap this long means descriptors came free.
+pub const ACCEPT_EMFILE_QUIET: Duration = Duration::from_secs(60);
+
 impl ListenFailures {
+    /// Record an accept `EMFILE` on `profile` at `now`. Returns whether it
+    /// starts a streak: the profile's first, or the first after
+    /// [`ACCEPT_EMFILE_QUIET`] with none.
+    fn accept_emfile(&mut self, profile: &ProfileId, now: Instant) -> bool {
+        let last = self.accept_emfile_at.insert(profile.clone(), now);
+        last.is_none_or(|last| now.saturating_duration_since(last) >= ACCEPT_EMFILE_QUIET)
+    }
+
     /// Record `endpoint`'s socket as failed. Returns whether any of
     /// `profile`'s sockets is failed, which is now always.
     fn failed(&mut self, profile: &ProfileId, endpoint: &str) -> bool {
@@ -347,10 +369,13 @@ fn bound_device(fd: libc::c_int) -> Option<String> {
 /// `EMFILE`, which leaves the socket listening.
 ///
 /// libtorrent's `session_impl::on_accept_connection` answers that error
-/// (`too_many_files_open`) by disconnecting a peer, lowering
-/// `connections_limit` and re-arming the accept on the same socket, and
+/// (`too_many_files_open`) by re-arming the accept on the same socket, and
 /// posts a `listen_failed_alert` with `operation_t::sock_accept` only to say
-/// so. So the alert loop does not take it as a failed socket: it is neither
+/// so. It also disconnects a peer and lowers `connections_limit`, but only
+/// while that limit is above 10 and some torrent has a peer to drop;
+/// otherwise the connection stays queued and the re-armed accept fails
+/// again at once, so a shortage that lasts posts a stream of these alerts
+/// (see [`ACCEPT_EMFILE_QUIET`]). So the alert loop does not take it as a failed socket: it is neither
 /// fatal nor published to a waiting rebind, and [`handle`] counts it in
 /// `listen_accept_errors_total` rather than in [`ListenFailures`]. Every
 /// other accept error returns without re-arming, so the listener has stopped
@@ -374,16 +399,33 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut ListenFail
             endpoint, message, ..
         } if is_accept_emfile(alert) => {
             let _enter = ctx.span.enter();
-            warn!(
-                target: "torrentd_engine::handler::listen",
-                endpoint = %endpoint,
-                error.kind = "listen_accept_emfile",
-                error.code = libc::EMFILE,
-                error.cause = %message,
-                "accepting a peer connection failed: the process is out of file descriptors. \
-                 libtorrent disconnected a peer, lowered connections_limit and keeps accepting \
-                 on this socket; raise LimitNOFILE or lower connections_limit",
-            );
+            // Warned once per streak: while the shortage lasts libtorrent
+            // can fail the re-armed accept as fast as it re-arms it, and a
+            // line per alert would bury the journal. The counter sees every
+            // one.
+            if failures.accept_emfile(&ctx.profile_id, ctx.clock.now()) {
+                warn!(
+                    target: "torrentd_engine::handler::listen",
+                    endpoint = %endpoint,
+                    error.kind = "listen_accept_emfile",
+                    error.code = libc::EMFILE,
+                    error.cause = %message,
+                    "accepting a peer connection failed: the process is out of file descriptors. \
+                     libtorrent keeps accepting on this socket, and may disconnect a peer and \
+                     lower connections_limit to free one; raise LimitNOFILE or lower \
+                     connections_limit. Further failures are counted in \
+                     listen_accept_errors_total and logged at debug until none arrives for 60 s",
+                );
+            } else {
+                debug!(
+                    target: "torrentd_engine::handler::listen",
+                    endpoint = %endpoint,
+                    error.kind = "listen_accept_emfile",
+                    error.code = libc::EMFILE,
+                    error.cause = %message,
+                    "accepting a peer connection failed again: out of file descriptors",
+                );
+            }
             ctx.metrics.inc_counter(
                 LISTEN_ACCEPT_ERRORS,
                 &[("profile_id", ctx.profile_id.as_str()), ("errno", "EMFILE")],
@@ -470,6 +512,8 @@ fn set_failure_active(ctx: &HandlerCtx<'_>, active: bool) {
 mod tests {
     use std::net::TcpListener;
     use std::net::UdpSocket;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use libtorrent_safe::alert::AlertHeader;
@@ -869,6 +913,104 @@ mod tests {
             )],
         );
         assert!(crate::metrics::LISTEN_ACCEPT_ERRNOS.contains(&"EMFILE"));
+    }
+
+    /// A shortage that lasts posts an accept `EMFILE` per re-armed accept:
+    /// each is counted, but only a streak's first is warned, and a streak
+    /// ends after `ACCEPT_EMFILE_QUIET` with none, per profile.
+    #[test]
+    fn an_accept_out_of_descriptors_is_warned_once_per_streak_and_counted_every_time() {
+        let mut failures = ListenFailures::default();
+        let a = ProfileId::new("a");
+        let b = ProfileId::new("b");
+        let t0 = Instant::now();
+        assert!(
+            failures.accept_emfile(&a, t0),
+            "a profile's first starts a streak"
+        );
+        for i in 1..=100 {
+            let at = t0 + Duration::from_millis(i * 100);
+            assert!(
+                !failures.accept_emfile(&a, at),
+                "alert {i} is in the streak"
+            );
+        }
+        assert!(failures.accept_emfile(&b, t0), "streaks are per profile");
+        let last = t0 + Duration::from_millis(100 * 100);
+        assert!(
+            !failures.accept_emfile(&a, last + ACCEPT_EMFILE_QUIET - Duration::from_millis(1)),
+            "a gap shorter than the quiet period continues the streak",
+        );
+        let last = last + ACCEPT_EMFILE_QUIET - Duration::from_millis(1);
+        assert!(
+            failures.accept_emfile(&a, last + ACCEPT_EMFILE_QUIET),
+            "a quiet period with none starts a new streak",
+        );
+
+        // Through `handle`: 50 back to back, then one after a quiet period.
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let clock = MockClock::new();
+        let metrics = RecordingSink::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut failures = ListenFailures::default();
+        let warns = Arc::new(WarnCounter::default());
+        tracing::subscriber::with_default(Arc::clone(&warns), || {
+            let mut ctx = HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: &metrics,
+                clock: &clock,
+                engine: &engine,
+                profile_fenced: None,
+                profile_id: ProfileId::new("a"),
+                span: tracing::info_span!("test"),
+            };
+            let alert = accept_failed("0.0.0.0:6881", libc::EMFILE);
+            for _ in 0..50 {
+                handle(&alert, &mut ctx, &mut failures);
+            }
+            assert_eq!(
+                warns.0.load(Ordering::Relaxed),
+                1,
+                "one warn for the streak"
+            );
+            clock.advance(ACCEPT_EMFILE_QUIET);
+            handle(&alert, &mut ctx, &mut failures);
+            assert_eq!(warns.0.load(Ordering::Relaxed), 2, "a new streak warns");
+        });
+        let counted = metrics
+            .calls()
+            .iter()
+            .filter(|c| {
+                matches!(c, MetricCall::IncCounter { name, .. } if name == LISTEN_ACCEPT_ERRORS)
+            })
+            .count();
+        assert_eq!(counted, 51, "every alert is counted");
+    }
+
+    /// Counts the `warn` events dispatched to it.
+    #[derive(Default)]
+    struct WarnCounter(AtomicUsize);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     /// An accept `EMFILE` neither holds nor clears a socket's failure.

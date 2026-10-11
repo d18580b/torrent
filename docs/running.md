@@ -1274,9 +1274,11 @@ The daemon sets none of these itself.
   file_pool_size + 32` per profile plus the API's 256-connection cap and 64
   for the process itself (the database, logs, listeners and the commands it
   runs). A peer listener that runs out of descriptors accepting a connection
-  keeps listening: libtorrent disconnects a peer, lowers `connections_limit`
-  and accepts again, and the daemon logs a warning and counts it in
-  `listen_accept_errors_total{profile_id, errno="EMFILE"}`. It is not a
+  keeps listening: libtorrent accepts again at once, disconnecting a peer and
+  lowering `connections_limit` only while that limit is above 10 and a
+  torrent has a peer to drop. The daemon counts every such failure in
+  `listen_accept_errors_total{profile_id, errno="EMFILE"}` and logs a warning
+  once per streak of them, a streak ending after 60 s with none. It is not a
   listen failure, so it neither stops a single-profile daemon nor raises
   `listen_failure_active`; a counter that keeps rising means the limit is too
   low for the load. Any other accept error stops that listener and is a
