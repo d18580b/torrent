@@ -217,7 +217,9 @@ authentication posture, and at least one `[[profile]]`:
 
 | Key | Default |
 | --- | --- |
-| `http_listen` | `127.0.0.1:8080`. A non-loopback value requires `[auth]` — §6. |
+| `http_listen` | `127.0.0.1:8080`. A non-loopback value requires `[auth]` — §6. `"unix:/run/torrentd/api.sock"` serves the API on a unix socket, and on no TCP port — §6. |
+| `http_socket_mode` | `0o660`, the permission bits of a `unix:` `http_listen` socket, as an octal TOML integer. Connecting takes write permission, so these bits decide who may call the API. Refused beside a TCP `http_listen`. Read once, at startup. |
+| `http_socket_group` | The daemon's own group. The group, by name or number, a `unix:` `http_listen` socket is given, so its members reach the API through the group bits. Refused beside a TCP `http_listen`. Read once, at startup. |
 | `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `allowed_hosts` | `[]`, so a daemon without `[auth]` answers only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`). List the names a reverse proxy passes through as `Host`, as bare names or addresses with no scheme, port or path. Refused beside `[auth]` — §6. Read once, at startup. |
 | `log_level` | `info` |
@@ -884,29 +886,73 @@ and are unaffected. A proxy in front must pass the client's `Host` through
 is logged as a `warn` on `torrentd::auth` at most once a minute. The full
 rules are in [`docs/api/README.md`](api/README.md).
 
-So there are two safe shapes:
+So there are three safe shapes:
 
 | `http_listen` | `[auth]` | |
 | --- | --- | --- |
+| `unix:` socket | absent, `allow_unauthenticated = true` | access control is the socket's mode and group |
 | loopback | absent, `allow_unauthenticated = true` | access control is the proxy's job — on a single-user host only |
 | anything | configured | the daemon authenticates itself |
 
 **Loopback is not private to the daemon's user.** Every uid on the host can
-connect to `127.0.0.1`, and the daemon has no unix-socket listener and no
-peer-credential check, so it cannot tell the proxy from any other local
-process — and a local client does not go through the proxy at all. Without
-`[auth]`, any local user or service (another login, a web app, a CI runner)
-can pause and reconfigure every profile and delete its torrents, and with
-`[pool]` `allow_mutations` move payload to the trash. The first shape is
-therefore safe only on a host where every local process belongs to you, or
-inside a network namespace or container that no other uid shares. Anywhere else, configure `[auth]` even on loopback.
+connect to `127.0.0.1`, so a TCP listener cannot tell the proxy from any
+other local process — and a local client does not go through the proxy at
+all. Without `[auth]`, any local user or service (another login, a web app, a
+CI runner) can pause and reconfigure every profile and delete its torrents,
+and with `[pool]` `allow_mutations` move payload to the trash. The loopback
+shape is therefore safe only on a host where every local process belongs to
+you, or inside a network namespace or container that no other uid shares.
+Anywhere else, serve the API on a unix socket, or configure `[auth]`.
 
-`[auth]` does not close the gap entirely: the default `http_listen` is a TCP
-port above 1024, so while the daemon is stopped or restarting another local
-user can bind it, and the next `torrentctl` call sends its bearer token (or
-login password) to that listener — nothing authenticates the server end of a
-plain-HTTP loopback connection. A port below 1024 removes this risk, since an
-unprivileged user cannot bind it (unless the host lowers
+**A unix socket is private to whom its mode admits.** With
+`http_listen = "unix:/run/torrentd/api.sock"` the daemon binds no TCP port at
+all; connecting takes write permission on the socket file, so
+`http_socket_mode` (default `0o660`) and `http_socket_group` decide who may
+call the API, and the kernel enforces it. Give the operators who run
+`torrentctl` membership of that group:
+
+```toml
+http_listen       = "unix:/run/torrentd/api.sock"
+http_socket_mode  = 0o660
+http_socket_group = "torrentd"
+```
+
+The socket's directory must exist and be writable by the daemon's user;
+`deploy/torrentd.service` creates none, so add `RuntimeDirectory=torrentd`
+(and `RuntimeDirectoryMode=0750` with `Group=` the socket's group, so its
+members can reach it) in a drop-in (`systemctl edit torrentd`). The socket is
+bound in a private (`0700`) staging directory beside it, given its mode and
+group, and only then renamed into place, so nobody but the daemon's user can
+connect before its permissions are set. That staging path is up to 14 bytes
+longer, so the configured path may be at most 93 bytes, and a longer one is
+refused at `--check-config`; a socket left by a daemon that was killed is replaced at the next
+start, a socket another process still answers on or a file that is not a
+socket refuses the start, and a clean stop removes it. `allow_unauthenticated`
+on a socket whose mode lets every user connect (an "other" write bit, as in
+`0o666`) is refused, as a routable address is. Requests over the socket carry
+no client address, so `trusted_proxies` never applies to them and the login
+throttle counts every socket caller as one client; each connection's log span
+carries the caller's `peer.uid` and `peer.pid`, read with `SO_PEERCRED`.
+
+A socket serves only the API: Prometheus cannot scrape `/metrics` over one,
+and the `[[auth.token]]` with the `metrics` scope has nothing to reach it
+through. A socket-only daemon is scraped by something on the host relaying
+the socket (`socat TCP-LISTEN:9180,bind=127.0.0.1,fork
+UNIX-CONNECT:/run/torrentd/api.sock`), which is a TCP port with every caveat
+above.
+
+`torrentctl` connects to `/run/torrentd/api.sock` whenever that socket exists
+and no URL is configured for it; `--url unix:/other/path` (or
+`TORRENTCTL_URL`, or `url` in its config file) names another one.
+
+**A TCP port can be taken over while the daemon is down.** `[auth]` does not
+close this gap: the default `http_listen` is a TCP port above 1024, so while
+the daemon is stopped or restarting another local user can bind it, and the
+next `torrentctl` call sends its bearer token (or login password) to that
+listener — nothing authenticates the server end of a plain-HTTP loopback
+connection. A unix socket in a directory only the daemon's user can write to
+removes this risk: nobody else can create a file at its path. So does a port
+below 1024, since an unprivileged user cannot bind it (unless the host lowers
 `net.ipv4.ip_unprivileged_port_start`), but the daemon then needs
 `CAP_NET_BIND_SERVICE`, and `deploy/torrentd.service` grants no capability
 by default: add it to both `AmbientCapabilities=` and `CapabilityBoundingSet=`.
@@ -931,7 +977,8 @@ config tells you to do.
 `http_listen` defaults to `127.0.0.1:8080`.
 
 **Restart, not reload.** `[auth]`, `allow_unauthenticated`, `http_listen`,
-`trusted_proxies` and `allowed_hosts` are read once, at startup: the session
+`http_socket_mode`, `http_socket_group`, `trusted_proxies` and
+`allowed_hosts` are read once, at startup: the session
 store is built, the listener bound and the trusted-proxy and allowed-host sets
 parsed before anything is served, and none of them can change under a live
 server. Editing any of them and then

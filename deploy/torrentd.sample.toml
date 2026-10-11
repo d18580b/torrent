@@ -14,15 +14,28 @@ torrent_dir       = "/var/lib/torrentd/torrents"
 http_listen       = "127.0.0.1:8080"   # loopback by default
 log_level         = "info"   # error | warn | info | debug (reloadable)
 
+# Or serve the API on a unix socket, and on no TCP port: connecting takes
+# write permission on the socket, so its mode and group decide who may call
+# the API, and nobody else can take its path over while the daemon is down.
+# torrentctl uses /run/torrentd/api.sock whenever it exists. The directory
+# must exist (RuntimeDirectory=torrentd in a drop-in for the unit), and a
+# socket serves no Prometheus scrape (docs/running.md §6). The two socket keys
+# are refused beside a TCP http_listen. Read once, at startup.
+# http_listen       = "unix:/run/torrentd/api.sock"
+# http_socket_mode  = 0o660        # an octal integer; the default
+# http_socket_group = "torrentd"   # default: the daemon's own group
+
 # The daemon refuses to start unless you either configure [auth] (see the
 # bottom of this file) or say here that you do not want authentication. This
 # sample takes the second option because it binds loopback, where access
 # control is the reverse proxy's job. That holds only on a single-user host,
 # or in a network namespace or container no other uid shares: every local
 # user can reach 127.0.0.1, and without [auth] any of them controls the
-# daemon (docs/running.md §6). Delete this line and configure [auth] on a
-# shared host, and before exposing the API anywhere — a non-loopback bind
-# without [auth] is refused outright.
+# daemon (docs/running.md §6). On a shared host, either move http_listen to
+# a unix socket whose mode and group admit only the operators, or delete
+# this line and configure [auth]. Before exposing the API anywhere, configure
+# [auth]: a non-loopback bind without it is refused outright, and so is a
+# socket whose mode lets every user connect.
 #
 # Read once, at startup, like [auth], http_listen and trusted_proxies: editing
 # any of the four takes effect on restart, not on SIGHUP. A reload after such an

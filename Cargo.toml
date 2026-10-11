@@ -73,6 +73,12 @@ bytes = "1"
 # The body trait kynos' request body implements, to read one under a deadline
 # (`torrentd::http::v1::TimedBody`); already in the tree through kynos.
 http-body = "1"
+# The unix-socket API listener (`torrentd::api_socket`), which kynos does not
+# serve: its HTTP/1 connection driver, and a capped read of a request body.
+# All three are already in the tree through kynos.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 hex = { version = "0.4", features = ["serde"] }
 sha1 = "0.10"
 tempfile = "3"

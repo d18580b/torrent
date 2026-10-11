@@ -39,17 +39,127 @@ impl LogLevel {
     }
 }
 
+/// Where the control API listens: a TCP address, or a unix socket written
+/// `unix:/run/torrentd/api.sock`.
+///
+/// A TCP port on loopback is reachable by every uid on the host, and while
+/// the daemon is down any of them can bind it and receive the next client's
+/// credentials. A unix socket is reachable only by those its file mode and
+/// group admit, and its path cannot be taken over by a user who cannot write
+/// to its directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HttpListen {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+/// What a `unix:` value is written with.
+const UNIX_PREFIX: &str = "unix:";
+
+/// The longest socket path the kernel binds: `sun_path` is 108 bytes on
+/// Linux, one of them the terminating NUL.
+const MAX_UNIX_PATH_BYTES: usize = 107;
+
+impl HttpListen {
+    /// The TCP address, when this is one.
+    pub fn tcp(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Tcp(addr) => Some(*addr),
+            Self::Unix(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for HttpListen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(addr) => write!(f, "{addr}"),
+            Self::Unix(path) => write!(f, "{UNIX_PREFIX}{}", path.display()),
+        }
+    }
+}
+
+impl std::str::FromStr for HttpListen {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(path) = s.strip_prefix(UNIX_PREFIX) {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "{s:?} names a relative socket path; write an absolute one, as in \
+                     \"unix:/run/torrentd/api.sock\""
+                ));
+            }
+            // The daemon binds the socket first at a staging path beside this
+            // one, which is longer: that is the path the kernel must accept.
+            let Some((_, staged)) = crate::api_socket::staging_paths(&path, u32::MAX) else {
+                return Err(format!("{s:?} names a directory, not a socket file"));
+            };
+            if staged.as_os_str().len() > MAX_UNIX_PATH_BYTES {
+                let longest =
+                    MAX_UNIX_PATH_BYTES - (staged.as_os_str().len() - path.as_os_str().len());
+                return Err(format!(
+                    "{s:?} is longer than the {longest} bytes a socket path may be here: the \
+                     daemon binds it first at a staging path beside it, and a unix socket path \
+                     may be at most {MAX_UNIX_PATH_BYTES} bytes"
+                ));
+            }
+            return Ok(Self::Unix(path));
+        }
+        s.parse::<SocketAddr>().map(Self::Tcp).map_err(|_| {
+            format!(
+                "{s:?} is neither an IP address and port (\"127.0.0.1:8080\") nor a unix \
+                 socket (\"unix:/run/torrentd/api.sock\")"
+            )
+        })
+    }
+}
+
+impl Serialize for HttpListen {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for HttpListen {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The mode a `unix:` socket is created with when `http_socket_mode` is
+/// absent: the daemon's user and its group, nobody else.
+pub const DEFAULT_HTTP_SOCKET_MODE: u32 = 0o660;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub default_save_path: PathBuf,
     pub resume_dir: PathBuf,
     pub torrent_dir: PathBuf,
-    /// Where the control API listens. Defaults to loopback, the only address
-    /// safe without `[auth]`; inside a network namespace (a container) it has
-    /// to be set to a routable address for the published port to reach it.
+    /// Where the control API listens. Defaults to loopback, the only TCP
+    /// address safe without `[auth]`; inside a network namespace (a
+    /// container) it has to be set to a routable address for the published
+    /// port to reach it. `unix:/path` serves it on a unix socket instead, and
+    /// on no TCP port at all.
     #[serde(default = "Config::default_http_listen")]
-    pub http_listen: SocketAddr,
+    pub http_listen: HttpListen,
+
+    /// Permission bits a `unix:` `http_listen` socket is given, written as an
+    /// octal TOML integer (`0o660`). Default [`DEFAULT_HTTP_SOCKET_MODE`].
+    /// Connecting takes write permission, so these bits are who may call the
+    /// API. Refused beside a TCP `http_listen`, where nothing reads it.
+    #[serde(default)]
+    pub http_socket_mode: Option<u32>,
+
+    /// The group a `unix:` `http_listen` socket is given, by name or number,
+    /// so its members reach the API through the group bits of
+    /// `http_socket_mode`. Absent, the socket keeps the daemon's own group.
+    /// Refused beside a TCP `http_listen`.
+    #[serde(default)]
+    pub http_socket_group: Option<String>,
 
     /// Peers whose forwarding headers are believed, as IPs or CIDR blocks:
     /// the address the reverse proxy connects from, and only that, since
@@ -211,8 +321,13 @@ fn is_json(p: &Path) -> bool {
 const TOP_LEVEL_FINGERPRINT: &str = "top-level peer_fingerprint";
 
 impl Config {
-    fn default_http_listen() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 8080))
+    fn default_http_listen() -> HttpListen {
+        HttpListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 8080)))
+    }
+
+    /// The mode a `unix:` `http_listen` socket is created with.
+    pub fn http_socket_mode(&self) -> u32 {
+        self.http_socket_mode.unwrap_or(DEFAULT_HTTP_SOCKET_MODE)
     }
 
     fn default_log_level() -> LogLevel {
@@ -300,9 +415,28 @@ impl Config {
                 listen = self.http_listen,
             );
         }
+        let addr = match &self.http_listen {
+            HttpListen::Tcp(addr) => *addr,
+            // A socket is reached by whoever its mode admits, so a mode that
+            // admits every uid is the unix form of a routable bind.
+            HttpListen::Unix(_) => {
+                let mode = self.http_socket_mode();
+                if mode & 0o002 != 0 {
+                    anyhow::bail!(
+                        "allow_unauthenticated = true with http_listen = {listen} and \
+                         http_socket_mode = {mode:#o}, which lets every user on the host \
+                         connect. That is an unauthenticated API that mutates state, open \
+                         to all of them. Drop the \"other\" write bit (0o660, with \
+                         http_socket_group naming who may call it), or configure [auth].",
+                        listen = self.http_listen,
+                    );
+                }
+                return Ok(());
+            }
+        };
         // `::ffff:127.0.0.1` is loopback too; `Ipv6Addr::is_loopback` says
         // so only of `::1`.
-        let listen_ip = match self.http_listen.ip() {
+        let listen_ip = match addr.ip() {
             std::net::IpAddr::V6(v6) => v6
                 .to_ipv4_mapped()
                 .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
@@ -345,6 +479,7 @@ impl Config {
         self.validate_effective_store_dirs()
             .context("[[profile]] validation failed")?;
         self.validate_http_listen_port()?;
+        self.validate_http_socket()?;
 
         // Not gated on `check_auth_posture`: a malformed or `/0` entry is a
         // refusal for operator tools too.
@@ -495,6 +630,8 @@ impl Config {
             resume_dir: new_resume_dir,
             torrent_dir: new_torrent_dir,
             http_listen: new_http_listen,
+            http_socket_mode: new_http_socket_mode,
+            http_socket_group: new_http_socket_group,
             allow_unauthenticated: new_allow_unauthenticated,
             allowed_hosts: new_allowed_hosts,
             log_level: new_log_level,
@@ -587,6 +724,12 @@ impl Config {
         }
         if old.http_listen != *new_http_listen {
             d.non_reloadable_changes.push("http_listen");
+        }
+        if old.http_socket_mode != *new_http_socket_mode {
+            d.non_reloadable_changes.push("http_socket_mode");
+        }
+        if old.http_socket_group != *new_http_socket_group {
+            d.non_reloadable_changes.push("http_socket_group");
         }
         if old.trusted_proxies != *new_trusted_proxies {
             d.non_reloadable_changes.push("trusted_proxies");
@@ -847,11 +990,49 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse a socket key beside a TCP `http_listen`, where it would be
+    /// silently inert, a mode with bits beyond `0o777`, and an empty group.
+    fn validate_http_socket(&self) -> anyhow::Result<()> {
+        if let HttpListen::Tcp(addr) = self.http_listen {
+            for (key, set) in [
+                ("http_socket_mode", self.http_socket_mode.is_some()),
+                ("http_socket_group", self.http_socket_group.is_some()),
+            ] {
+                if set {
+                    anyhow::bail!(
+                        "{key} is set, but http_listen = {addr} is a TCP address, and {key} \
+                         applies only to a unix socket (http_listen = \
+                         \"unix:/run/torrentd/api.sock\"). Delete {key}, or move \
+                         http_listen to a socket."
+                    );
+                }
+            }
+        }
+        if let Some(mode) = self.http_socket_mode {
+            if mode & !0o777 != 0 {
+                anyhow::bail!(
+                    "http_socket_mode = {mode:#o} sets bits beyond permission bits; write it \
+                     as an octal integer no larger than 0o777, as in 0o660"
+                );
+            }
+        }
+        if self
+            .http_socket_group
+            .as_deref()
+            .is_some_and(|g| g.trim().is_empty())
+        {
+            anyhow::bail!("http_socket_group is empty; name a group, or delete the key");
+        }
+        Ok(())
+    }
+
     /// Refuse an `http_listen` port a profile's session also listens on: the
     /// session binds first and the HTTP listener then fails. Compared on the
     /// port alone, since a vpn profile's address is known only at runtime.
     fn validate_http_listen_port(&self) -> anyhow::Result<()> {
-        let port = self.http_listen.port();
+        let Some(port) = self.http_listen.tcp().map(|a| a.port()) else {
+            return Ok(());
+        };
         if let Some(p) = self
             .profile
             .iter()
@@ -1203,6 +1384,8 @@ impl Config {
             resume_dir: dir.join("resume"),
             torrent_dir: dir.join("torrents"),
             http_listen: Self::default_http_listen(),
+            http_socket_mode: None,
+            http_socket_group: None,
             allow_unauthenticated: true,
             allowed_hosts: vec![],
             log_level: Self::default_log_level(),
@@ -2540,7 +2723,11 @@ upload_rate_limit = 0"#,
                 c.allow_unauthenticated = !c.allow_unauthenticated
             }),
             ("http_listen", |c| {
-                c.http_listen = SocketAddr::from(([127, 0, 0, 1], 9090))
+                c.http_listen = HttpListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 9090)))
+            }),
+            ("http_socket_mode", |c| c.http_socket_mode = Some(0o600)),
+            ("http_socket_group", |c| {
+                c.http_socket_group = Some("torrentd".into())
             }),
             ("trusted_proxies", |c| {
                 c.trusted_proxies = vec!["172.28.0.2".into()]
@@ -2821,8 +3008,118 @@ upload_rate_limit = 0"#,
         let top = TOP_LEVEL.replace("http_listen = \"127.0.0.1:8080\"\n", "");
         let p = write_cfg(dir.path(), &format!("{top}{ONE_HOST_PROFILE}"));
         let cfg = Config::load(&p).unwrap();
-        assert!(cfg.http_listen.ip().is_loopback());
-        assert_eq!(cfg.http_listen.port(), 8080);
+        let addr = cfg.http_listen.tcp().expect("a TCP address by default");
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn a_unix_http_listen_parses_and_round_trips() {
+        let listen: HttpListen = "unix:/run/torrentd/api.sock".parse().unwrap();
+        assert_eq!(listen, HttpListen::Unix("/run/torrentd/api.sock".into()));
+        assert_eq!(listen.to_string(), "unix:/run/torrentd/api.sock");
+        assert_eq!(listen.tcp(), None);
+        let tcp: HttpListen = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(tcp.to_string(), "127.0.0.1:8080");
+
+        for bad in [
+            "unix:run/api.sock",
+            "unix:",
+            "localhost:8080",
+            "unix:/",
+            &format!("unix:/{}", "a".repeat(MAX_UNIX_PATH_BYTES)),
+        ] {
+            assert!(bad.parse::<HttpListen>().is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// Validation holds a socket path to the length of the staging path it is
+    /// bound at first, so a path `--check-config` accepts is one boot binds.
+    #[test]
+    fn a_unix_path_is_refused_when_its_staging_path_would_not_bind() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().as_os_str().len() + 1;
+        let accepted = (1..=MAX_UNIX_PATH_BYTES - base)
+            .rev()
+            .map(|n| dir.path().join("a".repeat(n)))
+            .find(|p| {
+                format!("unix:{}", p.display())
+                    .parse::<HttpListen>()
+                    .is_ok()
+            })
+            .expect("some path in a temp dir is short enough");
+        // The longest accepted path binds, and one byte more is refused.
+        let socket = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { crate::api_socket::bind(&accepted, 0o600, None).map(drop) });
+        socket.unwrap_or_else(|e| panic!("{} bytes: {e:#}", accepted.as_os_str().len()));
+        let longer = format!("unix:{}a", accepted.display());
+        let msg = longer.parse::<HttpListen>().unwrap_err();
+        assert!(msg.contains("staging path"), "{msg}");
+        // Without the staging allowance, a path the kernel accepts as is
+        // would have passed and failed at boot.
+        assert!(longer.len() - "unix:".len() <= MAX_UNIX_PATH_BYTES);
+    }
+
+    /// `TOP_LEVEL` with `http_listen` replaced by `listen`, and `extra` keys
+    /// after it, plus one host profile.
+    fn with_listen(dir: &Path, listen: &str, extra: &str) -> anyhow::Result<Config> {
+        let top = TOP_LEVEL.replace(
+            "http_listen = \"127.0.0.1:8080\"\n",
+            &format!("http_listen = \"{listen}\"\n{extra}"),
+        );
+        Config::load(&write_cfg(dir, &format!("{top}{ONE_HOST_PROFILE}")))
+    }
+
+    #[test]
+    fn a_unix_socket_is_local_enough_for_allow_unauthenticated_unless_everyone_may_connect() {
+        let dir = tempdir().unwrap();
+        assert!(TOP_LEVEL.contains("allow_unauthenticated = true"));
+        let cfg = with_listen(dir.path(), "unix:/run/torrentd/api.sock", "").unwrap();
+        assert_eq!(cfg.http_socket_mode(), DEFAULT_HTTP_SOCKET_MODE);
+        with_listen(
+            dir.path(),
+            "unix:/run/torrentd/api.sock",
+            "http_socket_mode = 0o660\nhttp_socket_group = \"torrentd\"\n",
+        )
+        .unwrap();
+
+        let msg = format!(
+            "{:#}",
+            with_listen(
+                dir.path(),
+                "unix:/run/torrentd/api.sock",
+                "http_socket_mode = 0o666\n"
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("every user on the host"), "got: {msg}");
+    }
+
+    #[test]
+    fn socket_keys_are_refused_beside_a_tcp_listen_and_checked_beside_a_socket() {
+        let dir = tempdir().unwrap();
+        for extra in [
+            "http_socket_mode = 0o660\n",
+            "http_socket_group = \"torrentd\"\n",
+        ] {
+            let msg = format!(
+                "{:#}",
+                with_listen(dir.path(), "127.0.0.1:8080", extra).unwrap_err()
+            );
+            assert!(
+                msg.contains("applies only to a unix socket"),
+                "{extra}: {msg}"
+            );
+        }
+        for extra in ["http_socket_mode = 0o4660\n", "http_socket_group = \" \"\n"] {
+            assert!(
+                with_listen(dir.path(), "unix:/run/torrentd/api.sock", extra).is_err(),
+                "{extra} must be refused"
+            );
+        }
     }
 
     #[test]

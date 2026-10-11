@@ -554,7 +554,7 @@ mod tests {
         // second SIGHUP answered `config unchanged` about an `http_listen`
         // the daemon was not listening on.
         let (first, second, running) = reload_twice(|c| {
-            c.http_listen = std::net::SocketAddr::from(([127, 0, 0, 1], 9090));
+            c.http_listen = crate::config::HttpListen::Unix("/run/torrentd/api.sock".into());
             c.connections_limit = Some(20_000);
         });
         assert_eq!(first.non_reloadable_changes, vec!["http_listen"]);
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(running.connections_limit, Some(20_000));
         assert_eq!(
             running.http_listen,
-            std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+            crate::config::HttpListen::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))),
             "the running config keeps the address the daemon bound",
         );
     }

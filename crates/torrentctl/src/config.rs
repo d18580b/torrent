@@ -1,7 +1,10 @@
 //! Where the daemon is, and what to authenticate with.
 //!
 //! Resolved in order: flags, then `TORRENTCTL_URL` / `TORRENTCTL_TOKEN`, then
-//! `$XDG_CONFIG_HOME/torrentctl/config.toml`. A token is read from a file only
+//! `$XDG_CONFIG_HOME/torrentctl/config.toml`. With no URL from any of them, the
+//! daemon's unix socket at [`DEFAULT_SOCKET`] is preferred when it exists, and
+//! [`DEFAULT_URL`] is the fallback. A URL may name a socket as `unix:/path`.
+//! A token is read from a file only
 //! when that file is private to its owner: a readable token file is a leaked
 //! token, and refusing to use one is how the operator finds out.
 
@@ -13,11 +16,18 @@ use serde::Deserialize;
 /// The daemon's default `http_listen`.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8080";
 
+/// The socket path the daemon's docs and sample config name for
+/// `http_listen = "unix:…"`, as a URL. Preferred over [`DEFAULT_URL`] when it
+/// exists: a socket's permissions say who may connect, and nobody else can
+/// take its path over while the daemon is down, as any local user can take
+/// over a TCP port.
+pub const DEFAULT_SOCKET: &str = "unix:/run/torrentd/api.sock";
+
 /// The config file.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct File {
-    /// The daemon's base URL.
+    /// The daemon's base URL, or `unix:/path` for its socket.
     pub url: Option<String>,
     /// A file holding a bearer token (`tdp_…`), mode `0600`.
     pub token_file: Option<PathBuf>,
@@ -83,7 +93,10 @@ pub fn resolve(overrides: Overrides) -> Result<Config, ConfigError> {
         Some(p) if p.exists() => load(p)?,
         _ => File::default(),
     };
-    resolve_from(overrides, env_url, env_token, file)
+    let default_socket = DEFAULT_SOCKET
+        .strip_prefix(crate::api::UNIX_PREFIX)
+        .is_some_and(|p| Path::new(p).exists());
+    resolve_from(overrides, env_url, env_token, file, default_socket)
 }
 
 fn load(path: &Path) -> Result<File, ConfigError> {
@@ -102,12 +115,16 @@ fn resolve_from(
     env_url: Option<String>,
     env_token: Option<String>,
     file: File,
+    default_socket_exists: bool,
 ) -> Result<Config, ConfigError> {
-    let url = overrides
-        .url
-        .or(env_url)
-        .or(file.url)
-        .unwrap_or_else(|| DEFAULT_URL.to_owned());
+    let url = overrides.url.or(env_url).or(file.url).unwrap_or_else(|| {
+        if default_socket_exists {
+            DEFAULT_SOCKET
+        } else {
+            DEFAULT_URL
+        }
+        .to_owned()
+    });
     let token = match (
         overrides.token,
         overrides.token_file,
@@ -186,6 +203,7 @@ mod tests {
             Some("http://env:1".into()),
             Some("tdp_env".into()),
             file,
+            true,
         )
         .unwrap();
         assert_eq!(cfg.url, "http://flag:1", "a trailing slash is trimmed");
@@ -199,14 +217,38 @@ mod tests {
                 url: Some("http://file:1".into()),
                 token_file: None,
             },
+            true,
         )
         .unwrap();
         assert_eq!(cfg.url, "http://env:1");
         assert_eq!(cfg.token.as_deref(), Some("tdp_env"));
 
-        let cfg = resolve_from(Overrides::default(), None, None, File::default()).unwrap();
+        let cfg = resolve_from(Overrides::default(), None, None, File::default(), false).unwrap();
         assert_eq!(cfg.url, DEFAULT_URL);
         assert_eq!(cfg.token, None, "no token means a password sign-in");
+    }
+
+    #[test]
+    fn the_daemon_socket_is_preferred_over_the_tcp_default_but_not_over_a_stated_url() {
+        let cfg = resolve_from(Overrides::default(), None, None, File::default(), true).unwrap();
+        assert_eq!(cfg.url, DEFAULT_SOCKET);
+
+        let file = File {
+            url: Some("http://file:1".into()),
+            token_file: None,
+        };
+        let cfg = resolve_from(Overrides::default(), None, None, file, true).unwrap();
+        assert_eq!(
+            cfg.url, "http://file:1",
+            "a configured URL wins over the socket"
+        );
+
+        let file = File {
+            url: Some("unix:/srv/torrentd/api.sock".into()),
+            token_file: None,
+        };
+        let cfg = resolve_from(Overrides::default(), None, None, file, false).unwrap();
+        assert_eq!(cfg.url, "unix:/srv/torrentd/api.sock");
     }
 
     #[test]
