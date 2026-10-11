@@ -856,15 +856,22 @@ pub struct ScanSummary {
 }
 
 /// Torrents added without seed mode, waiting for libtorrent to finish hashing,
-/// and re-hashes of loaded torrents `POST /v1/pool/verifications` asked for.
+/// and re-hashes of loaded torrents `POST /v1/pool/verifications` or
+/// `POST /v1/torrents/{infohash}/recheck` asked for.
 ///
-/// Adopting a large subtree can queue thousands of verifications, and one
-/// request can name a thousand torrents to re-hash. Admitting them all at
-/// once would saturate the disk and starve whatever is already seeding — a
-/// re-hash also disconnects the torrent's peers until it ends — so only
-/// `limit` are in flight, adoptions and re-hashes together, and the rest
-/// wait. libtorrent's own `active_checking` does not bound them: it applies
-/// only to auto-managed torrents, and no torrent here is one.
+/// Adopting a large subtree can queue thousands of verifications, one
+/// request can name a thousand torrents to re-hash, and a script can recheck
+/// a whole library one torrent at a time. Admitting them all at once would
+/// saturate the disk and starve whatever is already seeding — a re-hash also
+/// disconnects the torrent's peers until it ends — so only `limit` are in
+/// flight, adoptions and re-hashes together, and the rest wait. libtorrent's
+/// own `active_checking` does not bound them: it applies only to
+/// auto-managed torrents, and no torrent here is one.
+///
+/// It bounds only what it admits. The first check of a `.torrent` added with
+/// no resume data (`POST /v1/torrents`, the boot's `torrent_dir` scan), a
+/// disk-error retry's check, and a magnet's check once its metadata arrives
+/// start in libtorrent at once, uncounted.
 #[derive(Debug)]
 pub struct VerifyQueue {
     /// Every list keeps its length beside it, so [`VerifyQueue::depth`] and
@@ -969,7 +976,8 @@ struct InFlight {
     seen: bool,
 }
 
-/// A re-hash of a loaded torrent `POST /v1/pool/verifications` asked for.
+/// A re-hash of a loaded torrent `POST /v1/pool/verifications` or
+/// `POST /v1/torrents/{infohash}/recheck` asked for.
 #[derive(Clone, Debug)]
 struct Recheck {
     infohash: String,
@@ -1320,7 +1328,8 @@ pub(crate) fn force_recheck_marking_checking(
 /// tick: `held_logged` names the profiles already logged.
 ///
 /// Every re-hash dropped here is counted in `pool_recheck_dropped_total` by
-/// why, since `POST /v1/pool/verifications` answered that it started.
+/// why, since `POST /v1/pool/verifications` answered that it started, and
+/// `POST /v1/torrents/{infohash}/recheck` that it was accepted.
 fn admit_recheck(
     q: &VerifyQueue,
     source: &dyn AlertSource,
