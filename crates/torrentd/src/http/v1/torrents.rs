@@ -1195,8 +1195,10 @@ torrent_error! {
         /// safe to move to the trash: a file outside every managed root, one
         /// the index does not record this torrent claiming, one that changed
         /// since the scan, or another assigned torrent whose files no session
-        /// can report to compare against; or the torrent itself is one the
-        /// boot left unloaded, which no session holds. Nothing was changed.
+        /// can report to compare against; or the torrent itself is one no
+        /// session holds: the boot left it unloaded, or a delete that did not
+        /// move its payload removed it from its session and could not clear
+        /// its assignment. Nothing was changed.
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload cannot be trashed")]
         PayloadUntrashable { detail: String },
@@ -1300,6 +1302,31 @@ pub async fn delete_torrent(
     let Some(engine) = s.source.engine_for(&profile) else {
         return clear_sessionless(&s, &ih, &profile, delete_files);
     };
+    // An earlier delete removed the torrent from its session and then could
+    // not clear the assignment, and answered asking for this retry. The
+    // session's removal alert drops the state-map entry, so the match below
+    // would answer `409 torrent-adding` for a torrent no add is in flight
+    // for; and before the alert lands, removing the handle a second time is
+    // not the work left. The assignment, and the index owner the failed
+    // attempt never reached, are all there is to clear.
+    let removed = s.removed_unassigned.lock().get(&ih).copied();
+    if let Some(payload_deleted) = removed {
+        if delete_files && !payload_deleted {
+            // A 204 would say files went to the trash that the delete which
+            // removed the torrent did not move, and no session holds it now
+            // to reach them.
+            return Err(DeleteTorrentError::PayloadUntrashable {
+                detail: format!(
+                    "torrent {ih} was already removed from its session by a delete that did not \
+                     move its payload to the trash, and no session holds it now to reach it. \
+                     Nothing was changed; retry without `delete_files` to clear its assignment \
+                     and leave the files where they are."
+                ),
+            });
+        }
+        clear_assignment(&s, &ih, &profile, payload_deleted)?;
+        return Ok(NoContent);
+    }
     // A missing state-map entry means one of two things, and only one of them
     // may be cleared.
     //
@@ -1653,19 +1680,24 @@ fn clear_assignment(
     // comes back from the file at the next restart, over a torrent that no
     // longer exists, and clearing it then is the hard case. The removal from
     // the session has already happened, which the detail says, so a retry is
-    // about the assignment alone.
-    s.registry
-        .remove(ih)
-        .map_err(|e| DeleteTorrentError::Internal {
+    // about the assignment alone. The info-hash is recorded for that retry:
+    // once the removal alert drops its state-map entry nothing else tells it
+    // from an add whose alert has not landed, which a delete refuses.
+    if let Err(e) = s.registry.remove(ih) {
+        s.removed_unassigned.lock().insert(*ih, payload_deleted);
+        return Err(DeleteTorrentError::Internal {
             detail: format!(
                 "{} The torrent was removed from its session; retry the delete to clear the \
-             assignment.",
+                 assignment.",
                 internal("clearing the torrent's assignment", e)
             ),
-        })?;
+        });
+    }
     // Cleared, so a later add of the same info-hash is this process's own
-    // and must not be mistaken for one the boot left unloaded.
+    // and must not be mistaken for one the boot left unloaded, or for one an
+    // earlier delete removed.
     s.unloaded_at_boot.lock().remove(ih);
+    s.removed_unassigned.lock().remove(ih);
     release_index_owner(s, ih, profile, payload_deleted);
     Ok(())
 }
@@ -1842,6 +1874,7 @@ fn clear_unheld(
             ),
         })?;
     s.unloaded_at_boot.lock().remove(ih);
+    s.removed_unassigned.lock().remove(ih);
     release_index_owner(s, ih, profile, false);
     Ok(())
 }

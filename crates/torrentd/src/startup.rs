@@ -3079,6 +3079,7 @@ impl DaemonHandle {
             allowed_hosts: crate::http::security::HostAllowlist::parse(&cfg.allowed_hosts)
                 .expect("validated at startup"),
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
+            removed_unassigned: Arc::default(),
             shutdown: shutdown_tx.clone(),
             work: Arc::clone(&work),
             events: Arc::default(),
