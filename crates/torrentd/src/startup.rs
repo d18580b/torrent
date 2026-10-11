@@ -2594,29 +2594,35 @@ where
 
     // A bring-up or teardown task that does not join (it panicked) fails that
     // profile, as every other per-profile failure does, rather than the boot.
+    // `{e:#}`, not `%e`: the bring-up caller passes an `anyhow::Error` whose
+    // plain Display prints only its outermost context, so the log and the
+    // profile's reason would name the task and drop the join error under it.
+    // For the `JoinError` the other caller passes, `{e:#}` prints as `{e}`.
     macro_rules! profile_task_failed {
         ($what:literal, $err:expr) => {{
             let e = $err;
             error!(
                 profile_id = %p.id,
-                error.cause = %e,
+                error.cause = %format_args!("{e:#}"),
                 concat!($what, " task did not join; profile disabled"),
             );
-            fail_profile!(format!(concat!($what, " task failed: {}"), e));
+            fail_profile!(format!(concat!($what, " task failed: {:#}"), e));
         }};
     }
     // The teardowns below all run on a profile that is failing anyway, so a
     // task that does not join is reported against the profile and does not
     // replace the reason it is failing for. It does not abort the boot either:
     // the tunnel that may still be standing belongs to this profile, and
-    // taking the other profiles down does not remove it.
+    // taking the other profiles down does not remove it. The error is an
+    // `anyhow::Error` whose outermost context is `vpn teardown task`, so it is
+    // logged with `{e:#}` to keep the join error under that label.
     macro_rules! tear_down_or_warn {
         ($iface:expr) => {
             if let Err(e) = cleanup.take_down_off_worker($iface).await {
                 warn!(
                     profile_id = %p.id,
                     vpn_iface = %$iface,
-                    error.cause = %e,
+                    error.cause = %format_args!("{e:#}"),
                     "VPN teardown task did not join; the profile is disabled \
                      either way and its tunnel may still be standing",
                 );
@@ -3039,7 +3045,8 @@ impl DaemonHandle {
         // parts each time the server is restarted after running out of
         // descriptors (`serve_until_shutdown`).
         let openapi = http::document_json()
-            .map_err(|e| error!(error.cause = %e, "build the HTTP API"))
+            // `{e:#}`: an `anyhow::Error`, whose plain Display drops its cause.
+            .map_err(|e| error!(error.cause = %format_args!("{e:#}"), "build the HTTP API"))
             .ok()
             .map(|openapi| Arc::new(bytes::Bytes::from(openapi)));
         let build_app = move || {
