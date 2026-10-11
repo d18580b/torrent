@@ -1505,10 +1505,12 @@ That first check starts at once, beside every other: nothing bounds how many
 Add a large set in batches, or adopt it through the pool, whose verifications
 are bounded ([import.md §7](import.md#7-monitoring-the-queue)).
 
-`POST /v1/torrents/{infohash}/recheck` answers `202` and the torrent shows
-`checking` until its check ends. Each check disconnects the torrent's peers
-until it ends. With `[pool]` configured the recheck is queued, not started: the
-pool's verify queue starts it once a slot is free, at most
+`POST /v1/torrents/{infohash}/recheck` answers `202`, and the torrent shows
+`checking` from the moment its check starts until it ends. Each check
+disconnects the torrent's peers until it ends. With `[pool]` configured the
+recheck is queued, not started, and a queued recheck shows the torrent's old
+phase until the verify queue starts it: the queue starts it once a slot is
+free, at most
 `[pool] max_concurrent_verify` checks at once together with adoptions and
 `POST /v1/pool/verifications`, so a script that rechecks every torrent does
 not hash them all at once. `GET /v1/pool` counts a queued recheck in

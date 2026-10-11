@@ -511,7 +511,10 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 Action::Pause => format!("paused {short}"),
                 Action::Resume => format!("resumed {short}"),
                 Action::Recheck => {
-                    format!("recheck started for {short}; it shows `checking` until done")
+                    format!(
+                        "recheck accepted for {short}; it shows `checking` once its check starts, \
+                         which waits for a verify slot with [pool]"
+                    )
                 }
                 Action::Reannounce => {
                     format!("reannounce sent for {short}; its trackers show the outcome")

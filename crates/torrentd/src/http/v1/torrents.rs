@@ -1985,9 +1985,11 @@ pub async fn resume_torrent(
 /// Re-verify a torrent's payload.
 ///
 /// Re-hashes the payload against the piece hashes. `202`: libtorrent checks
-/// asynchronously, and the torrent's `phase` reports `checking` until it is
-/// done. Needs no `[pool]`. With `[pool]` configured, the check is queued
-/// rather than started: the verify queue starts it once a slot is free, at
+/// asynchronously, and the torrent's `phase` reports `checking` from the
+/// moment the check starts until it is done. Needs no `[pool]`. With `[pool]`
+/// configured, the check is queued rather than started, and a queued check
+/// leaves the torrent in its old `phase` until the verify queue starts it:
+/// the queue starts it once a slot is free, at
 /// most `[pool] max_concurrent_verify` checks at once together with
 /// adoptions' verifications and `POST /v1/pool/verifications`' re-hashes, and
 /// `GET /v1/pool` counts it in `verify_queue_depth` while it waits and
