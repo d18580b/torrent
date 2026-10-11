@@ -1048,6 +1048,46 @@ fn execute_due_retries(
             continue;
         }
         match engine.resume_torrent(handle) {
+            // The fence check above and this resume are not atomic. A fence
+            // whose walk paused this torrent between the two would have it
+            // running again in a `vpn_down` profile, and the monitor never
+            // fences a profile already marked, so nothing would pause it until
+            // an operator set the profile online. Ask again after the resume,
+            // as the daemon's single resume does: the `SeqCst` fence pairs
+            // with the one the VPN monitor's fence issues between its mark and
+            // its walk, so either this read sees the mark, or the mark and the
+            // walk that pauses this torrent came after the resume. Seeing it,
+            // pause the torrent again and look later, as for a skip: the
+            // resume was undone, so it is not an attempt.
+            Ok(())
+                if {
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    profile_fenced.is_some_and(|f| f(&st.profile_id))
+                } =>
+            {
+                match engine.pause_torrent(handle) {
+                    Ok(()) => warn!(
+                        target: "torrentd_engine::alert_loop",
+                        profile_id = %st.profile_id,
+                        infohash = %handle.infohash,
+                        "disk-error retry: profile was fenced while the torrent was being resumed; paused it again",
+                    ),
+                    Err(e) => {
+                        error!(
+                            target: "torrentd_engine::alert_loop",
+                            profile_id = %st.profile_id,
+                            infohash = %handle.infohash,
+                            error.cause = %e,
+                            "disk-error retry: could not pause again a torrent resumed as its profile was fenced",
+                        );
+                        metrics.inc_counter(
+                            "profile_fence_pause_errors_total",
+                            &[("profile_id", st.profile_id.as_str())],
+                        );
+                    }
+                }
+                defer_retry(state, clock, &handle.infohash);
+            }
             Ok(()) => {
                 info!(
                     target: "torrentd_engine::alert_loop",
@@ -1743,6 +1783,104 @@ mod tests {
         assert!(
             resumed(&engine),
             "the torrent was not retried after its fence lifted"
+        );
+    }
+
+    #[test]
+    fn a_fence_landing_during_the_retrys_resume_pauses_the_torrent_again() {
+        // The retry asked once and then resumed. A fence whose walk paused the
+        // torrent in between had it running again in a `vpn_down` profile,
+        // and the monitor never fences a marked profile again, so nothing
+        // paused it. The predicate answers `false` to the first question and
+        // `true` after, as a fence landing in that gap reads.
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
+        let (state, h) = state_with_a_due_retry(clock.now());
+        let asked = Arc::new(AtomicU64::new(0));
+        let fence: ProfileFenced = {
+            let asked = Arc::clone(&asked);
+            Arc::new(move |_: &ProfileId| asked.fetch_add(1, Ordering::SeqCst) > 0)
+        };
+
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            clock.now(),
+        );
+
+        let calls: Vec<_> = engine
+            .calls()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    crate::mock::RecordedCall::ResumeTorrent(_)
+                        | crate::mock::RecordedCall::PauseTorrent(_)
+                )
+            })
+            .collect();
+        assert!(
+            matches!(
+                calls.as_slice(),
+                [
+                    crate::mock::RecordedCall::ResumeTorrent(r),
+                    crate::mock::RecordedCall::PauseTorrent(p),
+                ] if *r == h && *p == h
+            ),
+            "the resumed torrent was not paused again: {calls:?}",
+        );
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 1, "an undone resume is not an attempt");
+        assert_eq!(
+            retry.next_attempt,
+            clock.now() + crate::state::RetryState::INITIAL_DELAY,
+            "the retry is deferred as for a skip",
+        );
+        assert!(
+            !recording.calls().iter().any(|c| matches!(
+                c,
+                MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
+            )),
+            "an undone resume is not counted as a retry attempt",
+        );
+
+        // A pause that fails leaves the torrent running in a fenced profile:
+        // counted where the fence's own failed pauses are, and still deferred.
+        let engine = Arc::new(MockEngine::new());
+        engine.inject_error("pause_torrent", crate::engine::EngineError::Shutdown);
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
+        let (state, h) = state_with_a_due_retry(clock.now());
+        asked.store(0, Ordering::SeqCst);
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            clock.now(),
+        );
+        assert!(recording.calls().iter().any(|c| matches!(
+            c,
+            MetricCall::IncCounter { name, .. } if name == "profile_fence_pause_errors_total"
+        )));
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 1);
+        assert_eq!(
+            retry.next_attempt,
+            clock.now() + crate::state::RetryState::INITIAL_DELAY
         );
     }
 
