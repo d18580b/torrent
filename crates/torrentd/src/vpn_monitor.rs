@@ -573,9 +573,11 @@ pub(crate) fn fence(
     // whoever fences: the kill-switch watch's fence left it at the monitor's
     // last 1, and the monitor never polls a fenced profile to correct it, so
     // a profile its lift left fenced read as healthy to every alert on it.
-    // The monitor's healthy poll and the kill-switch lift write 1 under this
-    // lock, and only on a profile not `vpn_down`, so neither lands on a fence
-    // once this one is in.
+    // The monitor's healthy poll writes 1 under this lock and skips a profile
+    // that reads `vpn_down`, so it never lands on a fence once this one is in.
+    // The kill-switch lift writes 1 in the update that returns a `vpn_down`
+    // profile to `Active`; it is serialised with the kill-switch fence by
+    // `KillSwitchFence::fenced`, held from its mark check through that update.
     entry.update_health(|h| {
         h.status = ProfileStatus::VpnDown;
         h.tunnel_ip = current;
