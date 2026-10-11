@@ -40,6 +40,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use libtorrent_safe::alert::AlertHeader;
+use libtorrent_safe::alert::TorrentStatusView;
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
 use libtorrent_safe::AlertKind;
@@ -279,6 +280,9 @@ pub struct MockEngine {
     largest_files_copy: AtomicUsize,
     /// infohash → what `torrent_trackers` returns. Unset: empty.
     trackers: DashMap<InfoHash, Vec<TrackerEntry>>,
+    /// infohash → the status `torrent_statuses` reports for it. Unset: the
+    /// torrent is left out.
+    statuses: DashMap<InfoHash, TorrentStatusView>,
     /// Whether `pause_session` is in force.
     session_paused: AtomicBool,
     /// What `alert_translate_errors` returns. See
@@ -313,6 +317,7 @@ impl MockEngine {
             files: DashMap::new(),
             largest_files_copy: AtomicUsize::new(0),
             trackers: DashMap::new(),
+            statuses: DashMap::new(),
             session_paused: AtomicBool::new(false),
             translate_errors: AtomicU64::new(0),
         }
@@ -467,6 +472,12 @@ impl MockEngine {
     /// What `torrent_trackers(h)` returns from now on.
     pub fn set_torrent_trackers(&self, h: TorrentHandle, trackers: Vec<TrackerEntry>) {
         self.trackers.insert(h.infohash, trackers);
+    }
+
+    /// What `torrent_statuses` reports for `status.handle` from now on, for
+    /// as long as the mock holds that handle.
+    pub fn set_torrent_status(&self, status: TorrentStatusView) {
+        self.statuses.insert(status.handle.infohash, status);
     }
 
     /// What `torrent_details` returns for a handle nothing was preloaded for:
@@ -793,6 +804,19 @@ impl TorrentEngine for MockEngine {
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
         self.check_error("torrents")?;
         Ok(self.handles.iter().map(|e| *e.value()).collect())
+    }
+
+    /// The status `set_torrent_status` gave each handle the mock still
+    /// holds; a held handle with none set is left out. Not recorded: it is a
+    /// query.
+    fn torrent_statuses(&self) -> Result<Vec<TorrentStatusView>, EngineError> {
+        self.check_error("torrent_statuses")?;
+        Ok(self
+            .statuses
+            .iter()
+            .filter(|s| self.handles.get(s.key()).is_some_and(|h| *h == s.handle))
+            .map(|s| s.value().clone())
+            .collect())
     }
 
     /// What `set_alert_translate_errors` last set. Not recorded: the alert

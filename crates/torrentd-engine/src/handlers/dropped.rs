@@ -16,6 +16,10 @@
 //! is settled as that alert would have settled it, since only that alert
 //! drops a torrent from the map. Its tombstone is left for that alert, which
 //! may be only late, or for the next boot.
+//!
+//! When they include `state_update_alert`, every tracked torrent's status is
+//! read from the session and folded into the state map, since libtorrent
+//! never posts a paused or idle torrent's lost update again.
 
 use std::collections::HashSet;
 
@@ -26,6 +30,7 @@ use tracing::error;
 use tracing::warn;
 
 use crate::handlers::add;
+use crate::handlers::state_update;
 use crate::handlers::HandlerCtx;
 
 /// `save_resume_data_alert::alert_type` and
@@ -40,6 +45,8 @@ const ADD_TORRENT_TYPE: u32 = 67;
 /// `torrent_removed_alert::alert_type` in libtorrent 2.0. Critical priority
 /// only raises the queue limit it is held to, so it can be dropped too.
 const TORRENT_REMOVED_TYPE: u32 = 4;
+/// `state_update_alert::alert_type` in libtorrent 2.0.
+const STATE_UPDATE_TYPE: u32 = 68;
 
 /// Whether alert type `ty` is set in a `dropped_alerts` bitset.
 fn dropped(bits: &[u64; 2], ty: u32) -> bool {
@@ -88,6 +95,11 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     if adds || removals {
         reconcile_session(ctx, adds, removals);
     }
+    // After the adds: a torrent tracked from its lost add alert above was in
+    // the same lost updates, so it is refreshed too.
+    if dropped(bits, STATE_UPDATE_TYPE) {
+        refresh_statuses(ctx);
+    }
     // One per overflow. libtorrent reports *which alert types* it dropped, as
     // a bitset, and never how many alerts; this used to add the bitset's
     // popcount to `alerts_dropped_total`, which is a count of neither. The
@@ -95,6 +107,61 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     // the series is named for that.
     ctx.metrics.inc_counter(
         "alert_queue_overflows_total",
+        &[("profile_id", ctx.profile_id.as_str())],
+    );
+}
+
+/// Read every torrent's status from the session and fold it into the state
+/// map as a `state_update_alert` would, for an overflow that dropped one.
+///
+/// libtorrent posts a torrent in a `state_update_alert` only when its status
+/// changed since the last post, and forgets the change once it has posted it
+/// (`session_impl::post_torrent_updates`). A torrent that is transferring
+/// changes every tick and recovers by itself; one that was paused, or seeds
+/// with no peers, is never posted again, and its entry would keep the phase,
+/// `needs_save_resume` and error state it had before the overflow until a
+/// restart. Every torrent is refreshed, since libtorrent names the lost types
+/// and never the torrents.
+///
+/// Only an entry this profile tracks under the same handle is refreshed: a
+/// status of a torrent the map does not track, or tracks under another
+/// handle, describes nothing the map holds.
+fn refresh_statuses(ctx: &HandlerCtx<'_>) {
+    let statuses = match ctx.engine.torrent_statuses() {
+        Ok(statuses) => statuses,
+        Err(e) => {
+            error!(
+                target: "torrentd_engine::handler::dropped",
+                op = "torrent_statuses",
+                error.cause = %e,
+                "state updates were among the dropped alerts and the session's torrent statuses \
+                 could not be read; paused or idle torrents keep the phase they had before the \
+                 overflow until their status changes again",
+            );
+            return;
+        }
+    };
+    let mut refreshed = 0u64;
+    for s in &statuses {
+        let tracked = ctx
+            .state
+            .get(&s.handle.infohash)
+            .is_some_and(|st| st.handle == s.handle && st.profile_id == ctx.profile_id);
+        if tracked {
+            state_update::apply(s, ctx);
+            refreshed += 1;
+        }
+    }
+    warn!(
+        target: "torrentd_engine::handler::dropped",
+        torrent_count = refreshed,
+        "state updates were among the dropped alerts; refreshed every tracked torrent's status \
+         from the session",
+    );
+    // Under the profile whose queue overflowed, like the other counters here.
+    ctx.metrics.add_counter(
+        "statuses_refreshed_total",
+        refreshed,
         &[("profile_id", ctx.profile_id.as_str())],
     );
 }
@@ -641,6 +708,122 @@ mod tests {
         run_on(mock, &state, &metrics, ADD_DROPPED);
         assert!(!state.contains(&h.infohash));
         // The overflow is still counted.
+        assert_eq!(metrics.count_for("alert_queue_overflows_total"), 1);
+    }
+
+    const STATE_UPDATE_DROPPED: [u64; 2] = [0, 1u64 << (STATE_UPDATE_TYPE - 64)];
+
+    /// A paused seed's status, as libtorrent reports it: still `seeding`,
+    /// with the paused flag set.
+    fn paused_status(h: TorrentHandle) -> libtorrent_safe::alert::TorrentStatusView {
+        libtorrent_safe::alert::TorrentStatusView {
+            handle: h,
+            state: 5,
+            flags: libtorrent_safe::TorrentFlags::PAUSED.bits(),
+            total_uploaded: 0,
+            total_payload_uploaded: 0,
+            upload_rate: 0,
+            download_rate: 0,
+            num_peers: 0,
+            num_seeds: 0,
+            num_connections: 0,
+            progress: 1.0,
+            has_metadata: true,
+            needs_save_resume: true,
+            is_finished: true,
+            is_seeding: false,
+            has_error: false,
+        }
+    }
+
+    #[test]
+    fn a_dropped_state_update_refreshes_every_tracked_torrent_from_the_session() {
+        use crate::state::TorrentPhase;
+
+        let mock = Arc::new(MockEngine::new());
+        let p = ProfileId::new("p");
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        // Two seeds the map last saw seeding, which were paused since, with
+        // the update that said so lost.
+        let (a, b) = (
+            mock.register_handle(InfoHash([10; 20])),
+            mock.register_handle(InfoHash([11; 20])),
+        );
+        for h in [a, b] {
+            assert!(state.track_added(h, &p, std::time::Instant::now()));
+            state.update(&h.infohash, |st| {
+                st.phase = TorrentPhase::Seeding;
+                st.is_seeding = true;
+                st.needs_save_resume = false;
+            });
+            mock.set_torrent_status(paused_status(h));
+        }
+        // Held by the session and not tracked: its status describes nothing
+        // the map holds, and is not counted.
+        let untracked = mock.register_handle(InfoHash([12; 20]));
+        mock.set_torrent_status(paused_status(untracked));
+
+        run_on(mock.clone(), &state, &metrics, STATE_UPDATE_DROPPED);
+
+        for h in [a, b] {
+            let st = state.get(&h.infohash).expect("tracked");
+            assert_eq!(st.phase, TorrentPhase::Paused);
+            assert!(st.needs_save_resume, "the sweep saves it");
+            assert!(!st.is_seeding);
+        }
+        assert!(!state.contains(&untracked.infohash));
+        let refreshed: Vec<_> = metrics
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::metrics::MetricCall::AddCounter {
+                    name,
+                    value,
+                    labels,
+                } if name == "statuses_refreshed_total" => Some((value, labels)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refreshed,
+            vec![(2, vec![("profile_id".to_string(), "p".to_string())])],
+        );
+    }
+
+    #[test]
+    fn an_overflow_that_spared_the_state_updates_reads_no_status() {
+        use crate::state::TorrentPhase;
+
+        let mock = Arc::new(MockEngine::new());
+        let h = mock.register_handle(InfoHash([13; 20]));
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        assert!(state.track_added(h, &ProfileId::new("p"), std::time::Instant::now()));
+        state.update(&h.infohash, |st| st.phase = TorrentPhase::Seeding);
+        mock.set_torrent_status(paused_status(h));
+        let mut bits = [u64::MAX, u64::MAX];
+        bits[1] &= !STATE_UPDATE_DROPPED[1];
+        run_on(mock, &state, &metrics, bits);
+        assert_eq!(state.get(&h.infohash).unwrap().phase, TorrentPhase::Seeding);
+        assert_eq!(metrics.count_for("statuses_refreshed_total"), 0);
+    }
+
+    #[test]
+    fn statuses_that_cannot_be_read_leave_the_map_as_it_was() {
+        use crate::state::TorrentPhase;
+
+        let mock = Arc::new(MockEngine::new());
+        let h = mock.register_handle(InfoHash([14; 20]));
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        assert!(state.track_added(h, &ProfileId::new("p"), std::time::Instant::now()));
+        state.update(&h.infohash, |st| st.phase = TorrentPhase::Seeding);
+        mock.set_torrent_status(paused_status(h));
+        mock.inject_error("torrent_statuses", EngineError::Shutdown);
+        run_on(mock, &state, &metrics, STATE_UPDATE_DROPPED);
+        assert_eq!(state.get(&h.infohash).unwrap().phase, TorrentPhase::Seeding);
+        assert_eq!(metrics.count_for("statuses_refreshed_total"), 0);
         assert_eq!(metrics.count_for("alert_queue_overflows_total"), 1);
     }
 
