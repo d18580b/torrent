@@ -444,6 +444,77 @@ tests:
         alertname: TorrentdPortForwardRenewFailed
         exp_alerts: []
 
+  # Renewals that failed during the boot scans, before the first scrape: the
+  # counter's first sample already holds them, so only the boot gauge shows
+  # them, and the alert holds for the life of the process.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="renew"}'
+        values: '2x40'
+      - series: 'torrentd_boot_port_forward_failures{profile_id="acct_a", stage="renew"}'
+        values: '2x40'
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="rebind"}'
+        values: '0x40'
+      - series: 'torrentd_boot_port_forward_failures{profile_id="acct_a", stage="rebind"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdPortForwardRenewFailed
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              stage: renew
+            exp_annotations:
+              summary: "The NAT-PMP gateway did not renew profile acct_a's lease; a provider-side problem, retried in seconds"
+      - eval_time: 30m
+        alertname: TorrentdPortForwardRenewFailed
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              stage: renew
+            exp_annotations:
+              summary: "The NAT-PMP gateway did not renew profile acct_a's lease; a provider-side problem, retried in seconds"
+      - eval_time: 30m
+        alertname: TorrentdPortForwardRebindFailed
+        exp_alerts: []
+
+  # A rebind that failed during the boot scans: the session listens on a port
+  # the gateway no longer forwards, though the lease is held.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="rebind"}'
+        values: '1x40'
+      - series: 'torrentd_boot_port_forward_failures{profile_id="acct_a", stage="rebind"}'
+        values: '1x40'
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="renew"}'
+        values: '0x40'
+      - series: 'torrentd_boot_port_forward_failures{profile_id="acct_a", stage="renew"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdPortForwardRebindFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              stage: rebind
+            exp_annotations:
+              summary: "Profile acct_a's session could not be rebound to the port the gateway forwarded; it still listens on the old one"
+      - eval_time: 30m
+        alertname: TorrentdPortForwardRebindFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              stage: rebind
+            exp_annotations:
+              summary: "Profile acct_a's session could not be rebound to the port the gateway forwarded; it still listens on the old one"
+      - eval_time: 30m
+        alertname: TorrentdPortForwardRenewFailed
+        exp_alerts: []
+
   - interval: 1m
     input_series:
       - series: 'torrentd_listen_failure_active{profile_id="acct_a"}'
@@ -460,6 +531,64 @@ tests:
               profile_id: acct_a
             exp_annotations:
               summary: "Profile acct_a's listen socket failed; it accepts no incoming connections"
+
+  # Accepts that ran out of descriptors after the first scrape; the seeded
+  # zero alone stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_listen_accept_errors_total{profile_id="acct_a", errno="EMFILE"}'
+        values: '0 0 3 3'
+      - series: 'torrentd_boot_listen_accept_errors{profile_id="acct_a", errno="EMFILE"}'
+        values: '0x3'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdListenAcceptErrors
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdListenAcceptErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              errno: EMFILE
+            exp_annotations:
+              summary: "Profile acct_a's listen socket ran out of file descriptors accepting peers (EMFILE); raise LimitNOFILE or lower connections_limit, see docs/running.md section 7"
+      - eval_time: 3m
+        alertname: TorrentdListenFailed
+        exp_alerts: []
+
+  # Every profile's torrents starting at once under a low descriptor limit:
+  # the accepts fail before the first scrape, whose sample already holds
+  # them, and only the boot gauge shows them.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_listen_accept_errors_total{profile_id="acct_a", errno="EMFILE"}'
+        values: '40x40'
+      - series: 'torrentd_boot_listen_accept_errors{profile_id="acct_a", errno="EMFILE"}'
+        values: '40x40'
+      - series: 'torrentd_listen_accept_errors_total{profile_id="acct_b", errno="EMFILE"}'
+        values: '0x40'
+      - series: 'torrentd_boot_listen_accept_errors{profile_id="acct_b", errno="EMFILE"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdListenAcceptErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              errno: EMFILE
+            exp_annotations:
+              summary: "Profile acct_a's listen socket ran out of file descriptors accepting peers (EMFILE); raise LimitNOFILE or lower connections_limit, see docs/running.md section 7"
+      - eval_time: 30m
+        alertname: TorrentdListenAcceptErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              errno: EMFILE
+            exp_annotations:
+              summary: "Profile acct_a's listen socket ran out of file descriptors accepting peers (EMFILE); raise LimitNOFILE or lower connections_limit, see docs/running.md section 7"
 
   # ---- kill switch ------------------------------------------------------
   # Two vpn profiles, kill switch off.
@@ -548,7 +677,7 @@ tests:
               severity: warning
               outcome: reinstalled
             exp_annotations:
-              summary: "A runtime check found the nftables kill switch table missing or drifted in the last hour; the daemon's egress was unconfined until it was reinstalled (outcome reinstalled) or still is (outcome lost). Look for what flushes the ruleset"
+              summary: "A runtime check found the nftables kill switch table missing or drifted in the last hour or during the boot; the daemon's egress was unconfined until it was reinstalled (outcome reinstalled) or still is (outcome lost). Look for what flushes the ruleset"
 
   - interval: 1m
     input_series:
@@ -562,6 +691,68 @@ tests:
               severity: warning
             exp_annotations:
               summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
+
+  # Checks that could not run during the boot scans, before the first scrape.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_kill_switch_probe_errors_total'
+        values: '2x40'
+      - series: 'torrentd_boot_kill_switch_probe_errors'
+        values: '2x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdKillSwitchUnverifiable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
+      - eval_time: 30m
+        alertname: TorrentdKillSwitchUnverifiable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
+
+  # A ruleset flush two minutes into an eight-minute boot: the watch
+  # reinstalled the table before the first scrape, whose sample already
+  # holds the loss, so only the boot gauge records it, for the life of the
+  # process rather than the hour increase() would hold it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_kill_switch_active'
+        values: '1x90'
+      - series: 'torrentd_kill_switch_table_present'
+        values: '1x90'
+      - series: 'torrentd_kill_switch_lost_total{outcome="reinstalled"}'
+        values: '1x90'
+      - series: 'torrentd_boot_kill_switch_lost{outcome="reinstalled"}'
+        values: '1x90'
+      - series: 'torrentd_kill_switch_lost_total{outcome="lost"}'
+        values: '0x90'
+      - series: 'torrentd_boot_kill_switch_lost{outcome="lost"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdKillSwitchGone
+        exp_alerts: []
+      - eval_time: 0m
+        alertname: TorrentdKillSwitchLost
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: reinstalled
+            exp_annotations:
+              summary: "A runtime check found the nftables kill switch table missing or drifted in the last hour or during the boot; the daemon's egress was unconfined until it was reinstalled (outcome reinstalled) or still is (outcome lost). Look for what flushes the ruleset"
+      - eval_time: 90m
+        alertname: TorrentdKillSwitchLost
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              outcome: reinstalled
+            exp_annotations:
+              summary: "A runtime check found the nftables kill switch table missing or drifted in the last hour or during the boot; the daemon's egress was unconfined until it was reinstalled (outcome reinstalled) or still is (outcome lost). Look for what flushes the ruleset"
 
   - interval: 1m
     input_series:

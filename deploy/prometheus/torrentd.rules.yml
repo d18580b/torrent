@@ -180,7 +180,9 @@ groups:
         # renewal is retried within seconds and one failure leaves the lease
         # standing, so this is information; a lease actually lost is
         # TorrentdPortForwardDown.
-        expr: increase(torrentd_profile_port_forward_failures_total{stage="renew"}[15m]) > 0
+        expr: >
+          increase(torrentd_profile_port_forward_failures_total{stage="renew"}[15m]) > 0
+          or torrentd_boot_port_forward_failures{stage="renew"} > 0
         labels:
           severity: info
         annotations:
@@ -189,7 +191,9 @@ groups:
       - alert: TorrentdPortForwardRebindFailed
         # Local side: the gateway named a new port and the session could not
         # be rebound to it, so the session still listens on the old port.
-        expr: increase(torrentd_profile_port_forward_failures_total{stage="rebind"}[15m]) > 0
+        expr: >
+          increase(torrentd_profile_port_forward_failures_total{stage="rebind"}[15m]) > 0
+          or torrentd_boot_port_forward_failures{stage="rebind"} > 0
         labels:
           severity: warning
         annotations:
@@ -201,6 +205,19 @@ groups:
           severity: critical
         annotations:
           summary: "Profile {{ $labels.profile_id }}'s listen socket failed; it accepts no incoming connections"
+
+      - alert: TorrentdListenAcceptErrors
+        # Not a listen failure: libtorrent keeps listening and accepts again
+        # at once, dropping peers and lowering connections_limit meanwhile.
+        # The boot, when every profile's torrents start at once, is when a
+        # descriptor limit too low for the load is likeliest to show.
+        expr: >
+          increase(torrentd_listen_accept_errors_total[15m]) > 0
+          or torrentd_boot_listen_accept_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s listen socket ran out of file descriptors accepting peers ({{ $labels.errno }}); raise LimitNOFILE or lower connections_limit, see docs/running.md section 7"
 
       # ---- kill switch -------------------------------------------------
       - alert: TorrentdKillSwitchOff
@@ -233,16 +250,21 @@ groups:
       # A loss the watch's reinstall repairs is over within one check, so
       # TorrentdKillSwitchGone never sees it: the counter is its only trace.
       # Each one left the daemon's egress unconfined for up to a check
-      # interval and fenced every vpn profile meanwhile.
+      # interval and fenced every vpn profile meanwhile. The watch starts
+      # before the boot scans, so a loss in them is in the boot gauge.
       - alert: TorrentdKillSwitchLost
-        expr: increase(torrentd_kill_switch_lost_total[1h]) > 0
+        expr: >
+          increase(torrentd_kill_switch_lost_total[1h]) > 0
+          or torrentd_boot_kill_switch_lost > 0
         labels:
           severity: warning
         annotations:
-          summary: "A runtime check found the nftables kill switch table missing or drifted in the last hour; the daemon's egress was unconfined until it was reinstalled (outcome reinstalled) or still is (outcome lost). Look for what flushes the ruleset"
+          summary: "A runtime check found the nftables kill switch table missing or drifted in the last hour or during the boot; the daemon's egress was unconfined until it was reinstalled (outcome reinstalled) or still is (outcome lost). Look for what flushes the ruleset"
 
       - alert: TorrentdKillSwitchUnverifiable
-        expr: increase(torrentd_kill_switch_probe_errors_total[15m]) > 0
+        expr: >
+          increase(torrentd_kill_switch_probe_errors_total[15m]) > 0
+          or torrentd_boot_kill_switch_probe_errors > 0
         labels:
           severity: warning
         annotations:

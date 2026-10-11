@@ -150,7 +150,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Accepts on a listen socket that ran out of file descriptors; libtorrent accepts \
          again at once and keeps listening, first dropping a peer and lowering \
          `connections_limit` while that limit is above 10 and a torrent has a peer to drop. \
-         Not a listen failure.";
+         Not a listen failure. A count that keeps rising means the descriptor limit \
+         (`LimitNOFILE`) is too low for the load; TorrentdListenAcceptErrors fires on any rise.";
     "disk_error_retry_attempts_total" Counter Profile Zero =>
         "Torrents the disk-error retry timer resumed to clear a libtorrent error.";
     "disk_error_retry_errors_total" Counter Profile Zero => "Retry-timer resumes that failed.";
@@ -264,6 +265,20 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_pool_verify_failed" Gauge Daemon Owner("always") =>
         "pool_verify_failed_total as of the first scrape, which already holds what the boot \
          counted; fixed for the life of the process.";
+    "boot_listen_accept_errors" Gauge Profile
+        ("errno": torrentd_engine::metrics::LISTEN_ACCEPT_ERRNOS) Owner("always") =>
+        "listen_accept_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_port_forward_failures" Gauge NatpmpProfile ("stage": BOOT_PORT_FORWARD_STAGES)
+        Owner("live natpmp profiles") =>
+        "profile_port_forward_failures_total for these stages as of the first scrape, which \
+         already holds what the boot counted; fixed for the life of the process.";
+    "boot_kill_switch_lost" Gauge Daemon ("outcome": &["reinstalled", "lost"]) Owner("always") =>
+        "kill_switch_lost_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_kill_switch_probe_errors" Gauge Daemon Owner("always") =>
+        "kill_switch_probe_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
     "boot_metrics_dropped_samples" Gauge Daemon ("reason": &["registration", "labels"]) Owner("always") =>
         "metrics_dropped_samples_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
@@ -416,6 +431,12 @@ pub const BOOT_SESSION_KINDS: &[&str] = &["portmap_error", "udp_error", "fastres
 /// carry on their own, and a fixed boot count would skew.
 pub const BOOT_TRACKER_KINDS: &[&str] = &["warning", "scrape_failed"];
 
+/// The `stage` values of `profile_port_forward_failures_total` that
+/// `TorrentdPortForwardRenewFailed` and `TorrentdPortForwardRebindFailed`
+/// read, and so the ones `boot_port_forward_failures` carries. `port_taken`
+/// is left out: no alert reads it.
+pub const BOOT_PORT_FORWARD_STAGES: &[&str] = &["renew", "rebind"];
+
 /// A counter an alert reads that a boot moves before anything can scrape it,
 /// and the gauge [`PromSink::render`] exports its first-scrape count as.
 #[derive(Clone, Copy, Debug)]
@@ -447,13 +468,27 @@ pub struct BootCount {
 /// the first scrape. The verify queue starts before the HTTP server too, and
 /// a re-queued adoption whose disk is not there can fail before it. An
 /// exporter's dropped sample can come from any emission, the boot's included.
+///
+/// Two watchers start before the boot scans, and the scans can run for
+/// minutes. The kill-switch watch checks its table every 30 s, and counts a
+/// check that could not run and a loss it found, which its reinstall may
+/// already have repaired before the first scrape. The port-forward monitor
+/// renews each NAT-PMP lease through the scans, and each bring-up refreshes
+/// one, so a renewal or rebind that fails there is counted before it. And
+/// every profile's torrents start at once, which is when a descriptor limit
+/// too low for the load makes the listen sockets' accepts fail.
+///
 /// Each is mirrored whole: whatever a counter an alert reads had counted at
 /// the first scrape is beyond `increase()`, whether it raced the scrape or
 /// always precedes it.
 ///
 /// `disk_errors_total` appears with its first event, so its gauge does too:
 /// only for the operations the boot counted one under. `tracker_alerts_total`
-/// is mirrored only for the kinds in [`BOOT_TRACKER_KINDS`].
+/// is mirrored only for the kinds in [`BOOT_TRACKER_KINDS`], and
+/// `profile_port_forward_failures_total` only for the stages in
+/// [`BOOT_PORT_FORWARD_STAGES`]. The port-forward monitor writes that
+/// counter's zeros for each live natpmp profile when it starts, before the
+/// scans, so its gauge is present for the same profiles.
 pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: "profile_assignment_registry_errors_total",
@@ -553,6 +588,26 @@ pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: "pool_verify_failed_total",
         gauge: "boot_pool_verify_failed",
+        only: None,
+    },
+    BootCount {
+        counter: torrentd_engine::metrics::LISTEN_ACCEPT_ERRORS,
+        gauge: "boot_listen_accept_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "profile_port_forward_failures_total",
+        gauge: "boot_port_forward_failures",
+        only: Some(("stage", BOOT_PORT_FORWARD_STAGES)),
+    },
+    BootCount {
+        counter: "kill_switch_lost_total",
+        gauge: "boot_kill_switch_lost",
+        only: None,
+    },
+    BootCount {
+        counter: "kill_switch_probe_errors_total",
+        gauge: "boot_kill_switch_probe_errors",
         only: None,
     },
     // Last, so its gauge also holds any sample the rows above dropped as
@@ -1122,11 +1177,12 @@ mod tests {
             assert_eq!(counter.kind, MetricType::Counter, "{}", b.counter);
             assert_eq!(gauge.kind, MetricType::Gauge, "{}", b.gauge);
             // Present from boot where the counter is seeded; where it appears
-            // with its first event, so does the gauge.
+            // with its first event, so does the gauge; where its owner writes
+            // it, the gauge is present where the counter is.
             let present = match counter.seed {
                 Seed::Zero => Seed::Owner("always"),
                 Seed::OnFirstEvent => Seed::OnFirstEvent,
-                Seed::Owner(_) => panic!("{} is neither seeded nor first-event", b.counter),
+                Seed::Owner(when) => Seed::Owner(when),
             };
             assert_eq!(gauge.seed, present, "{}", b.gauge);
             assert_eq!(gauge.scope, counter.scope, "{}", b.gauge);
@@ -1192,6 +1248,21 @@ mod tests {
             &[("profile_id", "a"), ("store", "tombstone")],
         );
         sink.inc_counter("pool_verify_failed_total", &[]);
+        sink.add_counter(
+            "listen_accept_errors_total",
+            3,
+            &[("profile_id", "a"), ("errno", "EMFILE")],
+        );
+        // The port-forward monitor's own zeros for natpmp profile a, then a
+        // rebind and a port_taken counted during the boot.
+        let stage = |s| [("profile_id", "a"), ("stage", s)];
+        for s in ["renew", "rebind", "port_taken"] {
+            sink.add_counter("profile_port_forward_failures_total", 0, &stage(s));
+        }
+        sink.inc_counter("profile_port_forward_failures_total", &stage("rebind"));
+        sink.inc_counter("profile_port_forward_failures_total", &stage("port_taken"));
+        sink.inc_counter("kill_switch_lost_total", &[("outcome", "reinstalled")]);
+        sink.add_counter("kill_switch_probe_errors_total", 2, &[]);
         // A label mismatch, as an emission at boot could make.
         sink.inc_counter("pool_plan_failures_total", &[("phase", "redrive")]);
 
@@ -1290,6 +1361,37 @@ mod tests {
             ),
             ("boot_pool_verify_failed", String::new(), "1"),
             (
+                "boot_listen_accept_errors",
+                "{errno=\"EMFILE\",profile_id=\"a\"}".to_string(),
+                "3",
+            ),
+            (
+                "boot_listen_accept_errors",
+                "{errno=\"EMFILE\",profile_id=\"b\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_port_forward_failures",
+                "{profile_id=\"a\",stage=\"rebind\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_port_forward_failures",
+                "{profile_id=\"a\",stage=\"renew\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_kill_switch_lost",
+                "{outcome=\"reinstalled\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_kill_switch_lost",
+                "{outcome=\"lost\"}".to_string(),
+                "0",
+            ),
+            ("boot_kill_switch_probe_errors", String::new(), "2"),
+            (
                 "boot_metrics_dropped_samples",
                 "{reason=\"labels\"}".to_string(),
                 "1",
@@ -1323,6 +1425,21 @@ mod tests {
             None,
             "{first}"
         );
+        // Nor a stage the port-forward alerts read, nor a profile the
+        // port-forward monitor did not write.
+        assert_eq!(
+            sample(
+                &first,
+                "boot_port_forward_failures",
+                "{profile_id=\"a\",stage=\"port_taken\"}"
+            ),
+            None,
+            "{first}"
+        );
+        assert!(
+            !first.contains("torrentd_boot_port_forward_failures{profile_id=\"b\""),
+            "{first}"
+        );
         // A first-event counter's gauge exists only where it counted.
         assert!(
             !first.contains("torrentd_boot_disk_errors{op=\"file_open\",profile_id=\"b\"}"),
@@ -1343,6 +1460,8 @@ mod tests {
             &[("profile_id", "a"), ("store", "tombstone")],
         );
         sink.inc_counter("pool_verify_failed_total", &[]);
+        sink.inc_counter("kill_switch_lost_total", &[("outcome", "reinstalled")]);
+        sink.inc_counter("profile_port_forward_failures_total", &stage("renew"));
         let later = String::from_utf8(sink.render()).unwrap();
         assert_eq!(
             sample(
