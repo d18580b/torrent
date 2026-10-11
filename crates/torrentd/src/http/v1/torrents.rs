@@ -1747,9 +1747,8 @@ fn refuse_unloaded_with_store_files(
              (the boot logged a warning naming it, such as `resume add failed`, `torrent-dir \
              add failed` or a tracker `allowed_tracker_urls` refuses, and \
              `torrentd_boot_torrent_load_failures` counts failed adds) and restart the daemon. \
-             To retire \
-             it anyway, move those files out of the profile's resume and torrent directories \
-             and retry the delete.",
+             To retire it anyway, move those files out of the profile's resume and torrent \
+             directories and retry the delete.",
             held.join(" and "),
         ),
     })
