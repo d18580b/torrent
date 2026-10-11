@@ -1902,6 +1902,38 @@ extern "C" void lt_post_session_stats(lt_session* s) {
     LT_SHIM_CATCH_VOID
 }
 
+extern "C" int lt_torrent_statuses(lt_session* s, struct lt_status_list* out,
+                                   char* err_out, int err_len)
+{
+    if (!s || !out) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    LT_SHIM_TRY
+    std::memset(out, 0, sizeof(*out));
+    // Synchronous: the network thread reads every torrent's status in one
+    // pass. Default flags, which fill every field fill_state_view reads.
+    auto const statuses =
+        s->ses.get_torrent_status([](lt::torrent_status const&) { return true; });
+    auto const n = statuses.size();
+    if (n == 0) return LT_OK;
+    // Published to *out only once filled; the unique_ptr releases it if
+    // anything in between throws.
+    std::unique_ptr<lt_torrent_status_view, decltype(&std::free)> arr(
+        static_cast<lt_torrent_status_view*>(std::calloc(n, sizeof(lt_torrent_status_view))),
+        &std::free);
+    if (!arr) throw std::bad_alloc{};
+    for (std::size_t i = 0; i < n; ++i) fill_state_view(arr.get()[i], s, statuses[i]);
+    out->statuses = arr.release();
+    out->count = n;
+    return LT_OK;
+    LT_SHIM_CATCH(err_out, err_len, LT_ERR)
+}
+
+extern "C" void lt_status_list_free(struct lt_status_list* l) {
+    if (!l) return;
+    std::free(l->statuses);
+    l->statuses = nullptr;
+    l->count = 0;
+}
+
 extern "C" int lt_session_stats_metric_index(const char* name) {
     if (!name) return -1;
     LT_SHIM_TRY

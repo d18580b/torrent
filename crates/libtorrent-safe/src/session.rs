@@ -15,6 +15,7 @@ use libtorrent_sys as ffi;
 use tracing::debug;
 
 use crate::alert::Alert;
+use crate::alert::TorrentStatusView;
 use crate::error::Error;
 use crate::error::Result;
 use crate::handle::InfoHash;
@@ -545,6 +546,26 @@ impl Session {
         unsafe { ffi::lt_post_torrent_updates(self.ptr) }
     }
 
+    /// Every torrent's status, read from the session now, in the shape a
+    /// `state_update_alert` carries, whether or not it changed since the last
+    /// [`Session::post_torrent_updates`]. libtorrent posts a torrent again
+    /// only once its status changes again, so this is the only way to learn
+    /// the status of a paused or idle torrent whose update was dropped.
+    pub fn torrent_statuses(&self) -> Result<Vec<TorrentStatusView>> {
+        let mut list = StatusListGuard::new();
+        let mut err = ErrBuf::new();
+        let rc =
+            unsafe { ffi::lt_torrent_statuses(self.ptr, &mut list.0, err.ptr(), err.len() as i32) };
+        if rc != ffi::LT_OK as i32 {
+            return Err(Error::Shim(err.into_string()));
+        }
+        Ok(list
+            .statuses()
+            .iter()
+            .filter_map(TorrentStatusView::from_raw)
+            .collect())
+    }
+
     /// Triggers a `session_stats_alert` with the current counters.
     pub fn post_session_stats(&self) {
         unsafe { ffi::lt_post_session_stats(self.ptr) }
@@ -912,6 +933,33 @@ impl ErrBuf {
             unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, ERR_BUF_LEN) };
         let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..nul]).into_owned()
+    }
+}
+
+/// Owns an `lt_status_list` the shim filled and frees it on drop.
+struct StatusListGuard(ffi::lt_status_list);
+
+impl StatusListGuard {
+    fn new() -> Self {
+        // SAFETY: a zeroed lt_status_list is the empty list the free
+        // function accepts.
+        Self(unsafe { std::mem::zeroed() })
+    }
+
+    fn statuses(&self) -> &[ffi::lt_torrent_status_view] {
+        if self.0.statuses.is_null() || self.0.count == 0 {
+            return &[];
+        }
+        // SAFETY: the shim allocated `count` initialised views at
+        // `statuses`, which live until the guard drops.
+        unsafe { std::slice::from_raw_parts(self.0.statuses, self.0.count) }
+    }
+}
+
+impl Drop for StatusListGuard {
+    fn drop(&mut self) {
+        // SAFETY: idempotent; safe on a zeroed or already-freed struct.
+        unsafe { ffi::lt_status_list_free(&mut self.0) };
     }
 }
 
