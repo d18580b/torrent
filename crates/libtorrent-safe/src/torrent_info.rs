@@ -10,6 +10,7 @@
 use libtorrent_sys as ffi;
 
 use crate::metadata::fixed_c_str;
+use crate::metadata::sized_str;
 
 /// Details of one torrent in a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,13 +91,20 @@ fn non_empty(s: String) -> Option<String> {
 }
 
 impl TorrentDetails {
-    pub(crate) fn from_raw(raw: &ffi::lt_torrent_details) -> Self {
+    /// # Safety
+    ///
+    /// `raw.name` and `raw.save_path` are each null, or point at
+    /// `name_len` / `save_path_len` readable bytes: the state the shim
+    /// leaves a struct it filled, until `lt_torrent_details_free`.
+    pub(crate) unsafe fn from_raw(raw: &ffi::lt_torrent_details) -> Self {
         let has_metadata = raw.has_metadata != 0;
         Self {
-            name: non_empty(fixed_c_str(&raw.name)),
+            // SAFETY: the caller's contract.
+            name: non_empty(unsafe { sized_str(raw.name, raw.name_len) }),
             has_metadata,
             total_size: has_metadata.then_some(raw.total_size),
-            save_path: fixed_c_str(&raw.save_path),
+            // SAFETY: as above.
+            save_path: unsafe { sized_str(raw.save_path, raw.save_path_len) },
             upload_limit: (raw.upload_limit != 0).then_some(raw.upload_limit),
             added_at: (raw.added_time != 0).then_some(raw.added_time),
         }
@@ -104,10 +112,16 @@ impl TorrentDetails {
 }
 
 impl TorrentFile {
-    pub(crate) fn from_raw(index: u32, raw: &ffi::lt_torrent_file_entry) -> Self {
+    /// # Safety
+    ///
+    /// `raw.path` is null, or points at `path_len` readable bytes: the state
+    /// the shim leaves an entry of a list it filled, until
+    /// `lt_torrent_file_list_free`.
+    pub(crate) unsafe fn from_raw(index: u32, raw: &ffi::lt_torrent_file_entry) -> Self {
         Self {
             index,
-            path: fixed_c_str(&raw.path),
+            // SAFETY: the caller's contract.
+            path: unsafe { sized_str(raw.path, raw.path_len) },
             size: raw.size,
             downloaded: raw.downloaded,
             priority: raw.priority,
@@ -130,6 +144,32 @@ impl TrackerEntry {
             scrape_complete: u32::try_from(raw.scrape_complete).ok(),
             scrape_incomplete: u32::try_from(raw.scrape_incomplete).ok(),
         }
+    }
+}
+
+/// Owns an `lt_torrent_details` the shim filled and frees its strings on
+/// drop, so every return path (including a panic while copying) releases
+/// them.
+pub(crate) struct DetailsGuard(pub(crate) ffi::lt_torrent_details);
+
+impl DetailsGuard {
+    pub(crate) fn new() -> Self {
+        // SAFETY: all-zero is the shim's documented empty state (null
+        // pointers, zero lengths), which lt_torrent_details_free accepts.
+        Self(unsafe { std::mem::zeroed() })
+    }
+
+    pub(crate) fn details(&self) -> TorrentDetails {
+        // SAFETY: zeroed (null pointers) or filled by the shim, and the
+        // strings live until this guard drops.
+        unsafe { TorrentDetails::from_raw(&self.0) }
+    }
+}
+
+impl Drop for DetailsGuard {
+    fn drop(&mut self) {
+        // SAFETY: idempotent; safe on a zeroed or already-freed struct.
+        unsafe { ffi::lt_torrent_details_free(&mut self.0) };
     }
 }
 
@@ -199,8 +239,10 @@ mod tests {
     #[test]
     fn details_sentinels_become_none() {
         let mut raw: ffi::lt_torrent_details = unsafe { std::mem::zeroed() };
-        put(&mut raw.save_path, "/srv");
-        let d = TorrentDetails::from_raw(&raw);
+        let save = "/srv";
+        raw.save_path = save.as_ptr().cast();
+        raw.save_path_len = save.len();
+        let d = unsafe { TorrentDetails::from_raw(&raw) };
         assert_eq!(
             d,
             TorrentDetails {
@@ -213,12 +255,14 @@ mod tests {
             }
         );
 
-        put(&mut raw.name, "n");
+        let name = "n";
+        raw.name = name.as_ptr().cast();
+        raw.name_len = name.len();
         raw.has_metadata = 1;
         raw.total_size = 0;
         raw.upload_limit = 1024;
         raw.added_time = 1_700_000_000;
-        let d = TorrentDetails::from_raw(&raw);
+        let d = unsafe { TorrentDetails::from_raw(&raw) };
         assert_eq!(d.name.as_deref(), Some("n"));
         assert_eq!(
             d.total_size,
@@ -268,7 +312,30 @@ mod tests {
     }
 
     #[test]
+    fn details_and_paths_are_read_to_their_length_not_a_buffer() {
+        // Past the 1 023 bytes the old fixed buffers held, with no NUL at
+        // the end of what the length covers.
+        let long = format!("{}/leaf.bin", "d".repeat(1_210));
+        let mut raw: ffi::lt_torrent_details = unsafe { std::mem::zeroed() };
+        raw.save_path = long.as_ptr().cast();
+        raw.save_path_len = long.len();
+        raw.name = long.as_ptr().cast();
+        raw.name_len = long.len();
+        let d = unsafe { TorrentDetails::from_raw(&raw) };
+        assert_eq!(d.save_path, long);
+        assert_eq!(d.name.as_deref(), Some(long.as_str()));
+
+        let mut entry: ffi::lt_torrent_file_entry = unsafe { std::mem::zeroed() };
+        entry.path = long.as_ptr().cast();
+        entry.path_len = long.len();
+        assert_eq!(unsafe { TorrentFile::from_raw(0, &entry) }.path, long);
+    }
+
+    #[test]
     fn empty_guards_free_cleanly() {
+        let d = DetailsGuard::new();
+        assert_eq!(d.details().save_path, "");
+        assert_eq!(d.details().name, None);
         let f = FileListGuard::new();
         assert!(f.entries().is_empty());
         let t = TrackerListGuard::new();

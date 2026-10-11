@@ -496,7 +496,12 @@ fn multi_file_tracker_torrent() -> Vec<u8> {
 }
 
 fn add_file(s: *mut lt_session, bytes: &[u8]) -> lt_handle {
-    let save = CString::new("/tmp").unwrap();
+    add_file_at(s, bytes, "/tmp")
+}
+
+/// Added paused, so libtorrent creates nothing under `save_path`.
+fn add_file_at(s: *mut lt_session, bytes: &[u8], save_path: &str) -> lt_handle {
+    let save = CString::new(save_path).unwrap();
     let mut ih = [0u8; 20];
     let mut err = [0 as c_char; 512];
     let h = unsafe {
@@ -544,12 +549,90 @@ fn c_buf(buf: &[c_char]) -> String {
     String::from_utf8_lossy(&bytes[..nul]).into_owned()
 }
 
-fn details(s: *mut lt_session, h: lt_handle) -> lt_torrent_details {
+/// `lt_torrent_details`, copied out and freed.
+struct Details {
+    name: String,
+    save_path: String,
+    total_size: u64,
+    added_time: i64,
+    upload_limit: u32,
+    has_metadata: u8,
+}
+
+fn details(s: *mut lt_session, h: lt_handle) -> Details {
     let mut d: lt_torrent_details = unsafe { std::mem::zeroed() };
     let mut err = [0 as c_char; 512];
     let rc = unsafe { lt_torrent_details(s, h, &mut d, err.as_mut_ptr(), 512) };
     assert_eq!(rc, LT_OK as i32, "lt_torrent_details: {}", c_buf(&err));
-    d
+    let out = Details {
+        name: sized_c_str(d.name, d.name_len),
+        save_path: sized_c_str(d.save_path, d.save_path_len),
+        total_size: d.total_size,
+        added_time: d.added_time,
+        upload_limit: d.upload_limit,
+        has_metadata: d.has_metadata,
+    };
+    unsafe { lt_torrent_details_free(&mut d) };
+    assert!(d.strings.is_null() && d.name.is_null() && d.save_path.is_null());
+    // Idempotent, and safe on null.
+    unsafe { lt_torrent_details_free(&mut d) };
+    unsafe { lt_torrent_details_free(ptr::null_mut()) };
+    out
+}
+
+/// A v1 single-root `.torrent` whose one file sits under directories deep
+/// enough to push its torrent-relative path past the 1 023 bytes the shim's
+/// fixed path buffers used to hold. Every component stays under the 255-byte
+/// file-name limit, so the path is one a filesystem can hold.
+fn long_path_torrent() -> (Vec<u8>, String) {
+    let dirs: Vec<String> = (0..6).map(|i| format!("{i}{}", "d".repeat(199))).collect();
+    let bstr = |s: &str| format!("{}:{s}", s.len());
+    let mut path = String::new();
+    for d in &dirs {
+        path.push_str(&bstr(d));
+    }
+    path.push_str(&bstr("leaf.bin"));
+    let mut out = Vec::new();
+    out.extend_from_slice(b"d4:infod5:filesl");
+    out.extend_from_slice(format!("d6:lengthi1000e4:pathl{path}ee").as_bytes());
+    out.extend_from_slice(b"e");
+    out.extend_from_slice(format!("4:name{}", bstr("long-root")).as_bytes());
+    out.extend_from_slice(b"12:piece lengthi16384e");
+    out.extend_from_slice(b"6:pieces20:");
+    out.extend(std::iter::repeat_n(0xAB_u8, 20));
+    out.extend_from_slice(b"ee");
+    let rel = format!("long-root/{}/leaf.bin", dirs.join("/"));
+    (out, rel)
+}
+
+#[test]
+fn files_and_details_return_paths_past_the_old_buffer_whole() {
+    let (bytes, rel) = long_path_torrent();
+    assert!(rel.len() > 1_023, "the path must outgrow the old buffer");
+    // Never created: the torrent is added paused.
+    let deep = format!("/tmp/{}", vec!["s".repeat(200); 6].join("/"));
+    assert!(
+        deep.len() > 1_023,
+        "the save path must outgrow the old buffer"
+    );
+    let s = make_session();
+    let h = add_file_at(s, &bytes, &deep);
+
+    let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut list, err.as_mut_ptr(), 512) };
+    assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
+    assert_eq!(list.num_files, 1);
+    let f = unsafe { &*list.files };
+    assert_eq!(f.path_len, rel.len());
+    assert_eq!(sized_c_str(f.path, f.path_len), rel);
+    unsafe { lt_torrent_file_list_free(&mut list) };
+    assert!(list.files.is_null() && list.strings.is_null());
+
+    let d = details(s, h);
+    assert_eq!(d.save_path, deep);
+    assert_eq!(d.name, "long-root");
+    unsafe { lt_session_destroy(s) };
 }
 
 #[test]
@@ -562,12 +645,8 @@ fn details_without_metadata_report_the_magnet_name_and_no_size() {
     let d = details(s, h);
     assert_eq!(d.has_metadata, 0);
     assert_eq!(d.total_size, 0, "no metadata, no size");
-    assert_eq!(
-        c_buf(&d.name),
-        "pending-name",
-        "dn= is the name until metadata"
-    );
-    assert_eq!(c_buf(&d.save_path), "/tmp");
+    assert_eq!(d.name, "pending-name", "dn= is the name until metadata");
+    assert_eq!(d.save_path, "/tmp");
     assert_eq!(d.upload_limit, 0, "a fresh torrent is unlimited");
     assert!(d.added_time > 1_600_000_000, "added_time is unix seconds");
     unsafe { lt_session_destroy(s) };
@@ -580,7 +659,7 @@ fn details_with_metadata_report_size_name_and_upload_limit() {
     let d = details(s, h);
     assert_eq!(d.has_metadata, 1);
     assert_eq!(d.total_size, 61_000);
-    assert_eq!(c_buf(&d.name), "multi-root");
+    assert_eq!(d.name, "multi-root");
 
     assert_eq!(
         unsafe { lt_torrent_set_upload_limit(s, h, 50_000) },
@@ -619,7 +698,14 @@ fn files_list_every_file_with_size_progress_and_priority() {
         let files = unsafe { std::slice::from_raw_parts(list.files, list.num_files) };
         got = files
             .iter()
-            .map(|f| (c_buf(&f.path), f.size, f.downloaded, f.priority))
+            .map(|f| {
+                (
+                    sized_c_str(f.path, f.path_len),
+                    f.size,
+                    f.downloaded,
+                    f.priority,
+                )
+            })
             .collect::<Vec<(String, u64, u64, u8)>>();
         unsafe { lt_torrent_file_list_free(&mut list) };
         assert!(list.files.is_null() && list.num_files == 0);
@@ -664,7 +750,7 @@ fn files_page_copies_only_the_requested_range_and_reports_the_total() {
         } else {
             unsafe { std::slice::from_raw_parts(list.files, list.num_files) }
                 .iter()
-                .map(|f| c_buf(&f.path))
+                .map(|f| sized_c_str(f.path, f.path_len))
                 .collect()
         };
         let first = list.first_index;
@@ -1108,6 +1194,7 @@ fn queries_on_unknown_or_removed_handles_fail_with_the_marker() {
             LT_ERR
         );
         assert_eq!(c_buf(&err), marker);
+        assert!(d.strings.is_null(), "no allocation on failure");
 
         let mut err = [0 as c_char; 512];
         let mut files: lt_torrent_file_list = unsafe { std::mem::zeroed() };
@@ -1285,6 +1372,7 @@ fn a_re_added_info_hash_gets_a_live_handle() {
         "{}",
         c_buf(&err)
     );
+    unsafe { lt_torrent_details_free(&mut d) };
     unsafe { lt_session_destroy(s) };
 }
 
@@ -1320,6 +1408,7 @@ fn a_removal_drained_after_the_re_add_leaves_the_new_id_live() {
         "the re-added id still resolves: {}",
         c_buf(&err)
     );
+    unsafe { lt_torrent_details_free(&mut d) };
     assert_eq!(
         unsafe { lt_save_resume_data(s, again, 0) },
         LT_OK as i32,
