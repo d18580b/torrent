@@ -2222,23 +2222,25 @@ fn retire_in_flight(
     }
 }
 
-/// Free the slot of every started re-hash whose check has ended, handing the
-/// ones whose verdict is recorded to [`retire_rechecks`].
+/// Free the slot of every started check that has ended, handing the re-hashes
+/// whose verdict is recorded to [`retire_rechecks`], and releasing the held
+/// adds' entries in the record of held adds.
 ///
-/// A check has ended once one finished after the re-hash started. One paused
-/// while it checked keeps its slot, as a paused adoption does: libtorrent
-/// goes on with the check once the torrent is resumed (a fence lifting,
-/// resume-all, a disk-error retry), and a slot freed at the pause would let
-/// that check run beside `limit` others. Except one whose check failed on a
-/// disk error ([`error_paused`]): that check is over, with no
-/// `torrent_checked`, and what resumes it is the disk-error retry, whose
-/// check the queue does not bound anyway. Held, its slot would stay taken
-/// until `expiry`, and a few rechecks of torrents on a failing disk would
-/// stall every adoption and re-hash for a day. Its verdict, where one is
-/// recorded, is still waited for, without a slot. One removed has nothing
-/// left to hash. One older than `expiry` ([`RECHECK_EXPIRY`] in the worker)
-/// lost its check, and is forgotten rather than hold a slot for the life of
-/// the process.
+/// A check has ended once one finished after it started. One paused while it
+/// checked keeps its slot, as a paused adoption does: libtorrent goes on with
+/// the check once the torrent is resumed (a fence lifting, resume-all, a
+/// disk-error retry), and a slot freed at the pause would let that check run
+/// beside `limit` others. Except one whose check failed on a disk error
+/// ([`error_paused`]): that check is over, with no `torrent_checked`, and
+/// what resumes it is the disk-error retry, which takes a slot of its own
+/// first. Held, its slot would stay taken until `expiry`, and a few rechecks
+/// of torrents on a failing disk would stall every adoption and re-hash for a
+/// day. Its verdict, where one is recorded, is still waited for, without a
+/// slot. A check not known to start ([`CheckSource::always_checks`]) frees its
+/// slot once the torrent shows none running past [`CHECK_SETTLE`]. One removed
+/// has nothing left to hash. One older than `expiry` ([`RECHECK_EXPIRY`] in
+/// the worker) lost its check, and is forgotten rather than hold a slot for
+/// the life of the process.
 fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
     let mut ended = Vec::new();
     // Held adds whose check is over, or gone with their torrent: their

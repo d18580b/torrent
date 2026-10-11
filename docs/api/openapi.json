@@ -11024,14 +11024,14 @@
             "maximum": 4294967295.0,
             "minimum": 0.0,
             "format": "uint32",
-            "description": "Adopted torrents, and re-hashes `POST /v1/pool/verifications` or\n`POST /v1/torrents/{infohash}/recheck` queued, waiting for a\nverification slot."
+            "description": "Adopted torrents, re-hashes `POST /v1/pool/verifications` or\n`POST /v1/torrents/{infohash}/recheck` queued, and `.torrent`s added\npaused for their first check, waiting for a check slot."
           },
           "verify_in_flight": {
             "type": "integer",
             "maximum": 4294967295.0,
             "minimum": 0.0,
             "format": "uint32",
-            "description": "Adopted torrents and queued re-hashes libtorrent is hashing now: at\nmost `[pool] max_concurrent_verify`."
+            "description": "Adopted torrents verifying, and every other check holding a slot\n(re-hashes, `.torrent`s' first checks, disk-error retries): at most\n`[pool] max_concurrent_verify`, or one over it for each waiting\n`.torrent` the operator resumed by hand."
           }
         },
         "type": "object",
