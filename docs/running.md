@@ -125,8 +125,17 @@ fails with `EACCES`. Before the first `compose up`:
 
 ```bash
 sudo install -d -o 1000 -g 1000 -m0755 /data/torrents
-# Rootless podman maps the container's uid 1000 to a subordinate uid:
-#   podman unshare chown 1000:1000 /data/torrents
+```
+
+Rootless podman maps the container's uid 1000 to one of your subordinate
+uids, and `podman unshare chown` can only change a directory your own uid
+already owns: on one created as host uid 1000 above, it fails with `EPERM`
+unless your uid is 1000. Create the directory as yourself instead, then hand
+it to the container's uid:
+
+```bash
+sudo install -d -o "$USER" -g "$USER" -m0755 /data/torrents
+podman unshare chown 1000:1000 /data/torrents
 ```
 
 Changing `user:` to match the host directory's owner instead is no shortcut:

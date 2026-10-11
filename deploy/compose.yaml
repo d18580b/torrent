@@ -107,7 +107,11 @@ services:
       # 0755, and docs/running.md §4c creates it for the `torrentd` system
       # user, a different uid. Before the first `up`, on the host:
       #   sudo install -d -o 1000 -g 1000 -m0755 /data/torrents
-      # (rootless podman: `podman unshare chown 1000:1000 /data/torrents`).
+      # Rootless podman instead: create it owned by your own uid, since
+      # `podman unshare chown` fails with EPERM on a directory you do not
+      # own, then hand it to the container's uid 1000:
+      #   sudo install -d -o "$USER" -g "$USER" -m0755 /data/torrents
+      #   podman unshare chown 1000:1000 /data/torrents
       - /data/torrents:/data/torrents
 
   # torrentd does not terminate TLS, by design: an HTTP server's TLS
