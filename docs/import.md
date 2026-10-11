@@ -284,17 +284,33 @@ announces, and seeds to nobody.
 
 ## 7. Monitoring the queue
 
-Hashing is bounded by `[pool] max_concurrent_verify` (default `4`), so a bulk
-adopt cannot saturate the disk and starve what already seeds. The bound
-covers a manual verification too: `POST /v1/pool/verifications` only queues
-its re-hashes, and they take slots from the same limit as adoptions, which
-the queue alternates between. Raise it only before the first adopt (§2:
-changing it needs a restart).
+The verify queue bounds hashing at `[pool] max_concurrent_verify` (default
+`4`) checks at once, so a bulk adopt cannot saturate the disk and starve what
+already seeds. The bound covers a manual check too: `POST
+/v1/pool/verifications` and `POST /v1/torrents/{infohash}/recheck` only queue
+their re-hashes, which take slots from the same limit as adoptions, and the
+queue alternates between the two. A recheck of a paused torrent, or of one
+with no metadata yet, is the exception: it starts no disk work until the
+torrent is resumed or its metadata arrives, so it is passed to libtorrent at
+once, and its check then runs outside the bound. Raise the limit only before
+the first adopt (§2: changing it needs a restart).
+
+The bound covers only what the queue admits. These checks start in libtorrent
+at once, and neither the bound nor the gauges below count them:
+
+- the first check of a `.torrent` added by `POST /v1/torrents`, or found in a
+  profile's `torrent_dir` at boot with no resume file beside it,
+- the disk-error retry's re-check of a torrent whose disk error cleared,
+- a magnet's check of its files once its metadata arrives.
+
+Dropping thousands of `.torrent` files into `torrent_dir` before a restart
+therefore starts thousands of checks at once. Add them in batches instead, or
+adopt them through the pool (§2), whose verifications the queue bounds.
 
 | Metric | What it says |
 | --- | --- |
 | `torrentd_pool_verify_queue_depth` | Torrents waiting for a slot, adoptions and queued re-hashes |
-| `torrentd_pool_verify_in_flight` | Torrents libtorrent is hashing now, adoptions and re-hashes |
+| `torrentd_pool_verify_in_flight` | Torrents libtorrent is hashing now for the queue, adoptions and queued re-hashes |
 | `torrentd_pool_verify_completed_total` | Verified and seeding; the index records them `adopted` |
 | `torrentd_pool_verify_failed_total` | Failed or dropped |
 | `torrentd_pool_recheck_dropped_total` | Queued re-hashes dropped before they started, by `reason` |
@@ -318,6 +334,9 @@ changing it needs a restart).
 - **A re-hash paused while it checks** keeps its slot until the check ends,
   because libtorrent goes on with it once the torrent is resumed. Resume or
   remove the torrent to free the slot; otherwise it is freed after 24 hours.
+  One whose check fails on a disk error frees its slot at once: the torrent
+  is left paused with the error, and the disk-error retry, which the queue
+  does not bound, checks it again.
 - **A dropped re-hash** never started: by the time a slot was free its
   torrent had been removed, paused, or had no metadata, or libtorrent refused
   the request. The log reads `re-hash dropped: …`, or ends `dropping the
@@ -330,7 +349,8 @@ queues every torrent still waiting in it again, in order, so
 A torrent that was still hashing comes back from its `.torrent`, is hashed
 again, and has that check's verdict recorded: a failure is paused and marked
 `drifted` exactly as without the restart. Queued re-hashes are held only in
-memory: a restart drops the ones not yet recorded, so send
+memory: a restart drops the ones not yet recorded, and those
+`POST /v1/torrents/{infohash}/recheck` queued that had not started, so send
 `POST /v1/pool/verifications` again for those still `drifted`.
 [After a crash](operations.md#after-a-crash) covers the rare claim a crash
 can still leave with nothing behind it.

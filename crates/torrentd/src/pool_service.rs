@@ -856,15 +856,22 @@ pub struct ScanSummary {
 }
 
 /// Torrents added without seed mode, waiting for libtorrent to finish hashing,
-/// and re-hashes of loaded torrents `POST /v1/pool/verifications` asked for.
+/// and re-hashes of loaded torrents `POST /v1/pool/verifications` or
+/// `POST /v1/torrents/{infohash}/recheck` asked for.
 ///
-/// Adopting a large subtree can queue thousands of verifications, and one
-/// request can name a thousand torrents to re-hash. Admitting them all at
-/// once would saturate the disk and starve whatever is already seeding — a
-/// re-hash also disconnects the torrent's peers until it ends — so only
-/// `limit` are in flight, adoptions and re-hashes together, and the rest
-/// wait. libtorrent's own `active_checking` does not bound them: it applies
-/// only to auto-managed torrents, and no torrent here is one.
+/// Adopting a large subtree can queue thousands of verifications, one
+/// request can name a thousand torrents to re-hash, and a script can recheck
+/// a whole library one torrent at a time. Admitting them all at once would
+/// saturate the disk and starve whatever is already seeding — a re-hash also
+/// disconnects the torrent's peers until it ends — so only `limit` are in
+/// flight, adoptions and re-hashes together, and the rest wait. libtorrent's
+/// own `active_checking` does not bound them: it applies only to
+/// auto-managed torrents, and no torrent here is one.
+///
+/// It bounds only what it admits. The first check of a `.torrent` added with
+/// no resume data (`POST /v1/torrents`, the boot's `torrent_dir` scan), a
+/// disk-error retry's check, and a magnet's check once its metadata arrives
+/// start in libtorrent at once, uncounted.
 #[derive(Debug)]
 pub struct VerifyQueue {
     /// Every list keeps its length beside it, so [`VerifyQueue::depth`] and
@@ -969,7 +976,8 @@ struct InFlight {
     seen: bool,
 }
 
-/// A re-hash of a loaded torrent `POST /v1/pool/verifications` asked for.
+/// A re-hash of a loaded torrent `POST /v1/pool/verifications` or
+/// `POST /v1/torrents/{infohash}/recheck` asked for.
 #[derive(Clone, Debug)]
 struct Recheck {
     infohash: String,
@@ -1186,6 +1194,22 @@ pub async fn run_verify_queue(
     }
 }
 
+/// One verify-queue tick's slot accounting and admission, as
+/// [`run_verify_queue`] makes it, for tests that drive the queue through the
+/// HTTP API.
+#[cfg(test)]
+pub(crate) fn admit_tick_for_tests(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    profiles: &Arc<crate::profile_registry::ProfileRegistry>,
+    registry: &Arc<AssignmentRegistry>,
+) {
+    let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+    retire_checking(pool.verify_queue(), state, RECHECK_EXPIRY);
+    admit(pool, source, state, &metrics, profiles, registry);
+}
+
 /// What one admission attempt did.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Admission {
@@ -1304,7 +1328,8 @@ pub(crate) fn force_recheck_marking_checking(
 /// tick: `held_logged` names the profiles already logged.
 ///
 /// Every re-hash dropped here is counted in `pool_recheck_dropped_total` by
-/// why, since `POST /v1/pool/verifications` answered that it started.
+/// why, since `POST /v1/pool/verifications` answered that it started, and
+/// `POST /v1/torrents/{infohash}/recheck` that it was accepted.
 fn admit_recheck(
     q: &VerifyQueue,
     source: &dyn AlertSource,
@@ -1628,10 +1653,16 @@ fn retire_in_flight(
 /// while it checked keeps its slot, as a paused adoption does: libtorrent
 /// goes on with the check once the torrent is resumed (a fence lifting,
 /// resume-all, a disk-error retry), and a slot freed at the pause would let
-/// that check run beside `limit` others. One removed has nothing left to
-/// hash. One older than `expiry` ([`RECHECK_EXPIRY`] in the worker) lost its
-/// check, and is forgotten rather than hold a slot for the life of the
-/// process.
+/// that check run beside `limit` others. Except one whose check failed on a
+/// disk error ([`error_paused`]): that check is over, with no
+/// `torrent_checked`, and what resumes it is the disk-error retry, whose
+/// check the queue does not bound anyway. Held, its slot would stay taken
+/// until `expiry`, and a few rechecks of torrents on a failing disk would
+/// stall every adoption and re-hash for a day. Its verdict, where one is
+/// recorded, is still waited for, without a slot. One removed has nothing
+/// left to hash. One older than `expiry` ([`RECHECK_EXPIRY`] in the worker)
+/// lost its check, and is forgotten rather than hold a slot for the life of
+/// the process.
 fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
     let mut ended = Vec::new();
     q.checking.lock().retain(|(r, started)| {
@@ -1639,7 +1670,7 @@ fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
         else {
             return false;
         };
-        if st.checked_at.is_some_and(|t| t > *started) {
+        if st.checked_at.is_some_and(|t| t > *started) || error_paused(&st) {
             if r.record {
                 ended.push((r.infohash.clone(), *started));
             }
@@ -1658,6 +1689,20 @@ fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
     for (ih, started) in ended {
         q.await_recheck_verdict(ih, started);
     }
+}
+
+/// Whether libtorrent has error-paused a torrent whose re-hash started, as a
+/// check that fails on a disk error leaves it.
+///
+/// The `file_error` records `DiskError` with the error at once, and the next
+/// status update reports the torrent `Paused` with the error. Neither can be
+/// left over from before the start: the start moves a torrent in `DiskError`
+/// to `Checking` ([`force_recheck_marking_checking`]), a paused torrent's
+/// re-hash is never started, and a status update sets the phase and the error
+/// together. A torrent paused without an error is not one: its check goes on
+/// once it is resumed.
+fn error_paused(st: &torrentd_engine::TorrentState) -> bool {
+    st.has_error && matches!(st.phase, TorrentPhase::DiskError | TorrentPhase::Paused)
 }
 
 /// Record the outcome of every re-hash of a loaded torrent whose check
@@ -4084,6 +4129,59 @@ mod tests {
         w.tick(&pool);
         assert_eq!(q.in_flight(), 0);
         assert!(q.tracks_recheck(&ok.to_hex()));
+    }
+
+    /// A re-hash whose check fails on a disk error frees its slot at once,
+    /// whether the `file_error` (`DiskError` with the error) or the status
+    /// update after it (`Paused` with the error) is what the tick reads: the
+    /// check ended with no `torrent_checked`, and held, the slot would stay
+    /// taken for a day. A recorded re-hash's verdict is still waited for, and
+    /// the slots go to the re-hashes behind them.
+    #[test]
+    fn a_rehash_whose_check_fails_on_a_disk_error_frees_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(2);
+        let w = Worker::new(dir.path());
+        let [disk_error, error_paused, next_a, next_b] =
+            [0xE1, 0xE2, 0xE3, 0xE4].map(|b| InfoHash([b; 20]));
+        for (i, ih) in [disk_error, error_paused, next_a, next_b]
+            .into_iter()
+            .enumerate()
+        {
+            w.load(ih, i as u64 + 1, "p", TorrentPhase::Seeding);
+        }
+        let q = pool.verify_queue();
+        q.enqueue_recheck(disk_error.to_hex(), true);
+        q.enqueue_recheck(error_paused.to_hex(), false);
+        q.enqueue_recheck(next_a.to_hex(), false);
+        q.enqueue_recheck(next_b.to_hex(), false);
+
+        w.tick(&pool);
+        assert_eq!(w.rechecked(), [disk_error, error_paused]);
+        assert_eq!(q.in_flight(), 2);
+
+        for (ih, phase) in [
+            (disk_error, TorrentPhase::DiskError),
+            (error_paused, TorrentPhase::Paused),
+        ] {
+            let mut st = w.state.get(&ih).unwrap();
+            st.phase = phase;
+            st.has_error = true;
+            w.state.insert(ih, st);
+        }
+        w.tick(&pool);
+        assert_eq!(
+            w.rechecked(),
+            [disk_error, error_paused, next_a, next_b],
+            "the error-paused checks' slots went to the re-hashes behind them",
+        );
+        assert_eq!(q.in_flight(), 2);
+        assert!(
+            q.tracks_recheck(&disk_error.to_hex()),
+            "a recorded re-hash still waits for its verdict",
+        );
+        assert!(!q.tracks_recheck(&error_paused.to_hex()));
     }
 
     /// A re-hash whose torrent a paced set-online holds paused until its
