@@ -1385,21 +1385,40 @@ pub async fn boot(
                 // back out where nothing else of this profile's is filed under
                 // the session's key, and refused either way.
                 Ok(h) if h.infohash != ih => {
-                    let unloaded = may_unload_rekeyed(
+                    let may_unload = may_unload_rekeyed(
                         &registry,
                         &*resume_store,
                         &*torrent_store,
                         &profile,
                         &h.infohash,
-                    ) && match engine.remove_torrent(h, false) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!(profile_id = %profile, infohash = %h.infohash, error.cause = %e,
-                                  "could not take a torrent filed under another infohash back out \
-                                   of its session");
-                            false
+                    );
+                    let mut unloaded = may_unload && unload_rekeyed(&state, &*engine, &profile, h);
+                    // Left in the session, it is claimed under the key the
+                    // session gave it, as rule 4 requires of every torrent a
+                    // session holds. Where it cannot be (another profile
+                    // holds the key, or the claim did not persist), it is
+                    // taken back out even at the cost of this profile's files
+                    // under that key, rather than seeded with no claim.
+                    let mut claimed = false;
+                    if !unloaded {
+                        claimed = match registry.assign(h.infohash, profile.clone()) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                warn!(profile_id = %profile, infohash = %h.infohash,
+                                      error.cause = %e,
+                                      "could not claim a torrent its session keys by another \
+                                       infohash than the one it is filed under");
+                                metrics.inc_counter(
+                                    "profile_assignment_registry_errors_total",
+                                    &[("profile_id", profile.as_str())],
+                                );
+                                false
+                            }
+                        };
+                        if !claimed && !may_unload {
+                            unloaded = unload_rekeyed(&state, &*engine, &profile, h);
                         }
-                    };
+                    }
                     warn!(
                         profile_id = %profile,
                         infohash = %ih,
@@ -1423,9 +1442,14 @@ pub async fn boot(
                         }
                     }
                     // Left in the session, it is held to the fence like any
-                    // other, under the key the session gave it.
+                    // other, under the key the session gave it, and counted
+                    // loaded where the profile's claim on that key is what
+                    // the unloaded-claims gauge compares it with.
                     if !unloaded {
                         loaded.insert(h.infohash);
+                        if claimed {
+                            added_from_resume += 1;
+                        }
                         scan_fence.added(&profile_registry, &metrics, &profile, h);
                     }
                 }
@@ -2530,6 +2554,32 @@ fn may_unload_rekeyed(
     registry.lookup(key).as_ref() != Some(profile)
         && !resume.exists(profile, key).unwrap_or(true)
         && !torrents.exists(profile, key)
+}
+
+/// Take `profile`'s torrent `h`, which its session keyed by another infohash
+/// than the one it was filed under, back out of its session, keeping its
+/// files. Whether the session accepted.
+///
+/// The removal is recorded first (`StateMap::begin_removal`), as `DELETE`
+/// records its own: the boot holds the profile's alerts, and an add of the
+/// same infohash accepted before the removal's alert is handled must keep the
+/// `.torrent` and save path it wrote, which an unrecorded removal deletes.
+fn unload_rekeyed(
+    state: &StateMap,
+    engine: &dyn TorrentEngine,
+    profile: &ProfileId,
+    h: torrentd_engine::TorrentHandle,
+) -> bool {
+    state.begin_removal(profile, h);
+    match engine.remove_torrent(h, false) {
+        Ok(()) => true,
+        Err(e) => {
+            state.abandon_removal(profile, h);
+            warn!(profile_id = %profile, infohash = %h.infohash, error.cause = %e,
+                  "could not take a torrent filed under another infohash back out of its session");
+            false
+        }
+    }
 }
 
 /// Where the boot torrent-dir scan re-adds a `.torrent` no resume data
