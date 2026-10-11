@@ -1112,7 +1112,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no save path was recorded; they will not seed until moved to their data"
+              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no usable save path was recorded; they will not seed until moved to their data"
       - eval_time: 30m
         alertname: TorrentdBootSavePathFallbacks
         exp_alerts:
@@ -1120,7 +1120,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no save path was recorded; they will not seed until moved to their data"
+              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no usable save path was recorded; they will not seed until moved to their data"
 
   - interval: 1m
     input_series:

@@ -388,7 +388,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "{{ $value }} torrents in profile {{ $labels.profile_id }} were re-added at default_save_path at boot because no save path was recorded; they will not seed until moved to their data"
+          summary: "{{ $value }} torrents in profile {{ $labels.profile_id }} were re-added at default_save_path at boot because no usable save path was recorded; they will not seed until moved to their data"
 
       - alert: TorrentdUnloadedRegistryTorrents
         expr: torrentd_profile_unloaded_registry_torrents > 0
