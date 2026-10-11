@@ -22,6 +22,7 @@ The small state files are described in full in
 | `pool.db.pre-v3.bak` | The index as it stood before this build's one-way schema migration. | Nothing the daemon reads. It is the only way back to a pre-v3 build. | Nothing. |
 | `resume/<profile>/<infohash>.resume` (`resume_dir`, or a profile's own `resume_dir`) | libtorrent resume data: save path, piece state, and settings. | Piece state and settings. A torrent whose `.torrent` survives is re-added at the save path recorded beside it and hashed there, or, with no such record, at `default_save_path`, which is logged and counted in `torrentd_boot_save_path_fallbacks_total`. | Nothing. Pool torrents can be re-adopted after a rescan. |
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
+| `library/` (`[pool] library_dir`; the sample config puts it here, though it can sit anywhere outside a managed root) | The `.torrent` files the pool index is built from: each scan indexes every torrent in it and matches it against the roots. | The pool's metainfo, including the only remaining copy of a pool torrent whose `torrents/<profile>/` file is gone. A scan of a missing `library_dir` logs `torrent library directory does not exist` and changes nothing; a scan of an empty one drops from the index every torrent no session is serving. | Nothing. Whatever filled it: you, or the client whose state directory it was copied from. |
 | `torrents/<profile>/<infohash>.save_path` (beside the `.torrent`) | The save path a torrent was added at through `POST /v1/torrents` or adopted at from the pool, as UTF-8 text. | Where a torrent with no resume file is re-added: without it, `default_save_path`. | Nothing. Each API add and each adoption writes it, and a pool relocation of a loaded torrent rewrites it. |
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
 | `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
@@ -54,9 +55,14 @@ dest=/backup/torrentd/$(date +%F)
 sudo install -d -o torrentd -g torrentd -m0750 "$dest"
 sudo -u torrentd sqlite3 /var/lib/torrentd/registry.db ".backup '$dest/registry.db'"
 sudo -u torrentd sqlite3 /var/lib/torrentd/pool.db     ".backup '$dest/pool.db'"
-# The stores after the databases.
-sudo rsync -a /var/lib/torrentd/resume /var/lib/torrentd/torrents "$dest/"
+# The stores after the databases, and the pool's library with them.
+sudo rsync -a /var/lib/torrentd/resume /var/lib/torrentd/torrents \
+              /var/lib/torrentd/library "$dest/"
 ```
+
+`library` is the sample config's `[pool] library_dir`. Where yours points
+outside the state directory, copy that directory into `$dest/library` instead;
+where there is no `[pool]` section, leave it out.
 
 Copy `resume/` and `torrents/` **after** the databases. A torrent added between
 the two copies then has its files in the backup but no claim in it. The next
@@ -78,6 +84,9 @@ sudo systemctl stop torrentd
 sudo rsync -a /var/lib/torrentd/ /backup/torrentd/$(date +%F)/
 sudo systemctl start torrentd
 ```
+
+This holds the library only when `[pool] library_dir` is inside the state
+directory, as in the sample config; copy one that is elsewhere on its own.
 
 Copy the `-wal` and `-shm` files along with their databases if they are
 present. Do not delete them: a `-wal` can still hold committed data that has
@@ -665,7 +674,8 @@ sudo mv /var/lib/torrentd /var/lib/torrentd.before-restore
 sudo install -d -o torrentd -g torrentd -m0750 /var/lib/torrentd
 
 src=/backup/torrentd/2026-10-01
-sudo rsync -a "$src/registry.db" "$src/pool.db" "$src/resume" "$src/torrents" /var/lib/torrentd/
+sudo rsync -a "$src/registry.db" "$src/pool.db" "$src/resume" "$src/torrents" \
+              "$src/library" /var/lib/torrentd/
 # An offline backup may also hold registry.db-wal or pool.db-wal and -shm.
 # Restore those with their databases, never on their own.
 # The online/offline choices: the current ones, else the backup's.
@@ -675,6 +685,11 @@ done
 sudo chown -R torrentd:torrentd /var/lib/torrentd
 sudo systemctl start torrentd
 ```
+
+`$src/library` is the `[pool] library_dir` the backup copied. Where yours is
+outside the state directory, the `mv` leaves it where it is: drop
+`"$src/library"` from the copy, and restore it to its own path only if it was
+lost with the state.
 
 A restore keeps `profile_state.json`. It records which profiles you hold
 offline now, not anything the databases depend on, so the copy from the
