@@ -184,9 +184,14 @@ touches nothing until it is applied.
   directory under a managed root. An adopted torrent moves through its
   session. A torrent no session holds is moved by the daemon only when
   nothing owns it: one the registry assigns, the verify queue holds, or the
-  index records an owner for is refused until its profile loads it. A
-  cross-device move of an unloaded torrent's directory is refused: move the
-  data yourself and rescan.
+  index records an owner for is refused until its profile loads it. Its
+  directory is renamed whole, so it is also not moved while any loaded
+  torrent serves a file from under that directory, such as a cross-seed added
+  through `POST /v1/torrents` with a `save_path` over the same files, which
+  the index holds no claims for. A loaded torrent with no metadata yet whose
+  save path is at, above, or below that directory counts too, and so does one
+  whose session cannot be read. A cross-device move of an unloaded torrent's
+  directory is refused: move the data yourself and rescan.
 - **`delete_orphans`** moves every unclaimed file under a root, or a subtree of
   one, into the trash.
 
