@@ -189,7 +189,8 @@ fn refusal_reason(name: &str, args: &[String]) -> Option<&'static str> {
         | "status"
         | "replay-persist"
         | "ifconfig-pool-persist"
-        | "tls-export-cert" => {
+        | "tls-export-cert"
+        | "genkey" => {
             Some("makes openvpn create or overwrite a path the file chooses, as the daemon's user")
         }
         _ => None,
@@ -1091,6 +1092,7 @@ mod tests {
             ("status /var/lib/torrentd/x 10", "status"),
             ("replay-persist /var/lib/torrentd/x", "replay-persist"),
             ("tls-export-cert /var/lib/torrentd", "tls-export-cert"),
+            ("genkey secret /var/lib/torrentd/x", "genkey"),
             (
                 "ifconfig-pool-persist /var/lib/torrentd/x",
                 "ifconfig-pool-persist",
