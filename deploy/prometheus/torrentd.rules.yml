@@ -93,7 +93,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Profile {{ $labels.profile_id }}'s tunnel is down; its torrents are fenced until the daemon restarts"
+          summary: "Profile {{ $labels.profile_id }}'s tunnel is down and its torrents are fenced; fix the tunnel, then PATCH /v1/profiles/{{ $labels.profile_id }} state=online, no restart needed"
 
       - alert: TorrentdFencePauseFailed
         expr: >

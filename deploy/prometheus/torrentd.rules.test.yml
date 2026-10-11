@@ -180,7 +180,7 @@ tests:
               severity: critical
               profile_id: acct_a
             exp_annotations:
-              summary: "Profile acct_a's tunnel is down; its torrents are fenced until the daemon restarts"
+              summary: "Profile acct_a's tunnel is down and its torrents are fenced; fix the tunnel, then PATCH /v1/profiles/acct_a state=online, no restart needed"
 
   - interval: 1m
     input_series:

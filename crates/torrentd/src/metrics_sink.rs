@@ -1020,6 +1020,40 @@ mod tests {
     }
 
     #[test]
+    fn no_alert_or_panel_says_a_fence_lasts_until_a_restart() {
+        // Setting a fenced profile online lifts the fence live (#355). Text
+        // telling the operator to wait for, or perform, a restart sends them
+        // to take every other profile off the network for nothing.
+        for file in [
+            "prometheus/torrentd.rules.yml",
+            "prometheus/torrentd.rules.test.yml",
+            "dashboard.json",
+        ] {
+            let text = deploy(file);
+            for (n, line) in text.lines().enumerate() {
+                let lower = line.to_ascii_lowercase();
+                assert!(
+                    !(lower.contains("fence")
+                        && (lower.contains("until the daemon restart")
+                            || lower.contains("until a restart"))),
+                    "deploy/{file}:{}: a fence is lifted by setting the profile online, not by \
+                     a restart",
+                    n + 1,
+                );
+            }
+        }
+        let rules = deploy("prometheus/torrentd.rules.yml");
+        let tunnel_down = rules
+            .split("- alert:")
+            .find(|b| b.trim_start().starts_with("TorrentdVpnTunnelDown"))
+            .expect("TorrentdVpnTunnelDown is in the rules");
+        assert!(
+            tunnel_down.contains("state=online"),
+            "TorrentdVpnTunnelDown's summary must name the set-online that lifts the fence",
+        );
+    }
+
+    #[test]
     fn seeding_writes_every_zero_series_for_every_profile_and_label() {
         let sink = PromSink::new();
         sink.seed(&["a", "b"]);
