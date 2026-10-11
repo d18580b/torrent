@@ -5249,6 +5249,59 @@ mod tests {
         assert_eq!((q.in_flight(), q.depth()), (1, 0));
     }
 
+    /// Issue #383: a slot taken outside the queue's own admission, as the
+    /// disk-error retry takes one, counts against the same limit: none is
+    /// handed out past it, or while an admission pass holds the queue, and
+    /// one whose check never started is given back. A check not known to
+    /// start frees its slot once the torrent shows none running.
+    #[test]
+    fn a_disk_error_retry_takes_a_slot_in_the_shared_limit() {
+        use super::CheckSource::DiskErrorRetry;
+
+        let q = super::VerifyQueue::new(2);
+        let (a, b, c) = (InfoHash([1; 20]), InfoHash([2; 20]), InfoHash([3; 20]));
+        assert!(q.try_take(a, DiskErrorRetry));
+        assert!(q.try_take(a, DiskErrorRetry), "one torrent holds one slot");
+        assert!(q.try_take(b, DiskErrorRetry));
+        assert_eq!(q.in_flight(), 2);
+        assert!(!q.try_take(c, DiskErrorRetry), "past the limit");
+        q.release_slot(&a);
+        {
+            let _admitting = q.admit_lock.lock();
+            assert!(
+                !q.try_take(c, DiskErrorRetry),
+                "never waits on an admission"
+            );
+        }
+        assert!(q.try_take(c, DiskErrorRetry));
+        assert_eq!(q.in_flight(), 2);
+
+        // `b` resumed with no check (its error was not a check's), `c` is
+        // checking: past the settle, `b` alone frees its slot.
+        let state = torrentd_engine::StateMap::new();
+        for (ih, phase) in [(b, TorrentPhase::Seeding), (c, TorrentPhase::Checking)] {
+            let mut st = TorrentState::newly_added(
+                TorrentHandle {
+                    id: 1,
+                    infohash: ih,
+                },
+                ProfileId::new("p"),
+                Instant::now(),
+            );
+            st.phase = phase;
+            state.insert(ih, st);
+        }
+        super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
+        assert_eq!(q.in_flight(), 2, "not before the settle");
+        for (r, started) in q.checking.lock().iter_mut() {
+            assert_eq!(r.source, DiskErrorRetry);
+            *started -= super::CHECK_SETTLE;
+        }
+        super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
+        assert_eq!(q.in_flight(), 1);
+        assert!(q.try_take(a, DiskErrorRetry));
+    }
+
     /// A started re-hash whose torrent is removed frees its slot with no
     /// verdict left to await, and one whose check never reports its end
     /// frees it once the expiry passes, and not before.

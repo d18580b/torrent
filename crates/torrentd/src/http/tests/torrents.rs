@@ -1986,6 +1986,18 @@ async fn a_held_add_follows_the_operators_pause_and_resume() {
         "only the operator's resume: {:?}",
         engine.calls()
     );
+
+    // A pause-all is the operator's too, for every torrent still waiting.
+    let resp = h
+        .write_json("POST", "/v1/torrents", metainfo("p", &torrent_bytes('c')))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    assert_eq!(q.depth(), 1);
+    h.write("POST", "/v1/torrents/pause-all")
+        .await
+        .assert_status(StatusCode::OK);
+    assert_eq!((q.depth(), q.in_flight()), (0, 0));
+    assert!(q.holds().held(&p).is_empty());
 }
 
 /// Drop the write bit on `dir`, returning the mode to restore afterwards.

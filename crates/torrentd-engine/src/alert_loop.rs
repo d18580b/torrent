@@ -2063,6 +2063,78 @@ mod tests {
             .any(|c| matches!(c, crate::mock::RecordedCall::ResumeTorrent(_)))
     }
 
+    /// Issue #383: the disk-error retry takes a slot in the daemon's check
+    /// limit before either action that can start a check - the resume of an
+    /// error-paused torrent and the re-check of one libtorrent kept serving -
+    /// and where none is free it looks again later without an attempt, as for
+    /// a fenced profile.
+    #[test]
+    fn the_disk_error_retry_waits_for_a_check_slot() {
+        #[derive(Default)]
+        struct Slots {
+            free: AtomicBool,
+            taken: std::sync::Mutex<Vec<InfoHash>>,
+        }
+        impl CheckSlots for Slots {
+            fn try_take(&self, _: &ProfileId, ih: InfoHash) -> bool {
+                let free = self.free.load(Ordering::SeqCst);
+                if free {
+                    self.taken.lock().unwrap().push(ih);
+                }
+                free
+            }
+            fn release(&self, _: &InfoHash) {}
+        }
+        for (has_error, phase) in [
+            (true, TorrentPhase::Paused),
+            (false, TorrentPhase::DiskError),
+        ] {
+            let engine = Arc::new(MockEngine::new());
+            let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+                Arc::clone(&engine) as Arc<dyn TorrentEngine>
+            ));
+            let state = Arc::new(StateMap::new());
+            let ih = InfoHash([9u8; 20]);
+            let h = TorrentHandle {
+                id: 9,
+                infohash: ih,
+            };
+            let now = std::time::Instant::now();
+            let mut st = crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now);
+            st.has_error = has_error;
+            st.phase = phase;
+            st.retry = Some(crate::state::RetryState {
+                next_attempt: now - Duration::from_secs(1),
+                attempts: 1,
+            });
+            state.insert(ih, st);
+            let metrics: Arc<dyn MetricsSink> = Arc::new(RecordingSink::new());
+            let clock: Arc<dyn Clock> = Arc::new(crate::clock::SystemClock);
+            let slots = Slots::default();
+            let acted = || {
+                engine.calls().iter().any(|c| {
+                    matches!(
+                        c,
+                        crate::mock::RecordedCall::ResumeTorrent(_)
+                            | crate::mock::RecordedCall::ForceRecheck(_)
+                    )
+                })
+            };
+
+            execute_due_retries(&source, &state, &metrics, &clock, None, Some(&slots), now);
+            assert!(!acted(), "has_error {has_error}: acted with no slot free");
+            let retry = state.get(&ih).unwrap().retry.unwrap();
+            assert_eq!(retry.attempts, 1, "waiting for a slot is not an attempt");
+            assert!(retry.next_attempt > now, "the look was scheduled");
+
+            slots.free.store(true, Ordering::SeqCst);
+            let later = retry.next_attempt + Duration::from_secs(1);
+            execute_due_retries(&source, &state, &metrics, &clock, None, Some(&slots), later);
+            assert!(acted(), "has_error {has_error}: a free slot let it act");
+            assert_eq!(*slots.taken.lock().unwrap(), [ih]);
+        }
+    }
+
     #[test]
     fn the_disk_error_retry_resumes_a_torrent_libtorrent_left_errored() {
         // A read failure or a failed check leaves the torrent paused with an
