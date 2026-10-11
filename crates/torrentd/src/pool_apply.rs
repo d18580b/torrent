@@ -3096,16 +3096,31 @@ mod tests {
             },
             &[&"ee".repeat(20), "below/X/a.bin"],
         );
+        // A file it lists but has not written yet resolves through its
+        // parent, the symlinked directory into the source.
+        assert_relocate_refused(
+            |dir| {
+                let below = dir.join("below");
+                std::fs::create_dir_all(&below).unwrap();
+                std::os::unix::fs::symlink(dir.join("pool/old/T"), below.join("X")).unwrap();
+                unclaimed_loaded(&below, Some(&["X/unwritten.bin"]))
+            },
+            &[&"ee".repeat(20), "below/X/unwritten.bin"],
+        );
     }
 
     /// A loaded torrent with no metadata yet could write any file under its
-    /// save path, so one saved above the source refuses the move; so does
-    /// one whose session cannot be read.
+    /// save path, so one saved above the source refuses the move, and so
+    /// does one saved below it; so does one whose session cannot be read.
     #[test]
     fn relocating_refuses_an_unloaded_torrent_a_loaded_one_may_serve_from() {
         assert_relocate_refused(
             |dir| unclaimed_loaded(&dir.join("pool"), None),
             &[&"ee".repeat(20), "serves"],
+        );
+        assert_relocate_refused(
+            |dir| unclaimed_loaded(&dir.join("pool/old/T"), None),
+            &[&"ee".repeat(20), "serves", "pool/old/T from under"],
         );
         for op in ["torrent_details", "torrent_files"] {
             assert_relocate_refused(
