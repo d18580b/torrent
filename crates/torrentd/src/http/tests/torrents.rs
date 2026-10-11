@@ -1663,6 +1663,19 @@ async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
     recheck(LOADED).await;
     assert_eq!(rechecked().last(), Some(&LOADED));
     assert_eq!(q.depth(), 0);
+
+    // So does a magnet still without metadata: there is nothing to hash
+    // against yet, and libtorrent checks it once its metadata arrives.
+    let magnet = hashes[1];
+    h.state
+        .state
+        .update(&magnet, |st| st.phase = TorrentPhase::AwaitingMetadata);
+    let before = rechecked().len();
+    recheck(magnet).await;
+    assert_eq!(rechecked().len(), before + 1);
+    assert_eq!(rechecked().last(), Some(&magnet));
+    assert_eq!(q.depth(), 0);
+    assert_eq!(q.in_flight(), 0);
 }
 
 /// Drop the write bit on `dir`, returning the mode to restore afterwards.
