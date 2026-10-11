@@ -807,8 +807,9 @@ impl vpn::killswitch::Fence for KillSwitchFence {
         // `ip` (up to its timeout), and every add alert on the alert loop's
         // one thread waits on this lock (`hold_recorded`), so probing under
         // it would stall the loop for as long as the probes take. Each
-        // verdict is kept with the record's mark, and applied below only to
-        // the record it was taken for.
+        // verdict is kept with the record's mark and the profile's fence
+        // generation, read with the status it was checked under, and applied
+        // below only to the record and the fence it was taken for.
         let marked: Vec<(ProfileId, u64)> = self
             .fenced
             .lock()
@@ -819,13 +820,12 @@ impl vpn::killswitch::Fence for KillSwitchFence {
         let checked: Vec<_> = marked
             .into_iter()
             .map(|(id, mark)| {
-                let healthy = self
-                    .profiles
-                    .resolve(&id)
-                    .active()
-                    .filter(|e| e.health().status == ProfileStatus::VpnDown)
-                    .map(|e| recovery_check(e, &self.probe));
-                (id, mark, healthy)
+                let checked = self.profiles.resolve(&id).active().and_then(|e| {
+                    let health = e.health();
+                    (health.status == ProfileStatus::VpnDown)
+                        .then(|| (health.fence_generation, recovery_check(e, &self.probe)))
+                });
+                (id, mark, checked)
             })
             .collect();
         // Held from the take of each record to its mark, not taken and
@@ -834,7 +834,7 @@ impl vpn::killswitch::Fence for KillSwitchFence {
         // find no record, and its torrents would stay paused in a profile
         // lifted around them.
         let mut fenced = self.fenced.lock();
-        for (profile_id, mark, healthy) in checked {
+        for (profile_id, mark, checked) in checked {
             // A record whose mark is not the one checked above is a fence
             // that landed since; it stays, unchecked, for the next lift.
             if fenced.profiles.get(&profile_id).map(|r| r.mark) != Some(mark) {
@@ -866,9 +866,25 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             };
             // Not checked: the profile did not read fenced when the checks
             // ran, so whatever fenced it since (the monitor) owns that fence.
-            let Some(healthy) = healthy else {
+            let Some((generation, healthy)) = checked else {
                 continue;
             };
+            // Fenced again since the check: the operator set the profile
+            // online and the monitor fenced it for its tunnel while the other
+            // profiles were probed. The mark above cannot tell, since neither
+            // touches this fence's record, and the profile reads `vpn_down`
+            // as it did; but every fence bumps the generation, so the verdict
+            // is one on a tunnel that has failed since. That fence owns the
+            // profile now, as it does an unchecked one.
+            if entry.health().fence_generation != generation {
+                info!(
+                    target: "torrentd::vpn_monitor",
+                    profile_id = %profile_id,
+                    "network kill switch back in force, but this profile was fenced again \
+                     after its tunnel was checked; it stays fenced",
+                );
+                continue;
+            }
             if let Err(reason) = healthy {
                 warn!(
                     target: "torrentd::vpn_monitor",
@@ -3900,6 +3916,53 @@ mod tests {
             fence.with_record(&ProfileId::new("acct_a"), |r| r.is_some()),
             "the record stays for the next lift",
         );
+    }
+
+    /// A profile set online and fenced again by the monitor while the lift
+    /// checks the tunnels is not lifted on the verdict taken before: the
+    /// record's mark is unchanged and the profile reads `vpn_down` as it did,
+    /// but the monitor's fence is a newer one, which keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn a_profile_fenced_again_during_the_lifts_check_is_not_lifted_on_it() {
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            move |iface: &str, wg: bool| {
+                // The verdict is the healthy tunnel's; between it and the
+                // lift's lock, the operator sets the profile online and the
+                // monitor fences it for a tunnel that went down since.
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let resolved = fence.profiles.resolve(&ProfileId::new("acct_a"));
+                let entry = resolved.active().expect("the profile");
+                entry.update_health(|h| h.status = ProfileStatus::Active);
+                super::fence(entry, &fence.state, None, fence.metrics.as_ref());
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        fence.fence_all();
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(
+            status_of(&fence),
+            ProfileStatus::VpnDown,
+            "the monitor's fence stands"
+        );
+        assert!(resumes(&engine).is_empty(), "nothing resumed");
     }
 
     /// Without the kill switch no fence lifts by its own record, so the add
