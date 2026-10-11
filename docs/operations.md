@@ -616,12 +616,12 @@ as the session adds it, unless the profile already holds one for it, as it
 does for every torrent the boot loads from its resume file. It is saved
 again at once when a recheck finishes (`POST /v1/torrents/{ih}/recheck`, the
 verify queue's, the disk-error retry's), when a pool relocation's move
-completes, and when `POST /v1/torrents/{ih}/pause` or a failed verification
-pauses the torrent. Otherwise resume data is saved every 30 minutes and by the
-shutdown drain, so a crash loses whatever else changed since the last save,
-such as the pauses of a profile's `pause-all`, of `POST /v1/torrents/pause-all`
-and of a VPN fence. A torrent whose resume file still names the
-directory a relocation moved it from, because the crash came before that
+completes, and when `POST /v1/torrents/{ih}/pause`,
+`POST /v1/profiles/{id}/pause-all`, `POST /v1/torrents/pause-all` or a failed
+verification pauses the torrent. Otherwise resume data is saved every 30
+minutes and by the shutdown drain, so a crash loses whatever else changed
+since the last save, such as the pauses of a VPN fence. A torrent whose
+resume file still names the directory a relocation moved it from, because the crash came before that
 save landed, is re-added where its `.save_path` record and the pool index
 both say it went. A torrent killed before its first save landed has no
 resume file at all:

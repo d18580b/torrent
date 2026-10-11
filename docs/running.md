@@ -1567,14 +1567,14 @@ my VPN configuration work" can be answered before "does my seeding setup
 work".
 
 ```bash
-torrentd --config /etc/torrentd/torrentd.toml vpn check   # all-vpn configs only
+torrentd --config /etc/torrentd/torrentd.toml vpn check
 torrentd --config /etc/torrentd/torrentd.toml vpn check --profile acct_a --json
 torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 ```
 
 | Flag | What it adds |
 | --- | --- |
-| `--profile ID` | Check one profile instead of every configured profile. Name a `vpn` profile with it unless every configured profile is one: the bare form reaches `host` profiles too, and aborts on the first one it reaches. |
+| `--profile ID` | Check one profile instead of every configured profile. The bare form checks every `vpn` profile and reports each `host` profile as `skip`, since it has no tunnel to check; a `skip` does not change the exit status. |
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
 | `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host, and **the only one that needs root** — see below. |
