@@ -277,6 +277,14 @@ int         lt_torrent_force_recheck(lt_session* s, lt_handle h);
  * change so trackers learn the new port. */
 int         lt_torrent_force_reannounce(lt_session* s, lt_handle h);
 
+/* Clear `flags` (LT_TF_* bits) on one torrent; bits it does not carry are
+ * left as they are. Only LT_TF_DISABLE_PEX, LT_TF_DISABLE_DHT and
+ * LT_TF_DISABLE_LSD may be cleared: a call naming any other bit returns
+ * LT_ERR and changes nothing, so no caller can lift upload mode, or a
+ * pause, this way. libtorrent writes the three bits into the torrent's
+ * resume data, so the change outlasts a restart only once a save follows. */
+int         lt_torrent_unset_flags(lt_session* s, lt_handle h, uint32_t flags);
+
 /* Move a torrent's payload to `new_path`, letting libtorrent perform the move
  * so its own storage state stays consistent. Completion arrives as
  * LT_ALERT_STORAGE_MOVED (or LT_ALERT_STORAGE_MOVED_FAILED).

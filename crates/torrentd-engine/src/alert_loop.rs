@@ -58,6 +58,7 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use libtorrent_safe::Alert;
 use libtorrent_safe::ResumeFlags;
+use libtorrent_safe::TorrentFlags;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -129,10 +130,22 @@ pub struct AlertLoopBuilder {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    magnet_guard_lift: Option<MagnetGuardLift>,
     listen_events: Option<Arc<ListenEvents>>,
     listen_device_check: Option<ListenDeviceCheck>,
     shutdown_deadline: Duration,
 }
+
+/// "Which discovery guards does a magnet in this profile shed once its
+/// metadata shows it is public?" — supplied by the daemon, which holds each
+/// profile's config, and answered with
+/// [`policy::public_magnet_lift`](crate::policy::public_magnet_lift).
+///
+/// Asked by the `metadata_received` handler. A magnet is added with DHT, PEX
+/// and LSD disabled on every profile because its `private` bit is unknown
+/// until then; the answer is the part of that guard the profile's own posture
+/// does not keep.
+pub type MagnetGuardLift = Arc<dyn Fn(&ProfileId) -> TorrentFlags + Send + Sync>;
 
 /// "Are this profile's sockets on this listen endpoint held to the right
 /// device?" — supplied by the daemon, which knows each profile's tunnel.
@@ -177,6 +190,7 @@ impl AlertLoopBuilder {
             fatal_listen_failure: false,
             on_fatal: None,
             profile_fenced: None,
+            magnet_guard_lift: None,
             listen_events: None,
             listen_device_check: None,
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
@@ -241,6 +255,14 @@ impl AlertLoopBuilder {
         self
     }
 
+    /// Supply which discovery guards a magnet sheds once its metadata shows
+    /// it is public. Without one, nothing is lifted: every magnet keeps DHT,
+    /// PEX and LSD disabled, which is safe and only costs it peers.
+    pub fn magnet_guard_lift(mut self, f: MagnetGuardLift) -> Self {
+        self.magnet_guard_lift = Some(f);
+        self
+    }
+
     /// Callback fired when the loop decides to self-terminate, before it
     /// begins the resume-data drain.
     pub fn on_fatal(mut self, f: FatalCallback) -> Self {
@@ -278,6 +300,7 @@ impl AlertLoopBuilder {
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
+                let magnet_guard_lift = self.magnet_guard_lift.clone();
                 let listen_events = self.listen_events.clone();
                 let listen_device_check = self.listen_device_check.clone();
                 let shutdown_deadline = self.shutdown_deadline;
@@ -306,6 +329,7 @@ impl AlertLoopBuilder {
                                 fatal_listen_failure,
                                 on_fatal,
                                 profile_fenced,
+                                magnet_guard_lift,
                                 unsaved_at_shutdown,
                                 listen_events,
                                 listen_device_check,
@@ -447,6 +471,7 @@ struct LoopHooks {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    magnet_guard_lift: Option<MagnetGuardLift>,
     unsaved_at_shutdown: Arc<AtomicU64>,
     listen_events: Option<Arc<ListenEvents>>,
     listen_device_check: Option<ListenDeviceCheck>,
@@ -495,6 +520,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.magnet_guard_lift.as_ref(),
                 &mut listen_failures,
                 &mut tracker_failures,
             );
@@ -598,6 +624,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.magnet_guard_lift.as_ref(),
                 &mut listen_failures,
                 &mut tracker_failures,
             );
@@ -621,6 +648,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.magnet_guard_lift.as_ref(),
                 &mut listen_failures,
                 &mut tracker_failures,
             );
@@ -779,6 +807,7 @@ fn dispatch_alert(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    magnet_guard_lift: Option<&MagnetGuardLift>,
     listen_failures: &mut ListenFailures,
     tracker_failures: &mut TrackerFailureLog,
 ) {
@@ -834,7 +863,12 @@ fn dispatch_alert(
             // so the sockets it kept are known (see `ListenFailures`).
             handlers::listen::recheck(&mut ctx, listen_failures);
         }
-        Alert::MetadataReceived { .. } => handlers::metadata::handle(&alert, &mut ctx),
+        Alert::MetadataReceived { .. } => {
+            // Without the daemon's answer nothing is lifted: a magnet keeps
+            // the guards it was added with.
+            let lift = magnet_guard_lift.map_or_else(TorrentFlags::empty, |f| f(&ctx.profile_id));
+            handlers::metadata::handle(&alert, &mut ctx, lift)
+        }
         Alert::TorrentChecked { .. }
         | Alert::StorageMoved { .. }
         | Alert::StorageMovedFailed { .. } => handlers::storage::handle(&alert, &mut ctx),
@@ -1126,6 +1160,7 @@ fn run_shutdown(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    magnet_guard_lift: Option<&MagnetGuardLift>,
     listen_failures: &mut ListenFailures,
     tracker_failures: &mut TrackerFailureLog,
 ) -> u64 {
@@ -1145,6 +1180,7 @@ fn run_shutdown(
         metrics,
         clock,
         profile_fenced,
+        magnet_guard_lift,
         listen_failures,
         tracker_failures,
     ) && clock.now() < stop_at
@@ -1192,6 +1228,7 @@ fn run_shutdown(
             metrics,
             clock,
             profile_fenced,
+            magnet_guard_lift,
             listen_failures,
             tracker_failures,
         );
@@ -1247,6 +1284,7 @@ fn drain_once(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    magnet_guard_lift: Option<&MagnetGuardLift>,
     listen_failures: &mut ListenFailures,
     tracker_failures: &mut TrackerFailureLog,
 ) -> bool {
@@ -1263,6 +1301,7 @@ fn drain_once(
             metrics,
             clock,
             profile_fenced,
+            magnet_guard_lift,
             listen_failures,
             tracker_failures,
         );
@@ -2646,6 +2685,7 @@ mod tests {
                 fatal_listen_failure: false,
                 on_fatal: None,
                 profile_fenced: None,
+                magnet_guard_lift: None,
                 unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
                 listen_events: None,
                 listen_device_check: None,
@@ -2684,6 +2724,7 @@ mod tests {
                     Arc::new(move |_| engine.set_alert_translate_errors(4)) as FatalCallback
                 }),
                 profile_fenced: None,
+                magnet_guard_lift: None,
                 unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
                 listen_events: None,
                 listen_device_check: None,
@@ -2717,12 +2758,73 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.len(), 1);
         assert!(state.contains(&InfoHash([0x42; 20])));
+    }
+
+    /// The daemon's lift reaches the metadata handler for the alert's own
+    /// profile, and without one a public magnet keeps its guards.
+    #[test]
+    fn public_metadata_is_lifted_by_what_the_daemon_answers_for_the_profile() {
+        let metadata = || Alert::MetadataReceived {
+            hdr: AlertHeader {
+                kind: AlertKind::MetadataReceived,
+                infohash: Some(InfoHash([0x43; 20])),
+                handle: Some(TorrentHandle {
+                    id: 1,
+                    infohash: InfoHash([0x43; 20]),
+                }),
+                timestamp_us: 0,
+            },
+            info_section: b"d4:name1:ae".to_vec(),
+        };
+        let unset = |engine: &MockEngine| -> Vec<TorrentFlags> {
+            engine
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    crate::mock::RecordedCall::UnsetFlags { flags, .. } => Some(flags),
+                    _ => None,
+                })
+                .collect()
+        };
+        let asked = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let lift: MagnetGuardLift = {
+            let asked = asked.clone();
+            Arc::new(move |p: &ProfileId| {
+                asked.lock().push(p.clone());
+                TorrentFlags::DISABLE_DHT
+            })
+        };
+
+        for (hook, want) in [
+            (Some(&lift), vec![TorrentFlags::DISABLE_DHT]),
+            (None, vec![]),
+        ] {
+            let engine = Arc::new(MockEngine::new());
+            let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+            dispatch_alert(
+                ProfileId::new("p"),
+                metadata(),
+                &source,
+                &Arc::new(StateMap::new()),
+                &(Arc::new(MemoryResumeStore::new()) as Arc<dyn ResumeStore>),
+                &(Arc::new(MemoryTorrentStore::new()) as Arc<dyn TorrentStore>),
+                &(Arc::new(NoopSink) as Arc<dyn MetricsSink>),
+                &(Arc::new(MockClock::new()) as Arc<dyn Clock>),
+                None,
+                hook,
+                &mut ListenFailures::default(),
+                &mut TrackerFailureLog::default(),
+            );
+            assert_eq!(unset(&engine), want);
+        }
+        assert_eq!(*asked.lock(), vec![ProfileId::new("p")]);
     }
 
     /// Dispatch each of `alerts` for profile `p`, then hand the saves they
@@ -2748,6 +2850,7 @@ mod tests {
                 &torrents,
                 &metrics,
                 &clock,
+                None,
                 None,
                 &mut ListenFailures::default(),
                 &mut TrackerFailureLog::default(),
@@ -2879,6 +2982,7 @@ mod tests {
                 &metrics,
                 &clock,
                 None,
+                None,
                 &mut listen_failures,
                 &mut TrackerFailureLog::default(),
             );
@@ -2925,6 +3029,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
         );
@@ -2956,6 +3061,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
@@ -3000,6 +3106,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
@@ -3050,6 +3157,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
@@ -3185,6 +3293,7 @@ mod tests {
                 &metrics,
                 &clock,
                 None,
+                None,
                 &mut ListenFailures::default(),
                 &mut TrackerFailureLog::default(),
             )
@@ -3255,6 +3364,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
         );
@@ -3290,6 +3400,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
@@ -3354,6 +3465,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
         );
@@ -3396,6 +3508,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),

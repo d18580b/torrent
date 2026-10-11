@@ -168,6 +168,13 @@ impl TorrentEngine for FaultEngine {
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
         self.inner.force_reannounce(h)
     }
+    fn unset_flags(
+        &self,
+        h: TorrentHandle,
+        flags: libtorrent_safe::TorrentFlags,
+    ) -> Result<(), EngineError> {
+        self.inner.unset_flags(h, flags)
+    }
     fn move_storage(
         &self,
         h: TorrentHandle,

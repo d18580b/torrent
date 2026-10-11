@@ -246,7 +246,7 @@ Every profile takes `id` plus `network`, and then:
 | `network = "host"` | |
 | --- | --- |
 | `listen_interfaces` | **required**, e.g. `"eth0:6881"` or `"0.0.0.0:6881,[::]:6881"`. The unspecified address is refused when any `vpn` profile is configured — see [Account isolation](#account-isolation). |
-| `dht` | default `false`. DHT is a public announcement of what this host holds, so it is opt-in. It never applies to a magnet: see below. |
+| `dht` | default `false`. DHT is a public announcement of what this host holds, so it is opt-in. It applies to a magnet only once its metadata shows it public: see below. |
 
 | `network = "vpn"` | |
 | --- | --- |
@@ -265,16 +265,28 @@ private torrent off DHT, PEX and LSD. A magnet has no flag to read until its
 metadata arrives, and libtorrent announces a torrent without metadata on the
 DHT regardless, so a private tracker's magnet would publish its infohash and the
 host's address before anything knew it was private. A magnet is therefore added
-with DHT, PEX and LSD disabled on every profile, host or `vpn`, and keeps them
-disabled once its metadata arrives, across restarts that reload its resume
-data. A torrent whose resume data reloads with no `.torrent` beside it, as a
-magnet still fetching metadata does, gets the same guard at boot. A former
-magnet re-added at boot from its `.torrent` alone, with no resume file, takes
-the profile's own posture instead: its `private` flag is known by then, and
-libtorrent honours it. Its metadata and its
-peers come from the trackers in its `tr=` parameters; a magnet with none can
-fetch its metadata only from a peer its `x.pe` parameters name. Add a public torrent you want on the DHT as
-a `.torrent` instead.
+with DHT, PEX and LSD disabled on every profile, host or `vpn`. Until its
+metadata arrives, its metadata and its peers come from the trackers in its
+`tr=` parameters; a magnet with none can fetch its metadata only from a peer
+its `x.pe` parameters name.
+
+When the metadata arrives, the daemon reads its `private` key. On a host
+profile, metadata with no `private` key, or `private` 0, lifts the guard: the
+torrent takes the profile's own posture, as the same torrent added from a
+`.torrent` would, and the daemon saves its resume data so the lift outlasts a
+restart. Private metadata, or metadata whose `private` key cannot be read,
+keeps the guard for good, across restarts that reload its resume data. A
+`vpn` profile keeps it whatever the metadata says. The lift is logged at
+`info` (`lifted its discovery guards`). A crash before the lift's resume save
+lands reloads the guard and keeps it, since the metadata does not arrive
+again: the torrent then finds peers through its trackers only, until it is
+removed and added again as a `.torrent`.
+
+A torrent whose resume data reloads with no `.torrent` beside it, as a magnet
+still fetching metadata does, gets the guard at boot too. A former magnet
+re-added at boot from its `.torrent` alone, with no resume file, takes the
+profile's own posture instead: its `private` flag is known by then, and
+libtorrent honours it.
 
 Each `vpn` profile's tunnel must come up with its own address. A tunnel is
 routed by its address (`from <address> lookup <table>`), so two sharing one — every Proton

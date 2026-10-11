@@ -25,6 +25,7 @@ use libtorrent_safe::Session;
 use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentDetails;
 use libtorrent_safe::TorrentFile;
+use libtorrent_safe::TorrentFlags;
 use libtorrent_safe::TorrentHandle;
 use libtorrent_safe::TrackerEntry;
 use parking_lot::MappedMutexGuard;
@@ -159,6 +160,11 @@ impl TorrentEngine for RealEngine {
     #[instrument(skip_all, fields(op = "force_reannounce", infohash = %h.infohash))]
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
         Ok(self.session()?.force_reannounce(h)?)
+    }
+
+    #[instrument(skip_all, fields(op = "unset_flags", infohash = %h.infohash, flags = ?flags))]
+    fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError> {
+        Ok(self.session()?.unset_flags(h, flags)?)
     }
 
     #[instrument(skip_all, fields(op = "move_storage", infohash = %h.infohash, new_path))]

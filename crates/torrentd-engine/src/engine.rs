@@ -19,6 +19,7 @@ pub use libtorrent_safe::ResumeFlags;
 pub use libtorrent_safe::Settings;
 pub use libtorrent_safe::TorrentDetails;
 pub use libtorrent_safe::TorrentFile;
+pub use libtorrent_safe::TorrentFlags;
 pub use libtorrent_safe::TorrentHandle;
 pub use libtorrent_safe::TrackerEntry;
 use thiserror::Error;
@@ -80,6 +81,12 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// Announce to every tracker now rather than at the next scheduled
     /// interval. Fire-and-forget: the outcome arrives as tracker alerts.
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError>;
+    /// Clear `flags` on one torrent. Only the discovery guards
+    /// (`DISABLE_PEX`, `DISABLE_DHT`, `DISABLE_LSD`) may be cleared; any
+    /// other bit is refused and reaches no torrent. The change reaches resume
+    /// data only with the next save, so a caller that must keep it across a
+    /// restart queues one.
+    fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError>;
     /// Relocate a torrent's payload via libtorrent, so its storage state stays
     /// consistent. Asynchronous: `Alert::StorageMoved{,Failed}`.
     fn move_storage(
@@ -194,6 +201,9 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
         (**self).force_reannounce(h)
+    }
+    fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError> {
+        (**self).unset_flags(h, flags)
     }
     fn move_storage(
         &self,
