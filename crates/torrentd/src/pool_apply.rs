@@ -1433,6 +1433,30 @@ pub struct TrashOutcome {
     pub failed: Option<(std::path::PathBuf, String)>,
 }
 
+/// Why [`torrent_payload`] refused a payload.
+#[derive(Debug)]
+pub enum PayloadRefusal {
+    /// Other torrents claim files of this one in the pool index: these,
+    /// sorted. Moving its payload would move theirs.
+    Shared(Vec<String>),
+    /// A file could not be proven movable, or the index could not be read:
+    /// why.
+    Unproven(String),
+}
+
+impl std::fmt::Display for PayloadRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shared(others) => write!(
+                f,
+                "{} other torrent(s) claim files of this one in the pool index",
+                others.len(),
+            ),
+            Self::Unproven(why) => f.write_str(why),
+        }
+    }
+}
+
 /// Prove that every file of the torrent `infohash` can go to the trash, and
 /// say which.
 ///
@@ -1448,19 +1472,29 @@ pub struct TrashOutcome {
 ///    device)`, checked here and again at the move.
 ///
 /// A listed file that is on neither the disk nor the index was never
-/// written, and is skipped. Nothing is changed on any outcome.
+/// written, and is skipped. Refused as [`PayloadRefusal::Shared`] when other
+/// torrents claim any of this one's files, before any file is stat'd.
+/// Nothing is changed on any outcome.
+///
+/// The claims, the co-claimants and every file's row are read on the read
+/// connection, in one read transaction: they all come from the same
+/// committed index, and the proof never waits out a scan holding the writer.
+/// A scan still running then can commit a claim on these files after the
+/// read; the delete is not refused for it, and the files go to the trash,
+/// where they can be taken back from.
 pub fn torrent_payload(
     pool: &PoolService,
     infohash: &str,
     save_path: &Path,
     files: &[String],
-) -> Result<TorrentPayload, String> {
-    let claims: std::collections::HashSet<(i64, String)> = pool
-        .with_store(|s| s.claims_of(infohash))
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .collect();
-    let mut out = Vec::with_capacity(files.len());
+) -> Result<TorrentPayload, PayloadRefusal> {
+    let outside = |path: &Path| {
+        PayloadRefusal::Unproven(format!(
+            "{} is outside every managed root, so there is no trash to move it to",
+            path.display(),
+        ))
+    };
+    let mut located = Vec::with_capacity(files.len());
     for file in files {
         let path = save_path.join(file);
         let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
@@ -1468,53 +1502,64 @@ pub fn torrent_payload(
                 .ok()
                 .map(|r| (*id, root.clone(), r.to_string_lossy().replace('\\', "/")))
         }) else {
-            return Err(format!(
-                "{} is outside every managed root, so there is no trash to move it to",
-                path.display(),
-            ));
+            return Err(outside(&path));
         };
         if !torrentd_pool::plan::contains(&root, &path) {
-            return Err(format!(
-                "{} is outside every managed root, so there is no trash to move it to",
-                path.display(),
-            ));
+            return Err(outside(&path));
         }
+        located.push((path, root_id, root, rel));
+    }
+    let (claims, others, rows) = pool
+        .with_reader(|s| {
+            let claims: std::collections::HashSet<(i64, String)> =
+                s.claims_of(infohash)?.into_iter().collect();
+            let others = s.co_claimants(infohash)?;
+            let rows = located
+                .iter()
+                .map(|(_, root_id, _, rel)| s.file(*root_id, rel))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, torrentd_pool::PoolError>((claims, others, rows))
+        })
+        .map_err(|e| PayloadRefusal::Unproven(e.to_string()))?;
+    if !others.is_empty() {
+        return Err(PayloadRefusal::Shared(others));
+    }
+    let mut out = Vec::with_capacity(located.len());
+    for ((path, root_id, root, rel), row) in located.into_iter().zip(rows) {
+        let unproven = |why: String| Err(PayloadRefusal::Unproven(why));
         let on_disk = match std::fs::symlink_metadata(&path) {
             Ok(md) => Some(md),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("stat {}: {e}", path.display())),
+            Err(e) => return unproven(format!("stat {}: {e}", path.display())),
         };
-        let row = pool
-            .with_store(|s| s.file(root_id, &rel))
-            .map_err(|e| e.to_string())?;
         let (md, row) = match (on_disk, row) {
             (None, None) => continue,
             (Some(md), Some(row)) => (md, row),
             (None, Some(_)) => {
-                return Err(format!(
+                return unproven(format!(
                     "{} is in the index but not on disk; rescan before deleting",
                     path.display(),
                 ))
             }
             (Some(_), None) => {
-                return Err(format!(
+                return unproven(format!(
                     "{} is not in the index; rescan before deleting",
                     path.display(),
                 ))
             }
         };
         if !claims.contains(&(root_id, rel.clone())) {
-            return Err(format!(
+            return unproven(format!(
                 "the index does not record this torrent claiming {}; rescan before deleting",
                 path.display(),
             ));
         }
         if !md.is_file() {
-            return Err(format!("{} is not a regular file", path.display()));
+            return unproven(format!("{} is not a regular file", path.display()));
         }
         let stamp = (row.size, row.mtime_ns, row.ino, row.dev);
         if torrentd_pool::file_stamp(&md) != stamp {
-            return Err(format!(
+            return unproven(format!(
                 "{} changed since the scan that indexed it; rescan before deleting",
                 path.display(),
             ));
@@ -4176,7 +4221,9 @@ mod tests {
         claimed(&pool, dir.path(), &ih, "T/a.bin");
         let refusal = |save: &Path, files: &[&str]| {
             let files: Vec<String> = files.iter().map(|f| (*f).to_owned()).collect();
-            torrent_payload(&pool, &ih, save, &files).unwrap_err()
+            torrent_payload(&pool, &ih, save, &files)
+                .unwrap_err()
+                .to_string()
         };
 
         // Outside every root: there is no trash to go to.
@@ -4202,6 +4249,25 @@ mod tests {
 
         assert!(claimed_file.exists() && unclaimed.exists());
         assert!(!root.join(".torrentd-trash").exists());
+    }
+
+    #[test]
+    fn a_torrents_payload_another_torrent_claims_is_refused_as_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        write(&root, "T/a.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        let other = "cd".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        claimed(&pool, dir.path(), &other, "T/a.bin");
+
+        match torrent_payload(&pool, &ih, &root, &["T/a.bin".to_owned()]) {
+            Err(PayloadRefusal::Shared(others)) => assert_eq!(others, vec![other]),
+            other => panic!("expected a shared refusal, got {other:?}"),
+        }
+        assert!(root.join("T/a.bin").exists());
     }
 
     #[test]
