@@ -4736,8 +4736,9 @@ mod shutdown_report_tests {
             "in the order the scan added them"
         );
         tick(&q);
+        // A check that ended leaves the record in a batch, not a rewrite per
+        // check, while others still wait; every one still waiting is in it.
         let held = PacedHolds::load(record.clone()).0.held(&p);
-        assert_eq!(held.len(), 6, "a check that ended leaves the record");
         assert!(added[6..].iter().all(|ih| held.contains(ih)));
 
         // The restart. Its resume scan loads every torrent the record names

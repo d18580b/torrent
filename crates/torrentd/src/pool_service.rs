@@ -977,6 +977,10 @@ pub struct VerifyQueue {
     /// reads so a restart does not leave one paused for good
     /// ([`VerifyQueue::set_holds`]). In memory until the daemon sets it.
     holds: std::sync::OnceLock<crate::profile_state::PacedHolds>,
+    /// Held adds whose check ended, not yet released from the record
+    /// ([`VerifyQueue::flush_ended_holds`]), and when it was last written.
+    ended_holds: Mutex<Vec<(ProfileId, libtorrent_safe::InfoHash)>>,
+    holds_flushed: Mutex<std::time::Instant>,
     /// Taken by every admission pass and by [`VerifyQueue::try_take`], so two
     /// of them never both see the last free slot.
     admit_lock: Mutex<()>,
@@ -1162,6 +1166,10 @@ const CHECK_SETTLE: Duration = Duration::from_secs(10);
 /// beside the profile states and the paced holds.
 pub const CHECK_HOLDS_FILE: &str = "check_holds.json";
 
+/// How often, at most, the record of held adds is rewritten to release the
+/// adds whose check ended while others still wait.
+const HOLDS_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Debug)]
 pub struct PendingVerify {
     pub infohash: String,
@@ -1211,6 +1219,8 @@ impl VerifyQueue {
             pending_adds: Counted::default(),
             checking: Counted::default(),
             holds: std::sync::OnceLock::new(),
+            ended_holds: Mutex::new(Vec::new()),
+            holds_flushed: Mutex::new(std::time::Instant::now()),
             admit_lock: Mutex::new(()),
             metrics: std::sync::OnceLock::new(),
             rechecks: Mutex::new(Vec::new()),
@@ -1265,6 +1275,9 @@ impl VerifyQueue {
         profile: &ProfileId,
         ih: libtorrent_safe::InfoHash,
     ) -> std::io::Result<()> {
+        // A release still waiting for its write, of an earlier add of the
+        // same torrent, must not take this hold with it.
+        self.ended_holds.lock().retain(|(_, h)| *h != ih);
         self.holds().hold(profile, [ih])
     }
 
@@ -1291,15 +1304,59 @@ impl VerifyQueue {
 
     /// Take `ih` out of the record of held adds, logging a failed write.
     fn release_hold(&self, profile: &ProfileId, ih: libtorrent_safe::InfoHash) {
-        if let Err(e) = self.holds().release(profile, [ih]) {
+        self.release_holds(profile, vec![ih]);
+    }
+
+    /// Take `ihs` out of the record of held adds in one write, logging a
+    /// failed one.
+    fn release_holds(&self, profile: &ProfileId, ihs: Vec<libtorrent_safe::InfoHash>) {
+        let count = ihs.len();
+        if let Err(e) = self.holds().release(profile, ihs) {
             warn!(
                 target: "torrentd::pool",
                 profile_id = %profile,
-                infohash = %ih,
+                count,
                 error.cause = %e,
-                "could not release a torrent from the record of adds held for a check slot; \
-                 the next boot holds it paused and queues its check again",
+                "could not release torrents from the record of adds held for a check slot; \
+                 the next boot holds them paused and queues their checks again",
             );
+        }
+    }
+
+    /// Release the record entries of held adds whose check ended, at most
+    /// once every [`HOLDS_FLUSH_INTERVAL`] while held adds remain, and at
+    /// once when none does.
+    ///
+    /// The record is rewritten whole on each change, so releasing each check
+    /// as it ended rewrote a file naming every waiting torrent once per check:
+    /// quadratic over a `torrent_dir` of thousands. An entry released late
+    /// costs only a restart in between, which loads its torrent paused and
+    /// checks it again in turn.
+    fn flush_ended_holds(&self, ended: Vec<(ProfileId, libtorrent_safe::InfoHash)>) {
+        let mut pending = self.ended_holds.lock();
+        pending.extend(ended);
+        if pending.is_empty() {
+            return;
+        }
+        let idle = self.pending_adds.len() == 0
+            && !self
+                .checking
+                .lock()
+                .iter()
+                .any(|(r, _)| r.held_by.is_some());
+        let mut last = self.holds_flushed.lock();
+        if !idle && last.elapsed() < HOLDS_FLUSH_INTERVAL {
+            return;
+        }
+        *last = std::time::Instant::now();
+        let mut by_profile: std::collections::HashMap<ProfileId, Vec<_>> =
+            std::collections::HashMap::new();
+        for (profile, ih) in pending.drain(..) {
+            by_profile.entry(profile).or_default().push(ih);
+        }
+        drop((pending, last));
+        for (profile, ihs) in by_profile {
+            self.release_holds(&profile, ihs);
         }
     }
 
@@ -2286,9 +2343,7 @@ fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
     for (ih, started) in ended {
         q.await_recheck_verdict(ih, started);
     }
-    for (profile, ih) in released {
-        q.release_hold(&profile, ih);
-    }
+    q.flush_ended_holds(released);
 }
 
 /// Whether libtorrent has error-paused a torrent whose re-hash started, as a
