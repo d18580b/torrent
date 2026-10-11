@@ -211,16 +211,39 @@ impl std::fmt::Debug for Api {
     }
 }
 
+/// How a `base_url` names the daemon's unix socket: `unix:/run/torrentd/api.sock`.
+pub const UNIX_PREFIX: &str = "unix:";
+
+/// The URL requests over a unix socket are written against. Only its path
+/// and `Host` reach the daemon; `localhost` is a `Host` every daemon answers.
+const UNIX_ORIGIN: &str = "http://localhost";
+
 impl Api {
     /// A client for `base_url`, authenticating with `token` when given. Fails
     /// only locally — an unusable URL — so the error is a message.
+    ///
+    /// `unix:/path` connects to the daemon's socket at `/path`.
     pub fn new(base_url: &str, token: Option<&str>) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("torrentctl/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(5));
+        let origin = match base_url.strip_prefix(UNIX_PREFIX) {
+            Some(path) => {
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        "invalid daemon URL {base_url:?}: a socket is named by an absolute \
+                         path, as in unix:/run/torrentd/api.sock"
+                    ));
+                }
+                builder = builder.unix_socket(path);
+                UNIX_ORIGIN
+            }
+            None => base_url,
+        };
+        let http = builder
             .build()
             .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
-        let mut client = Client::with_client(http, base_url)
+        let mut client = Client::with_client(http, origin)
             .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?;
         if let Some(token) = token {
             client = client.with_credential(
@@ -396,5 +419,18 @@ mod tests {
             !format!("{api:?}").contains("tdp_a"),
             "the token never prints"
         );
+    }
+
+    #[test]
+    fn a_unix_url_names_a_socket_by_its_absolute_path_and_survives_a_new_credential() {
+        let api = Api::new("unix:/run/torrentd/api.sock", None).unwrap();
+        assert_eq!(
+            api.base_url, "unix:/run/torrentd/api.sock",
+            "shown as given"
+        );
+        let next = api.with_token("tds_b").unwrap();
+        assert_eq!(next.base_url, api.base_url);
+        let err = Api::new("unix:run/api.sock", None).unwrap_err();
+        assert!(err.contains("absolute path"), "{err}");
     }
 }
