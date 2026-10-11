@@ -86,7 +86,9 @@
 //! # What a profile's `.ovpn` may not do
 //!
 //! An `.ovpn` is executable configuration: `script-security 2` and an `up`
-//! line run a program, `plugin` loads a shared library into openvpn, and
+//! line run a program, `plugin` loads a shared library into openvpn (as do
+//! `pkcs11-providers`, `show-pkcs11-ids`, `engine`, and `providers` naming a
+//! path, none of which `--script-security` gates), and
 //! `management` opens a socket that drives it, all as the daemon's uid and
 //! with whatever `CAP_NET_ADMIN` it holds. The WireGuard path refuses the
 //! equivalent `wg-quick` hooks, and this one does too, twice:
@@ -95,14 +97,15 @@
 //!   apply in order, so it overrides whatever level the file sets, and no
 //!   hook the file names can run.
 //! * The file is read before `openvpn` is spawned, and by `--check-config`
-//!   ([`config_refusal`]), and a file naming a hook, a plugin, a
-//!   management interface, a nested `config`, a directive that changes
-//!   how openvpn runs its own process, or one that has openvpn write a path
-//!   the file chooses (`log`, `status` and the like) is refused with the
-//!   directive named
-//!   ([`refused_directive`]). The flag alone would let a `plugin` or
-//!   `management` line through, and would leave a hook to fail at runtime
-//!   with a warning rather than at load with the line that names it.
+//!   ([`config_refusal`]), and a file naming a hook (`dns-updown` included,
+//!   unless it is `disable`), a plugin or other directive that loads a
+//!   shared library, a management interface, a nested `config`, a directive
+//!   that changes how openvpn runs its own process, or one that has openvpn
+//!   write a path the file chooses (`log`, `status` and the like) is refused
+//!   with the directive named ([`refused_directive`]). The flag alone would
+//!   let a `plugin`, `pkcs11-providers`, `providers` or `management` line
+//!   through, and would leave a hook to fail at runtime with a warning
+//!   rather than at load with the line that names it.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -173,8 +176,31 @@ fn refusal_reason(name: &str, args: &[String]) -> Option<&'static str> {
         | "client-connect"
         | "client-disconnect"
         | "learn-address" => Some("runs an external program as the daemon's user"),
+        // A command other than `disable` names a program. `--script-security
+        // 1` already keeps it from running, but refusing it here fails the
+        // file at load with its line rather than at runtime with a warning.
+        "dns-updown" => match args.first().map(String::as_str) {
+            Some("disable") => None,
+            _ => Some("runs an external program as the daemon's user"),
+        },
         "iproute" => Some("replaces the `ip` program openvpn runs as the daemon's user"),
-        "plugin" => Some("loads a shared library into openvpn"),
+        // `--script-security` gates none of these: pkcs11-helper loads each
+        // `pkcs11-providers` library at option post-processing, a config
+        // file's `show-pkcs11-ids` loads its provider before listing, and
+        // `engine` falls back to loading its name as an OpenSSL `dynamic`
+        // engine's `SO_PATH`. A headless daemon has no smartcard PIN flow,
+        // so none has a use here.
+        "plugin" | "pkcs11-providers" | "show-pkcs11-ids" | "engine" => {
+            Some("loads a shared library into openvpn")
+        }
+        // OpenSSL loads a provider name holding a `/` as a module file, and
+        // the library's constructors run before it looks for
+        // `OSSL_provider_init`. A bare name (`providers legacy default`, which
+        // bundles with old ciphers carry) loads only from OpenSSL's installed
+        // module directory, so it stays allowed.
+        "providers" if args.iter().any(|a| a.contains('/')) => {
+            Some("loads a shared library into openvpn from a path the file chooses")
+        }
         "management" => Some("opens a control interface that can drive openvpn"),
         "script-security" => match args.first().map(String::as_str) {
             Some("0" | "1") => None,
@@ -307,7 +333,7 @@ fn refused_directive(text: &str) -> Result<(), String> {
             return Err(format!(
                 "line {n}: `{name}` is refused: it {reason}. An .ovpn is executable \
                  configuration, and the daemon runs openvpn with --script-security 1 and \
-                 none of the hooks, plugins or management interface a profile's file \
+                 none of the hooks, shared libraries or management interface a profile's file \
                  names; remove the line"
             ));
         }
@@ -1043,6 +1069,9 @@ mod tests {
     fn a_provider_ovpn_with_no_hook_reads_clean() {
         refused_directive(PROVIDER_OVPN).unwrap();
         refused_directive("crl-verify /etc/openvpn/crl.pem\nscript-security 0\n").unwrap();
+        // A bare provider name loads only from OpenSSL's module directory,
+        // and `disable` names no program (#344).
+        refused_directive("providers legacy default\ndns-updown disable\n").unwrap();
     }
 
     /// Words split the way openvpn's `parse_line` splits them: a quoted
@@ -1079,6 +1108,17 @@ mod tests {
             ("learn-address /x", "learn-address"),
             ("iproute /tmp/ip", "iproute"),
             ("plugin /usr/lib/openvpn/evil.so", "plugin"),
+            // #344: each of these loads a library before any connection.
+            ("pkcs11-providers /x.so", "pkcs11-providers"),
+            ("show-pkcs11-ids /x.so", "show-pkcs11-ids"),
+            ("engine /x.so", "engine"),
+            ("engine", "engine"),
+            ("providers /x/evil.so", "providers"),
+            ("providers legacy /x.so", "providers"),
+            ("providers ../x", "providers"),
+            ("dns-updown /x", "dns-updown"),
+            ("dns-updown force", "dns-updown"),
+            ("dns-updown", "dns-updown"),
             ("management 0.0.0.0 7505", "management"),
             ("script-security 2", "script-security"),
             ("script-security 3 system", "script-security"),
