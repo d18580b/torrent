@@ -239,6 +239,17 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_disk_error_retry_errors" Gauge Profile Owner("always") =>
         "disk_error_retry_errors_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
+    "boot_storage_move_failures" Gauge Profile Owner("always") =>
+        "storage_move_failures_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_pool_plan_failures" Gauge Daemon
+        ("kind": &["step_failed", "index_diverged", "resume_failed", "redrive_timed_out"])
+        Owner("always") =>
+        "pool_plan_failures_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_metrics_dropped_samples" Gauge Daemon ("reason": &["registration", "labels"]) Owner("always") =>
+        "metrics_dropped_samples_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -398,6 +409,14 @@ pub struct BootCount {
 /// profile is fenced. The disk-error retry's first resume comes a minute
 /// after the error, which a scrape interval that long can still precede.
 ///
+/// The boot re-drive of interrupted pool plans starts before the HTTP server
+/// and races the first scrape: where the boot's torrents settle quickly, a
+/// re-drive that fails, or a re-driven step whose storage move fails, is
+/// counted before it. An exporter's dropped sample can come from any
+/// emission, the boot's included. Each is mirrored whole: whatever a counter
+/// an alert reads had counted at the first scrape is beyond `increase()`,
+/// whether it raced the scrape or always precedes it.
+///
 /// `disk_errors_total` appears with its first event, so its gauge does too:
 /// only for the operations the boot counted one under. `tracker_alerts_total`
 /// is mirrored only for the kinds in [`BOOT_TRACKER_KINDS`].
@@ -480,6 +499,23 @@ pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: "disk_error_retry_errors_total",
         gauge: "boot_disk_error_retry_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "storage_move_failures_total",
+        gauge: "boot_storage_move_failures",
+        only: None,
+    },
+    BootCount {
+        counter: "pool_plan_failures_total",
+        gauge: "boot_pool_plan_failures",
+        only: None,
+    },
+    // Last, so its gauge also holds any sample the rows above dropped as
+    // they wrote theirs, which the first render's sample of the counter holds.
+    BootCount {
+        counter: DROPPED,
+        gauge: "boot_metrics_dropped_samples",
         only: None,
     },
 ];
@@ -1104,6 +1140,10 @@ mod tests {
         );
         sink.add_counter("profile_fence_pause_errors_total", 3, &p);
         sink.inc_counter("disk_error_retry_errors_total", &p);
+        sink.add_counter("storage_move_failures_total", 2, &p);
+        sink.inc_counter("pool_plan_failures_total", &[("kind", "resume_failed")]);
+        // A label mismatch, as an emission at boot could make.
+        sink.inc_counter("pool_plan_failures_total", &[("phase", "redrive")]);
 
         let first = String::from_utf8(sink.render()).unwrap();
         let a = "{profile_id=\"a\"}";
@@ -1166,6 +1206,33 @@ mod tests {
             ("boot_fence_pause_errors", b.to_string(), "0"),
             ("boot_disk_error_retry_errors", a.to_string(), "1"),
             ("boot_disk_error_retry_errors", b.to_string(), "0"),
+            ("boot_storage_move_failures", a.to_string(), "2"),
+            ("boot_storage_move_failures", b.to_string(), "0"),
+            (
+                "boot_pool_plan_failures",
+                "{kind=\"resume_failed\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_pool_plan_failures",
+                "{kind=\"step_failed\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_pool_plan_failures",
+                "{kind=\"redrive_timed_out\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_metrics_dropped_samples",
+                "{reason=\"labels\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_metrics_dropped_samples",
+                "{reason=\"registration\"}".to_string(),
+                "0",
+            ),
         ];
         for (name, labels, value) in &expected {
             assert_eq!(
@@ -1203,6 +1270,8 @@ mod tests {
         sink.export_dir_fsync_errors(fsyncs + 1);
         sink.inc_counter("resume_write_errors_total", &p);
         sink.inc_counter("disk_errors_total", &disk("file_write"));
+        sink.inc_counter("pool_plan_failures_total", &[("kind", "resume_failed")]);
+        sink.inc_counter("pool_plan_failures_total", &[("phase", "redrive")]);
         let later = String::from_utf8(sink.render()).unwrap();
         assert_eq!(
             sample(

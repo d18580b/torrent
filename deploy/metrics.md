@@ -78,6 +78,9 @@ hold.
 | `torrentd_boot_torrent_file_persist_errors` | gauge | `profile_id`; `source`: `metadata`, `api` | each profile | from boot: always | torrent_file_persist_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_fence_pause_errors` | gauge | `profile_id` | each profile | from boot: always | profile_fence_pause_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_disk_error_retry_errors` | gauge | `profile_id` | each profile | from boot: always | disk_error_retry_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_storage_move_failures` | gauge | `profile_id` | each profile | from boot: always | storage_move_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_pool_plan_failures` | gauge | `kind`: `step_failed`, `index_diverged`, `resume_failed`, `redrive_timed_out` | daemon | from boot: always | pool_plan_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_metrics_dropped_samples` | gauge | `reason`: `registration`, `labels` | daemon | from boot: always | metrics_dropped_samples_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |

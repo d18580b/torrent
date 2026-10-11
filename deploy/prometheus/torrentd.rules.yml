@@ -52,7 +52,9 @@ groups:
           summary: "Background task {{ $labels.task }} has exited or panicked; what it watched is no longer watched"
 
       - alert: TorrentdMetricsDropped
-        expr: increase(torrentd_metrics_dropped_samples_total[15m]) > 0
+        expr: >
+          increase(torrentd_metrics_dropped_samples_total[15m]) > 0
+          or torrentd_boot_metrics_dropped_samples > 0
         labels:
           severity: warning
         annotations:
@@ -340,6 +342,7 @@ groups:
           or torrentd_boot_torrent_errors > 0
           or torrentd_boot_torrent_add_errors > 0
           or torrentd_boot_disk_error_retry_errors > 0
+          or torrentd_boot_storage_move_failures > 0
         labels:
           severity: warning
         annotations:
@@ -441,7 +444,11 @@ groups:
 
       # ---- pool --------------------------------------------------------
       - alert: TorrentdPoolPlanFailed
-        expr: increase(torrentd_pool_plan_failures_total[15m]) > 0
+        # The boot re-drive of interrupted plans can fail before the first
+        # scrape, where increase() cannot see it; the boot gauge carries it.
+        expr: >
+          increase(torrentd_pool_plan_failures_total[15m]) > 0
+          or torrentd_boot_pool_plan_failures > 0
         labels:
           severity: warning
         annotations:

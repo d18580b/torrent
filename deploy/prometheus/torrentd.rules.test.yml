@@ -79,6 +79,36 @@ tests:
             exp_annotations:
               summary: "The exporter dropped samples (labels); some series are missing or stale"
 
+  # A sample the exporter dropped at boot, before the first scrape: 1 at the
+  # first sample, flat. The boot gauge fires it, past the 15-minute window.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_metrics_dropped_samples_total{reason="labels"}'
+        values: '1x40'
+      - series: 'torrentd_boot_metrics_dropped_samples{reason="labels"}'
+        values: '1x40'
+      - series: 'torrentd_metrics_dropped_samples_total{reason="registration"}'
+        values: '0x40'
+      - series: 'torrentd_boot_metrics_dropped_samples{reason="registration"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdMetricsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: labels
+            exp_annotations:
+              summary: "The exporter dropped samples (labels); some series are missing or stale"
+      - eval_time: 30m
+        alertname: TorrentdMetricsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: labels
+            exp_annotations:
+              summary: "The exporter dropped samples (labels); some series are missing or stale"
+
   # acct_a never came up; acct_b's tunnel drops at 2m, leaving nothing serving.
   - interval: 1m
     input_series:
@@ -958,6 +988,36 @@ tests:
             exp_annotations:
               summary: "Torrents in profile acct_a are failing"
 
+  # A step of a pool plan the boot re-drove whose storage move failed before
+  # the first scrape: 1 at the first sample, flat. The boot gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_storage_move_failures_total{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_boot_storage_move_failures{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_storage_move_failures_total{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_boot_storage_move_failures{profile_id="acct_b"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+      - eval_time: 30m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+
   # disk_errors_total is labelled by libtorrent operation and so is not
   # seeded; the first error creates the series, and the rule matches that.
   - interval: 1m
@@ -1295,6 +1355,36 @@ tests:
               kind: step_failed
             exp_annotations:
               summary: "A pool plan stopped (step_failed); inspect it before resuming"
+
+  # The boot re-drive of an interrupted plan failed before the first scrape:
+  # 1 at the first sample, flat. The boot gauge fires it, past the window.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_plan_failures_total{kind="resume_failed"}'
+        values: '1x40'
+      - series: 'torrentd_boot_pool_plan_failures{kind="resume_failed"}'
+        values: '1x40'
+      - series: 'torrentd_pool_plan_failures_total{kind="step_failed"}'
+        values: '0x40'
+      - series: 'torrentd_boot_pool_plan_failures{kind="step_failed"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdPoolPlanFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: resume_failed
+            exp_annotations:
+              summary: "A pool plan stopped (resume_failed); inspect it before resuming"
+      - eval_time: 30m
+        alertname: TorrentdPoolPlanFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: resume_failed
+            exp_annotations:
+              summary: "A pool plan stopped (resume_failed); inspect it before resuming"
 
   - interval: 1m
     input_series:
