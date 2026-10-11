@@ -274,9 +274,7 @@ impl DeleteScope {
     fn reached_by(&self, live: &LiveTorrent) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
         let save_path = live.save_path.as_path();
-        let bases: Vec<std::path::PathBuf> = std::iter::once(save_path.to_path_buf())
-            .chain(std::fs::canonicalize(save_path).ok())
-            .collect();
+        let bases = live.bases();
         let Some(files) = &live.files else {
             return bases.iter().find_map(|b| {
                 if let Some(r) = self.root_over(b) {
@@ -309,13 +307,7 @@ impl DeleteScope {
                     ));
                 }
             }
-            // A file not written yet resolves through its parent: a symlinked
-            // directory below the save path leads there all the same.
-            let resolved = std::fs::canonicalize(&joined).ok().or_else(|| {
-                let parent = std::fs::canonicalize(joined.parent()?).ok()?;
-                Some(parent.join(joined.file_name()?))
-            });
-            if let Some(p) = resolved {
+            if let Some(p) = live.resolved(rel) {
                 if let Some(r) = self.root_over(&p) {
                     return Some(format!(
                         "lists {rel}, at {}, which a symlink leads to {}, under this plan's \
@@ -797,6 +789,7 @@ fn move_torrent(
             )
             .into());
         }
+        refuse_live_files_under(source, state, Path::new(&step.src))?;
         move_directory(Path::new(&step.src), Path::new(dst))?;
         record_new_base(pool, &infohash, Path::new(dst));
         return Ok(());
@@ -1133,6 +1126,56 @@ fn await_storage_move_within(
     }
 }
 
+/// Refuse renaming `src`, an unloaded torrent's directory, while any torrent
+/// a session holds serves a file from under it.
+///
+/// The pool index cannot answer this: claims come from the matcher alone, so
+/// a cross-seed added through `POST /v1/torrents` with a `save_path` over the
+/// same files claims nothing, and `recheck_relocatable` sees neither a
+/// co-claimant nor a foreign file. This reads every loaded torrent from its
+/// session instead, as `DELETE ?delete_files=true` does. One whose session
+/// cannot be read cannot be shown not to serve from `src`, so it refuses too.
+fn refuse_live_files_under(
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    src: &Path,
+) -> Result<(), String> {
+    let mut loaded = state.infohashes();
+    loaded.sort_unstable_by_key(libtorrent_safe::InfoHash::to_hex);
+    for ih in &loaded {
+        // Removed since the list was taken: it serves nothing any more.
+        let Some(st) = state.get(ih) else { continue };
+        let unprovable = |why: String| {
+            format!(
+                "torrent {ih} {why}, so whether it serves files from under {} cannot be \
+                 ruled out; nothing was moved. Apply again once its session can be read, \
+                 or once it is removed",
+                src.display(),
+            )
+        };
+        let live = read_live_torrent(source, &st).map_err(|e| match e {
+            LiveReadError::NoSession => unprovable(format!(
+                "is held by profile {}, which has no session",
+                st.profile_id,
+            )),
+            LiveReadError::Engine(e) => {
+                unprovable(format!("could not be read from its session ({e})"))
+            }
+        })?;
+        if let Some(path) = live.file_under(src) {
+            return Err(format!(
+                "torrent {ih}, loaded in profile {}, serves {} from under {}, so renaming \
+                 that directory would move its files away from it; nothing was moved. Remove \
+                 that torrent or move it through its session first, then apply again",
+                st.profile_id,
+                path.display(),
+                src.display(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Move a directory tree torrentd owns outright.
 fn move_directory(src: &Path, dst: &Path) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
@@ -1378,9 +1421,7 @@ impl TorrentPayload {
     /// has not arrived yet could write any file under its `save_path`, so
     /// every payload file under it counts as shared.
     pub fn shared_with(&self, other: &LiveTorrent) -> Option<&std::path::Path> {
-        let bases: Vec<std::path::PathBuf> = std::iter::once(other.save_path.clone())
-            .chain(std::fs::canonicalize(&other.save_path).ok())
-            .collect();
+        let bases = other.bases();
         fn forms(f: &PayloadFile) -> impl Iterator<Item = &std::path::PathBuf> {
             std::iter::once(&f.path).chain(f.resolved.as_ref())
         }
@@ -1418,6 +1459,60 @@ pub struct LiveTorrent {
     /// Its files, torrent-relative and `/`-separated, or `None` while its
     /// metadata has not arrived.
     pub files: Option<Vec<String>>,
+}
+
+impl LiveTorrent {
+    /// The first path at which this torrent serves a file from under `dir`,
+    /// or `None` when it serves none from there: the directory-level
+    /// counterpart of [`TorrentPayload::shared_with`], for a move that
+    /// renames `dir` whole.
+    ///
+    /// Paths are compared as the session spells them and with their
+    /// symlinks resolved, on both sides, so a save path reaching `dir`
+    /// through a symlink, a symlinked directory below it, and a file that
+    /// is itself a symlink into `dir` are all caught. A file not written
+    /// yet resolves through its parent. A torrent whose metadata has not
+    /// arrived could write any file under its save path, so it serves from
+    /// `dir` when its save path is `dir`, above it, or below it; the path
+    /// returned is then its save path.
+    pub fn file_under(&self, dir: &Path) -> Option<std::path::PathBuf> {
+        let dirs: Vec<std::path::PathBuf> = std::iter::once(dir.to_path_buf())
+            .chain(std::fs::canonicalize(dir).ok())
+            .collect();
+        let bases = self.bases();
+        let under = |p: &Path| dirs.iter().any(|d| p.starts_with(d));
+        let Some(files) = &self.files else {
+            return bases
+                .iter()
+                .any(|b| under(b) || dirs.iter().any(|d| d.starts_with(b)))
+                .then(|| self.save_path.clone());
+        };
+        files.iter().find_map(|rel| {
+            let hit = bases.iter().any(|b| under(&b.join(rel)))
+                || self.resolved(rel).as_deref().is_some_and(under);
+            hit.then(|| self.save_path.join(rel))
+        })
+    }
+
+    /// Its save path as the session spells it, then with its symlinks
+    /// resolved where it resolves: the two bases every comparison of its
+    /// files joins them to.
+    fn bases(&self) -> Vec<std::path::PathBuf> {
+        std::iter::once(self.save_path.clone())
+            .chain(std::fs::canonicalize(&self.save_path).ok())
+            .collect()
+    }
+
+    /// Where its file `rel` lies with every symlink on its full path
+    /// resolved. A file not written yet resolves through its parent, so a
+    /// symlinked directory below the save path leads there all the same.
+    fn resolved(&self, rel: &str) -> Option<std::path::PathBuf> {
+        let joined = self.save_path.join(rel);
+        std::fs::canonicalize(&joined).ok().or_else(|| {
+            let parent = std::fs::canonicalize(joined.parent()?).ok()?;
+            Some(parent.join(joined.file_name()?))
+        })
+    }
 }
 
 /// What [`trash_torrent_payload`] did.
@@ -2923,6 +3018,178 @@ mod tests {
         assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
         assert!(!src_file.exists());
         assert!(root.join("new/T/a.bin").exists());
+    }
+
+    /// A matched torrent nothing owns at `root/old/T/a.bin`, and a one-step
+    /// relocate plan moving it to `root/new`. Returns the plan and the file.
+    fn unowned_relocate(dir: &Path) -> (Arc<PoolService>, i64, PathBuf) {
+        let root = dir.join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+        let pool = service(dir, true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        add_and_rematch(
+            &pool,
+            &ih,
+            "T",
+            Some(&root.join("old")),
+            &[("T/a.bin", 100)],
+        );
+        let plan_id = relocate_plan(&pool, &ih);
+        (pool, plan_id, src_file)
+    }
+
+    /// Build [`unowned_relocate`] in a fresh directory, load what `load`
+    /// returns for that directory, and apply the plan, expecting its one
+    /// step to fail with an error containing each of `needles` and the
+    /// source to be left in place.
+    fn assert_relocate_refused(
+        load: impl FnOnce(&Path) -> (Arc<dyn AlertSource>, StateMap),
+        needles: &[&str],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, src_file) = unowned_relocate(dir.path());
+        let (source, state) = load(dir.path());
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+        let why = pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0]
+            .error
+            .clone()
+            .unwrap_or_default();
+        for needle in needles {
+            assert!(why.contains(needle), "{needle:?} not in {why}");
+        }
+        assert!(src_file.exists(), "the payload was renamed: {why}");
+        assert!(!dir.path().join("pool/new").exists(), "{why}");
+    }
+
+    /// A torrent added through the API over the unloaded torrent's files has
+    /// no claims, so only its session shows it serves them: renaming the
+    /// directory would pull them from under it.
+    #[test]
+    fn relocating_refuses_an_unloaded_torrent_a_loaded_one_serves_files_from() {
+        assert_relocate_refused(
+            |dir| unclaimed_loaded(&dir.join("pool/old"), Some(&["T/a.bin"])),
+            &[&"ee".repeat(20), "serves", "T/a.bin", "nothing was moved"],
+        );
+    }
+
+    /// The same, reached through a symlink: a save path that is a symlink to
+    /// the source's parent, and one whose directory below it is a symlink
+    /// into the source.
+    #[test]
+    fn relocating_refuses_an_unloaded_torrent_a_loaded_one_serves_through_a_symlink() {
+        assert_relocate_refused(
+            |dir| {
+                let link = dir.join("link");
+                std::os::unix::fs::symlink(dir.join("pool/old"), &link).unwrap();
+                unclaimed_loaded(&link, Some(&["T/a.bin"]))
+            },
+            &[&"ee".repeat(20), "link/T/a.bin"],
+        );
+        assert_relocate_refused(
+            |dir| {
+                let below = dir.join("below");
+                std::fs::create_dir_all(&below).unwrap();
+                std::os::unix::fs::symlink(dir.join("pool/old/T"), below.join("X")).unwrap();
+                unclaimed_loaded(&below, Some(&["X/a.bin"]))
+            },
+            &[&"ee".repeat(20), "below/X/a.bin"],
+        );
+        // A file it lists but has not written yet resolves through its
+        // parent, the symlinked directory into the source.
+        assert_relocate_refused(
+            |dir| {
+                let below = dir.join("below");
+                std::fs::create_dir_all(&below).unwrap();
+                std::os::unix::fs::symlink(dir.join("pool/old/T"), below.join("X")).unwrap();
+                unclaimed_loaded(&below, Some(&["X/unwritten.bin"]))
+            },
+            &[&"ee".repeat(20), "below/X/unwritten.bin"],
+        );
+    }
+
+    /// A loaded torrent with no metadata yet could write any file under its
+    /// save path, so one saved above the source refuses the move, and so
+    /// does one saved below it; so does one whose session cannot be read.
+    #[test]
+    fn relocating_refuses_an_unloaded_torrent_a_loaded_one_may_serve_from() {
+        assert_relocate_refused(
+            |dir| unclaimed_loaded(&dir.join("pool"), None),
+            &[&"ee".repeat(20), "serves"],
+        );
+        assert_relocate_refused(
+            |dir| unclaimed_loaded(&dir.join("pool/old/T"), None),
+            &[&"ee".repeat(20), "serves", "pool/old/T from under"],
+        );
+        for op in ["torrent_details", "torrent_files"] {
+            assert_relocate_refused(
+                |dir| {
+                    let mock = Arc::new(torrentd_engine::MockEngine::new());
+                    let loaded =
+                        unclaimed_loaded_on(mock.clone(), &dir.join("other"), Some(&["a.bin"]));
+                    mock.inject_error(op, torrentd_engine::EngineError::Shutdown);
+                    loaded
+                },
+                &["could not be read from its session", "cannot be ruled out"],
+            );
+        }
+        assert_relocate_refused(
+            |_| {
+                let (source, _) = engine_and_state();
+                let state = StateMap::new();
+                let hash = libtorrent_safe::InfoHash([0xee; 20]);
+                state.insert(
+                    hash,
+                    torrentd_engine::TorrentState::newly_added(
+                        torrentd_engine::TorrentHandle {
+                            id: 1,
+                            infohash: hash,
+                        },
+                        torrentd_engine::ProfileId::new("q"),
+                        std::time::Instant::now(),
+                    ),
+                );
+                (source, state)
+            },
+            &["profile q, which has no session", "cannot be ruled out"],
+        );
+    }
+
+    /// A loaded torrent serving from elsewhere does not block the move, with
+    /// or without its metadata, nor does one in a sibling directory whose
+    /// name merely starts with the source's.
+    #[test]
+    fn relocating_moves_an_unloaded_torrent_beside_a_loaded_one_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, src_file) = unowned_relocate(dir.path());
+        // The step renames the torrent's base directory, `pool/old`.
+        let src = pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0]
+            .src
+            .clone();
+        assert_eq!(Path::new(&src), dir.path().join("pool/old"));
+        let elsewhere = dir.path().join("other");
+        write(&elsewhere, "U/b.bin", 64);
+        let sibling = dir.path().join("pool/older");
+        write(&sibling, "T/a.bin", 64);
+        for save_path in [&elsewhere, &sibling] {
+            for files in [Some(&["U/b.bin", "T/a.bin"][..]), None] {
+                let (source, state) = unclaimed_loaded(save_path, files);
+                refuse_live_files_under(&source, &state, Path::new(&src))
+                    .unwrap_or_else(|e| panic!("refused {save_path:?} with {files:?}: {e}"));
+            }
+        }
+        let (source, state) = unclaimed_loaded(&elsewhere, Some(&["U/b.bin"]));
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert_eq!(
+            (out.done, out.status.as_str()),
+            (1, "applied"),
+            "{out:?} {:?}",
+            steps[0].error,
+        );
+        assert!(!src_file.exists());
+        assert!(dir.path().join("pool/new/T/a.bin").exists());
     }
 
     /// Index a torrent straight into the pool and re-match, as a rescan that
