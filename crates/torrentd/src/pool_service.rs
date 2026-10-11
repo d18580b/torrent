@@ -4018,9 +4018,9 @@ mod tests {
             .map_or(0, |v| v.parse().unwrap())
     }
 
-    /// The kill-switch watch lifts its fence: the profile reads active again
-    /// at once, and the lift's run resumes the torrents a batch at a time
-    /// (`spawn_lift(Lift::KillSwitch)` opens it with `begin_resume`). A
+    /// The kill-switch watch lifts its fence: it records the lift's run with
+    /// `begin_resume`, marks the profile active, and the run resumes the
+    /// torrents a batch at a time (`KillSwitchFence::lift`). A
     /// re-hash that reaches a torrent the run has not resumed yet waits for
     /// it rather than being dropped as paused, and starts once it is resumed.
     #[test]
@@ -4074,9 +4074,13 @@ mod tests {
         w.tick(&pool);
         assert_eq!(q.depth(), 1, "fenced: it waits");
 
-        // Set online: marked active, then resumed a batch at a time.
-        entry.update_health(|h| h.status = ProfileStatus::Active);
+        // Set online: the run is recorded, then the profile marked active,
+        // then its torrents resumed a batch at a time. A tick between the
+        // two steps finds it still fenced.
         let run = entry.begin_resume(w.state.handles_for_profile(&id));
+        w.tick(&pool);
+        assert_eq!(q.depth(), 1, "run recorded, still fenced: it waits");
+        entry.update_health(|h| h.status = ProfileStatus::Active);
         w.tick(&pool);
         assert!(w.rechecked().is_empty());
         assert_eq!(q.depth(), 1, "the lift has yet to resume it: it waits");

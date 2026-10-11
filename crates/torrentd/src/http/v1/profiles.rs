@@ -541,6 +541,11 @@ fn set_state(
 /// request is answered ([`crate::vpn_monitor::spawn_lift`]).
 fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     let profile_id = entry.id();
+    let handles = s.state.handles_for_profile(profile_id);
+    let torrent_count = handles.len();
+    // Recorded before the profile reads active, so a queued re-hash never
+    // finds it active with no run to resume its torrents.
+    let run = entry.begin_resume(handles);
     entry.update_health(|h| {
         h.status = EngineProfileStatus::Active;
         h.tunnel_ip = entry.session_ip;
@@ -550,18 +555,17 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     s.metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
     s.metrics
         .set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
-    let handles = s.state.handles_for_profile(profile_id);
     info!(
         profile_id = %profile_id,
-        torrent_count = handles.len(),
+        torrent_count,
         "fence lifted: the tunnel checked healthy and the profile was set online; resuming \
          its torrents a batch at a time",
     );
-    crate::vpn_monitor::spawn_lift(
+    crate::vpn_monitor::spawn_run(
         &s.profiles,
         &s.metrics,
         entry,
-        handles,
+        run,
         crate::vpn_monitor::Lift::SetOnline,
     );
 }
