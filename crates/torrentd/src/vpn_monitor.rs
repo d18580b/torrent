@@ -530,7 +530,14 @@ pub(crate) fn recovery_check(
 /// second or so, and can overflow the session's alert queue
 /// (`TorrentdAlertQueueOverflow`). Its lift is paced, which is the burst a
 /// flapping tunnel or ruleset would otherwise repeat at full size.
-fn fence(
+///
+/// The generation is bumped in the same update that marks the profile and
+/// starts the count over, so the boot scans, which can read the profile
+/// between this fence's mark and its walk, never see the new mark under the
+/// old generation ([`ProfileHealth::fence_generation`]).
+///
+/// [`ProfileHealth::fence_generation`]: crate::profile_registry::ProfileHealth::fence_generation
+pub(crate) fn fence(
     entry: &ProfileEntry,
     state: &StateMap,
     current: Option<IpAddr>,
@@ -541,6 +548,7 @@ fn fence(
         h.status = ProfileStatus::VpnDown;
         h.tunnel_ip = current;
         h.paused_for_vpn = 0;
+        h.fence_generation += 1;
     });
     atomic::fence(atomic::Ordering::SeqCst);
     let labels = [("profile_id", profile_id.as_str())];

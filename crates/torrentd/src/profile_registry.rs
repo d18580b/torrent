@@ -38,6 +38,13 @@ pub struct ProfileHealth {
     /// handler or `vpn_monitor::hold_if_fenced` is not counted, because both
     /// of those (and the walk) can pause the same torrent.
     pub paused_for_vpn: u64,
+    /// How many times the profile has been fenced: bumped by every fence
+    /// (`vpn_monitor::fence`, which the monitor and the kill-switch watch's
+    /// `fence_all` both run) in the same update that marks it `vpn_down` and
+    /// starts `paused_for_vpn` over, and reset by no lift. The boot scans'
+    /// `ScanFence` reads a value it has not seen as a new fence, whose count
+    /// the torrents it paused before are not yet in.
+    pub fence_generation: u64,
     /// Current NAT-PMP-negotiated listening port (natpmp profiles only; `None`
     /// for static profiles).
     pub forwarded_port: Option<u16>,
@@ -183,6 +190,7 @@ impl ProfileEntry {
                 status: ProfileStatus::Active,
                 tunnel_ip,
                 paused_for_vpn: 0,
+                fence_generation: 0,
                 forwarded_port,
                 forwarded_epoch,
                 port_forward_ok: true,

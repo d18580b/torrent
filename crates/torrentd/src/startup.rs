@@ -1603,7 +1603,7 @@ pub async fn boot(
     // only from their add alerts: an alert libtorrent dropped would leave its
     // torrent seeding with no fence, save or `DELETE` reaching it. The alert
     // loop's handling of each add alert, held above, keeps these entries.
-    scan_fence.track_all(&state);
+    scan_fence.track_all(&state, &profile_registry);
 
     // A profile fenced after its own scan's last add would otherwise keep
     // what that scan loaded running: a fenced profile is skipped by the
@@ -2124,6 +2124,15 @@ struct ScanFenced {
     /// The kill-switch fence's mark (`FenceRecord::mark`) those were paused
     /// under, `None` where it held no record of the profile then.
     mark: Option<u64>,
+    /// The profile's fence generation (`ProfileHealth::fence_generation`)
+    /// those were counted under.
+    generation: u64,
+    /// The profile's fence generation read once [`ScanFence::track_all`]
+    /// had put `handles` into the state map, `None` before then. A fence
+    /// whose generation is past it marked the profile after that read, so
+    /// its walk of the state map found every one of `handles` and counted
+    /// each pause that took.
+    tracked: Option<u64>,
 }
 
 impl ScanFence {
@@ -2158,12 +2167,23 @@ impl ScanFence {
 
     /// Put every torrent the scans added into `state`, under the handle its
     /// session returned. An entry already there for that torrent is kept.
-    fn track_all(&self, state: &StateMap) {
+    ///
+    /// Each profile's fence generation is read after its torrents are in
+    /// `state`, so a fence that bumps it past that read walks a state map
+    /// holding all of them ([`ScanFenced::tracked`]).
+    fn track_all(&mut self, state: &StateMap, profiles: &ProfileRegistry) {
         let now = std::time::Instant::now();
-        for (profile, fenced) in &self.profiles {
+        for (profile, fenced) in &mut self.profiles {
             for &h in &fenced.handles {
                 state.track_added(h, profile, now);
             }
+            // Pairs with the one in `vpn_monitor::fence` between its bump
+            // of the generation and its walk.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            fenced.tracked = profiles
+                .resolve(profile)
+                .active()
+                .map(|e| e.health().fence_generation);
         }
     }
 
@@ -2208,7 +2228,8 @@ impl ScanFence {
         let Some(entry) = profiles.resolve(profile).active() else {
             return;
         };
-        if entry.health().status != ProfileStatus::VpnDown {
+        let health = entry.health();
+        if health.status != ProfileStatus::VpnDown {
             // Lifted since, which during boot only the kill-switch watch
             // does, resuming what it recorded: everything paused so far is
             // running again, and a later fence has all of it to pause.
@@ -2216,24 +2237,45 @@ impl ScanFence {
             fenced.counted.clear();
             return;
         }
-        // Fenced, but not by the fence those were paused under: the
-        // kill-switch watch lifted that one and a fence has landed since,
-        // with no call here in between to see the profile lifted. The lift
-        // resumed them, so all of it is paused again, and counted again: the
-        // new fence started the count over.
+        // Fenced, but not by the fence those were counted under: a lift and
+        // a new fence (the kill-switch watch's or the monitor's) have landed
+        // since, with no call here in between to see the profile lifted. The
+        // lift resumed them, so all of it is paused again, and counted again:
+        // the new fence started the count over. Every fence bumps the
+        // generation and no lift resets it, so this holds whichever fence
+        // came second, and whether or not the kill-switch fence holds a
+        // record of the profile now.
         //
-        // A record that vanished while the profile stayed fenced is most
-        // likely a kill-switch lift that left it fenced for a failing tunnel.
-        // That lift resumed nothing and left the count standing, so what was
-        // paused already is not counted twice, while one whose earlier pause
-        // failed is counted once a pause of it takes. It is still paused
-        // again, since a lift that did resume it, followed by the monitor's
-        // own fence, leaves no record either and reads the same here.
+        // A fence that marked the profile after `track_all` read its
+        // generation walked a state map holding every one of these, and
+        // counted each pause of them that took: they are paused again, which
+        // retries a pause that failed and records them for the kill-switch
+        // lift, but not counted again. A fence that marked it before that
+        // read may have walked the map before or after the tracking, and is
+        // taken to have missed them, so nothing is left running uncounted
+        // for; a walk that raced the tracking can then count some twice.
+        if fenced.generation != health.fence_generation {
+            fenced.generation = health.fence_generation;
+            fenced.counted.clear();
+            fenced.paused = 0;
+            if fenced
+                .tracked
+                .is_some_and(|tracked| health.fence_generation > tracked)
+            {
+                fenced.counted.resize(fenced.handles.len(), true);
+            }
+        }
+        // The same fence, under a different kill-switch record: a record
+        // that vanished while the profile stayed fenced is a kill-switch lift
+        // that left it fenced for a failing tunnel. That lift resumed nothing
+        // and left the count standing, so what was paused already is not
+        // counted twice, while one whose earlier pause failed is counted once
+        // a pause of it takes. All of it is still paused again, which retries
+        // each pause that failed. (A new record never comes without a new
+        // generation: the kill-switch watch fences only a profile not fenced
+        // already.)
         let mark = record.as_ref().map(|r| r.mark);
         if fenced.mark != mark {
-            if mark.is_some() {
-                fenced.counted.clear();
-            }
             fenced.mark = mark;
             fenced.paused = 0;
         }
@@ -5914,7 +5956,7 @@ mod tests {
             loaded.push(h);
         }
         source.hold_alerts(&p);
-        scan.track_all(&state);
+        scan.track_all(&state, &ProfileRegistry::new(vec![]));
         let tracked_before_the_loop = state.len();
 
         let metrics = Arc::new(RecordingSink::new());
@@ -6364,6 +6406,118 @@ mod tests {
         scan.enforce_all(&t.profiles, &t.metrics);
         assert_eq!(t.pauses().len(), 5, "nothing left to pause");
         assert_eq!(t.paused_for_vpn(), 3);
+    }
+
+    /// A kill-switch lift resumes the profile and the monitor fences it
+    /// before the scans' next call, so the scans never see it lifted and
+    /// the kill-switch fence holds no record of it. The lift started the
+    /// count over, and the monitor's walk reaches none of the scans'
+    /// torrents, so the scans' pause of them again is counted again.
+    #[tokio::test(start_paused = true)]
+    async fn a_monitor_fence_after_a_kill_switch_lift_the_scans_never_saw_counts_their_torrents() {
+        use crate::vpn::killswitch::Fence as _;
+
+        let t = KillSwitchScan::new(|| {});
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let hs = [t.handle(1), t.handle(2)];
+
+        t.fence.fence_all();
+        for h in hs {
+            scan.added(&t.profiles, &t.metrics, &t.a, h);
+        }
+        assert_eq!(t.paused_for_vpn(), 2);
+        t.fence.lift();
+        t.settle().await;
+        assert_eq!(t.resumes(), hs);
+        assert_eq!(t.paused_for_vpn(), 0, "the lift started the count over");
+
+        // The tunnel's peer goes away: the monitor fences the profile, and
+        // its walk of an empty state map pauses nothing.
+        let resolved = t.profiles.resolve(&t.a);
+        let entry = resolved.active().unwrap();
+        let walked = crate::vpn_monitor::fence(entry, &StateMap::new(), None, t.metrics.as_ref());
+        assert_eq!(walked, 0);
+        assert_eq!(t.status(), ProfileStatus::VpnDown);
+
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses()[2..], hs, "the scans pause them again");
+        assert_eq!(
+            t.paused_for_vpn(),
+            2,
+            "the monitor's fence counts the scans' torrents"
+        );
+        let exported = String::from_utf8(t.metrics.render()).expect("utf-8");
+        assert!(
+            exported.contains("torrentd_profile_torrents_paused_vpn_down{profile_id=\"acct_a\"} 2"),
+            "{exported}"
+        );
+
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses().len(), 4, "nothing left to pause");
+        assert_eq!(t.paused_for_vpn(), 2, "nothing is counted twice");
+    }
+
+    /// As above, but the monitor fences the profile after the scans' torrents
+    /// are tracked: its walk pauses and counts them, so the scans' last
+    /// enforce pauses them again without counting them again.
+    #[tokio::test(start_paused = true)]
+    async fn a_monitor_fence_after_the_tracking_that_follows_a_lift_counts_the_scans_torrents_once()
+    {
+        use crate::vpn::killswitch::Fence as _;
+
+        let t = KillSwitchScan::new(|| {});
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let state = StateMap::new();
+        let hs = [t.handle(1), t.handle(2)];
+
+        t.fence.fence_all();
+        for h in hs {
+            scan.added(&t.profiles, &t.metrics, &t.a, h);
+        }
+        t.fence.lift();
+        t.settle().await;
+        assert_eq!(t.paused_for_vpn(), 0, "the lift started the count over");
+
+        scan.track_all(&state, &t.profiles);
+        let resolved = t.profiles.resolve(&t.a);
+        let entry = resolved.active().unwrap();
+        let walked = crate::vpn_monitor::fence(entry, &state, None, t.metrics.as_ref());
+        assert_eq!(walked, 2, "the monitor's walk finds the tracked torrents");
+        assert_eq!(t.paused_for_vpn(), 2);
+
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses()[4..], hs, "the scans pause them again");
+        assert_eq!(t.paused_for_vpn(), 2, "nothing is counted twice");
+        let exported = String::from_utf8(t.metrics.render()).expect("utf-8");
+        assert!(
+            exported.contains("torrentd_profile_torrents_paused_vpn_down{profile_id=\"acct_a\"} 2"),
+            "{exported}"
+        );
+    }
+
+    /// The first fence of a profile landing after the scans' torrents are
+    /// tracked: its walk pauses and counts them, and the scans' last enforce
+    /// counts none of them again.
+    #[test]
+    fn a_first_monitor_fence_after_the_tracking_counts_the_scans_torrents_once() {
+        let t = KillSwitchScan::new(|| {});
+        let mut scan = ScanFence::new(None);
+        let state = StateMap::new();
+        let hs = [t.handle(1), t.handle(2), t.handle(3)];
+
+        for h in hs {
+            scan.added(&t.profiles, &t.metrics, &t.a, h);
+        }
+        assert!(t.pauses().is_empty(), "not fenced yet");
+        scan.track_all(&state, &t.profiles);
+        let resolved = t.profiles.resolve(&t.a);
+        let entry = resolved.active().unwrap();
+        let walked = crate::vpn_monitor::fence(entry, &state, None, t.metrics.as_ref());
+        assert_eq!(walked, 3);
+
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses()[3..], hs, "the scans pause them again");
+        assert_eq!(t.paused_for_vpn(), 3, "nothing is counted twice");
     }
 
     /// A torrent whose pause failed was never counted, so when the record
