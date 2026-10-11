@@ -1392,7 +1392,8 @@ pub async fn boot(
                         &profile,
                         &h.infohash,
                     );
-                    let mut unloaded = may_unload && unload_rekeyed(&state, &*engine, &profile, h);
+                    let mut unloaded = may_unload
+                        && unload_rekeyed(&profile_source, &state, &*engine, &profile, h);
                     // Left in the session, it is claimed under the key the
                     // session gave it, as rule 4 requires of every torrent a
                     // session holds. Where it cannot be (another profile
@@ -1416,7 +1417,8 @@ pub async fn boot(
                             }
                         };
                         if !claimed && !may_unload {
-                            unloaded = unload_rekeyed(&state, &*engine, &profile, h);
+                            unloaded =
+                                unload_rekeyed(&profile_source, &state, &*engine, &profile, h);
                         }
                     }
                     warn!(
@@ -2564,12 +2566,21 @@ fn may_unload_rekeyed(
 /// records its own: the boot holds the profile's alerts, and an add of the
 /// same infohash accepted before the removal's alert is handled must keep the
 /// `.torrent` and save path it wrote, which an unrecorded removal deletes.
+///
+/// The profile's alerts are popped and held first, so the add's alert is
+/// translated while the shim still knows the torrent as `h`. A recorded
+/// removal drops only the entry of the handle it names, and an add alert
+/// translated after the removal names a handle the shim issued anew
+/// (`register_handle`), whose entry would outlive the torrent and hold the
+/// shutdown drain.
 fn unload_rekeyed(
+    profile_source: &ProfileSource,
     state: &StateMap,
     engine: &dyn TorrentEngine,
     profile: &ProfileId,
     h: torrentd_engine::TorrentHandle,
 ) -> bool {
+    profile_source.hold_alerts(profile);
     state.begin_removal(profile, h);
     match engine.remove_torrent(h, false) {
         Ok(()) => true,
