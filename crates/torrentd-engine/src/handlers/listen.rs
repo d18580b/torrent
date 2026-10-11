@@ -13,6 +13,10 @@
 //! logged and counted here, the alert loop warns naming it, and the other
 //! sessions keep serving.
 //!
+//! One `ListenFailed` is not a failed socket at all, whatever the session
+//! count: an `accept()` that ran out of file descriptors, after which
+//! libtorrent keeps accepting on the same socket ([`is_accept_emfile`]).
+//!
 //! This handler only logs and records metrics. Nothing in the daemon reads
 //! those metrics back; they are exported for scraping and alerting.
 //!
@@ -43,8 +47,10 @@ use std::os::unix::ffi::OsStrExt;
 use libtorrent_safe::Alert;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 use crate::handlers::HandlerCtx;
+use crate::metrics::LISTEN_ACCEPT_ERRORS;
 use crate::profile::ProfileId;
 
 /// Each profile's listen endpoints whose socket failed and has not come up
@@ -337,10 +343,52 @@ fn bound_device(fd: libc::c_int) -> Option<String> {
     (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned())
 }
 
+/// Whether `alert` is an `accept()` on a listen socket that failed with
+/// `EMFILE`, which leaves the socket listening.
+///
+/// libtorrent's `session_impl::on_accept_connection` answers that error
+/// (`too_many_files_open`) by disconnecting a peer, lowering
+/// `connections_limit` and re-arming the accept on the same socket, and
+/// posts a `listen_failed_alert` with `operation_t::sock_accept` only to say
+/// so. So the alert loop does not take it as a failed socket: it is neither
+/// fatal nor published to a waiting rebind, and [`handle`] counts it in
+/// `listen_accept_errors_total` rather than in [`ListenFailures`]. Every
+/// other accept error returns without re-arming, so the listener has stopped
+/// accepting and those stay listen failures, `ENFILE` included.
+///
+/// The shim passes the error's value without its category. An accept error
+/// comes from the socket call, in the system category, where 24 is `EMFILE`.
+pub fn is_accept_emfile(alert: &Alert) -> bool {
+    matches!(
+        alert,
+        Alert::ListenFailed { operation, error_code, .. }
+            if operation == "sock_accept" && *error_code == libc::EMFILE
+    )
+}
+
 /// `failures` is the loop's record of which of each profile's sockets are
 /// failed; this alert updates it before the gauge is set from it.
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut ListenFailures) {
     match alert {
+        Alert::ListenFailed {
+            endpoint, message, ..
+        } if is_accept_emfile(alert) => {
+            let _enter = ctx.span.enter();
+            warn!(
+                target: "torrentd_engine::handler::listen",
+                endpoint = %endpoint,
+                error.kind = "listen_accept_emfile",
+                error.code = libc::EMFILE,
+                error.cause = %message,
+                "accepting a peer connection failed: the process is out of file descriptors. \
+                 libtorrent disconnected a peer, lowered connections_limit and keeps accepting \
+                 on this socket; raise LimitNOFILE or lower connections_limit",
+            );
+            ctx.metrics.inc_counter(
+                LISTEN_ACCEPT_ERRORS,
+                &[("profile_id", ctx.profile_id.as_str()), ("errno", "EMFILE")],
+            );
+        }
         Alert::ListenFailed {
             error_code,
             operation,
@@ -744,6 +792,114 @@ mod tests {
         assert!(socket_held(&at));
         drop(udp);
         assert!(!socket_held(&at));
+    }
+
+    fn accept_failed(endpoint: &str, errno: i32) -> Alert {
+        Alert::ListenFailed {
+            hdr: hdr(AlertKind::ListenFailed),
+            error_code: errno,
+            operation: "sock_accept".into(),
+            endpoint: endpoint.into(),
+            iface: "0.0.0.0".into(),
+            message: io::Error::from_raw_os_error(errno).to_string(),
+        }
+    }
+
+    /// The metric calls `alerts` make, each dispatched to profile `a`.
+    fn calls_after(alerts: &[Alert]) -> Vec<MetricCall> {
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let clock = MockClock::new();
+        let metrics = RecordingSink::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut failures = ListenFailures::default();
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: ProfileId::new("a"),
+            span: tracing::info_span!("test"),
+        };
+        for alert in alerts {
+            handle(alert, &mut ctx, &mut failures);
+        }
+        metrics.calls()
+    }
+
+    /// libtorrent keeps accepting after an `EMFILE` on accept, so the
+    /// socket is not failed: the gauge stays at 0, and the error is counted
+    /// by errno rather than as a listen failure.
+    #[test]
+    fn an_accept_out_of_descriptors_leaves_the_gauge_at_0() {
+        let gauge = gauge_after(&[
+            ("a", succeeded("0.0.0.0:6881")),
+            ("a", accept_failed("0.0.0.0:6881", libc::EMFILE)),
+        ]);
+        assert_eq!(gauge["a"], 0.0);
+
+        let calls = calls_after(&[accept_failed("0.0.0.0:6881", libc::EMFILE)]);
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                MetricCall::SetGauge { name, value, .. }
+                    if name == "listen_failure_active" && *value != 0.0
+            )),
+            "{calls:?}",
+        );
+        let counted: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                MetricCall::IncCounter { name, labels } => Some((name.as_str(), labels.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            counted,
+            vec![(
+                LISTEN_ACCEPT_ERRORS,
+                vec![
+                    ("profile_id".to_string(), "a".to_string()),
+                    ("errno".to_string(), "EMFILE".to_string()),
+                ],
+            )],
+        );
+        assert!(crate::metrics::LISTEN_ACCEPT_ERRNOS.contains(&"EMFILE"));
+    }
+
+    /// An accept `EMFILE` neither holds nor clears a socket's failure.
+    #[test]
+    fn an_accept_out_of_descriptors_does_not_clear_a_held_failure() {
+        let gauge = gauge_after(&[
+            ("a", failed("0.0.0.0:6881")),
+            ("a", accept_failed("0.0.0.0:6881", libc::EMFILE)),
+        ]);
+        assert_eq!(gauge["a"], 1.0);
+    }
+
+    /// Every other accept error stops libtorrent's listener, so it is a
+    /// failed socket.
+    #[test]
+    fn any_other_accept_error_is_a_listen_failure() {
+        for errno in [libc::ENFILE, libc::ENOBUFS, libc::ECONNABORTED] {
+            let alert = accept_failed("0.0.0.0:6881", errno);
+            assert!(!is_accept_emfile(&alert), "errno {errno}");
+            let gauge = gauge_after(&[("a", alert)]);
+            assert_eq!(gauge["a"], 1.0, "errno {errno}");
+        }
+        assert!(is_accept_emfile(&accept_failed(
+            "0.0.0.0:6881",
+            libc::EMFILE
+        )));
+        let mut open = failed("0.0.0.0:6881");
+        if let Alert::ListenFailed { error_code, .. } = &mut open {
+            *error_code = libc::EMFILE;
+        }
+        assert!(!is_accept_emfile(&open), "sock_bind with EMFILE");
     }
 
     #[test]
