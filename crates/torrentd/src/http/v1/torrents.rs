@@ -19,8 +19,8 @@ use kynos::prelude::*;
 use kynos::response::status::Accepted;
 use kynos::schema::ParamValue;
 use kynos::security::auth::Scoped;
-use libtorrent_safe::info_hash_from_magnet;
-use libtorrent_safe::info_hash_from_torrent;
+use libtorrent_safe::info_hashes_from_magnet;
+use libtorrent_safe::info_hashes_from_torrent;
 use libtorrent_safe::AddParams;
 use libtorrent_safe::InfoHash;
 use serde::Deserialize;
@@ -191,7 +191,8 @@ impl ParamValue for TorrentPhase {}
 /// `GET /v1/torrents/{infohash}` returns the fuller [`Torrent`], which adds
 /// what only the torrent's session can say.
 pub struct TorrentSummary {
-    /// The torrent's v1 infohash.
+    /// The torrent's v1 infohash, or for a v2-only torrent its v2 infohash
+    /// truncated to 20 bytes.
     pub infohash: InfoHashHex,
     /// The profile the torrent is assigned to. An infohash belongs to exactly
     /// one profile.
@@ -299,14 +300,16 @@ page!(
 /// The torrent `/{infohash}` names.
 #[derive(Schema, PathParams)]
 pub struct TorrentPath {
-    /// The torrent's v1 infohash, 40 hex digits in either case.
+    /// The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex
+    /// digits in either case.
     pub infohash: InfoHashHex,
 }
 
 /// One file of a torrent, `/{infohash}/files/{index}`.
 #[derive(Schema, PathParams)]
 pub struct TorrentFilePath {
-    /// The torrent's v1 infohash, 40 hex digits in either case.
+    /// The torrent's v1 infohash (truncated v2 for a v2-only torrent), 40 hex
+    /// digits in either case.
     pub infohash: InfoHashHex,
     /// The file's index, as `GET /v1/torrents/{infohash}/files` reports it.
     pub index: u32,
@@ -691,7 +694,10 @@ enum AddSource {
 /// From a magnet URI, a `.torrent` on the daemon's filesystem, or a
 /// `.torrent` in the request (base64). The infohash is computed before any
 /// session sees the torrent, so an infohash already assigned anywhere is
-/// `409 torrent-exists` and the session never receives a duplicate. When the
+/// `409 torrent-exists` and the session never receives a duplicate; a hybrid
+/// torrent is checked under its truncated v2 infohash as well as its v1 one.
+/// A magnet must carry the torrent's v1 infohash (`xt=urn:btih:`): one with
+/// only `xt=urn:btmh:` is `422 invalid-metainfo`. When the
 /// profile sets `allowed_tracker_domains`, every tracker the torrent announces
 /// to — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
 /// there must be at least one; when it also sets `allowed_tracker_urls`, every
@@ -787,11 +793,27 @@ pub async fn add_torrent(
     // Compute the info-hash WITHOUT touching any session: Safety Rule 4
     // (the session never receives an unverified torrent) and Rule 3 (global
     // info-hash uniqueness across profiles).
-    let infohash = match &source {
-        AddSource::Magnet(uri) => info_hash_from_magnet(uri),
-        AddSource::File(bytes) => info_hash_from_torrent(bytes),
+    let hashes = match &source {
+        AddSource::Magnet(uri) => info_hashes_from_magnet(uri),
+        AddSource::File(bytes) => info_hashes_from_torrent(bytes),
     }
     .map_err(|e| AddTorrentError::InvalidMetainfo(format!("invalid torrent: {e}")))?;
+    // A magnet's torrent is keyed by its v1 hash, the one its metadata never
+    // takes away. A btmh-only magnet has none until the metadata arrives, and
+    // if that metadata is hybrid the torrent's key would change from the
+    // truncated v2 hash to the v1 one under every record kept by the first.
+    if matches!(source, AddSource::Magnet(_)) && hashes.v1.is_none() {
+        return Err(AddTorrentError::InvalidMetainfo(
+            "a magnet must name the torrent's v1 infohash (xt=urn:btih:...); \
+             for a v2-only torrent, add its .torrent instead"
+                .to_owned(),
+        ));
+    }
+    let Some(infohash) = hashes.key() else {
+        return Err(AddTorrentError::InvalidMetainfo(
+            "the torrent names no infohash".to_owned(),
+        ));
+    };
 
     let registry_error = || {
         s.metrics.inc_counter(
@@ -856,8 +878,10 @@ pub async fn add_torrent(
         }
     }
 
-    // Reject duplicates before the session sees the torrent.
-    if s.registry.lookup(&infohash).is_some() {
+    // Reject duplicates before the session sees the torrent, under each hash
+    // the torrent may be recorded by: a hybrid's truncated v2 hash too, which
+    // is what an earlier build keyed hybrid torrents by.
+    if hashes.keys().any(|k| s.registry.lookup(&k).is_some()) {
         registry_error();
         return Err(AddTorrentError::TorrentExists(
             "a torrent with this infohash is already assigned".to_owned(),
@@ -2059,10 +2083,21 @@ pub async fn resume_torrent(
 /// Re-verify a torrent's payload.
 ///
 /// Re-hashes the payload against the piece hashes. `202`: libtorrent checks
-/// asynchronously, and the torrent's `phase` reports `checking` until it is
-/// done. Needs no `[pool]`. A recheck drops seed mode, which is safe because
-/// the no-download invariant rests on upload mode, and that survives it.
-/// Refused while the profile is fenced, as resuming is.
+/// asynchronously, and the torrent's `phase` reports `checking` from the
+/// moment the check starts until it is done. Needs no `[pool]`. With `[pool]`
+/// configured, the check is queued rather than started, and a queued check
+/// leaves the torrent in its old `phase` until the verify queue starts it:
+/// the queue starts it once a slot is free, at
+/// most `[pool] max_concurrent_verify` checks at once together with
+/// adoptions' verifications and `POST /v1/pool/verifications`' re-hashes, and
+/// `GET /v1/pool` counts it in `verify_queue_depth` while it waits and
+/// `verify_in_flight` while it hashes. Asking again for a torrent already
+/// waiting or checking queues nothing more. Without `[pool]`, and for a
+/// paused torrent or one still without metadata (which libtorrent does not
+/// hash until it is resumed or its metadata arrives), libtorrent is asked at
+/// once. A recheck drops seed mode, which is safe because the no-download
+/// invariant rests on upload mode, and that survives it. Refused while the
+/// profile is fenced, as resuming is.
 #[kynos::post("/torrents/{infohash}/recheck", tag = Torrents)]
 pub async fn recheck_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -2070,6 +2105,31 @@ pub async fn recheck_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
+    // Every check started at once used to run beside every other: libtorrent
+    // bounds checking only for auto-managed torrents, and none is one here.
+    // A scripted recheck of a whole library hashed it all at once, and each
+    // check disconnects its torrent's peers until it ends. The verify queue
+    // is that bound, and its admission checks again everything this request
+    // checked (still loaded, profile on the network), holding the check
+    // while the profile is fenced or a paced resume has yet to reach it.
+    //
+    // Its verdict is not recorded in the pool index: this endpoint never
+    // paused a torrent that failed, or cleared one `drifted`, and
+    // `POST /v1/pool/verifications` is the request that does.
+    //
+    // A paused torrent, or one with no metadata, starts no disk work now:
+    // libtorrent marks it to check once it can. The queue drops such a
+    // re-hash rather than hold a slot for it, so it is asked for directly,
+    // as it always was.
+    let hashes_now = !matches!(
+        st.phase,
+        torrentd_engine::TorrentPhase::Paused | torrentd_engine::TorrentPhase::AwaitingMetadata
+    );
+    if let Some(pool) = s.pool.as_ref().filter(|_| hashes_now) {
+        pool.verify_queue()
+            .enqueue_recheck(st.handle.infohash.to_hex(), false);
+        return Ok(Accepted::new(()));
+    }
     let state = Arc::clone(&s);
     blocking(move || {
         crate::pool_service::force_recheck_marking_checking(

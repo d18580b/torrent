@@ -17,7 +17,11 @@ use tracing::error;
 
 use crate::app_state::AppState;
 
-/// A torrent's v1 infohash as the API spells it: 40 hex digits.
+/// A torrent's infohash as the API spells it: 40 hex digits.
+///
+/// A torrent is named by its v1 infohash, a hybrid (v1+v2) torrent's
+/// included; only a v2-only torrent, which has none, is named by its v2
+/// infohash truncated to its first 20 bytes.
 ///
 /// Emitted lowercase; accepted in either case, in a path and in a body alike.
 /// Anything else is refused where it is parsed — a `400` in a path, a `422`

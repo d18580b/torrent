@@ -5,7 +5,11 @@ use std::fmt;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// 20-byte BitTorrent v1 infohash. Always lowercase hex when displayed.
+/// A 20-byte BitTorrent infohash. Always lowercase hex when displayed.
+///
+/// Where it names a torrent (a handle, an alert, an add's result) it is the
+/// torrent's key, [`crate::InfoHashes::key`]: its v1 hash, or for a v2-only
+/// torrent its v2 hash truncated to 20 bytes.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct InfoHash(#[serde(with = "hex::serde")] pub [u8; 20]);

@@ -1642,6 +1642,129 @@ async fn torrents_behave_as_documented() {
     scenarios(&Coverage::new()).await;
 }
 
+/// Issue #352: `POST /v1/torrents/{ih}/recheck` sent for twelve torrents in a
+/// row, with `[pool] max_concurrent_verify = 4`, never has more than four
+/// checking at once, and starts the rest as earlier checks end. Each used to
+/// call `force_recheck` itself, so all twelve hashed at once, each with its
+/// peers disconnected, while `torrentd_pool_verify_in_flight` read 0.
+#[tokio::test]
+async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+    cfg.pool.as_mut().unwrap().max_concurrent_verify = 4;
+    let pool = crate::pool_service::PoolService::open(&cfg)
+        .unwrap()
+        .expect("the config has [pool]");
+    let hashes: Vec<InfoHash> = (0..12u8).map(|i| InfoHash([0x40 + i; 20])).collect();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        for ih in &hashes {
+            load(s, &e.p, *ih, "p", TorrentPhase::Seeding);
+        }
+        s.pool = Some(Arc::clone(&pool));
+        engine = Some(e.p);
+    });
+    let engine = engine.unwrap();
+    let rechecked = || -> Vec<InfoHash> {
+        engine
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRecheck(h) => Some(h.infohash),
+                _ => None,
+            })
+            .collect()
+    };
+    let recheck = |ih: InfoHash| {
+        let h = &h;
+        async move {
+            h.write("POST", &format!("/v1/torrents/{}/recheck", hex(ih)))
+                .await
+                .assert_status(StatusCode::ACCEPTED);
+        }
+    };
+
+    for ih in &hashes {
+        recheck(*ih).await;
+    }
+    // Asked for twice, queued once.
+    recheck(hashes[0]).await;
+    assert!(
+        rechecked().is_empty(),
+        "nothing hashes before the verify queue admits it: {:?}",
+        engine.calls(),
+    );
+    let q = pool.verify_queue();
+    assert_eq!(q.depth(), 12);
+    let resp = h.read("/v1/pool").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["verify_queue_depth"], 12);
+
+    let tick = || {
+        crate::pool_service::admit_tick_for_tests(
+            &pool,
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    let mut finished = std::collections::HashSet::new();
+    let mut peak = 0;
+    for n in 0..100 {
+        tick();
+        let started = rechecked();
+        let checking = started.iter().filter(|h| !finished.contains(*h)).count();
+        assert!(checking <= 4, "tick {n}: {checking} checking at once");
+        assert_eq!(q.in_flight(), checking, "tick {n}");
+        assert_eq!(q.depth(), 12 - started.len(), "tick {n}");
+        peak = peak.max(checking);
+        if started.len() == hashes.len() && checking == 0 {
+            break;
+        }
+        // The session reports the oldest running check over, as
+        // `torrent_checked` does: after the start, on any clock resolution.
+        if let Some(ih) = started.iter().find(|h| !finished.contains(*h)) {
+            std::thread::sleep(Duration::from_millis(2));
+            h.state
+                .state
+                .update(ih, |st| st.checked_at = Some(Instant::now()));
+            finished.insert(*ih);
+        }
+    }
+    assert_eq!(
+        rechecked(),
+        hashes,
+        "every torrent re-hashed once, in order"
+    );
+    assert_eq!(peak, 4, "the limit is reached, not merely respected");
+    assert_eq!(q.in_flight(), 0);
+
+    // A paused torrent starts no disk work, and the queue would drop its
+    // re-hash: libtorrent is asked at once, as it always was, and marks it
+    // to check once it is resumed.
+    h.state
+        .state
+        .update(&LOADED, |st| st.phase = TorrentPhase::Paused);
+    recheck(LOADED).await;
+    assert_eq!(rechecked().last(), Some(&LOADED));
+    assert_eq!(q.depth(), 0);
+
+    // So does a magnet still without metadata: there is nothing to hash
+    // against yet, and libtorrent checks it once its metadata arrives.
+    let magnet = hashes[1];
+    h.state
+        .state
+        .update(&magnet, |st| st.phase = TorrentPhase::AwaitingMetadata);
+    let before = rechecked().len();
+    recheck(magnet).await;
+    assert_eq!(rechecked().len(), before + 1);
+    assert_eq!(rechecked().last(), Some(&magnet));
+    assert_eq!(q.depth(), 0);
+    assert_eq!(q.in_flight(), 0);
+}
+
 /// Drop the write bit on `dir`, returning the mode to restore afterwards.
 ///
 /// Restoring matters: `tempfile::TempDir`'s cleanup cannot remove a file from
@@ -2914,4 +3037,105 @@ async fn a_torrent_re_added_to_another_profile_right_after_delete_stays_tracked(
     // The removed torrent's own files went with it.
     assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
     assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
+}
+
+/// The repository's own hybrid (v1+v2) test torrent, and its two hashes.
+/// `cargo test` runs without the vendor submodules, so not libtorrent's.
+fn hybrid_torrent() -> (Vec<u8>, InfoHash, InfoHash) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let hashes = libtorrent_safe::info_hashes_from_torrent(&bytes).unwrap();
+    let v1 = hashes.v1.expect("a hybrid has a v1 hash");
+    let v2 = hashes.v2.expect("a hybrid has a v2 hash").truncated();
+    assert_ne!(v1, v2);
+    (bytes, v1, v2)
+}
+
+#[tokio::test]
+async fn a_hybrid_torrent_is_added_and_found_under_its_v1_infohash() {
+    // The infohash a tracker site shows, and the one a btih-only magnet for
+    // the same torrent carries: a key of the truncated v2 hash was a 404 for
+    // it, and let the magnet into a second profile.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let (bytes, v1, v2) = hybrid_torrent();
+
+    let resp = h
+        .write_json("POST", "/v1/torrents", metainfo("p", &bytes))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    resp.assert_header("location", &format!("/v1/torrents/{}", hex(v1)));
+    assert_eq!(resp.json::<Value>()["infohash"], hex(v1));
+    assert_eq!(h.state.registry.lookup(&v1).unwrap().as_str(), "p");
+    assert_eq!(h.state.registry.lookup(&v2), None);
+
+    let resp = h.read(&format!("/v1/torrents/{}", hex(v1))).await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["infohash"], hex(v1));
+
+    // A btih-only magnet for it is the same torrent.
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "magnet",
+                   "uri": format!("magnet:?xt=urn:btih:{}", hex(v1))}}),
+        )
+        .await;
+    assert_problem(&resp, 409, "torrent-exists");
+}
+
+#[tokio::test]
+async fn a_hybrid_torrent_recorded_under_its_truncated_v2_infohash_is_a_duplicate() {
+    // An earlier build keyed hybrid torrents by the truncated v2 hash, and the
+    // registry may still hold one under it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+    });
+    let e = engine.unwrap();
+    let (bytes, v1, v2) = hybrid_torrent();
+    h.state.registry.assign(v2, ProfileId::new("f")).unwrap();
+
+    let before = e.calls().len();
+    let resp = h
+        .write_json("POST", "/v1/torrents", metainfo("p", &bytes))
+        .await;
+    assert_problem(&resp, 409, "torrent-exists");
+    assert_eq!(e.calls().len(), before, "the session never sees it");
+    assert_eq!(h.state.registry.lookup(&v1), None);
+}
+
+#[tokio::test]
+async fn a_magnet_without_a_v1_infohash_is_refused() {
+    // Its key would be the truncated v2 hash until the metadata arrived, and
+    // the v1 hash after, if that metadata is hybrid.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let v2 = "5c".repeat(32);
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "magnet",
+                   "uri": format!("magnet:?xt=urn:btmh:1220{v2}")}}),
+        )
+        .await;
+    assert_problem(&resp, 422, "invalid-metainfo");
+    assert!(resp.json::<Value>()["detail"]
+        .as_str()
+        .unwrap()
+        .contains("xt=urn:btih"));
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(&v2[..40]).unwrap()),
+        None
+    );
 }
