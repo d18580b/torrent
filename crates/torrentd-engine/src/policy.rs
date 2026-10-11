@@ -95,18 +95,32 @@ pub fn seed_flags(profile: &ProfileConfig) -> TorrentFlags {
 /// infohash and the host's address before anything could know it is private:
 /// a BEP 27 breach the tracker can see.
 ///
-/// The guard is not lifted when the metadata turns out public: the session
-/// API has no per-torrent flag clear yet. libtorrent keeps the three bits in
-/// the resume data it writes, so they survive a restart that reloads that
-/// resume data, and [`resume_flags_set_without_metadata`] re-asserts them on
-/// one that reloads it still without metadata. A former magnet the boot
-/// torrent-dir scan re-adds from its `.torrent` alone, with no resume file,
-/// gets the profile's own posture instead: by then its `private` bit is known,
-/// and libtorrent honours it. A magnet on a host
-/// profile therefore finds its metadata and its peers through its trackers
-/// only, and a magnet with no `tr=` only from a peer its `x.pe` names.
+/// Until its metadata arrives, a magnet on a host profile therefore finds its
+/// metadata and its peers through its trackers only, and a magnet with no
+/// `tr=` only from a peer its `x.pe` names. Once the metadata arrives and
+/// shows the torrent public, the `metadata_received` handler clears
+/// [`public_magnet_lift`] and saves resume data; private metadata keeps the
+/// guard for good.
+///
+/// libtorrent keeps the three bits in the resume data it writes, so a guard
+/// still standing survives a restart that reloads that resume data, and
+/// [`resume_flags_set_without_metadata`] re-asserts it on one that reloads it
+/// still without metadata. A former magnet the boot torrent-dir scan re-adds
+/// from its `.torrent` alone, with no resume file, gets the profile's own
+/// posture instead: by then its `private` bit is known, and libtorrent
+/// honours it.
 pub fn magnet_flags(profile: &ProfileConfig) -> TorrentFlags {
     seed_flags(profile) | discovery_off()
+}
+
+/// The part of [`magnet_flags`]' guard a magnet in `profile` sheds once its
+/// metadata shows it is public: DHT, PEX and LSD less what the profile's own
+/// [`discovery_guards`] keep. All three on a host profile, where a public
+/// torrent is as entitled to them as one added from a `.torrent`; none on a
+/// `vpn` profile, which keeps them on every torrent whatever its metadata
+/// says.
+pub fn public_magnet_lift(profile: &ProfileConfig) -> TorrentFlags {
+    discovery_off() - discovery_guards(profile)
 }
 
 /// Flags for an add that must be hash-checked before it seeds. Deliberately no
@@ -343,6 +357,22 @@ mod tests {
             assert!(flags.contains(seed_flags(&p)), "{} {flags:?}", p.id);
             assert!(!flags.intersects(forbidden()), "{flags:?}");
         }
+    }
+
+    #[test]
+    fn public_metadata_lifts_the_magnet_guard_to_the_profiles_own_posture() {
+        // What a magnet keeps once the lift is cleared is exactly what a
+        // `.torrent` add of the same public torrent would carry.
+        for p in [host(), vpn()] {
+            assert_eq!(
+                magnet_flags(&p) - public_magnet_lift(&p),
+                seed_flags(&p),
+                "{}",
+                p.id,
+            );
+        }
+        assert_eq!(public_magnet_lift(&host()), discovery_off());
+        assert!(public_magnet_lift(&vpn()).is_empty());
     }
 
     #[test]

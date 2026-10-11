@@ -1776,6 +1776,19 @@ pub async fn boot(
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
+    // A magnet is added with DHT, PEX and LSD disabled because its `private`
+    // bit is unknown; once its metadata shows it public, the engine lifts
+    // what the profile's own posture does not keep. A profile the registry
+    // does not know lifts nothing.
+    .magnet_guard_lift({
+        let profiles = profile_registry.clone();
+        Arc::new(move |id: &torrentd_engine::ProfileId| {
+            profiles
+                .config(id)
+                .map(torrentd_engine::policy::public_magnet_lift)
+                .unwrap_or_else(torrentd_engine::TorrentFlags::empty)
+        }) as torrentd_engine::MagnetGuardLift
+    })
     // libtorrent's device binding of a listen socket is best effort, and its
     // `listen_succeeded` alert names no device, so every socket a vpn
     // session opens is checked against the kernel as it comes up.
