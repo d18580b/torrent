@@ -333,7 +333,7 @@ async fn serve_connection(
                 parts.extensions.insert(connection);
                 let body = match read_body(body).await {
                     Ok(body) => body,
-                    Err((status, title)) => return Ok::<_, Infallible>(problem(status, title)),
+                    Err((status, detail)) => return Ok::<_, Infallible>(problem(status, detail)),
                 };
                 let request = kynos::http::Request::from_parts(parts, Body::from_bytes(body));
                 Ok(service.call(request).await)
@@ -360,44 +360,38 @@ async fn serve_connection(
 }
 
 /// Read a request body whole, under [`BODY_DEADLINE`] and capped at
-/// [`MAX_ADD_BODY_BYTES`], or the status and title of the problem that
-/// refuses it.
+/// [`MAX_ADD_BODY_BYTES`], or the status and detail of the problem that
+/// refuses it: `413` and `408` as `TimedBody` answers them on TCP.
 async fn read_body(
     body: hyper::body::Incoming,
-) -> Result<bytes::Bytes, (kynos::http::StatusCode, &'static str)> {
+) -> Result<bytes::Bytes, (kynos::http::StatusCode, String)> {
     let limited = http_body_util::Limited::new(body, MAX_ADD_BODY_BYTES);
     match tokio::time::timeout(BODY_DEADLINE, limited.collect()).await {
         Ok(Ok(collected)) => Ok(collected.to_bytes()),
         Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => Err((
             kynos::http::StatusCode::PAYLOAD_TOO_LARGE,
-            "Request body too large",
+            format!("the request body is larger than {MAX_ADD_BODY_BYTES} bytes"),
         )),
-        Ok(Err(_)) => Err((
+        Ok(Err(e)) => Err((
             kynos::http::StatusCode::BAD_REQUEST,
-            "Request body could not be read",
+            format!("the request body could not be read: {e}"),
         )),
         Err(_) => Err((
             kynos::http::StatusCode::REQUEST_TIMEOUT,
-            "Request body not received in time",
+            format!(
+                "the request body did not arrive within {} seconds",
+                BODY_DEADLINE.as_secs()
+            ),
         )),
     }
 }
 
-/// An `about:blank` problem document with `status` and `title`.
-fn problem(status: kynos::http::StatusCode, title: &str) -> kynos::http::Response {
-    let body = serde_json::json!({
-        "type": "about:blank",
-        "title": title,
-        "status": status.as_u16(),
-    });
-    let mut response =
-        kynos::http::Response::new(Body::from_bytes(bytes::Bytes::from(body.to_string())));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        kynos::http::header::CONTENT_TYPE,
-        kynos::http::HeaderValue::from_static("application/problem+json"),
-    );
-    response
+/// An `about:blank` problem document with `status` and `detail`.
+fn problem(status: kynos::http::StatusCode, detail: String) -> kynos::http::Response {
+    use kynos::response::IntoResponse as _;
+    kynos::error::problem::Problem::new(status)
+        .with_detail(detail)
+        .into_response()
 }
 
 #[cfg(test)]
