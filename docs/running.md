@@ -826,8 +826,9 @@ directory, as code. The daemon closes this two ways, as it refuses
   above 1, `daemon`, `chroot`, `cd`, `config` (a nested include), or one
   that has `openvpn` create or overwrite a path the file chooses as the
   daemon's user — `log`, `log-append`, `status`, `replay-persist`,
-  `ifconfig-pool-persist`, `tls-export-cert` (the daemon's state, resume
-  and token files are writable by that user). Words are split as `openvpn`
+  `ifconfig-pool-persist`, `tls-export-cert`, `genkey` (the daemon's
+  state, resume and token files are writable by that user). Words are
+  split as `openvpn`
   splits them, so a word ends at its closing quote (`"plugin"/x.so` is
   `plugin`). A leading `--` and `setenv opt` do not hide one; the body of an inline
   `<ca>`/`<key>`/… block is data and is not read as directives, a
