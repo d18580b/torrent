@@ -563,13 +563,13 @@ impl LoginThrottle {
     }
 
     /// The same throttle with a daemon-wide budget a test can exhaust and
-    /// watch refill.
+    /// watch refill, on a clock only [`advance`](Self::advance) moves: a
+    /// refill a test observes on the system clock races the scheduler.
     #[cfg(test)]
     pub(crate) fn with_kdf_budget(burst: u32, refill: Duration) -> Self {
-        Self {
-            kdf: Mutex::new(KdfBudget::new(burst, refill, Instant::now())),
-            ..Self::new()
-        }
+        let t = Self::with_fake_clock();
+        *t.kdf.lock() = KdfBudget::new(burst, refill, t.clock.now());
+        t
     }
 
     /// Spend one password verification, or say how long until one is
@@ -1316,7 +1316,7 @@ mod tests {
         assert!(t.admit_verification(None).is_ok());
         assert!(t.admit_verification(None).is_err(), "burst of two is spent");
 
-        std::thread::sleep(refill + Duration::from_millis(10));
+        t.advance(refill + Duration::from_millis(10));
         assert!(
             t.admit_verification(None).is_ok(),
             "one refill interval, one run"
@@ -1326,12 +1326,60 @@ mod tests {
             "and only one: the budget accrues, it does not reset",
         );
 
-        std::thread::sleep(refill * 4);
+        t.advance(refill * 4);
         assert!(t.admit_verification(None).is_ok());
         assert!(t.admit_verification(None).is_ok());
         assert!(
             t.admit_verification(None).is_err(),
             "idle time accrues no more than the burst",
+        );
+    }
+
+    /// The instants a wall-clock sleep could never land on: a nanosecond
+    /// short of a refill, exactly one, and several from empty.
+    #[test]
+    fn the_verification_budget_refills_on_the_interval_edges() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+        assert_eq!(
+            t.admit_verification(None),
+            Err(refill),
+            "the refill clock starts at the first token taken from a full bucket",
+        );
+
+        t.advance(refill - Duration::from_nanos(1));
+        assert_eq!(
+            t.admit_verification(None),
+            Err(Duration::from_nanos(1)),
+            "a nanosecond short of a refill accrues nothing",
+        );
+
+        t.advance(Duration::from_nanos(1));
+        assert!(
+            t.admit_verification(None).is_ok(),
+            "exactly one refill interval, one run"
+        );
+        assert_eq!(t.admit_verification(None), Err(refill), "and only one");
+
+        t.advance(refill * 2);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+        assert!(
+            t.admit_verification(None).is_err(),
+            "two intervals from empty, two runs: not the burst of three",
+        );
+
+        t.advance(refill * 10);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+        assert_eq!(
+            t.admit_verification(None),
+            Err(refill),
+            "ten intervals idle accrue no more than the burst",
         );
     }
 
