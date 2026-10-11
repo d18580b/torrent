@@ -150,6 +150,33 @@ pub struct TorrentStatusView {
     pub has_error: bool,
 }
 
+impl TorrentStatusView {
+    /// Copy one shim status view, as a `state_update_alert` or
+    /// `lt_torrent_statuses` filled it. `None` for a torrent whose handle had
+    /// gone invalid when it was read, which names no torrent.
+    pub(crate) fn from_raw(s: &ffi::lt_torrent_status_view) -> Option<Self> {
+        let handle = TorrentHandle::from_raw(s.handle as u64, s.infohash)?;
+        Some(Self {
+            handle,
+            state: s.state,
+            flags: s.flags,
+            total_uploaded: s.total_uploaded,
+            total_payload_uploaded: s.total_payload_uploaded,
+            upload_rate: s.upload_rate,
+            download_rate: s.download_rate,
+            num_peers: s.num_peers,
+            num_seeds: s.num_seeds,
+            num_connections: s.num_connections,
+            progress: s.progress,
+            has_metadata: s.has_metadata != 0,
+            needs_save_resume: s.needs_save_resume != 0,
+            is_finished: s.is_finished != 0,
+            is_seeding: s.is_seeding != 0,
+            has_error: s.has_error != 0,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Alert {
     AddTorrent {
@@ -399,28 +426,7 @@ impl Alert {
                 let mut statuses = Vec::with_capacity(count);
                 if !p.statuses.is_null() {
                     let slice = unsafe { std::slice::from_raw_parts(p.statuses, count) };
-                    for s in slice {
-                        if let Some(handle) = TorrentHandle::from_raw(s.handle as u64, s.infohash) {
-                            statuses.push(TorrentStatusView {
-                                handle,
-                                state: s.state,
-                                flags: s.flags,
-                                total_uploaded: s.total_uploaded,
-                                total_payload_uploaded: s.total_payload_uploaded,
-                                upload_rate: s.upload_rate,
-                                download_rate: s.download_rate,
-                                num_peers: s.num_peers,
-                                num_seeds: s.num_seeds,
-                                num_connections: s.num_connections,
-                                progress: s.progress,
-                                has_metadata: s.has_metadata != 0,
-                                needs_save_resume: s.needs_save_resume != 0,
-                                is_finished: s.is_finished != 0,
-                                is_seeding: s.is_seeding != 0,
-                                has_error: s.has_error != 0,
-                            });
-                        }
-                    }
+                    statuses.extend(slice.iter().filter_map(TorrentStatusView::from_raw));
                 }
                 Alert::StateUpdate { hdr, statuses }
             }

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use libtorrent_safe::alert::TorrentStatusView;
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
 use libtorrent_safe::FilePage;
@@ -271,6 +272,11 @@ impl TorrentEngine for RealEngine {
         let _session = self.session()?;
         Ok(self.held.lock().values().copied().collect())
     }
+
+    #[instrument(skip_all, fields(op = "torrent_statuses"))]
+    fn torrent_statuses(&self) -> Result<Vec<TorrentStatusView>, EngineError> {
+        Ok(self.session()?.torrent_statuses()?)
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +437,122 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!state.contains(&added[0].infohash), "its removal settled");
+
+        alert_loop.signal_shutdown(ShutdownReason::Test);
+        alert_loop.join().expect("alert loop");
+    }
+
+    /// A `state_update_alert` lost to an overflow is the only report of the
+    /// paused torrents it carried: libtorrent posts a torrent again only
+    /// once its status changes, and a paused one does not change. The
+    /// overflow handler reads every status from the session instead, so the
+    /// paused torrents read `Paused`, with libtorrent's `needs_save_resume`.
+    #[test]
+    fn paused_torrents_whose_state_update_overflowed_the_queue_read_paused() {
+        use crate::alert_loop::AlertLoopBuilder;
+        use crate::alert_loop::ShutdownReason;
+        use crate::metrics::RecordingSink;
+        use crate::profile::ProfileId;
+        use crate::resume_store::MemoryResumeStore;
+        use crate::source::ProfileSource;
+        use crate::state::StateMap;
+        use crate::state::TorrentPhase;
+        use crate::torrent_store::MemoryTorrentStore;
+
+        const PAUSED: u32 = 20;
+        // Critical alerts, adds among them, fill three times
+        // `alert_queue_size`, and a state update is held to less: 400 adds
+        // leave no room for it in a queue of 100.
+        const FLOOD: u32 = 400;
+        let mut settings = local_settings();
+        settings.alert_queue_size = Some(100);
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let engine = Arc::new(RealEngine::new(&settings).expect("session"));
+        let p = ProfileId::new("p");
+        let state = Arc::new(StateMap::new());
+        // Running torrents, settled: the check of their missing payload has
+        // left them `downloading`, in upload mode.
+        let paused: Vec<TorrentHandle> = (0..PAUSED)
+            .map(|n| {
+                engine
+                    .add_torrent(AddParams::File {
+                        bytes: tiny_torrent(n),
+                        save_path: dir.path().to_string_lossy().into_owned(),
+                        flags: TorrentFlags::UPLOAD_MODE,
+                        trackers: Vec::new(),
+                    })
+                    .expect("add")
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !engine
+            .torrent_statuses()
+            .expect("statuses")
+            .iter()
+            .all(|s| s.state == 3)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Every change so far posted and consumed, and the map holding what
+        // it said: libtorrent has nothing left to post for them.
+        engine.post_updates();
+        engine.torrent_statuses().expect("statuses");
+        while !engine.pop_alerts().is_empty() {}
+        for h in &paused {
+            assert!(state.track_added(*h, &p, Instant::now()));
+            state.update(&h.infohash, |st| st.phase = TorrentPhase::Incomplete);
+        }
+        // Paused, and then the flood: the next update, the only one that
+        // carries the pauses, finds the queue full.
+        for h in &paused {
+            engine.pause_torrent(*h).expect("pause");
+        }
+        for n in PAUSED..PAUSED + FLOOD {
+            add_tiny(&engine, dir.path(), n);
+        }
+        engine.post_updates();
+        // Synchronous on libtorrent's network thread, so the update above has
+        // been posted, into a full queue, before the alert loop pops.
+        engine.torrent_statuses().expect("statuses");
+
+        let metrics = Arc::new(RecordingSink::new());
+        let alert_loop = AlertLoopBuilder::new(
+            Arc::new(ProfileSource::new(vec![(p.clone(), engine.clone())])),
+            state.clone(),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .shutdown_deadline(Duration::from_secs(1))
+        .spawn();
+
+        // As libtorrent holds them now, and as the map reads them.
+        let settled = || {
+            let live = engine.torrent_statuses().expect("statuses");
+            paused.iter().all(|h| {
+                let Some(s) = live.iter().find(|s| s.handle == *h) else {
+                    return false;
+                };
+                state.get(&h.infohash).is_some_and(|st| {
+                    st.phase == TorrentPhase::Paused && st.needs_save_resume == s.needs_save_resume
+                })
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !settled() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            metrics.count_for("alert_queue_overflows_total") > 0,
+            "the queue overflowed, or this test proves nothing",
+        );
+        assert!(settled(), "every paused torrent reads Paused");
+        assert!(
+            metrics.count_for("statuses_refreshed_total") >= u64::from(PAUSED),
+            "a state update was dropped and every paused torrent refreshed",
+        );
 
         alert_loop.signal_shutdown(ShutdownReason::Test);
         alert_loop.join().expect("alert loop");

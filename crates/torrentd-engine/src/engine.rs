@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+pub use libtorrent_safe::alert::TorrentStatusView;
 pub use libtorrent_safe::AddParams;
 pub use libtorrent_safe::Alert;
 pub use libtorrent_safe::FilePage;
@@ -138,6 +139,16 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// nothing tracking it. A torrent whose removal the session accepted is
     /// not listed, though its `torrent_removed_alert` may still be queued.
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError>;
+    /// Every torrent's status, read from the session now, as a
+    /// `state_update_alert` would carry it, in no order.
+    ///
+    /// Asked by the alert loop when libtorrent reports it dropped a
+    /// `state_update_alert`: libtorrent posts a torrent in one only when its
+    /// status changed since the last post, and forgets the change once
+    /// posted, so a paused or idle torrent whose update was lost would keep
+    /// its stale phase in the state map until a restart. No default, so a
+    /// wrapping engine cannot forget to forward it.
+    fn torrent_statuses(&self) -> Result<Vec<TorrentStatusView>, EngineError>;
     /// How many alerts this session popped from libtorrent and then lost
     /// because the shim could not translate them. Each is dropped on its own
     /// and the rest of its batch still delivered, so a rise is alerts lost one
@@ -247,6 +258,9 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
         (**self).torrents()
+    }
+    fn torrent_statuses(&self) -> Result<Vec<TorrentStatusView>, EngineError> {
+        (**self).torrent_statuses()
     }
     fn alert_translate_errors(&self) -> u64 {
         (**self).alert_translate_errors()

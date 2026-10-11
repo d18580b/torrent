@@ -1,5 +1,6 @@
 //! `StateUpdate` and `TorrentFinished` handlers.
 
+use libtorrent_safe::alert::TorrentStatusView;
 use libtorrent_safe::Alert;
 use libtorrent_safe::TorrentFlags;
 use tracing::info;
@@ -11,93 +12,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
         Alert::StateUpdate { statuses, .. } => {
             for s in statuses {
-                let now = ctx.clock.now();
-                ctx.state.update(&s.handle.infohash, |st| {
-                    st.last_alert = now;
-                    st.upload_rate = s.upload_rate;
-                    st.download_rate = s.download_rate;
-                    st.total_uploaded = s.total_uploaded;
-                    st.total_payload_uploaded = s.total_payload_uploaded;
-                    st.num_peers = s.num_peers;
-                    st.progress = s.progress;
-                    st.is_finished = s.is_finished;
-                    st.is_seeding = s.is_seeding;
-                    st.needs_save_resume = s.needs_save_resume;
-                    st.has_error = s.has_error;
-                    // Map libtorrent's state enum onto our TorrentPhase.
-                    // libtorrent state_t values:
-                    //   0=queued_for_checking (deprecated), 1=checking_files,
-                    //   2=downloading_metadata, 3=downloading, 4=finished,
-                    //   5=seeding, 6=allocating, 7=checking_resume_data
-                    //
-                    // The paused bit wins over the state enum, because
-                    // libtorrent keeps reporting `seeding` for a paused
-                    // torrent: pausing stops the transfers, it does not change
-                    // `state`. Mapping on the enum alone is why
-                    // `TorrentPhase::Paused` was never assigned by anything
-                    // and `/status` reported a permanent zero however many
-                    // torrents were paused — including a whole profile the VPN
-                    // monitor had fenced, which is exactly when someone looks.
-                    //
-                    // `Errored` / `DiskError` are deliberately *not* pinned
-                    // above this: a torrent libtorrent error-paused reports
-                    // `Paused` — the state an operator acts on first — and
-                    // leaves it when the disk-error retry resumes it.
-                    //
-                    // `downloading_metadata` and `downloading` have phases of
-                    // their own. Folding them into whatever came before left a
-                    // torrent whose check found pieces missing reporting
-                    // `Checking` forever, and the disk-error retry, which waits
-                    // out a check, deferring for as long. A torrent that was
-                    // `DiskError` or `Errored` stays so through them: neither
-                    // says the error cleared.
-                    //
-                    // `finished` and `seeding` keep `DiskError` too. Not every
-                    // `file_error_alert` comes with a libtorrent error: a disk
-                    // read for a peer's request that fails
-                    // (vendor/libtorrent/src/peer_connection.cpp,
-                    // `on_disk_read_complete`) rejects the request and posts
-                    // the alert, and nothing else — no `set_error`, no
-                    // `pause()` — so the torrent goes on reporting `seeding`
-                    // while it cannot serve a block. Mapping that to
-                    // `Seeding` hid it from the phase filter, `/status` and
-                    // the disk-error retry alike. The retry clears it: it
-                    // re-checks a torrent in `DiskError` with no libtorrent
-                    // error, which moves it to `Checking`, and the check's
-                    // verdict decides where it goes from there. `Errored` is
-                    // cleared by a healthy update as before: `torrent_error`
-                    // comes from `set_error`, so the error that recorded it
-                    // shows in `has_error` until it is gone.
-                    let flags = TorrentFlags::from_bits_truncate(s.flags);
-                    let sticky =
-                        matches!(st.phase, TorrentPhase::DiskError | TorrentPhase::Errored);
-                    let phase = if flags.contains(TorrentFlags::PAUSED) {
-                        TorrentPhase::Paused
-                    } else {
-                        match s.state {
-                            0 | 1 | 7 => TorrentPhase::Checking,
-                            2 if !sticky => TorrentPhase::AwaitingMetadata,
-                            3 if !sticky => TorrentPhase::Incomplete,
-                            4 | 5 if st.phase == TorrentPhase::DiskError => st.phase,
-                            4 | 5 => {
-                                if s.is_seeding {
-                                    TorrentPhase::Seeding
-                                } else {
-                                    TorrentPhase::Idle
-                                }
-                            }
-                            // Preserve the current phase: `allocating` says
-                            // nothing a seeder acts on, and `DiskError` and
-                            // `Errored` are set by the error handler and must
-                            // survive here.
-                            _ => st.phase,
-                        }
-                    };
-                    if st.phase != phase {
-                        st.phase = phase;
-                    }
-                    st.phase_since_check = true;
-                });
+                apply(s, ctx);
             }
         }
         Alert::TorrentFinished { hdr } => {
@@ -121,6 +36,98 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         }
         _ => unreachable!("state_update::handle called with non-state_update alert"),
     }
+}
+
+/// Fold one torrent's status into its state-map entry, as a
+/// `state_update_alert` reports it. Also fed the statuses the overflow
+/// handler reads from the session when such an alert was dropped.
+pub(crate) fn apply(s: &TorrentStatusView, ctx: &HandlerCtx<'_>) {
+    let now = ctx.clock.now();
+    ctx.state.update(&s.handle.infohash, |st| {
+        st.last_alert = now;
+        st.upload_rate = s.upload_rate;
+        st.download_rate = s.download_rate;
+        st.total_uploaded = s.total_uploaded;
+        st.total_payload_uploaded = s.total_payload_uploaded;
+        st.num_peers = s.num_peers;
+        st.progress = s.progress;
+        st.is_finished = s.is_finished;
+        st.is_seeding = s.is_seeding;
+        st.needs_save_resume = s.needs_save_resume;
+        st.has_error = s.has_error;
+        // Map libtorrent's state enum onto our TorrentPhase.
+        // libtorrent state_t values:
+        //   0=queued_for_checking (deprecated), 1=checking_files,
+        //   2=downloading_metadata, 3=downloading, 4=finished,
+        //   5=seeding, 6=allocating, 7=checking_resume_data
+        //
+        // The paused bit wins over the state enum, because
+        // libtorrent keeps reporting `seeding` for a paused
+        // torrent: pausing stops the transfers, it does not change
+        // `state`. Mapping on the enum alone is why
+        // `TorrentPhase::Paused` was never assigned by anything
+        // and `/status` reported a permanent zero however many
+        // torrents were paused — including a whole profile the VPN
+        // monitor had fenced, which is exactly when someone looks.
+        //
+        // `Errored` / `DiskError` are deliberately *not* pinned
+        // above this: a torrent libtorrent error-paused reports
+        // `Paused` — the state an operator acts on first — and
+        // leaves it when the disk-error retry resumes it.
+        //
+        // `downloading_metadata` and `downloading` have phases of
+        // their own. Folding them into whatever came before left a
+        // torrent whose check found pieces missing reporting
+        // `Checking` forever, and the disk-error retry, which waits
+        // out a check, deferring for as long. A torrent that was
+        // `DiskError` or `Errored` stays so through them: neither
+        // says the error cleared.
+        //
+        // `finished` and `seeding` keep `DiskError` too. Not every
+        // `file_error_alert` comes with a libtorrent error: a disk
+        // read for a peer's request that fails
+        // (vendor/libtorrent/src/peer_connection.cpp,
+        // `on_disk_read_complete`) rejects the request and posts
+        // the alert, and nothing else — no `set_error`, no
+        // `pause()` — so the torrent goes on reporting `seeding`
+        // while it cannot serve a block. Mapping that to
+        // `Seeding` hid it from the phase filter, `/status` and
+        // the disk-error retry alike. The retry clears it: it
+        // re-checks a torrent in `DiskError` with no libtorrent
+        // error, which moves it to `Checking`, and the check's
+        // verdict decides where it goes from there. `Errored` is
+        // cleared by a healthy update as before: `torrent_error`
+        // comes from `set_error`, so the error that recorded it
+        // shows in `has_error` until it is gone.
+        let flags = TorrentFlags::from_bits_truncate(s.flags);
+        let sticky = matches!(st.phase, TorrentPhase::DiskError | TorrentPhase::Errored);
+        let phase = if flags.contains(TorrentFlags::PAUSED) {
+            TorrentPhase::Paused
+        } else {
+            match s.state {
+                0 | 1 | 7 => TorrentPhase::Checking,
+                2 if !sticky => TorrentPhase::AwaitingMetadata,
+                3 if !sticky => TorrentPhase::Incomplete,
+                4 | 5 if st.phase == TorrentPhase::DiskError => st.phase,
+                4 | 5 => {
+                    if s.is_seeding {
+                        TorrentPhase::Seeding
+                    } else {
+                        TorrentPhase::Idle
+                    }
+                }
+                // Preserve the current phase: `allocating` says
+                // nothing a seeder acts on, and `DiskError` and
+                // `Errored` are set by the error handler and must
+                // survive here.
+                _ => st.phase,
+            }
+        };
+        if st.phase != phase {
+            st.phase = phase;
+        }
+        st.phase_since_check = true;
+    });
 }
 
 #[cfg(test)]

@@ -269,6 +269,27 @@ int  lt_pop_alert(lt_session* s, struct lt_alert_union* out);
  * safe to call on a zero-initialized union. */
 void lt_alert_payload_free(struct lt_alert_union* u);
 
+/* Every torrent's status, read from the session now. `statuses` is
+ * heap-allocated; release the whole struct with lt_status_list_free(). */
+struct lt_status_list {
+    struct lt_torrent_status_view* statuses;
+    size_t count;
+};
+
+/* Fill *out with the status of every torrent the session holds, in the shape
+ * a state_update_alert carries, whether or not it changed since the last
+ * lt_post_torrent_updates. For an overflow that dropped a state_update_alert:
+ * libtorrent posts a torrent again only once its status changes again, so a
+ * paused or idle torrent whose update was lost is never reported otherwise.
+ * Returns LT_OK / LT_ERR (err_out populated). On LT_OK the caller MUST call
+ * lt_status_list_free(out); on LT_ERR nothing was allocated. */
+int  lt_torrent_statuses(lt_session* s, struct lt_status_list* out,
+                         char* err_out, int err_len);
+
+/* Release the heap status list. Idempotent; safe on a zero-initialized
+ * struct. */
+void lt_status_list_free(struct lt_status_list* l);
+
 #ifdef __cplusplus
 }
 #endif

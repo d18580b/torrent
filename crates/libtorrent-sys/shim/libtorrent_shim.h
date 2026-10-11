@@ -599,6 +599,10 @@ void        lt_tracker_list_free(struct lt_tracker_list* l);
 void        lt_post_torrent_updates(lt_session* s);
 void        lt_post_session_stats(lt_session* s);
 
+/* lt_torrent_statuses and lt_status_list_free are declared in alert_union.h,
+ * after lt_torrent_status_view's full definition: bindgen makes a struct it
+ * meets forward-declared first an opaque one. */
+
 /* Resolve a libtorrent session-stats counter name (e.g. "net.sent_bytes")
  * to its index in the session_stats_alert counter array. Returns the index,
  * or -1 if the name is unknown to this libtorrent build. The mapping is a

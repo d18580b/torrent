@@ -44,6 +44,7 @@ use std::time::Duration;
 use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use libtorrent_safe::alert::AlertHeader;
+use libtorrent_safe::alert::TorrentStatusView;
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
 use libtorrent_safe::AlertKind;
@@ -218,6 +219,9 @@ impl TorrentEngine for FaultEngine {
     }
     fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
         self.inner.torrents()
+    }
+    fn torrent_statuses(&self) -> Result<Vec<TorrentStatusView>, EngineError> {
+        self.inner.torrent_statuses()
     }
     fn alert_translate_errors(&self) -> u64 {
         self.inner.alert_translate_errors()

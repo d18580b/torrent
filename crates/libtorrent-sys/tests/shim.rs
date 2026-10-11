@@ -951,6 +951,44 @@ fn trackers_report_every_url_with_its_tier() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// `lt_torrent_statuses` reports every torrent the session holds, under the
+/// handle it was added with, paused or not, and owns nothing on an empty
+/// session or a refused call.
+#[test]
+fn statuses_report_every_torrent_under_its_handle() {
+    let s = make_session();
+    let mut list: lt_status_list = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+
+    let rc = unsafe { lt_torrent_statuses(s, &mut list, err.as_mut_ptr(), 512) };
+    assert_eq!(rc, LT_OK as i32, "lt_torrent_statuses: {}", c_buf(&err));
+    assert!(list.statuses.is_null() && list.count == 0, "empty session");
+
+    let h = add_file(s, &multi_file_tracker_torrent());
+    let rc = unsafe { lt_torrent_statuses(s, &mut list, err.as_mut_ptr(), 512) };
+    assert_eq!(rc, LT_OK as i32, "lt_torrent_statuses: {}", c_buf(&err));
+    let views = unsafe { std::slice::from_raw_parts(list.statuses, list.count) };
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].handle, h);
+    assert_ne!(views[0].infohash, [0u8; 20]);
+    assert_ne!(views[0].flags & LT_TF_PAUSED, 0, "added paused");
+
+    unsafe { lt_status_list_free(&mut list) };
+    assert!(list.statuses.is_null() && list.count == 0);
+    unsafe { lt_status_list_free(&mut list) };
+    unsafe { lt_status_list_free(ptr::null_mut()) };
+
+    assert_eq!(
+        unsafe { lt_torrent_statuses(ptr::null_mut(), &mut list, err.as_mut_ptr(), 512) },
+        LT_ERR
+    );
+    assert_eq!(
+        unsafe { lt_torrent_statuses(s, ptr::null_mut(), err.as_mut_ptr(), 512) },
+        LT_ERR
+    );
+    unsafe { lt_session_destroy(s) };
+}
+
 /// A tracker error carries the category its code belongs to: an announce to
 /// a closed loopback port is refused with an `errno`, in the system category,
 /// and was not cancelled.
