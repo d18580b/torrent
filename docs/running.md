@@ -1273,7 +1273,14 @@ The daemon sets none of these itself.
   daemon warns at boot when the soft limit is below `connections_limit +
   file_pool_size + 32` per profile plus the API's 256-connection cap and 64
   for the process itself (the database, logs, listeners and the commands it
-  runs). An API that runs out of descriptors accepting a connection cuts off
+  runs). A peer listener that runs out of descriptors accepting a connection
+  keeps listening: libtorrent disconnects a peer, lowers `connections_limit`
+  and accepts again, and the daemon logs a warning and counts it in
+  `listen_accept_errors_total{profile_id, errno="EMFILE"}`. It is not a
+  listen failure, so it neither stops a single-profile daemon nor raises
+  `listen_failure_active`; a counter that keeps rising means the limit is too
+  low for the load. Any other accept error stops that listener and is a
+  listen failure. An API that runs out of descriptors accepting a connection cuts off
   its open requests and serves again on the same socket after a backoff of
   1 s doubling to 30 s, logging each time; the daemon does not restart. The
   HTTP API draws on the same table and holds at most 256 connections; the
