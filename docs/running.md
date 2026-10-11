@@ -883,9 +883,14 @@ directory, as code. The daemon closes this two ways, as it refuses
   programs and are allowed. A refusal at the pre-flight exits `78`; a file
   the pre-flight cannot read is left to that profile's bring-up, which fails
   the profile alone. Remove the line. A provider's DNS hook such as `up
-  /etc/openvpn/update-resolv-conf` is not run either way; routing is the
-  daemon's (§11.6), and lookups through a tunnel are set up as "Tracker
-  lookups through a tunnel" (§5) describes.
+  /etc/openvpn/update-resolv-conf` is not run either way, and neither is
+  OpenVPN 2.7's built-in DNS script: `openvpn` also runs with `--setenv opt
+  dns-updown disable` after `--config`, so a server that pushes `dhcp-option
+  DNS` or `dns` changes neither systemd-resolved, `resolvconf` nor
+  `/etc/resolv.conf`. OpenVPN 2.6 has no such script, and logs one warning
+  about the unknown `dns-updown` option; 2.6 and 2.7 are both supported.
+  Routing is the daemon's (§11.6), and lookups through a tunnel are set up
+  as "Tracker lookups through a tunnel" (§5) describes.
 
 **`[[profile]] upload_rate_limit`** (optional, bytes/sec) is applied to that
 profile's session at boot. **Omit it to inherit the top-level
