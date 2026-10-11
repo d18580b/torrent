@@ -6,7 +6,8 @@
  * use fixed-size character buffers (LT_PATH_MAX, LT_MSG_MAX) for short
  * strings — if the source string is longer, it is truncated and NUL
  * terminated. Variants that carry bulk data (resume buffers, stats counter
- * arrays, torrent_status arrays) hold heap-allocated pointers; the caller
+ * arrays, torrent_status arrays) or a path a decision rests on (the
+ * storage_moved save path) hold heap-allocated pointers; the caller
  * must invoke lt_alert_payload_free() exactly once after consumption.
  */
 #ifndef LIBTORRENT_SHIM_ALERT_UNION_H
@@ -181,8 +182,13 @@ struct lt_alert_log {
 /* Storage / verification variants                                     */
 /* ------------------------------------------------------------------ */
 
+/* The new save_path, at its full length: `path_len` bytes followed by a NUL,
+ * on the heap and freed by lt_alert_payload_free. It is never truncated: the
+ * relocation step records it as the torrent's base and boot-scan save path,
+ * and a path cut short names another directory. */
 struct lt_alert_storage_moved {
-    char    path[LT_PATH_MAX];      /* the new save_path */
+    char*   path;
+    size_t  path_len;
 };
 
 struct lt_alert_storage_moved_failed {

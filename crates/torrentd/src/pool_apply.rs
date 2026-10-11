@@ -4009,6 +4009,14 @@ mod tests {
 
         let base = pool.with_store(|s| s.adoption_base(&t.infohash)).unwrap();
         assert_eq!(base, Some((root_id, "new/place".to_owned())));
+
+        // A destination past the 1 023 bytes the shim once cut a moved-to
+        // path at is recorded whole, not as a prefix naming another
+        // directory.
+        let (deep, _) = long_rel_path();
+        record_new_base(&pool, &t.infohash, &root.join(&deep));
+        let base = pool.with_store(|s| s.adoption_base(&t.infohash)).unwrap();
+        assert_eq!(base, Some((root_id, deep)));
     }
 
     #[test]

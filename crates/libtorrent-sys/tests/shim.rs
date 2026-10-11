@@ -636,6 +636,45 @@ fn files_and_details_return_paths_past_the_old_buffer_whole() {
 }
 
 #[test]
+fn storage_moved_reports_a_destination_past_the_old_buffer_whole() {
+    // The relocation step records this path as the torrent's base and its
+    // boot-scan save path, so a cut one would name another directory.
+    let base = std::env::temp_dir().join(format!("lt-shim-long-move-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let dst = base.join(vec!["m".repeat(200); 6].join("/"));
+    let dst = dst.to_str().unwrap().to_owned();
+    assert!(
+        dst.len() > 1_023,
+        "the destination must outgrow the old buffer"
+    );
+
+    let (bytes, _) = long_path_torrent();
+    let s = make_session();
+    let h = add_file_at(s, &bytes, src.to_str().unwrap());
+    let want = CString::new(dst.clone()).unwrap();
+    let rc = unsafe { lt_torrent_move_storage(s, h, want.as_ptr(), LT_MOVE_DONT_REPLACE) };
+    assert_eq!(rc, LT_OK as i32);
+
+    let moved = wait_for(s, |u| {
+        if u.kind == lt_alert_kind_LT_ALERT_STORAGE_MOVED_FAILED {
+            let p = unsafe { &u.payload.storage_moved_failed };
+            panic!("move failed: {}", c_buf(&p.message));
+        }
+        (u.kind == lt_alert_kind_LT_ALERT_STORAGE_MOVED && u.handle == h).then(|| {
+            let p = unsafe { &u.payload.storage_moved };
+            (p.path_len, sized_c_str(p.path, p.path_len))
+        })
+    });
+    assert_eq!(moved, Some((dst.len(), dst.clone())));
+    // The session serves from the whole path too.
+    assert_eq!(details(s, h).save_path, dst);
+    unsafe { lt_session_destroy(s) };
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn details_without_metadata_report_the_magnet_name_and_no_size() {
     let s = make_session();
     let h = add_magnet(
