@@ -198,8 +198,8 @@ pub struct PoolFile {
 /// A `.torrent` in the library, plus whatever the sidecar `.fastresume` told us.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolTorrent {
-    /// The 20-byte key the rest of the daemon uses, matching libtorrent's
-    /// `info_hash_t::get_best()` (truncated v2 when present, else v1).
+    /// The 20-byte key the rest of the daemon uses,
+    /// `libtorrent_safe::InfoHashes::key` (v1 when present, else truncated v2).
     pub infohash: String,
     pub infohash_v1: Option<String>,
     pub infohash_v2: Option<String>,
