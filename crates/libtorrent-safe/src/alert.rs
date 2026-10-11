@@ -11,6 +11,7 @@ use libtorrent_sys as ffi;
 
 use crate::handle::InfoHash;
 use crate::handle::TorrentHandle;
+use crate::metadata::sized_str;
 use crate::resume::ResumeData;
 
 /// Compact tag enum mirroring `lt_alert_kind`. Useful for routing /
@@ -506,7 +507,10 @@ impl Alert {
                 let p = unsafe { &raw.payload.storage_moved };
                 Alert::StorageMoved {
                     hdr,
-                    path: c_str_to_owned(&p.path),
+                    // SAFETY: the shim leaves `path` null or pointing at
+                    // `path_len` readable bytes until the payload is freed
+                    // below.
+                    path: unsafe { sized_str(p.path, p.path_len) },
                 }
             }
             AlertKind::StorageMovedFailed => {

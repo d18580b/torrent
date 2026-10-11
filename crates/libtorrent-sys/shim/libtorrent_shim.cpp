@@ -749,8 +749,18 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     }
     if (auto* x = lt::alert_cast<lt::storage_moved_alert>(a)) {
         out.kind = LT_ALERT_STORAGE_MOVED;
-        copy_str_truncated(out.payload.storage_moved.path, LT_PATH_MAX,
-                           std::string(x->storage_path()));
+        // Whole, on the heap: the relocation step records this as the
+        // torrent's base and boot-scan save path, and a path cut short
+        // names another directory. `kind` is set first, so a throw below
+        // leaves lt_alert_payload_free exactly what was allocated.
+        char const* const path = x->storage_path();
+        std::size_t const n = std::strlen(path);
+        auto* buf = static_cast<char*>(std::malloc(n + 1));
+        if (!buf) throw std::bad_alloc{};
+        std::memcpy(buf, path, n);
+        buf[n] = '\0';
+        out.payload.storage_moved.path = buf;
+        out.payload.storage_moved.path_len = n;
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
@@ -1964,6 +1974,11 @@ extern "C" void lt_alert_payload_free(lt_alert_union* u) {
             std::free(u->payload.session_stats.counters);
             u->payload.session_stats.counters = nullptr;
             u->payload.session_stats.count = 0;
+            break;
+        case LT_ALERT_STORAGE_MOVED:
+            std::free(u->payload.storage_moved.path);
+            u->payload.storage_moved.path = nullptr;
+            u->payload.storage_moved.path_len = 0;
             break;
         default:
             break;
