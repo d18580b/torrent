@@ -770,6 +770,7 @@ fn public_magnet_metadata_lifts_the_discovery_guards_and_private_keeps_them() {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.id.clone(),
             span: tracing::info_span!("test"),
         };

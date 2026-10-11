@@ -2271,6 +2271,7 @@ fn deliver(h: &Harness, profile: &str, alert: &torrentd_engine::Alert) {
         clock: &clock,
         engine: &engine,
         profile_fenced: None,
+        fence_hold: None,
         profile_id: ProfileId::new(profile),
         span: tracing::info_span!("test"),
     };

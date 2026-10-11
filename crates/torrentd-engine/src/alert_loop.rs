@@ -130,6 +130,7 @@ pub struct AlertLoopBuilder {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    fence_hold: Option<FenceHold>,
     magnet_guard_lift: Option<MagnetGuardLift>,
     listen_events: Option<Arc<ListenEvents>>,
     listen_device_check: Option<ListenDeviceCheck>,
@@ -165,6 +166,21 @@ pub type FatalCallback = Arc<dyn Fn(ShutdownReason) + Send + Sync>;
 /// un-quarantines it behind the operator's back.
 pub type ProfileFenced = Arc<dyn Fn(&ProfileId) -> bool + Send + Sync>;
 
+/// "Hold this torrent, and tell whoever lifts the fence" — supplied by the
+/// daemon, whose kill-switch watch lifts its own fence and resumes only the
+/// torrents it recorded.
+///
+/// Called by the add handler with the profile, the torrent it just took into
+/// the state map, and `hold`: the handler's own check of
+/// [`ProfileFenced`] and pause, which answers whether it found the profile
+/// fenced. The daemon runs `hold` under that fence's lock and, where `hold`
+/// answers `true` and the fence holds the profile, records the torrent for
+/// its lift. A torrent whose add alert lands after the fence walked the state
+/// map is otherwise paused with no record, and stays paused once the fence
+/// lifts around it.
+pub type FenceHold =
+    Arc<dyn Fn(&ProfileId, libtorrent_safe::TorrentHandle, &mut dyn FnMut() -> bool) + Send + Sync>;
+
 impl std::fmt::Debug for AlertLoopBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlertLoopBuilder").finish_non_exhaustive()
@@ -190,6 +206,7 @@ impl AlertLoopBuilder {
             fatal_listen_failure: false,
             on_fatal: None,
             profile_fenced: None,
+            fence_hold: None,
             magnet_guard_lift: None,
             listen_events: None,
             listen_device_check: None,
@@ -258,6 +275,15 @@ impl AlertLoopBuilder {
         self
     }
 
+    /// Supply what the add handler runs its hold of a torrent added into a
+    /// fenced profile through. Without one, the hold runs alone, which is
+    /// correct where no fence lifts by its own record: a deployment without
+    /// the kill switch, and tests.
+    pub fn fence_hold(mut self, f: FenceHold) -> Self {
+        self.fence_hold = Some(f);
+        self
+    }
+
     /// Supply which discovery guards a magnet sheds once its metadata shows
     /// it is public. Without one, nothing is lifted: every magnet keeps DHT,
     /// PEX and LSD disabled, which is safe and only costs it peers.
@@ -303,6 +329,7 @@ impl AlertLoopBuilder {
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
+                let fence_hold = self.fence_hold.clone();
                 let magnet_guard_lift = self.magnet_guard_lift.clone();
                 let listen_events = self.listen_events.clone();
                 let listen_device_check = self.listen_device_check.clone();
@@ -332,6 +359,7 @@ impl AlertLoopBuilder {
                                 fatal_listen_failure,
                                 on_fatal,
                                 profile_fenced,
+                                fence_hold,
                                 magnet_guard_lift,
                                 unsaved_at_shutdown,
                                 listen_events,
@@ -474,6 +502,7 @@ struct LoopHooks {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    fence_hold: Option<FenceHold>,
     magnet_guard_lift: Option<MagnetGuardLift>,
     unsaved_at_shutdown: Arc<AtomicU64>,
     listen_events: Option<Arc<ListenEvents>>,
@@ -523,6 +552,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.fence_hold.as_ref(),
                 hooks.magnet_guard_lift.as_ref(),
                 &mut listen_failures,
                 &mut tracker_failures,
@@ -634,6 +664,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.fence_hold.as_ref(),
                 hooks.magnet_guard_lift.as_ref(),
                 &mut listen_failures,
                 &mut tracker_failures,
@@ -658,6 +689,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.fence_hold.as_ref(),
                 hooks.magnet_guard_lift.as_ref(),
                 &mut listen_failures,
                 &mut tracker_failures,
@@ -817,6 +849,7 @@ fn dispatch_alert(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    fence_hold: Option<&FenceHold>,
     magnet_guard_lift: Option<&MagnetGuardLift>,
     listen_failures: &mut ListenFailures,
     tracker_failures: &mut TrackerFailureLog,
@@ -842,6 +875,7 @@ fn dispatch_alert(
         clock: clock.as_ref(),
         engine: &engine,
         profile_fenced,
+        fence_hold,
         profile_id: profile,
         span,
     };
@@ -1170,6 +1204,7 @@ fn run_shutdown(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    fence_hold: Option<&FenceHold>,
     magnet_guard_lift: Option<&MagnetGuardLift>,
     listen_failures: &mut ListenFailures,
     tracker_failures: &mut TrackerFailureLog,
@@ -1190,6 +1225,7 @@ fn run_shutdown(
         metrics,
         clock,
         profile_fenced,
+        fence_hold,
         magnet_guard_lift,
         listen_failures,
         tracker_failures,
@@ -1238,6 +1274,7 @@ fn run_shutdown(
             metrics,
             clock,
             profile_fenced,
+            fence_hold,
             magnet_guard_lift,
             listen_failures,
             tracker_failures,
@@ -1294,6 +1331,7 @@ fn drain_once(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    fence_hold: Option<&FenceHold>,
     magnet_guard_lift: Option<&MagnetGuardLift>,
     listen_failures: &mut ListenFailures,
     tracker_failures: &mut TrackerFailureLog,
@@ -1311,6 +1349,7 @@ fn drain_once(
             metrics,
             clock,
             profile_fenced,
+            fence_hold,
             magnet_guard_lift,
             listen_failures,
             tracker_failures,
@@ -1991,6 +2030,7 @@ mod tests {
                 clock: &mock_clock,
                 engine: &ctx_engine,
                 profile_fenced: None,
+                fence_hold: None,
                 profile_id: ProfileId::new("p"),
                 span: tracing::info_span!("test"),
             };
@@ -2821,6 +2861,7 @@ mod tests {
                 fatal_listen_failure: false,
                 on_fatal: None,
                 profile_fenced: None,
+                fence_hold: None,
                 magnet_guard_lift: None,
                 unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
                 listen_events: None,
@@ -2860,6 +2901,7 @@ mod tests {
                     Arc::new(move |_| engine.set_alert_translate_errors(4)) as FatalCallback
                 }),
                 profile_fenced: None,
+                fence_hold: None,
                 magnet_guard_lift: None,
                 unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
                 listen_events: None,
@@ -2893,6 +2935,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             None,
             &mut ListenFailures::default(),
@@ -2954,6 +2997,7 @@ mod tests {
                 &(Arc::new(NoopSink) as Arc<dyn MetricsSink>),
                 &(Arc::new(MockClock::new()) as Arc<dyn Clock>),
                 None,
+                None,
                 hook,
                 &mut ListenFailures::default(),
                 &mut TrackerFailureLog::default(),
@@ -2986,6 +3030,7 @@ mod tests {
                 &torrents,
                 &metrics,
                 &clock,
+                None,
                 None,
                 None,
                 &mut ListenFailures::default(),
@@ -3119,6 +3164,7 @@ mod tests {
                 &clock,
                 None,
                 None,
+                None,
                 &mut listen_failures,
                 &mut TrackerFailureLog::default(),
             );
@@ -3166,6 +3212,7 @@ mod tests {
             &clock,
             None,
             None,
+            None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
         );
@@ -3197,6 +3244,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             None,
             &mut ListenFailures::default(),
@@ -3242,6 +3290,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             None,
             &mut ListenFailures::default(),
@@ -3293,6 +3342,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             None,
             &mut ListenFailures::default(),
@@ -3430,6 +3480,7 @@ mod tests {
                 &clock,
                 None,
                 None,
+                None,
                 &mut ListenFailures::default(),
                 &mut TrackerFailureLog::default(),
             )
@@ -3501,6 +3552,7 @@ mod tests {
             &clock,
             None,
             None,
+            None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
         );
@@ -3536,6 +3588,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             None,
             &mut ListenFailures::default(),
@@ -3602,6 +3655,7 @@ mod tests {
             &clock,
             None,
             None,
+            None,
             &mut ListenFailures::default(),
             &mut TrackerFailureLog::default(),
         );
@@ -3644,6 +3698,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
             None,
             None,
             &mut ListenFailures::default(),
