@@ -252,12 +252,15 @@ impl ProfileEntry {
     /// batch comes. The run is not told which torrents it has reached, so
     /// one it has already resumed reads as pending too until the run ends,
     /// which is the same answer a moment early.
+    ///
+    /// A run is cancelled only once it is out of `resuming` (taken, replaced
+    /// or halted under this lock), so the run read here is never cancelled.
     pub fn resume_pending(&self, ih: &InfoHash) -> bool {
         let resuming = self.resuming.lock();
         let Some(run) = resuming.as_ref() else {
             return false;
         };
-        if run.cancelled() || run.gate.halted() {
+        if run.gate.halted() {
             return false;
         }
         run.handles
