@@ -433,4 +433,51 @@ mod tests {
         let err = Api::new("unix:run/api.sock", None).unwrap_err();
         assert!(err.contains("absolute path"), "{err}");
     }
+
+    /// A `unix:` client connects to that socket, and writes its requests
+    /// against the path with `Host: localhost` and its bearer token.
+    #[tokio::test]
+    async fn a_unix_url_sends_its_requests_over_that_socket() {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let body = serde_json::to_string(&crate::testing::server(false, false)).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the request head ended early");
+                received.extend_from_slice(&buf[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+                 {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&received).into_owned()
+        });
+
+        let api = Api::new(&format!("unix:{}", path.display()), Some("tdp_sock")).unwrap();
+        let info = call(api.client.get_server())
+            .await
+            .expect("served over the socket");
+        assert_eq!(info.api_version, "1");
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.starts_with("get /v1/server http/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("\r\nhost: localhost\r\n"), "{request}");
+        assert!(
+            request.contains("\r\nauthorization: bearer tdp_sock\r\n"),
+            "{request}"
+        );
+    }
 }
