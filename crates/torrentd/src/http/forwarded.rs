@@ -400,7 +400,12 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
             secure: false,
         };
     };
-    if trusted.is_empty() || !trusted.trusts(peer) {
+    // An unspecified peer is never a proxy: no TCP peer connects from one,
+    // and it is the address every unix-socket request carries
+    // (`api_socket::SOCKET_PEER`). Refused here rather than in the trust
+    // list, so no entry - `0.0.0.0`, `0.0.0.0/8`, `::` - lets a socket caller
+    // forge a forwarding header past the login throttle.
+    if trusted.is_empty() || peer.is_unspecified() || !trusted.trusts(peer) {
         // Not a proxy we know. Its headers are worth nothing, and its socket
         // address is the truth.
         return Client {
@@ -605,6 +610,38 @@ mod tests {
         // A dual-stack listener's mapped peer is trusted as its v4 form.
         let c = resolve_from("::ffff:10.1.2.3", PROXIES, &[]);
         assert_eq!(c.ip, Some(PEER.parse().unwrap()));
+    }
+
+    /// The unspecified address a unix-socket request carries is never a
+    /// proxy, whatever trust entry would match it.
+    #[test]
+    fn an_unspecified_peer_is_never_trusted() {
+        let headers = [(XFF, "198.51.100.9"), ("x-forwarded-proto", "https")];
+        for (peer, trust) in [
+            ("0.0.0.0", &["0.0.0.0"][..]),
+            ("0.0.0.0", &["0.0.0.0/8"][..]),
+            ("::", &["::/8"][..]),
+            ("::ffff:0.0.0.0", &["0.0.0.0/8"][..]),
+        ] {
+            let c = resolve_from(peer, trust, &headers);
+            assert!(
+                c.ip.is_some_and(|ip| ip.is_unspecified()),
+                "{peer} {trust:?}: {:?}",
+                c.ip
+            );
+            assert!(!c.secure, "{peer} {trust:?}");
+        }
+        let socket = super::resolve(
+            Some(crate::api_socket::SOCKET_PEER),
+            &[(
+                HeaderName::from_static(XFF),
+                HeaderValue::from_static("198.51.100.9"),
+            )]
+            .into_iter()
+            .collect(),
+            &TrustedProxies::parse(&["0.0.0.0/8".to_owned()]).unwrap(),
+        );
+        assert_eq!(socket.ip, Some(crate::api_socket::SOCKET_PEER.ip()));
     }
 
     /// A quoted string is structure in `Forwarded` alone, and `param` and
