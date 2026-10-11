@@ -24,7 +24,13 @@
 //! route via the tunnel in a table of its own, and a rule sending traffic from
 //! the tunnel address to that table. The profile's sockets are bound to that
 //! address and device, so that is all they need, and nothing else on the host
-//! is rerouted. A global IPv6 address on the device — a pushed
+//! is rerouted. Name lookups are not rerouted either: openvpn also runs with
+//! `--setenv opt dns-updown disable` after `--config`, so OpenVPN 2.7's
+//! built-in DNS script, which `--script-security 1` would otherwise let run
+//! whenever the server pushes DNS, never points the host's resolver
+//! (systemd-resolved, `resolvconf` or `/etc/resolv.conf`) at the tunnel.
+//! OpenVPN 2.6 has no such script and no such option, and only warns about
+//! the `setenv opt` line, so both 2.6 and 2.7 are supported. A global IPv6 address on the device — a pushed
 //! `ifconfig-ipv6` — gets a rule and an IPv6 default route of its own too:
 //! the session listens on the device and so sends from it, and without one
 //! its traffic and the kernel's replies from it follow the main table out of
@@ -134,9 +140,20 @@ fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&
         // After `--config`, so it overrides any level the file sets: no
         // `up`, `route-up` or other hook the file names may run a program
         // as the daemon's uid (see the module docs). Level 1 still lets
-        // openvpn run its own built-in tools.
+        // openvpn run its own built-in tools, and on 2.7 one of those is
+        // the default `dns-updown` script, which is disabled next.
         "--script-security",
         "1",
+        // OpenVPN 2.7 runs its built-in `dns-updown` script on every
+        // bring-up whose server pushes DNS, and level 1 allows it: it
+        // points the host's resolver at this tunnel. After `--config`, so a
+        // file cannot re-enable it. The `setenv opt` form is applied as
+        // `--dns-updown disable` on 2.7 and only warned about on 2.6, which
+        // has no such option and no DNS script to disable.
+        "--setenv",
+        "opt",
+        "dns-updown",
+        "disable",
         // Authoritative, so the OpenVPN profile file cannot disagree with the
         // profile config.
         "--dev",
@@ -1036,6 +1053,28 @@ mod tests {
             args.iter().filter(|a| **a == "--script-security").count(),
             1,
             "{args:?}"
+        );
+    }
+
+    /// #386: `--script-security 1` still lets OpenVPN 2.7 run its built-in
+    /// `dns-updown` script, which points the host's resolver at the tunnel
+    /// whenever the server pushes DNS. The disable has to come after
+    /// `--config`, so a file cannot re-enable it, and in the `setenv opt`
+    /// form, so 2.6 (which has no `dns-updown`) warns instead of refusing to
+    /// start. Drop it, move it before `--config`, or pass the bare option,
+    /// and this fails.
+    #[test]
+    fn the_built_in_dns_script_is_disabled_after_the_config() {
+        let args = openvpn_args("/etc/openvpn/a.conf", "tun-a", "/var/lib/torrentd/p.pid");
+        let config = args.iter().position(|a| *a == "--config").unwrap();
+        let disable = args
+            .windows(4)
+            .position(|w| w == ["--setenv", "opt", "dns-updown", "disable"])
+            .unwrap_or_else(|| panic!("no --setenv opt dns-updown disable: {args:?}"));
+        assert!(disable > config, "it must follow --config: {args:?}");
+        assert!(
+            !args.contains(&"--dns-updown"),
+            "the bare option is fatal on OpenVPN 2.6: {args:?}"
         );
     }
 
