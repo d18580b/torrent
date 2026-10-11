@@ -1555,6 +1555,116 @@ async fn torrents_behave_as_documented() {
     scenarios(&Coverage::new()).await;
 }
 
+/// Issue #352: `POST /v1/torrents/{ih}/recheck` sent for twelve torrents in a
+/// row, with `[pool] max_concurrent_verify = 4`, never has more than four
+/// checking at once, and starts the rest as earlier checks end. Each used to
+/// call `force_recheck` itself, so all twelve hashed at once, each with its
+/// peers disconnected, while `torrentd_pool_verify_in_flight` read 0.
+#[tokio::test]
+async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+    cfg.pool.as_mut().unwrap().max_concurrent_verify = 4;
+    let pool = crate::pool_service::PoolService::open(&cfg)
+        .unwrap()
+        .expect("the config has [pool]");
+    let hashes: Vec<InfoHash> = (0..12u8).map(|i| InfoHash([0x40 + i; 20])).collect();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        for ih in &hashes {
+            load(s, &e.p, *ih, "p", TorrentPhase::Seeding);
+        }
+        s.pool = Some(Arc::clone(&pool));
+        engine = Some(e.p);
+    });
+    let engine = engine.unwrap();
+    let rechecked = || -> Vec<InfoHash> {
+        engine
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRecheck(h) => Some(h.infohash),
+                _ => None,
+            })
+            .collect()
+    };
+    let recheck = |ih: InfoHash| {
+        let h = &h;
+        async move {
+            h.write("POST", &format!("/v1/torrents/{}/recheck", hex(ih)))
+                .await
+                .assert_status(StatusCode::ACCEPTED);
+        }
+    };
+
+    for ih in &hashes {
+        recheck(*ih).await;
+    }
+    // Asked for twice, queued once.
+    recheck(hashes[0]).await;
+    assert!(
+        rechecked().is_empty(),
+        "nothing hashes before the verify queue admits it: {:?}",
+        engine.calls(),
+    );
+    let q = pool.verify_queue();
+    assert_eq!(q.depth(), 12);
+    let resp = h.read("/v1/pool").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["verify_queue_depth"], 12);
+
+    let tick = || {
+        crate::pool_service::admit_tick_for_tests(
+            &pool,
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    let mut finished = std::collections::HashSet::new();
+    let mut peak = 0;
+    for n in 0..100 {
+        tick();
+        let started = rechecked();
+        let checking = started.iter().filter(|h| !finished.contains(*h)).count();
+        assert!(checking <= 4, "tick {n}: {checking} checking at once");
+        assert_eq!(q.in_flight(), checking, "tick {n}");
+        assert_eq!(q.depth(), 12 - started.len(), "tick {n}");
+        peak = peak.max(checking);
+        if started.len() == hashes.len() && checking == 0 {
+            break;
+        }
+        // The session reports the oldest running check over, as
+        // `torrent_checked` does: after the start, on any clock resolution.
+        if let Some(ih) = started.iter().find(|h| !finished.contains(*h)) {
+            std::thread::sleep(Duration::from_millis(2));
+            h.state
+                .state
+                .update(ih, |st| st.checked_at = Some(Instant::now()));
+            finished.insert(*ih);
+        }
+    }
+    assert_eq!(
+        rechecked(),
+        hashes,
+        "every torrent re-hashed once, in order"
+    );
+    assert_eq!(peak, 4, "the limit is reached, not merely respected");
+    assert_eq!(q.in_flight(), 0);
+
+    // A paused torrent starts no disk work, and the queue would drop its
+    // re-hash: libtorrent is asked at once, as it always was, and marks it
+    // to check once it is resumed.
+    h.state
+        .state
+        .update(&LOADED, |st| st.phase = TorrentPhase::Paused);
+    recheck(LOADED).await;
+    assert_eq!(rechecked().last(), Some(&LOADED));
+    assert_eq!(q.depth(), 0);
+}
+
 /// Drop the write bit on `dir`, returning the mode to restore afterwards.
 ///
 /// Restoring matters: `tempfile::TempDir`'s cleanup cannot remove a file from

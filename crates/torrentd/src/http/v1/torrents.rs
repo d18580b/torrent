@@ -1986,9 +1986,18 @@ pub async fn resume_torrent(
 ///
 /// Re-hashes the payload against the piece hashes. `202`: libtorrent checks
 /// asynchronously, and the torrent's `phase` reports `checking` until it is
-/// done. Needs no `[pool]`. A recheck drops seed mode, which is safe because
-/// the no-download invariant rests on upload mode, and that survives it.
-/// Refused while the profile is fenced, as resuming is.
+/// done. Needs no `[pool]`. With `[pool]` configured, the check is queued
+/// rather than started: the verify queue starts it once a slot is free, at
+/// most `[pool] max_concurrent_verify` checks at once together with
+/// adoptions' verifications and `POST /v1/pool/verifications`' re-hashes, and
+/// `GET /v1/pool` counts it in `verify_queue_depth` while it waits and
+/// `verify_in_flight` while it hashes. Asking again for a torrent already
+/// waiting or checking queues nothing more. Without `[pool]`, and for a
+/// paused torrent or one still without metadata (which libtorrent does not
+/// hash until it is resumed or its metadata arrives), libtorrent is asked at
+/// once. A recheck drops seed mode, which is safe because the no-download
+/// invariant rests on upload mode, and that survives it. Refused while the
+/// profile is fenced, as resuming is.
 #[kynos::post("/torrents/{infohash}/recheck", tag = Torrents)]
 pub async fn recheck_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1996,6 +2005,31 @@ pub async fn recheck_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
+    // Every check started at once used to run beside every other: libtorrent
+    // bounds checking only for auto-managed torrents, and none is one here.
+    // A scripted recheck of a whole library hashed it all at once, and each
+    // check disconnects its torrent's peers until it ends. The verify queue
+    // is that bound, and its admission checks again everything this request
+    // checked (still loaded, profile on the network), holding the check
+    // while the profile is fenced or a paced resume has yet to reach it.
+    //
+    // Its verdict is not recorded in the pool index: this endpoint never
+    // paused a torrent that failed, or cleared one `drifted`, and
+    // `POST /v1/pool/verifications` is the request that does.
+    //
+    // A paused torrent, or one with no metadata, starts no disk work now:
+    // libtorrent marks it to check once it can. The queue drops such a
+    // re-hash rather than hold a slot for it, so it is asked for directly,
+    // as it always was.
+    let hashes_now = !matches!(
+        st.phase,
+        torrentd_engine::TorrentPhase::Paused | torrentd_engine::TorrentPhase::AwaitingMetadata
+    );
+    if let Some(pool) = s.pool.as_ref().filter(|_| hashes_now) {
+        pool.verify_queue()
+            .enqueue_recheck(st.handle.infohash.to_hex(), false);
+        return Ok(Accepted::new(()));
+    }
     let state = Arc::clone(&s);
     blocking(move || {
         crate::pool_service::force_recheck_marking_checking(

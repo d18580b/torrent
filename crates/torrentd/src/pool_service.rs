@@ -1186,6 +1186,22 @@ pub async fn run_verify_queue(
     }
 }
 
+/// One verify-queue tick's slot accounting and admission, as
+/// [`run_verify_queue`] makes it, for tests that drive the queue through the
+/// HTTP API.
+#[cfg(test)]
+pub(crate) fn admit_tick_for_tests(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    profiles: &Arc<crate::profile_registry::ProfileRegistry>,
+    registry: &Arc<AssignmentRegistry>,
+) {
+    let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+    retire_checking(pool.verify_queue(), state, RECHECK_EXPIRY);
+    admit(pool, source, state, &metrics, profiles, registry);
+}
+
 /// What one admission attempt did.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Admission {
