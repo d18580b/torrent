@@ -1852,6 +1852,36 @@ mod tests {
             )),
             "an undone resume is not counted as a retry attempt",
         );
+
+        // A pause that fails leaves the torrent running in a fenced profile:
+        // counted where the fence's own failed pauses are, and still deferred.
+        let engine = Arc::new(MockEngine::new());
+        engine.inject_error("pause_torrent", crate::engine::EngineError::Shutdown);
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
+        let (state, h) = state_with_a_due_retry(clock.now());
+        asked.store(0, Ordering::SeqCst);
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            clock.now(),
+        );
+        assert!(recording.calls().iter().any(|c| matches!(
+            c,
+            MetricCall::IncCounter { name, .. } if name == "profile_fence_pause_errors_total"
+        )));
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 1);
+        assert_eq!(
+            retry.next_attempt,
+            clock.now() + crate::state::RetryState::INITIAL_DELAY
+        );
     }
 
     #[test]
