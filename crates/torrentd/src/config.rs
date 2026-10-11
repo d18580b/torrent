@@ -91,10 +91,18 @@ impl std::str::FromStr for HttpListen {
                      \"unix:/run/torrentd/api.sock\""
                 ));
             }
-            if path.as_os_str().len() > MAX_UNIX_PATH_BYTES {
+            // The daemon binds the socket first at a staging path beside this
+            // one, which is longer: that is the path the kernel must accept.
+            let Some((_, staged)) = crate::api_socket::staging_paths(&path, u32::MAX) else {
+                return Err(format!("{s:?} names a directory, not a socket file"));
+            };
+            if staged.as_os_str().len() > MAX_UNIX_PATH_BYTES {
+                let longest =
+                    MAX_UNIX_PATH_BYTES - (staged.as_os_str().len() - path.as_os_str().len());
                 return Err(format!(
-                    "{s:?} is longer than the {MAX_UNIX_PATH_BYTES} bytes a unix socket \
-                     path may be"
+                    "{s:?} is longer than the {longest} bytes a socket path may be here: the \
+                     daemon binds it first at a staging path beside it, and a unix socket path \
+                     may be at most {MAX_UNIX_PATH_BYTES} bytes"
                 ));
             }
             return Ok(Self::Unix(path));
@@ -3018,10 +3026,41 @@ upload_rate_limit = 0"#,
             "unix:run/api.sock",
             "unix:",
             "localhost:8080",
+            "unix:/",
             &format!("unix:/{}", "a".repeat(MAX_UNIX_PATH_BYTES)),
         ] {
             assert!(bad.parse::<HttpListen>().is_err(), "{bad} must be refused");
         }
+    }
+
+    /// Validation holds a socket path to the length of the staging path it is
+    /// bound at first, so a path `--check-config` accepts is one boot binds.
+    #[test]
+    fn a_unix_path_is_refused_when_its_staging_path_would_not_bind() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().as_os_str().len() + 1;
+        let accepted = (1..=MAX_UNIX_PATH_BYTES - base)
+            .rev()
+            .map(|n| dir.path().join("a".repeat(n)))
+            .find(|p| {
+                format!("unix:{}", p.display())
+                    .parse::<HttpListen>()
+                    .is_ok()
+            })
+            .expect("some path in a temp dir is short enough");
+        // The longest accepted path binds, and one byte more is refused.
+        let socket = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { crate::api_socket::bind(&accepted, 0o600, None).map(drop) });
+        socket.unwrap_or_else(|e| panic!("{} bytes: {e:#}", accepted.as_os_str().len()));
+        let longer = format!("unix:{}a", accepted.display());
+        let msg = longer.parse::<HttpListen>().unwrap_err();
+        assert!(msg.contains("staging path"), "{msg}");
+        // Without the staging allowance, a path the kernel accepts as is
+        // would have passed and failed at boot.
+        assert!(longer.len() - "unix:".len() <= MAX_UNIX_PATH_BYTES);
     }
 
     /// `TOP_LEVEL` with `http_listen` replaced by `listen`, and `extra` keys

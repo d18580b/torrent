@@ -9,9 +9,10 @@
 //! Two things differ from TCP, both because kynos' request body can be built
 //! only from bytes outside the crate:
 //!
-//! - A request body is read whole before the router sees it, capped at the
-//!   largest any route accepts ([`MAX_ADD_BODY_BYTES`]) and bounded by
-//!   [`BODY_DEADLINE`]. A route's own, smaller cap still answers `413`.
+//! - A request body is read whole before the router sees it, and so before
+//!   the request is authorized, bounded by [`BODY_DEADLINE`] and capped at
+//!   [`MAX_ADD_BODY_BYTES`] for adding a torrent and [`MAX_BODY_BYTES`] for
+//!   everything else ([`body_cap`]). A route's own cap still answers `413`.
 //! - Every request reaches the router from [`SOCKET_PEER`], an address no
 //!   socket connects from, so no `trusted_proxies` entry admits a forwarding
 //!   header sent over the socket. Who called is logged by uid and pid
@@ -43,6 +44,7 @@ use tracing::Instrument as _;
 
 use crate::http::v1::BODY_DEADLINE;
 use crate::http::v1::MAX_ADD_BODY_BYTES;
+use crate::http::v1::MAX_BODY_BYTES;
 
 /// The peer address every request over the socket carries: unspecified, so
 /// it names no host and matches no `trusted_proxies` entry.
@@ -92,29 +94,34 @@ impl Drop for SocketFile {
 /// run's, and is replaced. One that answers belongs to a running process, and
 /// anything at `path` that is not a socket is somebody's file: both refuse.
 ///
-/// The socket is bound under a temporary name beside `path`, given its mode
-/// and group, and only then renamed into place, so the configured path never
-/// names a socket with any other permissions. Must run inside a tokio
-/// runtime.
+/// The socket is bound in a private staging directory beside `path` (see
+/// [`staging_paths`]), given its mode and group, and only then renamed into
+/// place, so the configured path never names a socket with any other
+/// permissions. The directory is mode `0700` whatever the umask, so while the
+/// socket still has the umask's permissions only the daemon's own user can
+/// connect to it, and no connection another user queued then is accepted
+/// after the rename. Must run inside a tokio runtime.
 pub fn bind(path: &Path, mode: u32, group: Option<&str>) -> anyhow::Result<ApiSocket> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
     use anyhow::Context as _;
 
     let gid = group.map(resolve_group).transpose()?;
     clear_stale(path)?;
 
-    let file_name = path
-        .file_name()
+    let (staging, temp) = staging_paths(path, std::process::id())
         .with_context(|| format!("{} names no file", path.display()))?;
-    let mut temp_name = std::ffi::OsString::from(".");
-    temp_name.push(file_name);
-    temp_name.push(format!(".{}.tmp", std::process::id()));
-    let temp = path.with_file_name(temp_name);
     // A leftover from a run of this pid that died between bind and rename.
     let _ = std::fs::remove_file(&temp);
+    let _ = std::fs::remove_dir(&staging);
 
-    let listener = tokio::net::UnixListener::bind(&temp)
-        .with_context(|| format!("bind the API socket at {}", temp.display()))?;
-    let placed = (|| -> anyhow::Result<std::fs::Metadata> {
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .with_context(|| format!("create the staging directory {}", staging.display()))?;
+    let placed = (|| -> anyhow::Result<(tokio::net::UnixListener, std::fs::Metadata)> {
+        let listener = tokio::net::UnixListener::bind(&temp)
+            .with_context(|| format!("bind the API socket at {}", temp.display()))?;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("chmod {mode:o} {}", temp.display()))?;
         if let Some(gid) = gid {
@@ -123,21 +130,38 @@ pub fn bind(path: &Path, mode: u32, group: Option<&str>) -> anyhow::Result<ApiSo
         }
         std::fs::rename(&temp, path)
             .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
-        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))
+        let meta =
+            std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        Ok((listener, meta))
     })();
-    match placed {
-        Ok(meta) => Ok(ApiSocket {
-            listener,
-            file: SocketFile {
-                path: path.to_owned(),
-                id: (meta.dev(), meta.ino()),
-            },
-        }),
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(e)
-        }
+    let _ = std::fs::remove_file(&temp);
+    if let Err(e) = std::fs::remove_dir(&staging) {
+        warn!(path = %staging.display(), error.cause = %e, "remove the API socket's staging directory");
     }
+    let (listener, meta) = placed?;
+    Ok(ApiSocket {
+        listener,
+        file: SocketFile {
+            path: path.to_owned(),
+            id: (meta.dev(), meta.ino()),
+        },
+    })
+}
+
+/// Where a socket at `path` is bound before it is renamed into place, by the
+/// process with id `pid`: a directory `.<name>.<pid>` beside it, and the
+/// socket `s` inside that. `None` when `path` names no file.
+///
+/// The staged socket's path is longer than `path`, by at most 14 bytes for
+/// any pid, so configuration validation holds `path` to the length this
+/// returns for the longest pid, not to `path`'s own.
+pub fn staging_paths(path: &Path, pid: u32) -> Option<(PathBuf, PathBuf)> {
+    let mut dir_name = std::ffi::OsString::from(".");
+    dir_name.push(path.file_name()?);
+    dir_name.push(format!(".{pid}"));
+    let dir = path.with_file_name(dir_name);
+    let socket = dir.join("s");
+    Some((dir, socket))
 }
 
 /// Remove a socket at `path` that no process answers on; refuse one that
@@ -331,7 +355,7 @@ async fn serve_connection(
             async move {
                 let (mut parts, body) = request.into_parts();
                 parts.extensions.insert(connection);
-                let body = match read_body(body).await {
+                let body = match read_body(body, body_cap(&parts)).await {
                     Ok(body) => body,
                     Err((status, detail)) => return Ok::<_, Infallible>(problem(status, detail)),
                 };
@@ -359,25 +383,44 @@ async fn serve_connection(
     }
 }
 
-/// Read a request body whole, under [`BODY_DEADLINE`] and capped at
-/// [`MAX_ADD_BODY_BYTES`], or the status and detail of the problem that
-/// refuses it: `413` and `408` as `TimedBody` answers them on TCP.
+/// The most of a request's body read before it is routed: the
+/// [`MAX_ADD_BODY_BYTES`] of `POST /v1/torrents`, which adds a torrent, and
+/// the [`MAX_BODY_BYTES`] every other operation accepts.
+///
+/// The body is read before the router authorizes the request, so this is
+/// what bounds the memory a caller the socket's mode admits, signed in or
+/// not, can make the daemon hold: one add-torrent body per connection, and
+/// 64 KiB for anything else.
+fn body_cap(parts: &hyper::http::request::Parts) -> usize {
+    let add = parts.method == hyper::Method::POST
+        && parts.uri.path().strip_prefix(crate::http::v1::PREFIX) == Some("/torrents");
+    if add {
+        MAX_ADD_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    }
+}
+
+/// Read a request body whole, under [`BODY_DEADLINE`] and capped at `cap`,
+/// or the status and detail of the problem that refuses it: `413` and `408`
+/// as `TimedBody` answers them on TCP.
 async fn read_body(
     body: hyper::body::Incoming,
+    cap: usize,
 ) -> Result<bytes::Bytes, (kynos::http::StatusCode, String)> {
     // A declared length over the cap is refused before a byte is read.
     let too_large = || {
         (
             kynos::http::StatusCode::PAYLOAD_TOO_LARGE,
-            format!("the request body is larger than {MAX_ADD_BODY_BYTES} bytes"),
+            format!("the request body is larger than {cap} bytes"),
         )
     };
     if usize::try_from(http_body::Body::size_hint(&body).lower())
-        .map_or(true, |declared| declared > MAX_ADD_BODY_BYTES)
+        .map_or(true, |declared| declared > cap)
     {
         return Err(too_large());
     }
-    let limited = http_body_util::Limited::new(body, MAX_ADD_BODY_BYTES);
+    let limited = http_body_util::Limited::new(body, cap);
     match tokio::time::timeout(BODY_DEADLINE, limited.collect()).await {
         Ok(Ok(collected)) => Ok(collected.to_bytes()),
         Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => Err(too_large()),
@@ -418,12 +461,80 @@ mod tests {
             & 0o777
     }
 
+    /// What a bind left in `dir` beside the socket: a staging directory or
+    /// a socket in it, which a bind must never leave.
     fn leftovers(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
+            .filter(|n| n.starts_with('.'))
             .collect()
+    }
+
+    /// A gid this process is not a member of, so chgrp to it fails; `None`
+    /// as root, which may chgrp to anything.
+    fn foreign_gid() -> Option<u32> {
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        // SAFETY: called with a zero size, `getgroups` only counts.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0; usize::try_from(n).unwrap()];
+        // SAFETY: `groups` holds `n` entries.
+        let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(n).unwrap());
+        // SAFETY: `getgid` has no preconditions.
+        groups.push(unsafe { libc::getgid() });
+        (1..).find(|gid| !groups.contains(gid))
+    }
+
+    #[tokio::test]
+    async fn a_bind_that_fails_after_binding_leaves_no_socket_and_no_staging_directory() {
+        let Some(gid) = foreign_gid() else {
+            eprintln!("skipped: root may chgrp to any gid");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let msg = format!(
+            "{:#}",
+            bind(&path, 0o660, Some(&gid.to_string())).unwrap_err()
+        );
+        assert!(msg.contains(&format!("chgrp {gid}")), "got: {msg}");
+        assert!(!path.exists(), "nothing was renamed into place");
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "{:?}",
+            leftovers(dir.path())
+        );
+        // The next bind is not in the way of anything the failed one left.
+        drop(bind(&path, 0o600, None).unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_socket_keeps_a_file_that_replaced_it_at_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let socket = bind(&path, 0o600, None).unwrap();
+        // Another process removed the socket and bound its own there.
+        std::fs::remove_file(&path).unwrap();
+        let other = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(socket);
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "the other socket is not this one's to remove"
+        );
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        drop(other);
+    }
+
+    #[test]
+    fn a_staging_path_is_a_private_directory_beside_the_socket() {
+        let (dir, socket) = staging_paths(Path::new("/run/torrentd/api.sock"), 4242).unwrap();
+        assert_eq!(dir, Path::new("/run/torrentd/.api.sock.4242"));
+        assert_eq!(socket, Path::new("/run/torrentd/.api.sock.4242/s"));
+        assert!(staging_paths(Path::new("/"), 1).is_none());
     }
 
     #[tokio::test]
@@ -491,8 +602,16 @@ mod tests {
         response
     }
 
-    #[tokio::test]
-    async fn a_request_over_the_socket_is_served_and_a_shutdown_drains_it_and_removes_the_file() {
+    /// A socket server over the test router, running.
+    struct Running {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        tx: broadcast::Sender<ShutdownReason>,
+        server: tokio::task::JoinHandle<()>,
+        hook_rx: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    fn start(limits: Limits) -> Running {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
         let socket = bind(&path, 0o600, None).unwrap();
@@ -509,12 +628,227 @@ mod tests {
             move || {
                 let _ = hook_tx.send(());
             },
-            Limits {
-                max_connections: 4,
-                header_read_timeout: Duration::from_secs(5),
-                drain_timeout: Duration::from_secs(5),
-            },
+            limits,
         ));
+        Running {
+            _dir: dir,
+            path,
+            tx,
+            server,
+            hook_rx,
+        }
+    }
+
+    const LIMITS: Limits = Limits {
+        max_connections: 4,
+        header_read_timeout: Duration::from_secs(5),
+        drain_timeout: Duration::from_secs(5),
+    };
+
+    /// A request head for `POST /v1/sessions` with a declared `length`.
+    fn login_head(length: usize) -> String {
+        format!(
+            "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n"
+        )
+    }
+
+    /// The pre-routing read is held to 64 KiB everywhere but the add-torrent
+    /// route, so a caller that is not signed in cannot make the daemon buffer
+    /// 96 MiB per connection.
+    #[tokio::test]
+    async fn a_body_over_the_small_cap_is_refused_before_routing_except_when_adding_a_torrent() {
+        let Running {
+            _dir,
+            path,
+            tx,
+            server,
+            ..
+        } = start(LIMITS);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            exchange(&path, &login_head(MAX_BODY_BYTES + 1)),
+        )
+        .await
+        .expect("refused at once");
+        assert!(response.starts_with("HTTP/1.1 413"), "got: {response:.300}");
+        assert!(
+            response.contains(&format!("larger than {MAX_BODY_BYTES} bytes")),
+            "got: {response:.600}"
+        );
+
+        // The same size to the add route is read whole and reaches it.
+        let body = format!("{{{}", " ".repeat(MAX_BODY_BYTES));
+        let response = exchange(
+            &path,
+            &format!(
+                "POST /v1/torrents HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 4"), "got: {response:.300}");
+        assert!(
+            !response.starts_with("HTTP/1.1 413"),
+            "got: {response:.300}"
+        );
+
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        server.await.unwrap();
+    }
+
+    /// Past `max_connections`, a connection waits unaccepted until one closes.
+    #[tokio::test]
+    async fn a_connection_past_the_cap_is_served_only_once_another_closes() {
+        let Running {
+            _dir,
+            path,
+            tx,
+            server,
+            ..
+        } = start(Limits {
+            max_connections: 1,
+            ..LIMITS
+        });
+        let get = "GET /v1/openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+        // Holds the one permit: a connection with a request half sent.
+        let mut first = tokio::net::UnixStream::connect(&path).await.unwrap();
+        first
+            .write_all(b"GET /v1/openapi.json HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        let second = tokio::spawn({
+            let path = path.clone();
+            async move { exchange(&path, get).await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !second.is_finished(),
+            "the second connection was served past the cap"
+        );
+
+        drop(first);
+        let response = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("served once the first closed")
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response:.200}");
+
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        server.await.unwrap();
+    }
+
+    /// A connection that never finishes its request head is closed after
+    /// `header_read_timeout`, which frees its permit.
+    #[tokio::test]
+    async fn a_request_head_that_never_completes_is_cut_off() {
+        let Running {
+            _dir,
+            path,
+            tx,
+            server,
+            ..
+        } = start(Limits {
+            max_connections: 1,
+            header_read_timeout: Duration::from_millis(200),
+            ..LIMITS
+        });
+        let mut stalled = tokio::net::UnixStream::connect(&path).await.unwrap();
+        stalled
+            .write_all(b"GET /v1/openapi.json HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut rest))
+            .await
+            .expect("the daemon closed the stalled connection")
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&rest).starts_with("HTTP/1.1 200"),
+            "a half-sent head is never served"
+        );
+
+        // Its permit is free again.
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            exchange(
+                &path,
+                "GET /v1/openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ),
+        )
+        .await
+        .expect("served after the cut-off");
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response:.200}");
+
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        server.await.unwrap();
+    }
+
+    /// A shutdown that arrives while a request is in flight lets it finish
+    /// and answers it before the server stops.
+    #[tokio::test]
+    async fn a_shutdown_drains_a_request_in_flight() {
+        let Running {
+            path,
+            tx,
+            mut server,
+            hook_rx,
+            _dir,
+        } = start(LIMITS);
+
+        // A login whose body has not all arrived: the request is in the
+        // socket server's body read when the shutdown comes.
+        let body = "{\"password\":\"not-the-password\"}";
+        let (head, tail) = body.split_at(5);
+        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(format!("{}{head}", login_head(body.len())).as_bytes())
+            .await
+            .unwrap();
+        // Long enough for the connection to be accepted and its head read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        hook_rx.await.expect("the shutdown hook ran");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut server)
+                .await
+                .is_err(),
+            "the server waits for the request in flight"
+        );
+
+        stream.write_all(tail.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the request in flight is answered")
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 "), "got: {response:.300}");
+        assert!(
+            !response.starts_with("HTTP/1.1 5") && !response.starts_with("HTTP/1.1 408"),
+            "the router answered it, not a cut-off: {response:.300}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the server stops once it is drained")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_over_the_socket_is_served_and_a_shutdown_removes_the_file() {
+        let Running {
+            path,
+            tx,
+            server,
+            hook_rx,
+            _dir,
+        } = start(LIMITS);
 
         let response = exchange(
             &path,

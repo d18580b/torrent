@@ -921,8 +921,11 @@ The socket's directory must exist and be writable by the daemon's user;
 `deploy/torrentd.service` creates none, so add `RuntimeDirectory=torrentd`
 (and `RuntimeDirectoryMode=0750` with `Group=` the socket's group, so its
 members can reach it) in a drop-in (`systemctl edit torrentd`). The socket is
-bound under a temporary name, given its mode and group, and only then renamed
-into place; a socket left by a daemon that was killed is replaced at the next
+bound in a private (`0700`) staging directory beside it, given its mode and
+group, and only then renamed into place, so nobody but the daemon's user can
+connect before its permissions are set. That staging path is up to 14 bytes
+longer, so the configured path may be at most 93 bytes, and a longer one is
+refused at `--check-config`; a socket left by a daemon that was killed is replaced at the next
 start, a socket another process still answers on or a file that is not a
 socket refuses the start, and a clean stop removes it. `allow_unauthenticated`
 on a socket whose mode lets every user connect (an "other" write bit, as in
