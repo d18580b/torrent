@@ -18,7 +18,9 @@
 //!     attempt with exponential backoff. A torrent still in `DiskError` with
 //!     no libtorrent error — a failed peer read, which libtorrent neither
 //!     pauses nor errors — is re-checked instead, on the same backoff. A
-//!     torrent with neither has its timer retired.
+//!     torrent with neither has its timer retired. Either action first takes
+//!     a slot in the daemon's check limit ([`CheckSlots`]), and waits for one
+//!     as for a fenced profile.
 //!   - Shutdown: on signal, queue a resume save (`ONLY_IF_MODIFIED`) for
 //!     every torrent, then loop dispatching and draining until
 //!     `pending_resume_count == 0` or the drain deadline (default
@@ -132,6 +134,7 @@ pub struct AlertLoopBuilder {
     profile_fenced: Option<ProfileFenced>,
     fence_hold: Option<FenceHold>,
     magnet_guard_lift: Option<MagnetGuardLift>,
+    check_slots: Option<Arc<dyn CheckSlots>>,
     listen_events: Option<Arc<ListenEvents>>,
     listen_device_check: Option<ListenDeviceCheck>,
     shutdown_deadline: Duration,
@@ -181,6 +184,22 @@ pub type ProfileFenced = Arc<dyn Fn(&ProfileId) -> bool + Send + Sync>;
 pub type FenceHold =
     Arc<dyn Fn(&ProfileId, libtorrent_safe::TorrentHandle, &mut dyn FnMut() -> bool) + Send + Sync>;
 
+/// The daemon's bound on concurrent hash checks, which the disk-error retry
+/// takes a slot in before it starts one.
+///
+/// libtorrent bounds checking only for auto-managed torrents, and none is
+/// one here, so the daemon keeps the bound: a queue every check it starts
+/// waits in. The retry runs on the loop's own schedule, so it asks rather
+/// than queues, and where no slot is free it looks again later, as for a
+/// fenced profile.
+pub trait CheckSlots: Send + Sync {
+    /// Take a slot for a check of `ih` about to start: `false` where none is
+    /// free, or the answer would mean waiting. Never blocks.
+    fn try_take(&self, profile: &ProfileId, ih: libtorrent_safe::InfoHash) -> bool;
+    /// Free the slot `try_take` took for `ih`, whose check did not start.
+    fn release(&self, ih: &libtorrent_safe::InfoHash);
+}
+
 impl std::fmt::Debug for AlertLoopBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlertLoopBuilder").finish_non_exhaustive()
@@ -208,6 +227,7 @@ impl AlertLoopBuilder {
             profile_fenced: None,
             fence_hold: None,
             magnet_guard_lift: None,
+            check_slots: None,
             listen_events: None,
             listen_device_check: None,
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
@@ -292,6 +312,15 @@ impl AlertLoopBuilder {
         self
     }
 
+    /// Supply the daemon's check limit, which the disk-error retry takes a
+    /// slot in before each check it may start. Without one the retry's
+    /// checks are unbounded, which is correct where nothing else checks:
+    /// tests.
+    pub fn check_slots(mut self, slots: Arc<dyn CheckSlots>) -> Self {
+        self.check_slots = Some(slots);
+        self
+    }
+
     /// Callback fired when the loop decides to self-terminate, before it
     /// begins the resume-data drain.
     pub fn on_fatal(mut self, f: FatalCallback) -> Self {
@@ -331,6 +360,7 @@ impl AlertLoopBuilder {
                 let profile_fenced = self.profile_fenced.clone();
                 let fence_hold = self.fence_hold.clone();
                 let magnet_guard_lift = self.magnet_guard_lift.clone();
+                let check_slots = self.check_slots.clone();
                 let listen_events = self.listen_events.clone();
                 let listen_device_check = self.listen_device_check.clone();
                 let shutdown_deadline = self.shutdown_deadline;
@@ -361,6 +391,7 @@ impl AlertLoopBuilder {
                                 profile_fenced,
                                 fence_hold,
                                 magnet_guard_lift,
+                                check_slots,
                                 unsaved_at_shutdown,
                                 listen_events,
                                 listen_device_check,
@@ -504,6 +535,7 @@ struct LoopHooks {
     profile_fenced: Option<ProfileFenced>,
     fence_hold: Option<FenceHold>,
     magnet_guard_lift: Option<MagnetGuardLift>,
+    check_slots: Option<Arc<dyn CheckSlots>>,
     unsaved_at_shutdown: Arc<AtomicU64>,
     listen_events: Option<Arc<ListenEvents>>,
     listen_device_check: Option<ListenDeviceCheck>,
@@ -740,6 +772,7 @@ fn run(
             &metrics,
             &clock,
             hooks.profile_fenced.as_ref(),
+            hooks.check_slots.as_deref(),
             now,
         );
 
@@ -908,6 +941,12 @@ fn dispatch_alert(
             handlers::listen::recheck(&mut ctx, listen_failures);
         }
         Alert::MetadataReceived { .. } => {
+            // libtorrent starts the magnet's check as the metadata lands, on
+            // its own thread and before this alert, outside every bound the
+            // daemon keeps (`CheckSlots`): counted, so a burst of them is
+            // visible beside the checks the daemon admits.
+            ctx.metrics
+                .inc_counter("checks_started_total", &[("source", "magnet_metadata")]);
             // Without the daemon's answer nothing is lifted: a magnet keeps
             // the guards it was added with.
             let lift = magnet_guard_lift.map_or_else(TorrentFlags::empty, |f| f(&ctx.profile_id));
@@ -951,6 +990,7 @@ fn execute_due_retries(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    check_slots: Option<&dyn CheckSlots>,
     now: Instant,
 ) {
     let due = state.retries_due(now);
@@ -1043,6 +1083,21 @@ fn execute_due_retries(
             defer_retry(state, clock, &handle.infohash);
             continue;
         };
+        // Either branch below can start a check: the re-check of a torrent
+        // libtorrent kept serving, and the resume, whose `clear_error`
+        // re-checks the files where the error came from a check. Each takes
+        // a slot in the daemon's check limit first, or waits for one as for
+        // a fenced profile: skipping is not an attempt.
+        if check_slots.is_some_and(|c| !c.try_take(&st.profile_id, handle.infohash)) {
+            debug!(
+                target: "torrentd_engine::alert_loop",
+                profile_id = %st.profile_id,
+                infohash = %handle.infohash,
+                "disk-error retry deferred: no check slot is free",
+            );
+            defer_retry(state, clock, &handle.infohash);
+            continue;
+        }
         if !st.has_error {
             recheck_unpaused_disk_error(engine.as_ref(), state, clock, handle, &st.profile_id);
             continue;
@@ -1085,6 +1140,11 @@ fn execute_due_retries(
                             &[("profile_id", st.profile_id.as_str())],
                         );
                     }
+                }
+                // Paused again before any check could run: the slot it took
+                // would otherwise be held until the check it never ran ends.
+                if let Some(c) = check_slots {
+                    c.release(&handle.infohash);
                 }
                 defer_retry(state, clock, &handle.infohash);
             }
@@ -1760,6 +1820,7 @@ mod tests {
             &metrics,
             &dyn_clock,
             Some(&fence),
+            None,
             clock.now(),
         );
         assert!(!resumed(&engine), "a fenced torrent was resumed");
@@ -1778,6 +1839,7 @@ mod tests {
             &metrics,
             &dyn_clock,
             Some(&fence),
+            None,
             clock.now(),
         );
         assert!(
@@ -1814,6 +1876,7 @@ mod tests {
             &metrics,
             &dyn_clock,
             Some(&fence),
+            None,
             clock.now(),
         );
 
@@ -1870,6 +1933,7 @@ mod tests {
             &metrics,
             &dyn_clock,
             Some(&fence),
+            None,
             clock.now(),
         );
         assert!(recording.calls().iter().any(|c| matches!(
@@ -1894,7 +1958,15 @@ mod tests {
         // No engine for the torrent's profile.
         let empty: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![]));
         let (state, h) = state_with_a_due_retry(clock.now());
-        execute_due_retries(&empty, &state, &metrics, &dyn_clock, None, clock.now());
+        execute_due_retries(
+            &empty,
+            &state,
+            &metrics,
+            &dyn_clock,
+            None,
+            None,
+            clock.now(),
+        );
         let retry = state.get(&h.infohash).unwrap().retry.unwrap();
         assert_eq!(retry.attempts, 1);
         assert!(retry.next_attempt > clock.now());
@@ -1912,12 +1984,28 @@ mod tests {
             Arc::clone(&engine) as Arc<dyn TorrentEngine>
         ));
         let (state, h) = state_with_a_due_retry(clock.now());
-        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            None,
+            None,
+            clock.now(),
+        );
         assert!(resumed(&engine));
         let retry = state.get(&h.infohash).unwrap().retry.unwrap();
         assert_eq!(retry.attempts, 2, "a failed resume backs off");
         clock.advance(crate::state::RetryState::delay_for_attempt(2));
-        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            None,
+            None,
+            clock.now(),
+        );
         assert_eq!(
             engine
                 .calls()
@@ -1964,7 +2052,7 @@ mod tests {
         let recording = Arc::new(RecordingSink::new());
         let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::SystemClock);
-        execute_due_retries(&source, &state, &metrics, &clock, None, now);
+        execute_due_retries(&source, &state, &metrics, &clock, None, None, now);
         (engine, state, recording)
     }
 
@@ -2106,7 +2194,15 @@ mod tests {
             s.has_error = false;
             s.phase = TorrentPhase::DiskError;
         });
-        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            None,
+            None,
+            clock.now(),
+        );
         assert_eq!(rechecked(&engine), 1);
         let st = state.get(&h.infohash).unwrap();
         assert_eq!(st.phase, TorrentPhase::DiskError);
@@ -2191,7 +2287,7 @@ mod tests {
 
         let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
         let clock: Arc<dyn Clock> = Arc::new(crate::clock::SystemClock);
-        execute_due_retries(&source, &state, &metrics, &clock, None, now);
+        execute_due_retries(&source, &state, &metrics, &clock, None, None, now);
 
         assert!(resumed(&engine), "the error-paused torrent was not resumed");
         let retry = state
@@ -3001,6 +3097,7 @@ mod tests {
                 profile_fenced: None,
                 fence_hold: None,
                 magnet_guard_lift: None,
+                check_slots: None,
                 unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
                 listen_events: None,
                 listen_device_check: None,
@@ -3041,6 +3138,7 @@ mod tests {
                 profile_fenced: None,
                 fence_hold: None,
                 magnet_guard_lift: None,
+                check_slots: None,
                 unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
                 listen_events: None,
                 listen_device_check: None,

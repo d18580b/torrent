@@ -973,17 +973,37 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         assert!(a.forbids_downloading(), "{a:?}");
     }
 
-    // A session that refuses the torrent releases the claim for a retry.
+    // Issue #383: a `.torrent`'s first check waits for a slot in the check
+    // queue, `[pool]` or not: it is added paused, queued, and named in the
+    // record the next boot reads. A magnet has nothing to check yet.
+    let paused: Vec<bool> = adds
+        .iter()
+        .map(|a| {
+            a.flags_set()
+                .contains(torrentd_engine::TorrentFlags::PAUSED)
+        })
+        .collect();
+    assert_eq!(paused, [false, true, true], "{adds:?}");
+    assert_eq!(h.state.checks.depth(), 2);
+    for ih in [added, from_disk] {
+        assert!(h.state.checks.holds().holds(&p, &ih), "{ih}");
+    }
+
+    // A session that refuses the torrent releases the claim for a retry,
+    // and its place in the check queue and the record.
     e.p.inject_error("add_torrent", injected("add_torrent"));
     let resp = h
         .write_json("POST", "/v1/torrents", metainfo("p", &torrent_bytes('c')))
         .await;
     assert_problem(&resp, 500, "internal");
     assert!(!resp.text().contains("boom"), "the cause stays in the log");
+    assert_eq!(h.state.checks.depth(), 2);
+    assert_eq!(h.state.checks.holds().held(&p).len(), 2);
     let resp = h
         .write_json("POST", "/v1/torrents", metainfo("p", &torrent_bytes('c')))
         .await;
     resp.assert_status(StatusCode::CREATED);
+    assert_eq!(h.state.checks.depth(), 3);
 
     body_framework_rejections(
         h,
@@ -1074,6 +1094,24 @@ pub(super) async fn body_framework_rejections(
 async fn controls(h: &Harness, e: &Engines) {
     let loaded = handle(&e.p, LOADED);
     let unknown = hex(InfoHash([0xee; 20]));
+    // A recheck is queued, `[pool]` or not: the check queue's tick starts
+    // it, and a check that ends frees its slot for the next.
+    let tick = || {
+        crate::pool_service::admit_tick_for_tests(
+            &h.state.checks,
+            None,
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    let end_check = |ih: InfoHash| {
+        h.state
+            .state
+            .update(&ih, |st| st.checked_at = Some(std::time::Instant::now()));
+        tick();
+    };
 
     // Pause: allowed on a fenced profile, which it puts nothing on the
     // network for.
@@ -1106,6 +1144,10 @@ async fn controls(h: &Harness, e: &Engines) {
         h.write("POST", &format!("/v1/torrents/{}/{verb}", hex(LOADED)))
             .await
             .assert_status(status);
+        if verb == "recheck" {
+            assert!(!called(&e.p, &call), "a recheck waits for the queue");
+            tick();
+        }
         assert!(called(&e.p, &call), "{verb}");
         let resp = h
             .write("POST", &format!("/v1/torrents/{}/{verb}", hex(FENCED)))
@@ -1128,20 +1170,30 @@ async fn controls(h: &Harness, e: &Engines) {
     let recheck = format!("/v1/torrents/{}/recheck", hex(LOADED));
     let set_phase = |phase| h.state.state.update(&LOADED, |st| st.phase = phase);
     let phase = || h.state.state.get(&LOADED).unwrap().phase;
+    end_check(LOADED);
     set_phase(TorrentPhase::DiskError);
     h.write("POST", &recheck)
         .await
         .assert_status(StatusCode::ACCEPTED);
+    tick();
     assert_eq!(phase(), TorrentPhase::Checking);
+    end_check(LOADED);
     set_phase(TorrentPhase::DiskError);
     e.p.inject_error("force_recheck", injected("force_recheck"));
-    assert_problem(&h.write("POST", &recheck).await, 500, "internal");
+    // Accepted, and dropped when it fails to start: the queue counts it in
+    // `pool_recheck_dropped_total{reason="start_failed"}`.
+    h.write("POST", &recheck)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    tick();
     assert_eq!(phase(), TorrentPhase::DiskError);
     set_phase(TorrentPhase::Seeding);
     h.write("POST", &recheck)
         .await
         .assert_status(StatusCode::ACCEPTED);
+    tick();
     assert_eq!(phase(), TorrentPhase::Seeding);
+    end_check(LOADED);
 
     // Unloaded — never loaded, or mid-add — is 404; a session error is 500.
     for (verb, op) in [
@@ -1154,11 +1206,17 @@ async fn controls(h: &Harness, e: &Engines) {
             let resp = h.write("POST", &format!("/v1/torrents/{ih}/{verb}")).await;
             assert_problem(&resp, 404, "torrent-not-found");
         }
+        // A recheck of a paused torrent is asked for at once, so the
+        // session's refusal is the request's to report.
+        if verb == "recheck" {
+            set_phase(TorrentPhase::Paused);
+        }
         e.p.inject_error(op, injected(op));
         let resp = h
             .write("POST", &format!("/v1/torrents/{}/{verb}", hex(LOADED)))
             .await;
         assert_problem(&resp, 500, "internal");
+        set_phase(TorrentPhase::Seeding);
     }
 
     // The upload limit: set, removed with null or absence, bounded, and
@@ -1662,6 +1720,7 @@ async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
         for ih in &hashes {
             load(s, &e.p, *ih, "p", TorrentPhase::Seeding);
         }
+        s.checks = crate::pool_service::VerifyQueue::for_daemon(Some(&pool));
         s.pool = Some(Arc::clone(&pool));
         engine = Some(e.p);
     });
@@ -1703,7 +1762,8 @@ async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
 
     let tick = || {
         crate::pool_service::admit_tick_for_tests(
-            &pool,
+            pool.verify_queue(),
+            Some(&pool),
             &h.state.source,
             &h.state.state,
             &h.state.profiles,
@@ -1763,6 +1823,169 @@ async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
     assert_eq!(rechecked().last(), Some(&magnet));
     assert_eq!(q.depth(), 0);
     assert_eq!(q.in_flight(), 0);
+}
+
+/// Issue #383: twelve `.torrent`s posted to `POST /v1/torrents` in a row,
+/// with no `[pool]`, never have more than the default check limit of four
+/// hashing at once. Each used to be added running, so all twelve hashed at
+/// once, uncounted. Each is added paused instead, and the check queue resumes
+/// it once a slot is free, counting it in `checks_started_total`.
+#[tokio::test]
+async fn a_burst_of_torrent_adds_hashes_at_most_the_check_limit_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        s.checks.set_metrics(s.metrics.clone());
+        engine = Some(e.p);
+    });
+    let engine = engine.unwrap();
+    assert!(h.state.pool.is_none(), "the bound holds without [pool]");
+    let p = ProfileId::new("p");
+    let mut added = Vec::new();
+    for name in 'a'..='l' {
+        let resp = h
+            .write_json("POST", "/v1/torrents", metainfo("p", &torrent_bytes(name)))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let ih = InfoHash::from_hex(resp.json::<Value>()["infohash"].as_str().unwrap()).unwrap();
+        // What the add alert does: the state map takes the torrent in.
+        let mut st = TorrentState::newly_added(handle(&engine, ih), p.clone(), Instant::now());
+        st.phase = TorrentPhase::Paused;
+        h.state.state.insert(ih, st);
+        added.push(ih);
+    }
+    let resumed = || -> Vec<InfoHash> {
+        engine
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ResumeTorrent(h) => Some(h.infohash),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(
+        resumed().is_empty(),
+        "nothing hashes before the queue admits it"
+    );
+    let q = &h.state.checks;
+    assert_eq!(q.depth(), 12);
+    assert_eq!(q.holds().held(&p).len(), 12);
+
+    let tick = || {
+        crate::pool_service::admit_tick_for_tests(
+            q,
+            None,
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    let mut finished = std::collections::HashSet::new();
+    let mut peak = 0;
+    for n in 0..100 {
+        tick();
+        let started = resumed();
+        let checking = started.iter().filter(|h| !finished.contains(*h)).count();
+        assert!(checking <= 4, "tick {n}: {checking} checking at once");
+        assert_eq!(q.in_flight(), checking, "tick {n}");
+        assert_eq!(q.depth(), 12 - started.len(), "tick {n}");
+        peak = peak.max(checking);
+        if started.len() == added.len() && checking == 0 {
+            break;
+        }
+        // libtorrent reports the oldest running check over.
+        if let Some(ih) = started.iter().find(|h| !finished.contains(*h)) {
+            std::thread::sleep(Duration::from_millis(2));
+            h.state.state.update(ih, |st| {
+                st.checked_at = Some(Instant::now());
+                st.phase = TorrentPhase::Seeding;
+            });
+            finished.insert(*ih);
+        }
+    }
+    assert_eq!(resumed(), added, "every torrent resumed once, in order");
+    assert_eq!(peak, 4, "the limit is reached, not merely respected");
+    assert_eq!(q.in_flight(), 0);
+    assert!(
+        q.holds().held(&p).is_empty(),
+        "a check that ended leaves the record, so the next boot loads it as it is"
+    );
+    let rendered = String::from_utf8(h.state.metrics.render()).unwrap();
+    assert!(
+        rendered.contains(r#"torrentd_checks_started_total{source="add"} 12"#),
+        "{rendered}"
+    );
+}
+
+/// A `.torrent` waiting for its first check that the operator pauses is
+/// theirs: the queue no longer resumes it, and the record lets it go. One
+/// the operator resumes takes its slot at once.
+#[tokio::test]
+async fn a_held_add_follows_the_operators_pause_and_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        engine = Some(e.p);
+    });
+    let engine = engine.unwrap();
+    let p = ProfileId::new("p");
+    let mut added = Vec::new();
+    for name in ['a', 'b'] {
+        let resp = h
+            .write_json("POST", "/v1/torrents", metainfo("p", &torrent_bytes(name)))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let ih = InfoHash::from_hex(resp.json::<Value>()["infohash"].as_str().unwrap()).unwrap();
+        let mut st = TorrentState::newly_added(handle(&engine, ih), p.clone(), Instant::now());
+        st.phase = TorrentPhase::Paused;
+        h.state.state.insert(ih, st);
+        added.push(ih);
+    }
+    let q = &h.state.checks;
+    assert_eq!(q.depth(), 2);
+
+    h.write("POST", &format!("/v1/torrents/{}/pause", hex(added[0])))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(q.depth(), 1);
+    assert!(
+        !q.holds().holds(&p, &added[0]),
+        "the pause is the operator's"
+    );
+
+    h.write("POST", &format!("/v1/torrents/{}/resume", hex(added[1])))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(q.depth(), 0);
+    assert_eq!(q.in_flight(), 1, "a check resumed by hand holds a slot");
+    assert!(
+        q.holds().holds(&p, &added[1]),
+        "held until its check ends, so a restart before then queues it again"
+    );
+
+    crate::pool_service::admit_tick_for_tests(
+        q,
+        None,
+        &h.state.source,
+        &h.state.state,
+        &h.state.profiles,
+        &h.state.registry,
+    );
+    let resumes = engine
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, RecordedCall::ResumeTorrent(_)))
+        .count();
+    assert_eq!(
+        resumes,
+        1,
+        "only the operator's resume: {:?}",
+        engine.calls()
+    );
 }
 
 /// Drop the write bit on `dir`, returning the mode to restore afterwards.

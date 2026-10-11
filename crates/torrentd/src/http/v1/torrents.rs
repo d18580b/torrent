@@ -702,9 +702,14 @@ enum AddSource {
 /// to — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
 /// there must be at least one; when it also sets `allowed_tracker_urls`, every
 /// announce URL must fall under one of those account prefixes. A `.torrent`'s
-/// payload is hashed before the torrent seeds: it is `checking` first, and a
-/// payload that is absent, truncated or not yet fully written ends
-/// `incomplete` and never announces itself complete. The daemon never
+/// payload is hashed before the torrent seeds, and a payload that is absent,
+/// truncated or not yet fully written ends `incomplete` and never announces
+/// itself complete. The torrent is added `paused` and waits for a slot in
+/// the daemon's check queue, which starts it once fewer than
+/// `[pool] max_concurrent_verify` checks (4 without `[pool]`) are running,
+/// adoptions' and rechecks' included; it is `checking` from then until the
+/// check ends. Pausing it while it waits leaves it paused, and resuming it
+/// starts its check at once. The daemon never
 /// downloads, so supply the payload, then recheck it with
 /// `POST /v1/torrents/{infohash}/recheck`. The response is the torrent as its
 /// session first reports it; its `phase` is `unknown` until the first state
@@ -939,7 +944,7 @@ pub async fn add_torrent(
     })
     .await
     .map_err(|e| AddTorrentError::Internal {
-        detail: internal("adding the torrent to its session", e),
+        detail: internal("adding the torrent", e),
     })?;
 
     // The state map learns of the torrent only with its `AddTorrent` alert,
@@ -969,39 +974,82 @@ pub async fn add_torrent(
     ))
 }
 
+/// Why [`add_and_settle`] added nothing.
+#[derive(Debug, thiserror::Error)]
+enum SettleError {
+    /// The record of adds held for a check slot could not be written, so the
+    /// `.torrent` was not added paused behind it.
+    #[error("recording the torrent as held for its first check: {0}")]
+    Hold(std::io::Error),
+    /// The session refused the add.
+    #[error("adding the torrent to its session: {0}")]
+    Engine(EngineError),
+}
+
 /// Hand `params` to the session, then settle the claim on `infohash` either
 /// way: release it when the add failed, persist the `.torrent` and the
 /// `save_path` it was added at when it succeeded.
+///
+/// A `.torrent` (`AddParams::File`) is added paused, and its first check
+/// waits for a slot in the daemon's check queue, which resumes it:
+/// libtorrent bounds checking only for auto-managed torrents, and a burst of
+/// adds otherwise hashed every payload at once. Its entry in the record of
+/// held adds is written before the add, so a restart before its check ends
+/// loads it paused and queues it again rather than leaving it paused for
+/// good. A magnet has nothing to check until its metadata arrives.
 ///
 /// Blocking, and called from inside the blocking task so that it completes
 /// when the request that started it is dropped mid-add.
 fn add_and_settle(
     s: &AppState,
     engine: &dyn TorrentEngine,
-    params: AddParams,
+    mut params: AddParams,
     infohash: InfoHash,
     profile_id: &ProfileId,
     torrent_bytes: Option<Vec<u8>>,
     save_path: &str,
-) -> Result<torrentd_engine::TorrentHandle, EngineError> {
+) -> Result<torrentd_engine::TorrentHandle, SettleError> {
+    // Release the claim so the add can be retried. A release that fails to
+    // persist comes back from the file at the next restart as a claim on a
+    // torrent no session holds.
+    let release_claim = || {
+        if let Err(re) = s.registry.remove(&infohash) {
+            warn!(
+                infohash = %infohash,
+                error.cause = %re,
+                "could not release the claim of a torrent whose add failed",
+            );
+            s.metrics
+                .inc_counter("store_write_errors_total", &[("store", "registry")]);
+        }
+    };
+    let held_for_check = matches!(params, AddParams::File { .. });
+    if held_for_check {
+        if let Err(e) = s.checks.hold_add(profile_id, infohash) {
+            release_claim();
+            return Err(SettleError::Hold(e));
+        }
+        if let AddParams::File { flags, .. } = &mut params {
+            *flags |= torrentd_engine::TorrentFlags::PAUSED;
+        }
+    }
     let handle = match engine.add_torrent(params) {
         Ok(handle) => handle,
         Err(e) => {
-            // Release the claim so the add can be retried. A release that
-            // fails to persist comes back from the file at the next restart as
-            // a claim on a torrent no session holds.
-            if let Err(re) = s.registry.remove(&infohash) {
-                warn!(
-                    infohash = %infohash,
-                    error.cause = %re,
-                    "could not release the claim of a torrent whose add failed",
-                );
-                s.metrics
-                    .inc_counter("store_write_errors_total", &[("store", "registry")]);
+            release_claim();
+            if held_for_check {
+                s.checks.abandon_add(profile_id, infohash);
             }
-            return Err(e);
+            return Err(SettleError::Engine(e));
         }
     };
+    if held_for_check {
+        s.checks.enqueue_add(
+            profile_id.clone(),
+            infohash,
+            crate::pool_service::CheckSource::Add,
+        );
+    }
     // `unfenced_engine` let this add through, but a fence can have landed
     // between that check and the add.
     crate::vpn_monitor::hold_if_fenced(
@@ -2038,6 +2086,10 @@ pub async fn pause_torrent(
     paused.map_err(|e| PauseTorrentError::Internal {
         detail: internal("pausing the torrent", e),
     })?;
+    // A `.torrent` held paused for its first check is the operator's to
+    // resume from here on: the check queue no longer resumes it, and the
+    // next boot keeps it paused.
+    s.checks.forget_add(st.handle.infohash);
     // Saved now rather than at the next 30-minute sweep: a crash before it
     // would bring the torrent back running.
     s.state.queue_resume_save_now(st.handle.infohash);
@@ -2101,12 +2153,20 @@ pub async fn resume_torrent(
         // resume, so a failed one leaves the torrent held, and serialised
         // with a set-online's hold-and-pause, so the hold and the torrent's
         // pause cannot part.
-        match state.profiles.resolve(&st.profile_id).active() {
+        let resumed = match state.profiles.resolve(&st.profile_id).active() {
             Some(entry) => entry.resume_by_hand(st.handle, resume, |r| {
                 *r == crate::vpn_monitor::SingleResume::Resumed
             }),
             None => resume(),
+        };
+        // A `.torrent` still waiting for a check slot starts its first check
+        // now, by the operator's hand: it takes its slot at once, over the
+        // limit if it must, so the queue counts it and admits nothing beside
+        // it until it ends.
+        if matches!(resumed, Ok(crate::vpn_monitor::SingleResume::Resumed)) {
+            state.checks.start_held_add_now(st.handle.infohash);
         }
+        resumed
     })
     .await
     .map_err(|e| UnfencedControlError::Internal {
@@ -2128,20 +2188,20 @@ pub async fn resume_torrent(
 ///
 /// Re-hashes the payload against the piece hashes. `202`: libtorrent checks
 /// asynchronously, and the torrent's `phase` reports `checking` from the
-/// moment the check starts until it is done. Needs no `[pool]`. With `[pool]`
-/// configured, the check is queued rather than started, and a queued check
-/// leaves the torrent in its old `phase` until the verify queue starts it:
-/// the queue starts it once a slot is free, at
-/// most `[pool] max_concurrent_verify` checks at once together with
-/// adoptions' verifications and `POST /v1/pool/verifications`' re-hashes, and
-/// `GET /v1/pool` counts it in `verify_queue_depth` while it waits and
-/// `verify_in_flight` while it hashes. Asking again for a torrent already
-/// waiting or checking queues nothing more. Without `[pool]`, and for a
-/// paused torrent or one still without metadata (which libtorrent does not
-/// hash until it is resumed or its metadata arrives), libtorrent is asked at
-/// once. A recheck drops seed mode, which is safe because the no-download
-/// invariant rests on upload mode, and that survives it. Refused while the
-/// profile is fenced, as resuming is.
+/// moment the check starts until it is done. Needs no `[pool]`. The check is
+/// queued rather than started, and a queued check leaves the torrent in its
+/// old `phase` until the daemon's check queue starts it: the queue starts it
+/// once a slot is free, at most `[pool] max_concurrent_verify` checks at once
+/// (its default of 4 without `[pool]`) together with adoptions'
+/// verifications, `POST /v1/pool/verifications`' re-hashes, the first checks
+/// of `.torrent`s added and the disk-error retry's checks. `GET /v1/pool`
+/// counts it in `verify_queue_depth` while it waits and `verify_in_flight`
+/// while it hashes. Asking again for a torrent already waiting or checking
+/// queues nothing more. For a paused torrent or one still without metadata
+/// (which libtorrent does not hash until it is resumed or its metadata
+/// arrives), libtorrent is asked at once. A recheck drops seed mode, which is
+/// safe because the no-download invariant rests on upload mode, and that
+/// survives it. Refused while the profile is fenced, as resuming is.
 #[kynos::post("/torrents/{infohash}/recheck", tag = Torrents)]
 pub async fn recheck_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -2169,9 +2229,8 @@ pub async fn recheck_torrent(
         st.phase,
         torrentd_engine::TorrentPhase::Paused | torrentd_engine::TorrentPhase::AwaitingMetadata
     );
-    if let Some(pool) = s.pool.as_ref().filter(|_| hashes_now) {
-        pool.verify_queue()
-            .enqueue_recheck(st.handle.infohash.to_hex(), false);
+    if hashes_now {
+        s.checks.enqueue_recheck(st.handle.infohash.to_hex(), false);
         return Ok(Accepted::new(()));
     }
     let state = Arc::clone(&s);

@@ -272,10 +272,12 @@ pub struct PoolConfig {
     #[serde(default)]
     pub db_path: Option<PathBuf>,
 
-    /// How many torrents may be hashing at once, adoptions' verifications and
-    /// `POST /v1/pool/verifications` re-hashes together. Adopting a large
-    /// subtree, or re-hashing a library, otherwise saturates the disk and
-    /// starves whatever is already seeding.
+    /// How many torrents may be hashing at once: adoptions' verifications,
+    /// re-hashes, the first check of a `.torrent` added with no resume data
+    /// and the disk-error retry's checks together. Adopting a large subtree,
+    /// re-hashing a library or adding many `.torrent`s otherwise saturates
+    /// the disk and starves whatever is already seeding. Without `[pool]` the
+    /// same checks share the default.
     #[serde(default = "PoolConfig::default_max_concurrent_verify")]
     pub max_concurrent_verify: usize,
 
@@ -295,7 +297,8 @@ impl PoolConfig {
     fn default_true() -> bool {
         true
     }
-    fn default_max_concurrent_verify() -> usize {
+    /// Also the daemon's check limit where `[pool]` is not configured.
+    pub(crate) fn default_max_concurrent_verify() -> usize {
         4
     }
 }

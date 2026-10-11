@@ -911,6 +911,9 @@ pub async fn pause_profile(
         entry.halt_resumes();
         entry.note_paused(&handles);
     }
+    // A `.torrent` held paused for its first check stays paused too: the
+    // check queue no longer resumes it, and the next boot keeps it paused.
+    s.checks.forget_profile_adds(&profile_id);
     let mut out = BulkOutcome::default();
     tally(
         &mut out,
@@ -1018,6 +1021,7 @@ pub async fn pause_all_torrents(
         entry.note_paused(&handles);
         entry.halt_resumes();
         entry.note_paused(&handles);
+        s.checks.forget_profile_adds(entry.id());
         let reached =
             for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), pause_and_save).await;
         tally(&mut out, reached);

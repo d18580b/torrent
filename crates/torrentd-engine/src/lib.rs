@@ -35,6 +35,7 @@ pub mod alert_loop;
 pub use alert_loop::heartbeat_age;
 pub use alert_loop::AlertLoopBuilder;
 pub use alert_loop::AlertLoopHandle;
+pub use alert_loop::CheckSlots;
 pub use alert_loop::FatalCallback;
 pub use alert_loop::FenceHold;
 pub use alert_loop::MagnetGuardLift;
