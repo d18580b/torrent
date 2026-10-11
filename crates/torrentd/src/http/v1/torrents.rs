@@ -2019,14 +2019,22 @@ pub async fn pause_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, PauseTorrentError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
-    if let Some(entry) = s.profiles.resolve(&st.profile_id).active() {
-        entry.exclude_from_resumes(st.handle);
+    let entry = s.profiles.resolve(&st.profile_id).active();
+    // Noted paused first, so a kill-switch fence or a set-online that reads
+    // what is running from here on, before a state update reports the pause,
+    // does not resume it; the gates catch one that read before.
+    let before = entry.map(|e| {
+        let before = e.note_running(st.handle, false);
+        e.exclude_from_resumes(st.handle);
+        before
+    });
+    let paused = blocking(move || engine.pause_torrent(st.handle)).await;
+    if let (Err(_), Some(e), Some(before)) = (&paused, entry, before) {
+        e.restore_noted(st.handle, before);
     }
-    blocking(move || engine.pause_torrent(st.handle))
-        .await
-        .map_err(|e| PauseTorrentError::Internal {
-            detail: internal("pausing the torrent", e),
-        })?;
+    paused.map_err(|e| PauseTorrentError::Internal {
+        detail: internal("pausing the torrent", e),
+    })?;
     // Saved now rather than at the next 30-minute sweep: a crash before it
     // would bring the torrent back running.
     s.state.queue_resume_save_now(st.handle.infohash);

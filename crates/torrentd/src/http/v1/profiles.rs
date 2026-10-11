@@ -900,6 +900,11 @@ pub async fn pause_profile(
     let profile_id = ProfileId::new(path.profile_id);
     let engine = engine_for(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
     if let Some(entry) = s.profiles.resolve(&profile_id).active() {
+        // Noted paused before the gates halt, so a kill-switch fence or a
+        // set-online that reads what is running from here on, before a state
+        // update reports the walk's pauses, resumes none of them; one that
+        // read before opened a gate this halts.
+        entry.note_paused(&s.state.handles_for_profile(&profile_id));
         entry.halt_resumes();
     }
     let mut out = BulkOutcome::default();
@@ -1003,6 +1008,8 @@ pub async fn pause_all_torrents(
         ..BulkOutcome::default()
     };
     for entry in s.profiles.iter() {
+        // As a profile's pause-all does ([`pause_profile`]).
+        entry.note_paused(&s.state.handles_for_profile(entry.id()));
         entry.halt_resumes();
         let reached =
             for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), pause_and_save).await;
