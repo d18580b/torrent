@@ -375,9 +375,10 @@ fn bound_device(fd: libc::c_int) -> Option<String> {
 /// while that limit is above 10 and some torrent has a peer to drop;
 /// otherwise the connection stays queued and the re-armed accept fails
 /// again at once, so a shortage that lasts posts a stream of these alerts
-/// (see [`ACCEPT_EMFILE_QUIET`]). So the alert loop does not take it as a failed socket: it is neither
-/// fatal nor published to a waiting rebind, and [`handle`] counts it in
-/// `listen_accept_errors_total` rather than in [`ListenFailures`]. Every
+/// (see [`ACCEPT_EMFILE_QUIET`]). So the alert loop does not take it as a
+/// failed socket: it is neither fatal nor published to a waiting rebind,
+/// and [`handle`] counts it in `listen_accept_errors_total` rather than in
+/// [`ListenFailures`]. Every
 /// other accept error returns without re-arming, so the listener has stopped
 /// accepting and those stay listen failures, `ENFILE` included.
 ///
