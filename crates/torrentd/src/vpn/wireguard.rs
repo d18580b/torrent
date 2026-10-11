@@ -79,8 +79,10 @@ impl ProbeUnavailable {
 ///
 /// This is the signal the health monitor uses on top of IP presence: a tunnel
 /// can keep its address while its handshake silently stops (peer gone, key
-/// rotation stalled), which the IP check cannot see. A seeding host always has
-/// traffic, so a healthy tunnel rekeys well inside the threshold.
+/// rotation stalled), which the IP check cannot see. An age alone does not
+/// make a tunnel stale: WireGuard handshakes only when it has something to
+/// send, so a quiet link's handshake ages however healthy it is. The monitor
+/// reads it beside the link's byte counters ([`transfer`]).
 pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavailable> {
     // `wg show <iface> latest-handshakes` prints `<pubkey>\t<unix_secs>` per
     // peer; 0 means "never". Take the freshest across peers.
@@ -132,6 +134,58 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
         return Ok(Some(Duration::ZERO));
     }
     Ok(Some(Duration::from_secs(now - latest)))
+}
+
+/// A WireGuard link's byte counters, summed across its peers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Transfer {
+    /// Bytes received from the peers, handshake responses included.
+    pub rx: u64,
+    /// Bytes sent to the peers, handshake initiations included.
+    pub tx: u64,
+}
+
+/// The byte counters of `iface`'s peers, from `wg show <iface> transfer`.
+///
+/// What tells a quiet link from a dead one. A healthy peer answers whatever
+/// the link sends, and on a session past WireGuard's rekey time the first
+/// thing sent is a handshake that the peer answers within seconds, so `rx`
+/// grows soon after `tx` does. A link whose `tx` grew while `rx` did not has
+/// sent into a tunnel that is not answering; one whose `tx` stayed flat has
+/// sent nothing to answer, whatever its handshake's age.
+///
+/// `Err(_)` as for [`latest_handshake_age`]: the probe could not run.
+pub fn transfer(iface: &str) -> Result<Transfer, ProbeUnavailable> {
+    let name = exec::iface(iface).map_err(|_| ProbeUnavailable::Refused)?;
+    let out = exec::run("wg", &["show", name, "transfer"], None, exec::QUICK)
+        .map_err(|_| ProbeUnavailable::NoTool)?;
+    if !out.status.success() {
+        return Err(ProbeUnavailable::Refused);
+    }
+    parse_transfer(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// [`transfer`]'s reading of `wg show <iface> transfer`, which prints
+/// `<pubkey>\t<rx_bytes>\t<tx_bytes>` per peer and nothing for a link with no
+/// peers. A line it cannot read fails the whole probe: a sum that skipped a
+/// peer would read that peer's traffic as silence.
+fn parse_transfer(text: &str) -> Result<Transfer, ProbeUnavailable> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .try_fold(Transfer::default(), |sum, line| {
+            let mut fields = line.split_whitespace().skip(1);
+            let mut count = || {
+                fields
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or(ProbeUnavailable::Unparseable)
+            };
+            let (rx, tx) = (count()?, count()?);
+            Ok(Transfer {
+                rx: sum.rx.saturating_add(rx),
+                tx: sum.tx.saturating_add(tx),
+            })
+        })
 }
 
 /// The host's boot id, or `None` if it could not be read.
@@ -1452,6 +1506,30 @@ mod tests {
             matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
             "got {r:?}",
         );
+        let r = transfer("torrentd-nonexistent-iface");
+        assert!(
+            matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
+            "got {r:?}",
+        );
+    }
+
+    /// The counters are summed across peers; a link with no peers reads
+    /// zero, and a line that cannot be read fails the probe rather than
+    /// dropping that peer's traffic from the sum.
+    #[test]
+    fn transfer_sums_every_peer_and_refuses_a_line_it_cannot_read() {
+        assert_eq!(parse_transfer(""), Ok(Transfer::default()));
+        assert_eq!(
+            parse_transfer("pkA=\t100\t2000\npkB=\t5\t7\n"),
+            Ok(Transfer { rx: 105, tx: 2007 }),
+        );
+        for bad in ["pkA=\t100\n", "pkA=\tlots\t7\n", "pkA=\t1\t2\npkB=\n"] {
+            assert_eq!(
+                parse_transfer(bad),
+                Err(ProbeUnavailable::Unparseable),
+                "{bad:?}"
+            );
+        }
     }
 
     /// [`ownership`]'s truth table, and what each answer means to the

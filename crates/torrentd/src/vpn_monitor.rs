@@ -148,10 +148,12 @@ pub(crate) struct Observation {
     /// How long a WireGuard tunnel has had traffic to carry with no handshake
     /// answering it, counted only over the current run of polls that saw
     /// torrents in its profile that can send (not paused): for a handshaked
-    /// tunnel, the time since that run began or the handshake's age, whichever
-    /// is shorter; for a never-handshaked one, the time since the first poll
-    /// in it that saw no handshake. Zero on any poll whose profile has nothing
-    /// to send, which ends the run. [`unanswered_clock`] keeps it.
+    /// tunnel, the time since the link's byte counters first showed it
+    /// sending with nothing received, or the handshake's age, whichever is
+    /// shorter (the time since the run began where the counters cannot be
+    /// read); for a never-handshaked one, the time since the first poll in it
+    /// that saw no handshake. Zero on any poll whose profile has nothing to
+    /// send, which ends the run. [`unanswered_clock`] keeps it.
     ///
     /// Not time since bring-up, and not the handshake's age alone. WireGuard
     /// handshakes only when it has a packet to send, and a profile with no
@@ -159,7 +161,9 @@ pub(crate) struct Observation {
     /// one that never handshaked stays so. Judged on either, a fresh
     /// deployment's empty profile, or one whose torrents are all paused, was
     /// fenced for having nothing to do, and fencing, which pauses nothing
-    /// there, still needed an operator to undo.
+    /// there, still needed an operator to undo. A seeding profile with no
+    /// peer connected sends only its announces, half an hour apart, and was
+    /// fenced between two of them on the time it had carried alone.
     pub unanswered_for: Duration,
 }
 
@@ -321,6 +325,12 @@ struct Unanswered {
     /// The first poll of that run that saw the tunnel never handshaked, since
     /// the last poll that saw a handshake.
     never_since: Option<Instant>,
+    /// The tunnel's byte counters at the last poll of this run that could
+    /// read them.
+    counters: Option<vpn::WireguardTransfer>,
+    /// The first poll of this run that saw the tunnel send (`tx` grew) with
+    /// nothing received (`rx` still), since the last poll that saw `rx` grow.
+    sent_unanswered_since: Option<Instant>,
 }
 
 /// Advance one profile's unanswered clock and read it
@@ -334,11 +344,25 @@ struct Unanswered {
 ///   handshake while carrying. A handshake resets this, so a link re-raised
 ///   under the profile (its handshake gone again) gets the whole threshold to
 ///   handshake, as a fresh one does.
-/// - **Handshaked:** the time since the profile started carrying, capped at
-///   the handshake's age. A handshake inside the run answered the traffic up
-///   to it; one older than the run predates any traffic it could have
-///   answered, so an idle link's handshake, however old, is no fault until
-///   the profile has carried for the threshold with none.
+/// - **Handshaked:** the time since the tunnel sent something nothing has
+///   answered, capped at the handshake's age. `transfer` is the link's byte
+///   counters this poll: the clock starts at the first poll that sees `tx`
+///   grow with `rx` still, and any growth in `rx` stops it, since the peer
+///   answered. A link whose `tx` stays flat has sent nothing to answer, so a
+///   quiet seed's handshake, however old, is no fault: with no keepalive and
+///   no peer connected it sends only an announce every half hour, and judged
+///   on the time it had carried, it was fenced between two of them. A
+///   handshake inside the run answered the traffic up to it.
+///
+///   Counters that dropped (the link was re-raised and they restarted) are a
+///   new baseline with nothing outstanding. The first poll of a run that
+///   reads them is a baseline too, since what was sent before it is unknown.
+/// - **Handshaked, counters unreadable:** a poll whose counters could not be
+///   read after earlier polls in the run read them says nothing, and leaves
+///   the clock as it stands and reads zero. Where no poll in the run has read
+///   them, the clock falls back to the time since the profile started
+///   carrying, capped at the handshake's age: a quiet seed may then be
+///   fenced, but a dead tunnel still is.
 ///
 /// A poll whose handshake probe could not run ([`Handshake::NoSignal`]) says
 /// nothing about the handshake, so while the profile carries traffic it leaves
@@ -349,6 +373,7 @@ fn unanswered_clock(
     clocks: &mut std::collections::HashMap<torrentd_engine::ProfileId, Unanswered>,
     id: &torrentd_engine::ProfileId,
     handshake: Handshake,
+    transfer: Option<vpn::WireguardTransfer>,
     carrying: bool,
     now: Instant,
 ) -> Duration {
@@ -359,12 +384,30 @@ fn unanswered_clock(
     let clock = clocks.entry(id.clone()).or_insert(Unanswered {
         carrying_since: now,
         never_since: None,
+        counters: None,
+        sent_unanswered_since: None,
     });
+    if let Some(seen) = transfer {
+        if let Some(last) = clock.counters.replace(seen) {
+            if seen.rx != last.rx || seen.tx < last.tx {
+                clock.sent_unanswered_since = None;
+            } else if seen.tx > last.tx {
+                clock.sent_unanswered_since.get_or_insert(now);
+            }
+        }
+    }
     match handshake {
         Handshake::Never => now.saturating_duration_since(*clock.never_since.get_or_insert(now)),
         Handshake::Age(age) => {
             clock.never_since = None;
-            now.saturating_duration_since(clock.carrying_since).min(age)
+            let since = match (transfer, clock.counters) {
+                (Some(_), _) => clock.sent_unanswered_since,
+                (None, Some(_)) => None,
+                (None, None) => Some(clock.carrying_since),
+            };
+            since.map_or(Duration::ZERO, |since| {
+                now.saturating_duration_since(since).min(age)
+            })
         }
         Handshake::NoSignal => Duration::ZERO,
     }
@@ -405,6 +448,14 @@ pub(crate) type Prober = Arc<dyn Fn(&str, bool) -> TunnelProbes + Send + Sync>;
 pub(crate) fn host_prober() -> Prober {
     Arc::new(probe_tunnel)
 }
+
+/// How [`run_with`] reads a WireGuard tunnel's byte counters:
+/// [`vpn::wireguard_transfer`] outside tests. Apart from [`Prober`] because
+/// only the poll loop reads them: [`recovery_check`] does not judge the
+/// handshake.
+type CounterProber = Arc<
+    dyn Fn(&str) -> Result<vpn::WireguardTransfer, vpn::HandshakeProbeUnavailable> + Send + Sync,
+>;
 
 /// Whether a fenced profile's tunnel is healthy enough to lift the fence,
 /// asked when the operator sets the profile online. Blocking: it shells out.
@@ -1180,12 +1231,14 @@ pub async fn run(
         handshake_max_age,
         shutdown,
         host_prober(),
+        Arc::new(vpn::wireguard_transfer),
     )
     .await;
 }
 
-/// [`run`] with the host probes behind `probe`, so a test can drive the poll
-/// loop — the gauges it sets, the clock it keeps, the fence — without a tunnel.
+/// [`run`] with the host probes behind `probe` and `counters`, so a test can
+/// drive the poll loop — the gauges it sets, the clock it keeps, the fence —
+/// without a tunnel.
 async fn run_with(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -1193,6 +1246,7 @@ async fn run_with(
     handshake_max_age: Duration,
     mut shutdown: broadcast::Receiver<ShutdownReason>,
     probe: Prober,
+    counters: CounterProber,
 ) {
     seed_baselines(&profiles, &metrics);
     // Per profile: when its current run of polls with torrents to carry
@@ -1236,11 +1290,12 @@ async fn run_with(
             let probed = tokio::task::spawn_blocking({
                 let iface = iface.clone();
                 let probe = probe.clone();
-                move || probe(&iface, is_wg)
+                let counters = counters.clone();
+                move || (probe(&iface, is_wg), is_wg.then(|| counters(&iface)))
             })
             .await;
-            let (addr_probe, route_probe, handshake_probe) = match probed {
-                Ok(p) => (p.ip, p.route, p.handshake),
+            let (addr_probe, route_probe, handshake_probe, transfer_probe) = match probed {
+                Ok((p, transfer)) => (p.ip, p.route, p.handshake, transfer),
                 Err(e) => {
                     error!(
                         target: "torrentd::vpn_monitor",
@@ -1339,6 +1394,21 @@ async fn run_with(
                     Handshake::Age(age)
                 }
             };
+            let transfer = match transfer_probe {
+                Some(Ok(t)) => Some(t),
+                Some(Err(why)) => {
+                    warn!(
+                        target: "torrentd::vpn_monitor",
+                        profile_id = %profile_id,
+                        vpn_iface = %iface,
+                        reason = why.as_str(),
+                        "wireguard transfer probe unavailable; an aged handshake is \
+                         judged on the profile's torrents alone",
+                    );
+                    None
+                }
+                None => None,
+            };
             // A WireGuard tunnel with nothing to send does not handshake, so
             // on a profile with nothing to carry its handshake, never made or
             // aging, says nothing about the tunnel: the clock reads zero and
@@ -1356,6 +1426,7 @@ async fn run_with(
                 &mut unanswered,
                 &profile_id,
                 handshake,
+                transfer,
                 carrying,
                 // The runtime's clock, which is the wall clock outside tests
                 // and the one the poll interval is measured on.
@@ -1628,28 +1699,29 @@ mod tests {
         let later = t0 + Duration::from_secs(600);
 
         assert_eq!(
-            unanswered_clock(&mut since, &id, Handshake::Never, false, t0),
+            unanswered_clock(&mut since, &id, Handshake::Never, None, false, t0),
             Duration::ZERO
         );
         assert_eq!(
-            unanswered_clock(&mut since, &id, Handshake::Never, false, later),
+            unanswered_clock(&mut since, &id, Handshake::Never, None, false, later),
             Duration::ZERO,
             "no torrents, however long: nothing was sent to answer",
         );
 
         assert_eq!(
-            unanswered_clock(&mut since, &id, Handshake::Never, true, later),
+            unanswered_clock(&mut since, &id, Handshake::Never, None, true, later),
             Duration::ZERO,
             "starts when the first torrent is there",
         );
         let then = later + MAX + Duration::from_secs(1);
-        assert!(unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX);
+        assert!(unanswered_clock(&mut since, &id, Handshake::Never, None, true, then) > MAX);
 
         assert_eq!(
             unanswered_clock(
                 &mut since,
                 &id,
                 Handshake::Age(Duration::from_secs(1)),
+                None,
                 true,
                 then
             ),
@@ -1661,6 +1733,7 @@ mod tests {
                 &mut since,
                 &id,
                 Handshake::Never,
+                None,
                 true,
                 then + Duration::from_secs(30)
             ),
@@ -1668,13 +1741,14 @@ mod tests {
             "a handshake resets the never-handshaked clock: a link re-raised \
              under the profile gets the whole threshold",
         );
-        unanswered_clock(&mut since, &id, Handshake::Never, false, then);
+        unanswered_clock(&mut since, &id, Handshake::Never, None, false, then);
         assert!(since.is_empty());
     }
 
-    /// An aged handshake counts only from when the profile started carrying:
-    /// a handshake older than that predates any traffic it could have
-    /// answered. Within the run the clock is the handshake's age.
+    /// With no byte counters to read, an aged handshake counts only from when
+    /// the profile started carrying: a handshake older than that predates any
+    /// traffic it could have answered. Within the run the clock is the
+    /// handshake's age.
     #[test]
     fn an_aged_handshake_counts_only_from_when_the_profile_started_carrying() {
         let id = torrentd_engine::ProfileId::new("acct_a");
@@ -1683,18 +1757,18 @@ mod tests {
         let ancient = Handshake::Age(Duration::from_secs(3600));
 
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, false, t0),
+            unanswered_clock(&mut since, &id, ancient, None, false, t0),
             Duration::ZERO,
             "nothing to carry, however old the handshake",
         );
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, true, t0),
+            unanswered_clock(&mut since, &id, ancient, None, true, t0),
             Duration::ZERO,
             "starts when the first torrent that can send is there",
         );
         let then = t0 + MAX + Duration::from_secs(1);
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, true, then),
+            unanswered_clock(&mut since, &id, ancient, None, true, then),
             MAX + Duration::from_secs(1),
         );
         assert_eq!(
@@ -1702,6 +1776,7 @@ mod tests {
                 &mut since,
                 &id,
                 Handshake::Age(Duration::from_secs(5)),
+                None,
                 true,
                 then
             ),
@@ -1709,10 +1784,85 @@ mod tests {
             "a handshake inside the run caps it",
         );
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, false, then),
+            unanswered_clock(&mut since, &id, ancient, None, false, then),
             Duration::ZERO,
         );
         assert!(since.is_empty(), "nothing to carry ends the run");
+    }
+
+    /// With the link's byte counters, an aged handshake counts only from the
+    /// first poll that saw the link send with nothing received: a quiet seed
+    /// whose `tx` stays flat is never judged, however old its handshake.
+    #[test]
+    fn an_aged_handshake_counts_only_from_traffic_nothing_answered() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let ancient = Handshake::Age(Duration::from_secs(3600));
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let seen = |rx: u64, tx: u64| Some(vpn::WireguardTransfer { rx, tx });
+        let mut clock = |t: Option<vpn::WireguardTransfer>, now| {
+            unanswered_clock(&mut since, &id, ancient, t, true, now)
+        };
+
+        assert_eq!(clock(seen(10, 10), at(0)), Duration::ZERO, "a baseline");
+        assert_eq!(
+            clock(seen(10, 10), at(600)),
+            Duration::ZERO,
+            "nothing sent, however long: nothing to answer",
+        );
+        assert_eq!(clock(seen(10, 20), at(630)), Duration::ZERO, "sent: starts");
+        assert_eq!(
+            clock(seen(10, 20), at(700)),
+            Duration::from_secs(70),
+            "sent and unanswered, though nothing more is sent",
+        );
+        assert_eq!(
+            clock(seen(11, 30), at(730)),
+            Duration::ZERO,
+            "something came back: answered",
+        );
+        assert_eq!(clock(seen(11, 40), at(760)), Duration::ZERO);
+        assert_eq!(
+            clock(None, at(790)),
+            Duration::ZERO,
+            "counters unread after a reading: no verdict",
+        );
+        assert_eq!(
+            clock(seen(11, 40), at(800)),
+            Duration::from_secs(40),
+            "the unread poll left the clock where it stood",
+        );
+        assert_eq!(
+            clock(seen(0, 5), at(830)),
+            Duration::ZERO,
+            "counters that dropped are a re-raised link: a new baseline",
+        );
+        assert_eq!(clock(seen(0, 5), at(1000)), Duration::ZERO);
+        assert_eq!(
+            unanswered_clock(
+                &mut since,
+                &id,
+                Handshake::Age(Duration::from_secs(5)),
+                seen(0, 9),
+                true,
+                at(1100),
+            ),
+            Duration::ZERO,
+            "sent: starts",
+        );
+        assert_eq!(
+            unanswered_clock(
+                &mut since,
+                &id,
+                Handshake::Age(Duration::from_secs(5)),
+                seen(0, 9),
+                true,
+                at(1400),
+            ),
+            Duration::from_secs(5),
+            "a handshake inside the run caps it",
+        );
     }
 
     /// A probe that could not run says nothing about the handshake, so it
@@ -1724,12 +1874,13 @@ mod tests {
         let mut since = std::collections::HashMap::new();
         let t0 = Instant::now();
 
-        unanswered_clock(&mut since, &id, Handshake::Never, true, t0);
+        unanswered_clock(&mut since, &id, Handshake::Never, None, true, t0);
         assert_eq!(
             unanswered_clock(
                 &mut since,
                 &id,
                 Handshake::NoSignal,
+                None,
                 true,
                 t0 + Duration::from_secs(60)
             ),
@@ -1738,11 +1889,11 @@ mod tests {
         );
         let then = t0 + MAX + Duration::from_secs(1);
         assert!(
-            unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX,
+            unanswered_clock(&mut since, &id, Handshake::Never, None, true, then) > MAX,
             "the clock kept its start across the failed probe",
         );
 
-        unanswered_clock(&mut since, &id, Handshake::NoSignal, false, then);
+        unanswered_clock(&mut since, &id, Handshake::NoSignal, None, false, then);
         assert!(
             since.is_empty(),
             "with nothing to carry, a failed probe resets it like any other poll",
@@ -1847,11 +1998,43 @@ mod tests {
         (health.status, exported)
     }
 
+    /// A transfer probe that cannot run, so the poll loop judges an aged
+    /// handshake on the profile's torrents alone.
+    fn no_counters() -> CounterProber {
+        Arc::new(|_| Err(vpn::HandshakeProbeUnavailable::NoTool))
+    }
+
+    /// A transfer probe whose `tx` grows by `tx_step` and `rx` by `rx_step`
+    /// on each poll.
+    fn counting(rx_step: u64, tx_step: u64) -> CounterProber {
+        let polls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Arc::new(move |_| {
+            let n = polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vpn::WireguardTransfer {
+                rx: 1000 + n * rx_step,
+                tx: 1000 + n * tx_step,
+            })
+        })
+    }
+
     /// [`poll_acct_a_held`], returning the profile's whole health.
     async fn poll_acct_a_health(
         state: StateMap,
         max_age: Duration,
         probe: Prober,
+        polls: u32,
+        offline: bool,
+    ) -> (crate::profile_registry::ProfileHealth, String) {
+        poll_acct_a_counted(state, max_age, probe, no_counters(), polls, offline).await
+    }
+
+    /// [`poll_acct_a_health`], with the link's byte counters read by
+    /// `counters`.
+    async fn poll_acct_a_counted(
+        state: StateMap,
+        max_age: Duration,
+        probe: Prober,
+        counters: CounterProber,
         polls: u32,
         offline: bool,
     ) -> (crate::profile_registry::ProfileHealth, String) {
@@ -1884,6 +2067,7 @@ mod tests {
             max_age,
             rx,
             probe,
+            counters,
         ));
         tokio::time::sleep(POLL_INTERVAL * polls + Duration::from_secs(1)).await;
         tx.send(ShutdownReason::Test).unwrap();
@@ -2107,6 +2291,58 @@ mod tests {
         assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
     }
 
+    /// The acceptance test for a quiet seed: a seeding profile with no
+    /// keepalive and no peer connected sends nothing between announces, so
+    /// its handshake is long past the threshold while its link's `tx` stays
+    /// flat. It stays up across many polls. The same link with `tx` growing
+    /// and `rx` flat sent into a tunnel nobody answers, and is fenced
+    /// `handshake_stale`; with `rx` growing beside it, it is answered.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_judges_an_aged_handshake_on_traffic_nothing_answered() {
+        let max_age = Duration::from_secs(60);
+        let stale = || {
+            scripted(
+                Some(Ok(RouteProbe::ViaTunnel)),
+                Ok(Some(Duration::from_secs(3600))),
+            )
+        };
+        let seeding = || {
+            let s = StateMap::new();
+            loaded(&s, 1, "acct_a", TorrentPhase::Seeding);
+            s
+        };
+
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(0, 0), 8, false).await;
+        assert_eq!(
+            health.status,
+            ProfileStatus::Active,
+            "a quiet seed sent nothing to be answered: {exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            "{exported}"
+        );
+
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(64, 512), 8, false).await;
+        assert_eq!(
+            health.status,
+            ProfileStatus::Active,
+            "sent and answered: {exported}"
+        );
+
+        // The first poll is the baseline and the second sees `tx` grow, so
+        // the threshold is passed at the fifth (90s > 60s), not the fourth.
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(0, 512), 4, false).await;
+        assert_eq!(health.status, ProfileStatus::Active, "{exported}");
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(0, 512), 5, false).await;
+        assert_eq!(health.status, ProfileStatus::VpnDown, "{exported}");
+        assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
+    }
+
     /// A profile the operator holds offline has its session paused and sends
     /// nothing, whatever its torrents' phases, so its tunnel's handshake —
     /// never made, or aging — fences it on no rule while the address and
@@ -2172,6 +2408,7 @@ mod tests {
             max_age,
             rx,
             scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
+            no_counters(),
         ));
         let entry = profiles.iter().next().unwrap();
 
