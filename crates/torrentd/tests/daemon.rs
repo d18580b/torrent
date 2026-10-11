@@ -1549,6 +1549,92 @@ fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
     assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
 }
 
+/// Issue #354's regression: a plain `DELETE` of a torrent the boot left
+/// unloaded because its resume add failed keeps its resume file, which is
+/// what the next boot loads it from, and refuses with `torrent-unloaded`
+/// naming it.
+///
+/// The resume file has no info-hash, so libtorrent refuses the add, as it
+/// does a save path on a disk not mounted yet: the resume scan claims the
+/// info-hash, the add fails, and the claim stays with nothing loaded. The
+/// `DELETE` the "After a crash" runbook runs over every unloaded claim used to
+/// answer `204` and delete the resume file with the claim.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_plain_delete_of_a_torrent_whose_resume_add_failed_keeps_its_resume_file() {
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    let ih = "cd".repeat(20);
+    let resume_dir = p.join("resume").join(PROFILE);
+    std::fs::create_dir_all(&resume_dir).unwrap();
+    let resume = resume_dir.join(format!("{ih}.resume"));
+    let bytes = b"d11:file-format22:libtorrent resume file12:file-versioni1ee".to_vec();
+    std::fs::write(&resume, &bytes).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+    wait_healthy(addr);
+
+    // Both are set once the scans have run.
+    let series = [
+        format!("torrentd_boot_torrent_load_failures{{profile_id=\"{PROFILE}\",source=\"resume_add\"}} 1"),
+        format!("torrentd_profile_unloaded_registry_torrents{{profile_id=\"{PROFILE}\"}} 1"),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, metrics) = http(addr, "GET", "/metrics", None);
+        if series.iter().all(|s| metrics.lines().any(|l| l == s)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed resume add was not counted as {series:?}:\n{metrics}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 409, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        problem["type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("#torrent-unloaded")),
+        "{body}"
+    );
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains(&format!("{ih}.resume"))),
+        "the refusal does not name the resume file: {body}"
+    );
+    assert_eq!(
+        std::fs::read(&resume).ok(),
+        Some(bytes.clone()),
+        "the refused delete touched the resume file"
+    );
+    let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 200, "the refused delete cleared the claim: {body}");
+
+    // Retiring it anyway: with the file moved out of the store, the claim has
+    // nothing behind it and the delete clears it.
+    let kept = p.join("kept.resume");
+    std::fs::rename(&resume, &kept).unwrap();
+    let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 204, "{body}");
+    let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 404, "{body}");
+    assert_eq!(std::fs::read(&kept).ok(), Some(bytes));
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+}
+
 /// [`http`] with a read timeout of `timeout`, for a request that runs long.
 fn http_within(addr: &str, method: &str, path: &str, timeout: Duration) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).expect("connect");
