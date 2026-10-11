@@ -3703,10 +3703,47 @@ fn http_exit_code(outcome: kynos::Result<()>) -> i32 {
             0
         }
         Err(e) => {
-            error!(error.cause = %e, "HTTP server exited with error");
+            let (cause, errno) = error_chain(&e);
+            error!(
+                error.cause = %cause,
+                error.errno = errno,
+                "HTTP server exited with error",
+            );
             70
         }
     }
+}
+
+/// `e` and every `source()` under it, joined with `": "`, and the OS error
+/// code of the innermost `io::Error` in that chain that carries one.
+///
+/// kynos' server errors keep their `io::Error` only as a source, so `e`'s own
+/// message names the listener that failed and never why: `ENOBUFS`, `EPERM`
+/// and a second `EMFILE` all read the same.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> (String, Option<i32>) {
+    let mut cause = e.to_string();
+    let mut errno = None;
+    let mut previous = cause.clone();
+    let mut link = Some(e);
+    while let Some(current) = link {
+        if let Some(code) = current
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+        {
+            errno = Some(code);
+        }
+        link = current.source();
+        if let Some(next) = link {
+            // A transparent wrapper prints its source's message as its own.
+            let message = next.to_string();
+            if message != previous {
+                cause.push_str(": ");
+                cause.push_str(&message);
+                previous = message;
+            }
+        }
+    }
+    (cause, errno)
 }
 
 /// Take the daemon off the network in the one order that leaks nothing:
@@ -4404,6 +4441,57 @@ mod shutdown_report_tests {
                 source: std::io::Error::from_raw_os_error(errno),
             },
         ))
+    }
+
+    #[test]
+    fn a_fatal_accept_failure_logs_its_os_error() {
+        // kynos' message names only the listener; the errno is in its source.
+        let log = crate::tracing_init::Buf::default();
+        let (_reload, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let code = tracing::subscriber::with_default(subscriber, || {
+            http_exit_code(accept_failure(libc::EINVAL))
+        });
+        assert_eq!(code, 70);
+        let log = log.text();
+        let line = log
+            .lines()
+            .find(|l| l.contains("HTTP server exited with error"))
+            .unwrap_or_else(|| panic!("the failure is logged: {log}"));
+        let os_error = std::io::Error::from_raw_os_error(libc::EINVAL).to_string();
+        assert!(line.contains(&os_error), "the OS error text: {line}");
+        assert!(
+            line.contains(&format!("\"error.errno\":{}", libc::EINVAL)),
+            "the errno as its own field: {line}"
+        );
+    }
+
+    #[test]
+    fn the_error_chain_skips_a_transparent_repeat_and_keeps_the_innermost_errno() {
+        #[derive(Debug)]
+        struct Wrap(&'static str, std::io::Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.1)
+            }
+        }
+        let inner = std::io::Error::from_raw_os_error(libc::ENOBUFS);
+        let inner_text = inner.to_string();
+        let outer = Wrap(
+            "listener failed",
+            std::io::Error::other(Wrap("accept", inner)),
+        );
+        let (cause, errno) = error_chain(&outer);
+        assert_eq!(cause, format!("listener failed: accept: {inner_text}"));
+        assert_eq!(errno, Some(libc::ENOBUFS));
+        let (cause, errno) = error_chain(&std::io::Error::other("no errno"));
+        assert_eq!(cause, "no errno");
+        assert_eq!(errno, None);
     }
 
     #[test]
