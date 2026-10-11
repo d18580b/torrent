@@ -146,6 +146,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "listen_failures_total" Counter Profile Zero => "Listen sockets that failed.";
     "listen_failure_active" Gauge Profile Zero =>
         "1 while any of the profile's listen sockets is failed (one socket per `listen_interfaces` endpoint), 0 once each has come up or a socket is up on its address at another port.";
+    "listen_accept_errors_total" Counter Profile ("errno": torrentd_engine::metrics::LISTEN_ACCEPT_ERRNOS) Zero =>
+        "Accepts on a listen socket that ran out of file descriptors; libtorrent accepts \
+         again at once and keeps listening, first dropping a peer and lowering \
+         `connections_limit` while that limit is above 10 and a torrent has a peer to drop. \
+         Not a listen failure.";
     "disk_error_retry_attempts_total" Counter Profile Zero =>
         "Torrents the disk-error retry timer resumed to clear a libtorrent error.";
     "disk_error_retry_errors_total" Counter Profile Zero => "Retry-timer resumes that failed.";
