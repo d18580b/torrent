@@ -259,7 +259,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "The WireGuard transfer probe cannot run for acct_a; an aged handshake is not judged on the link's traffic, so a dead peer may not fence it"
+              summary: "The WireGuard transfer probe cannot run for acct_a; an aged handshake is judged on the profile's torrents alone, so a quiet seed may be fenced handshake_stale"
 
   # A route probe that recovers before the hold stays quiet; one that stays
   # down fires.

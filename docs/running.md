@@ -1884,10 +1884,12 @@ On a scratch pool, not your real one.
    A poll whose transfer probe could not run logs `wireguard transfer probe
    unavailable` at warn and sets `torrentd_profile_vpn_transfer_probe_ok`
    to 0, which `TorrentdTransferProbeUnavailable` alerts on after 5 minutes.
-   After an earlier poll read the counters it leaves
-   the clock where it was; where none has, the threshold runs from the first
-   poll that saw a torrent there that can send, as if every such profile
-   sent, so a quiet seed may then be fenced. `PersistentKeepalive = 25` in
+   While it fails the fence fails safe, whether or not an earlier poll read
+   the counters: the threshold runs from the first poll that saw a torrent
+   there that can send, capped at the handshake's age, as if every such
+   profile sent, so a quiet seed may then be fenced `handshake_stale`. A
+   later poll that reads the counters again judges on them as before.
+   `PersistentKeepalive = 25` in
    the `[Peer]` section of the profile's WireGuard config keeps the
    handshake inside the default 180 s either way, at the cost of a packet
    every 25 s. The daemon applies the config as written (`wg setconf`) and
