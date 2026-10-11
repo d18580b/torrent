@@ -334,6 +334,9 @@ adopt them through the pool (§2), whose verifications the queue bounds.
 - **A re-hash paused while it checks** keeps its slot until the check ends,
   because libtorrent goes on with it once the torrent is resumed. Resume or
   remove the torrent to free the slot; otherwise it is freed after 24 hours.
+  One whose check fails on a disk error frees its slot at once: the torrent
+  is left paused with the error, and the disk-error retry, which the queue
+  does not bound, checks it again.
 - **A dropped re-hash** never started: by the time a slot was free its
   torrent had been removed, paused, or had no metadata, or libtorrent refused
   the request. The log reads `re-hash dropped: …`, or ends `dropping the
