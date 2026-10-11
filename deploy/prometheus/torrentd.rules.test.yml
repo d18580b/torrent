@@ -180,7 +180,58 @@ tests:
               severity: critical
               profile_id: acct_a
             exp_annotations:
-              summary: "Profile acct_a's tunnel is down; its torrents are fenced until the daemon restarts"
+              summary: "Profile acct_a's tunnel is down or it is fenced (by the VPN monitor, or a kill-switch fence its lift left standing); it seeds nothing until it is set online on a healthy tunnel, or restarted if it never came up"
+
+  # A ruleset flush at 2m: the kill-switch watch fences both vpn profiles,
+  # reinstalls the table and lifts its fence in the same check, but neither
+  # tunnel passes the recovery check, so both stay fenced with the gauge at 0.
+  # TorrentdKillSwitchLost resolves an hour later; the fence, and the alerts
+  # on it, do not.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_kill_switch_lost_total{job="torrentd", instance="seedbox:8080", outcome="reinstalled"}'
+        values: '0 0 1x100'
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
+        values: '0x102'
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_b"}'
+        values: '0x102'
+      - series: 'torrentd_profile_vpn_tunnel_up{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
+        values: '1 1 0x100'
+      - series: 'torrentd_profile_vpn_tunnel_up{job="torrentd", instance="seedbox:8080", profile_id="acct_b"}'
+        values: '1 1 0x100'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdUnready
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: TorrentdKillSwitchLost
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: TorrentdUnready
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: torrentd
+              instance: seedbox:8080
+            exp_annotations:
+              summary: "Every profile failed at boot or is fenced; the daemon is seeding nothing and /healthz answers 503"
+      - eval_time: 90m
+        alertname: TorrentdVpnTunnelDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: torrentd
+              instance: seedbox:8080
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Profile acct_a's tunnel is down or it is fenced (by the VPN monitor, or a kill-switch fence its lift left standing); it seeds nothing until it is set online on a healthy tunnel, or restarted if it never came up"
+          - exp_labels:
+              severity: critical
+              job: torrentd
+              instance: seedbox:8080
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Profile acct_b's tunnel is down or it is fenced (by the VPN monitor, or a kill-switch fence its lift left standing); it seeds nothing until it is set online on a healthy tunnel, or restarted if it never came up"
 
   - interval: 1m
     input_series:

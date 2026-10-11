@@ -88,12 +88,19 @@ groups:
         annotations:
           summary: "Profile {{ $labels.profile_id }} got no session at boot and is not seeding"
 
+      # The gauge goes to 0 whenever the profile is fenced: by the VPN monitor
+      # for its tunnel, by the kill-switch watch while the nftables table is
+      # missing or drifted, or at boot for a tunnel that never came up. A
+      # kill-switch fence whose lift found the tunnel failing the recovery
+      # check stays standing, and keeps this firing after
+      # TorrentdKillSwitchLost has resolved. It clears once the profile is
+      # set online on a healthy tunnel, or the kill-switch lift finds one.
       - alert: TorrentdVpnTunnelDown
         expr: torrentd_profile_vpn_tunnel_up == 0
         labels:
           severity: critical
         annotations:
-          summary: "Profile {{ $labels.profile_id }}'s tunnel is down; its torrents are fenced until the daemon restarts"
+          summary: "Profile {{ $labels.profile_id }}'s tunnel is down or it is fenced (by the VPN monitor, or a kill-switch fence its lift left standing); it seeds nothing until it is set online on a healthy tunnel, or restarted if it never came up"
 
       - alert: TorrentdFencePauseFailed
         expr: >
