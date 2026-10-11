@@ -900,7 +900,16 @@ pub async fn pause_profile(
     let profile_id = ProfileId::new(path.profile_id);
     let engine = engine_for(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
     if let Some(entry) = s.profiles.resolve(&profile_id).active() {
+        // Noted paused before the gates halt, so a kill-switch fence or a
+        // set-online that reads what is running from here on, before a state
+        // update reports the walk's pauses, resumes none of them; one that
+        // read before opened a gate this halts. Noted again once the gates
+        // halt: a paced resume that took a gate between the two noted its
+        // torrent running, and that resume lands before the walk's pause.
+        let handles = s.state.handles_for_profile(&profile_id);
+        entry.note_paused(&handles);
         entry.halt_resumes();
+        entry.note_paused(&handles);
     }
     let mut out = BulkOutcome::default();
     tally(
@@ -1003,7 +1012,12 @@ pub async fn pause_all_torrents(
         ..BulkOutcome::default()
     };
     for entry in s.profiles.iter() {
+        // As a profile's pause-all does ([`pause_profile`]), noting before
+        // and after the halt.
+        let handles = s.state.handles_for_profile(entry.id());
+        entry.note_paused(&handles);
         entry.halt_resumes();
+        entry.note_paused(&handles);
         let reached =
             for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), pause_and_save).await;
         tally(&mut out, reached);

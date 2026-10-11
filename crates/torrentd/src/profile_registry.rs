@@ -5,6 +5,7 @@
 //! least one profile or it does not boot, so `AppState::profiles` is a plain
 //! `Arc<ProfileRegistry>` rather than an `Option`.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::AtomicBool;
@@ -82,6 +83,10 @@ pub struct ProfileEntry {
     /// release of its hold ([`ProfileEntry::resume_by_hand`]), so neither
     /// lands inside the other.
     holding: Mutex<()>,
+    /// What the daemon last set each torrent's own paused flag to, running
+    /// or not, until a state update reports it. See
+    /// [`ProfileEntry::note_running`].
+    noted: Mutex<HashMap<TorrentHandle, bool>>,
 }
 
 /// What the operator paused while one paced resume runs: a pause of the whole
@@ -199,6 +204,7 @@ impl ProfileEntry {
             gates: Mutex::new(Vec::new()),
             holds: Arc::new(PacedHolds::in_memory()),
             holding: Mutex::new(()),
+            noted: Mutex::new(HashMap::new()),
         }
     }
 
@@ -384,6 +390,78 @@ impl ProfileEntry {
             self.release_holds(&[h]);
         }
         Ok(outcome)
+    }
+
+    /// Note that `h`'s own paused flag is about to be cleared (`running`) or
+    /// set, ahead of the state update that will report it, and return what
+    /// was noted for it before, for [`ProfileEntry::restore_noted`] should the
+    /// engine refuse.
+    ///
+    /// A torrent's paused flag reaches the state map only through a state
+    /// update, which comes every couple of seconds, while the kill-switch
+    /// watch can fence and lift inside one check. Its fence, and a
+    /// set-online, decide what to resume from what is running
+    /// ([`ProfileEntry::running`]), so without this a pause just before
+    /// either was undone by the lift or the pace, and a resume just before
+    /// either was left paused. Noted before the engine call, so a reader that
+    /// comes after the note sees the new flag, and one that comes before it
+    /// read before the pause or resume began, which the pause's gates
+    /// ([`ProfileEntry::exclude_from_resumes`]) and the resume's fence check
+    /// cover.
+    pub fn note_running(&self, h: TorrentHandle, running: bool) -> Option<bool> {
+        self.noted.lock().insert(h, running)
+    }
+
+    /// [`ProfileEntry::note_running`] with `running` false, for every one of
+    /// `handles`: a pause of the whole profile.
+    pub fn note_paused(&self, handles: &[TorrentHandle]) {
+        let mut noted = self.noted.lock();
+        for &h in handles {
+            noted.insert(h, false);
+        }
+    }
+
+    /// Put back `before`, what [`ProfileEntry::note_running`] returned, for
+    /// `h`: the engine refused the call, so its flag did not change. `None`
+    /// forgets `h`, so the state map's word on it stands.
+    pub fn restore_noted(&self, h: TorrentHandle, before: Option<bool>) {
+        let mut noted = self.noted.lock();
+        match before {
+            Some(running) => noted.insert(h, running),
+            None => noted.remove(&h),
+        };
+    }
+
+    /// Forget everything noted: a fence has just paused every torrent in the
+    /// profile, so the state map's next word on each is the right one.
+    pub fn forget_noted(&self) {
+        self.noted.lock().clear();
+    }
+
+    /// Whether each torrent of `reported`, the profile's torrents as the last
+    /// state update left their paused flags (`true` where clear), is running
+    /// now: what [`ProfileEntry::note_running`] noted for it where that is
+    /// not reported yet, and the report otherwise.
+    ///
+    /// A note the report agrees with is dropped, since the state map now says
+    /// the same: one that disagrees stands, since a report requested before
+    /// the call reached the session can land after it. Notes for torrents
+    /// not in `reported`, gone from the profile, are dropped too.
+    pub fn running(&self, reported: Vec<(TorrentHandle, bool)>) -> Vec<(TorrentHandle, bool)> {
+        let mut noted = self.noted.lock();
+        let mut kept = HashMap::with_capacity(noted.len().min(reported.len()));
+        let running = reported
+            .into_iter()
+            .map(|(h, reported)| match noted.remove(&h) {
+                Some(running) if running != reported => {
+                    kept.insert(h, running);
+                    (h, running)
+                }
+                _ => (h, reported),
+            })
+            .collect();
+        *noted = kept;
+        running
     }
 
     /// Log a [`PacedHolds`] release that could not be written. The record
