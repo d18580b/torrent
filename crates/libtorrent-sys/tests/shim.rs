@@ -74,6 +74,41 @@ fn null_and_unknown_handle_ops_are_safe() {
         unsafe { lt_torrent_force_reannounce(ptr::null_mut(), 1) },
         LT_ERR
     );
+    assert_eq!(
+        unsafe { lt_torrent_unset_flags(s, 999_999, LT_TF_DISABLE_DHT) },
+        LT_ERR
+    );
+    assert_eq!(
+        unsafe { lt_torrent_unset_flags(ptr::null_mut(), 1, LT_TF_DISABLE_DHT) },
+        LT_ERR
+    );
+    unsafe { lt_session_destroy(s) };
+}
+
+/// `lt_torrent_unset_flags` clears the discovery guards and refuses every
+/// other bit, upload mode first among them, without touching the torrent.
+#[test]
+fn unset_flags_clears_only_the_discovery_guards() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    let guards = LT_TF_DISABLE_PEX | LT_TF_DISABLE_DHT | LT_TF_DISABLE_LSD;
+    assert_eq!(
+        unsafe { lt_torrent_unset_flags(s, h, guards) },
+        LT_OK as i32
+    );
+    assert_eq!(unsafe { lt_torrent_unset_flags(s, h, 0) }, LT_OK as i32);
+    for refused in [
+        LT_TF_UPLOAD_MODE,
+        LT_TF_PAUSED,
+        LT_TF_SEED_MODE,
+        LT_TF_DISABLE_DHT | LT_TF_UPLOAD_MODE,
+    ] {
+        assert_eq!(
+            unsafe { lt_torrent_unset_flags(s, h, refused) },
+            LT_ERR,
+            "bits {refused:#x} must be refused",
+        );
+    }
     unsafe { lt_session_destroy(s) };
 }
 

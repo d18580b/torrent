@@ -87,6 +87,10 @@ pub enum RecordedCall {
     PostStats,
     ForceRecheck(TorrentHandle),
     ForceReannounce(TorrentHandle),
+    UnsetFlags {
+        handle: TorrentHandle,
+        flags: TorrentFlags,
+    },
     MoveStorage {
         handle: TorrentHandle,
         new_path: String,
@@ -619,6 +623,21 @@ impl TorrentEngine for MockEngine {
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
         self.record(RecordedCall::ForceReannounce(h));
         self.check_error("force_reannounce")
+    }
+
+    fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError> {
+        self.record(RecordedCall::UnsetFlags { handle: h, flags });
+        self.check_error("unset_flags")?;
+        // The session refuses every bit but the discovery guards; so does
+        // the mock, so a test cannot pass on a call production would refuse.
+        let clearable =
+            TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD;
+        if !clearable.contains(flags) {
+            return Err(EngineError::Safe(libtorrent_safe::Error::InvalidInput(
+                "only DISABLE_PEX, DISABLE_DHT and DISABLE_LSD can be cleared",
+            )));
+        }
+        Ok(())
     }
 
     fn move_storage(

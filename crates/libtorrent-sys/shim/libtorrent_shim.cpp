@@ -1526,6 +1526,21 @@ extern "C" int lt_torrent_force_reannounce(lt_session* s, lt_handle h) {
     LT_SHIM_CATCH(nullptr, 0, LT_ERR)
 }
 
+extern "C" int lt_torrent_unset_flags(lt_session* s, lt_handle h, std::uint32_t flags) {
+    if (!s) return LT_ERR;
+    // The discovery guards and nothing else: upload mode is what keeps a
+    // torrent from requesting pieces, and no caller may lift it here.
+    constexpr std::uint32_t clearable =
+        LT_TF_DISABLE_PEX | LT_TF_DISABLE_DHT | LT_TF_DISABLE_LSD;
+    if (flags & ~clearable) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    if (flags != 0) th.unset_flags(translate_torrent_flags(flags));
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
 extern "C" int lt_torrent_move_storage(lt_session* s, lt_handle h,
                                        const char* new_path, uint32_t flags)
 {

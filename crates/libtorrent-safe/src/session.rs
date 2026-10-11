@@ -391,6 +391,31 @@ impl Session {
         }
     }
 
+    /// Clear `flags` on one torrent; bits it does not carry stay as they are.
+    ///
+    /// Only the discovery guards — [`TorrentFlags::DISABLE_PEX`],
+    /// [`TorrentFlags::DISABLE_DHT`] and [`TorrentFlags::DISABLE_LSD`] — may
+    /// be cleared: anything else is [`Error::InvalidInput`] and reaches no
+    /// torrent, so this can never lift upload mode. libtorrent writes the
+    /// three bits into resume data, so the change survives a restart only
+    /// once a resume save follows it.
+    pub fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<()> {
+        let clearable =
+            TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD;
+        if !clearable.contains(flags) {
+            return Err(Error::InvalidInput(
+                "only DISABLE_PEX, DISABLE_DHT and DISABLE_LSD can be cleared",
+            ));
+        }
+        let rc =
+            unsafe { ffi::lt_torrent_unset_flags(self.ptr, h.id as ffi::lt_handle, flags.bits()) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
     /// Relocate the torrent's payload, letting libtorrent perform the move so
     /// its storage state stays consistent. Asynchronous — completion arrives
     /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.
