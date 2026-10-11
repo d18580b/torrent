@@ -362,12 +362,16 @@ struct Unanswered {
 ///   Counters that dropped (the link was re-raised and they restarted) are a
 ///   new baseline with nothing outstanding. The first poll of a run that
 ///   reads them is a baseline too, since what was sent before it is unknown.
-/// - **Handshaked, counters unreadable:** a poll whose counters could not be
-///   read after earlier polls in the run read them says nothing, and leaves
-///   the clock as it stands and reads zero. Where no poll in the run has read
-///   them, the clock falls back to the time since the profile started
-///   carrying, capped at the handshake's age: a quiet seed may then be
-///   fenced, but a dead tunnel still is.
+/// - **Handshaked, counters unreadable:** the clock reads the time since the
+///   profile started carrying, capped at the handshake's age, whether or not
+///   an earlier poll in the run read the counters: a quiet seed may then be
+///   fenced, but a dead tunnel still is. The run's start is never later than
+///   a clock the counters started, so this never reads less than that clock
+///   would. The poll leaves the counters' baseline and that clock as they
+///   stand, so a later reading picks up where the last one left off.
+///   Reading zero here instead, after one good reading, let a transfer probe
+///   that failed steadily switch the stale-handshake fence off for as long
+///   as it failed, however old the handshake grew.
 ///
 /// A poll whose handshake probe could not run ([`Handshake::NoSignal`]) says
 /// nothing about the handshake, so while the profile carries traffic it leaves
@@ -405,10 +409,9 @@ fn unanswered_clock(
         Handshake::Never => now.saturating_duration_since(*clock.never_since.get_or_insert(now)),
         Handshake::Age(age) => {
             clock.never_since = None;
-            let since = match (transfer, clock.counters) {
-                (Some(_), _) => clock.sent_unanswered_since,
-                (None, Some(_)) => None,
-                (None, None) => Some(clock.carrying_since),
+            let since = match transfer {
+                Some(_) => clock.sent_unanswered_since,
+                None => Some(clock.carrying_since),
             };
             since.map_or(Duration::ZERO, |since| {
                 now.saturating_duration_since(since).min(age)
@@ -1563,9 +1566,10 @@ async fn run_with(
                     Some(t)
                 }
                 Some(Err(why)) => {
-                    // After one good reading in the run, an aged handshake
-                    // gets no verdict while this fails, so the fence on it is
-                    // off. A log line alone left that silent to alerting.
+                    // While this fails, an aged handshake is judged on the time
+                    // the profile has carried traffic, not on the link's
+                    // traffic, so a quiet seed may be fenced handshake_stale.
+                    // A log line alone left that silent to alerting.
                     metrics.set_gauge("profile_vpn_transfer_probe_ok", 0.0, &labels);
                     warn!(
                         target: "torrentd::vpn_monitor",
@@ -1573,7 +1577,8 @@ async fn run_with(
                         vpn_iface = %iface,
                         reason = why.as_str(),
                         "wireguard transfer probe unavailable; an aged handshake is \
-                         judged on the profile's torrents alone",
+                         judged on the profile's torrents alone, so a quiet seed may \
+                         be fenced",
                     );
                     None
                 }
@@ -1995,13 +2000,13 @@ mod tests {
         assert_eq!(clock(seen(11, 40), at(760)), Duration::ZERO);
         assert_eq!(
             clock(None, at(790)),
-            Duration::ZERO,
-            "counters unread after a reading: no verdict",
+            Duration::from_secs(790),
+            "counters unread after a reading: judged from when the run began",
         );
         assert_eq!(
             clock(seen(11, 40), at(800)),
             Duration::from_secs(40),
-            "the unread poll left the clock where it stood",
+            "the unread poll left the counters' clock where it stood",
         );
         assert_eq!(
             clock(seen(0, 5), at(830)),
@@ -2033,6 +2038,79 @@ mod tests {
             Duration::from_secs(5),
             "a handshake inside the run caps it",
         );
+    }
+
+    /// A transfer probe that fails steadily after one good reading fails
+    /// safe: an aged handshake on a profile carrying traffic is fenced
+    /// `handshake_stale` once the run is older than the threshold, as it is
+    /// where no poll ever read the counters. Reading zero there instead let a
+    /// tunnel whose peer had gone seed on unfenced for as long as `wg show
+    /// transfer` failed.
+    #[test]
+    fn a_failing_transfer_probe_after_one_good_reading_still_fences_an_aged_handshake() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let aged = |s: u64| Handshake::Age(Duration::from_secs(s));
+        let judge = |handshake, unanswered_for| {
+            evaluate(
+                &Observation {
+                    handshake,
+                    unanswered_for,
+                    ..healthy()
+                },
+                MAX,
+            )
+        };
+
+        let good = Some(vpn::WireguardTransfer { rx: 10, tx: 10 });
+        let first = unanswered_clock(&mut since, &id, aged(30), good, true, at(0));
+        assert_eq!(judge(aged(30), first), Ok(()), "one good reading");
+
+        let mut verdict = Ok(());
+        for s in (30..=MAX.as_secs() + 60).step_by(30) {
+            let handshake = aged(30 + s);
+            let unanswered = unanswered_clock(&mut since, &id, handshake, None, true, at(s));
+            verdict = judge(handshake, unanswered);
+            if s <= MAX.as_secs() {
+                assert_eq!(verdict, Ok(()), "inside the threshold at {s}s");
+            }
+        }
+        assert_eq!(
+            verdict,
+            Err(DownReason::HandshakeStale),
+            "a handshake aged past the threshold while the probe fails is fenced",
+        );
+    }
+
+    /// The other side of failing safe: with the transfer probe working, a
+    /// quiet seed whose sent bytes stay flat is never fenced, however old its
+    /// handshake grows while it carries.
+    #[test]
+    fn a_quiet_seed_with_a_working_transfer_probe_is_not_fenced() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let flat = Some(vpn::WireguardTransfer { rx: 10, tx: 10 });
+
+        for s in (0..=3600).step_by(30) {
+            let handshake = Handshake::Age(Duration::from_secs(30 + s));
+            let unanswered = unanswered_clock(
+                &mut since,
+                &id,
+                handshake,
+                flat,
+                true,
+                t0 + Duration::from_secs(s),
+            );
+            let obs = Observation {
+                handshake,
+                unanswered_for: unanswered,
+                ..healthy()
+            };
+            assert_eq!(evaluate(&obs, MAX), Ok(()), "quiet at {s}s");
+        }
     }
 
     /// A probe that could not run says nothing about the handshake, so it
