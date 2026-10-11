@@ -1828,12 +1828,12 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
     // assignment write fails, and a 204 would bring the claim back from the
     // file at the next restart, over a torrent that no longer exists.
     let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("failing.db");
     let mut engine = None;
     let h = Harness::authed(&Coverage::new(), |s| {
         engine = Some(fixture(s, dir.path()).p);
         // The torrent is assigned, and from then on every write to the
         // registry fails, as on a full or read-only state directory.
-        let db = dir.path().join("failing.db");
         s.registry = Arc::new(AssignmentRegistry::new_empty(&db));
         s.registry.assign(LOADED, ProfileId::new("p")).unwrap();
         rusqlite::Connection::open(&db)
@@ -1843,7 +1843,37 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
                    BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
             )
             .unwrap();
+        s.pool = crate::pool_service::PoolService::open(&crate::config::Config::minimal_for_tests(
+            dir.path(),
+            false,
+        ))
+        .unwrap();
     });
+    // The pool index records `p` owning the torrent, as an adoption leaves it.
+    let index = Arc::clone(h.state.pool.as_ref().unwrap());
+    index
+        .with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: hex(LOADED),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "L".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join("l.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: Some("p".into()),
+                },
+                0,
+            )
+        })
+        .unwrap();
+    let owner = || index.with_reader(|st| st.profile_of(&hex(LOADED)).unwrap());
+    assert_eq!(owner().as_deref(), Some("p"));
     let resp = h
         .write("DELETE", &format!("/v1/torrents/{}", hex(LOADED)))
         .await;
@@ -1853,11 +1883,15 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
         detail.contains("assignment") && detail.contains("removed from its session"),
         "the operator has to know which half failed: {detail}"
     );
-    assert!(engine
-        .unwrap()
-        .calls()
-        .iter()
-        .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
+    let engine = engine.unwrap();
+    let removals = || {
+        engine
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, RecordedCall::RemoveTorrent { .. }))
+            .count()
+    };
+    assert_eq!(removals(), 1);
     // The detail says to retry. That only works if the failed write left the
     // claim in memory too; dropping it there first made the retry a 404 and
     // the claim came back from disk at the next restart.
@@ -1866,6 +1900,89 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
         Some(ProfileId::new("p")),
         "a remove that failed to persist releases nothing",
     );
+    assert_eq!(
+        owner().as_deref(),
+        Some("p"),
+        "the index owner is released with the assignment, not before",
+    );
+
+    // The session confirms the removal, which drops the state-map entry, and
+    // the operator frees the disk.
+    let settled = h
+        .state
+        .state
+        .settle_removal(&ProfileId::new("p"), &LOADED, |_| {});
+    assert!(settled.entry_released);
+    assert!(h.state.state.get(&LOADED).is_none());
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TRIGGER no_delete;")
+        .unwrap();
+
+    // The retry the detail asked for clears the assignment. It used to find
+    // no state and no boot record, answer `409 torrent-adding`, and go on
+    // answering it until a restart.
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(LOADED)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(removals(), 1, "the session is not asked a second time");
+    assert_eq!(h.state.registry.lookup(&LOADED), None);
+    assert!(h.state.removed_unassigned.lock().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while owner().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the index owner the failed delete skipped was never released",
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // And the info-hash can be added again.
+    let uri = format!("magnet:?xt=urn:btih:{}", hex(LOADED));
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "magnet", "uri": uri}}),
+        )
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    assert_eq!(h.state.registry.lookup(&LOADED), Some(ProfileId::new("p")));
+}
+
+#[tokio::test]
+async fn a_retried_delete_with_delete_files_refuses_a_payload_the_removal_did_not_trash() {
+    // A plain delete removed the torrent and failed to clear the assignment.
+    // A retry asking for the payload too cannot reach it — no session holds
+    // the torrent — so it refuses rather than answering 204 for files that
+    // never moved, and a plain retry still clears it.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+        s.pool = crate::pool_service::PoolService::open(&crate::config::Config::minimal_for_tests(
+            dir.path(),
+            true,
+        ))
+        .unwrap();
+    });
+    h.state.removed_unassigned.lock().insert(ADDING, false);
+    let resp = h
+        .write(
+            "DELETE",
+            &format!(
+                "/v1/torrents/{}?delete_files=true&confirm={}",
+                hex(ADDING),
+                hex(ADDING)
+            ),
+        )
+        .await;
+    assert_problem(&resp, 409, "payload-untrashable");
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(ProfileId::new("p")));
+
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(h.state.registry.lookup(&ADDING), None);
+    assert!(h.state.removed_unassigned.lock().is_empty());
 }
 
 /// Wait, up to ten seconds, for `cond` to hold.

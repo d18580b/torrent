@@ -1,5 +1,6 @@
 //! Shared state every HTTP handler reads, through `http::ctx::AppCtx`.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -73,6 +74,16 @@ pub struct AppState {
     /// `AddTorrent` alert has not arrived yet, so clearing it would leave the
     /// torrent seeding unassigned and free to be added to a second profile.
     pub unloaded_at_boot: Arc<Mutex<HashSet<InfoHash>>>,
+    /// Info-hashes a `DELETE /v1/torrents/{infohash}` removed from their
+    /// session and then failed to clear the assignment of, each with whether
+    /// that delete moved the payload to the trash.
+    ///
+    /// The session's removal alert drops the state-map entry, and an entry
+    /// with no state and no place in `unloaded_at_boot` answers every delete
+    /// `409 torrent-adding`, so without this the retry the failed delete asks
+    /// for could never clear the assignment short of a restart. An entry is
+    /// dropped as its assignment is cleared.
+    pub removed_unassigned: Arc<Mutex<HashMap<InfoHash, bool>>>,
     /// The daemon-wide shutdown signal. Long-lived responses — the
     /// `/v1/events` stream — end when it fires, so a graceful shutdown is not
     /// held open by a client that never disconnects.
@@ -298,6 +309,7 @@ pub(crate) fn build_test_state_with_sessions(
         trusted_proxies: Default::default(),
         allowed_hosts: Default::default(),
         unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
+        removed_unassigned: Arc::default(),
         shutdown: tokio::sync::broadcast::channel(4).0,
         work: Arc::default(),
         events: Arc::default(),
