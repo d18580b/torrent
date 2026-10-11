@@ -2124,6 +2124,9 @@ struct ScanFenced {
     /// The kill-switch fence's mark (`FenceRecord::mark`) those were paused
     /// under, `None` where it held no record of the profile then.
     mark: Option<u64>,
+    /// The profile's fence generation (`ProfileHealth::fence_generation`)
+    /// those were counted under.
+    generation: u64,
 }
 
 impl ScanFence {
@@ -2208,7 +2211,8 @@ impl ScanFence {
         let Some(entry) = profiles.resolve(profile).active() else {
             return;
         };
-        if entry.health().status != ProfileStatus::VpnDown {
+        let health = entry.health();
+        if health.status != ProfileStatus::VpnDown {
             // Lifted since, which during boot only the kill-switch watch
             // does, resuming what it recorded: everything paused so far is
             // running again, and a later fence has all of it to pause.
@@ -2216,24 +2220,30 @@ impl ScanFence {
             fenced.counted.clear();
             return;
         }
-        // Fenced, but not by the fence those were paused under: the
-        // kill-switch watch lifted that one and a fence has landed since,
-        // with no call here in between to see the profile lifted. The lift
-        // resumed them, so all of it is paused again, and counted again: the
-        // new fence started the count over.
-        //
-        // A record that vanished while the profile stayed fenced is most
-        // likely a kill-switch lift that left it fenced for a failing tunnel.
-        // That lift resumed nothing and left the count standing, so what was
-        // paused already is not counted twice, while one whose earlier pause
-        // failed is counted once a pause of it takes. It is still paused
-        // again, since a lift that did resume it, followed by the monitor's
-        // own fence, leaves no record either and reads the same here.
+        // Fenced, but not by the fence those were counted under: a lift and
+        // a new fence (the kill-switch watch's or the monitor's) have landed
+        // since, with no call here in between to see the profile lifted. The
+        // lift resumed them, so all of it is paused again, and counted again:
+        // the new fence started the count over. Every fence bumps the
+        // generation and no lift resets it, so this holds whichever fence
+        // came second, and whether or not the kill-switch fence holds a
+        // record of the profile now.
+        if fenced.generation != health.fence_generation {
+            fenced.generation = health.fence_generation;
+            fenced.counted.clear();
+            fenced.paused = 0;
+        }
+        // The same fence, under a different kill-switch record: a record
+        // that vanished while the profile stayed fenced is a kill-switch lift
+        // that left it fenced for a failing tunnel. That lift resumed nothing
+        // and left the count standing, so what was paused already is not
+        // counted twice, while one whose earlier pause failed is counted once
+        // a pause of it takes. All of it is still paused again, which retries
+        // each pause that failed. (A new record never comes without a new
+        // generation: the kill-switch watch fences only a profile not fenced
+        // already.)
         let mark = record.as_ref().map(|r| r.mark);
         if fenced.mark != mark {
-            if mark.is_some() {
-                fenced.counted.clear();
-            }
             fenced.mark = mark;
             fenced.paused = 0;
         }
@@ -6364,6 +6374,55 @@ mod tests {
         scan.enforce_all(&t.profiles, &t.metrics);
         assert_eq!(t.pauses().len(), 5, "nothing left to pause");
         assert_eq!(t.paused_for_vpn(), 3);
+    }
+
+    /// A kill-switch lift resumes the profile and the monitor fences it
+    /// before the scans' next call, so the scans never see it lifted and
+    /// the kill-switch fence holds no record of it. The lift started the
+    /// count over, and the monitor's walk reaches none of the scans'
+    /// torrents, so the scans' pause of them again is counted again.
+    #[tokio::test(start_paused = true)]
+    async fn a_monitor_fence_after_a_kill_switch_lift_the_scans_never_saw_counts_their_torrents() {
+        use crate::vpn::killswitch::Fence as _;
+
+        let t = KillSwitchScan::new(|| {});
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let hs = [t.handle(1), t.handle(2)];
+
+        t.fence.fence_all();
+        for h in hs {
+            scan.added(&t.profiles, &t.metrics, &t.a, h);
+        }
+        assert_eq!(t.paused_for_vpn(), 2);
+        t.fence.lift();
+        t.settle().await;
+        assert_eq!(t.resumes(), hs);
+        assert_eq!(t.paused_for_vpn(), 0, "the lift started the count over");
+
+        // The tunnel's peer goes away: the monitor fences the profile, and
+        // its walk of an empty state map pauses nothing.
+        let resolved = t.profiles.resolve(&t.a);
+        let entry = resolved.active().unwrap();
+        let walked = crate::vpn_monitor::fence(entry, &StateMap::new(), None, t.metrics.as_ref());
+        assert_eq!(walked, 0);
+        assert_eq!(t.status(), ProfileStatus::VpnDown);
+
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses()[2..], hs, "the scans pause them again");
+        assert_eq!(
+            t.paused_for_vpn(),
+            2,
+            "the monitor's fence counts the scans' torrents"
+        );
+        let exported = String::from_utf8(t.metrics.render()).expect("utf-8");
+        assert!(
+            exported.contains("torrentd_profile_torrents_paused_vpn_down{profile_id=\"acct_a\"} 2"),
+            "{exported}"
+        );
+
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses().len(), 4, "nothing left to pause");
+        assert_eq!(t.paused_for_vpn(), 2, "nothing is counted twice");
     }
 
     /// A torrent whose pause failed was never counted, so when the record
