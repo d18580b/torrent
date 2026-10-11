@@ -47,6 +47,7 @@ hold.
 | `torrentd_resume_save_dispatch_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | save_resume_data requests that failed before reaching libtorrent. |
 | `torrentd_listen_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | Listen sockets that failed. |
 | `torrentd_listen_failure_active` | gauge | `profile_id` | each profile | from boot, at 0 | 1 while any of the profile's listen sockets is failed (one socket per `listen_interfaces` endpoint), 0 once each has come up or a socket is up on its address at another port. |
+| `torrentd_listen_accept_errors_total` | counter | `profile_id`; `errno`: `EMFILE` | each profile | from boot, at 0 | Accepts on a listen socket that ran out of file descriptors; libtorrent accepts again at once and keeps listening, first dropping a peer and lowering `connections_limit` while that limit is above 10 and a torrent has a peer to drop. Not a listen failure. |
 | `torrentd_disk_error_retry_attempts_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents the disk-error retry timer resumed to clear a libtorrent error. |
 | `torrentd_disk_error_retry_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Retry-timer resumes that failed. |
 | `torrentd_alert_queue_overflows_total` | counter | `profile_id` | each profile | from boot, at 0 | Times libtorrent's alert queue overflowed and dropped alerts. |
