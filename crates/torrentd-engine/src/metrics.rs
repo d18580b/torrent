@@ -18,6 +18,17 @@ pub const REMOVE_CLEANUP_ERRORS: &str = "torrent_remove_cleanup_errors_total";
 /// are gone.
 pub const REMOVE_CLEANUP_STORES: &[&str] = &["resume", "torrent", "tombstone"];
 
+/// `accept()` failures on a listen socket that libtorrent survives and keeps
+/// accepting on, by `profile_id` and by `errno`: [`LISTEN_ACCEPT_ERRNOS`].
+/// Counted by the listen handler in place of `listen_failures_total`, since
+/// the socket did not fail (see `handlers::listen::is_accept_emfile`).
+pub const LISTEN_ACCEPT_ERRORS: &str = "listen_accept_errors_total";
+
+/// The `errno` values of [`LISTEN_ACCEPT_ERRORS`]. Only `EMFILE` is one
+/// libtorrent re-arms the accept after; every other accept error stops the
+/// listener and is a listen failure.
+pub const LISTEN_ACCEPT_ERRNOS: &[&str] = &["EMFILE"];
+
 pub trait MetricsSink: Send + Sync + std::fmt::Debug {
     fn inc_counter(&self, name: &str, labels: &[(&str, &str)]);
     fn add_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]);

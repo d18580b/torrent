@@ -242,6 +242,9 @@ impl AlertLoopBuilder {
     /// failure on the port a NAT-PMP rebind is moving onto, with any
     /// number of sessions ([`ListenEvents::rebind_in_progress`]): the rebind
     /// reverts to its previous port, and a failure of that revert is fatal.
+    /// Nor is an `accept()` that failed with `EMFILE`
+    /// ([`handlers::listen::is_accept_emfile`]): libtorrent keeps accepting
+    /// on that socket.
     pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
         self.fatal_listen_failure = yes;
         self
@@ -544,7 +547,12 @@ fn run(
             // endpoint's port: the failure is published below to the waiting
             // rebind, which puts the previous port back. Asked before the
             // publish, which is what wakes the rebind and ends it.
-            if let Alert::ListenFailed { endpoint, .. } = &alert {
+            //
+            // An accept that ran out of file descriptors is none of this:
+            // libtorrent keeps accepting on that socket, so it is neither
+            // fatal nor published, and its handler counts it apart.
+            let accept_emfile = handlers::listen::is_accept_emfile(&alert);
+            if let (Alert::ListenFailed { endpoint, .. }, false) = (&alert, accept_emfile) {
                 let rebinding = hooks
                     .listen_events
                     .as_ref()
@@ -610,7 +618,9 @@ fn run(
                     }
                     Alert::ListenFailed {
                         endpoint, message, ..
-                    } => events.publish(&profile, endpoint, Some(message.clone())),
+                    } if !accept_emfile => {
+                        events.publish(&profile, endpoint, Some(message.clone()))
+                    }
                     _ => {}
                 }
             }
@@ -1441,6 +1451,132 @@ mod tests {
         );
         handle.join().expect("loop thread panicked");
         assert_eq!(*seen.lock(), vec![ShutdownReason::ListenFailed]);
+    }
+
+    /// A `listen_failed_alert` from `operation` with `errno`, on the
+    /// session's listen socket.
+    fn listen_failed_with(operation: &str, errno: i32) -> Alert {
+        match listen_failed_alert() {
+            Alert::ListenFailed {
+                hdr,
+                endpoint,
+                iface,
+                ..
+            } => Alert::ListenFailed {
+                hdr,
+                error_code: errno,
+                operation: operation.into(),
+                endpoint,
+                iface,
+                message: std::io::Error::from_raw_os_error(errno).to_string(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Run the only live session's loop over `alert` until it has been
+    /// handled, then shut it down. Returns whether the loop took it as
+    /// fatal, the reasons `on_fatal` saw, and the metrics.
+    fn run_the_only_session_over(alert: Alert) -> (bool, Vec<ShutdownReason>, Arc<RecordingSink>) {
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(alert);
+        let metrics = Arc::new(RecordingSink::new());
+        let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine)),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .fatal_listen_failure(true)
+        .on_fatal({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |r| seen.lock().push(r)) as FatalCallback
+        })
+        .spawn();
+        let handled = || {
+            metrics.count_for("listen_failures_total")
+                + metrics.count_for(crate::metrics::LISTEN_ACCEPT_ERRORS)
+                > 0
+        };
+        assert!(wait_for(handled), "the loop never handled the alert");
+        // A loop that took it as fatal has already returned; one that did
+        // not stops here. Either way the outcome is final once joined.
+        handle.signal_shutdown(ShutdownReason::Test);
+        let listen_failed = Arc::clone(&handle.listen_failed);
+        handle.join().expect("loop thread panicked");
+        let seen = seen.lock().clone();
+        (listen_failed.load(Ordering::Relaxed), seen, metrics)
+    }
+
+    /// libtorrent re-arms an accept that failed with `EMFILE` on the same
+    /// socket, so the only live session is still listening: no shutdown.
+    #[test]
+    fn an_accept_out_of_descriptors_on_the_only_session_is_not_fatal() {
+        let (fatal, seen, metrics) =
+            run_the_only_session_over(listen_failed_with("sock_accept", libc::EMFILE));
+        assert!(!fatal, "the listener keeps accepting");
+        assert!(seen.is_empty(), "on_fatal saw {seen:?}");
+        assert_eq!(metrics.count_for(crate::metrics::LISTEN_ACCEPT_ERRORS), 1);
+        assert_eq!(metrics.count_for("listen_failures_total"), 0);
+    }
+
+    /// The same errno from opening the socket is a socket that failed, and
+    /// any other accept error, `ENFILE` included, stops the listener.
+    #[test]
+    fn other_listen_failures_on_the_only_session_are_still_fatal() {
+        for (operation, errno) in [
+            ("sock_open", libc::EMFILE),
+            ("sock_accept", libc::ENFILE),
+            ("sock_accept", libc::ECONNABORTED),
+        ] {
+            let (fatal, seen, metrics) =
+                run_the_only_session_over(listen_failed_with(operation, errno));
+            assert!(fatal, "{operation} errno {errno} should be fatal");
+            assert_eq!(
+                seen,
+                vec![ShutdownReason::ListenFailed],
+                "{operation} {errno}"
+            );
+            assert_eq!(metrics.count_for(crate::metrics::LISTEN_ACCEPT_ERRORS), 0);
+        }
+    }
+
+    /// A rebind waiting on the endpoint is not told an accept `EMFILE` is
+    /// a failure: the next outcome there is what it reads.
+    #[test]
+    fn an_accept_out_of_descriptors_is_not_published_to_a_rebind() {
+        use crate::port_forward::ListenConfirmation;
+
+        let engine = Arc::new(MockEngine::new());
+        let events = Arc::new(ListenEvents::new());
+        let cursor = events.cursor();
+        engine.push_alert(listen_failed_with("sock_accept", libc::EMFILE));
+        engine.push_alert(listen_succeeded_alert("0.0.0.0:6881"));
+        let handle = builder_with(engine)
+            .fatal_listen_failure(true)
+            .listen_events(events.clone())
+            .spawn();
+
+        let p = ProfileId::new("p");
+        assert_eq!(
+            events.wait_for(
+                &p,
+                cursor,
+                "0.0.0.0:6881".parse().unwrap(),
+                Duration::from_secs(5)
+            ),
+            ListenConfirmation::Succeeded,
+        );
+        assert!(
+            handle.signal_shutdown(ShutdownReason::Test),
+            "the loop is still running",
+        );
+        let listen_failed = Arc::clone(&handle.listen_failed);
+        handle.join().expect("loop thread panicked");
+        assert!(!listen_failed.load(Ordering::Relaxed));
     }
 
     /// A metrics sink that panics, to drive a genuine panic through a handler.
