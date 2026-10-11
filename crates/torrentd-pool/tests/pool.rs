@@ -516,21 +516,39 @@ fn a_rescan_demotes_an_adopted_torrent_nothing_holds() {
     let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
     // Loaded in a session: kept.
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     // Not loaded, but a profile still owns it (offline, or its add alert not
     // in yet): kept.
-    store.set_profile("aa", Some("p")).unwrap();
-    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    let owned = std::collections::HashSet::from(["aa".to_owned()]);
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &owned).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     // Neither, and no view of the sessions (`torrentd pool scan`): kept.
-    store.set_profile("aa", None).unwrap();
     torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     // Neither, with the sessions' view: demoted, and adoptable again.
-    let stats = torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    let stats =
+        torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default())
+            .unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
     assert_eq!(stats.matched, 1);
+}
+
+#[test]
+fn a_rescan_demotes_an_adopted_torrent_held_only_by_an_index_owner_record() {
+    // A `DELETE` whose owner release was lost to a restart left the record
+    // behind: kept `adopted` on it alone, the torrent was refused by every
+    // later adoption, and no rescan ever cleared it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = adopted_store(dir.path());
+    store.set_profile("aa", Some("p")).unwrap();
+    for _ in 0..3 {
+        torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default())
+            .unwrap();
+        assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
+    }
+    // The record itself is the registry's to reconcile, not the matcher's.
+    assert_eq!(store.profile_of("aa").unwrap().as_deref(), Some("p"));
 }
 
 #[test]
@@ -546,7 +564,7 @@ fn a_rescan_keeps_a_held_adopted_torrent_adopted_while_its_payload_is_gone() {
 
     std::fs::remove_file(root.join("T/a.bin")).unwrap();
     torrentd_pool::scan_root(&mut store, root).unwrap();
-    let stats = torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    let stats = torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     assert_eq!(stats.missing, 1);
     assert_eq!(store.adoption_base("aa").unwrap(), base);
@@ -557,14 +575,14 @@ fn a_rescan_keeps_a_held_adopted_torrent_adopted_while_its_payload_is_gone() {
 
     write_file(root, "T/a.bin", 64);
     torrentd_pool::scan_root(&mut store, root).unwrap();
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     assert_eq!(store.adoption_base("aa").unwrap(), base);
 
     // Nothing holds it: the missing payload demotes it.
     std::fs::remove_file(root.join("T/a.bin")).unwrap();
     torrentd_pool::scan_root(&mut store, root).unwrap();
-    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Missing);
 }
 
@@ -602,7 +620,8 @@ fn a_rescan_keeps_a_held_adopted_torrent_adopted_while_its_payload_is_partial() 
     std::fs::remove_file(root.join("T/b.bin")).unwrap();
     torrentd_pool::scan_root(&mut store, root).unwrap();
     // Not loaded yet, but its profile owns it.
-    let stats = torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    let owned = std::collections::HashSet::from(["ab".to_owned()]);
+    let stats = torrentd_pool::match_all_serving(&mut store, &Default::default(), &owned).unwrap();
     assert_eq!(state_of(&store, "ab"), AdoptionState::Adopted);
     assert_eq!(stats.partial, 1);
     assert_eq!(store.adoption_base("ab").unwrap(), base);
@@ -610,9 +629,8 @@ fn a_rescan_keeps_a_held_adopted_torrent_adopted_while_its_payload_is_partial() 
     let orphans = store.orphan_files(r, "").unwrap();
     assert!(!orphans.contains(&"T/a.bin".to_owned()), "{orphans:?}");
 
-    // Owner released and nothing loads it: demoted to what the payload is.
-    store.set_profile("ab", None).unwrap();
-    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    // Nothing owns or loads it any more: demoted to what the payload is.
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default()).unwrap();
     assert_eq!(state_of(&store, "ab"), AdoptionState::Partial);
 }
 
@@ -655,7 +673,7 @@ fn held_adopted_with_a_file_moved_away(root: &Path) -> (PoolStore, i64) {
     std::fs::rename(root.join("src/T/b.bin"), root.join("misc/b.bin")).unwrap();
     torrentd_pool::scan_root(&mut store, root).unwrap();
     let loaded = std::collections::HashMap::from([("ab".to_owned(), None)]);
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "ab"), AdoptionState::Adopted);
     (store, root_id)
 }
@@ -2362,7 +2380,7 @@ fn a_rescan_keeps_an_adopted_torrent_at_its_recorded_base() {
     let (mut store, root_id) = adopted_at_the_second_copy(dir.path());
     let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     assert_eq!(
         store.adoption_base("aa").unwrap(),
@@ -2391,7 +2409,7 @@ fn a_rescan_prefers_where_the_session_holds_a_torrent_over_its_recorded_base() {
     let (mut store, root_id) = adopted_at_the_second_copy(root);
     let loaded = std::collections::HashMap::from([("aa".to_owned(), Some(root.to_path_buf()))]);
 
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     assert_eq!(
         store.adoption_base("aa").unwrap(),
@@ -2412,7 +2430,7 @@ fn a_rescan_falls_back_to_the_recorded_base_when_the_session_path_is_not_complet
     // root. Either way the recorded base stands.
     for at in [root.join("elsewhere"), PathBuf::from("/nonexistent/pool")] {
         let loaded = std::collections::HashMap::from([("aa".to_owned(), Some(at.clone()))]);
-        torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+        torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
         assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted, "{at:?}");
         assert_eq!(
             store.adoption_base("aa").unwrap(),
@@ -2432,7 +2450,7 @@ fn a_held_torrent_missing_everywhere_keeps_the_base_its_session_reads_from() {
     torrentd_pool::scan_root(&mut store, root).unwrap();
     let loaded = std::collections::HashMap::from([("aa".to_owned(), Some(root.join("moved")))]);
 
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     assert_eq!(
         store.adoption_base("aa").unwrap(),
@@ -2449,7 +2467,7 @@ fn a_rescan_moves_an_adopted_torrent_off_a_recorded_base_that_is_no_longer_compl
     torrentd_pool::scan_root(&mut store, root).unwrap();
     let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
     assert_eq!(
         store.adoption_base("aa").unwrap(),
@@ -2483,7 +2501,7 @@ fn a_rescan_keeps_a_loaded_drifted_torrent_at_its_recorded_base() {
     let (mut store, root_id) = drifted_at_the_second_copy(dir.path());
     let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
     assert_eq!(
         store.adoption_base("aa").unwrap(),
@@ -2521,12 +2539,40 @@ fn a_rescan_with_no_session_view_keeps_an_owned_drifted_torrent_at_its_recorded_
 }
 
 #[test]
+fn a_rescan_keeps_a_torrent_the_caller_says_is_owned_at_its_recorded_base() {
+    // Not `adopted`, no owner in the index, and no session loads it: only the
+    // caller's `owned` set - a registry assignment or a verify-queue item -
+    // says it is served, and so which of its two copies is claimed.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, root_id) = drifted_at_the_second_copy(dir.path());
+    assert_eq!(store.profile_of("aa").unwrap(), None);
+    let owned = std::collections::HashSet::from(["aa".to_owned()]);
+
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &owned).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, "seed".to_owned()))
+    );
+    let orphans = store.orphan_files(root_id, "").unwrap();
+    assert!(!orphans.contains(&"seed/T/a.bin".to_owned()), "{orphans:?}");
+
+    // Not listed in `owned`: nothing serves it, and it is placed by cost
+    // order again.
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default()).unwrap();
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, String::new()))
+    );
+}
+
+#[test]
 fn a_delete_plan_refuses_every_copy_of_a_torrent_complete_more_than_once() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let (mut store, root_id) = adopted_at_the_second_copy(root);
     let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
-    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded, &Default::default()).unwrap();
 
     // `T` holds the unclaimed copy, `seed` the claimed one; neither is
     // provably the one nobody reads.
@@ -2567,7 +2613,7 @@ fn a_delete_plan_refuses_every_copy_of_a_torrent_complete_more_than_once() {
 
     // A matched torrent nothing serves is guarded the same way: which copy
     // it will be adopted from is the operator's call, not the planner's.
-    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
     let guard = torrentd_pool::plan::DeleteGuard::load(&store, root_id, root).unwrap();
     assert!(guard.refusal("T/a.bin", 64).is_some());
@@ -2577,7 +2623,7 @@ fn a_delete_plan_refuses_every_copy_of_a_torrent_complete_more_than_once() {
     // is refused for this reason.
     std::fs::remove_file(root.join("seed/T/a.bin")).unwrap();
     torrentd_pool::scan_root(&mut store, root).unwrap();
-    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &Default::default(), &Default::default()).unwrap();
     let guard = torrentd_pool::plan::DeleteGuard::load(&store, root_id, root).unwrap();
     assert_eq!(guard.refusal("seed/other.bin", 3), None);
 }

@@ -235,6 +235,70 @@ impl PoolService {
         .map_err(|e| e.to_string())
     }
 
+    /// Every info-hash a profile owns without needing a session to hold it:
+    /// assigned in the registry, or waiting in the verify queue, in memory or
+    /// in `pool.db`. `None` where no registry is set (`torrentd pool …`), and
+    /// nothing can tell an owner record the registry backs from one it does
+    /// not.
+    ///
+    /// The pool index's own owner records are not consulted: they are a cache
+    /// of the registry, and this is what a stale one is checked against.
+    fn backed_owners(
+        &self,
+        store: &PoolStore,
+    ) -> Result<Option<std::collections::HashSet<String>>, torrentd_pool::PoolError> {
+        let Some(registry) = self.registry.get() else {
+            return Ok(None);
+        };
+        let mut owned = std::collections::HashSet::new();
+        registry.for_each(|ih, _| {
+            owned.insert(ih.to_hex());
+        });
+        owned.extend(self.verify.held());
+        owned.extend(store.verify_queue()?.into_iter().map(|r| r.infohash));
+        Ok(Some(owned))
+    }
+
+    /// Clear every pool-index owner record nothing backs: no registry claim,
+    /// no session holding the torrent in `state`, and no verify-queue item.
+    /// Returns each `(infohash, profile)` cleared.
+    ///
+    /// A `DELETE` releases the record after the torrent has left its session
+    /// and the registry, and where a scan holds the writer the release only
+    /// waits in memory: a daemon that stops before the scan ends loses it,
+    /// as a failed write does. The record left behind made adoption refuse
+    /// the torrent into any other profile and relocation refuse it outright,
+    /// and `DELETE`, the remedy for both, answers `404` once the registry has
+    /// forgotten the torrent. The boot calls this once the sessions have
+    /// loaded and the verify queue is restored, and each record goes as
+    /// [`PoolStore::release_owner`] releases it, an `adopted` verdict with
+    /// it. Nothing is cleared where no registry is set.
+    pub fn clear_unbacked_owners(
+        &self,
+        state: &StateMap,
+    ) -> Result<Vec<(String, String)>, torrentd_pool::PoolError> {
+        let loaded: std::collections::HashSet<String> =
+            state.infohashes().iter().map(|ih| ih.to_hex()).collect();
+        self.with_store_mut(|store| {
+            let Some(backed) = self.backed_owners(store)? else {
+                return Ok(Vec::new());
+            };
+            let mut cleared = Vec::new();
+            for t in store.torrents()? {
+                let Some(profile) = t.profile else {
+                    continue;
+                };
+                if backed.contains(&t.infohash) || loaded.contains(&t.infohash) {
+                    continue;
+                }
+                if store.release_owner(&t.infohash, &profile, false)? {
+                    cleared.push((t.infohash, profile));
+                }
+            }
+            Ok(cleared)
+        })
+    }
+
     /// The sessions' torrent store, which adoption writes each adopted
     /// torrent's `.torrent` into. The daemon sets this once after opening; a
     /// second call is ignored.
@@ -801,6 +865,17 @@ impl PoolService {
             // nothing holds be demoted; without one, every verdict stands.
             let m = match loaded {
                 Some(loaded) => {
+                    let owned = match self.backed_owners(store)? {
+                        Some(owned) => owned,
+                        // No registry to say who owns what: the index's own
+                        // owner records are all there is, and they stand.
+                        None => store
+                            .torrents()?
+                            .into_iter()
+                            .filter(|t| t.profile.is_some())
+                            .map(|t| t.infohash)
+                            .collect(),
+                    };
                     let save_paths = serving.as_ref();
                     let loaded = loaded
                         .into_iter()
@@ -809,7 +884,7 @@ impl PoolService {
                             (ih, at)
                         })
                         .collect();
-                    torrentd_pool::match_all_serving(store, &loaded)?
+                    torrentd_pool::match_all_serving(store, &loaded, &owned)?
                 }
                 None => torrentd_pool::match_all(store)?,
             };
@@ -2806,6 +2881,189 @@ mod tests {
             "the next taker of the writer saw the record already released",
         );
         assert!(pool.deferred_releases.lock().is_empty());
+    }
+
+    /// A pool index over `dir` holding one complete, adopted torrent owned by
+    /// profile `p`, with a registry handed over as the daemon hands the
+    /// boot's, assigning the torrent to `claim` or to nobody.
+    fn adopted_by_p(
+        dir: &std::path::Path,
+        claim: Option<&str>,
+    ) -> (std::sync::Arc<super::PoolService>, InfoHash) {
+        let cfg = crate::config::Config::minimal_for_tests(dir, false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        std::fs::create_dir_all(dir.join("pool")).unwrap();
+        std::fs::write(dir.join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.join("library/t.torrent"), &bare).unwrap();
+        let ih = libtorrent_safe::info_hash_from_torrent(&bare).unwrap();
+        pool.scan().unwrap();
+        let hex = ih.to_hex();
+        pool.with_store(|s| {
+            let (r, b) = s.adoption_base(&hex).unwrap().unwrap();
+            s.set_adoption(
+                &hex,
+                super::AdoptionState::Adopted,
+                Some(r),
+                Some(&b),
+                Some(1),
+                None,
+                None,
+            )
+            .unwrap();
+            s.set_profile(&hex, Some("p")).unwrap();
+        });
+        let registry = super::AssignmentRegistry::new_empty(dir.join("registry.db"));
+        if let Some(claimant) = claim {
+            registry.assign(ih, ProfileId::new(claimant)).unwrap();
+        }
+        pool.set_registry(std::sync::Arc::new(registry));
+        (pool, ih)
+    }
+
+    fn adopt_plan(pool: &super::PoolService, ih: InfoHash) -> super::AdoptPlan {
+        let roots = pool.roots().to_vec();
+        pool.with_store(|s| {
+            torrentd_pool::adopt::plan(s, &ih.to_hex(), |id| {
+                roots.iter().find(|(r, _)| *r == id).map(|(_, p)| p.clone())
+            })
+            .unwrap()
+        })
+    }
+
+    /// A `DELETE`'s release queued behind a held writer, then a restart
+    /// before the writer was free: the new daemon's boot clears the owner
+    /// record the lost release left, and the `adopted` verdict with it.
+    #[test]
+    fn a_release_lost_to_a_restart_is_reconciled_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih) = adopted_by_p(dir.path(), None);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let pool = std::sync::Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let _store = pool.store.lock();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+        pool.release_owner_soon(ih.to_hex(), "p".into(), false);
+        // The daemon stops before the writer is free: the queue dies with it.
+        pool.deferred_releases.lock().clear();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+
+        // The restart: a new service over the same `pool.db`.
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let reopened = super::PoolService::open(&cfg).unwrap().unwrap();
+        reopened.set_registry(std::sync::Arc::new(super::AssignmentRegistry::new_empty(
+            dir.path().join("registry.db"),
+        )));
+        assert_eq!(
+            reopened.with_store(|s| s.adoption_state(&ih.to_hex()).unwrap()),
+            Some(super::AdoptionState::Adopted),
+        );
+        let cleared = reopened
+            .clear_unbacked_owners(&torrentd_engine::StateMap::new())
+            .unwrap();
+        assert_eq!(cleared, vec![(ih.to_hex(), "p".to_owned())]);
+        assert_eq!(owner_of(&reopened, ih), None);
+        assert_eq!(
+            reopened.with_store(|s| s.adoption_state(&ih.to_hex()).unwrap()),
+            Some(super::AdoptionState::Matched),
+        );
+        // A rescan keeps it adoptable.
+        reopened.set_state(std::sync::Arc::new(torrentd_engine::StateMap::new()));
+        reopened.scan().unwrap();
+        assert_eq!(
+            reopened.with_store(|s| s.adoption_state(&ih.to_hex()).unwrap()),
+            Some(super::AdoptionState::Matched),
+        );
+    }
+
+    /// An owner record no registry claim, session or verify item backs is
+    /// cleared at boot, and adoption then plans the torrent instead of
+    /// refusing it as already adopted.
+    #[test]
+    fn the_boot_clears_an_owner_record_nothing_backs_so_adoption_accepts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih) = adopted_by_p(dir.path(), None);
+        assert!(matches!(
+            adopt_plan(&pool, ih),
+            super::AdoptPlan::Refuse {
+                reason: "already adopted"
+            }
+        ));
+
+        let cleared = pool
+            .clear_unbacked_owners(&torrentd_engine::StateMap::new())
+            .unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(owner_of(&pool, ih), None);
+        let plan = adopt_plan(&pool, ih);
+        assert!(!plan.is_refusal(), "{plan:?}");
+    }
+
+    /// An owner record a registry claim, a session or a verify item backs
+    /// stands, and so does every record where no registry is set.
+    #[test]
+    fn the_boot_leaves_an_owner_record_something_backs() {
+        let empty = torrentd_engine::StateMap::new();
+
+        // A registry claim, under the record's profile or another's.
+        for claimant in ["p", "q"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (pool, ih) = adopted_by_p(dir.path(), Some(claimant));
+            assert!(pool.clear_unbacked_owners(&empty).unwrap().is_empty());
+            assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+            assert_eq!(
+                pool.with_store(|s| s.adoption_state(&ih.to_hex()).unwrap()),
+                Some(super::AdoptionState::Adopted),
+            );
+        }
+
+        // A session holding it.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih) = adopted_by_p(dir.path(), None);
+        let state = torrentd_engine::StateMap::new();
+        state.insert(
+            ih,
+            TorrentState::newly_added(
+                TorrentHandle {
+                    id: 1,
+                    infohash: ih,
+                },
+                ProfileId::new("p"),
+                Instant::now(),
+            ),
+        );
+        assert!(pool.clear_unbacked_owners(&state).unwrap().is_empty());
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+
+        // A verify item, in memory or in `pool.db`.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih) = adopted_by_p(dir.path(), None);
+        pool.verify_queue().enqueue(pending(ih, "p"));
+        assert!(pool.clear_unbacked_owners(&empty).unwrap().is_empty());
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih) = adopted_by_p(dir.path(), None);
+        pool.with_store(|s| s.enqueue_verify(&pending(ih, "p").to_row()))
+            .unwrap();
+        assert!(pool.clear_unbacked_owners(&empty).unwrap().is_empty());
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+
+        // No registry set: nothing can tell, so nothing is cleared.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x93; 20]);
+        let pool = pool_with(dir.path(), ih, Some("p"));
+        assert!(pool.clear_unbacked_owners(&empty).unwrap().is_empty());
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
     }
 
     fn owner_of(pool: &super::PoolService, ih: InfoHash) -> Option<String> {
