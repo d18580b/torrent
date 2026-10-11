@@ -791,6 +791,75 @@ mod tests {
         );
     }
 
+    /// The map's entry for `h` as a seed the map last saw seeding, under
+    /// `profile`.
+    fn seeding_entry(state: &StateMap, h: TorrentHandle, profile: &ProfileId) {
+        use crate::state::TorrentPhase;
+
+        assert!(state.track_added(h, profile, std::time::Instant::now()));
+        state.update(&h.infohash, |st| {
+            st.phase = TorrentPhase::Seeding;
+            st.is_seeding = true;
+            st.needs_save_resume = false;
+        });
+    }
+
+    /// The entry [`seeding_entry`] left for `h` is unchanged, under `h` and
+    /// `profile`, and no status was counted as refreshed.
+    fn left_as_it_was(
+        state: &StateMap,
+        metrics: &RecordingSink,
+        h: TorrentHandle,
+        profile: &ProfileId,
+    ) {
+        use crate::state::TorrentPhase;
+
+        let st = state.get(&h.infohash).expect("still tracked");
+        assert_eq!((st.handle, &st.profile_id), (h, profile));
+        assert_eq!(st.phase, TorrentPhase::Seeding);
+        assert!(st.is_seeding);
+        assert!(!st.needs_save_resume);
+        assert_eq!(metrics.count_for("statuses_refreshed_total"), 0);
+    }
+
+    #[test]
+    fn a_status_under_another_handle_than_the_entry_is_not_applied() {
+        let mock = Arc::new(MockEngine::new());
+        let p = ProfileId::new("p");
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        let ih = InfoHash([15; 20]);
+        // The map tracks the torrent under a handle the session has since
+        // replaced with another for the same info-hash.
+        let old = mock.register_handle(ih);
+        seeding_entry(&state, old, &p);
+        mock.remove_torrent(old, false).unwrap();
+        let new = mock.register_handle(ih);
+        assert_ne!(new, old);
+        mock.set_torrent_status(paused_status(new));
+
+        run_on(mock, &state, &metrics, STATE_UPDATE_DROPPED);
+
+        left_as_it_was(&state, &metrics, old, &p);
+    }
+
+    #[test]
+    fn a_status_whose_entry_another_profile_tracks_is_not_applied() {
+        let mock = Arc::new(MockEngine::new());
+        let q = ProfileId::new("q");
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        // Same handle, but the entry is another profile's, not the one whose
+        // queue overflowed.
+        let h = mock.register_handle(InfoHash([16; 20]));
+        seeding_entry(&state, h, &q);
+        mock.set_torrent_status(paused_status(h));
+
+        run_on(mock, &state, &metrics, STATE_UPDATE_DROPPED);
+
+        left_as_it_was(&state, &metrics, h, &q);
+    }
+
     #[test]
     fn an_overflow_that_spared_the_state_updates_reads_no_status() {
         use crate::state::TorrentPhase;
