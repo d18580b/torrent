@@ -91,19 +91,8 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 // since no alert of this torrent's follows this one. A delete
                 // that fails here keeps the tombstone, so the next boot
                 // deletes the file rather than loading the torrent again.
-                let (resume, torrents, metrics) = (ctx.resume, ctx.torrents, ctx.metrics);
-                let (profile, state) = (&ctx.profile_id, ctx.state);
-                let settled = ctx.state.settle_removal(profile, &ih, |readded| {
-                    let left = delete_removed_files(
-                        resume,
-                        torrents,
-                        metrics,
-                        profile,
-                        &ih,
-                        readded,
-                        Tombstone::Settle,
-                    );
-                    state.set_stale_resume_file(profile, &ih, left.resume_failed);
+                let settled = ctx.state.settle_removal(&ctx.profile_id, &ih, |readded| {
+                    settle_removed_files(ctx, &ih, readded, Tombstone::Settle);
                 });
                 // Settle a save that was in flight when the torrent went: its
                 // answer arrives with no info-hash (the shim skips an invalid
@@ -129,6 +118,34 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         }
         _ => unreachable!("add::handle called with non-add alert"),
     }
+}
+
+/// Delete what a settled removal of the profile's `ih` leaves to delete: its
+/// resume file, and its `.torrent` and save path unless `readded`, doing with
+/// its tombstone what `tombstone` says. A resume file the delete leaves behind
+/// is marked stale.
+///
+/// For `torrent_removed_alert`, which settles the tombstone, and for a removal
+/// an overflow may have dropped that alert of (`handlers::dropped`), which
+/// keeps it: that alert may be only late, and a resume save can still land
+/// before it.
+pub(crate) fn settle_removed_files(
+    ctx: &HandlerCtx<'_>,
+    ih: &InfoHash,
+    readded: bool,
+    tombstone: Tombstone,
+) {
+    let left = delete_removed_files(
+        ctx.resume,
+        ctx.torrents,
+        ctx.metrics,
+        &ctx.profile_id,
+        ih,
+        readded,
+        tombstone,
+    );
+    ctx.state
+        .set_stale_resume_file(&ctx.profile_id, ih, left.resume_failed);
 }
 
 /// What [`delete_removed_files`] could not delete.

@@ -489,6 +489,46 @@ impl StateMap {
         }
     }
 
+    /// Settle the removal of `profile`'s torrent `handle` as its
+    /// `torrent_removed_alert` would, for an overflow that may have dropped
+    /// that alert: drop the entry, and run `delete_files` with whether the
+    /// profile has added the info-hash again since. Returns `None`, changing
+    /// nothing and running nothing, unless a removal of that very torrent was
+    /// recorded ([`Self::begin_removal`]) and the map still holds its entry.
+    ///
+    /// The caller has seen that the session no longer holds `handle`. That
+    /// does not mean the alert was lost: libtorrent posts it only once the
+    /// torrent's disk jobs are aborted, after it has left the session's list.
+    /// So the record is kept, for an alert still to come to settle as
+    /// [`Self::settle_removal`] always has, by this handle and with what it
+    /// knows about a re-add, rather than as a removal nobody recorded, which
+    /// would drop and delete whatever the profile added under the info-hash
+    /// since. A record whose alert was lost stays until the next removal of
+    /// the info-hash in this profile replaces it.
+    ///
+    /// `delete_files` runs under the lock [`Self::note_readded`] takes, as in
+    /// [`Self::settle_removal`].
+    pub fn reconcile_removal(
+        &self,
+        profile: &ProfileId,
+        handle: TorrentHandle,
+        delete_files: impl FnOnce(bool),
+    ) -> Option<RemovalSettled> {
+        let ih = handle.infohash;
+        let removals = self.removals.lock();
+        let pending = removals
+            .get(&(profile.clone(), ih))
+            .filter(|p| p.handle == handle)?;
+        self.remove(&ih, profile, Some(handle))?;
+        let readded = pending.readded;
+        delete_files(readded);
+        drop(removals);
+        Some(RemovalSettled {
+            entry_released: !self.inner.contains_key(&ih),
+            readded,
+        })
+    }
+
     /// Record whether `profile`'s resume file for `ih` is a removed torrent's
     /// left behind: `true` where the removal's delete failed, `false` where a
     /// later one succeeded.
@@ -995,6 +1035,45 @@ mod tests {
         // Consumed: a later removal of the re-added torrent deletes.
         m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
         assert_eq!(seen, Some(false));
+    }
+
+    #[test]
+    fn a_reconciled_removal_settles_only_a_recorded_torrent_and_keeps_its_record() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let p = ProfileId::new("p");
+        let (old, new) = (handle(1, 1), handle(2, 1));
+        m.insert(ih(1), TorrentState::newly_added(old, p.clone(), now));
+        // Nobody asked for its removal: left alone, nothing deleted.
+        assert_eq!(m.reconcile_removal(&p, old, |_| panic!("deleted")), None);
+        assert!(m.contains(&ih(1)));
+
+        m.begin_removal(&p, old);
+        // Not that torrent.
+        assert_eq!(m.reconcile_removal(&p, new, |_| panic!("deleted")), None);
+        let mut seen = None;
+        let settled = m.reconcile_removal(&p, old, |readded| seen = Some(readded));
+        assert_eq!(seen, Some(false));
+        assert_eq!(
+            settled,
+            Some(RemovalSettled {
+                entry_released: true,
+                readded: false,
+            })
+        );
+        assert!(!m.contains(&ih(1)));
+        // Once settled, a second reconcile finds no entry and runs nothing.
+        assert_eq!(m.reconcile_removal(&p, old, |_| panic!("deleted")), None);
+
+        // The alert was only late: the profile re-added the info-hash, and
+        // the alert then settles by the kept record, leaving the new entry
+        // and its files.
+        m.note_readded(&p, &ih(1));
+        m.insert(ih(1), TorrentState::newly_added(new, p.clone(), now));
+        let settled = m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(true));
+        assert!(!settled.entry_released);
+        assert_eq!(m.get(&ih(1)).map(|s| s.handle), Some(new));
     }
 
     #[test]

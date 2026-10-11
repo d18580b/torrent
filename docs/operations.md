@@ -110,6 +110,19 @@ removes the two store files itself. When the boot left the torrent unloaded
 while its session runs, the delete clears the claim and the owner, and nothing
 else.
 
+The daemon stops tracking the removed torrent when libtorrent reports the
+removal. If the alert queue overflows and drops that report (the log shows
+"libtorrent alert queue overflowed; alerts dropped"), the daemon settles every
+removal it asked for whose torrent the session no longer holds, as the report
+would have: it drops the torrent and deletes its files. It leaves the
+tombstone, because the report may be only late and a resume save can still
+land before it; the late report, or the next boot, settles it. It logs how many
+it settled and counts them in `torrentd_removals_reconciled_total`, which also
+counts a report that was only late, and that report is then counted again in
+`torrentd_torrents_removed_total`. Before this fix, a dropped report left the
+torrent tracked until a restart, and every `delete_files` and pool delete plan
+on the host was refused for a torrent that could not be read from its session.
+
 What stays behind:
 
 - **The index entry.** The delete resets an adopted torrent's `adopted`

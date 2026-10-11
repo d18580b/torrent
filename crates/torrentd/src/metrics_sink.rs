@@ -162,6 +162,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "resume_saves_requeued_total" Counter Profile Zero =>
         "Resume saves asked for again because an overflow of this profile's alert queue may \
          have dropped their answer.";
+    "removals_reconciled_total" Counter Profile Zero =>
+        "Torrent removals settled because an overflow of this profile's alert queue dropped \
+         torrent-removed alerts and the session no longer held the torrent: its state-map entry \
+         dropped and its files deleted. The torrent's own alert may have been lost or only late; \
+         a late one is counted again in torrentd_torrents_removed_total.";
     "tracker_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::TRACKER_KINDS) Zero =>
         "Tracker announce errors, successful announces (reply), tracker warnings, scrape \
          failures, and announces that failed because the torrent was stopping (stopped): \
