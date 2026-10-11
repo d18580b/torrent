@@ -560,9 +560,11 @@ pub enum TorrentSource {
     /// A magnet URI. The torrent has no name, size or file list until its
     /// metadata arrives from peers. Whether it is private is unknown until
     /// then too, so a magnet is added with DHT, PEX and LSD disabled on every
-    /// profile, and keeps them disabled: its metadata and peers come from its
-    /// trackers, and a magnet with no `tr=` only from a peer its `x.pe`
-    /// names.
+    /// profile: until then its metadata and peers come from its trackers,
+    /// and a magnet with no `tr=` only from a peer its `x.pe` names. On a
+    /// `host` profile, metadata that is not private lifts that guard and the
+    /// torrent takes the profile's own posture; private metadata keeps it,
+    /// and a `vpn` profile keeps it whatever the metadata says.
     Magnet {
         /// The magnet URI, `magnet:?…`.
         #[schema(pattern = "^magnet:\\?")]
@@ -804,7 +806,8 @@ pub async fn add_torrent(
     // reads exactly that.
     let (params, torrent_bytes) = match source {
         // A magnet's `private` bit is unknown until its metadata arrives, so
-        // it never touches DHT, PEX or LSD, whatever the profile allows.
+        // it touches no DHT, PEX or LSD before then, whatever the profile
+        // allows; the metadata handler lifts that once it shows it public.
         AddSource::Magnet(uri) => (
             AddParams::Magnet {
                 uri,
