@@ -568,14 +568,22 @@ pub(crate) fn fence(
     metrics: &dyn MetricsSink,
 ) -> u64 {
     let profile_id = entry.id();
+    let labels = [("profile_id", profile_id.as_str())];
+    // `profile_vpn_tunnel_up` goes to 0 with the mark, under the same lock,
+    // whoever fences: the kill-switch watch's fence left it at the monitor's
+    // last 1, and the monitor never polls a fenced profile to correct it, so
+    // a profile its lift left fenced read as healthy to every alert on it.
+    // The monitor's healthy poll and the kill-switch lift write 1 under this
+    // lock, and only on a profile not `vpn_down`, so neither lands on a fence
+    // once this one is in.
     entry.update_health(|h| {
         h.status = ProfileStatus::VpnDown;
         h.tunnel_ip = current;
         h.paused_for_vpn = 0;
         h.fence_generation += 1;
+        metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
     });
     atomic::fence(atomic::Ordering::SeqCst);
-    let labels = [("profile_id", profile_id.as_str())];
     let mut paused = 0u64;
     for h in state.handles_for_profile(profile_id) {
         match entry.engine.pause_torrent(h) {
@@ -903,6 +911,11 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             entry.update_health(|h| {
                 h.status = ProfileStatus::Active;
                 h.paused_for_vpn = 0;
+                // Back to 1 only here, where the profile reads active again:
+                // a profile whose tunnel failed the check above stays fenced,
+                // and its 0 stands for the alerts on it.
+                self.metrics
+                    .set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
                 self.metrics
                     .set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
             });
@@ -1655,7 +1668,15 @@ async fn run_with(
 
             let reason = match evaluate(&observation, handshake_max_age) {
                 Ok(()) => {
-                    metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
+                    // Under the health lock, and only while the profile is
+                    // not fenced: a kill-switch fence that landed during the
+                    // probes has set 0, and a 1 from a verdict taken before
+                    // it would hide that fence from every alert on it.
+                    e.update_health(|h| {
+                        if h.status != ProfileStatus::VpnDown {
+                            metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
+                        }
+                    });
                     continue;
                 }
                 Err(reason) => reason,
@@ -1674,7 +1695,7 @@ async fn run_with(
             // before it and be fenced again on the first poll after.
             unanswered.remove(&profile_id);
 
-            metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
+            // `fence` has set `profile_vpn_tunnel_up` to 0 with its mark.
             // Only an actual IP change increments the IP-change counter. It
             // used to be bumped for every unhealthy verdict, stale handshakes
             // included, so the series did not measure what its name says.
@@ -3566,6 +3587,59 @@ mod tests {
         fence.lift();
         assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
         assert!(resumes(&engine).is_empty());
+    }
+
+    /// `profile_vpn_tunnel_up{profile_id="acct_a"}` as the fence's sink
+    /// exports it; `None` while it has no sample.
+    fn tunnel_up(fence: &KillSwitchFence) -> Option<f64> {
+        let exported = String::from_utf8(fence.metrics.render()).expect("utf-8");
+        exported.lines().find_map(|l| {
+            l.strip_prefix("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} ")
+                .map(|v| v.parse().expect("a number"))
+        })
+    }
+
+    /// The kill switch's fence reads as down on `profile_vpn_tunnel_up`, as
+    /// the monitor's does, and a lift that leaves the profile fenced for its
+    /// tunnel keeps it there. It stayed at the monitor's last 1, and the
+    /// monitor never polls a fenced profile, so every alert built on the
+    /// gauge stayed quiet while the profile seeded nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_switch_fence_its_lift_leaves_standing_reads_as_a_tunnel_down() {
+        use vpn::killswitch::Fence;
+        let (fence, _engine) = kill_switch_fence(ProfileStatus::Active, false);
+        let labels = [("profile_id", "acct_a")];
+        // As the monitor's healthy polls leave it.
+        fence
+            .metrics
+            .set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
+
+        fence.fence_all();
+        assert_eq!(tunnel_up(&fence), Some(0.0), "the fence reads as down");
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        assert_eq!(
+            tunnel_up(&fence),
+            Some(0.0),
+            "a lift that leaves the profile fenced keeps it down",
+        );
+    }
+
+    /// A kill-switch lift that returns the profile to `Active` reads as up
+    /// again on `profile_vpn_tunnel_up`, before the monitor polls it.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_switch_lift_to_active_reads_as_a_tunnel_up_again() {
+        use vpn::killswitch::Fence;
+        let (fence, _engine) = kill_switch_fence(ProfileStatus::Active, true);
+        fence.fence_all();
+        assert_eq!(tunnel_up(&fence), Some(0.0));
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(tunnel_up(&fence), Some(1.0), "the lift reads as up again");
     }
 
     /// A single resume re-checks the fence after `resume_torrent`, and pauses
