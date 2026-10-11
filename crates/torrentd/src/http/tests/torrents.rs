@@ -293,6 +293,64 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
             .any(|(ih, _)| *ih == ADDING),
         "a refused delete leaves the resume file in place"
     );
+    // Without `delete_files` too, while its resume file is there: the boot's
+    // add of it failed, and the next boot loads it from that file (#354).
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 409, "torrent-unloaded");
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
+    // An adoption the pool index records `drifted`, with a `.torrent` and no
+    // resume file, is one no boot loads: the delete clears it and its
+    // `.torrent`, so it can be adopted again and verified.
+    h.state.resume.delete(&live, &ADDING).unwrap();
+    h.state
+        .torrents
+        .write(&live, &ADDING, b"torrent-bytes")
+        .unwrap();
+    let drift = |state| {
+        h.state
+            .pool
+            .as_ref()
+            .unwrap()
+            .with_store_mut(|st| {
+                st.upsert_torrent(
+                    &torrentd_pool::PoolTorrent {
+                        infohash: hex(ADDING),
+                        infohash_v1: None,
+                        infohash_v2: None,
+                        name: "A".into(),
+                        total_size: 1,
+                        num_files: 1,
+                        source_path: dir.path().join("a.torrent"),
+                        fastresume_path: None,
+                        declared_save_path: None,
+                        category: None,
+                        tags: vec![],
+                        profile: Some("p".into()),
+                    },
+                    0,
+                )?;
+                st.set_adoption(&hex(ADDING), state, None, None, None, Some(1), None)
+            })
+            .unwrap();
+    };
+    // Recorded `adopted`, the `.torrent` is what the next boot loads.
+    drift(torrentd_pool::AdoptionState::Adopted);
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 409, "torrent-unloaded");
+    assert!(h.state.torrents.exists(&live, &ADDING));
+    drift(torrentd_pool::AdoptionState::Drifted);
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert!(h.state.registry.lookup(&ADDING).is_none());
+    assert!(!h.state.torrents.exists(&live, &ADDING));
+    // Back to what the rest of this test expects: assigned, held by no
+    // session, and not one the boot left unloaded.
+    h.state.registry.assign(ADDING, live.clone()).unwrap();
     // A cross-seed claims the same file in the pool index: deleting this
     // torrent's payload would delete that one's, so it is refused, and the
     // torrent stays loaded.
@@ -1468,41 +1526,70 @@ async fn deleting(h: &Harness, e: &Engines) {
         .await;
     assert_problem(&resp, 409, "torrent-adding");
     assert!(h.state.registry.lookup(&ADDING).is_some());
-    // Once the boot is known to have left it unloaded, it is clearable, and
-    // so are the resume file and `.torrent` its failed resume add left on
-    // disk, which would re-assign it at the next start.
+    // Once the boot is known to have left it unloaded, a plain delete still
+    // refuses while its stores hold the resume file or `.torrent` its failed
+    // add left (#354): those are what the next boot loads it from, once the
+    // reason the add failed is fixed.
     h.state.unloaded_at_boot.lock().insert(ADDING);
     let live = ProfileId::new("p");
-    h.state
-        .resume
-        .write(&live, &ADDING, b"resume-bytes")
-        .unwrap();
-    h.state
-        .torrents
-        .write(&live, &ADDING, b"torrent-bytes")
-        .unwrap();
-    h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
-        .await
-        .assert_status(StatusCode::NO_CONTENT);
-    assert!(h.state.registry.lookup(&ADDING).is_none());
-    assert!(
-        !h.state
+    let in_resume = |h: &Harness| {
+        h.state
             .resume
             .load_all(&live)
             .unwrap()
             .iter()
-            .any(|(ih, _)| *ih == ADDING),
-        "the resume store still holds the cleared torrent"
-    );
-    assert!(
-        !h.state
+            .any(|(ih, _)| *ih == ADDING)
+    };
+    let in_torrents = |h: &Harness| {
+        h.state
             .torrents
             .load_all(&live)
             .unwrap()
             .iter()
-            .any(|(ih, _)| *ih == ADDING),
-        "the .torrent store still holds the cleared torrent"
-    );
+            .any(|(ih, _)| *ih == ADDING)
+    };
+    for (resume, torrent) in [(true, true), (true, false), (false, true)] {
+        if resume {
+            h.state
+                .resume
+                .write(&live, &ADDING, b"resume-bytes")
+                .unwrap();
+        }
+        if torrent {
+            h.state
+                .torrents
+                .write(&live, &ADDING, b"torrent-bytes")
+                .unwrap();
+        }
+        let resp = h
+            .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+            .await;
+        assert_problem(&resp, 409, "torrent-unloaded");
+        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        for (held, name) in [
+            (resume, format!("{}.resume", hex(ADDING))),
+            (torrent, format!("{}.torrent", hex(ADDING))),
+        ] {
+            assert_eq!(detail.contains(&name), held, "{name}: {detail}");
+        }
+        assert!(
+            detail.contains("torrentd_boot_torrent_load_failures"),
+            "{detail}"
+        );
+        assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
+        assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+        assert_eq!(in_resume(h), resume, "the refusal touched the resume file");
+        assert_eq!(in_torrents(h), torrent, "the refusal touched the .torrent");
+        // What the operator does to retire it anyway: move the files out.
+        h.state.resume.delete(&live, &ADDING).unwrap();
+        h.state.torrents.delete(&live, &ADDING).unwrap();
+    }
+    // A claim with nothing behind it, as a crash between an add's claim and
+    // its first record leaves, is cleared.
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert!(h.state.registry.lookup(&ADDING).is_none());
     assert!(
         !h.state.unloaded_at_boot.lock().contains(&ADDING),
         "a later add of the same infohash must not be taken for a boot leftover"
@@ -2598,6 +2685,185 @@ async fn a_delete_whose_tombstone_write_fails_counts_it_and_still_answers_204() 
         ["torrentd_torrent_remove_cleanup_errors_total{profile_id=\"p\",store=\"tombstone\"} 1"],
         "only the tombstone write failed: {text}"
     );
+}
+
+/// A resume store that cannot say whether it holds a file, and otherwise
+/// works.
+#[derive(Debug, Default)]
+struct UncheckableResume(torrentd_engine::MemoryResumeStore);
+impl torrentd_engine::ResumeStore for UncheckableResume {
+    fn scan(
+        &self,
+        p: &ProfileId,
+    ) -> Result<
+        torrentd_engine::resume_store::Scan<libtorrent_safe::ResumeData>,
+        torrentd_engine::resume_store::ResumeStoreError,
+    > {
+        self.0.scan(p)
+    }
+    fn write(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+        d: &[u8],
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.write(p, ih, d)
+    }
+    fn delete(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.delete(p, ih)
+    }
+    fn exists(
+        &self,
+        _: &ProfileId,
+        _: &InfoHash,
+    ) -> Result<bool, torrentd_engine::resume_store::ResumeStoreError> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+    }
+    fn write_tombstone(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.write_tombstone(p, ih)
+    }
+    fn clear_tombstone(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.clear_tombstone(p, ih)
+    }
+    fn tombstones(
+        &self,
+        p: &ProfileId,
+    ) -> Result<Vec<InfoHash>, torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.tombstones(p)
+    }
+}
+
+#[tokio::test]
+async fn an_unloaded_delete_whose_resume_store_cannot_answer_answers_500_and_changes_nothing() {
+    // Whether the resume file is there decides whether the delete may clear
+    // the claim (#354). A store that cannot say must not be read as "absent",
+    // or a load failure becomes a lost torrent.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+        s.resume = Arc::new(UncheckableResume::default());
+    });
+    let p = ProfileId::new("p");
+    h.state.unloaded_at_boot.lock().insert(ADDING);
+    h.state.resume.write(&p, &ADDING, b"resume-bytes").unwrap();
+    h.state
+        .torrents
+        .write(&p, &ADDING, b"torrent-bytes")
+        .unwrap();
+
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 500, "internal");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("resume file"), "{detail}");
+    assert!(detail.contains("Nothing was changed"), "{detail}");
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(p.clone()));
+    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+    assert!(
+        h.state
+            .resume
+            .load_all(&p)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING),
+        "the resume file is kept"
+    );
+    assert!(h.state.torrents.exists(&p, &ADDING), "the .torrent is kept");
+}
+
+#[tokio::test]
+async fn an_unloaded_delete_whose_pool_index_cannot_be_read_keeps_a_resume_less_torrent() {
+    // A `.torrent` with no resume file is cleared only where the pool index
+    // records its adoption `drifted`. An index that cannot be read says
+    // nothing of the kind, so the `.torrent` is what the next boot loads and
+    // the delete refuses.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::config::Config::minimal_for_tests(dir.path(), true);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+        s.pool = crate::pool_service::PoolService::open(&cfg).unwrap();
+    });
+    let p = ProfileId::new("p");
+    h.state.unloaded_at_boot.lock().insert(ADDING);
+    h.state
+        .torrents
+        .write(&p, &ADDING, b"torrent-bytes")
+        .unwrap();
+    h.state
+        .pool
+        .as_ref()
+        .unwrap()
+        .with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: hex(ADDING),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "A".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join("a.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: Some("p".into()),
+                },
+                0,
+            )?;
+            st.set_adoption(
+                &hex(ADDING),
+                torrentd_pool::AdoptionState::Drifted,
+                None,
+                None,
+                None,
+                Some(1),
+                None,
+            )
+        })
+        .unwrap();
+    // The reader fails from here on, as on a corrupt or unreadable index.
+    let index = rusqlite::Connection::open(cfg.pool_db_path()).unwrap();
+    index
+        .execute_batch("ALTER TABLE adoption RENAME TO adoption_unreadable")
+        .unwrap();
+
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 409, "torrent-unloaded");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains(&format!("{}.torrent", hex(ADDING))),
+        "{detail}"
+    );
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(p.clone()));
+    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+    assert!(h.state.torrents.exists(&p, &ADDING), "the .torrent is kept");
+
+    // The unreadable index is what refused: readable again, the `drifted`
+    // record clears it.
+    index
+        .execute_batch("ALTER TABLE adoption_unreadable RENAME TO adoption")
+        .unwrap();
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert!(h.state.registry.lookup(&ADDING).is_none());
+    assert!(!h.state.torrents.exists(&p, &ADDING));
 }
 
 #[tokio::test]

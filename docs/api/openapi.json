@@ -1920,7 +1920,7 @@
           "torrents"
         ],
         "summary": "Remove a torrent.",
-        "description": "Removes it from its session and clears its assignment, so the infohash can\nbe added again. Its resume file, `.torrent` and recorded save path are\ndeleted before the answer, so a restart after a `204` does not load it\nagain. `delete_files=true` also moves the payload into the trash\nof the managed root it lies in, never unlinking it, and needs `[pool]\nallow_mutations` and `confirm` repeating the infohash. It is refused,\nchanging nothing, unless every file is under a managed root, claimed by\nthis torrent alone in the pool index, listed at the same path by no other\ntorrent any session holds, and unchanged since the scan that indexed it;\nwhile another assigned torrent is held by no session, its files cannot be\ncompared, and that refuses too. A torrent whose profile has no running\nsession, or that the boot left unloaded, is cleared from the daemon's\nrecords alone (`delete_files` is refused there: nothing can reach the\npayload). A torrent still being added is `409 torrent-adding`; retry once\nit lists a phase other than `unknown`.",
+        "description": "Removes it from its session and clears its assignment, so the infohash can\nbe added again. Its resume file, `.torrent` and recorded save path are\ndeleted before the answer, so a restart after a `204` does not load it\nagain. `delete_files=true` also moves the payload into the trash\nof the managed root it lies in, never unlinking it, and needs `[pool]\nallow_mutations` and `confirm` repeating the infohash. It is refused,\nchanging nothing, unless every file is under a managed root, claimed by\nthis torrent alone in the pool index, listed at the same path by no other\ntorrent any session holds, and unchanged since the scan that indexed it;\nwhile another assigned torrent is held by no session, its files cannot be\ncompared, and that refuses too. A torrent whose profile has no running\nsession, or that the boot left unloaded, is cleared from the daemon's\nrecords alone (`delete_files` is refused there: nothing can reach the\npayload). One the boot left unloaded whose resume file or `.torrent` its\nprofile's stores still hold is `409 torrent-unloaded`, changing nothing:\nthose files are what the next boot loads it from. A torrent still being\nadded is `409 torrent-adding`; retry once it lists a phase other than\n`unknown`.",
         "operationId": "delete_torrent",
         "parameters": [
           {
@@ -2138,7 +2138,7 @@
             }
           },
           "409": {
-            "description": "The torrent is still being added; The payload is shared; The payload cannot be trashed; The profile is unavailable",
+            "description": "The torrent is still being added; The payload is shared; The payload cannot be trashed; The torrent did not load; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2190,6 +2190,22 @@
                         }
                       ],
                       "title": "The payload cannot be trashed"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-unloaded"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The torrent did not load"
                     },
                     {
                       "allOf": [

@@ -107,8 +107,18 @@ its resume and `.torrent` files. It clears its registry claim and clears the
 index's owner for it, so the info-hash can be added again. The payload stays
 where it is. When the torrent's profile has no running session, the delete
 removes the two store files itself. When the boot left the torrent unloaded
-while its session runs, the delete clears the claim and the owner, and nothing
-else.
+while its session runs, the delete clears the claim and the owner only when
+the profile's stores hold no resume file and no `.torrent` for it, as after a
+crash between an add's claim and its first record, and deletes them as well
+for an adoption the pool index records `drifted` with no resume file, which
+no boot loads. Where either file is still there otherwise, the boot's add of
+it failed or was refused, and those files are what the next boot loads it
+from: the delete is refused with `409`
+[`torrent-unloaded`](api/problems.md#torrent-unloaded), changing nothing, and
+names them. Fix the cause and restart, as
+[After a crash](#after-a-crash) describes; to retire the torrent anyway, move
+the named files out of the profile's resume and torrent directories and
+delete again.
 
 The daemon stops tracking the removed torrent when libtorrent reports the
 removal. If the alert queue overflows and drops that report (the log shows
@@ -524,8 +534,21 @@ That leaves a claim with nothing behind it, so no scan loads the torrent, and
 adopting it again is refused with `info-hash already loaded in profile …`.
 The boot counts these per profile in
 `torrentd_profile_unloaded_registry_torrents`, which does not count the
-adoptions it queued again. Where it is above 0, list them: the registry lists
-them, and their phase is `unknown` because no session holds them.
+adoptions it queued again.
+
+That gauge also counts every claimed torrent whose add failed at boot, and
+those are not crash leftovers. Check `torrentd_boot_torrent_load_failures`
+first, and the boot's `resume add failed` and `torrent-dir add failed`
+warnings, which name each torrent. A save path on a disk that had not mounted
+yet, or a resume file libtorrent refused, fails the add and keeps the claim,
+the resume file and the `.torrent`, which is what the next boot loads the
+torrent from. Fix the cause and restart the daemon for those; do not delete
+them. The `DELETE` below refuses them anyway, with `409`
+[`torrent-unloaded`](api/problems.md#torrent-unloaded) naming the files, so
+running it over the whole list changes nothing for them.
+
+Where the gauge is still above 0, list the claims: the registry lists them,
+and their phase is `unknown` because no session holds them.
 
 ```bash
 # Repeat with ?cursor= while next_cursor is set.
@@ -536,8 +559,10 @@ curl -s "localhost:8080/v1/torrents?profile_id=acct_a&phase=unknown&limit=1000" 
 Run this once the boot has finished. A torrent still being added also reads
 `unknown` until its first state update arrives, and so does an adoption the
 boot queued again, until the queue adds it. The `DELETE` below refuses both
-with 409 and prints `failed:`; leave those. Then clear each claim with a
-plain `DELETE` (no `delete_files`), and adopt the torrent again
+with 409 and prints `failed:`; leave those, and the load failures it refuses
+the same way. Then clear each claim with a plain `DELETE` (no
+`delete_files`), which succeeds only for a claim with no resume file and no
+`.torrent` behind it, and adopt the torrent again
 (`POST /v1/pool/adoptions`):
 
 ```bash

@@ -1176,6 +1176,13 @@ torrent_error! {
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload cannot be trashed")]
         PayloadUntrashable { detail: String },
+        /// A plain delete of a torrent the boot left unloaded while its
+        /// profile's stores still hold its resume file or `.torrent`: they
+        /// are what the next boot loads it from. `detail` names them.
+        /// Nothing was changed.
+        #[error("{detail}")]
+        #[problem(status = 409, title = "The torrent did not load")]
+        TorrentUnloaded { detail: String },
         /// `delete_files=true` for a torrent whose profile has no running
         /// session: its payload is reachable only through one.
         #[error("{detail}")]
@@ -1208,8 +1215,11 @@ torrent_error! {
 /// compared, and that refuses too. A torrent whose profile has no running
 /// session, or that the boot left unloaded, is cleared from the daemon's
 /// records alone (`delete_files` is refused there: nothing can reach the
-/// payload). A torrent still being added is `409 torrent-adding`; retry once
-/// it lists a phase other than `unknown`.
+/// payload). One the boot left unloaded whose resume file or `.torrent` its
+/// profile's stores still hold is `409 torrent-unloaded`, changing nothing:
+/// those files are what the next boot loads it from. A torrent still being
+/// added is `409 torrent-adding`; retry once it lists a phase other than
+/// `unknown`.
 #[kynos::delete("/torrents/{infohash}", tag = Torrents)]
 pub async fn delete_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1387,16 +1397,21 @@ pub async fn delete_torrent(
                     ),
                 });
             }
-            // The boot left it unloaded mostly because its resume add failed,
-            // so its resume file is still on disk to re-assign it at the next
-            // start: the stores go too, as for a sessionless profile.
+            // The boot leaves a torrent unloaded mostly because its add
+            // failed: a save path on a disk not mounted yet, or a resume file
+            // libtorrent refused. Its resume file and `.torrent` are then the
+            // only copy of its metadata and what the next boot loads it from,
+            // so a plain delete refuses rather than deleting them. A claim
+            // with nothing behind it, which a crash between an add's claim
+            // and its first record leaves, has neither and is cleared.
+            refuse_unloaded_with_store_files(&s, &ih, &profile)?;
             clear_unheld(&s, &ih, &profile)?;
             warn!(
                 target: "torrentd::http",
                 infohash = %ih,
                 profile_id = %profile,
-                "cleared an assignment the startup scans left unloaded, and deleted its resume \
-                 and .torrent files so the startup scan does not re-assign it",
+                "cleared an assignment the startup scans left unloaded, which had no resume or \
+                 .torrent file behind it",
             );
         }
         None => return Err(DeleteTorrentError::TorrentAdding),
@@ -1689,6 +1704,65 @@ fn clear_sessionless(
          and .torrent files so the startup scan does not re-assign it",
     );
     Ok(NoContent)
+}
+
+/// Refuse, changing nothing, the plain delete of a torrent the boot left
+/// unloaded while `profile`'s stores still hold its resume file or `.torrent`.
+///
+/// Those files are what the next boot loads it from once the reason its add
+/// failed is fixed, and for a torrent not adopted from the pool the only copy
+/// of its metadata, so deleting them would turn a load failure into a lost
+/// torrent. A store that cannot say whether it holds the file refuses too.
+fn refuse_unloaded_with_store_files(
+    s: &AppState,
+    ih: &InfoHash,
+    profile: &ProfileId,
+) -> Result<(), DeleteTorrentError> {
+    let resume = s
+        .resume
+        .exists(profile, ih)
+        .map_err(|e| DeleteTorrentError::Internal {
+            detail: format!(
+                "{} Nothing was changed; retry the delete.",
+                internal("checking for the torrent's resume file", e)
+            ),
+        })?;
+    // A `.torrent` with no resume file that the pool index records `drifted`
+    // is one the boot held back on purpose: its verification failed, no boot
+    // loads it, and deleting it and adopting it again is how it is verified
+    // again. Where the index cannot be read it is kept.
+    let torrent = s.torrents.exists(profile, ih) && (resume || !recorded_drifted(s, ih));
+    let held: Vec<String> = [(resume, "resume"), (torrent, "torrent")]
+        .into_iter()
+        .filter(|(present, _)| *present)
+        .map(|(_, suffix)| format!("`{}.{suffix}`", ih.to_hex()))
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    Err(DeleteTorrentError::TorrentUnloaded {
+        detail: format!(
+            "the boot left torrent {ih} unloaded, and profile {profile}'s stores still hold {}, \
+             which the next boot loads it from. Nothing was changed. Fix why it did not load \
+             (the boot logged a warning naming it, such as `resume add failed`, `torrent-dir \
+             add failed` or a tracker `allowed_tracker_urls` refuses, and \
+             `torrentd_boot_torrent_load_failures` counts failed adds) and restart the daemon. \
+             To retire it anyway, move those files out of the profile's resume and torrent \
+             directories and retry the delete.",
+            held.join(" and "),
+        ),
+    })
+}
+
+/// Whether the pool index records `ih`'s adoption `drifted`; `false` with no
+/// pool, or where the index cannot be read.
+fn recorded_drifted(s: &AppState, ih: &InfoHash) -> bool {
+    s.pool.as_ref().is_some_and(|pool| {
+        matches!(
+            pool.with_reader(|st| st.adoption_state(&ih.to_hex())),
+            Ok(Some(torrentd_pool::AdoptionState::Drifted))
+        )
+    })
 }
 
 /// Clear the assignment of `ih` to `profile`, which no session holds, with
