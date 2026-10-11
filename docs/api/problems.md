@@ -212,7 +212,30 @@ the torrent alone and deal with the files by hand.
 
 It is also the answer for a torrent the boot left unloaded: no session holds
 it, so nothing can reach its payload. Nothing was changed; retry without
-`delete_files` to clear its assignment, resume file and `.torrent`.
+`delete_files` to clear its assignment, which is refused in turn with
+[`torrent-unloaded`](#torrent-unloaded) while its resume file or `.torrent` is
+still in its profile's stores.
+
+## `torrent-unloaded`
+
+**409**, from a plain `DELETE /v1/torrents/{infohash}` (no `delete_files`).
+The boot left the torrent unloaded, and its profile's stores still hold its
+resume file or `.torrent`, which `detail` names. Those files are what the next
+boot loads it from, and for a torrent not adopted from the pool the only copy
+of its metadata, so nothing was changed. An adoption the pool index records
+`drifted` with no resume file is the exception: no boot loads it, so its
+`.torrent` does not refuse the delete, which clears it so it can be adopted
+again.
+
+A boot leaves a torrent unloaded this way when its add failed, such as a save
+path on a disk not mounted yet or a resume file libtorrent refused, or when
+its trackers fall outside the profile's `allowed_tracker_urls`. The boot logs
+a warning naming the torrent (`resume add failed` or `torrent-dir add failed`
+for a failed add), and `torrentd_boot_torrent_load_failures` counts the
+failed adds. Fix the cause and restart the
+daemon, and the torrent loads. To retire it anyway, move the named files out
+of the profile's resume and torrent directories and retry the delete; with
+nothing left behind the claim, the delete clears it.
 
 ## `metadata-pending`
 
