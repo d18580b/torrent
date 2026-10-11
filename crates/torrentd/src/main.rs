@@ -19,6 +19,7 @@ compile_error!(
      lookups, and nftables. There is no macOS or Windows port."
 );
 
+mod api_socket;
 mod app_state;
 mod auth;
 mod cli;

@@ -3056,7 +3056,7 @@ impl DaemonHandle {
                 .ok()
         };
         let app = build_app().map(|app| (app, build_app));
-        let http_listen = cfg.http_listen;
+        let http_listen = cfg.http_listen.clone();
 
         // SIGHUP pump.
         let reload_source = source.clone();
@@ -3081,28 +3081,41 @@ impl DaemonHandle {
         // the server and falls through to the same drain and teardown a
         // signalled shutdown runs, exiting 70, after `run_http_stage` has told
         // the background tasks to stop.
-        let listener = match tokio::net::TcpListener::bind(http_listen).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                error!(addr = %http_listen, error.cause = %e, "bind HTTP listener");
-                None
-            }
-        };
+        let listener = bind_api_listener(&cfg).await;
+        let posture = unauthenticated_posture(&cfg);
+        let (tx, alert, gate) = (&shutdown_tx, &alert_loop, &work);
         let mut exit_code = run_http_stage(
             listener,
             app,
-            |listener, (app, build_app)| {
-                serve_until_shutdown(
-                    listener,
-                    app,
-                    build_app,
-                    http_listen,
-                    unauthenticated_posture(&cfg),
-                    &shutdown_tx,
-                    shutdown_rx,
-                    &alert_loop,
-                    &work,
-                )
+            |listener, (app, build_app)| async move {
+                announce_ready(&http_listen, posture, tx, alert);
+                match listener {
+                    ApiListener::Tcp(listener, addr) => {
+                        serve_until_shutdown(listener, app, build_app, addr, tx, shutdown_rx, gate)
+                            .await
+                    }
+                    ApiListener::Unix(socket) => {
+                        let work = Arc::clone(gate);
+                        crate::api_socket::serve(
+                            socket,
+                            app,
+                            shutdown_rx,
+                            move || {
+                                // As the TCP server's graceful-shutdown hook.
+                                work.cancel();
+                                sd_notify::stopping();
+                                sd_notify::status("draining HTTP requests");
+                            },
+                            crate::api_socket::Limits {
+                                max_connections: HTTP_MAX_CONNECTIONS.get(),
+                                header_read_timeout: HTTP_HEADER_READ_TIMEOUT,
+                                drain_timeout: HTTP_DRAIN_TIMEOUT,
+                            },
+                        )
+                        .await;
+                        0
+                    }
+                }
             },
             &shutdown_tx,
         )
@@ -3297,18 +3310,88 @@ where
 /// Split out of `run_until_signal` so that function has no early return
 /// between `boot`'s `disarm` and its teardown: a failure to bind skips this
 /// and nothing else.
-#[allow(clippy::too_many_arguments)]
 async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
     app: kynos::router::service::Service<http::ctx::AppCtx>,
     build_app: impl Fn() -> Option<kynos::router::service::Service<http::ctx::AppCtx>>,
     http_listen: std::net::SocketAddr,
-    posture: Option<String>,
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
     shutdown_rx: broadcast::Receiver<ShutdownReason>,
-    alert_loop: &torrentd_engine::AlertLoopHandle,
     work: &Arc<crate::app_state::WorkGate>,
 ) -> i32 {
+    // kynos records every connection's peer address, which is what lets the
+    // session throttle and the auth failure log see who was calling.
+    //
+    // The limits are set here rather than left to kynos' defaults, which are
+    // sized for a public web service: 10,000 connections and a 30 s header
+    // timeout. This is a single-operator control plane sharing one descriptor
+    // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
+    // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
+    //
+    // kynos gives up on a listener after five consecutive accept failures
+    // inside about 150 ms, `EMFILE` and `ENFILE` included, and drops it. A
+    // daemon briefly out of descriptors is not one to restart — the restart
+    // tears down every tunnel and session to fix what a closing peer socket
+    // fixes — so a second descriptor on the socket keeps it bound, and the
+    // server is started again on it after a backoff (`descriptor_exhaustion`).
+    serve_through_exhaustion(
+        listener,
+        app,
+        build_app,
+        |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned(),
+        |listener, app, server_shutdown| serve_once(listener, app, server_shutdown, work),
+        http_listen,
+        shutdown_tx,
+        shutdown_rx,
+    )
+    .await
+}
+
+/// The API's bound listener: a TCP socket, or a unix one.
+#[derive(Debug)]
+enum ApiListener {
+    Tcp(tokio::net::TcpListener, std::net::SocketAddr),
+    Unix(crate::api_socket::ApiSocket),
+}
+
+/// Bind `http_listen`, or log why it could not be and return `None`.
+async fn bind_api_listener(cfg: &Config) -> Option<ApiListener> {
+    match &cfg.http_listen {
+        crate::config::HttpListen::Tcp(addr) => match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => Some(ApiListener::Tcp(l, *addr)),
+            Err(e) => {
+                error!(addr = %addr, error.cause = %e, "bind HTTP listener");
+                None
+            }
+        },
+        crate::config::HttpListen::Unix(path) => {
+            match crate::api_socket::bind(
+                path,
+                cfg.http_socket_mode(),
+                cfg.http_socket_group.as_deref(),
+            ) {
+                Ok(socket) => Some(ApiListener::Unix(socket)),
+                Err(e) => {
+                    error!(
+                        addr = %cfg.http_listen,
+                        error.cause = %format_args!("{e:#}"),
+                        "bind HTTP listener",
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Log the listener and the authentication posture, tell systemd the daemon
+/// is ready, and start the watchdog pings. Runs once the listener is bound.
+fn announce_ready(
+    http_listen: &crate::config::HttpListen,
+    posture: Option<String>,
+    shutdown_tx: &broadcast::Sender<ShutdownReason>,
+    alert_loop: &torrentd_engine::AlertLoopHandle,
+) {
     info!(addr = %http_listen, "HTTP server listening");
     if let Some(posture) = posture {
         warn!(target: "torrentd::auth", addr = %http_listen, "{posture}");
@@ -3353,33 +3436,6 @@ async fn serve_until_shutdown(
             }
         });
     }
-
-    // kynos records every connection's peer address, which is what lets the
-    // session throttle and the auth failure log see who was calling.
-    //
-    // The limits are set here rather than left to kynos' defaults, which are
-    // sized for a public web service: 10,000 connections and a 30 s header
-    // timeout. This is a single-operator control plane sharing one descriptor
-    // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
-    // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
-    //
-    // kynos gives up on a listener after five consecutive accept failures
-    // inside about 150 ms, `EMFILE` and `ENFILE` included, and drops it. A
-    // daemon briefly out of descriptors is not one to restart — the restart
-    // tears down every tunnel and session to fix what a closing peer socket
-    // fixes — so a second descriptor on the socket keeps it bound, and the
-    // server is started again on it after a backoff (`descriptor_exhaustion`).
-    serve_through_exhaustion(
-        listener,
-        app,
-        build_app,
-        |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned(),
-        |listener, app, server_shutdown| serve_once(listener, app, server_shutdown, work),
-        http_listen,
-        shutdown_tx,
-        shutdown_rx,
-    )
-    .await
 }
 
 /// Run `serve` on `listener` until it stops for a reason other than running
