@@ -381,6 +381,15 @@ groups:
         annotations:
           summary: "{{ $value }} torrents in profile {{ $labels.profile_id }} failed to load at boot ({{ $labels.source }})"
 
+      - alert: TorrentdBootSavePathFallbacks
+        # Only the boot torrent-dir scan counts this, so like the load
+        # failures it holds for the life of the process.
+        expr: torrentd_boot_save_path_fallbacks_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} torrents in profile {{ $labels.profile_id }} were re-added at default_save_path at boot because no save path was recorded; they will not seed until moved to their data"
+
       - alert: TorrentdUnloadedRegistryTorrents
         expr: torrentd_profile_unloaded_registry_torrents > 0
         labels:
@@ -405,6 +414,17 @@ groups:
           severity: warning
         annotations:
           summary: "A .torrent for profile {{ $labels.profile_id }} could not be written ({{ $labels.source }})"
+
+      - alert: TorrentdRemoveCleanupFailed
+        # The boot counts a cleanup it could not finish as it honours the
+        # tombstones, before the first scrape; the boot gauge carries it.
+        expr: >
+          increase(torrentd_torrent_remove_cleanup_errors_total[15m]) > 0
+          or torrentd_boot_torrent_remove_cleanup_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cleaning up a removed torrent in profile {{ $labels.profile_id }} failed ({{ $labels.store }}); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
 
       - alert: TorrentdStoreWriteFailed
         expr: >
@@ -473,7 +493,12 @@ groups:
           summary: "A pool scan skipped entries ({{ $labels.kind }}); the index may be incomplete"
 
       - alert: TorrentdPoolVerifyFailed
-        expr: increase(torrentd_pool_verify_failed_total[1h]) > 0
+        # The verify queue starts before /metrics is served, so an adoption
+        # the boot re-queued can fail before the first scrape; the boot gauge
+        # carries it.
+        expr: >
+          increase(torrentd_pool_verify_failed_total[1h]) > 0
+          or torrentd_boot_pool_verify_failed > 0
         labels:
           severity: warning
         annotations:

@@ -1095,6 +1095,33 @@ tests:
             exp_annotations:
               summary: "2 torrents in profile acct_a failed to load at boot (torrent_dir_add)"
 
+  # Torrents the boot torrent-dir scan re-added at default_save_path: 3 at the
+  # first sample, flat, since nothing after the boot counts them. Fires from
+  # that sample and still past any window; a profile at zero stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_boot_save_path_fallbacks_total{profile_id="acct_a"}'
+        values: '3x40'
+      - series: 'torrentd_boot_save_path_fallbacks_total{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdBootSavePathFallbacks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no save path was recorded; they will not seed until moved to their data"
+      - eval_time: 30m
+        alertname: TorrentdBootSavePathFallbacks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no save path was recorded; they will not seed until moved to their data"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_profile_unloaded_registry_torrents{profile_id="acct_a"}'
@@ -1200,6 +1227,64 @@ tests:
               source: api
             exp_annotations:
               summary: "A .torrent for profile acct_a could not be written (api)"
+
+  # A DELETE whose tombstone write failed after the first scrape: increase()
+  # fires it, and it resolves once the 15-minute window has passed.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="tombstone"}'
+        values: '0 0 1x20'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="tombstone"}'
+        values: '0x22'
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="resume"}'
+        values: '0x22'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="resume"}'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              store: tombstone
+            exp_annotations:
+              summary: "Cleaning up a removed torrent in profile acct_a failed (tombstone); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
+      - eval_time: 20m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts: []
+
+  # The boot could not delete what a tombstone names: 2 at the first sample,
+  # flat. The boot gauge fires it, past the window, for that store only.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="torrent"}'
+        values: '2x40'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="torrent"}'
+        values: '2x40'
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="tombstone"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="tombstone"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              store: torrent
+            exp_annotations:
+              summary: "Cleaning up a removed torrent in profile acct_a failed (torrent); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
+      - eval_time: 30m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              store: torrent
+            exp_annotations:
+              summary: "Cleaning up a removed torrent in profile acct_a failed (torrent); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
 
   - interval: 1m
     input_series:
@@ -1429,6 +1514,43 @@ tests:
               severity: warning
             exp_annotations:
               summary: "Adopted torrents failed verification"
+
+  # An adoption the boot re-queued failed against an unmounted pool root
+  # before the first scrape: 1 at the first sample, flat. The boot gauge fires
+  # it, past the hour increase() would need.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_verify_failed_total'
+        values: '1x90'
+      - series: 'torrentd_boot_pool_verify_failed'
+        values: '1x90'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdPoolVerifyFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Adopted torrents failed verification"
+      - eval_time: 80m
+        alertname: TorrentdPoolVerifyFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Adopted torrents failed verification"
+
+  # A boot that failed none stays quiet while nothing fails.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_verify_failed_total'
+        values: '0x90'
+      - series: 'torrentd_boot_pool_verify_failed'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: TorrentdPoolVerifyFailed
+        exp_alerts: []
 
   # Work queued, nothing finishing either way: fires only once the counters
   # hold an hour of history with no completion, and that has lasted the `for:`
