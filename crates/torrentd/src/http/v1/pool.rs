@@ -292,9 +292,12 @@ pub struct PoolOverview {
     /// Library torrents by adoption state. A torrent never matched has no
     /// state and is in none of these.
     pub states: AdoptionCounts,
-    /// Adopted torrents waiting for a verification slot.
+    /// Adopted torrents, and re-hashes `POST /v1/pool/verifications` or
+    /// `POST /v1/torrents/{infohash}/recheck` queued, waiting for a
+    /// verification slot.
     pub verify_queue_depth: u32,
-    /// Adopted torrents libtorrent is hashing now.
+    /// Adopted torrents and queued re-hashes libtorrent is hashing now: at
+    /// most `[pool] max_concurrent_verify`.
     pub verify_in_flight: u32,
 }
 
@@ -1028,6 +1031,11 @@ from_profile_problem!(AdoptError);
 ///
 /// Not gated on `[pool] allow_mutations`: adoption records an existing file's
 /// ownership and moves nothing on disk.
+///
+/// The work has no deadline and the request answers once every target is
+/// adopted or refused: a large subtree, or a running scan holding the index,
+/// keeps it open for as long as that takes. Only the body has one: a body
+/// that has not arrived within 30 seconds is answered `408`.
 #[kynos::post("/pool/adoptions", tag = Pool)]
 pub async fn adopt_pool_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -1323,12 +1331,14 @@ impl Validate for VerifyRequest {
     }
 }
 
-/// Which re-hashes started.
+/// Which re-hashes were queued.
 #[derive(Debug, Schema, Serialize)]
 pub struct VerifyResult {
     /// How many infohashes the request named.
     pub requested: u32,
-    /// Torrents libtorrent is now re-hashing.
+    /// Torrents queued for a re-hash. Each starts once the verify queue has
+    /// a slot free: `[pool] max_concurrent_verify` bounds re-hashes and
+    /// adoptions' verifications together.
     pub started: Vec<InfoHashHex>,
     /// Torrents not re-hashed, each with the reason.
     pub skipped: Vec<RefusedTorrent>,
@@ -1358,21 +1368,27 @@ from_invalid!(VerifyError);
 ///
 /// Asks libtorrent to check each torrent's payload against its piece hashes
 /// (v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.
-/// `202` means the checks started; each torrent reports `checking` until it
-/// finishes. A torrent not loaded in any session, or paused (libtorrent does
-/// not hash a paused torrent), is skipped with the reason. Only a torrent in
-/// the pool index has its outcome recorded: a pass marks it `adopted`, a
-/// failure marks it `drifted` and pauses it.
+/// `202` means the checks are queued: the verify queue starts them as slots
+/// free up, at most `[pool] max_concurrent_verify` at once together with
+/// adoptions' verifications, and `GET /v1/pool` counts them in
+/// `verify_queue_depth` while they wait and `verify_in_flight` while they
+/// hash. Each torrent reports `checking` from when its check starts until it
+/// finishes. A torrent not loaded in any session, paused (libtorrent does not
+/// hash a paused torrent), or without metadata yet is skipped with the
+/// reason. The queue is held in memory: a restart drops the re-hashes that
+/// had not started. Only a torrent in the pool index has its outcome
+/// recorded: a pass marks it `adopted`, a failure marks it `drifted` and
+/// pauses it.
 #[kynos::post("/pool/verifications", tag = Pool)]
 pub async fn verify_pool_torrents(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Accepted<Json<VerifyResult>>, VerifyError> {
-    s.pool.as_ref().ok_or(VerifyError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(VerifyError::PoolNotConfigured)?;
     req.validate()?;
-    // On the blocking pool: each recheck takes its session's lock, and a
-    // request may name thousands of torrents.
+    // On the blocking pool: each torrent reads the pool index, and a request
+    // may name a thousand torrents.
     let resp = crate::http::v1::common::blocking(move || {
         let mut resp = VerifyResult {
             requested: count(req.infohashes.len()),
@@ -1389,9 +1405,10 @@ pub async fn verify_pool_torrents(
             };
             // A recheck resumes the torrent's network activity once it ends,
             // so a fenced or offline profile is skipped as resume-all skips
-            // it: its torrents wait for the operator to set it online.
-            let engine = match unfenced_engine(&s, &st.profile_id) {
-                Ok(engine) => engine,
+            // it: its torrents wait for the operator to set it online. The
+            // verify queue checks again when it starts the re-hash.
+            match unfenced_engine(&s, &st.profile_id) {
+                Ok(_) => {}
                 Err(crate::http::v1::common::ProfileProblem::Unavailable { detail, .. }) => {
                     skip(&mut resp, detail);
                     continue;
@@ -1400,7 +1417,7 @@ pub async fn verify_pool_torrents(
                     skip(&mut resp, "engine missing".to_owned());
                     continue;
                 }
-            };
+            }
             // libtorrent does not hash a paused torrent: the check waits for a
             // resume that nothing here issues, so reporting it started would
             // be false. A torrent paused by a failed verification is the
@@ -1415,27 +1432,27 @@ pub async fn verify_pool_torrents(
                 );
                 continue;
             }
-            // Tracked before it is asked for, so the check it starts finishes
-            // after the mark; the verify queue then records its outcome, which
-            // is what clears a drifted torrent or pauses one that failed.
-            // Only a torrent the pool index holds has an adoption to record:
-            // anything else is re-hashed and left alone, neither paused on a
-            // failure nor written into the index.
-            if let Some(pool) = s.pool.as_ref() {
-                let ih = infohash.to_string();
-                let indexed = pool.with_reader(|st| st.torrent(&ih).map(|t| t.is_some()));
-                match indexed {
-                    Ok(true) => pool.verify_queue().track_recheck(ih),
-                    Ok(false) => {}
-                    Err(e) => {
-                        skip(&mut resp, format!("pool index unreadable: {e}"));
-                        continue;
-                    }
-                }
+            // libtorrent has nothing to hash a magnet against until its
+            // metadata arrives, and ignores the request.
+            if st.phase == torrentd_engine::TorrentPhase::AwaitingMetadata {
+                skip(
+                    &mut resp,
+                    "no metadata yet, so there is nothing to hash against".to_owned(),
+                );
+                continue;
             }
-            match engine.force_recheck(st.handle) {
-                Ok(()) => resp.started.push(infohash),
-                Err(e) => skip(&mut resp, e.to_string()),
+            // The verify queue starts the re-hash once a slot is free, and
+            // records its outcome, which is what clears a drifted torrent or
+            // pauses one that failed. Only a torrent the pool index holds has
+            // an adoption to record: anything else is re-hashed and left
+            // alone, neither paused on a failure nor written into the index.
+            let ih = infohash.to_string();
+            match pool.with_reader(|st| st.torrent(&ih).map(|t| t.is_some())) {
+                Ok(indexed) => {
+                    pool.verify_queue().enqueue_recheck(ih, indexed);
+                    resp.started.push(infohash);
+                }
+                Err(e) => skip(&mut resp, format!("pool index unreadable: {e}")),
             }
         }
         resp
@@ -1455,11 +1472,11 @@ pub enum PlanKind {
     /// Move one torrent's payload to another directory under a managed root.
     Relocate,
     /// Delete every file under a subtree that no torrent claims, by moving it
-    /// into `<root>/.torrentd-trash/<plan id>/`. Refused where a torrent the
-    /// matcher could not fully place expects its files, and a file the size
-    /// of one the library is still missing is left out. Destructive: applying
-    /// it needs the plan's `confirm_token`, which changes whenever the pool is
-    /// rescanned.
+    /// into `<root>/.torrentd-trash/<plan id>-<created_at>/`, `created_at` in
+    /// unix seconds. Refused where a torrent the matcher could not fully place
+    /// expects its files, and a file the size of one the library is still
+    /// missing is left out. Destructive: applying it needs the plan's
+    /// `confirm_token`, which changes whenever the pool is rescanned.
     DeleteOrphans,
 }
 
@@ -1474,7 +1491,9 @@ pub enum PlanStatus {
     /// Every step is done.
     Applied,
     /// Applying stopped at a failed step. Applying it again retries from the
-    /// first step not done.
+    /// first step not done, unless a step is still `in_progress`: then every
+    /// apply refuses it, and the only way on is to rescan, discard it, and
+    /// build a new plan.
     Failed,
     /// Discarded without being applied.
     Cancelled,
@@ -1497,8 +1516,12 @@ pub enum StepOp {
 pub enum StepStatus {
     /// Not attempted.
     Pending,
-    /// Attempted and not finished. Found on a plan nothing is applying, it
-    /// means a run died mid-step and a human must inspect `src`.
+    /// Attempted and not finished. Found on a plan nothing is applying, its
+    /// outcome is unknown: a run died inside the batch of up to 64 delete
+    /// steps journalled with it, or a move's wait was cut off.
+    /// Nothing marks it resolved, so every apply refuses the plan; a human
+    /// inspects `src` (and `dst` for a move), rescans, discards the plan, and
+    /// builds a new one.
     InProgress,
     /// Done.
     Done,
@@ -1603,13 +1626,85 @@ pub struct Plan {
     pub created_at: jiff::Timestamp,
     /// When an apply last finished, successfully or not; `null` before.
     pub applied_at: Option<jiff::Timestamp>,
-    /// Every step, in the order an apply runs them.
+    /// How many steps the plan has, and how many stand in each status: the
+    /// plan's progress, whatever its size.
+    pub step_counts: StepCounts,
+    /// The plan's first steps, at most 100, in the order an apply runs them.
+    /// `GET /v1/pool/plans/{plan_id}/steps` pages through all of them.
     pub steps: Vec<PlanStep>,
+    /// Pass as `cursor` to `GET /v1/pool/plans/{plan_id}/steps` for the steps
+    /// after `steps`; `null` when `steps` holds every step.
+    pub steps_next_cursor: Option<String>,
     /// For a plan that deletes data, the token `POST …/apply` must repeat;
-    /// `null` for any other. Derived from the steps, so it names this plan and
-    /// no other.
+    /// `null` for any other. Derived from every step, so it names this plan
+    /// and no other.
     pub confirm_token: Option<String>,
 }
+
+/// How many of a plan's steps stand in each status.
+#[derive(Debug, Default, Schema, Serialize, PartialEq, Eq)]
+pub struct StepCounts {
+    /// Every step of the plan.
+    pub total: u64,
+    /// Not attempted.
+    pub pending: u64,
+    /// Attempted and not finished.
+    pub in_progress: u64,
+    /// Done.
+    pub done: u64,
+    /// Failed.
+    pub failed: u64,
+    /// Not attempted, deliberately.
+    pub skipped: u64,
+}
+
+impl StepCounts {
+    /// The counts of `rows`, `(status, count)` pairs as the pool index holds
+    /// them.
+    fn of(rows: Vec<(String, u64)>) -> Result<Self, String> {
+        let mut c = Self::default();
+        for (status, n) in rows {
+            let slot =
+                match StepStatus::parse(&status).ok_or_else(|| unknown("step status", &status))? {
+                    StepStatus::Pending => &mut c.pending,
+                    StepStatus::InProgress => &mut c.in_progress,
+                    StepStatus::Done => &mut c.done,
+                    StepStatus::Failed => &mut c.failed,
+                    StepStatus::Skipped => &mut c.skipped,
+                };
+            *slot += n;
+            c.total += n;
+        }
+        Ok(c)
+    }
+}
+
+/// Steps a plan carries inline; the rest are paged from its steps listing.
+const PLAN_STEPS_INLINE: usize = crate::http::page::DEFAULT_LIMIT as usize;
+
+/// The cursor listing of plan `id`'s steps. It names the plan, so a cursor
+/// from one plan's steps is refused on another's.
+fn plan_steps_listing(id: i64) -> String {
+    format!("pool-plan-steps-{id}")
+}
+
+/// A step row as the API shows it.
+fn step_of(s: torrentd_pool::model::PlanStepRow) -> Result<PlanStep, String> {
+    Ok(PlanStep {
+        op: StepOp::parse(&s.op).ok_or_else(|| unknown("step op", &s.op))?,
+        status: StepStatus::parse(&s.status).ok_or_else(|| unknown("step status", &s.status))?,
+        seq: s.seq,
+        src: s.src,
+        dst: s.dst,
+        error: s.error,
+    })
+}
+
+page!(
+    /// One page of a plan's steps, in the order an apply runs them.
+    PlanStepPage,
+    PlanStep
+);
 
 /// A plan without its steps, as a listing carries it.
 #[derive(Debug, Schema, Serialize)]
@@ -1650,10 +1745,12 @@ fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, String> 
 ///
 /// `Err` is the `detail` of a `500 internal`.
 ///
-/// Read on the read connection, in one snapshot, so the steps and the
-/// generation its confirm token binds are the same commit's; a plan written
-/// on the writer is visible once it commits. Blocking: call it on the
-/// blocking pool.
+/// Read on the read connection, in one snapshot, so the counts, the inline
+/// steps, and the generation its confirm token binds are the same commit's; a
+/// plan written on the writer is visible once it commits. The body carries
+/// [`PLAN_STEPS_INLINE`] steps at most, whatever the plan's size; only a
+/// plan that deletes data reads every step, to derive its token, and none
+/// of them reaches the body. Blocking: call it on the blocking pool.
 fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
     let fail = |e: torrentd_pool::PoolError| internal("reading a plan", e);
     let read = pool
@@ -1661,36 +1758,47 @@ fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
             let Some(row) = st.plan(id)? else {
                 return Ok(None);
             };
-            Ok(Some((row, st.plan_steps(id)?, st.index_generation()?)))
+            let head = st.plan_steps_page(id, None, PLAN_STEPS_INLINE + 1)?;
+            let counts = st.plan_step_counts(id)?;
+            let token = if torrentd_pool::plan::is_destructive(&row.kind) {
+                let generation = st.index_generation()?;
+                Some(torrentd_pool::plan::confirm_token(
+                    id,
+                    generation,
+                    &st.plan_steps(id)?,
+                ))
+            } else {
+                None
+            };
+            Ok(Some((row, head, counts, token)))
         })
         .map_err(fail)?;
-    let Some((row, steps, generation)) = read else {
+    let Some((row, head, counts, confirm_token)) = read else {
         return Ok(None);
     };
-    let confirm_token = torrentd_pool::plan::is_destructive(&row.kind)
-        .then(|| torrentd_pool::plan::confirm_token(id, generation, &steps));
     let summary = summary_of(&row)?;
-    let steps = steps
+    let head = head
         .into_iter()
-        .map(|s| {
-            Ok(PlanStep {
-                op: StepOp::parse(&s.op).ok_or_else(|| unknown("step op", &s.op))?,
-                status: StepStatus::parse(&s.status)
-                    .ok_or_else(|| unknown("step status", &s.status))?,
-                seq: s.seq,
-                src: s.src,
-                dst: s.dst,
-                error: s.error,
-            })
-        })
+        .map(step_of)
         .collect::<Result<Vec<_>, String>>()?;
+    let (steps, steps_next_cursor) = paginate(
+        &plan_steps_listing(id),
+        head,
+        |s: &PlanStep| plan_key(s.seq),
+        &PageRequest {
+            after: None,
+            limit: PLAN_STEPS_INLINE,
+        },
+    );
     Ok(Some(Plan {
         id: summary.id,
         kind: summary.kind,
         status: summary.status,
         created_at: summary.created_at,
         applied_at: summary.applied_at,
+        step_counts: StepCounts::of(counts)?,
         steps,
+        steps_next_cursor,
         confirm_token,
     }))
 }
@@ -1744,7 +1852,8 @@ pub async fn list_plans(
     Ok(Json(PlanPage { items, next_cursor }))
 }
 
-/// A plan id as a cursor key: zero-padded, so byte order is numeric order.
+/// A plan id, or a step's `seq`, as a cursor key: zero-padded, so byte order
+/// is numeric order.
 fn plan_key(id: i64) -> String {
     format!("{id:0PLAN_KEY_WIDTH$}")
 }
@@ -1829,6 +1938,10 @@ pub enum CreatePlanError {
 /// Refused with `403 mutations-disabled` unless `[pool] allow_mutations` is
 /// set. Creating a plan touches nothing, but a plan that can never be applied
 /// is a trap, and refusing where the operator asks is the clearer signal.
+///
+/// The work has no deadline: the plan is written to the index, so it waits
+/// for a running scan to finish before it answers. Only the body has one: a
+/// body that has not arrived within 30 seconds is answered `408`.
 #[kynos::post("/pool/plans", tag = Pool)]
 pub async fn create_plan(
     _caller: Scoped<Bearer, Write>,
@@ -1878,7 +1991,7 @@ fn create_plan_blocking(
         target: "torrentd::http::pool",
         plan_id = id,
         kind = %kind,
-        step_count = plan.steps.len(),
+        step_count = plan.step_counts.total,
         "plan created (nothing applied)",
     );
     Ok(Created::at(
@@ -1912,8 +2025,10 @@ pub enum GetPlanError {
 
 /// Describe a mutation plan.
 ///
-/// Its status, every step with where it stands, and — for a plan that deletes
-/// data — the confirm token applying it needs.
+/// Its status, how many steps stand in each status, its first 100 steps, and
+/// — for a plan that deletes data — the confirm token applying it needs. The
+/// body is bounded whatever the plan's size; `GET …/steps` pages through
+/// every step.
 #[kynos::get("/pool/plans/{plan_id}", tag = Pool)]
 pub async fn get_plan(
     _caller: Scoped<Bearer, Read>,
@@ -1926,6 +2041,119 @@ pub async fn get_plan(
         .map_err(|detail| GetPlanError::Internal { detail })?
         .map(Json)
         .ok_or(GetPlanError::PlanNotFound)
+}
+
+/// Why a plan's steps could not be listed.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum ListPlanStepsError {
+    /// The cursor is not one this plan's steps listing issued.
+    #[error("the cursor is not one this listing issued; start again without one")]
+    #[problem(status = 400, title = "Invalid cursor")]
+    InvalidCursor,
+    /// The daemon has no `[pool]` section.
+    #[error("{NO_POOL}")]
+    #[problem(status = 404, title = "The pool is not configured")]
+    PoolNotConfigured,
+    /// No plan has this id.
+    #[error("no such plan")]
+    #[problem(status = 404, title = "Plan not found")]
+    PlanNotFound,
+    /// A query parameter breaks a documented constraint.
+    #[error("{summary}")]
+    #[problem(status = 422, title = "The request is invalid")]
+    ValidationFailed {
+        summary: String,
+        /// Every violated constraint.
+        #[problem(extension)]
+        errors: serde_json::Value,
+    },
+    /// The pool index failed; the daemon's log has the cause.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
+}
+from_invalid!(ListPlanStepsError);
+
+impl From<InvalidCursor> for ListPlanStepsError {
+    fn from(_: InvalidCursor) -> Self {
+        Self::InvalidCursor
+    }
+}
+
+/// Which page of a plan's steps.
+#[derive(Schema, QueryParams)]
+pub struct PlanStepQuery {
+    /// Resume after the last step of the previous page, or after a plan's
+    /// inline `steps`, with its `steps_next_cursor`.
+    pub cursor: Option<String>,
+    /// Steps per page; 100 when absent.
+    #[schema(minimum = 1, maximum = 1000)]
+    pub limit: Option<PageLimit>,
+}
+
+/// List a mutation plan's steps.
+///
+/// Every step with where it stands, in the order an apply runs them, a page
+/// at a time: a plan over a large subtree has a step per file. A cursor is
+/// bound to its plan, and refused on another's steps.
+#[kynos::get("/pool/plans/{plan_id}/steps", tag = Pool)]
+pub async fn list_plan_steps(
+    _caller: Scoped<Bearer, Read>,
+    Inject(s): Inject<Arc<AppState>>,
+    Path(p): Path<PlanPath>,
+    Query(q): Query<PlanStepQuery>,
+) -> Result<Json<PlanStepPage>, ListPlanStepsError> {
+    let pool = s
+        .pool
+        .clone()
+        .ok_or(ListPlanStepsError::PoolNotConfigured)?;
+    let id = p.plan_id;
+    let listing = plan_steps_listing(id);
+    let mut invalid = Invalid::new();
+    let page = PageRequest::parse(
+        &listing,
+        q.cursor.as_deref(),
+        q.limit.map(PageLimit::get),
+        |key| crate::http::page::is_padded_decimal(key, PLAN_KEY_WIDTH),
+        &mut invalid,
+    )?;
+    invalid.finish()?;
+    let after = page
+        .after
+        .as_deref()
+        .map(|k| {
+            k.parse::<i64>()
+                .map_err(|_| ListPlanStepsError::InvalidCursor)
+        })
+        .transpose()?;
+    // `limit + 1` rows off the primary key, on the read connection: one page
+    // whatever the plan's size, and never waiting for a scan.
+    let limit = page.limit;
+    let rows = blocking(move || {
+        pool.with_reader(|st| -> Result<_, torrentd_pool::PoolError> {
+            if st.plan(id)?.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(st.plan_steps_page(
+                id,
+                after,
+                limit.saturating_add(1),
+            )?))
+        })
+    })
+    .await
+    .map_err(|e| ListPlanStepsError::Internal {
+        detail: internal("listing a plan's steps", e),
+    })?
+    .ok_or(ListPlanStepsError::PlanNotFound)?;
+    let items = rows
+        .into_iter()
+        .map(step_of)
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|detail| ListPlanStepsError::Internal { detail })?;
+    let (items, next_cursor) = paginate(&listing, items, |s: &PlanStep| plan_key(s.seq), &page);
+    Ok(Json(PlanStepPage { items, next_cursor }))
 }
 
 /// Why a plan was not discarded.
@@ -2048,7 +2276,10 @@ pub enum ApplyPlanError {
 /// Whether a plan in `status` can be claimed for an apply.
 ///
 /// `failed` can: applying again retries from the first step not done, which is
-/// how an operator continues after fixing what stopped it.
+/// how an operator continues after fixing what stopped it. A `failed` plan
+/// with a step still `in_progress` is claimable here but refused by the
+/// executor on every apply; it can only be discarded and rebuilt after a
+/// rescan.
 fn applicable(status: PlanStatus) -> bool {
     matches!(status, PlanStatus::Draft | PlanStatus::Failed)
 }
@@ -2059,7 +2290,10 @@ fn applicable(status: PlanStatus) -> bool {
 /// large delete or a cross-device move can run for minutes. Each step is
 /// journalled before it is attempted, and applying stops at the first failure
 /// — answering `200` with `status: failed` and the plan's steps saying which
-/// and why. A `failed` plan can be applied again to retry.
+/// and why. A `failed` plan can be applied again to retry, unless a step is
+/// still `in_progress`: its outcome is unknown, nothing marks it resolved, and
+/// every apply refuses the plan with `409`. Rescan, discard the plan, and
+/// build a new one.
 ///
 /// A plan that deletes data applies only with its `confirm_token`: not a
 /// security control, but a guard against applying the wrong plan id. Refused
@@ -2178,6 +2412,7 @@ macro_rules! bodyless_routes {
             crate::http::v1::pool::check_pool_drift,
             crate::http::v1::pool::list_plans,
             crate::http::v1::pool::get_plan,
+            crate::http::v1::pool::list_plan_steps,
             crate::http::v1::pool::delete_plan,
         ])
     };
@@ -2188,20 +2423,24 @@ pub(crate) use bodyless_routes;
 /// bounded by `REQUEST_DEADLINE`.
 macro_rules! body_routes {
     ($group:expr) => {
-        $group.mount(kynos::routes![
-            crate::http::v1::pool::adopt_pool_torrents,
-            crate::http::v1::pool::verify_pool_torrents,
-            crate::http::v1::pool::create_plan,
-        ])
+        $group.mount(kynos::routes![crate::http::v1::pool::verify_pool_torrents,])
     };
 }
 pub(crate) use body_routes;
 
 /// Operations whose body is bounded by `MAX_BODY_BYTES` and that may run for
-/// minutes, so carry no deadline: applying a plan waits for every step.
+/// minutes, so carry no deadline on their handler: applying a plan waits for
+/// every step, and adopting or creating a plan waits on the index's writer,
+/// which a scan holds for its whole run. Cut off by a deadline, each would
+/// answer `408` and then run to completion anyway, its outcome lost to the
+/// client. Their body still has to arrive within `BODY_DEADLINE`.
 macro_rules! long_body_routes {
     ($group:expr) => {
-        $group.mount(kynos::routes![crate::http::v1::pool::apply_plan])
+        $group.mount(kynos::routes![
+            crate::http::v1::pool::adopt_pool_torrents,
+            crate::http::v1::pool::create_plan,
+            crate::http::v1::pool::apply_plan,
+        ])
     };
 }
 pub(crate) use long_body_routes;

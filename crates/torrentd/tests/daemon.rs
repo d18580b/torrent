@@ -19,19 +19,35 @@ use std::time::Instant;
 /// Minimal blocking HTTP/1.1 client: sends `Connection: close` and reads the
 /// whole response to EOF. Returns `(status, body)`.
 fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    http_as(addr, method, path, body, "localhost")
+}
+
+/// As [`http`], naming `host` as the request's `Host`.
+fn http_as(addr: &str, method: &str, path: &str, body: Option<&str>, host: &str) -> (u16, String) {
+    try_http_as(addr, method, path, body, host)
+        .unwrap_or_else(|e| panic!("{method} {path} on {addr}: {e}"))
+}
+
+/// As [`http_as`], returning a failure to connect, write or read instead of
+/// panicking on it.
+fn try_http_as(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    host: &str,
+) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let body = body.unwrap_or("");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(req.as_bytes())?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).unwrap();
+    stream.read_to_end(&mut buf)?;
     let resp = String::from_utf8_lossy(&buf);
     let status = resp
         .lines()
@@ -44,7 +60,7 @@ fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, Strin
         .map(|(_, b)| b)
         .unwrap_or("")
         .to_string();
-    (status, body)
+    Ok((status, body))
 }
 
 /// The `POST /v1/torrents` body adding `magnet` to the test profile.
@@ -55,14 +71,74 @@ fn add_magnet(magnet: &str) -> String {
 }
 
 fn wait_healthy(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() && http(addr, "GET", "/healthz", None).0 == 200 {
-            return;
+    wait_healthy_within(addr, Duration::from_secs(30));
+}
+
+/// As [`wait_healthy`], with a boot deadline of `budget`. The panic names the
+/// last `/healthz` answer, or the error that kept one from arriving, so a boot
+/// that never came up says whether nothing listened or what it answered.
+fn wait_healthy_within(addr: &str, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    let last = loop {
+        let last = match try_http_as(addr, "GET", "/healthz", None, "localhost") {
+            Ok((200, _)) => return,
+            Ok((status, body)) => format!("the last /healthz answered {status}: {body}"),
+            Err(e) => format!("the last /healthz attempt failed: {e}"),
+        };
+        if Instant::now() >= deadline {
+            break last;
         }
         std::thread::sleep(Duration::from_millis(200));
+    };
+    panic!("daemon on {addr} did not become healthy within {budget:?}; {last}");
+}
+
+/// The daemon's stdout and stderr, written to `daemon.log` in a test's
+/// tempdir, whose tail is printed if the test panics.
+///
+/// The daemon logs to stdout, so a test that discarded it lost the reason a
+/// boot failed. Declare the guard before the child it captures, so the child
+/// is killed first and the log is complete when it is read, and after the
+/// tempdir, so the file is still there.
+struct DaemonLog(std::path::PathBuf);
+
+impl DaemonLog {
+    /// Lines of the log printed on a panic.
+    const TAIL: usize = 200;
+
+    fn new(dir: &std::path::Path) -> Self {
+        let path = dir.join("daemon.log");
+        std::fs::File::create(&path).expect("create daemon.log");
+        Self(path)
     }
-    panic!("daemon did not become healthy within 30s");
+
+    /// A handle for the child's stdout or stderr. Opened for append, so the
+    /// two streams interleave rather than overwrite each other.
+    fn stdio(&self) -> std::process::Stdio {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.0)
+            .expect("open daemon.log")
+            .into()
+    }
+}
+
+impl Drop for DaemonLog {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let text = std::fs::read_to_string(&self.0)
+            .unwrap_or_else(|e| format!("<could not read {}: {e}>", self.0.display()));
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(Self::TAIL)..];
+        eprintln!(
+            "--- the last {} of {} lines of the daemon's output ---\n{}\n--- end of the daemon's output ---",
+            tail.len(),
+            lines.len(),
+            tail.join("\n")
+        );
+    }
 }
 
 /// The profile every torrent in these tests belongs to.
@@ -209,6 +285,49 @@ fn daemon_end_to_end() {
     assert!(
         p.join(format!("session_state-{PROFILE}.dat")).exists(),
         "a dht profile's session state should be written on SIGTERM"
+    );
+}
+
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_configured_allowed_host_is_answered_and_another_is_refused() {
+    // The router tests set the allowlist on the state they build; this holds
+    // the path from the config file to the running daemon's gate.
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    let body = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("allowed_hosts = [\"torrentd.example.com\"]\n{body}"),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+
+    wait_healthy(addr);
+
+    for host in ["torrentd.example.com", "torrentd.example.com:8443"] {
+        let (code, body) = http_as(addr, "GET", "/v1/torrents", None, host);
+        assert_eq!(code, 200, "GET with Host {host}: {body}");
+        let (code, body) = http_as(addr, "POST", "/v1/torrents/pause-all", None, host);
+        assert!(
+            (200..300).contains(&code),
+            "POST with Host {host}: {code} {body}"
+        );
+    }
+    let (code, body) = http_as(addr, "GET", "/v1/torrents", None, "attacker.example");
+    assert_eq!(code, 403, "a Host not in allowed_hosts: {body}");
+
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
     );
 }
 
@@ -799,18 +918,18 @@ fn a_config_that_fails_to_load_exits_ex_config() {
 
     // An operator subcommand is not the daemon: `vpn check` documents only
     // 0/1/2, and a config it cannot load is its 1.
-    let status = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+    let out = Command::new(env!("CARGO_BIN_EXE_torrentd"))
         .arg("--config")
         .arg(&cfg)
         .args(["vpn", "check"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .expect("spawn torrentd vpn check");
     assert_eq!(
-        status.code(),
+        out.status.code(),
         Some(1),
-        "vpn check on a config that fails to load"
+        "vpn check on a config that fails to load; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -1204,6 +1323,313 @@ fn the_boot_scans_hold_every_torrent_to_the_profiles_tracker_domains() {
         }),
         "three refusals should be counted:\n{metrics}"
     );
+    // They are the boot's, already in the counter's first sample, where
+    // increase() cannot see them; the boot gauge holds them for the alert.
+    let boot = format!("torrentd_boot_registry_errors{{profile_id=\"{PROFILE}\"}} 3");
+    assert!(
+        metrics.lines().any(|l| l == boot),
+        "the boot's refusals should be exported as {boot}:\n{metrics}"
+    );
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+}
+
+/// Issue #186's acceptance: a torrent added through `POST /v1/torrents` whose
+/// resume file is lost is re-added at the save path recorded beside its
+/// `.torrent`, not left unloaded.
+///
+/// The add claims the info-hash before it loads, and the claim outlives the
+/// resume file. The torrent-dir scan used to skip every claimed info-hash,
+/// so the torrent came back in no session, counted as one the registry
+/// claims and the scans did not load.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_claimed_torrent_with_no_resume_file_is_re_added_at_its_recorded_save_path() {
+    boot_a_claimed_torrent_with_no_resume_file(false);
+}
+
+/// The other side of #186's re-add: a claimed torrent with no resume file
+/// that the pool index records `drifted` failed its verification and was
+/// paused for it, so the torrent-dir scan leaves it unloaded rather than
+/// re-add it in seed mode, announcing a payload its piece hashes rejected.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_claimed_torrent_the_pool_records_drifted_is_not_re_added_with_no_resume_file() {
+    boot_a_claimed_torrent_with_no_resume_file(true);
+}
+
+/// Add a torrent through the API, stop the daemon, remove its resume file,
+/// and boot again; with `drifted`, also record it `drifted` in `pool.db`
+/// first. Asserts it is re-added at its recorded save path, or with
+/// `drifted` that it is left unloaded.
+fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
+    use base64::Engine as _;
+
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    let pool_db = p.join("pool.db");
+    if drifted {
+        let (root, library) = (p.join("root"), p.join("library"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&library).unwrap();
+        let mut text = std::fs::read_to_string(&cfg).unwrap();
+        text.push_str(&format!(
+            "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\ndb_path = \"{}\"\n",
+            root.display(),
+            library.display(),
+            pool_db.display(),
+        ));
+        std::fs::write(&cfg, text).unwrap();
+    }
+    // Inside `default_save_path`, as an API add requires, and not it, so a
+    // fallback to `default_save_path` shows.
+    let recorded = p.join("data").join("elsewhere");
+    std::fs::create_dir_all(&recorded).unwrap();
+    let torrent = metainfo("lost_resume", "http://tracker.example/announce");
+    let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+        .unwrap()
+        .to_hex();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        let child = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_torrentd"))
+                .arg("--config")
+                .arg(&cfg)
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        wait_healthy(addr);
+        child
+    };
+    let session_save_path = |ih: &str| -> Option<String> {
+        let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+        if code != 200 {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["session"]["save_path"].as_str().map(str::to_owned)
+    };
+
+    let mut child = spawn();
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/torrents",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"save_path\":\"{}\",\"source\":{{\"kind\":\
+             \"metainfo\",\"data\":\"{}\"}}}}",
+            recorded.display(),
+            base64::engine::general_purpose::STANDARD.encode(&torrent),
+        )),
+    );
+    assert_eq!(code, 201, "{body}");
+    assert_eq!(
+        session_name(addr, &ih, Duration::from_secs(30)).as_deref(),
+        Some("lost_resume"),
+        "the added torrent never loaded",
+    );
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+
+    // What a crash before the first save, or an unreadable resume file,
+    // leaves: the claim, the `.torrent` and its recorded save path.
+    let torrents = p.join("torrents").join(PROFILE);
+    assert!(torrents.join(format!("{ih}.torrent")).exists());
+    assert!(torrents.join(format!("{ih}.save_path")).exists());
+    let resume = p.join("resume").join(PROFILE).join(format!("{ih}.resume"));
+    if resume.exists() {
+        std::fs::remove_file(&resume).unwrap();
+    }
+    if drifted {
+        // What a failed verification records (`record_verify_outcome`).
+        let store = torrentd_pool::PoolStore::open(&pool_db).unwrap();
+        store
+            .upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.clone(),
+                    infohash_v1: Some(ih.clone()),
+                    infohash_v2: None,
+                    name: "lost_resume".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: torrents.join(format!("{ih}.torrent")),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: Vec::new(),
+                    profile: Some(PROFILE.into()),
+                },
+                0,
+            )
+            .unwrap();
+        store
+            .set_adoption(
+                &ih,
+                torrentd_pool::AdoptionState::Drifted,
+                None,
+                None,
+                None,
+                Some(1),
+                Some("verification failed"),
+            )
+            .unwrap();
+    }
+
+    let mut child = spawn();
+    if drifted {
+        // The gauge is set once both scans have run.
+        let unloaded =
+            format!("torrentd_profile_unloaded_registry_torrents{{profile_id=\"{PROFILE}\"}} 1");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (_, metrics) = http(addr, "GET", "/metrics", None);
+            if metrics.lines().any(|l| l == unloaded) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the drifted torrent was not counted unloaded:\n{metrics}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(
+            session_name(addr, &ih, Duration::from_secs(2)),
+            None,
+            "a torrent the pool records drifted was re-added",
+        );
+        sigterm(&child.0);
+        assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+        return;
+    }
+    assert_eq!(
+        session_name(addr, &ih, Duration::from_secs(30)).as_deref(),
+        Some("lost_resume"),
+        "the torrent with no resume file was left unloaded",
+    );
+    assert_eq!(
+        session_save_path(&ih).as_deref(),
+        Some(recorded.to_str().unwrap()),
+        "re-added somewhere other than its recorded save path",
+    );
+    let (code, metrics) = http(addr, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    for (series, what) in [
+        (
+            "torrentd_profile_unloaded_registry_torrents{",
+            "counted as a claim the scans did not load",
+        ),
+        (
+            "torrentd_boot_save_path_fallbacks_total{",
+            "re-added at default_save_path",
+        ),
+        (
+            "torrentd_profile_assignment_registry_errors_total{",
+            "counted as a registry error",
+        ),
+    ] {
+        assert!(
+            !metrics.lines().any(|l| l.starts_with(series)
+                && l.contains(&format!("profile_id=\"{PROFILE}\""))
+                && !l.ends_with(" 0")),
+            "{what}:\n{metrics}"
+        );
+    }
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
+
+/// Issue #354's regression: a plain `DELETE` of a torrent the boot left
+/// unloaded because its resume add failed keeps its resume file, which is
+/// what the next boot loads it from, and refuses with `torrent-unloaded`
+/// naming it.
+///
+/// The resume file has no info-hash, so libtorrent refuses the add, as it
+/// does a save path on a disk not mounted yet: the resume scan claims the
+/// info-hash, the add fails, and the claim stays with nothing loaded. The
+/// `DELETE` the "After a crash" runbook runs over every unloaded claim used to
+/// answer `204` and delete the resume file with the claim.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_plain_delete_of_a_torrent_whose_resume_add_failed_keeps_its_resume_file() {
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    let ih = "cd".repeat(20);
+    let resume_dir = p.join("resume").join(PROFILE);
+    std::fs::create_dir_all(&resume_dir).unwrap();
+    let resume = resume_dir.join(format!("{ih}.resume"));
+    let bytes = b"d11:file-format22:libtorrent resume file12:file-versioni1ee".to_vec();
+    std::fs::write(&resume, &bytes).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+    wait_healthy(addr);
+
+    // Both are set once the scans have run.
+    let series = [
+        format!("torrentd_boot_torrent_load_failures{{profile_id=\"{PROFILE}\",source=\"resume_add\"}} 1"),
+        format!("torrentd_profile_unloaded_registry_torrents{{profile_id=\"{PROFILE}\"}} 1"),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, metrics) = http(addr, "GET", "/metrics", None);
+        if series.iter().all(|s| metrics.lines().any(|l| l == s)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed resume add was not counted as {series:?}:\n{metrics}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 409, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        problem["type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("#torrent-unloaded")),
+        "{body}"
+    );
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains(&format!("{ih}.resume"))),
+        "the refusal does not name the resume file: {body}"
+    );
+    assert_eq!(
+        std::fs::read(&resume).ok(),
+        Some(bytes.clone()),
+        "the refused delete touched the resume file"
+    );
+    let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 200, "the refused delete cleared the claim: {body}");
+
+    // Retiring it anyway: with the file moved out of the store, the claim has
+    // nothing behind it and the delete clears it.
+    let kept = p.join("kept.resume");
+    std::fs::rename(&resume, &kept).unwrap();
+    let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 204, "{body}");
+    let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+    assert_eq!(code, 404, "{body}");
+    assert_eq!(std::fs::read(&kept).ok(), Some(bytes));
 
     sigterm(&child);
     assert!(wait_exit(&mut child, Duration::from_secs(30)));
@@ -1314,6 +1740,9 @@ fn a_million_file_scan_leaves_the_daemon_responsive() {
             let _ = self.0.wait();
         }
     }
+    // Its output, printed if anything below panics: declared before `child`,
+    // so it is read once the daemon is dead.
+    let log = DaemonLog::new(p);
     let mut child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_torrentd"))
             .arg("--config")
@@ -1321,11 +1750,15 @@ fn a_million_file_scan_leaves_the_daemon_responsive() {
             .env("NOTIFY_SOCKET", &sock_path)
             .env("WATCHDOG_USEC", WATCHDOG_USEC.to_string())
             .env_remove("WATCHDOG_PID")
-            .stdout(std::process::Stdio::null())
+            .stdout(log.stdio())
+            .stderr(log.stdio())
             .spawn()
             .expect("spawn daemon"),
     );
-    wait_healthy(addr);
+    // A longer boot deadline than the other tests': this one boots while the
+    // rest of Layer 3 starts its own daemons and libtorrent sessions on the
+    // same runner, and 30s once proved too little on CI (issue #359).
+    wait_healthy_within(addr, Duration::from_secs(120));
 
     // The library alone, so the index the second scan replaces holds it.
     let (code, body) = http_within(addr, "POST", "/v1/pool/scan", Duration::from_secs(600));
@@ -1593,6 +2026,128 @@ fn torrent_phase(addr: &str, ih: &str) -> Option<String> {
     v["phase"].as_str().map(str::to_owned)
 }
 
+/// Issue #215's acceptance: a `.torrent` added over the API, or found in the
+/// profile's `torrent_dir` at boot, is hash-checked before it seeds.
+///
+/// Both paths used to add in libtorrent's seed mode, which assumes every
+/// piece is correct and checks no more than file sizes, so a torrent whose
+/// payload was the right length but not yet written reported `seeding` and
+/// announced itself complete until a peer's request failed a piece. Here a
+/// complete payload still reaches `seeding`; an absent, a truncated and an
+/// unwritten one over the API, and an unwritten one from the torrent-dir
+/// scan, settle `incomplete` and are never `seeding`.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn an_add_whose_payload_is_absent_or_wrong_is_never_reported_seeding() {
+    use base64::Engine as _;
+    use sha1::Digest;
+
+    // A one-file, one-piece `.torrent` named `name` over `payload`.
+    let torrent = |name: &str, payload: &[u8]| {
+        let mut t = format!(
+            "d4:infod6:lengthi{}e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+            payload.len(),
+            name.len()
+        )
+        .into_bytes();
+        t.extend_from_slice(&sha1::Sha1::digest(payload));
+        t.extend_from_slice(b"ee");
+        t
+    };
+    let hex = |t: &[u8]| libtorrent_safe::info_hash_from_torrent(t).unwrap().to_hex();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let data = p.join("data");
+    let complete = torrent("complete", b"xy");
+    std::fs::write(data.join("complete"), b"xy").unwrap();
+    let absent = torrent("absent", b"xy");
+    let truncated = torrent("truncated", b"xy");
+    std::fs::write(data.join("truncated"), b"x").unwrap();
+    // Full length, wrong bytes: a copy still in flight into a preallocated
+    // file. A size check passes it, and only hashing finds it out.
+    let unwritten = torrent("unwritten", b"xy");
+    std::fs::write(data.join("unwritten"), [0u8; 2]).unwrap();
+    let dir_unwritten = torrent("dir_unwritten", b"xy");
+    std::fs::write(data.join("dir_unwritten"), [0u8; 2]).unwrap();
+    let torrents = p.join("torrents").join(PROFILE);
+    std::fs::create_dir_all(&torrents).unwrap();
+    std::fs::write(
+        torrents.join(format!("{}.torrent", hex(&dir_unwritten))),
+        &dir_unwritten,
+    )
+    .unwrap();
+
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    for t in [&complete, &absent, &truncated, &unwritten] {
+        let (code, body) = http(
+            addr,
+            "POST",
+            "/v1/torrents",
+            Some(&format!(
+                "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"metainfo\",\
+                 \"data\":\"{}\"}}}}",
+                base64::engine::general_purpose::STANDARD.encode(t),
+            )),
+        );
+        assert_eq!(code, 201, "{body}");
+    }
+
+    let unverifiable = [
+        ("absent", hex(&absent)),
+        ("truncated", hex(&truncated)),
+        ("unwritten", hex(&unwritten)),
+        ("dir_unwritten", hex(&dir_unwritten)),
+    ];
+    let complete = hex(&complete);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut settled = torrent_phase(addr, &complete).as_deref() == Some("seeding");
+        for (name, ih) in &unverifiable {
+            let phase = torrent_phase(addr, ih);
+            assert_ne!(
+                phase.as_deref(),
+                Some("seeding"),
+                "{name}: reported seeding with its payload unverifiable",
+            );
+            settled &= phase.as_deref() == Some("incomplete");
+        }
+        if settled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not settled within 60s: complete {:?}, {:?}",
+            torrent_phase(addr, &complete),
+            unverifiable
+                .iter()
+                .map(|(name, ih)| (name, torrent_phase(addr, ih)))
+                .collect::<Vec<_>>(),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
+
 /// The adoption state `GET /v1/pool/torrents` reports for `ih`.
 fn pool_state(addr: &str, ih: &str) -> Option<String> {
     let (code, body) = http(addr, "GET", "/v1/pool/torrents?limit=1000", None);
@@ -1726,6 +2281,552 @@ fn a_restart_while_an_adoption_hashes_still_records_its_verdict() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Issue #192's acceptance: `delete_files` refuses a payload another loaded
+/// torrent has files at, however that torrent was added.
+///
+/// T1 is adopted from the pool into one profile, so the index records it
+/// claiming the file. T2 — the same file, another infohash, as a cross-seed
+/// tool would add it — goes through `POST /v1/torrents` into a second
+/// profile with a `save_path` over the same directory, and claims nothing.
+/// The co-claimant check reads the index alone, so it used to find nobody
+/// sharing T1's payload and move the file T2 was serving into the trash.
+/// The delete has to be refused, and the file left where T2 reads it; once
+/// T2 is gone, the same delete goes through.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn delete_files_refuses_a_payload_a_torrent_added_over_it_still_serves() {
+    use base64::Engine as _;
+    use sha1::Digest;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let file = root.join("a");
+    std::fs::write(&file, b"x").unwrap();
+    // One file, `a`, whose piece hash the payload matches. T2 differs only by
+    // a `source` key in its info dict, which changes the infohash and
+    // nothing about the files.
+    let torrent = |source: &str| {
+        let mut t = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        t.extend_from_slice(&sha1::Sha1::digest(b"x"));
+        if !source.is_empty() {
+            t.extend_from_slice(format!("6:source{}:{source}", source.len()).as_bytes());
+        }
+        t.extend_from_slice(b"ee");
+        t
+    };
+    let (t1, t2) = (torrent(""), torrent("cross-seed"));
+    std::fs::write(library.join("t1.torrent"), &t1).unwrap();
+    let hex = |t: &[u8]| libtorrent_safe::info_hash_from_torrent(t).unwrap().to_hex();
+    let (ih1, ih2) = (hex(&t1), hex(&t2));
+    assert_ne!(ih1, ih2);
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[[profile]]\nid = \"cross\"\nnetwork = \"host\"\n\
+         listen_interfaces = \"127.0.0.1:{}\"\n\
+         \n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\nallow_mutations = true\n",
+        free_port(),
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    let (code, body) = http(addr, "POST", "/v1/pool/scan", None);
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/pool/adoptions",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"selector\":{{\"kind\":\"infohashes\",\
+             \"infohashes\":[\"{ih1}\"]}}}}"
+        )),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        session_name(addr, &ih1, Duration::from_secs(30)).as_deref(),
+        Some("a"),
+        "the adopted torrent never loaded",
+    );
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/torrents",
+        Some(&format!(
+            "{{\"profile_id\":\"cross\",\"save_path\":\"{}\",\"source\":{{\"kind\":\
+             \"metainfo\",\"data\":\"{}\"}}}}",
+            root.display(),
+            base64::engine::general_purpose::STANDARD.encode(&t2),
+        )),
+    );
+    assert_eq!(code, 201, "{body}");
+    assert_eq!(
+        session_name(addr, &ih2, Duration::from_secs(30)).as_deref(),
+        Some("a"),
+        "the cross-seed never loaded",
+    );
+
+    let delete_t1 = format!("/v1/torrents/{ih1}?delete_files=true&confirm={ih1}");
+    let (code, body) = http(addr, "DELETE", &delete_t1, None);
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("payload-shared"), "{body}");
+    assert!(
+        body.contains(&ih2),
+        "the refusal names the cross-seed: {body}"
+    );
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"x",
+        "the cross-seed's file left its place"
+    );
+    assert!(!root.join(".torrentd-trash").exists());
+    assert!(torrent_phase(addr, &ih1).is_some(), "T1 left its session");
+
+    // With the cross-seed gone, nothing else serves the file, and the same
+    // delete moves it to the trash. Its session settles the removal a moment
+    // after the 204, until when the file is still its.
+    let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih2}"), None);
+    assert_eq!(code, 204, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (code, body) = http(addr, "DELETE", &delete_t1, None);
+        if code == 204 {
+            break;
+        }
+        assert!(
+            code == 409 && Instant::now() < deadline,
+            "the delete with the cross-seed gone: {code} {body}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!file.exists(), "the payload was not moved to the trash");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
+
+/// Issue #199's acceptance: a rescan never relabels an adopted torrent a
+/// session still holds, whatever its payload reads as.
+///
+/// A root unmounted for maintenance used to commit an empty index for it, so
+/// the rescan turned every adopted torrent on it `missing` while its session
+/// went on seeding, and the rescan after the remount `matched`: the index
+/// offered them all for adoption again. Removed, the root keeps its previous
+/// index; with the root present but the payload gone, the matcher keeps the
+/// verdict of a torrent a session holds. Back in place, it is still adopted.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_rescan_with_the_root_or_payload_gone_keeps_a_loaded_torrent_adopted() {
+    use sha1::Digest;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let away = p.join("pool-unmounted");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(root.join("a"), b"x").unwrap();
+    let mut torrent = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+    torrent.extend_from_slice(&sha1::Sha1::digest(b"x"));
+    torrent.extend_from_slice(b"ee");
+    std::fs::write(library.join("t.torrent"), &torrent).unwrap();
+    let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+        .unwrap()
+        .to_hex();
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\n",
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    let scan = || {
+        let (code, body) = http(addr, "POST", "/v1/pool/scan", None);
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+    scan();
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/pool/adoptions",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"selector\":{{\"kind\":\"infohashes\",\
+             \"infohashes\":[\"{ih}\"]}}}}"
+        )),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        session_name(addr, &ih, Duration::from_secs(30)).as_deref(),
+        Some("a"),
+        "the adopted torrent never loaded",
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while pool_state(addr, &ih).as_deref() != Some("adopted") {
+        assert!(
+            Instant::now() < deadline,
+            "the adoption never recorded `adopted`: {:?}",
+            pool_state(addr, &ih),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The root unmounted: counted as an error, and its previous index kept.
+    std::fs::rename(&root, &away).unwrap();
+    let summary = scan();
+    assert!(summary["errors"].as_u64().unwrap() >= 1, "{summary}");
+    assert_eq!(
+        pool_state(addr, &ih).as_deref(),
+        Some("adopted"),
+        "{summary}"
+    );
+
+    // The root back without the payload: the index finds nothing, and the
+    // session still holds the torrent.
+    std::fs::create_dir_all(&root).unwrap();
+    let summary = scan();
+    assert_eq!(summary["missing"], 1, "{summary}");
+    assert_eq!(
+        pool_state(addr, &ih).as_deref(),
+        Some("adopted"),
+        "{summary}"
+    );
+
+    // The payload back.
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&away, &root).unwrap();
+    let summary = scan();
+    assert_eq!(summary["matched"], 1, "{summary}");
+    assert_eq!(
+        pool_state(addr, &ih).as_deref(),
+        Some("adopted"),
+        "{summary}"
+    );
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
+
+/// Issue #189: a `DELETE` answered `204` stays deleted across a SIGKILL.
+///
+/// The resume file and `.torrent` used to be deleted only when the alert
+/// loop handled `torrent_removed`, after the answer, with no directory fsync:
+/// a `kill -9` straight after the `204` left the resume file, and the next
+/// boot claimed it and loaded the torrent again, in 3 trials out of 3. Each
+/// round here adds a torrent, waits for its resume file, deletes it, kills
+/// the daemon at once, restarts it, and asks for the torrent.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_delete_answered_204_stays_deleted_across_a_sigkill() {
+    use base64::Engine as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        let child = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_torrentd"))
+                .arg("--config")
+                .arg(&cfg)
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        wait_healthy(addr);
+        child
+    };
+    let profile_dir = |store: &str| p.join(store).join(PROFILE);
+
+    let mut child = spawn();
+    for round in 0..3 {
+        let torrent = metainfo(&format!("kill{round}"), "http://127.0.0.1:1/announce");
+        let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+            .unwrap()
+            .to_hex();
+        let (code, body) = http(
+            addr,
+            "POST",
+            "/v1/torrents",
+            Some(&format!(
+                "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"metainfo\",\
+                 \"data\":\"{}\"}}}}",
+                base64::engine::general_purpose::STANDARD.encode(&torrent),
+            )),
+        );
+        assert_eq!(code, 201, "round {round}: {body}");
+        let resume = profile_dir("resume").join(format!("{ih}.resume"));
+        assert!(
+            read_within(&resume, Duration::from_secs(10)).is_some(),
+            "round {round}: the add never wrote its resume file",
+        );
+
+        let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih}"), None);
+        assert_eq!(code, 204, "round {round}: {body}");
+        // SIGKILL: no drain, no alert handled after this.
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        for leftover in [
+            resume.clone(),
+            profile_dir("torrents").join(format!("{ih}.torrent")),
+            profile_dir("torrents").join(format!("{ih}.save_path")),
+        ] {
+            assert!(
+                !leftover.exists(),
+                "round {round}: {} outlived the 204",
+                leftover.display()
+            );
+        }
+
+        child = spawn();
+        let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+        assert_eq!(
+            code, 404,
+            "round {round}: the deleted torrent came back: {body}"
+        );
+        assert!(
+            !profile_dir("resume").join(format!("{ih}.removed")).exists(),
+            "round {round}: the boot did not spend the tombstone",
+        );
+    }
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
+
+/// Which pieces a two-piece torrent's resume file records as held: the
+/// top-level `pieces` string, one byte a piece, bit 0 set for a piece held.
+/// The info dict's `pieces` holds 40 bytes of hashes, so `6:pieces2:` is the
+/// top-level one alone.
+fn resume_pieces(resume: &[u8]) -> Option<[bool; 2]> {
+    const KEY: &[u8] = b"6:pieces2:";
+    let at = resume.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    let held = resume.get(at..at + 2)?;
+    Some([held[0] & 1 == 1, held[1] & 1 == 1])
+}
+
+/// Poll `GET /v1/torrents/{ih}` until its `(phase, progress)` satisfies
+/// `done`, returning it; or, once `within` has passed, the last one seen as
+/// the error. The phase can move a status update before the progress does,
+/// so a wait names both.
+fn settled_in(
+    addr: &str,
+    ih: &str,
+    within: Duration,
+    done: impl Fn(&str, f64) -> bool,
+) -> Result<(String, f64), Option<(String, f64)>> {
+    let deadline = Instant::now() + within;
+    let mut last = None;
+    loop {
+        let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+        if code == 200 {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let seen = (
+                v["phase"].as_str().unwrap_or_default().to_owned(),
+                v["progress"].as_f64().unwrap_or_default(),
+            );
+            if done(&seen.0, seen.1) {
+                return Ok(seen);
+            }
+            last = Some(seen);
+        }
+        if Instant::now() >= deadline {
+            return Err(last);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Issue #182's acceptance, left to #311: a recheck's verdict survives a
+/// SIGKILL straight after it.
+///
+/// A recheck used to queue no resume save, so until the next 30-minute sweep
+/// the resume file still said what the last graceful stop wrote: every piece
+/// held, `seed_mode 0`. A crash in that window booted the torrent from it as
+/// complete, without hashing, and it seeded a piece it no longer had. Here a
+/// two-piece torrent is stopped gracefully, one of its pieces is corrupted in
+/// place with the file's size unchanged, and a recheck finds it out; the
+/// daemon is killed once the verdict reaches the resume file, and the boot
+/// after must not report the torrent complete.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_recheck_verdict_survives_a_sigkill() {
+    use std::os::unix::fs::FileExt as _;
+
+    use base64::Engine as _;
+    use sha1::Digest;
+
+    const PIECE: usize = 16384;
+    let payload: Vec<u8> = (0..2 * PIECE).map(|i| (i % 251) as u8).collect();
+    let mut torrent = format!(
+        "d4:infod6:lengthi{}e4:name7:recheck12:piece lengthi{PIECE}e6:pieces40:",
+        payload.len()
+    )
+    .into_bytes();
+    for piece in payload.chunks(PIECE) {
+        torrent.extend_from_slice(&sha1::Sha1::digest(piece));
+    }
+    torrent.extend_from_slice(b"ee");
+    let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+        .unwrap()
+        .to_hex();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let data = p.join("data").join("recheck");
+    std::fs::write(&data, &payload).unwrap();
+    let resume = p.join("resume").join(PROFILE).join(format!("{ih}.resume"));
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        let child = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_torrentd"))
+                .arg("--config")
+                .arg(&cfg)
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        wait_healthy(addr);
+        child
+    };
+    let seeding = |what: &str| {
+        let seen = settled_in(addr, &ih, Duration::from_secs(60), |phase, progress| {
+            phase == "seeding" && progress == 1.0
+        });
+        assert!(
+            seen.is_ok(),
+            "{what}: the complete torrent never reached seeding: {seen:?}"
+        );
+    };
+
+    // Added and hashed complete, then stopped gracefully: its resume file
+    // says every piece is held, and not in seed mode.
+    let mut child = spawn();
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/torrents",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"metainfo\",\
+             \"data\":\"{}\"}}}}",
+            base64::engine::general_purpose::STANDARD.encode(&torrent),
+        )),
+    );
+    assert_eq!(code, 201, "{body}");
+    seeding("after the add");
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    let stopped = std::fs::read(&resume).expect("the graceful stop wrote no resume file");
+    assert_eq!(resume_pieces(&stopped), Some([true, true]));
+    assert!(
+        stopped.windows(14).any(|w| w == b"9:seed_modei0e"),
+        "the resume file is not seed_mode 0"
+    );
+
+    // Booted from it, the first piece corrupted in place, and rechecked.
+    let mut child = spawn();
+    seeding("after the restart");
+    let file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+    file.write_all_at(&[!payload[0]], 0).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let (code, body) = http(addr, "POST", &format!("/v1/torrents/{ih}/recheck"), None);
+    assert_eq!(code, 202, "{body}");
+    let seen = settled_in(addr, &ih, Duration::from_secs(60), |phase, progress| {
+        phase == "incomplete" && progress == 0.5
+    });
+    assert!(
+        seen.is_ok(),
+        "the recheck did not find the corrupted piece: {seen:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::read(&resume)
+        .ok()
+        .as_deref()
+        .and_then(resume_pieces)
+        != Some([false, true])
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the recheck's verdict did not reach the resume file within 30s",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // SIGKILL: no drain, no save after this.
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let mut child = spawn();
+    // Settled either way: incomplete with the one piece it holds counted, or
+    // seeding complete, which is the regression.
+    let after = settled_in(addr, &ih, Duration::from_secs(60), |phase, progress| {
+        (phase == "incomplete" && progress > 0.0) || (phase == "seeding" && progress == 1.0)
+    });
+    assert!(
+        after
+            .as_ref()
+            .is_ok_and(|(phase, progress)| phase == "incomplete" && *progress < 1.0),
+        "booted after the SIGKILL as {after:?}, not incomplete",
+    );
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
 }
 
 /// A spawned daemon, killed if the test panics before stopping it: an

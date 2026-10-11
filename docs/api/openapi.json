@@ -651,7 +651,7 @@
           "server"
         ],
         "summary": "Re-read the configuration file.",
-        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded.",
+        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
         "operationId": "reload_config",
         "responses": {
           "401": {
@@ -1337,7 +1337,7 @@
           "torrents"
         ],
         "summary": "Add a torrent.",
-        "description": "From a magnet URI, a `.torrent` on the daemon's filesystem, or a\n`.torrent` in the request (base64). The infohash is computed before any\nsession sees the torrent, so an infohash already assigned anywhere is\n`409 torrent-exists` and the session never receives a duplicate; a hybrid\ntorrent is checked under its truncated v2 infohash as well as its v1 one.\nA magnet must carry the torrent's v1 infohash (`xt=urn:btih:`): one with\nonly `xt=urn:btmh:` is `422 invalid-metainfo`. When the\nprofile sets `allowed_tracker_domains`, every tracker the torrent announces\nto — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and\nthere must be at least one. The response is the torrent as its session first reports\nit; its `phase` is `unknown` until the first state update.",
+        "description": "From a magnet URI, a `.torrent` on the daemon's filesystem, or a\n`.torrent` in the request (base64). The infohash is computed before any\nsession sees the torrent, so an infohash already assigned anywhere is\n`409 torrent-exists` and the session never receives a duplicate; a hybrid\ntorrent is checked under its truncated v2 infohash as well as its v1 one.\nA magnet must carry the torrent's v1 infohash (`xt=urn:btih:`): one with\nonly `xt=urn:btmh:` is `422 invalid-metainfo`. When the\nprofile sets `allowed_tracker_domains`, every tracker the torrent announces\nto — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and\nthere must be at least one; when it also sets `allowed_tracker_urls`, every\nannounce URL must fall under one of those account prefixes. A `.torrent`'s\npayload is hashed before the torrent seeds: it is `checking` first, and a\npayload that is absent, truncated or not yet fully written ends\n`incomplete` and never announces itself complete. The daemon never\ndownloads, so supply the payload, then recheck it with\n`POST /v1/torrents/{infohash}/recheck`. The response is the torrent as its\nsession first reports it; its `phase` is `unknown` until the first state\nupdate.",
         "operationId": "add_torrent",
         "requestBody": {
           "content": {
@@ -1920,7 +1920,7 @@
           "torrents"
         ],
         "summary": "Remove a torrent.",
-        "description": "Removes it from its session and clears its assignment, so the infohash can\nbe added again. `delete_files=true` also moves the payload into the trash\nof the managed root it lies in, never unlinking it, and needs `[pool]\nallow_mutations` and `confirm` repeating the infohash. It is refused,\nchanging nothing, unless every file is under a managed root, claimed by\nthis torrent alone in the pool index, and unchanged since the scan that\nindexed it. A torrent whose profile has no running session, or that the\nboot left unloaded, is cleared from the daemon's records alone\n(`delete_files` is refused there: nothing can reach the payload). A\ntorrent still being added is `409 torrent-adding`; retry once it lists a\nphase other than `unknown`.",
+        "description": "Removes it from its session and clears its assignment, so the infohash can\nbe added again. Its resume file, `.torrent` and recorded save path are\ndeleted before the answer, so a restart after a `204` does not load it\nagain. `delete_files=true` also moves the payload into the trash\nof the managed root it lies in, never unlinking it, and needs `[pool]\nallow_mutations` and `confirm` repeating the infohash. It is refused,\nchanging nothing, unless every file is under a managed root, claimed by\nthis torrent alone in the pool index, listed at the same path by no other\ntorrent any session holds, and unchanged since the scan that indexed it;\nwhile another assigned torrent is held by no session, its files cannot be\ncompared, and that refuses too. A torrent whose profile has no running\nsession, or that the boot left unloaded, is cleared from the daemon's\nrecords alone (`delete_files` is refused there: nothing can reach the\npayload). One the boot left unloaded whose resume file or `.torrent` its\nprofile's stores still hold is `409 torrent-unloaded`, changing nothing:\nthose files are what the next boot loads it from. A torrent still being\nadded is `409 torrent-adding`; retry once it lists a phase other than\n`unknown`.",
         "operationId": "delete_torrent",
         "parameters": [
           {
@@ -2138,7 +2138,7 @@
             }
           },
           "409": {
-            "description": "The torrent is still being added; The payload is shared; The payload cannot be trashed; The profile is unavailable",
+            "description": "The torrent is still being added; The payload is shared; The payload cannot be trashed; The torrent did not load; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2200,6 +2200,22 @@
                           "properties": {
                             "type": {
                               "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-unloaded"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The torrent did not load"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
                             }
                           }
@@ -2250,7 +2266,7 @@
           "torrents"
         ],
         "summary": "Pause a torrent.",
-        "description": "Stops it announcing and serving peers until resumed. Allowed on a fenced\nprofile: pausing puts nothing back on the network.",
+        "description": "Stops it announcing and serving peers until resumed. Allowed on a fenced\nprofile: pausing puts nothing back on the network. A paced resume still\nrunning in the profile, a lifted fence's or a resume-all's, leaves it out.",
         "operationId": "pause_torrent",
         "parameters": [
           {
@@ -2444,7 +2460,7 @@
           "torrents"
         ],
         "summary": "Resume a torrent.",
-        "description": "Refused with `409 profile-unavailable` while the torrent's profile is\nfenced: un-quarantining a torrent whose tunnel is down would announce it\nfrom the wrong address.",
+        "description": "Refused with `409 profile-unavailable` while the torrent's profile is\nfenced: un-quarantining a torrent whose tunnel is down would announce it\nfrom the wrong address. A profile fenced while the resume goes out is\nrefused the same way, and the torrent is paused again. A torrent a paced\nset-online still held is no longer held once resumed.",
         "operationId": "resume_torrent",
         "parameters": [
           {
@@ -2660,7 +2676,7 @@
           "torrents"
         ],
         "summary": "Re-verify a torrent's payload.",
-        "description": "Re-hashes the payload against the piece hashes. `202`: libtorrent checks\nasynchronously, and the torrent's `phase` reports `checking` until it is\ndone. Needs no `[pool]`. A recheck drops seed mode, which is safe because\nthe no-download invariant rests on upload mode, and that survives it.\nRefused while the profile is fenced, as resuming is.",
+        "description": "Re-hashes the payload against the piece hashes. `202`: libtorrent checks\nasynchronously, and the torrent's `phase` reports `checking` from the\nmoment the check starts until it is done. Needs no `[pool]`. With `[pool]`\nconfigured, the check is queued rather than started, and a queued check\nleaves the torrent in its old `phase` until the verify queue starts it:\nthe queue starts it once a slot is free, at\nmost `[pool] max_concurrent_verify` checks at once together with\nadoptions' verifications and `POST /v1/pool/verifications`' re-hashes, and\n`GET /v1/pool` counts it in `verify_queue_depth` while it waits and\n`verify_in_flight` while it hashes. Asking again for a torrent already\nwaiting or checking queues nothing more. Without `[pool]`, and for a\npaused torrent or one still without metadata (which libtorrent does not\nhash until it is resumed or its metadata arrives), libtorrent is asked at\nonce. A recheck drops seed mode, which is safe because the no-download\ninvariant rests on upload mode, and that survives it. Refused while the\nprofile is fenced, as resuming is.",
         "operationId": "recheck_torrent",
         "parameters": [
           {
@@ -3885,7 +3901,7 @@
           "profiles"
         ],
         "summary": "Set one profile online or offline.",
-        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says. The setting is written to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the fence's pauses are undone and the\nVPN monitor watches the profile again, handshake included; if it fails,\n`409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
+        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says: those that were running are started again 100\na second, going on after the response, since each one started announces\nto its trackers. Setting it offline meanwhile stops that, and the next\n`online` starts the rest; a restart starts them at boot. The setting is\nwritten to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
         "operationId": "set_profile_state",
         "parameters": [
           {
@@ -4352,7 +4368,7 @@
           "profiles"
         ],
         "summary": "Clear offline-all.",
-        "description": "Each profile returns to its own `desired_state`: one set offline on its\nown stays offline. A fenced (`vpn_down`) profile stays fenced; setting it\nonline with `PATCH /v1/profiles/{profile_id}` is what checks its tunnel\nand lifts the fence.",
+        "description": "Each profile returns to its own `desired_state`: one set offline on its\nown stays offline. Each profile that goes online has its running torrents\nstarted again 100 a second, as `PATCH /v1/profiles/{profile_id}` does,\ngoing on after the response. A fenced (`vpn_down`) profile stays fenced; setting it\nonline with `PATCH /v1/profiles/{profile_id}` is what checks its tunnel\nand lifts the fence.",
         "operationId": "set_online_all",
         "responses": {
           "401": {
@@ -4498,7 +4514,7 @@
           "profiles"
         ],
         "summary": "Pause every torrent in one profile.",
-        "description": "A fenced (`vpn_down`) profile is paused too: its torrents are already\npaused, and pausing again is harmless. A profile that never came up has\nnothing loaded to pause and answers `409 profile-unavailable` with its\nbring-up failure. `failed_count` counts torrents the engine refused.",
+        "description": "A fenced (`vpn_down`) profile is paused too: its torrents are already\npaused, and pausing again is harmless. A profile that never came up has\nnothing loaded to pause and answers `409 profile-unavailable` with its\nbring-up failure. `failed_count` counts torrents the engine refused.\n\nA paced resume still running in the profile, a lifted fence's or a\nresume-all's, is stopped first, so it does not resume torrents after this\npaused them.",
         "operationId": "pause_profile",
         "parameters": [
           {
@@ -4699,7 +4715,7 @@
           "profiles"
         ],
         "summary": "Resume every torrent in one profile.",
-        "description": "Refused with `409 profile-unavailable` for a profile that never came up\n(nothing of it is loaded), for a fenced (`vpn_down`) one, whose torrents\nwere paused because the tunnel is gone and stay paused until the profile\nis set online and its tunnel checks healthy, and for an `offline` one.\n`failed_count` counts torrents the engine refused.",
+        "description": "Each torrent resumed announces to its trackers, so they are resumed 100 a\nsecond, and the response comes once the last is: about a second per 100\ntorrents in the profile. The resume goes on if the client stops waiting.\nA profile fenced while it runs stops it there: the profile is then listed\nin `skipped_profiles` (`vpn_down`), with how many torrents stayed paused.\n\nRefused with `409 profile-unavailable` for a profile that never came up\n(nothing of it is loaded), for a fenced (`vpn_down`) one, whose torrents\nwere paused because the tunnel is gone and stay paused until the profile\nis set online and its tunnel checks healthy, and for an `offline` one.\n`failed_count` counts torrents the engine refused.",
         "operationId": "resume_profile",
         "parameters": [
           {
@@ -4900,7 +4916,7 @@
           "torrents"
         ],
         "summary": "Pause every torrent in every profile.",
-        "description": "Every live profile is reached, fenced ones included: their torrents are\nalready paused, and pausing again is harmless. Profiles that never came up\nare listed in `skipped_profiles`, since nothing of theirs is loaded. A\nnonzero `failed_count` means some torrents are still running.",
+        "description": "Every live profile is reached, fenced ones included: their torrents are\nalready paused, and pausing again is harmless. Profiles that never came up\nare listed in `skipped_profiles`, since nothing of theirs is loaded. A\nnonzero `failed_count` means some torrents are still running.\n\nA paced resume still running in a profile, a lifted fence's or a\nresume-all's, is stopped first, so it does not resume torrents after this\npaused them.",
         "operationId": "pause_all_torrents",
         "responses": {
           "401": {
@@ -5024,7 +5040,7 @@
           "torrents"
         ],
         "summary": "Resume every torrent in every profile that is not fenced or offline.",
-        "description": "A fenced (`vpn_down`) or `offline` profile is skipped and listed in\n`skipped_profiles`, not refused wholesale: one account's dead tunnel must\nnot stop the others resuming, and resuming it is exactly what the\nprofile's own resume-all refuses. Profiles that never came up are listed\ntoo.",
+        "description": "A fenced (`vpn_down`) or `offline` profile is skipped and listed in\n`skipped_profiles`, not refused wholesale: one account's dead tunnel must\nnot stop the others resuming, and resuming it is exactly what the\nprofile's own resume-all refuses. Profiles that never came up are listed\ntoo.\n\nEach torrent resumed announces to its trackers, so each profile's are\nresumed 100 a second, one profile after another, and the response comes\nonce the last is: about a second per 100 torrents in the daemon. The\nresume goes on if the client stops waiting. A profile fenced while its\ntorrents are being resumed is listed in `skipped_profiles` (`vpn_down`)\nwith how many stayed paused. A pause that lands while it runs is kept in\nevery profile, including those not reached yet: the daemon's pause-all\nstops it, a profile's pause-all stops it in that profile, and a torrent\npaused on its own is left out. A profile so paused is not listed in\n`skipped_profiles`.",
         "operationId": "resume_all_torrents",
         "responses": {
           "401": {
@@ -6808,7 +6824,7 @@
           "pool"
         ],
         "summary": "Compute a mutation plan.",
-        "description": "Works out every step the change would take and stores them as a `draft`,\ntouching nothing on disk; `POST …/apply` performs it. The planner refuses\nwith `409 plan-refused` when the change is unsafe as the index stands — an\noverlap, drift, an occupied destination, a torrent not in the index.\n\nRefused with `403 mutations-disabled` unless `[pool] allow_mutations` is\nset. Creating a plan touches nothing, but a plan that can never be applied\nis a trap, and refusing where the operator asks is the clearer signal.",
+        "description": "Works out every step the change would take and stores them as a `draft`,\ntouching nothing on disk; `POST …/apply` performs it. The planner refuses\nwith `409 plan-refused` when the change is unsafe as the index stands — an\noverlap, drift, an occupied destination, a torrent not in the index.\n\nRefused with `403 mutations-disabled` unless `[pool] allow_mutations` is\nset. Creating a plan touches nothing, but a plan that can never be applied\nis a trap, and refusing where the operator asks is the clearer signal.\n\nThe work has no deadline: the plan is written to the index, so it waits\nfor a running scan to finish before it answers. Only the body has one: a\nbody that has not arrived within 30 seconds is answered `408`.",
         "operationId": "create_plan",
         "requestBody": {
           "content": {
@@ -7080,8 +7096,8 @@
               }
             }
           },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
+          "413": {
+            "description": "the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7102,8 +7118,8 @@
               }
             }
           },
-          "413": {
-            "description": "the request body exceeds the configured limit",
+          "408": {
+            "description": "the request body did not arrive within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7140,7 +7156,7 @@
           "pool"
         ],
         "summary": "Describe a mutation plan.",
-        "description": "Its status, every step with where it stands, and — for a plan that deletes\ndata — the confirm token applying it needs.",
+        "description": "Its status, how many steps stand in each status, its first 100 steps, and\n— for a plan that deletes data — the confirm token applying it needs. The\nbody is bounded whatever the plan's size; `GET …/steps` pages through\nevery step.",
         "operationId": "get_plan",
         "parameters": [
           {
@@ -7593,13 +7609,304 @@
         ]
       }
     },
+    "/v1/pool/plans/{plan_id}/steps": {
+      "get": {
+        "tags": [
+          "pool"
+        ],
+        "summary": "List a mutation plan's steps.",
+        "description": "Every step with where it stands, in the order an apply runs them, a page\nat a time: a plan over a large subtree has a step per file. A cursor is\nbound to its plan, and refused on another's steps.",
+        "operationId": "list_plan_steps",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "description": "The plan's id.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Resume after the last step of the previous page, or after a plan's\ninline `steps`, with its `steps_next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Steps per page; 100 when absent.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "maximum": 1000.0,
+              "minimum": 1.0,
+              "format": "uint32"
+            }
+          }
+        ],
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request; Invalid cursor",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#invalid-cursor"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "OK",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanStepPage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The pool is not configured; Plan not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The pool is not configured"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#plan-not-found"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "Plan not found"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The request is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "read"
+            ]
+          }
+        ]
+      }
+    },
     "/v1/sessions": {
       "post": {
         "tags": [
           "sessions"
         ],
         "summary": "Exchange the operator password for a session token.",
-        "description": "The token carries `read` and `write` and expires after\n`[auth] session_ttl_secs` (`GET /v1/server` reports it). Failed attempts\nare throttled per client, and every attempt spends from one daemon-wide\nbudget for the memory-hard password hash; either limit answers\n`429 login-throttled` with `Retry-After`.",
+        "description": "The token carries `read` and `write` and expires after\n`[auth] session_ttl_secs` (`GET /v1/server` reports it). Failed attempts\nare throttled per client, and attempts spend from one daemon-wide budget\nfor the memory-hard password hash. Once that budget is spent, a client\nthat has logged in since the daemon started spends from a small reserve\nthat only such clients share instead. Either limit answers\n`429 login-throttled` with `Retry-After`.",
         "operationId": "create_session",
         "requestBody": {
           "content": {
@@ -8549,13 +8856,298 @@
         ]
       }
     },
+    "/v1/pool/verifications": {
+      "post": {
+        "tags": [
+          "pool"
+        ],
+        "summary": "Re-hash loaded torrents.",
+        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks are queued: the verify queue starts them as slots\nfree up, at most `[pool] max_concurrent_verify` at once together with\nadoptions' verifications, and `GET /v1/pool` counts them in\n`verify_queue_depth` while they wait and `verify_in_flight` while they\nhash. Each torrent reports `checking` from when its check starts until it\nfinishes. A torrent not loaded in any session, paused (libtorrent does not\nhash a paused torrent), or without metadata yet is skipped with the\nreason. The queue is held in memory: a restart drops the re-hashes that\nhad not started. Only a torrent in the pool index has its outcome\nrecorded: a pass marks it `adopted`, a failure marks it `drifted` and\npauses it.",
+        "operationId": "verify_pool_torrents",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Entity; The request is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "the request was accepted, and the processing it asked for has not completed",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The pool is not configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          }
+        ]
+      }
+    },
     "/v1/pool/adoptions": {
       "post": {
         "tags": [
           "pool"
         ],
         "summary": "Adopt existing payload.",
-        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.",
+        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.\n\nThe work has no deadline and the request answers once every target is\nadopted or refused: a large subtree, or a running scan holding the index,\nkeeps it open for as long as that takes. Only the body has one: a body\nthat has not arrived within 30 seconds is answered `408`.",
         "operationId": "adopt_pool_torrents",
         "requestBody": {
           "content": {
@@ -8861,28 +9453,6 @@
               }
             }
           },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "413": {
             "description": "the request body exceeds the configured limit",
             "content": {
@@ -8904,272 +9474,9 @@
                 }
               }
             }
-          }
-        },
-        "security": [
-          {
-            "bearer": [
-              "write"
-            ]
-          }
-        ]
-      }
-    },
-    "/v1/pool/verifications": {
-      "post": {
-        "tags": [
-          "pool"
-        ],
-        "summary": "Re-hash loaded torrents.",
-        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session, or paused (libtorrent does\nnot hash a paused torrent), is skipped with the reason. Only a torrent in\nthe pool index has its outcome recorded: a pass marks it `adopted`, a\nfailure marks it `drifted` and pauses it.",
-        "operationId": "verify_pool_torrents",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/VerifyRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "401": {
-            "description": "Unauthorized",
-            "headers": {
-              "WWW-Authenticate": {
-                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
-                "schema": {
-                  "type": "string"
-                },
-                "example": "Bearer"
-              }
-            },
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "oneOf": [
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "about:blank"
-                            }
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad Request",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "Unsupported Media Type",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Unprocessable Entity; The request is invalid",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "oneOf": [
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "about:blank"
-                            }
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
-                            }
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "202": {
-            "description": "the request was accepted, and the processing it asked for has not completed",
-            "headers": {
-              "X-Request-Id": {
-                "description": "The identifier this request is correlated by",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
-                "required": true,
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
-                "required": true,
-                "schema": {
-                  "type": "string"
-                }
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/VerifyResult"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "The pool is not configured",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           },
           "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
+            "description": "the request body did not arrive within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9206,7 +9513,7 @@
           "pool"
         ],
         "summary": "Apply a mutation plan.",
-        "description": "Performs every step not yet done, in order, and waits for the last: a\nlarge delete or a cross-device move can run for minutes. Each step is\njournalled before it is attempted, and applying stops at the first failure\n— answering `200` with `status: failed` and the plan's steps saying which\nand why. A `failed` plan can be applied again to retry.\n\nA plan that deletes data applies only with its `confirm_token`: not a\nsecurity control, but a guard against applying the wrong plan id. Refused\nwith `403 mutations-disabled` unless `[pool] allow_mutations` is set.",
+        "description": "Performs every step not yet done, in order, and waits for the last: a\nlarge delete or a cross-device move can run for minutes. Each step is\njournalled before it is attempted, and applying stops at the first failure\n— answering `200` with `status: failed` and the plan's steps saying which\nand why. A `failed` plan can be applied again to retry, unless a step is\nstill `in_progress`: its outcome is unknown, nothing marks it resolved, and\nevery apply refuses the plan with `409`. Rescan, discard the plan, and\nbuild a new one.\n\nA plan that deletes data applies only with its `confirm_token`: not a\nsecurity control, but a guard against applying the wrong plan id. Refused\nwith `403 mutations-disabled` unless `[pool] allow_mutations` is set.",
         "operationId": "apply_plan",
         "parameters": [
           {
@@ -9563,6 +9870,28 @@
           },
           "413": {
             "description": "the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the request body did not arrive within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10518,7 +10847,7 @@
               "$ref": "#/components/schemas/SkippedProfile"
             },
             "type": "array",
-            "description": "Profiles this request did not act on, each with why. Always empty for\na single profile's operation, which refuses instead."
+            "description": "Profiles this request did not act on, or not on all of, each with why.\nA single profile's operation refuses a profile it cannot act on, so\nlists one here only when a resume was cut short by a fence."
           }
         },
         "type": "object",
@@ -10695,14 +11024,14 @@
             "maximum": 4294967295.0,
             "minimum": 0.0,
             "format": "uint32",
-            "description": "Adopted torrents waiting for a verification slot."
+            "description": "Adopted torrents, and re-hashes `POST /v1/pool/verifications` or\n`POST /v1/torrents/{infohash}/recheck` queued, waiting for a\nverification slot."
           },
           "verify_in_flight": {
             "type": "integer",
             "maximum": 4294967295.0,
             "minimum": 0.0,
             "format": "uint32",
-            "description": "Adopted torrents libtorrent is hashing now."
+            "description": "Adopted torrents and queued re-hashes libtorrent is hashing now: at\nmost `[pool] max_concurrent_verify`."
           }
         },
         "type": "object",
@@ -11078,6 +11407,56 @@
         ],
         "description": "One page of plans, oldest first."
       },
+      "StepCounts": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Every step of the plan."
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Not attempted."
+          },
+          "in_progress": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Attempted and not finished."
+          },
+          "done": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Done."
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Failed."
+          },
+          "skipped": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Not attempted, deliberately."
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "pending",
+          "in_progress",
+          "done",
+          "failed",
+          "skipped"
+        ],
+        "description": "How many of a plan's steps stand in each status."
+      },
       "StepOp": {
         "type": "string",
         "enum": [
@@ -11168,19 +11547,30 @@
             "format": "date-time",
             "description": "When an apply last finished, successfully or not; `null` before."
           },
+          "step_counts": {
+            "$ref": "#/components/schemas/StepCounts",
+            "description": "How many steps the plan has, and how many stand in each status: the\nplan's progress, whatever its size."
+          },
           "steps": {
             "items": {
               "$ref": "#/components/schemas/PlanStep"
             },
             "type": "array",
-            "description": "Every step, in the order an apply runs them."
+            "description": "The plan's first steps, at most 100, in the order an apply runs them.\n`GET /v1/pool/plans/{plan_id}/steps` pages through all of them."
+          },
+          "steps_next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to `GET /v1/pool/plans/{plan_id}/steps` for the steps\nafter `steps`; `null` when `steps` holds every step."
           },
           "confirm_token": {
             "type": [
               "string",
               "null"
             ],
-            "description": "For a plan that deletes data, the token `POST …/apply` must repeat;\n`null` for any other. Derived from the steps, so it names this plan and\nno other."
+            "description": "For a plan that deletes data, the token `POST …/apply` must repeat;\n`null` for any other. Derived from every step, so it names this plan\nand no other."
           }
         },
         "type": "object",
@@ -11189,9 +11579,33 @@
           "kind",
           "status",
           "created_at",
+          "step_counts",
           "steps"
         ],
         "description": "A mutation plan: the exact diff an apply would make."
+      },
+      "PlanStepPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PlanStep"
+            },
+            "type": "array",
+            "description": "This page's items, in the collection's order."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to fetch the next page; `null` on the last one."
+          }
+        },
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "description": "One page of a plan's steps, in the order an apply runs them."
       },
       "CreateSession": {
         "properties": {
@@ -11287,6 +11701,75 @@
         ],
         "description": "The state to set a profile to."
       },
+      "VerifyRequest": {
+        "properties": {
+          "infohashes": {
+            "items": {
+              "$ref": "#/components/schemas/InfoHashHex"
+            },
+            "type": "array",
+            "maxItems": 1000,
+            "minItems": 1,
+            "description": "Between 1 and 1000 loaded torrents."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "infohashes"
+        ],
+        "description": "Torrents to re-hash."
+      },
+      "RefusedTorrent": {
+        "properties": {
+          "infohash": {
+            "$ref": "#/components/schemas/InfoHashHex",
+            "description": "The torrent."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it was not acted on, in prose for an operator."
+          }
+        },
+        "type": "object",
+        "required": [
+          "infohash",
+          "reason"
+        ],
+        "description": "A torrent an adoption or verification did not act on, and why."
+      },
+      "VerifyResult": {
+        "properties": {
+          "requested": {
+            "type": "integer",
+            "maximum": 4294967295.0,
+            "minimum": 0.0,
+            "format": "uint32",
+            "description": "How many infohashes the request named."
+          },
+          "started": {
+            "items": {
+              "$ref": "#/components/schemas/InfoHashHex"
+            },
+            "type": "array",
+            "description": "Torrents queued for a re-hash. Each starts once the verify queue has\na slot free: `[pool] max_concurrent_verify` bounds re-hashes and\nadoptions' verifications together."
+          },
+          "skipped": {
+            "items": {
+              "$ref": "#/components/schemas/RefusedTorrent"
+            },
+            "type": "array",
+            "description": "Torrents not re-hashed, each with the reason."
+          }
+        },
+        "type": "object",
+        "required": [
+          "requested",
+          "started",
+          "skipped"
+        ],
+        "description": "Which re-hashes were queued."
+      },
       "AdoptSelector": {
         "oneOf": [
           {
@@ -11367,24 +11850,6 @@
         ],
         "description": "A request to adopt existing payload into a profile."
       },
-      "RefusedTorrent": {
-        "properties": {
-          "infohash": {
-            "$ref": "#/components/schemas/InfoHashHex",
-            "description": "The torrent."
-          },
-          "reason": {
-            "type": "string",
-            "description": "Why it was not acted on, in prose for an operator."
-          }
-        },
-        "type": "object",
-        "required": [
-          "infohash",
-          "reason"
-        ],
-        "description": "A torrent an adoption or verification did not act on, and why."
-      },
       "AdoptionResult": {
         "properties": {
           "dry_run": {
@@ -11428,57 +11893,6 @@
           "verify_bytes"
         ],
         "description": "What an adoption did, or would do."
-      },
-      "VerifyRequest": {
-        "properties": {
-          "infohashes": {
-            "items": {
-              "$ref": "#/components/schemas/InfoHashHex"
-            },
-            "type": "array",
-            "maxItems": 1000,
-            "minItems": 1,
-            "description": "Between 1 and 1000 loaded torrents."
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "infohashes"
-        ],
-        "description": "Torrents to re-hash."
-      },
-      "VerifyResult": {
-        "properties": {
-          "requested": {
-            "type": "integer",
-            "maximum": 4294967295.0,
-            "minimum": 0.0,
-            "format": "uint32",
-            "description": "How many infohashes the request named."
-          },
-          "started": {
-            "items": {
-              "$ref": "#/components/schemas/InfoHashHex"
-            },
-            "type": "array",
-            "description": "Torrents libtorrent is now re-hashing."
-          },
-          "skipped": {
-            "items": {
-              "$ref": "#/components/schemas/RefusedTorrent"
-            },
-            "type": "array",
-            "description": "Torrents not re-hashed, each with the reason."
-          }
-        },
-        "type": "object",
-        "required": [
-          "requested",
-          "started",
-          "skipped"
-        ],
-        "description": "Which re-hashes started."
       },
       "CreatePlanRequest": {
         "oneOf": [
@@ -11620,7 +12034,7 @@
               "kind",
               "uri"
             ],
-            "description": "A magnet URI. The torrent has no name, size or file list until its\nmetadata arrives from peers."
+            "description": "A magnet URI. The torrent has no name, size or file list until its\nmetadata arrives from peers. Whether it is private is unknown until\nthen too, so a magnet is added with DHT, PEX and LSD disabled on every\nprofile: until then its metadata and peers come from its trackers,\nand a magnet with no `tr=` only from a peer its `x.pe` names. On a\n`host` profile, metadata that is not private lifts that guard and the\ntorrent takes the profile's own posture; private metadata keeps it,\nand a `vpn` profile keeps it whatever the metadata says."
           },
           {
             "properties": {

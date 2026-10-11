@@ -79,8 +79,10 @@ impl ProbeUnavailable {
 ///
 /// This is the signal the health monitor uses on top of IP presence: a tunnel
 /// can keep its address while its handshake silently stops (peer gone, key
-/// rotation stalled), which the IP check cannot see. A seeding host always has
-/// traffic, so a healthy tunnel rekeys well inside the threshold.
+/// rotation stalled), which the IP check cannot see. An age alone does not
+/// make a tunnel stale: WireGuard handshakes only when it has something to
+/// send, so a quiet link's handshake ages however healthy it is. The monitor
+/// reads it beside the link's byte counters ([`transfer`]).
 pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavailable> {
     // `wg show <iface> latest-handshakes` prints `<pubkey>\t<unix_secs>` per
     // peer; 0 means "never". Take the freshest across peers.
@@ -132,6 +134,58 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
         return Ok(Some(Duration::ZERO));
     }
     Ok(Some(Duration::from_secs(now - latest)))
+}
+
+/// A WireGuard link's byte counters, summed across its peers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Transfer {
+    /// Bytes received from the peers, handshake responses included.
+    pub rx: u64,
+    /// Bytes sent to the peers, handshake initiations included.
+    pub tx: u64,
+}
+
+/// The byte counters of `iface`'s peers, from `wg show <iface> transfer`.
+///
+/// What tells a quiet link from a dead one. A healthy peer answers whatever
+/// the link sends, and on a session past WireGuard's rekey time the first
+/// thing sent is a handshake that the peer answers within seconds, so `rx`
+/// grows soon after `tx` does. A link whose `tx` grew while `rx` did not has
+/// sent into a tunnel that is not answering; one whose `tx` stayed flat has
+/// sent nothing to answer, whatever its handshake's age.
+///
+/// `Err(_)` as for [`latest_handshake_age`]: the probe could not run.
+pub fn transfer(iface: &str) -> Result<Transfer, ProbeUnavailable> {
+    let name = exec::iface(iface).map_err(|_| ProbeUnavailable::Refused)?;
+    let out = exec::run("wg", &["show", name, "transfer"], None, exec::QUICK)
+        .map_err(|_| ProbeUnavailable::NoTool)?;
+    if !out.status.success() {
+        return Err(ProbeUnavailable::Refused);
+    }
+    parse_transfer(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// [`transfer`]'s reading of `wg show <iface> transfer`, which prints
+/// `<pubkey>\t<rx_bytes>\t<tx_bytes>` per peer and nothing for a link with no
+/// peers. A line it cannot read fails the whole probe: a sum that skipped a
+/// peer would read that peer's traffic as silence.
+fn parse_transfer(text: &str) -> Result<Transfer, ProbeUnavailable> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .try_fold(Transfer::default(), |sum, line| {
+            let mut fields = line.split_whitespace().skip(1);
+            let mut count = || {
+                fields
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or(ProbeUnavailable::Unparseable)
+            };
+            let (rx, tx) = (count()?, count()?);
+            Ok(Transfer {
+                rx: sum.rx.saturating_add(rx),
+                tx: sum.tx.saturating_add(tx),
+            })
+        })
 }
 
 /// The host's boot id, or `None` if it could not be read.
@@ -412,6 +466,38 @@ fn profile_public_key(config_path: &Path) -> Option<String> {
     }
     let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!key.is_empty()).then_some(key)
+}
+
+/// The host of every `[Peer]`'s `Endpoint` in a WireGuard config: the server
+/// the tunnel's traffic leaves through, which is what a tracker sees as the
+/// account's address. Read the way [`native::parse`] reads keys: `#` starts a
+/// comment and keys match case-insensitively. `host:port` gives `host` and
+/// `[v6]:port` gives `v6`, lowercased so two spellings of one name compare
+/// equal. The host is not resolved, so two names for one server are two hosts
+/// here.
+pub fn endpoint_hosts(text: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let mut in_peer = false;
+    for line in text.lines() {
+        let stripped = line.split('#').next().unwrap_or_default();
+        let (key, value) = match stripped.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (stripped.trim(), ""),
+        };
+        if key.starts_with('[') {
+            in_peer = key.eq_ignore_ascii_case("[Peer]");
+        } else if in_peer && key.eq_ignore_ascii_case("Endpoint") && !value.is_empty() {
+            let host = match value.strip_prefix('[') {
+                Some(rest) => rest.split_once(']').map_or(rest, |(h, _)| h),
+                None => value.rsplit_once(':').map_or(value, |(h, _)| h),
+            };
+            let host = host.trim().to_ascii_lowercase();
+            if !host.is_empty() && !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
 }
 
 #[derive(Debug)]
@@ -987,27 +1073,140 @@ mod native {
             .map(str::to_string)
     }
 
+    /// Which section of the config a line is in.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        /// Before the first section header.
+        None,
+        Interface,
+        Peer,
+    }
+
+    /// The keys `wg setconf` reads in each section, lowercased. Anything
+    /// else it rejects by echoing the whole line, value included, on stderr.
+    const WG_INTERFACE_KEYS: &[&str] = &["privatekey", "listenport", "fwmark"];
+    const WG_PEER_KEYS: &[&str] = &[
+        "publickey",
+        "presharedkey",
+        "allowedips",
+        "endpoint",
+        "persistentkeepalive",
+    ];
+
+    /// How an error names the key on line `n`: by name where it reads as one
+    /// (letters only, no longer than any key `wg` knows), otherwise by line
+    /// number alone. A line such as `PrivateKey KCNt…=` splits on the key's
+    /// own padding, so what sits left of the `=` can be the secret itself.
+    fn named(key: &str, n: usize) -> String {
+        if !key.is_empty() && key.len() <= 24 && key.bytes().all(|b| b.is_ascii_alphabetic()) {
+            format!("line {n}: {key}")
+        } else {
+            format!("line {n}")
+        }
+    }
+
+    /// Whether `value` is a key `wg` accepts: 44 characters of base64, the
+    /// last of them `=`, decoding to 32 bytes. Whitespace inside it is
+    /// ignored, as `wg` strips it. The 43rd character carries two bits past
+    /// the 32 bytes, and `wg`'s `key_from_base64` refuses a key where they
+    /// are not zero, so that character must be one of the sixteen whose low
+    /// two bits are clear.
+    fn is_wg_key(value: &str) -> bool {
+        let key: Vec<u8> = value.bytes().filter(|&b| !is_wg_space(b.into())).collect();
+        key.len() == 44
+            && key[43] == b'='
+            && key[..43]
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+            && b"AEIMQUYcgkosw048".contains(&key[42])
+    }
+
+    /// Whether `wg` counts `c` as whitespace: C's `isspace` in the C locale,
+    /// which wireguard-tools' `config_read_line` uses. That is ASCII space,
+    /// `\t`, `\n`, `\v`, `\f` and `\r`, and nothing outside ASCII, so `wg`
+    /// reads `Private<U+00A0>Key` as a key it does not know. Rust's
+    /// `is_ascii_whitespace` leaves out `\v`, and `char::is_whitespace` takes
+    /// in Unicode spaces `wg` keeps.
+    fn is_wg_space(c: char) -> bool {
+        c.is_ascii_whitespace() || c == '\x0b'
+    }
+
+    /// `s` with every whitespace character removed, as wireguard-tools'
+    /// `config_read_line` removes it from a line before reading it.
+    fn squeezed(s: &str) -> String {
+        s.chars().filter(|&c| !is_wg_space(c)).collect()
+    }
+
     /// Split a config the way `wg-quick`'s `parse_options` does: `#` starts a
     /// comment, keys match case-insensitively, and the `wg-quick` keys are
-    /// taken only inside `[Interface]`.
+    /// taken only inside `[Interface]`. Section headers and key names match
+    /// with all whitespace removed, as `wg` matches them, so `[ Peer ]` and
+    /// `Private Key` are read as `[Peer]` and `PrivateKey`.
+    ///
+    /// What is left for `wg setconf` is checked here too, because `wg`
+    /// reports a line it cannot read by echoing it on stderr, private key
+    /// and all. A `PrivateKey` or `PresharedKey` that is not a key, a key
+    /// `wg` does not read, a line outside any section and a line that is not
+    /// `Key = value` are each refused with an error that names the line and
+    /// the key, never the value.
     pub(super) fn parse(text: &str) -> Result<Parsed, String> {
         let mut p = Parsed {
             route: true,
             ..Parsed::default()
         };
-        let mut in_interface = false;
-        for line in text.lines() {
+        let mut section = Section::None;
+        for (i, line) in text.lines().enumerate() {
+            let n = i + 1;
             let stripped = line.split('#').next().unwrap_or_default();
-            let (key, value) = match stripped.split_once('=') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => (stripped.trim(), ""),
+            if stripped.chars().all(is_wg_space) {
+                p.wg_conf.push_str(line);
+                p.wg_conf.push('\n');
+                continue;
+            }
+            let Some((key, value)) = stripped.split_once('=') else {
+                section = match squeezed(stripped).to_ascii_lowercase().as_str() {
+                    "[interface]" => Section::Interface,
+                    "[peer]" => Section::Peer,
+                    _ => {
+                        return Err(format!(
+                            "line {n} is neither [Interface], [Peer] nor `Key = value`; \
+                             its text is not shown, as it may hold a key"
+                        ));
+                    }
+                };
+                p.wg_conf.push_str(line);
+                p.wg_conf.push('\n');
+                continue;
             };
-            if key.starts_with('[') {
-                in_interface = key.eq_ignore_ascii_case("[Interface]");
-            } else if key.eq_ignore_ascii_case("AllowedIPs") {
+            // `wg` reads `Private Key` as `PrivateKey`, so inner whitespace
+            // goes before the key is matched. The value loses only the
+            // whitespace `wg` strips, so a Unicode space around a key is
+            // refused here rather than echoed by `wg setconf`.
+            let (key, value) = (squeezed(key), value.trim_matches(is_wg_space));
+            let key = key.as_str();
+            let lower = key.to_ascii_lowercase();
+            let known = match section {
+                Section::None => {
+                    return Err(format!(
+                        "{} comes before any [Interface] or [Peer] section",
+                        named(key, n),
+                    ));
+                }
+                Section::Interface => WG_INTERFACE_KEYS,
+                Section::Peer => WG_PEER_KEYS,
+            };
+            if matches!(lower.as_str(), "privatekey" | "presharedkey") && !is_wg_key(value) {
+                return Err(format!(
+                    "{} is not a WireGuard key: it must be 44 characters of base64 \
+                     encoding 32 bytes, with no quotes or other text around it; its value \
+                     is not shown",
+                    named(key, n),
+                ));
+            }
+            if section == Section::Peer && lower == "allowedips" {
                 p.allowed_ips.extend(list(value));
-            } else if in_interface {
-                match key.to_ascii_lowercase().as_str() {
+            } else if section == Section::Interface {
+                match lower.as_str() {
                     "address" => {
                         p.addresses.extend(list(value));
                         continue;
@@ -1048,6 +1247,13 @@ mod native {
                     _ => {}
                 }
             }
+            if !known.contains(&lower.as_str()) {
+                return Err(format!(
+                    "{} is not a key `wg` reads in this section, so `wg setconf` would \
+                     refuse it; its value is not shown",
+                    named(key, n),
+                ));
+            }
             p.wg_conf.push_str(line);
             p.wg_conf.push('\n');
         }
@@ -1078,8 +1284,10 @@ mod native {
     }
 
     /// [`exec::run_ok`], with the error as the text a refusal carries. The
-    /// error names the command and what it printed; `stdin` — which carries
-    /// the private key — never appears in it.
+    /// error names the command and what it printed on stderr. `stdin` is not
+    /// copied into it, but a program that echoes its input on stderr puts it
+    /// there: `wg setconf` does, which is why [`configure_with`] passes its
+    /// error through [`redact_echo`].
     fn run(program: &str, args: &[&str], stdin: Option<&str>) -> Result<(), String> {
         exec::run_ok(program, args, stdin.map(str::as_bytes), exec::CHANGE)
             .map(|_| ())
@@ -1125,6 +1333,40 @@ mod native {
         )
     }
 
+    /// `wg setconf`'s error with what it echoed of the config removed.
+    ///
+    /// `wg` quotes the input it cannot read as `` `…' `` — "Key is not the
+    /// correct length or format: `<key>'", "Line unrecognized: `<line>'" —
+    /// and the config is what carries the private key. [`parse`] refuses
+    /// every line known to reach those paths, so this is the second guard:
+    /// from each backtick on a line through the last apostrophe on it (or the
+    /// end of the line, where there is none) becomes `` `<redacted>' ``. The
+    /// one span kept is the command [`exec::run_ok`] names at the very start,
+    /// `` `wg setconf <iface> /dev/stdin` ``, which carries no config.
+    pub(super) fn redact_echo(err: &str) -> String {
+        let (head, rest) = match err.strip_prefix('`').and_then(|r| r.find('`')) {
+            Some(end) => err.split_at(end + 2),
+            None => ("", err),
+        };
+        let mut out = head.to_string();
+        for (i, line) in rest.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            match line.find('`') {
+                Some(open) => {
+                    out.push_str(&line[..open]);
+                    out.push_str("`<redacted>'");
+                    if let Some(close) = line.rfind('\'').filter(|&c| c > open) {
+                        out.push_str(&line[close + 1..]);
+                    }
+                }
+                None => out.push_str(line),
+            }
+        }
+        out
+    }
+
     /// [`configure`] over the commands it runs, the route install and the
     /// route probe, so which failure is which can be tested without a link.
     pub(super) fn configure_with(
@@ -1135,7 +1377,7 @@ mod native {
         probe: impl FnOnce(&str, IpAddr) -> Result<RouteProbe, RouteProbeUnavailable>,
     ) -> Result<(), UpFailure> {
         run("wg", &["setconf", iface, "/dev/stdin"], Some(&p.wg_conf))
-            .map_err(UpFailure::Refused)?;
+            .map_err(|e| UpFailure::Refused(redact_echo(&e)))?;
         for addr in &p.addresses {
             run(
                 "ip",
@@ -1264,6 +1506,30 @@ mod tests {
             matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
             "got {r:?}",
         );
+        let r = transfer("torrentd-nonexistent-iface");
+        assert!(
+            matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
+            "got {r:?}",
+        );
+    }
+
+    /// The counters are summed across peers; a link with no peers reads
+    /// zero, and a line that cannot be read fails the probe rather than
+    /// dropping that peer's traffic from the sum.
+    #[test]
+    fn transfer_sums_every_peer_and_refuses_a_line_it_cannot_read() {
+        assert_eq!(parse_transfer(""), Ok(Transfer::default()));
+        assert_eq!(
+            parse_transfer("pkA=\t100\t2000\npkB=\t5\t7\n"),
+            Ok(Transfer { rx: 105, tx: 2007 }),
+        );
+        for bad in ["pkA=\t100\n", "pkA=\tlots\t7\n", "pkA=\t1\t2\npkB=\n"] {
+            assert_eq!(
+                parse_transfer(bad),
+                Err(ProbeUnavailable::Unparseable),
+                "{bad:?}"
+            );
+        }
     }
 
     /// [`ownership`]'s truth table, and what each answer means to the
@@ -2007,6 +2273,32 @@ Endpoint = 203.0.113.7:51820 # the exit
         }
     }
 
+    /// The exit a tracker sees is the `[Peer]`'s `Endpoint` host: the port
+    /// and an IPv6 literal's brackets come off, a comment is not part of it,
+    /// case does not tell two hosts apart, and nothing outside `[Peer]`
+    /// counts.
+    #[test]
+    fn the_endpoint_host_is_read_from_each_peer_without_its_port() {
+        assert_eq!(super::endpoint_hosts(PROVIDER_CONF), ["203.0.113.7"]);
+        let two_peers = "\
+[Interface]
+Endpoint = 198.51.100.1:1
+[peer]
+endpoint = NL-FREE-7.Example.net:51820
+[Peer]
+Endpoint = [2001:DB8::1]:51820
+[Peer]
+Endpoint = nl-free-7.example.net:443
+[Peer]
+PublicKey = x
+";
+        assert_eq!(
+            super::endpoint_hosts(two_peers),
+            ["nl-free-7.example.net", "2001:db8::1"],
+        );
+        assert!(super::endpoint_hosts("[Interface]\nAddress = 10.0.0.2/32\n").is_empty());
+    }
+
     /// Hooks are refused by name rather than skipped: the documented
     /// `PostUp = wg set %i private-key …` would otherwise leave a link with
     /// no key, which comes up and never handshakes.
@@ -2023,6 +2315,145 @@ Endpoint = 203.0.113.7:51820 # the exit
         let e = native::parse(&PROVIDER_CONF.replace("Address = 10.2.0.2/32, fd00::2/128", ""))
             .expect_err("no Address, nothing to bind a profile to");
         assert!(e.contains("Address"), "got {e}");
+    }
+
+    /// The private key in [`PROVIDER_CONF`], whose every malformed spelling
+    /// below must be refused without the refusal carrying it.
+    const KEY: &str = "SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=";
+
+    /// A secret key `wg` cannot read is refused at parse, by name and line,
+    /// never by value: handed on, `wg setconf` echoes it on stderr into the
+    /// profile's failure reason. A misspelt key, a line outside a section
+    /// and a line with no `=` are refused the same way, since `wg` echoes the
+    /// whole line for those.
+    #[test]
+    fn a_key_wg_cannot_read_is_refused_without_its_value() {
+        let private = |line: &str| PROVIDER_CONF.replace(&format!("PrivateKey = {KEY}"), line);
+        for (line, names) in [
+            (format!("PrivateKey = \"{KEY}\""), "line 3: PrivateKey"),
+            (format!("privatekey = {KEY}x"), "line 3: privatekey"),
+            (format!("PrivateKey = {KEY};"), "line 3: PrivateKey"),
+            (format!("PrivateKey = {}", &KEY[..43]), "line 3: PrivateKey"),
+            // `wg` refuses a key whose last character leaves bits set past
+            // the 32 bytes: `...rD3BEQ=` reads, `...rD3BER=` does not.
+            (
+                format!("PrivateKey = {}R=", &KEY[..42]),
+                "line 3: PrivateKey",
+            ),
+            // `wg` reads `Private Key` as `PrivateKey`, so its value is held
+            // to the same check.
+            (format!("Private Key = \"{KEY}\""), "line 3: PrivateKey"),
+            ("PrivateKey =".to_string(), "line 3: PrivateKey"),
+            (format!("PrivteKey = {KEY}"), "line 3: PrivteKey"),
+            (format!("PrivateKey: {KEY}"), "line 3"),
+            (format!("PrivateKey {KEY}"), "line 3"),
+            (format!("PrivateKey\t{}", &KEY[..43]), "line 3 is neither"),
+            // `wg` strips only ASCII whitespace, so it reads
+            // `Private<U+00A0>Key` as a key it does not know and would echo
+            // the line; the name is not letters only, so it is not shown.
+            (format!("Private\u{a0}Key = {KEY}"), "line 3 is not a key"),
+            (
+                format!("Private\u{2003}Key = \"{KEY}\""),
+                "line 3 is not a key",
+            ),
+            // `wg` keeps a Unicode space around a value, so the key fails
+            // its base64 read and the line is echoed.
+            (format!("PrivateKey = \u{a0}{KEY}"), "line 3: PrivateKey"),
+            (format!("PrivateKey = {KEY}\u{2003}"), "line 3: PrivateKey"),
+            // A line of nothing but a Unicode space is not blank to `wg`.
+            (format!("PrivateKey = {KEY}\n\u{a0}"), "line 4 is neither"),
+        ] {
+            let e = native::parse(&private(&line)).expect_err(&line);
+            assert!(!e.contains(&KEY[..43]), "{line:?} leaked the key: {e}");
+            assert!(e.contains(names), "{line:?} should name {names:?}: {e}");
+        }
+        let e = native::parse(&format!("PrivateKey = \"{KEY}\"\n{PROVIDER_CONF}"))
+            .expect_err("a key before any section");
+        assert!(
+            e.contains("line 1: PrivateKey") && !e.contains(&KEY[..43]),
+            "got {e}"
+        );
+
+        let psk = PROVIDER_CONF.replace(
+            "AllowedIPs = 0.0.0.0/0,::/0",
+            &format!("AllowedIPs = 0.0.0.0/0,::/0\nPresharedKey = '{KEY}'"),
+        );
+        let e = native::parse(&psk).expect_err("a quoted preshared key");
+        assert!(
+            e.contains("PresharedKey") && !e.contains(&KEY[..43]),
+            "got {e}"
+        );
+
+        // What `wg` does accept still parses: a preshared key, the other keys
+        // it reads, whitespace inside the value, the key name and the
+        // section header, and sections in any case.
+        let full = PROVIDER_CONF
+            .replace("[Interface]", "[ interface ]")
+            .replace("[Peer]", "[ Pe er ]")
+            .replace(
+                &format!("PrivateKey = {KEY}"),
+                // `\v` is whitespace to `wg`'s `isspace`, though not to
+                // Rust's `is_ascii_whitespace`.
+                &format!(
+                    "Private\x0bKey = {}\x0b {}\nListen Port = 51820\nFwMark = 0x1\n\x0b",
+                    &KEY[..20],
+                    &KEY[20..]
+                ),
+            )
+            .replace(
+                "AllowedIPs = 0.0.0.0/0,::/0",
+                &format!(
+                    "AllowedIPs = 0.0.0.0/0,::/0\nPresharedKey = {KEY}\nPersistentKeepalive = 25"
+                ),
+            );
+        native::parse(&full).unwrap_or_else(|e| panic!("{e}\n{full}"));
+    }
+
+    /// The second guard: whatever `wg setconf` echoes of its input is cut
+    /// out of the refusal. This is `wg`'s own stderr for a quoted key, as
+    /// `exec::run_ok` reports it.
+    #[test]
+    fn what_wg_setconf_echoes_never_reaches_the_refusal() {
+        let echoed = format!(
+            "`wg setconf wg-a /dev/stdin` exited exit status: 1: Key is not the correct length \
+             or format: `\"{KEY}\"'\nConfiguration parsing error"
+        );
+        let refused = native::configure_with(
+            "wg-a",
+            &parsed(false),
+            |p: &str, _: &[&str], _: Option<&str>| {
+                if p == "wg" {
+                    Err(echoed.clone())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| Ok(()),
+            |_, _| Ok(super::super::route::RouteProbe::ViaTunnel),
+        );
+        let Err(native::UpFailure::Refused(why)) = refused else {
+            panic!("a wg setconf failure is a refusal: {refused:?}");
+        };
+        assert!(!why.contains(&KEY[..43]), "leaked the key: {why}");
+        assert_eq!(
+            why,
+            "`wg setconf wg-a /dev/stdin` exited exit status: 1: Key is not the correct length \
+             or format: `<redacted>'\nConfiguration parsing error",
+        );
+
+        for (stderr, want) in [
+            (
+                format!("Line unrecognized: `PrivateKey={KEY}'"),
+                "Line unrecognized: `<redacted>'",
+            ),
+            // A key holding an apostrophe or a backtick is cut through the
+            // last apostrophe on its line, so no part of it is left behind.
+            (format!("bad: `ab'c{KEY}' tail"), "bad: `<redacted>' tail"),
+            (format!("bad: `a`b{KEY}"), "bad: `<redacted>'"),
+            ("no quotes here".to_string(), "no quotes here"),
+        ] {
+            assert_eq!(native::redact_echo(&stderr), want);
+        }
     }
 
     /// A split `AllowedIPs` is refused before anything is created: the

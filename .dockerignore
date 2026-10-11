@@ -9,3 +9,6 @@ target/
 *.db-shm
 *.resume
 *.resume.tmp
+# The operator's config compose.yaml mounts. It holds the argon2 hash and any
+# tokens, and `COPY . /src` would otherwise put it in the builder's layer cache.
+deploy/torrentd.toml

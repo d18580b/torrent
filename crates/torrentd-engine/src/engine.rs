@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub use libtorrent_safe::AddParams;
 pub use libtorrent_safe::Alert;
+pub use libtorrent_safe::FilePage;
 pub use libtorrent_safe::InfoHash;
 pub use libtorrent_safe::MoveFlags;
 pub use libtorrent_safe::ResumeData;
@@ -18,6 +19,7 @@ pub use libtorrent_safe::ResumeFlags;
 pub use libtorrent_safe::Settings;
 pub use libtorrent_safe::TorrentDetails;
 pub use libtorrent_safe::TorrentFile;
+pub use libtorrent_safe::TorrentFlags;
 pub use libtorrent_safe::TorrentHandle;
 pub use libtorrent_safe::TrackerEntry;
 use thiserror::Error;
@@ -79,6 +81,12 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// Announce to every tracker now rather than at the next scheduled
     /// interval. Fire-and-forget: the outcome arrives as tracker alerts.
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError>;
+    /// Clear `flags` on one torrent. Only the discovery guards
+    /// (`DISABLE_PEX`, `DISABLE_DHT`, `DISABLE_LSD`) may be cleared; any
+    /// other bit is refused and reaches no torrent. The change reaches resume
+    /// data only with the next save, so a caller that must keep it across a
+    /// restart queues one.
+    fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError>;
     /// Relocate a torrent's payload via libtorrent, so its storage state stays
     /// consistent. Asynchronous: `Alert::StorageMoved{,Failed}`.
     fn move_storage(
@@ -106,8 +114,44 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// The torrent's files in index order, or `None` while its metadata has
     /// not arrived yet.
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError>;
+    /// At most `limit` of the torrent's files from index `start` on, with
+    /// how many it has in all, or `None` while its metadata has not arrived.
+    ///
+    /// A listing pages with this rather than slicing
+    /// [`TorrentEngine::torrent_files`]: only the page is copied out of the
+    /// session, so a page of a 250,000-file torrent holds the session no
+    /// longer than a page of a small one. `limit` 0 reads the count alone.
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError>;
     /// The torrent's trackers, tier by tier, with their announce state.
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError>;
+    /// Every torrent the session holds, as the handles
+    /// [`TorrentEngine::add_torrent`] returned for them, in no order.
+    ///
+    /// Asked by the alert loop when libtorrent reports it dropped
+    /// `add_torrent_alert`s: the state map learns of a torrent from that
+    /// alert, so a torrent whose alert was lost would otherwise seed with
+    /// nothing tracking it. A torrent whose removal the session accepted is
+    /// not listed, though its `torrent_removed_alert` may still be queued.
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError>;
+    /// How many alerts this session popped from libtorrent and then lost
+    /// because the shim could not translate them. Each is dropped on its own
+    /// and the rest of its batch still delivered, so a rise is alerts lost one
+    /// at a time: possibly a `torrent_removed` or a `save_resume_data` answer
+    /// the state map then never sees.
+    ///
+    /// Monotonic for the session's lifetime, and only a [`pop_alerts`] moves
+    /// it. Never fails and never blocks behind other calls: the alert loop
+    /// asks after every drain. Once the session is closed it stays at what it
+    /// last read. No default, so a wrapping engine cannot forget to forward
+    /// it and report zero.
+    ///
+    /// [`pop_alerts`]: TorrentEngine::pop_alerts
+    fn alert_translate_errors(&self) -> u64;
     /// Destroy the session now, closing every peer and tracker socket, and
     /// answer every later call with [`EngineError::Shutdown`].
     ///
@@ -158,6 +202,9 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
         (**self).force_reannounce(h)
     }
+    fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError> {
+        (**self).unset_flags(h, flags)
+    }
     fn move_storage(
         &self,
         h: TorrentHandle,
@@ -187,8 +234,22 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
         (**self).torrent_files(h)
     }
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError> {
+        (**self).torrent_files_page(h, start, limit)
+    }
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         (**self).torrent_trackers(h)
+    }
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
+        (**self).torrents()
+    }
+    fn alert_translate_errors(&self) -> u64 {
+        (**self).alert_translate_errors()
     }
     fn close(&self) {
         (**self).close()

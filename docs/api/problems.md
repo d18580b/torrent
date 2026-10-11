@@ -40,9 +40,10 @@ says everything there is to say:
 | --- | --- |
 | `400` | A path parameter, a query parameter or a JSON body that does not parse. |
 | `401` | No bearer token, or one that is unknown, expired or revoked. `WWW-Authenticate: Bearer` accompanies it. |
+| `403` | A daemon without `[auth]` refused a request a browser sent on another site's behalf: a `Host` that is not loopback or in `allowed_hosts`, or a state change whose `Sec-Fetch-Site`, `Origin` or `Content-Type` marks it cross-site. See [the README](README.md#authentication). |
 | `404` | No route matches the path. |
 | `405` | The route exists, but not for this method. |
-| `408` | An operation that takes a body did not receive it and answer within its deadline (30 seconds, or 300 for `POST /v1/torrents`). Effects already started are not undone: an add may still complete, and a pool verification's rechecks may still start. |
+| `408` | An operation that takes a body did not receive it and answer within its deadline (30 seconds, or 300 for `POST /v1/torrents`). Effects already started are not undone: an add may still complete, and a pool verification's rechecks may still start. Adopting (`POST /v1/pool/adoptions`), creating a plan (`POST /v1/pool/plans`) and applying one put no deadline on their work: their 30 seconds bound only the body's arrival, so their `408` means the body stalled and nothing was started. |
 | `413` | The request body is over the operation's limit (64 KiB, or 96 MiB for `POST /v1/torrents`). |
 | `415` | A body whose `Content-Type` is not `application/json`. |
 | `422` | A JSON body of the wrong shape: a missing field, an unknown field, or a value of the wrong type. |
@@ -90,7 +91,9 @@ extension member.
 **409**, from `DELETE /v1/sessions/current`. The presented credential is a
 static token, or the daemon runs without authentication. Only a session token
 can be revoked here. To revoke a static token, remove it from the config and
-reload.
+restart the daemon. `[auth]` is read once, at startup: `SIGHUP` and
+`POST /v1/config/reload` log the change as needing a restart and leave the
+removed token working until then.
 
 ## `validation-failed`
 
@@ -113,6 +116,13 @@ is never silently treated as the first page.
 ## `torrent-not-found`
 
 **404.** No torrent with this infohash is assigned to any profile.
+
+The operations that act through the torrent's session — `pause`, `resume`,
+`recheck`, `reannounce`, `upload-limit`, `files`, a file's `priority`, and
+`trackers` — also answer this for a torrent that is assigned but not loaded in
+a session: one still being added, or one the boot left unloaded.
+`GET /v1/torrents` and `GET /v1/torrents/{infohash}` still list such a
+torrent, with phase `unknown`.
 
 ## `file-not-found`
 
@@ -166,12 +176,16 @@ member says why:
 
 **409**, from `POST /v1/torrents`. A torrent with this infohash is already
 assigned, to this profile or another. An infohash belongs to exactly one
-profile.
+profile. An assignment registry that cannot be written — a full or read-only
+state directory, say — is not a duplicate and answers
+[`internal`](#internal) instead: nothing was added, so retry the add.
 
 ## `torrent-adding`
 
 **409**, from `DELETE /v1/torrents/{infohash}`. The torrent is still being
-added to its session. Retry once it appears in `GET /v1/torrents`.
+added to its session. It is listed by `GET /v1/torrents` from the start, with
+phase `unknown`, so its appearing there is not the signal: retry once it lists
+a phase other than `unknown`.
 
 ## `payload-shared`
 
@@ -195,6 +209,33 @@ there. `detail` names the first file and which of these failed:
 Nothing was changed: the torrent is still in its session. Rescan
 (`POST /v1/pool/scan`) and retry, or retry without `delete_files` to remove
 the torrent alone and deal with the files by hand.
+
+It is also the answer for a torrent the boot left unloaded: no session holds
+it, so nothing can reach its payload. Nothing was changed; retry without
+`delete_files` to clear its assignment, which is refused in turn with
+[`torrent-unloaded`](#torrent-unloaded) while its resume file or `.torrent` is
+still in its profile's stores.
+
+## `torrent-unloaded`
+
+**409**, from a plain `DELETE /v1/torrents/{infohash}` (no `delete_files`).
+The boot left the torrent unloaded, and its profile's stores still hold its
+resume file or `.torrent`, which `detail` names. Those files are what the next
+boot loads it from, and for a torrent not adopted from the pool the only copy
+of its metadata, so nothing was changed. An adoption the pool index records
+`drifted` with no resume file is the exception: no boot loads it, so its
+`.torrent` does not refuse the delete, which clears it so it can be adopted
+again.
+
+A boot leaves a torrent unloaded this way when its add failed, such as a save
+path on a disk not mounted yet or a resume file libtorrent refused, or when
+its trackers fall outside the profile's `allowed_tracker_urls`. The boot logs
+a warning naming the torrent (`resume add failed` or `torrent-dir add failed`
+for a failed add), and `torrentd_boot_torrent_load_failures` counts the
+failed adds. Fix the cause and restart the
+daemon, and the torrent loads. To retire it anyway, move the named files out
+of the profile's resume and torrent directories and retry the delete; with
+nothing left behind the claim, the delete clears it.
 
 ## `metadata-pending`
 
@@ -221,9 +262,11 @@ parsed, or the `.torrent` could not be read.
 
 **422**, from `POST /v1/torrents`. The profile sets `allowed_tracker_domains`,
 and the torrent announces to a tracker outside them — a `.torrent`'s announce
-list and a magnet's `tr=` parameters are both read — or to no tracker at all.
-Every tracker must be allowed, not just one. This guards against announcing
-one account's passkey from another account's profile. `POST
+list and a magnet's `tr=` parameters are both read — to one under none of the
+profile's `allowed_tracker_urls` (another account's passkey on the same
+tracker), or to no tracker at all; the `detail` says which. Every tracker must
+be allowed, not just one. This guards against announcing one account's
+passkey from another account's profile. `POST
 /v1/pool/adoptions` refuses such a torrent the same way, in its `refused`
 list.
 
@@ -245,7 +288,9 @@ applied in its current status: it is `applying` (another request claimed it
 first), `applied` or `cancelled`.
 
 A `draft` plan can be applied. So can a `failed` one: re-applying it retries
-the steps that did not complete.
+the steps that did not complete, unless a step is still `in_progress`. That
+plan is accepted here but refused on every apply with
+[`apply-failed`](#apply-failed).
 
 ## `apply-failed`
 
@@ -253,21 +298,32 @@ the steps that did not complete.
 run at all, for example because the index could not be locked. `detail` names
 the failure.
 
+It is also the answer, on every apply, for a `failed` plan with a step still
+`in_progress`: that step's outcome is unknown, because a run died mid-batch or
+a move's wait was cut off, and nothing marks it resolved. Applying it again
+never succeeds. Inspect the step's `src` (and `dst` for a move), rescan, then
+discard the plan and build a new one.
+
 A run that starts and then stops on a failing step is **not** this problem.
 It answers `200` with an `ApplyOutcome` whose `status` is `failed`, and the
-plan's steps show how far it got. Apply it again to retry.
+plan's steps show how far it got. Apply it again to retry, unless a step is
+still `in_progress`, as above.
 
 ## `confirm-token-required`
 
 **422**, from `POST /v1/pool/plans/{plan_id}/apply`. The plan deletes data, so
-it applies only when `confirm_token` repeats the token the plan was created
-with.
+it applies only when `confirm_token` repeats the token
+`GET /v1/pool/plans/{plan_id}` currently reports for it.
 
 ## `confirm-token-mismatch`
 
 **422**, from `POST /v1/pool/plans/{plan_id}/apply`. The `confirm_token` is not
-this plan's. Tokens are derived from the plan's steps, so a token cannot be
-carried over from another plan.
+this plan's current token. A token is derived from the plan's id, its steps,
+and the pool index's generation, which every rescan advances. So a token read
+before a rescan no longer matches, even for the same plan, and that is the
+usual cause; a token from another plan never matches. Re-read the plan with
+`GET /v1/pool/plans/{plan_id}`, check that its steps are still the ones to
+apply, and re-send its fresh token.
 
 ## `delete-unconfirmed`
 
@@ -293,9 +349,9 @@ stream you no longer read, or retry in a few seconds.
 
 ## `internal`
 
-**500.** Something failed inside the daemon, most often the torrent engine or
-the pool index. `detail` says what was being attempted. The cause is logged at
-`ERROR`, just before the trace line for the response, which carries its
+**500.** Something failed inside the daemon, most often the torrent engine,
+the pool index or the assignment registry. `detail` says what was being
+attempted. The cause is logged at `ERROR`, just before the trace line for the response, which carries its
 `X-Request-Id`.
 
 [RFC 9457]: https://www.rfc-editor.org/rfc/rfc9457

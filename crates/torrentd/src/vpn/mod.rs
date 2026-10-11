@@ -24,15 +24,19 @@ pub use ip_lookup::link_standing;
 pub use ip_lookup::probe_ipv4;
 pub use ip_lookup::AddrProbeUnavailable;
 pub use natpmp::NatpmpForwarder;
+pub use openvpn::config_refusal as openvpn_config_refusal;
 pub use openvpn::OpenvpnManager;
 pub use openvpn::Released as ReleasedOpenvpn;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
+pub use wireguard::endpoint_hosts as wireguard_endpoint_hosts;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::release_recorded as release_recorded_wireguard;
 pub use wireguard::sweep_raised_records;
+pub use wireguard::transfer as wireguard_transfer;
 pub use wireguard::ProbeUnavailable as HandshakeProbeUnavailable;
 pub use wireguard::Released as ReleasedWireguard;
+pub use wireguard::Transfer as WireguardTransfer;
 pub use wireguard::WireguardManager;
 
 /// Build the matching real implementation for a `VpnType`.

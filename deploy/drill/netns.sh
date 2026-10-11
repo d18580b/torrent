@@ -203,9 +203,9 @@ ks_install() {
   local uid
   uid=$(id -u)
   nft -f - <<EOF
-add table inet torrentd_ks
-delete table inet torrentd_ks
-table inet torrentd_ks {
+add table inet torrentd_ks_$uid
+delete table inet torrentd_ks_$uid
+table inet torrentd_ks_$uid {
 	chain output {
 		type filter hook output priority 0; policy accept;
 		ip saddr $WG_ADDR oifname != { "lo", "$WG_IF" } drop
@@ -218,7 +218,7 @@ table inet torrentd_ks {
 EOF
 }
 
-ks_remove() { nft delete table inet torrentd_ks 2>/dev/null || true; }
+ks_remove() { nft delete table inet "torrentd_ks_$(id -u)" 2>/dev/null || true; }
 
 # Capture what arrives on the peer's end of the physical link, from now until
 # `capture_stop`. Each line: proto src sport dst dport [tcp flags | icmp type].

@@ -24,7 +24,9 @@ use crate::settings::MoveFlags;
 use crate::settings::ResumeFlags;
 use crate::settings::Settings;
 use crate::settings::TorrentFlags;
+use crate::torrent_info::DetailsGuard;
 use crate::torrent_info::FileListGuard;
+use crate::torrent_info::FilePage;
 use crate::torrent_info::TorrentDetails;
 use crate::torrent_info::TorrentFile;
 use crate::torrent_info::TrackerEntry;
@@ -391,6 +393,31 @@ impl Session {
         }
     }
 
+    /// Clear `flags` on one torrent; bits it does not carry stay as they are.
+    ///
+    /// Only the discovery guards — [`TorrentFlags::DISABLE_PEX`],
+    /// [`TorrentFlags::DISABLE_DHT`] and [`TorrentFlags::DISABLE_LSD`] — may
+    /// be cleared: anything else is [`Error::InvalidInput`] and reaches no
+    /// torrent, so this can never lift upload mode. libtorrent writes the
+    /// three bits into resume data, so the change survives a restart only
+    /// once a resume save follows it.
+    pub fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<()> {
+        let clearable =
+            TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD;
+        if !clearable.contains(flags) {
+            return Err(Error::InvalidInput(
+                "only DISABLE_PEX, DISABLE_DHT and DISABLE_LSD can be cleared",
+            ));
+        }
+        let rc =
+            unsafe { ffi::lt_torrent_unset_flags(self.ptr, h.id as ffi::lt_handle, flags.bits()) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
     /// Relocate the torrent's payload, letting libtorrent perform the move so
     /// its storage state stays consistent. Asynchronous — completion arrives
     /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.
@@ -424,14 +451,13 @@ impl Session {
     /// Name, size, save path, upload limit and added time of one torrent.
     /// Synchronous: libtorrent answers from its network thread.
     pub fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails> {
-        // SAFETY: all-zero is a valid lt_torrent_details (plain data).
-        let mut raw: ffi::lt_torrent_details = unsafe { std::mem::zeroed() };
+        let mut raw = DetailsGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
             ffi::lt_torrent_details(
                 self.ptr,
                 h.id as ffi::lt_handle,
-                &mut raw,
+                &mut raw.0,
                 err.ptr(),
                 err.len() as i32,
             )
@@ -439,28 +465,52 @@ impl Session {
         if rc != ffi::LT_OK as i32 {
             return Err(query_error(h, err));
         }
-        Ok(TorrentDetails::from_raw(&raw))
+        Ok(raw.details())
     }
 
     /// The torrent's files in index order, or `None` while its metadata has
     /// not arrived yet (a magnet still fetching it).
     pub fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>> {
-        self.torrent_files_raw(h).map(RawFileList::into_files)
+        self.torrent_files_raw(h, 0, usize::MAX)
+            .map(RawFileList::into_files)
     }
 
-    /// The torrent's files as the shim returned them, unconverted.
+    /// At most `limit` of the torrent's files, from index `start` on, and
+    /// how many it has in all; `None` while its metadata has not arrived.
     ///
-    /// Converting is a copy of every path, up to `LT_MAX_TORRENT_FILES` of
-    /// them, and needs nothing from the session. A caller that serialises
-    /// session access behind a lock takes this under the lock and calls
+    /// Only the page is copied out of the session, so listing a large
+    /// torrent page by page costs each page its own size, not the whole list.
+    pub fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>> {
+        self.torrent_files_raw(h, start as usize, limit as usize)
+            .map(RawFileList::into_page)
+    }
+
+    /// At most `limit` of the torrent's files from index `start` on, as the
+    /// shim returned them, unconverted. `limit` `usize::MAX` is the whole list.
+    ///
+    /// Converting is a copy of every path in the page, and needs nothing from
+    /// the session. A caller that serialises session access behind a lock
+    /// takes this under the lock and calls [`RawFileList::into_page`] or
     /// [`RawFileList::into_files`] after releasing it.
-    pub fn torrent_files_raw(&self, h: TorrentHandle) -> Result<RawFileList> {
+    pub fn torrent_files_raw(
+        &self,
+        h: TorrentHandle,
+        start: usize,
+        limit: usize,
+    ) -> Result<RawFileList> {
         let mut list = FileListGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
             ffi::lt_torrent_files(
                 self.ptr,
                 h.id as ffi::lt_handle,
+                start,
+                limit,
                 &mut list.0,
                 err.ptr(),
                 err.len() as i32,
@@ -565,23 +615,38 @@ impl std::fmt::Debug for RawFileList {
         f.debug_struct("RawFileList")
             .field("has_metadata", &(self.0 .0.has_metadata != 0))
             .field("num_files", &self.0.entries().len())
+            .field("total_files", &self.0 .0.total_files)
+            .field("first_index", &self.0 .0.first_index)
             .finish()
     }
 }
 
 impl RawFileList {
-    /// The files in index order, or `None` while the torrent's metadata has
-    /// not arrived.
+    /// The page's files in index order, or `None` while the torrent's
+    /// metadata has not arrived.
     pub fn into_files(self) -> Option<Vec<TorrentFile>> {
-        if self.0 .0.has_metadata == 0 {
+        self.into_page().map(|p| p.files)
+    }
+
+    /// The page with the torrent's file count, or `None` while the torrent's
+    /// metadata has not arrived.
+    pub fn into_page(self) -> Option<FilePage> {
+        let raw = &self.0 .0;
+        if raw.has_metadata == 0 {
             return None;
         }
-        Some(
-            (0u32..)
+        // Both fit: libtorrent indexes files with an int.
+        let total = u32::try_from(raw.total_files).unwrap_or(u32::MAX);
+        let first = u32::try_from(raw.first_index).unwrap_or(u32::MAX);
+        Some(FilePage {
+            total,
+            files: (first..)
                 .zip(self.0.entries())
-                .map(|(i, f)| TorrentFile::from_raw(i, f))
+                // SAFETY: the shim filled these entries, and their paths
+                // live in the list until the guard drops, after this copy.
+                .map(|(i, f)| unsafe { TorrentFile::from_raw(i, f) })
                 .collect(),
-        )
+        })
     }
 }
 
@@ -650,15 +715,31 @@ fn key_of(hashes: InfoHashes) -> Result<InfoHash> {
 /// a magnet's `tr=` parameters, or — for resume data — its own `trackers`
 /// list, which replaces the attached `.torrent`'s.
 ///
+/// `url_prefixes`, when not empty, is the account binding: every tracker must
+/// also be announced under one of these announce-URL prefixes, as
+/// [`announce_url_has_prefix`] reads one.
+///
 /// [`TrackerVerdict::NotAllowed`] when any tracker is outside `domains` or has
 /// no host libtorrent can read, and when `domains` is empty;
+/// [`TrackerVerdict::AccountMismatch`] when every host is on `domains` but a
+/// tracker is under none of `url_prefixes`;
 /// [`TrackerVerdict::NoTrackers`] when there is no tracker at all. An `Err` is
 /// a source the shim cannot parse, which the add would refuse too.
-pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<TrackerVerdict> {
+pub fn add_trackers_allowed(
+    params: &AddParams,
+    domains: &[String],
+    url_prefixes: &[String],
+) -> Result<TrackerVerdict> {
     if domains.is_empty() {
         return Ok(TrackerVerdict::NotAllowed);
     }
     let csv_c = c_string(domains.join(","), "allowed_tracker_domains")?;
+    let prefixes_c = url_prefixes
+        .iter()
+        .map(|p| c_string(p.as_str(), "allowed_tracker_urls"))
+        .collect::<Result<Vec<_>>>()?;
+    let prefix_ptrs: Vec<*const std::os::raw::c_char> =
+        prefixes_c.iter().map(|c| c.as_ptr()).collect();
     let buf = |b: Option<&Vec<u8>>| match b {
         Some(b) if !b.is_empty() => (b.as_ptr(), b.len()),
         _ => (std::ptr::null(), 0),
@@ -703,6 +784,12 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<Tr
             resume.0,
             resume.1,
             csv_c.as_ptr(),
+            if prefix_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                prefix_ptrs.as_ptr()
+            },
+            prefix_ptrs.len(),
             err.ptr(),
             err.len() as i32,
         )
@@ -711,8 +798,25 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<Tr
         1 => Ok(TrackerVerdict::Allowed),
         0 => Ok(TrackerVerdict::NotAllowed),
         rc if rc == ffi::LT_NO_TRACKERS as i32 => Ok(TrackerVerdict::NoTrackers),
+        rc if rc == ffi::LT_TRACKER_ACCOUNT_MISMATCH as i32 => Ok(TrackerVerdict::AccountMismatch),
         _ => Err(Error::Shim(err.into_string())),
     }
+}
+
+/// Whether announce URL `url` falls under the announce-URL prefix `prefix`,
+/// the rule [`add_trackers_allowed`] applies to its `url_prefixes`.
+///
+/// `prefix` is `scheme://authority/...`. Its scheme and authority must equal
+/// the URL's, compared case-insensitively; the rest must be a byte-exact
+/// prefix of the URL's that ends at a boundary — the prefix ends in `/`, `?`
+/// or `&`, or the URL ends there or goes on with one of `/?&#;` — so
+/// `?passkey=a` does not admit `?passkey=ab`. A prefix of any other shape, or
+/// either argument holding a NUL, matches nothing.
+pub fn announce_url_has_prefix(url: &str, prefix: &str) -> bool {
+    let (Ok(url), Ok(prefix)) = (CString::new(url), CString::new(prefix)) else {
+        return false;
+    };
+    unsafe { ffi::lt_announce_url_has_prefix(url.as_ptr(), prefix.as_ptr()) == 1 }
 }
 
 /// What [`add_trackers_allowed`] found.
@@ -722,6 +826,10 @@ pub enum TrackerVerdict {
     Allowed,
     /// A tracker is outside the domains, or has no host libtorrent can read.
     NotAllowed,
+    /// Every tracker's host is on the domains, but one is announced under
+    /// none of the account's URL prefixes: another account on the same
+    /// tracker.
+    AccountMismatch,
     /// The add would announce to no tracker at all.
     NoTrackers,
 }

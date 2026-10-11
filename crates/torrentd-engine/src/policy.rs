@@ -58,23 +58,69 @@ pub fn forbidden() -> TorrentFlags {
 /// Safety Rules 5 and 6: PEX, DHT and LSD are disabled unconditionally on
 /// every torrent in a tunnelled profile, belt-and-braces against the torrent's
 /// own `private` bit being wrong. A host profile keeps them — that posture is
-/// public by definition, and its DHT is whatever it asked for.
+/// public by definition, and its DHT is whatever it asked for — except on a
+/// magnet, whose `private` bit is unknown when it is added: see
+/// [`magnet_flags`].
 ///
 /// This keys off the profile's declared network, not off its *name*. It used
 /// to branch on whether the id happened to be `default`, which a config could
 /// satisfy by accident and thereby seed a tunnelled profile with PEX on.
 pub fn discovery_guards(profile: &ProfileConfig) -> TorrentFlags {
     if profile.is_vpn() {
-        TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
+        discovery_off()
     } else {
         TorrentFlags::empty()
     }
+}
+
+/// DHT, PEX and LSD, each disabled for one torrent.
+fn discovery_off() -> TorrentFlags {
+    TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
 }
 
 /// Flags for an add whose payload is believed complete, so libtorrent may skip
 /// hashing (`SEED_MODE`) and seed immediately.
 pub fn seed_flags(profile: &ProfileConfig) -> TorrentFlags {
     TorrentFlags::SEED_MODE | no_download() | discovery_guards(profile)
+}
+
+/// Flags for a magnet add, on any profile: [`seed_flags`] with DHT, PEX and
+/// LSD disabled whatever the profile's posture.
+///
+/// A host profile otherwise trusts the torrent's own `private` bit, and a
+/// magnet has none until its metadata arrives. libtorrent announces a torrent
+/// without valid metadata on the DHT regardless (`torrent::should_announce_dht`
+/// checks `priv()` only once `m_torrent_file->is_valid()`), so a private
+/// tracker's magnet on a host profile with `dht = true` would publish its
+/// infohash and the host's address before anything could know it is private:
+/// a BEP 27 breach the tracker can see.
+///
+/// Until its metadata arrives, a magnet on a host profile therefore finds its
+/// metadata and its peers through its trackers only, and a magnet with no
+/// `tr=` only from a peer its `x.pe` names. Once the metadata arrives and
+/// shows the torrent public, the `metadata_received` handler clears
+/// [`public_magnet_lift`] and saves resume data; private metadata keeps the
+/// guard for good.
+///
+/// libtorrent keeps the three bits in the resume data it writes, so a guard
+/// still standing survives a restart that reloads that resume data, and
+/// [`resume_flags_set_without_metadata`] re-asserts it on one that reloads it
+/// still without metadata. A former magnet the boot torrent-dir scan re-adds
+/// from its `.torrent` alone, with no resume file, gets the profile's own
+/// posture instead: by then its `private` bit is known, and libtorrent
+/// honours it.
+pub fn magnet_flags(profile: &ProfileConfig) -> TorrentFlags {
+    seed_flags(profile) | discovery_off()
+}
+
+/// The part of [`magnet_flags`]' guard a magnet in `profile` sheds once its
+/// metadata shows it is public: DHT, PEX and LSD less what the profile's own
+/// [`discovery_guards`] keep. All three on a host profile, where a public
+/// torrent is as entitled to them as one added from a `.torrent`; none on a
+/// `vpn` profile, which keeps them on every torrent whatever its metadata
+/// says.
+pub fn public_magnet_lift(profile: &ProfileConfig) -> TorrentFlags {
+    discovery_off() - discovery_guards(profile)
 }
 
 /// Flags for an add that must be hash-checked before it seeds. Deliberately no
@@ -97,6 +143,19 @@ pub fn resume_flags_set(profile: &ProfileConfig) -> TorrentFlags {
     no_download() | discovery_guards(profile)
 }
 
+/// Flags re-asserted when loading resume data with no metadata beside it:
+/// [`resume_flags_set`] with DHT, PEX and LSD disabled whatever the profile's
+/// posture, as [`magnet_flags`] does for a magnet add.
+///
+/// Such a torrent reloads exactly as a magnet does: its `private` bit is
+/// unknown until its metadata arrives, and libtorrent announces it on the DHT
+/// meanwhile. Resume data for a magnet added before [`magnet_flags`] existed
+/// carries no discovery bits, so without this it would reload on a host
+/// profile with DHT on and announce its infohash again.
+pub fn resume_flags_set_without_metadata(profile: &ProfileConfig) -> TorrentFlags {
+    resume_flags_set(profile) | discovery_off()
+}
+
 /// Flags cleared when loading resume data: everything [`forbidden`], which
 /// resume data written by another client (or by this one, before the guard)
 /// may carry. A caller adds what it clears for its own reasons, such as
@@ -112,6 +171,14 @@ pub enum TrackerRefusal {
     /// `allowed_tracker_domains`, or to one whose host cannot be read.
     #[error("the torrent announces to a tracker outside the profile's allowed_tracker_domains")]
     NotAllowed,
+    /// Every tracker is on the profile's domains, but one announce URL is
+    /// under none of its `allowed_tracker_urls`: the torrent belongs to
+    /// another account on the same tracker.
+    #[error(
+        "the torrent announces to a tracker under none of the profile's allowed_tracker_urls, so \
+         it carries another account's passkey"
+    )]
+    ForeignAccount,
     /// The add would announce to no tracker at all, which names no account
     /// the profile holds. A `.torrent` another client wrote without its
     /// trackers, and no resume data carrying them, is the usual cause.
@@ -130,9 +197,14 @@ pub enum TrackerRefusal {
 ///
 /// A profile that sets `allowed_tracker_domains` — every `vpn` profile must —
 /// takes a torrent only when **every** tracker it would announce to is on
-/// that list, and it announces to at least one. This is what keeps one
-/// account's passkey from being announced from another account's session, so
-/// it is checked on all five add paths — `POST /v1/torrents`, pool adoption
+/// that list, and it announces to at least one. The list compares hosts, so
+/// it separates trackers; a profile that also sets `allowed_tracker_urls`
+/// further requires every announce URL to fall under one of those prefixes,
+/// which carry the account's passkey, and that is what separates two
+/// accounts on one tracker (`ProfileConfig::validate_set` requires it of
+/// two profiles whose domains overlap). This is what keeps one account's
+/// passkey from being announced from another account's session, so it is
+/// checked on all five add paths — `POST /v1/torrents`, pool adoption
 /// (the resume fast path and the verify queue), the startup resume reload and
 /// the startup torrent-dir scan — against the exact params each hands the
 /// session, before that session sees them.
@@ -152,20 +224,24 @@ pub fn check_trackers(
     if domains.is_empty() {
         return Ok(());
     }
-    match libtorrent_safe::add_trackers_allowed(params, domains) {
+    match libtorrent_safe::add_trackers_allowed(params, domains, &profile.allowed_tracker_urls) {
         Ok(TrackerVerdict::Allowed) => Ok(()),
         Ok(TrackerVerdict::NotAllowed) => Err(TrackerRefusal::NotAllowed),
+        Ok(TrackerVerdict::AccountMismatch) => Err(TrackerRefusal::ForeignAccount),
         Ok(TrackerVerdict::NoTrackers) => Err(TrackerRefusal::NoTrackers),
         Err(e) => Err(TrackerRefusal::Unreadable(e)),
     }
 }
 
 impl TrackerRefusal {
-    /// Whether the guard itself refused the add — a foreign tracker or none
-    /// at all — as opposed to a source it could not read. Each add path
-    /// counts these in `profile_assignment_registry_errors_total`.
+    /// Whether the guard itself refused the add — a foreign tracker, another
+    /// account's, or none at all — as opposed to a source it could not read.
+    /// Each add path counts these in `profile_assignment_registry_errors_total`.
     pub fn is_guard_refusal(&self) -> bool {
-        matches!(self, Self::NotAllowed | Self::NoTrackers)
+        matches!(
+            self,
+            Self::NotAllowed | Self::ForeignAccount | Self::NoTrackers
+        )
     }
 }
 
@@ -194,6 +270,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -210,6 +287,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -265,6 +343,49 @@ mod tests {
         let p = host();
         assert!(!seed_flags(&p).contains(TorrentFlags::DISABLE_DHT));
         assert!(!seed_flags(&p).contains(TorrentFlags::DISABLE_PEX));
+    }
+
+    #[test]
+    fn a_magnet_disables_discovery_on_every_profile() {
+        // A DHT-enabled host profile set up for a private tracker's account:
+        // the magnet's `private` bit is unknown until its metadata arrives.
+        let mut guarded_host = host();
+        guarded_host.allowed_tracker_domains = vec!["tracker.example".into()];
+        for p in [host(), guarded_host, vpn()] {
+            let flags = magnet_flags(&p);
+            assert!(flags.contains(discovery_off()), "{} {flags:?}", p.id);
+            assert!(flags.contains(seed_flags(&p)), "{} {flags:?}", p.id);
+            assert!(!flags.intersects(forbidden()), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn public_metadata_lifts_the_magnet_guard_to_the_profiles_own_posture() {
+        // What a magnet keeps once the lift is cleared is exactly what a
+        // `.torrent` add of the same public torrent would carry.
+        for p in [host(), vpn()] {
+            assert_eq!(
+                magnet_flags(&p) - public_magnet_lift(&p),
+                seed_flags(&p),
+                "{}",
+                p.id,
+            );
+        }
+        assert_eq!(public_magnet_lift(&host()), discovery_off());
+        assert!(public_magnet_lift(&vpn()).is_empty());
+    }
+
+    #[test]
+    fn resume_data_without_metadata_disables_discovery_on_every_profile() {
+        for p in [host(), vpn()] {
+            let flags = resume_flags_set_without_metadata(&p);
+            assert!(flags.contains(discovery_off()), "{} {flags:?}", p.id);
+            assert!(flags.contains(resume_flags_set(&p)), "{} {flags:?}", p.id);
+            assert!(!flags.contains(TorrentFlags::SEED_MODE), "{flags:?}");
+            assert!(!flags.intersects(forbidden()), "{flags:?}");
+        }
+        // Resume data with metadata beside it keeps the host's posture.
+        assert!(!resume_flags_set(&host()).intersects(discovery_off()));
     }
 
     #[test]
@@ -362,7 +483,11 @@ mod tests {
     fn allowed(p: &ProfileConfig, params: &libtorrent_safe::AddParams) -> bool {
         match check_trackers(p, params) {
             Ok(()) => true,
-            Err(TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers) => false,
+            Err(
+                TrackerRefusal::NotAllowed
+                | TrackerRefusal::ForeignAccount
+                | TrackerRefusal::NoTrackers,
+            ) => false,
             Err(e) => panic!("unexpected {e}"),
         }
     }
@@ -480,6 +605,60 @@ mod tests {
         // None given keeps the `.torrent`'s.
         assert!(allowed(&p, &file_with(torrent(&[OURS]), &[])));
         assert!(no_trackers(&p, &file_with(bare, &[&[]])));
+    }
+
+    /// Issue 166: two accounts on one tracker. Account A's announce URLs
+    /// pass account B's domain list, and only B's account binding refuses
+    /// them — on every source an add path hands the guard: a `.torrent`
+    /// (API file, `server_path`, the boot torrent-dir scan, the verify
+    /// queue), one with resume trackers in place of its own (adoption), a
+    /// magnet's `tr=`, and resume data (the boot resume scan, adoption's fast
+    /// path).
+    #[test]
+    fn an_account_binding_refuses_another_accounts_passkey_on_every_source() {
+        const A: &str = "https://tracker.example/PASS-A/announce";
+        const A_UDP: &str = "udp://tracker.example:6969/PASS-A/announce";
+        const B: &str = "https://tracker.example/PASS-B/announce";
+        let mut acct_b = guarded();
+        acct_b.allowed_tracker_urls = vec!["https://tracker.example/PASS-B/".into()];
+        let mut acct_a = guarded();
+        acct_a.allowed_tracker_urls = vec![
+            "https://tracker.example/PASS-A/".into(),
+            "udp://tracker.example:6969/PASS-A/".into(),
+        ];
+        let foreign = |p: &ProfileConfig, params: &libtorrent_safe::AddParams| {
+            matches!(
+                check_trackers(p, params),
+                Err(TrackerRefusal::ForeignAccount)
+            )
+        };
+        let enc = |u: &str| u.replace(':', "%3A").replace('/', "%2F");
+        let a_torrent = torrent(&[A, A_UDP]);
+        let bare = torrent(&[]);
+        let sources = [
+            file(a_torrent.clone()),
+            file_with(bare.clone(), &[&[A], &[A_UDP]]),
+            magnet(&format!("&tr={}&tr={}", enc(A), enc(A_UDP))),
+            resumed(resume(&a_torrent, None), Some(a_torrent.clone())),
+            resumed(resume(&bare, Some(&[A, A_UDP])), Some(bare.clone())),
+            resumed(resume(&bare, Some(&[A])), None),
+        ];
+        for params in &sources {
+            // The domain list alone admits it: the hole the binding closes.
+            assert!(allowed(&guarded(), params));
+            assert!(foreign(&acct_b, params));
+            assert!(allowed(&acct_a, params));
+        }
+        // One of A's trackers beside one of B's is still B's passkey
+        // announced from A's session.
+        assert!(foreign(&acct_a, &file(torrent(&[A, B]))));
+        // A foreign tracker is reported as one, binding or not.
+        assert!(matches!(
+            check_trackers(&acct_a, &file(torrent(&[A, FOREIGN]))),
+            Err(TrackerRefusal::NotAllowed)
+        ));
+        assert!(no_trackers(&acct_a, &file(torrent(&[]))));
+        assert!(TrackerRefusal::ForeignAccount.is_guard_refusal());
     }
 
     #[test]

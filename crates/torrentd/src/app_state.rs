@@ -61,6 +61,8 @@ pub struct AppState {
     pub reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
     /// Peers whose forwarding headers are believed. Empty means none are.
     pub trusted_proxies: crate::http::forwarded::TrustedProxies,
+    /// Host names a daemon without `[auth]` answers to beyond loopback.
+    pub allowed_hosts: crate::http::security::HostAllowlist,
     /// Info-hashes the assignment registry held after the startup scans that
     /// no scan loaded into a session: the only entries known to be held by
     /// no session at all.
@@ -84,6 +86,10 @@ pub struct AppState {
     /// How setting a fenced profile online probes its tunnel before it lifts
     /// the fence: the host's own probes outside tests.
     pub tunnel_probe: crate::vpn_monitor::Prober,
+    /// The kill-switch watch's fence, where `network_kill_switch` is on. An
+    /// add that finds its profile fenced records what it paused with it, so
+    /// the fence's lift resumes that too.
+    pub kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
@@ -290,6 +296,7 @@ pub(crate) fn build_test_state_with_sessions(
         torrent_dir: std::env::temp_dir(),
         reload_tx: None,
         trusted_proxies: Default::default(),
+        allowed_hosts: Default::default(),
         unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
         shutdown: tokio::sync::broadcast::channel(4).0,
         work: Arc::default(),
@@ -301,6 +308,7 @@ pub(crate) fn build_test_state_with_sessions(
             route: None,
             handshake: None,
         }),
+        kill_switch: None,
     }
 }
 

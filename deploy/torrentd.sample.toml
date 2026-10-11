@@ -14,17 +14,41 @@ torrent_dir       = "/var/lib/torrentd/torrents"
 http_listen       = "127.0.0.1:8080"   # loopback by default
 log_level         = "info"   # error | warn | info | debug (reloadable)
 
+# Or serve the API on a unix socket, and on no TCP port: connecting takes
+# write permission on the socket, so its mode and group decide who may call
+# the API, and nobody else can take its path over while the daemon is down.
+# torrentctl uses /run/torrentd/api.sock whenever it exists. The directory
+# must exist (RuntimeDirectory=torrentd in a drop-in for the unit), and a
+# socket serves no Prometheus scrape (docs/running.md §6). The two socket keys
+# are refused beside a TCP http_listen. Read once, at startup.
+# http_listen       = "unix:/run/torrentd/api.sock"
+# http_socket_mode  = 0o660        # an octal integer; the default
+# http_socket_group = "torrentd"   # default: the daemon's own group
+
 # The daemon refuses to start unless you either configure [auth] (see the
 # bottom of this file) or say here that you do not want authentication. This
 # sample takes the second option because it binds loopback, where access
-# control is the reverse proxy's job. Delete this line and configure [auth]
-# before exposing the API anywhere — a non-loopback bind without [auth] is
-# refused outright.
+# control is the reverse proxy's job. That holds only on a single-user host,
+# or in a network namespace or container no other uid shares: every local
+# user can reach 127.0.0.1, and without [auth] any of them controls the
+# daemon (docs/running.md §6). On a shared host, either move http_listen to
+# a unix socket whose mode and group admit only the operators, or delete
+# this line and configure [auth]. Before exposing the API anywhere, configure
+# [auth]: a non-loopback bind without it is refused outright, and so is a
+# socket whose mode lets every user connect.
 #
 # Read once, at startup, like [auth], http_listen and trusted_proxies: editing
 # any of the four takes effect on restart, not on SIGHUP. A reload after such an
 # edit warns "requires daemon restart; ignored" and changes nothing.
 allow_unauthenticated = true
+
+# Without [auth], a request whose Host is not loopback (localhost, 127.0.0.0/8,
+# [::1]) is refused, so a web page whose name rebinds to 127.0.0.1 cannot read
+# the API. A reverse proxy in front of this daemon passes its own name through
+# as Host (Caddy does by default; nginx needs `proxy_set_header Host $host;`):
+# list that name here. Names or addresses only, no scheme or port. Refused
+# beside [auth]. Read once, at startup.
+# allowed_hosts = ["torrentd.example.com"]
 
 # Peers whose forwarding headers are believed, as IPs or CIDR blocks. There
 # are three such headers and all three are read: X-Forwarded-For,
@@ -106,6 +130,12 @@ enable_lsd = false
 # agent is a client that does not exist. Nothing checks the pairing; take both
 # from the one client a profile presents as, as every example in this file
 # does ("-qB4630-" is qBittorrent 4.6.3's prefix).
+#
+# Only the prefix and the strings change: the rest of the peer id, the
+# extension handshake and the announce parameters stay libtorrent's. Name a
+# client built on libtorrent 2.0, in a version that ships on it — qBittorrent
+# or Deluge, as every example here does — never Transmission or rTorrent,
+# whose identity a tracker can tell this daemon's wire behaviour from.
 # peer_fingerprint = "-qB4630-"
 # user_agent       = "qBittorrent/4.6.3"
 
@@ -122,7 +152,7 @@ enable_lsd = false
 # shutdown_drain_secs = 60
 
 # Defence-in-depth kill switch. When true, torrentd installs a fail-closed
-# nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
+# nftables table (`torrentd_ks_<uid>`) confining the daemon's own egress to loopback
 # and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel
 # drops the traffic regardless of libtorrent's socket bind or the 30s monitor.
 # Removed cleanly on SIGTERM.
@@ -202,8 +232,8 @@ dht               = true
 # is fine, since neither store descends into a subdirectory.
 # resume_dir           = "/var/lib/torrentd/resume/public"
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
-# peer_fingerprint     = "-TR3000-"
-# user_agent           = "Transmission/3.00"
+# peer_fingerprint     = "-qB4670-"
+# user_agent           = "qBittorrent/4.6.7"
 # Per-profile upload cap in bytes/sec, overriding the daemon-wide key above.
 # `0` here means *unlimited* for this profile, not "unset": writing it is how
 # you uncap one account while the daemon-wide key caps the rest. Omit the key
@@ -231,21 +261,37 @@ dht               = true
 # The eight rules this is built on, and why each exists, are documented on the
 # `torrentd-engine::profile` module.
 #
-# `allowed_tracker_domains` is the account-isolation guard, and a vpn profile
-# must set it: the domains of the trackers this account belongs to. Every
-# torrent the profile takes — added over the API, adopted from the pool, or
-# found at startup in its resume or `.torrent` directory — must announce only
-# to trackers on those domains or their subdomains, and to at least one. One
+# `allowed_tracker_domains` is the tracker guard, and a vpn profile must set
+# it: the domains of the trackers this account belongs to. Every torrent the
+# profile takes — added over the API, adopted from the pool, or found at
+# startup in its resume or `.torrent` directory — must announce only to
+# trackers on those domains or their subdomains, and to at least one. One
 # tracker outside the list refuses the torrent, whatever else it announces
 # to; a resume file's own tracker list is what is checked where it has one.
-# It keeps one account's torrent, and its passkey, from being announced from
-# another account's tunnel. It is not an egress control. A host profile may
-# set it too, and is not checked when it does not.
+# It compares only the tracker's host, so it keeps apart accounts on
+# different trackers, and cannot tell two accounts on one tracker apart. It is
+# not an egress control. A host profile may set it too, and is not checked
+# when it does not.
+#
+# `allowed_tracker_urls` tells two accounts on one tracker apart: the start of
+# this account's announce URLs, up to and including its passkey, such as
+# "https://tracker.example.com/<passkey>/". Every announce URL must then also
+# fall under one of them, on the same add paths. Two profiles whose
+# `allowed_tracker_domains` overlap — like the two below, both on
+# tracker.example.com — are refused at load unless both set it, with
+# prefixes that do not overlap. Each entry holds a passkey: keep this file
+# private. No error and no API response repeats one.
 
 # The port here shares one namespace with the ports `public` binds above, so
 # it is 6891 rather than 6881: an announced port that two profiles share is
 # what correlates them to a tracker operator, whichever address each announced
 # from.
+#
+# The address a tracker sees is the tunnel's exit, not its own address, and a
+# shared exit correlates two accounts as surely as a shared port: give each
+# vpn profile a WireGuard config for a different server (its `[Peer]`
+# `Endpoint`). Startup warns, naming the profiles, when two configs name the
+# same Endpoint host. See "Account isolation" in docs/running.md.
 #
 # [[profile]]
 # id                       = "account_a"
@@ -259,6 +305,7 @@ dht               = true
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
+# allowed_tracker_urls     = ["https://tracker.example.com/<account_a's passkey>/"]
 # `0` means unlimited for this profile, overriding the daemon-wide cap; omit
 # the key to inherit it.
 # upload_rate_limit        = 0
@@ -279,11 +326,12 @@ dht               = true
 # vpn_interface            = "proton-a"
 # port_forward             = "natpmp"
 # port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
-# peer_fingerprint         = "-TR4060-"
-# user_agent               = "Transmission/4.0.6"
+# peer_fingerprint         = "-DE211s-"
+# user_agent               = "Deluge/2.1.1 libtorrent/2.0.14.0"
 # resume_dir               = "/var/lib/torrentd/resume/proton_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
+# allowed_tracker_urls     = ["https://tracker.example.com/<proton_a's passkey>/"]
 
 # A two-account deployment, live and uncommented, is in
 # deploy/torrentd.multi-account.sample.toml. Both files are parsed and
@@ -305,9 +353,13 @@ dht               = true
 # only reads, but there is no reason to have the other client's live state
 # directory open at all.
 #
-#   torrentd --config /etc/torrentd/torrentd.toml pool scan
-#   torrentd --config /etc/torrentd/torrentd.toml pool status
-#   torrentd --config /etc/torrentd/torrentd.toml pool orphans
+#   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool scan
+#   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool status
+#   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool orphans
+#
+# Run them as the daemon's user: run as root, `pool scan` creates `pool.db`
+# (and `registry.db`, with `import_legacy_registry` set) owned by root, which
+# the daemon cannot write, and the next start fails.
 #
 # The index schema moves forward one way. The first open on this build
 # migrates the torrent→account column from `slot` to `profile`, and a build
@@ -320,8 +372,11 @@ dht               = true
 # space equal to the size of `pool.db`. If it cannot be written the migration
 # stops, names the backup path and the reason, and leaves the index as it was.
 # Nothing deletes it afterwards and nothing ages it out: remove it yourself
-# once you would not go back. An existing copy at that path is kept as it is and
-# no new one is taken — but only where it really is one: it has to be a pool
+# once you would not go back. Where a copy is already at that path, a fresh one
+# is taken beside it as `<db_path>.pre-v3.bak.new`, which needs that free space
+# again; once the migration commits it replaces the old copy, and if the
+# migration fails it is discarded and the old copy stays. That holds only where
+# what is at that path really is a copy: it has to be a pool
 # index, at a schema version this build understands, and not this same `pool.db`
 # reached through a symlink. Anything else stops the migration instead, because
 # keeping it would run the one-way rename with no rollback at all.
@@ -364,8 +419,13 @@ dht               = true
 # with a non-loopback `http_listen` is refused, because that is an
 # unauthenticated mutating API on the network. So the two safe shapes are:
 #
-#   loopback + allow_unauthenticated   access control is the proxy's job
+#   loopback + allow_unauthenticated   access control is the proxy's job;
+#                                      single-user host only
 #   any bind + [auth]                  the daemon authenticates itself
+#
+# Every local uid can reach 127.0.0.1, so on a shared host the first shape
+# hands every local user full control of the daemon: use the second there
+# (docs/running.md §6).
 #
 # This sample ships the first, because it binds loopback: see
 # `allow_unauthenticated` in the daemon-wide block at the top. Configure [auth]

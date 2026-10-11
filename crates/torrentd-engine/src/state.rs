@@ -164,10 +164,12 @@ pub struct TorrentState {
     pub is_finished: bool,
     pub is_seeding: bool,
     /// libtorrent holds an error on this torrent, as of the last
-    /// state_update_alert. A disk error that libtorrent does not route to
-    /// upload mode (every read failure, and any failure while checking) sets
-    /// one *and* pauses the torrent; `resume()` clears both. This is what the
-    /// disk-error retry has to recover, so it is what the retry keys on.
+    /// state_update_alert. A disk error that reaches libtorrent's
+    /// `handle_disk_error` and is not routed to upload mode (any failure while
+    /// checking, a failed `read_piece`) sets one *and* pauses the torrent;
+    /// `resume()` clears both, so the disk-error retry resumes a torrent that
+    /// has one. A failed disk read for a peer's request sets neither: that
+    /// torrent stays `DiskError` with this false, and the retry re-checks it.
     pub has_error: bool,
     /// Outcome of the most recent `move_storage`, or `None` if none was ever
     /// requested.
@@ -240,11 +242,16 @@ impl TorrentState {
 ///   dispatcher (`StateMap::dispatch_resume_saves`), because every request
 ///   becomes an alert, and a 100K-torrent burst into a bounded alert queue is
 ///   exactly how alerts get dropped.
+/// * `again` — in flight, and changed since that request was handed over: a
+///   recheck's verdict, a move's new save path or a pause landed after it. The
+///   answer already on its way may predate the change, so its settle queues
+///   one more save, unconditional.
 #[derive(Debug, Default)]
 struct ResumeSaves {
     queued: VecDeque<(InfoHash, ResumeFlags)>,
     queued_set: HashSet<InfoHash>,
     in_flight: HashMap<InfoHash, ResumeFlags>,
+    again: HashSet<InfoHash>,
 }
 
 /// Retry deadlines, earliest on top: `(next_attempt, infohash bytes)`.
@@ -306,6 +313,10 @@ pub struct StateMap {
     /// removal's file deletes, so an add that marks one re-added either lands
     /// before them (and they are skipped) or after them.
     removals: Mutex<HashMap<(ProfileId, InfoHash), PendingRemoval>>,
+    /// Resume files a removal failed to delete. Each is the removed torrent's,
+    /// not whichever torrent the profile adds under the info-hash next, so
+    /// that add's first save must not be skipped for finding it.
+    stale_resume_files: Mutex<HashSet<(ProfileId, InfoHash)>>,
 }
 
 impl Default for StateMap {
@@ -315,6 +326,7 @@ impl Default for StateMap {
             saves: Mutex::new(ResumeSaves::default()),
             retry_heap: Mutex::new(BinaryHeap::new()),
             removals: Mutex::new(HashMap::new()),
+            stale_resume_files: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -346,6 +358,34 @@ impl StateMap {
         self.inner.insert(ih, state);
         if let Some(at) = armed {
             self.retry_heap.lock().push(Reverse((at, ih.0)));
+        }
+    }
+
+    /// Track `handle`, a torrent `profile`'s session holds, unless the map
+    /// already tracks that very torrent for that profile. Returns whether it
+    /// inserted a fresh entry.
+    ///
+    /// Every path that learns of a torrent goes through this: the boot scans
+    /// with the handle `add_torrent` returned, the `add_torrent_alert`
+    /// handler, and the reconciliation after libtorrent dropped such alerts.
+    /// More than one of them can report the same torrent, and the later one
+    /// must not reset what the earlier one's entry has gathered since. An
+    /// entry under another handle or profile is a torrent the info-hash has
+    /// outlived, and is replaced, as an add has always replaced it.
+    pub fn track_added(&self, handle: TorrentHandle, profile: &ProfileId, now: Instant) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(handle.infohash) {
+            Entry::Occupied(e) if e.get().handle == handle && e.get().profile_id == *profile => {
+                false
+            }
+            Entry::Occupied(mut e) => {
+                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                true
+            }
+            Entry::Vacant(e) => {
+                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                true
+            }
         }
     }
 
@@ -447,6 +487,67 @@ impl StateMap {
             entry_released: !self.inner.contains_key(ih),
             readded,
         }
+    }
+
+    /// Settle the removal of `profile`'s torrent `handle` as its
+    /// `torrent_removed_alert` would, for an overflow that may have dropped
+    /// that alert: drop the entry, and run `delete_files` with whether the
+    /// profile has added the info-hash again since. Returns `None`, changing
+    /// nothing and running nothing, unless a removal of that very torrent was
+    /// recorded ([`Self::begin_removal`]) and the map still holds its entry.
+    ///
+    /// The caller has seen that the session no longer holds `handle`. That
+    /// does not mean the alert was lost: libtorrent posts it only once the
+    /// torrent's disk jobs are aborted, after it has left the session's list.
+    /// So the record is kept, for an alert still to come to settle as
+    /// [`Self::settle_removal`] always has, by this handle and with what it
+    /// knows about a re-add, rather than as a removal nobody recorded, which
+    /// would drop and delete whatever the profile added under the info-hash
+    /// since. A record whose alert was lost stays until the next removal of
+    /// the info-hash in this profile replaces it.
+    ///
+    /// `delete_files` runs under the lock [`Self::note_readded`] takes, as in
+    /// [`Self::settle_removal`].
+    pub fn reconcile_removal(
+        &self,
+        profile: &ProfileId,
+        handle: TorrentHandle,
+        delete_files: impl FnOnce(bool),
+    ) -> Option<RemovalSettled> {
+        let ih = handle.infohash;
+        let removals = self.removals.lock();
+        let pending = removals
+            .get(&(profile.clone(), ih))
+            .filter(|p| p.handle == handle)?;
+        self.remove(&ih, profile, Some(handle))?;
+        let readded = pending.readded;
+        delete_files(readded);
+        drop(removals);
+        Some(RemovalSettled {
+            entry_released: !self.inner.contains_key(&ih),
+            readded,
+        })
+    }
+
+    /// Record whether `profile`'s resume file for `ih` is a removed torrent's
+    /// left behind: `true` where the removal's delete failed, `false` where a
+    /// later one succeeded.
+    pub fn set_stale_resume_file(&self, profile: &ProfileId, ih: &InfoHash, stale: bool) {
+        let mut stale_files = self.stale_resume_files.lock();
+        let key = (profile.clone(), *ih);
+        if stale {
+            stale_files.insert(key);
+        } else {
+            stale_files.remove(&key);
+        }
+    }
+
+    /// Whether `profile`'s resume file for `ih` was left behind by a removal,
+    /// forgetting it: the caller is about to replace it.
+    pub fn take_stale_resume_file(&self, profile: &ProfileId, ih: &InfoHash) -> bool {
+        self.stale_resume_files
+            .lock()
+            .remove(&(profile.clone(), *ih))
     }
 
     pub fn get(&self, ih: &InfoHash) -> Option<TorrentState> {
@@ -557,6 +658,11 @@ impl StateMap {
     /// Ask for a resume save of `ih`. Returns `false` when one is already
     /// queued or in flight: libtorrent answers each request with its own alert,
     /// so a second request for the same torrent is a second alert for nothing.
+    ///
+    /// The refused request's flags are dropped with it, and a queued
+    /// unconditional save is never downgraded to `ONLY_IF_MODIFIED`: each one
+    /// queued is a torrent whose modified bit cannot be trusted, either its
+    /// first save (no resume file yet) or a re-ask after a lost answer.
     pub fn queue_resume_save(&self, ih: InfoHash, flags: ResumeFlags) -> bool {
         let mut s = self.saves.lock();
         if s.in_flight.contains_key(&ih) || !s.queued_set.insert(ih) {
@@ -564,6 +670,31 @@ impl StateMap {
         }
         s.queued.push_back((ih, flags));
         true
+    }
+
+    /// Ask for a save of `ih` that holds its state as of now, because the
+    /// change just made is one a crash must not lose: a recheck's verdict, a
+    /// move's new save path, a pause the daemon issued. Until the next
+    /// periodic sweep, up to 30 minutes away, nothing else writes it.
+    ///
+    /// Always unconditional: libtorrent's modified bit is not what this
+    /// answers to. A save already queued for `ih` is raised to unconditional
+    /// rather than doubled. One already in flight may have been taken before
+    /// the change, so its settle queues one more
+    /// ([`StateMap::note_resume_settled`]).
+    pub fn queue_resume_save_now(&self, ih: InfoHash) {
+        let mut s = self.saves.lock();
+        if s.in_flight.contains_key(&ih) {
+            s.again.insert(ih);
+            return;
+        }
+        if s.queued_set.insert(ih) {
+            s.queued.push_back((ih, ResumeFlags::empty()));
+            return;
+        }
+        if let Some(queued) = s.queued.iter_mut().find(|(q, _)| *q == ih) {
+            queued.1 = ResumeFlags::empty();
+        }
     }
 
     /// Move queued saves to in flight until `cap` are in flight, returning
@@ -589,8 +720,19 @@ impl StateMap {
     /// dispatched. Returns whether one was in flight; a settle for a torrent
     /// nobody asked about (a save the API's fault injection queued, or a
     /// duplicate answer to a re-request) changes nothing.
+    ///
+    /// A torrent that changed while this save was in flight
+    /// ([`StateMap::queue_resume_save_now`]) is queued again, unconditional:
+    /// the answer that settled it may hold the state from before the change.
     pub fn note_resume_settled(&self, ih: &InfoHash) -> bool {
-        self.saves.lock().in_flight.remove(ih).is_some()
+        let mut s = self.saves.lock();
+        if s.in_flight.remove(ih).is_none() {
+            return false;
+        }
+        if s.again.remove(ih) && s.queued_set.insert(*ih) {
+            s.queued.push_back((*ih, ResumeFlags::empty()));
+        }
+        true
     }
 
     /// Put every in-flight save back at the front of the queue, to be asked
@@ -601,10 +743,18 @@ impl StateMap {
     /// flight may be one whose answer is gone and will never settle. Asking
     /// again is cheap and idempotent; waiting is the shutdown deadline. Returns
     /// how many were re-queued.
+    ///
+    /// One that changed while in flight is asked for unconditionally whatever
+    /// `flags` says, and that one request answers its change.
     pub fn requeue_in_flight_resume_saves(&self, flags: ResumeFlags) -> usize {
         let mut s = self.saves.lock();
         let lost: Vec<InfoHash> = s.in_flight.drain().map(|(ih, _)| ih).collect();
         for ih in lost.iter().rev() {
+            let flags = if s.again.remove(ih) {
+                ResumeFlags::empty()
+            } else {
+                flags
+            };
             if s.queued_set.insert(*ih) {
                 s.queued.push_front((*ih, flags));
             }
@@ -685,6 +835,74 @@ mod tests {
         // In flight counts as asked for, too.
         assert!(!m.queue_resume_save(ih(1), ResumeFlags::empty()));
         assert_eq!(m.pending_resume_count(), 1);
+    }
+
+    #[test]
+    fn a_later_only_if_modified_request_keeps_a_queued_unconditional_save() {
+        // The shutdown drain asks `ONLY_IF_MODIFIED` for every torrent; one
+        // still waiting on its first save has no file for "not modified" to
+        // leave in place.
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
+        assert!(!m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty())]
+        );
+    }
+
+    #[test]
+    fn a_save_now_is_unconditional_and_raises_a_queued_sweep_save() {
+        let m = StateMap::new();
+        m.queue_resume_save_now(ih(1));
+        assert!(m.queue_resume_save(ih(2), ResumeFlags::ONLY_IF_MODIFIED));
+        m.queue_resume_save_now(ih(2));
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty()), (ih(2), ResumeFlags::empty())],
+            "one request each, both unconditional",
+        );
+    }
+
+    #[test]
+    fn a_save_now_during_an_in_flight_save_asks_once_more_when_it_settles() {
+        // The answer on its way may have been taken before the change.
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
+        assert_eq!(m.dispatch_resume_saves(10).len(), 1);
+        m.queue_resume_save_now(ih(1));
+        m.queue_resume_save_now(ih(1));
+        assert_eq!(m.dispatch_resume_saves(10), vec![], "not doubled in flight");
+        assert!(m.note_resume_settled(&ih(1)));
+        assert_eq!(m.pending_resume_count(), 1);
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty())]
+        );
+        assert!(m.note_resume_settled(&ih(1)));
+        assert_eq!(m.pending_resume_count(), 0, "asked again once, not forever");
+    }
+
+    #[test]
+    fn a_lost_save_that_changed_in_flight_is_asked_for_unconditionally() {
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
+        m.dispatch_resume_saves(10);
+        m.queue_resume_save_now(ih(1));
+        assert_eq!(
+            m.requeue_in_flight_resume_saves(ResumeFlags::ONLY_IF_MODIFIED),
+            1
+        );
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty())]
+        );
+        assert!(m.note_resume_settled(&ih(1)));
+        assert_eq!(
+            m.pending_resume_count(),
+            0,
+            "the re-ask answered the change"
+        );
     }
 
     #[test]
@@ -817,6 +1035,45 @@ mod tests {
         // Consumed: a later removal of the re-added torrent deletes.
         m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
         assert_eq!(seen, Some(false));
+    }
+
+    #[test]
+    fn a_reconciled_removal_settles_only_a_recorded_torrent_and_keeps_its_record() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let p = ProfileId::new("p");
+        let (old, new) = (handle(1, 1), handle(2, 1));
+        m.insert(ih(1), TorrentState::newly_added(old, p.clone(), now));
+        // Nobody asked for its removal: left alone, nothing deleted.
+        assert_eq!(m.reconcile_removal(&p, old, |_| panic!("deleted")), None);
+        assert!(m.contains(&ih(1)));
+
+        m.begin_removal(&p, old);
+        // Not that torrent.
+        assert_eq!(m.reconcile_removal(&p, new, |_| panic!("deleted")), None);
+        let mut seen = None;
+        let settled = m.reconcile_removal(&p, old, |readded| seen = Some(readded));
+        assert_eq!(seen, Some(false));
+        assert_eq!(
+            settled,
+            Some(RemovalSettled {
+                entry_released: true,
+                readded: false,
+            })
+        );
+        assert!(!m.contains(&ih(1)));
+        // Once settled, a second reconcile finds no entry and runs nothing.
+        assert_eq!(m.reconcile_removal(&p, old, |_| panic!("deleted")), None);
+
+        // The alert was only late: the profile re-added the info-hash, and
+        // the alert then settles by the kept record, leaving the new entry
+        // and its files.
+        m.note_readded(&p, &ih(1));
+        m.insert(ih(1), TorrentState::newly_added(new, p.clone(), now));
+        let settled = m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(true));
+        assert!(!settled.entry_released);
+        assert_eq!(m.get(&ih(1)).map(|s| s.handle), Some(new));
     }
 
     #[test]

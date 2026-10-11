@@ -193,7 +193,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "Disk errors by operation",
-      "description": "File errors, by the libtorrent operation that failed. Each one puts a torrent into the disk-error phase. The series appears with its first error.",
+      "description": "File errors, by the libtorrent operation that failed. The journal names the torrent and file. The series appears with its first error.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
       "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
@@ -306,14 +306,15 @@
     {
       "id": 21,
       "type": "timeseries",
-      "title": "Handshake probe running",
-      "description": "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or unprivileged), which leaves only IP presence checked (TorrentdHandshakeProbeUnavailable).",
+      "title": "VPN probes running",
+      "description": "1 while each probe runs. Handshake: 0 when the WireGuard handshake probe cannot run (wg missing or unprivileged), which leaves only IP presence checked (TorrentdHandshakeProbeUnavailable). Route: 0 when the route probe cannot run, or is not asked because the address probe cannot, which leaves the tunnel's routing unchecked (TorrentdRouteProbeUnavailable).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_handshake_probe_ok{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_handshake_probe_ok{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}} handshake" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_route_probe_ok{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}} route" }
       ]
     },
     {
@@ -427,7 +428,7 @@
       "id": 30,
       "type": "timeseries",
       "title": "Verify queue",
-      "description": "Adoptions waiting to verify, and verifying now. A queue that holds work while nothing finishes is TorrentdPoolVerifyStuck. Exported only with [pool] configured.",
+      "description": "Adoptions waiting to verify and re-hashes POST /v1/pool/verifications or POST /v1/torrents/{infohash}/recheck queued, and both running now, together bounded by [pool] max_concurrent_verify. A queue that holds work while nothing finishes is TorrentdPoolVerifyStuck. Exported only with [pool] configured.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 77 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
@@ -468,7 +469,7 @@
       "id": 33,
       "type": "timeseries",
       "title": "Pool plan failures by kind",
-      "description": "Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, or re-driving an interrupted plan failed (TorrentdPoolPlanFailed).",
+      "description": "Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, re-driving an interrupted plan failed, or the boot re-drive gave up waiting for the loaded torrents to reach the state map and left interrupted plans applying (TorrentdPoolPlanFailed).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 85 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },

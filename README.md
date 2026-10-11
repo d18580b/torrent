@@ -257,9 +257,11 @@ user_agent              = "qBittorrent/5.0.3"  # of the same client
 allowed_tracker_domains = ["tracker.example.com"]  # required on vpn
 ```
 
-> **Config break.** A `vpn` profile without `allowed_tracker_domains`, a host
-> profile listening on `0.0.0.0` or `[::]` beside a `vpn` profile, and any
-> `peer_fingerprint` starting `-LT` are refused at load. See
+> **Config break.** A `vpn` profile without `allowed_tracker_domains`, two
+> profiles whose `allowed_tracker_domains` overlap unless both set
+> `allowed_tracker_urls`, a host profile listening on `0.0.0.0` or `[::]`
+> beside a `vpn` profile, and any `peer_fingerprint` starting `-LT` are
+> refused at load. See
 > [docs/running.md](docs/running.md#account-isolation) for what each means
 > and what to write instead.
 
@@ -355,29 +357,41 @@ operational side of each knob, including what the kill switch costs and what
 it needs, is in [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml),
 which is the file an operator actually edits.
 
-`allowed_tracker_domains` is the account-isolation guard, and every `vpn`
-profile must set it. A torrent enters a profile that sets it only when every
-tracker it announces to is on one of those domains, and it announces to at
-least one — on every add path: the API, pool adoption, and the startup reload
-of resume data and `.torrent` files. It keeps one account's torrent, and its
-passkey, from being announced from another account's tunnel; it is not an
-egress control. Public content that wants DHT belongs in a `network = "host"`
-profile.
+`allowed_tracker_domains` is the tracker guard, and every `vpn` profile must
+set it. A torrent enters a profile that sets it only when every tracker it
+announces to is on one of those domains, and it announces to at least one — on
+every add path: the API, pool adoption, and the startup reload of resume data
+and `.torrent` files. It compares only the tracker's host, so it keeps apart
+accounts on different trackers and cannot tell two accounts on one tracker
+apart. For those, `allowed_tracker_urls` binds each profile to announce-URL
+prefixes carrying its own passkey, held on the same add paths, and two
+profiles whose domain lists overlap are refused at load unless both set it.
+Together they keep one account's torrent, and its passkey, from being
+announced from another account's tunnel; neither is an egress control. Public
+content that wants DHT belongs in a `network = "host"` profile.
 
 ## Authentication
 
 **Required, one way or the other.** The daemon refuses to start unless you
 have either configured `[auth]` or written `allow_unauthenticated = true`.
 Without `[auth]` it authenticates nothing — every route, including every
-mutating one, is open to anyone who can reach the port. That is a legitimate
-posture behind a reverse proxy that does its own access control; it is not one
-to arrive at by omission. The opt-out does not extend to a routable address
-either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
+mutating one, is open to any client that can reach the port, except a browser
+sent by another site: a request whose `Host` is neither loopback nor in
+`allowed_hosts` (a DNS-rebound page), or a state-changing one that
+`Sec-Fetch-Site`, a foreign `Origin` or a form `Content-Type` marks as
+cross-site, is refused with a `403` ([docs/api/README.md](docs/api/README.md)).
+That is a legitimate
+posture behind a reverse proxy that does its own access control, but only on a
+single-user host, or in a network namespace or container no other uid shares:
+every local user can reach `127.0.0.1`, and without `[auth]` any of them
+controls the daemon ([docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other)).
+It is not one to arrive at by omission. The opt-out does not extend to a
+routable address either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
 and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
 inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` alongside them,
-are read once, at startup: changing any of the four takes a restart, not a
-`SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
+defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` and
+`allowed_hosts` alongside them, are read once, at startup: changing any of the
+five takes a restart, not a `SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
 ignored" — rather than reporting the config unchanged.
 
 Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
@@ -448,14 +462,15 @@ counts the gateway restarts a renewal detects on such a profile. A
 `profile_id` label marks a series as one session's rather than the daemon's,
 which is why most of those daemon counters carry one too — pool verification is
 daemon-wide and carries none. Outside both VPN groups, these are the labelled
-series worth an alert of their own: `listen_failure_active`, 0 once a profile's
-listen socket is up and 1 when it fails; `listen_failures_total`, which counts
+series worth an alert of their own: `listen_failure_active`, 1 while any of a
+profile's listen sockets is failed (a dual-stack `0.0.0.0:6881,[::]:6881`
+profile holds two) and 0 once every one of them is up; `listen_failures_total`, which counts
 those failures — and a listen failure on a daemon left with a single live
 session is fatal, so on that shape the alert that fires is the daemon going
 away; and `profile_assignment_registry_errors_total`, which counts the torrents
 a profile's registry refused to take, whether for a duplicate info-hash, a
 resume file found under another profile, or a tracker outside
-`allowed_tracker_domains` — the cross-account contamination profiles exist to
+`allowed_tracker_domains` or `allowed_tracker_urls` — the cross-account contamination profiles exist to
 prevent. `kill_switch_active` is none of these: it is a single unlabelled
 daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 `vpn` profile is configured.
@@ -465,17 +480,22 @@ daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 > [`deploy/prometheus/`](deploy/prometheus) and the Grafana dashboard in
 > [`deploy/dashboard.json`](deploy/dashboard.json) read only series that table
 > holds, and `cargo test -p torrentd` fails if either reads one it does not.
-> Most daemon counters are written at zero from boot, so `increase()` sees
-> their first event; a series the table marks "on first event" reads as "no
-> data" rather than zero until something happens. The per-profile families do
+> Most daemon counters are written at zero from boot, so `increase()` sees an
+> event that follows the first scrape. What a boot counts comes before any
+> scrape, so it is already in the counter's first sample, where `increase()`
+> cannot see it; the `torrentd_boot_*` gauges carry what the boot counted, and
+> the alerts that read those counters also fire on them. A series the table
+> marks "on first event" reads as "no data" rather than zero until something
+> happens. The per-profile families do
 > not wait for one: every family a per-profile monitor owns is pre-registered at
 > its baseline when that monitor starts, so `rate()` and alerting queries over
 > it resolve on a healthy daemon rather than on the first event ever to occur.
 > That is tunnel health and fencing on every profile, and port-forward state —
 > `profile_vpn_gateway_reboots_total` included — on every profile that
-> negotiates over NAT-PMP. `profile_vpn_handshake_probe_ok` is seeded at 1 on
-> every live WireGuard profile, so an alert on it reads "no" from a cold start;
-> it is never seeded on a profile that is not WireGuard, nor on one whose tunnel
+> negotiates over NAT-PMP. `profile_vpn_handshake_probe_ok` and
+> `profile_vpn_transfer_probe_ok` are seeded at 1 on
+> every live WireGuard profile, so an alert on either reads "no" from a cold
+> start; neither is ever seeded on a profile that is not WireGuard, nor on one whose tunnel
 > never came up, where a 0 would wrongly blame the host's `wg` tooling.
 > `profile_vpn_handshake_age_seconds` is the exception, because it registers on
 > the first probe rather than when the monitor starts: an alert on it reads "no

@@ -12,10 +12,20 @@
 //! the alert written for it. [`PromSink::seed`] therefore writes every
 //! catalogued series marked [`Seed::Zero`] at boot, for every configured
 //! profile and every value of its label, before the alert loop starts.
+//!
+//! A zero nobody scraped is no sample, though. The first scrape comes only
+//! once `/metrics` is served, after the boot scans and the first stretch of
+//! the alert loop, so what those count is already in the first sample there
+//! is, and `increase()` has nothing below it to rise from. [`BOOT_COUNTS`]
+//! names the counters an alert reads that a boot moves, and the first render
+//! exports what each had counted as a `boot_*` gauge, which the alert reads
+//! beside the counter.
 
 use std::collections::HashMap;
+use std::sync::Once;
 
 use parking_lot::Mutex;
+use prometheus::core::Collector;
 use prometheus::core::MetricVec;
 use prometheus::core::MetricVecBuilder;
 use prometheus::register_counter_vec_with_registry;
@@ -111,6 +121,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
     // engine: torrents and sessions
     "torrents_added_total" Counter Profile Zero => "Torrents a session accepted.";
     "torrents_removed_total" Counter Profile Zero => "Torrents removed from a session.";
+    "torrent_remove_cleanup_errors_total" Counter Profile ("store": torrentd_engine::metrics::REMOVE_CLEANUP_STORES) Zero =>
+        "Failed attempts to delete a removed torrent's resume file or its .torrent and save \
+         path, or to write or clear the tombstone that stands until they are gone; the next \
+         boot deletes what a tombstone names rather than loading it.";
     "torrent_add_errors_total" Counter Profile Zero => "Adds libtorrent rejected after accepting the call.";
     "torrents_finished_total" Counter Profile Zero => "Torrents that finished downloading.";
     "torrent_errors_total" Counter Profile Zero => "Torrents that entered libtorrent's error state.";
@@ -130,17 +144,33 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "resume_save_dispatch_errors_total" Counter Profile Zero =>
         "save_resume_data requests that failed before reaching libtorrent.";
     "listen_failures_total" Counter Profile Zero => "Listen sockets that failed.";
-    "listen_failure_active" Gauge Profile Zero => "1 while the profile's listen socket is failed.";
+    "listen_failure_active" Gauge Profile Zero =>
+        "1 while any of the profile's listen sockets is failed (one socket per `listen_interfaces` endpoint), 0 once each has come up or a socket is up on its address at another port.";
+    "listen_accept_errors_total" Counter Profile ("errno": torrentd_engine::metrics::LISTEN_ACCEPT_ERRNOS) Zero =>
+        "Accepts on a listen socket that ran out of file descriptors; libtorrent accepts \
+         again at once and keeps listening, first dropping a peer and lowering \
+         `connections_limit` while that limit is above 10 and a torrent has a peer to drop. \
+         Not a listen failure.";
     "disk_error_retry_attempts_total" Counter Profile Zero =>
         "Torrents the disk-error retry timer resumed to clear a libtorrent error.";
     "disk_error_retry_errors_total" Counter Profile Zero => "Retry-timer resumes that failed.";
     "alert_queue_overflows_total" Counter Profile Zero =>
         "Times libtorrent's alert queue overflowed and dropped alerts.";
+    "alert_translate_errors_total" Counter Profile Zero =>
+        "Alerts libtorrent posted that the daemon dropped because it could not translate them; \
+         each may be a torrent's removal or a resume save's answer the daemon never saw.";
     "resume_saves_requeued_total" Counter Profile Zero =>
         "Resume saves asked for again because an overflow of this profile's alert queue may \
          have dropped their answer.";
+    "removals_reconciled_total" Counter Profile Zero =>
+        "Torrent removals settled because an overflow of this profile's alert queue dropped \
+         torrent-removed alerts and the session no longer held the torrent: its state-map entry \
+         dropped and its files deleted. The torrent's own alert may have been lost or only late; \
+         a late one is counted again in torrentd_torrents_removed_total.";
     "tracker_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::TRACKER_KINDS) Zero =>
-        "Tracker announce errors, successful announces (reply), tracker warnings, and scrape failures.";
+        "Tracker announce errors, successful announces (reply), tracker warnings, scrape \
+         failures, and announces that failed because the torrent was stopping (stopped): \
+         paused, fenced, removed, or the announce cancelled.";
     "session_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::SESSION_KINDS) Zero =>
         "Port-mapping and UDP socket errors, rejected fast-resume data, and performance warnings.";
     "torrent_file_persist_errors_total" Counter Profile ("source": &["metadata", "api"]) Zero =>
@@ -169,6 +199,74 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_save_path_fallbacks_total" Counter Profile Zero =>
         "Torrents the boot torrent-dir scan placed at default_save_path because no usable \
          save path was recorded beside their .torrent.";
+    // What the counters below had counted when /metrics was first rendered:
+    // see BOOT_COUNTS.
+    "boot_registry_errors" Gauge Profile Owner("always") =>
+        "profile_assignment_registry_errors_total as of the first scrape, which already holds \
+         what the boot counted; fixed for the life of the process.";
+    "boot_alert_queue_overflows" Gauge Profile Owner("always") =>
+        "alert_queue_overflows_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_alert_translate_errors" Gauge Profile Owner("always") =>
+        "alert_translate_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_session_alerts" Gauge Profile ("kind": BOOT_SESSION_KINDS) Owner("always") =>
+        "session_alerts_total for these kinds as of the first scrape, which already holds what \
+         the boot counted; fixed for the life of the process.";
+    "boot_store_write_errors" Gauge Daemon ("store": &["registry", "pool_index"]) Owner("always") =>
+        "store_write_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_dir_fsync_errors" Gauge Daemon Owner("always") =>
+        "dir_fsync_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_torrent_add_errors" Gauge Profile Owner("always") =>
+        "torrent_add_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_torrent_errors" Gauge Profile Owner("always") =>
+        "torrent_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_resume_write_errors" Gauge Profile Owner("always") =>
+        "resume_write_errors_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_tracker_alerts" Gauge Profile ("kind": BOOT_TRACKER_KINDS) Owner("always") =>
+        "tracker_alerts_total for these kinds as of the first scrape, which already holds what \
+         the boot counted; fixed for the life of the process.";
+    "boot_disk_errors" Gauge Profile ("op": &[]) OnFirstEvent =>
+        "disk_errors_total as of the first scrape, for each operation the boot counted one \
+         under; fixed for the life of the process.";
+    "boot_resume_save_failures" Gauge Profile Owner("always") =>
+        "resume_save_failures_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_resume_save_dispatch_errors" Gauge Profile Owner("always") =>
+        "resume_save_dispatch_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_torrent_file_persist_errors" Gauge Profile ("source": &["metadata", "api"]) Owner("always") =>
+        "torrent_file_persist_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_fence_pause_errors" Gauge Profile Owner("always") =>
+        "profile_fence_pause_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_disk_error_retry_errors" Gauge Profile Owner("always") =>
+        "disk_error_retry_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_storage_move_failures" Gauge Profile Owner("always") =>
+        "storage_move_failures_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_pool_plan_failures" Gauge Daemon
+        ("kind": &["step_failed", "index_diverged", "resume_failed", "redrive_timed_out"])
+        Owner("always") =>
+        "pool_plan_failures_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_torrent_remove_cleanup_errors" Gauge Profile
+        ("store": torrentd_engine::metrics::REMOVE_CLEANUP_STORES) Owner("always") =>
+        "torrent_remove_cleanup_errors_total as of the first scrape, which already holds what \
+         the boot counted; fixed for the life of the process.";
+    "boot_pool_verify_failed" Gauge Daemon Owner("always") =>
+        "pool_verify_failed_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_metrics_dropped_samples" Gauge Daemon ("reason": &["registration", "labels"]) Owner("always") =>
+        "metrics_dropped_samples_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -200,6 +298,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "profile_vpn_handshake_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
         "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or \
          unprivileged).";
+    "profile_vpn_transfer_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
+        "1 while the WireGuard transfer probe (wg show transfer) runs; 0 when it cannot, and an \
+         aged handshake is not judged on the link's byte counters.";
     "profile_vpn_route_probe_ok" Gauge VpnProfile Owner("live vpn profiles") =>
         "1 while the route probe (ip route get from the tunnel address) runs; 0 when it \
          cannot, or is not asked because the address probe cannot run, and the tunnel's \
@@ -241,6 +342,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
          daemon-wide verification budget spent.";
     "auth_token_scope_denials_total" Counter Daemon Zero =>
         "Requests carrying a valid token without the scope the route needs.";
+    "auth_cross_site_refusals_total" Counter Daemon
+        ("reason": &["host", "sec_fetch_site", "origin", "content_type"]) Zero =>
+        "Requests a daemon without [auth] refused as sent by a browser from another site, by \
+         the header that refused them: a Host neither loopback nor in allowed_hosts, a \
+         cross-site Sec-Fetch-Site, a foreign Origin, or a body type an HTML form can send.";
     "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings"]) Zero =>
         "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
     // kill switch
@@ -262,18 +368,29 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "last_shutdown_kill_switch_removal_failed" Gauge Daemon Owner("always") =>
         "1 if the previous run could not remove the kill switch on its way out.";
     // pool
-    "pool_plan_failures_total" Counter Daemon ("kind": &["step_failed", "index_diverged", "resume_failed"]) Zero =>
+    "pool_plan_failures_total" Counter Daemon ("kind": &["step_failed", "index_diverged", "resume_failed", "redrive_timed_out"]) Zero =>
         "Pool plans that stopped: a step failed, the index stopped accounting for what is \
-         loaded, or re-driving an interrupted plan failed.";
+         loaded, re-driving an interrupted plan failed, or the boot re-drive gave up waiting \
+         for the loaded torrents to reach the state map and left interrupted plans applying.";
     "pool_scan_errors_total" Counter Daemon ("kind": &["walk", "stat", "path", "read", "parse"]) Zero =>
         "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or \
          unparseable .torrent files.";
     "pool_verify_completed_total" Counter Daemon Zero => "Adopted torrents that verified and are seeding.";
     "pool_verify_failed_total" Counter Daemon Zero => "Adopted torrents whose verification failed or was dropped.";
+    "pool_recheck_dropped_total" Counter Daemon
+        ("reason": &["not_loaded", "paused", "no_metadata", "no_engine", "start_failed"]) Zero =>
+        "Re-hashes POST /v1/pool/verifications or POST /v1/torrents/{infohash}/recheck queued \
+         that the queue dropped instead of starting, by why: the torrent was no longer loaded, it was paused (by the operator, or because \
+         libtorrent refused its resume during a fence's lift and the lift has ended), it had no \
+         metadata, its profile had no session, or libtorrent refused to start the check.";
     "pool_verify_queue_depth" Gauge Daemon Owner("pool configured, from the first queue tick") =>
-        "Adoptions waiting to verify.";
+        "Adoptions waiting to verify, and re-hashes POST /v1/pool/verifications or \
+         POST /v1/torrents/{infohash}/recheck queued that have not started.";
     "pool_verify_in_flight" Gauge Daemon Owner("pool configured, from the first queue tick") =>
-        "Adoptions verifying now.";
+        "Adoptions verifying and queued re-hashes checking now, together bounded by \
+         [pool] max_concurrent_verify. The first check of a .torrent added with no resume data, \
+         a disk-error retry's check and a magnet's check once its metadata arrives are neither \
+         counted nor bounded.";
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
         "Torrents whose pool-index profile disagrees with the assignment registry at boot.";
     // persistence and the exporter itself
@@ -287,6 +404,165 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Samples the exporter dropped: a series that could not be registered, or an emission \
          whose labels differ from the series' first use.";
 };
+
+/// The `kind` values of `session_alerts_total` that `TorrentdSessionErrors`
+/// reads, and so the ones `boot_session_alerts` carries.
+pub const BOOT_SESSION_KINDS: &[&str] = &["portmap_error", "udp_error", "fastresume_rejected"];
+
+/// The `kind` values of `tracker_alerts_total` that `TorrentdTrackerWarnings`
+/// reads, and so the ones `boot_tracker_alerts` carries. `error` and `reply`
+/// are left out: `TorrentdTrackerErrors` reads them only as a fraction of
+/// announces over half an hour, which the announces after the first scrape
+/// carry on their own, and a fixed boot count would skew.
+pub const BOOT_TRACKER_KINDS: &[&str] = &["warning", "scrape_failed"];
+
+/// A counter an alert reads that a boot moves before anything can scrape it,
+/// and the gauge [`PromSink::render`] exports its first-scrape count as.
+#[derive(Clone, Copy, Debug)]
+pub struct BootCount {
+    pub counter: &'static str,
+    pub gauge: &'static str,
+    /// Where only some of the counter's children are exported: the label,
+    /// and the values of it that are.
+    pub only: Option<(&'static str, &'static [&'static str])>,
+}
+
+/// See the module docs. The registry is written by both boot scans, the
+/// alert loop starts before the first scrape and counts overflows, alerts it
+/// could not translate, and session alerts from the scans' backlog, and the stores and their
+/// directory fsyncs are written by both. The same backlog holds the adds
+/// libtorrent rejected, the torrents that entered its error state, the file
+/// errors it raised, the resume saves it failed or could not be asked for and
+/// the resume data it produced that could not be written, and the trackers'
+/// first answers. The torrent-dir scan copies the pool library's .torrent
+/// files into the torrent store, and the boot pauses a scanned torrent whose
+/// profile is fenced. The disk-error retry's first resume comes a minute
+/// after the error, which a scrape interval that long can still precede.
+///
+/// The boot re-drive of interrupted pool plans starts before the HTTP server
+/// and races the first scrape: where the boot's torrents settle quickly, a
+/// re-drive that fails, or a re-driven step whose storage move fails, is
+/// counted before it. The boot deletes what each tombstone names before the
+/// HTTP server starts, so a cleanup that fails there is always counted before
+/// the first scrape. The verify queue starts before the HTTP server too, and
+/// a re-queued adoption whose disk is not there can fail before it. An
+/// exporter's dropped sample can come from any emission, the boot's included.
+/// Each is mirrored whole: whatever a counter an alert reads had counted at
+/// the first scrape is beyond `increase()`, whether it raced the scrape or
+/// always precedes it.
+///
+/// `disk_errors_total` appears with its first event, so its gauge does too:
+/// only for the operations the boot counted one under. `tracker_alerts_total`
+/// is mirrored only for the kinds in [`BOOT_TRACKER_KINDS`].
+pub const BOOT_COUNTS: &[BootCount] = &[
+    BootCount {
+        counter: "profile_assignment_registry_errors_total",
+        gauge: "boot_registry_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "alert_queue_overflows_total",
+        gauge: "boot_alert_queue_overflows",
+        only: None,
+    },
+    BootCount {
+        counter: "alert_translate_errors_total",
+        gauge: "boot_alert_translate_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "session_alerts_total",
+        gauge: "boot_session_alerts",
+        only: Some(("kind", BOOT_SESSION_KINDS)),
+    },
+    BootCount {
+        counter: "store_write_errors_total",
+        gauge: "boot_store_write_errors",
+        only: None,
+    },
+    BootCount {
+        counter: DIR_FSYNC_ERRORS,
+        gauge: "boot_dir_fsync_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "torrent_add_errors_total",
+        gauge: "boot_torrent_add_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "torrent_errors_total",
+        gauge: "boot_torrent_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "resume_write_errors_total",
+        gauge: "boot_resume_write_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "tracker_alerts_total",
+        gauge: "boot_tracker_alerts",
+        only: Some(("kind", BOOT_TRACKER_KINDS)),
+    },
+    BootCount {
+        counter: "disk_errors_total",
+        gauge: "boot_disk_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "resume_save_failures_total",
+        gauge: "boot_resume_save_failures",
+        only: None,
+    },
+    BootCount {
+        counter: "resume_save_dispatch_errors_total",
+        gauge: "boot_resume_save_dispatch_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "torrent_file_persist_errors_total",
+        gauge: "boot_torrent_file_persist_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "profile_fence_pause_errors_total",
+        gauge: "boot_fence_pause_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "disk_error_retry_errors_total",
+        gauge: "boot_disk_error_retry_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "storage_move_failures_total",
+        gauge: "boot_storage_move_failures",
+        only: None,
+    },
+    BootCount {
+        counter: "pool_plan_failures_total",
+        gauge: "boot_pool_plan_failures",
+        only: None,
+    },
+    BootCount {
+        counter: torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS,
+        gauge: "boot_torrent_remove_cleanup_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "pool_verify_failed_total",
+        gauge: "boot_pool_verify_failed",
+        only: None,
+    },
+    // Last, so its gauge also holds any sample the rows above dropped as
+    // they wrote theirs, which the first render's sample of the counter holds.
+    BootCount {
+        counter: DROPPED,
+        gauge: "boot_metrics_dropped_samples",
+        only: None,
+    },
+];
 
 /// The catalogue row for `name`.
 pub fn catalogued(name: &str) -> Option<&'static Series> {
@@ -320,6 +596,8 @@ pub struct PromSink {
     /// The engine's process-wide directory-fsync failure count as of the
     /// last time it was exported. See [`PromSink::export_dir_fsync_errors`].
     dir_fsync_exported: Mutex<u64>,
+    /// Run by the first render. See [`PromSink::export_boot_counts`].
+    boot_counts: Once,
 }
 
 const DROPPED: &str = "metrics_dropped_samples_total";
@@ -346,6 +624,7 @@ impl PromSink {
             histos: Mutex::new(HashMap::new()),
             dropped,
             dir_fsync_exported: Mutex::new(0),
+            boot_counts: Once::new(),
         }
     }
 
@@ -390,6 +669,9 @@ impl PromSink {
 
     pub fn render(&self) -> Vec<u8> {
         self.export_dir_fsync_errors(torrentd_engine::batch_writer::dir_fsync_errors());
+        // After the fsync count is brought up to date, so its boot gauge
+        // holds what this very render exports.
+        self.boot_counts.call_once(|| self.export_boot_counts());
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();
         let mut buf = Vec::new();
@@ -410,6 +692,39 @@ impl PromSink {
         if total > *exported {
             self.add_counter(DIR_FSYNC_ERRORS, total - *exported, &[]);
             *exported = total;
+        }
+    }
+
+    /// Set each [`BOOT_COUNTS`] gauge to its counter's count now, child by
+    /// child, with the counter's labels.
+    ///
+    /// Run once, by the first render: everything counted before it is in the
+    /// first sample of the counter, where `increase()` cannot see it, and
+    /// everything after it is a rise from that sample, where it can. Each
+    /// seeded counter was written at boot for every configured profile and
+    /// label value, so its gauge is written for each, at zero where nothing
+    /// was counted. A first-event counter has children only where something
+    /// was counted, and so its gauge too.
+    fn export_boot_counts(&self) {
+        for b in BOOT_COUNTS {
+            let Some(counter) = self.counters.lock().get(b.counter).cloned() else {
+                continue;
+            };
+            for family in counter.collect() {
+                for m in family.get_metric() {
+                    let labels: Vec<(&str, &str)> = m
+                        .get_label()
+                        .iter()
+                        .map(|l| (l.get_name(), l.get_value()))
+                        .collect();
+                    if let Some((name, values)) = b.only {
+                        if !labels.iter().any(|(k, v)| *k == name && values.contains(v)) {
+                            continue;
+                        }
+                    }
+                    self.set_gauge(b.gauge, m.get_counter().get_value(), &labels);
+                }
+            }
         }
     }
 
@@ -797,6 +1112,259 @@ mod tests {
         sink.export_dir_fsync_errors(total + 2);
         let text = String::from_utf8(sink.render()).unwrap();
         assert!(text.contains(&sample(total + 2)), "counted once: {text}");
+    }
+
+    #[test]
+    fn every_boot_count_mirrors_a_catalogued_counter_with_a_gauge_present_as_it_is() {
+        for b in BOOT_COUNTS {
+            let counter = catalogued(b.counter).expect("counter catalogued");
+            let gauge = catalogued(b.gauge).expect("gauge catalogued");
+            assert_eq!(counter.kind, MetricType::Counter, "{}", b.counter);
+            assert_eq!(gauge.kind, MetricType::Gauge, "{}", b.gauge);
+            // Present from boot where the counter is seeded; where it appears
+            // with its first event, so does the gauge.
+            let present = match counter.seed {
+                Seed::Zero => Seed::Owner("always"),
+                Seed::OnFirstEvent => Seed::OnFirstEvent,
+                Seed::Owner(_) => panic!("{} is neither seeded nor first-event", b.counter),
+            };
+            assert_eq!(gauge.seed, present, "{}", b.gauge);
+            assert_eq!(gauge.scope, counter.scope, "{}", b.gauge);
+            // The gauge carries the counter's label, with the values `only`
+            // keeps where it keeps some.
+            let expected = match (counter.label, b.only) {
+                (Some((name, _)), Some((only, values))) => {
+                    assert_eq!(name, only, "{}", b.gauge);
+                    Some((name, values))
+                }
+                (label, None) => label,
+                (None, Some(_)) => panic!("{} filters a label {} lacks", b.gauge, b.counter),
+            };
+            assert_eq!(gauge.label, expected, "{}", b.gauge);
+        }
+    }
+
+    /// The `torrentd_<name>` sample with exactly `labels`, as rendered.
+    fn sample(text: &str, name: &str, labels: &str) -> Option<String> {
+        let prefix = format!("torrentd_{name}{labels} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
+    }
+
+    #[test]
+    fn the_first_render_exports_what_the_boot_counted_and_later_ones_leave_it() {
+        let sink = PromSink::new();
+        sink.seed(&["a", "b"]);
+        let p = [("profile_id", "a")];
+        sink.add_counter("profile_assignment_registry_errors_total", 2, &p);
+        sink.inc_counter("alert_queue_overflows_total", &p);
+        sink.add_counter("alert_translate_errors_total", 2, &p);
+        let kind = |k| [("profile_id", "a"), ("kind", k)];
+        sink.add_counter("session_alerts_total", 3, &kind("fastresume_rejected"));
+        sink.inc_counter("session_alerts_total", &kind("performance_warning"));
+        sink.inc_counter("store_write_errors_total", &[("store", "registry")]);
+        // Above anything this process has really counted, as in the fsync
+        // test above.
+        let fsyncs = torrentd_engine::batch_writer::dir_fsync_errors() + 4;
+        sink.export_dir_fsync_errors(fsyncs);
+        sink.inc_counter("torrent_add_errors_total", &p);
+        sink.add_counter("torrent_errors_total", 3, &p);
+        sink.add_counter("resume_write_errors_total", 2, &p);
+        let tracker = |k| [("profile_id", "a"), ("kind", k)];
+        sink.add_counter("tracker_alerts_total", 4, &tracker("warning"));
+        sink.inc_counter("tracker_alerts_total", &tracker("scrape_failed"));
+        sink.add_counter("tracker_alerts_total", 9, &tracker("error"));
+        let disk = |op| [("profile_id", "a"), ("op", op)];
+        sink.add_counter("disk_errors_total", 2, &disk("file_open"));
+        sink.inc_counter("resume_save_failures_total", &p);
+        sink.add_counter("resume_save_dispatch_errors_total", 2, &p);
+        sink.inc_counter(
+            "torrent_file_persist_errors_total",
+            &[("profile_id", "a"), ("source", "api")],
+        );
+        sink.add_counter("profile_fence_pause_errors_total", 3, &p);
+        sink.inc_counter("disk_error_retry_errors_total", &p);
+        sink.add_counter("storage_move_failures_total", 2, &p);
+        sink.inc_counter("pool_plan_failures_total", &[("kind", "resume_failed")]);
+        sink.add_counter(
+            "torrent_remove_cleanup_errors_total",
+            2,
+            &[("profile_id", "a"), ("store", "tombstone")],
+        );
+        sink.inc_counter("pool_verify_failed_total", &[]);
+        // A label mismatch, as an emission at boot could make.
+        sink.inc_counter("pool_plan_failures_total", &[("phase", "redrive")]);
+
+        let first = String::from_utf8(sink.render()).unwrap();
+        let a = "{profile_id=\"a\"}";
+        let b = "{profile_id=\"b\"}";
+        let session = |p: &str, k: &str| format!("{{kind=\"{k}\",profile_id=\"{p}\"}}");
+        let expected = [
+            ("boot_registry_errors", a.to_string(), "2"),
+            ("boot_registry_errors", b.to_string(), "0"),
+            ("boot_alert_queue_overflows", a.to_string(), "1"),
+            ("boot_alert_queue_overflows", b.to_string(), "0"),
+            ("boot_alert_translate_errors", a.to_string(), "2"),
+            ("boot_alert_translate_errors", b.to_string(), "0"),
+            (
+                "boot_session_alerts",
+                session("a", "fastresume_rejected"),
+                "3",
+            ),
+            ("boot_session_alerts", session("a", "portmap_error"), "0"),
+            ("boot_session_alerts", session("b", "udp_error"), "0"),
+            (
+                "boot_store_write_errors",
+                "{store=\"registry\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_store_write_errors",
+                "{store=\"pool_index\"}".to_string(),
+                "0",
+            ),
+            ("boot_dir_fsync_errors", String::new(), &fsyncs.to_string()),
+            ("boot_torrent_add_errors", a.to_string(), "1"),
+            ("boot_torrent_add_errors", b.to_string(), "0"),
+            ("boot_torrent_errors", a.to_string(), "3"),
+            ("boot_torrent_errors", b.to_string(), "0"),
+            ("boot_resume_write_errors", a.to_string(), "2"),
+            ("boot_resume_write_errors", b.to_string(), "0"),
+            ("boot_tracker_alerts", session("a", "warning"), "4"),
+            ("boot_tracker_alerts", session("a", "scrape_failed"), "1"),
+            ("boot_tracker_alerts", session("b", "warning"), "0"),
+            (
+                "boot_disk_errors",
+                "{op=\"file_open\",profile_id=\"a\"}".to_string(),
+                "2",
+            ),
+            ("boot_resume_save_failures", a.to_string(), "1"),
+            ("boot_resume_save_failures", b.to_string(), "0"),
+            ("boot_resume_save_dispatch_errors", a.to_string(), "2"),
+            ("boot_resume_save_dispatch_errors", b.to_string(), "0"),
+            (
+                "boot_torrent_file_persist_errors",
+                "{profile_id=\"a\",source=\"api\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_torrent_file_persist_errors",
+                "{profile_id=\"a\",source=\"metadata\"}".to_string(),
+                "0",
+            ),
+            ("boot_fence_pause_errors", a.to_string(), "3"),
+            ("boot_fence_pause_errors", b.to_string(), "0"),
+            ("boot_disk_error_retry_errors", a.to_string(), "1"),
+            ("boot_disk_error_retry_errors", b.to_string(), "0"),
+            ("boot_storage_move_failures", a.to_string(), "2"),
+            ("boot_storage_move_failures", b.to_string(), "0"),
+            (
+                "boot_pool_plan_failures",
+                "{kind=\"resume_failed\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_pool_plan_failures",
+                "{kind=\"step_failed\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_pool_plan_failures",
+                "{kind=\"redrive_timed_out\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_torrent_remove_cleanup_errors",
+                "{profile_id=\"a\",store=\"tombstone\"}".to_string(),
+                "2",
+            ),
+            (
+                "boot_torrent_remove_cleanup_errors",
+                "{profile_id=\"a\",store=\"resume\"}".to_string(),
+                "0",
+            ),
+            (
+                "boot_torrent_remove_cleanup_errors",
+                "{profile_id=\"b\",store=\"torrent\"}".to_string(),
+                "0",
+            ),
+            ("boot_pool_verify_failed", String::new(), "1"),
+            (
+                "boot_metrics_dropped_samples",
+                "{reason=\"labels\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_metrics_dropped_samples",
+                "{reason=\"registration\"}".to_string(),
+                "0",
+            ),
+        ];
+        for (name, labels, value) in &expected {
+            assert_eq!(
+                sample(&first, name, labels).as_deref(),
+                Some(*value),
+                "{name}{labels}:\n{first}"
+            );
+        }
+        // Not a kind the session-errors alert reads.
+        assert_eq!(
+            sample(
+                &first,
+                "boot_session_alerts",
+                &session("a", "performance_warning")
+            ),
+            None,
+            "{first}"
+        );
+        // Nor one the tracker-warnings alert reads.
+        assert_eq!(
+            sample(&first, "boot_tracker_alerts", &session("a", "error")),
+            None,
+            "{first}"
+        );
+        // A first-event counter's gauge exists only where it counted.
+        assert!(
+            !first.contains("torrentd_boot_disk_errors{op=\"file_open\",profile_id=\"b\"}"),
+            "{first}"
+        );
+
+        // What is counted after the first scrape rises from its sample, where
+        // increase() sees it; the boot gauges stay as they were.
+        sink.add_counter("profile_assignment_registry_errors_total", 5, &p);
+        sink.add_counter("session_alerts_total", 5, &kind("fastresume_rejected"));
+        sink.export_dir_fsync_errors(fsyncs + 1);
+        sink.inc_counter("resume_write_errors_total", &p);
+        sink.inc_counter("disk_errors_total", &disk("file_write"));
+        sink.inc_counter("pool_plan_failures_total", &[("kind", "resume_failed")]);
+        sink.inc_counter("pool_plan_failures_total", &[("phase", "redrive")]);
+        sink.inc_counter(
+            "torrent_remove_cleanup_errors_total",
+            &[("profile_id", "a"), ("store", "tombstone")],
+        );
+        sink.inc_counter("pool_verify_failed_total", &[]);
+        let later = String::from_utf8(sink.render()).unwrap();
+        assert_eq!(
+            sample(
+                &later,
+                "boot_disk_errors",
+                "{op=\"file_write\",profile_id=\"a\"}"
+            ),
+            None,
+            "a first event after the first scrape is increase()'s to see:\n{later}"
+        );
+        for (name, labels, value) in &expected {
+            assert_eq!(
+                sample(&later, name, labels).as_deref(),
+                Some(*value),
+                "{name}{labels}:\n{later}"
+            );
+        }
+        assert_eq!(
+            sample(&later, "profile_assignment_registry_errors_total", a).as_deref(),
+            Some("7"),
+            "{later}"
+        );
     }
 
     #[test]

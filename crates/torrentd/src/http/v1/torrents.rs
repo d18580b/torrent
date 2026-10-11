@@ -25,10 +25,13 @@ use libtorrent_safe::AddParams;
 use libtorrent_safe::InfoHash;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::handlers::add::delete_removed_files;
+use torrentd_engine::handlers::add::Tombstone;
 use torrentd_engine::Claim;
 use torrentd_engine::EngineError;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
+use torrentd_engine::RegistryError;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -558,7 +561,13 @@ pub struct AddTorrentRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TorrentSource {
     /// A magnet URI. The torrent has no name, size or file list until its
-    /// metadata arrives from peers.
+    /// metadata arrives from peers. Whether it is private is unknown until
+    /// then too, so a magnet is added with DHT, PEX and LSD disabled on every
+    /// profile: until then its metadata and peers come from its trackers,
+    /// and a magnet with no `tr=` only from a peer its `x.pe` names. On a
+    /// `host` profile, metadata that is not private lifts that guard and the
+    /// torrent takes the profile's own posture; private metadata keeps it,
+    /// and a `vpn` profile keeps it whatever the metadata says.
     Magnet {
         /// The magnet URI, `magnet:?…`.
         #[schema(pattern = "^magnet:\\?")]
@@ -652,19 +661,19 @@ torrent_error! {
         #[problem(status = 422, title = "Invalid metainfo")]
         InvalidMetainfo(String),
         /// The profile sets `allowed_tracker_domains`, and the torrent
-        /// announces to a tracker outside them, or to none.
-        #[error(
-            "the torrent announces to a tracker outside the profile's allowed_tracker_domains, \
-             or to no tracker at all"
-        )]
+        /// announces to a tracker outside them, to one under none of the
+        /// profile's `allowed_tracker_urls` (another account's passkey), or
+        /// to none. The detail says which.
+        #[error("{0}")]
         #[problem(status = 422, title = "Tracker not allowed")]
-        TrackerNotAllowed,
+        TrackerNotAllowed(String),
         /// A torrent with this infohash is already assigned, to this profile
         /// or another.
         #[error("{0}")]
         #[problem(status = 409, title = "Torrent exists")]
         TorrentExists(String),
-        /// The session refused the torrent.
+        /// The session refused the torrent, or the assignment registry could
+        /// not record it.
         #[error("{detail}")]
         #[problem(status = 500, title = "Internal error")]
         Internal { detail: String },
@@ -691,8 +700,15 @@ enum AddSource {
 /// only `xt=urn:btmh:` is `422 invalid-metainfo`. When the
 /// profile sets `allowed_tracker_domains`, every tracker the torrent announces
 /// to — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
-/// there must be at least one. The response is the torrent as its session first reports
-/// it; its `phase` is `unknown` until the first state update.
+/// there must be at least one; when it also sets `allowed_tracker_urls`, every
+/// announce URL must fall under one of those account prefixes. A `.torrent`'s
+/// payload is hashed before the torrent seeds: it is `checking` first, and a
+/// payload that is absent, truncated or not yet fully written ends
+/// `incomplete` and never announces itself complete. The daemon never
+/// downloads, so supply the payload, then recheck it with
+/// `POST /v1/torrents/{infohash}/recheck`. The response is the torrent as its
+/// session first reports it; its `phase` is `unknown` until the first state
+/// update.
 #[kynos::post("/torrents", tag = Torrents)]
 pub async fn add_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -748,7 +764,6 @@ pub async fn add_torrent(
     let Some(profile_cfg) = s.profile_config(&profile_id) else {
         return Err(ProfileProblem::NotFound.into());
     };
-    let flags = torrentd_engine::seed_flags(profile_cfg);
 
     let source = match source {
         Ok(bytes) => {
@@ -812,19 +827,27 @@ pub async fn add_torrent(
     // What the session will be handed, built before the guard so the guard
     // reads exactly that.
     let (params, torrent_bytes) = match source {
+        // A magnet's `private` bit is unknown until its metadata arrives, so
+        // it touches no DHT, PEX or LSD before then, whatever the profile
+        // allows; the metadata handler lifts that once it shows it public.
         AddSource::Magnet(uri) => (
             AddParams::Magnet {
                 uri,
                 save_path,
-                flags,
+                flags: torrentd_engine::policy::magnet_flags(profile_cfg),
             },
             None,
         ),
+        // Nothing vouches for a payload named only by a `.torrent`: it may be
+        // absent, still copying or truncated. Hash it before it seeds, as
+        // pool adoption does without a complete `.fastresume`; `SEED_MODE`
+        // would announce it complete (`left=0`) until a peer's request
+        // failed a piece.
         AddSource::File(bytes) => (
             AddParams::File {
                 bytes: bytes.clone(),
                 save_path,
-                flags,
+                flags: torrentd_engine::verify_flags(profile_cfg),
                 trackers: Vec::new(),
             },
             Some(bytes),
@@ -834,13 +857,19 @@ pub async fn add_torrent(
     // The account-isolation guard, the same one every add path runs (see
     // `torrentd_engine::policy::check_trackers`): on a profile with
     // `allowed_tracker_domains`, every tracker the torrent announces to — a
-    // `.torrent`'s announce list, a magnet's `tr=` — must be on it.
+    // `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
+    // under one of its `allowed_tracker_urls` where it sets them.
     match torrentd_engine::check_trackers(profile_cfg, &params) {
         Ok(()) => {}
-        // The problem type already covers a torrent with no tracker.
-        Err(TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers) => {
+        // The problem type covers a foreign tracker, another account's, and
+        // none at all; the detail tells them apart.
+        Err(
+            e @ (TrackerRefusal::NotAllowed
+            | TrackerRefusal::ForeignAccount
+            | TrackerRefusal::NoTrackers),
+        ) => {
             registry_error();
-            return Err(AddTorrentError::TrackerNotAllowed);
+            return Err(AddTorrentError::TrackerNotAllowed(e.to_string()));
         }
         Err(TrackerRefusal::Unreadable(e)) => {
             return Err(AddTorrentError::InvalidMetainfo(format!(
@@ -873,9 +902,20 @@ pub async fn add_torrent(
                 "a torrent with this infohash is already assigned".to_owned(),
             ));
         }
-        Err(e) => {
+        Err(e @ RegistryError::Conflict { .. }) => {
             registry_error();
             return Err(AddTorrentError::TorrentExists(e.to_string()));
+        }
+        // The registry could not be written (a full or read-only state
+        // directory, a lock held past the busy timeout) or holds a row it
+        // cannot use. Nothing is assigned, so this is not a duplicate: a
+        // client told `torrent-exists` would stop retrying an add that never
+        // happened.
+        Err(e) => {
+            registry_error();
+            return Err(AddTorrentError::Internal {
+                detail: internal("writing the torrent's assignment to the registry", e),
+            });
         }
     }
 
@@ -964,7 +1004,14 @@ fn add_and_settle(
     };
     // `unfenced_engine` let this add through, but a fence can have landed
     // between that check and the add.
-    crate::vpn_monitor::hold_if_fenced(&s.profiles, profile_id, engine, handle, &*s.metrics);
+    crate::vpn_monitor::hold_if_fenced(
+        &s.profiles,
+        s.kill_switch.as_deref(),
+        profile_id,
+        engine,
+        handle,
+        &*s.metrics,
+    );
 
     // A `DELETE` of this info-hash whose removal alert is still queued would
     // otherwise delete the two files written below when it is handled.
@@ -1137,18 +1184,29 @@ torrent_error! {
         #[problem(status = 409, title = "The torrent is still being added")]
         TorrentAdding,
         /// `delete_files=true` for a torrent whose files the pool index has
-        /// another torrent claiming too — a cross-seed, or a conflict.
-        /// Deleting them would take the other torrent's payload with them.
+        /// another torrent claiming too — a cross-seed, or a conflict — or
+        /// one of whose files another torrent a session holds lists at the
+        /// same path, however it was added. Deleting them would take the
+        /// other torrent's payload with them.
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload is shared")]
         PayloadShared { detail: String },
         /// `delete_files=true` for a torrent whose payload cannot be proven
         /// safe to move to the trash: a file outside every managed root, one
-        /// the index does not record this torrent claiming, or one that
-        /// changed since the scan. Nothing was changed.
+        /// the index does not record this torrent claiming, one that changed
+        /// since the scan, or another assigned torrent whose files no session
+        /// can report to compare against; or the torrent itself is one the
+        /// boot left unloaded, which no session holds. Nothing was changed.
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload cannot be trashed")]
         PayloadUntrashable { detail: String },
+        /// A plain delete of a torrent the boot left unloaded while its
+        /// profile's stores still hold its resume file or `.torrent`: they
+        /// are what the next boot loads it from. `detail` names them.
+        /// Nothing was changed.
+        #[error("{detail}")]
+        #[problem(status = 409, title = "The torrent did not load")]
+        TorrentUnloaded { detail: String },
         /// `delete_files=true` for a torrent whose profile has no running
         /// session: its payload is reachable only through one.
         #[error("{detail}")]
@@ -1169,16 +1227,23 @@ torrent_error! {
 /// Remove a torrent.
 ///
 /// Removes it from its session and clears its assignment, so the infohash can
-/// be added again. `delete_files=true` also moves the payload into the trash
+/// be added again. Its resume file, `.torrent` and recorded save path are
+/// deleted before the answer, so a restart after a `204` does not load it
+/// again. `delete_files=true` also moves the payload into the trash
 /// of the managed root it lies in, never unlinking it, and needs `[pool]
 /// allow_mutations` and `confirm` repeating the infohash. It is refused,
 /// changing nothing, unless every file is under a managed root, claimed by
-/// this torrent alone in the pool index, and unchanged since the scan that
-/// indexed it. A torrent whose profile has no running session, or that the
-/// boot left unloaded, is cleared from the daemon's records alone
-/// (`delete_files` is refused there: nothing can reach the payload). A
-/// torrent still being added is `409 torrent-adding`; retry once it lists a
-/// phase other than `unknown`.
+/// this torrent alone in the pool index, listed at the same path by no other
+/// torrent any session holds, and unchanged since the scan that indexed it;
+/// while another assigned torrent is held by no session, its files cannot be
+/// compared, and that refuses too. A torrent whose profile has no running
+/// session, or that the boot left unloaded, is cleared from the daemon's
+/// records alone (`delete_files` is refused there: nothing can reach the
+/// payload). One the boot left unloaded whose resume file or `.torrent` its
+/// profile's stores still hold is `409 torrent-unloaded`, changing nothing:
+/// those files are what the next boot loads it from. A torrent still being
+/// added is `409 torrent-adding`; retry once it lists a phase other than
+/// `unknown`.
 #[kynos::delete("/torrents/{infohash}", tag = Torrents)]
 pub async fn delete_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1219,21 +1284,13 @@ pub async fn delete_torrent(
     if delete_files {
         if let Some(pool) = s.pool.as_ref() {
             let hex = ih.to_hex();
-            let others = pool.with_store(|st| st.co_claimants(&hex)).map_err(|e| {
-                DeleteTorrentError::Internal {
-                    detail: internal("reading the pool index", e),
-                }
-            })?;
-            if let Some(first) = others.first() {
-                return Err(DeleteTorrentError::PayloadShared {
-                    detail: format!(
-                        "{} other torrent(s) claim files of this one in the pool index — the \
-                         first is {first} — so deleting its payload would delete theirs; \
-                         retry without `delete_files`",
-                        others.len(),
-                    ),
-                });
-            }
+            // Off the reader: the claims are the last committed index's, and
+            // the writer would make a refusal wait out a whole running scan.
+            // A scan can commit a new co-claimant after this, so
+            // `payload_to_trash` asks again, in the read its proof makes,
+            // before anything is moved; this one only answers the common
+            // refusal early.
+            refuse_co_claimants(pool.with_reader(|st| st.co_claimants(&hex)))?;
         }
     }
     let profile = s
@@ -1275,6 +1332,17 @@ pub async fn delete_torrent(
                 } else {
                     None
                 };
+                // Written before the torrent leaves its session, so the
+                // delete is durable from the moment it is acted on: a crash,
+                // or a file below that will not delete, leaves a tombstone
+                // the next boot honours by deleting the files rather than
+                // loading the torrent. Until the assignment is cleared the
+                // boot reads it as a delete that never answered, and keeps
+                // the torrent.
+                let tombstoned = settler.resume.write_tombstone(&profile, &ih);
+                if let Err(e) = &tombstoned {
+                    count_cleanup_error(&settler, &ih, &profile, "tombstone", e);
+                }
                 // Recorded before the session is asked, so the alert that
                 // settles it finds the record: the assignment is cleared below
                 // as soon as the session accepts, and an add of the same
@@ -1283,14 +1351,37 @@ pub async fn delete_torrent(
                 settler.state.begin_removal(&profile, st.handle);
                 // libtorrent never deletes the files itself: they go to the
                 // trash below, where an operator can take them back.
+                //
+                // A tombstone left by a refusal is not cleared: a second
+                // `DELETE` running alongside may have written it, and its
+                // removal still needs it. One left standing is harmless, as
+                // the assignment is kept, and the boot spends it.
                 engine.remove_torrent(st.handle, false).map_err(|e| {
                     settler.state.abandon_removal(&profile, st.handle);
                     DeleteTorrentError::Internal {
                         detail: internal("removing the torrent from its session", e),
                     }
                 })?;
+                // Deleted before the assignment is cleared, which is the
+                // first moment an add of the same info-hash can write files
+                // of its own, and before the answer, so neither a restart nor
+                // a power loss after a 204 finds them to load. The tombstone
+                // stays: a resume save libtorrent queued before the removal
+                // can still be written, and the removal alert's handler, the
+                // last of this torrent's, deletes that and settles it.
+                let left = delete_removed_files(
+                    &*settler.resume,
+                    &*settler.torrents,
+                    &*settler.metrics,
+                    &profile,
+                    &ih,
+                    false,
+                    Tombstone::Keep,
+                );
+                let resurrects = tombstoned.is_err() && left.files_left();
                 let Some(payload) = payload else {
-                    return clear_assignment(&settler, &ih, &profile, false);
+                    clear_assignment(&settler, &ih, &profile, false)?;
+                    return report_unfinished_cleanup(&ih, resurrects);
                 };
                 let bucket = format!("torrent-{}-{}", ih.to_hex(), unix_now());
                 let outcome = crate::pool_apply::trash_torrent_payload(&payload, &bucket);
@@ -1311,20 +1402,41 @@ pub async fn delete_torrent(
                         ),
                     });
                 }
-                Ok(())
+                report_unfinished_cleanup(&ih, resurrects)
             })
             .await?;
         }
         None if s.unloaded_at_boot.lock().contains(&ih) => {
+            if delete_files {
+                // Refused before anything changes, as `clear_sessionless`
+                // refuses it: no session holds the torrent, so nothing can
+                // reach its payload, and a 204 would tell the client files
+                // went to the trash that were never touched.
+                return Err(DeleteTorrentError::PayloadUntrashable {
+                    detail: format!(
+                        "no session holds torrent {ih}: the startup scans left it unloaded, so \
+                         its payload cannot be reached to move to the trash. Nothing was \
+                         changed; retry without `delete_files` to clear it from the daemon's \
+                         records and leave the files where they are."
+                    ),
+                });
+            }
+            // The boot leaves a torrent unloaded mostly because its add
+            // failed: a save path on a disk not mounted yet, or a resume file
+            // libtorrent refused. Its resume file and `.torrent` are then the
+            // only copy of its metadata and what the next boot loads it from,
+            // so a plain delete refuses rather than deleting them. A claim
+            // with nothing behind it, which a crash between an add's claim
+            // and its first record leaves, has neither and is cleared.
+            refuse_unloaded_with_store_files(&s, &ih, &profile)?;
+            clear_unheld(&s, &ih, &profile)?;
             warn!(
                 target: "torrentd::http",
                 infohash = %ih,
                 profile_id = %profile,
-                "no session holds an info-hash the registry still assigns; the startup \
-                 scans did not load it, so clearing the assignment alone",
+                "cleared an assignment the startup scans left unloaded, which had no resume or \
+                 .torrent file behind it",
             );
-            // No session held it, so `delete_files` reached no payload.
-            clear_assignment(&s, &ih, &profile, false)?;
         }
         None => return Err(DeleteTorrentError::TorrentAdding),
     }
@@ -1355,13 +1467,122 @@ fn payload_to_trash(
         .into_iter()
         .map(|f| f.path)
         .collect();
-    crate::pool_apply::torrent_payload(pool, &ih.to_hex(), FsPath::new(&details.save_path), &files)
-        .map_err(|why| DeleteTorrentError::PayloadUntrashable {
-            detail: format!(
-                "{why}. Nothing was changed; the torrent is still in its session. Retry \
-             without `delete_files` to remove the torrent alone."
+    // The handler's co-claimant check ran before the session was asked for
+    // the files, and a scan may have committed since: the proof asks again,
+    // in the same read of the committed index as the claims and rows it
+    // rests on. It reads the read connection, so it never waits out a scan
+    // still holding the writer.
+    let payload = match crate::pool_apply::torrent_payload(
+        pool,
+        &ih.to_hex(),
+        FsPath::new(&details.save_path),
+        &files,
+    ) {
+        Ok(payload) => payload,
+        Err(crate::pool_apply::PayloadRefusal::Shared(others)) => {
+            return Err(payload_shared(&others));
+        }
+        Err(crate::pool_apply::PayloadRefusal::Unproven(why)) => {
+            return Err(DeleteTorrentError::PayloadUntrashable {
+                detail: format!(
+                    "{why}. Nothing was changed; the torrent is still in its session. Retry \
+                     without `delete_files` to remove the torrent alone."
+                ),
+            });
+        }
+    };
+    refuse_live_overlap(s, ih, &payload)?;
+    Ok(payload)
+}
+
+/// Refuse `delete_files` when the pool index has other torrents claiming
+/// files of this one: deleting its payload would delete theirs.
+fn refuse_co_claimants(
+    others: Result<Vec<String>, torrentd_pool::PoolError>,
+) -> Result<(), DeleteTorrentError> {
+    let others = others.map_err(|e| DeleteTorrentError::Internal {
+        detail: internal("reading the pool index", e),
+    })?;
+    if others.is_empty() {
+        return Ok(());
+    }
+    Err(payload_shared(&others))
+}
+
+/// `409 payload-shared`, naming the first of `others`: the torrents the pool
+/// index has claiming files of the one being deleted.
+fn payload_shared(others: &[String]) -> DeleteTorrentError {
+    DeleteTorrentError::PayloadShared {
+        detail: format!(
+            "{} other torrent(s) claim files of this one in the pool index — the first is {} — \
+             so deleting its payload would delete theirs; retry without `delete_files`",
+            others.len(),
+            others.first().map_or("unknown", String::as_str),
+        ),
+    }
+}
+
+/// Refuse `payload` when any other torrent the daemon holds has a file at
+/// one of its paths.
+///
+/// The co-claimant check reads the pool index, where only the matcher writes
+/// claims, so a cross-seed added through `POST /v1/torrents` with a
+/// `save_path` over the same files is invisible to it. This reads every other
+/// torrent from its session instead: each one assigned in the registry and
+/// each one in the state map, whichever profile holds it. One whose files no
+/// session can report — assigned but not loaded, or loaded where its session
+/// cannot be asked — cannot be shown not to overlap, so it refuses too.
+fn refuse_live_overlap(
+    s: &AppState,
+    ih: &InfoHash,
+    payload: &crate::pool_apply::TorrentPayload,
+) -> Result<(), DeleteTorrentError> {
+    let mut others: Vec<InfoHash> = s
+        .registry
+        .entries()
+        .into_iter()
+        .map(|(other, _)| other)
+        .chain(s.state.infohashes())
+        .filter(|other| other != ih)
+        .collect();
+    others.sort_unstable_by_key(InfoHash::to_hex);
+    others.dedup();
+    let unprovable = |other: &InfoHash, why: String| DeleteTorrentError::PayloadUntrashable {
+        detail: format!(
+            "torrent {other} {why}, so its files cannot be compared with this one's. Nothing \
+             was changed; retry once it is loaded or removed, or retry without `delete_files` \
+             to remove this torrent alone."
+        ),
+    };
+    for other in &others {
+        let Some(st) = s.state.get(other) else {
+            return Err(unprovable(
+                other,
+                "is assigned to a profile but no session holds it".to_owned(),
+            ));
+        };
+        let live = crate::pool_apply::read_live_torrent(&s.source, &st).map_err(|e| match e {
+            crate::pool_apply::LiveReadError::NoSession => unprovable(
+                other,
+                format!("is held by profile {}, which has no session", st.profile_id),
             ),
-        })
+            crate::pool_apply::LiveReadError::Engine(e) => {
+                unprovable(other, format!("could not be read from its session ({e})"))
+            }
+        })?;
+        if let Some(path) = payload.shared_with(&live) {
+            return Err(DeleteTorrentError::PayloadShared {
+                detail: format!(
+                    "torrent {other}, in profile {}, has a file at {}, so deleting this \
+                     torrent's payload would delete its files too; retry without \
+                     `delete_files`",
+                    st.profile_id,
+                    path.display(),
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Seconds since the epoch, naming a deleted torrent's trash directory.
@@ -1370,6 +1591,52 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Log and count a failure to write or clear `(profile, ih)`'s tombstone, as
+/// `delete_removed_files` counts the deletes it makes.
+fn count_cleanup_error(
+    s: &AppState,
+    ih: &InfoHash,
+    profile: &ProfileId,
+    store: &str,
+    e: &dyn fmt::Display,
+) {
+    warn!(
+        target: "torrentd::http",
+        infohash = %ih,
+        profile_id = %profile,
+        store,
+        error.cause = %e,
+        "failed to write or clear a removed torrent's tombstone",
+    );
+    s.metrics.inc_counter(
+        torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS,
+        &[("profile_id", profile.as_str()), ("store", store)],
+    );
+}
+
+/// Answer a delete that removed the torrent but left a file the next boot
+/// would load it from, with no tombstone to stop that, as the failure it is.
+///
+/// The torrent is out of its session and its assignment is cleared by now,
+/// so a retry answers `404`; the removal alert's handler deletes the files
+/// again, and writes the tombstone where they still will not go. The detail
+/// says so, rather than a 204 claiming a delete the next restart undoes.
+fn report_unfinished_cleanup(ih: &InfoHash, resurrects: bool) -> Result<(), DeleteTorrentError> {
+    if !resurrects {
+        return Ok(());
+    }
+    Err(DeleteTorrentError::Internal {
+        detail: format!(
+            "torrent {ih} was removed from its session and its assignment cleared, but its \
+             resume file or .torrent could not be deleted and no tombstone could be written to \
+             stop the next start loading it again; see \
+             torrentd_torrent_remove_cleanup_errors_total and the daemon log. The daemon \
+             retries the delete as the session confirms the removal. If the torrent is listed \
+             after a restart, delete it again."
+        ),
+    })
 }
 
 /// Clear `ih`'s assignment to `profile` once no session holds it.
@@ -1414,16 +1681,17 @@ fn clear_assignment(
 /// files are gone); one naming anything else was never this delete's. A
 /// failed write is logged and counted by the pool, and leaves adoption
 /// refusing rather than allowing.
+///
+/// The response does not wait for the write: while a scan holds the writer
+/// the release is queued until it lets go (see
+/// [`crate::pool_service::PoolService::release_owner_soon`]). The torrent is
+/// gone from the registry by then, so a client that timed out on the wait and
+/// retried got `404` for a delete that had succeeded.
 fn release_index_owner(s: &AppState, ih: &InfoHash, profile: &ProfileId, payload_deleted: bool) {
     let Some(pool) = s.pool.as_ref() else {
         return;
     };
-    let hex = ih.to_hex();
-    let released =
-        pool.with_store_mut(|st| st.release_owner(&hex, profile.as_str(), payload_deleted));
-    if let Err(e) = released {
-        pool.note_store_error("release_owner", &e);
-    }
+    pool.release_owner_soon(ih.to_hex(), profile.as_str().to_owned(), payload_deleted);
 }
 
 /// Remove a torrent whose profile has no live session.
@@ -1451,14 +1719,92 @@ fn clear_sessionless(
             profile_status: crate::http::v1::common::ProfileUnavailableReason::Failed.as_str(),
         });
     }
+    clear_unheld(s, ih, profile)?;
+    warn!(
+        target: "torrentd::http",
+        infohash = %ih,
+        profile_id = %profile,
+        "cleared an assignment whose profile has no running session, and deleted its resume \
+         and .torrent files so the startup scan does not re-assign it",
+    );
+    Ok(NoContent)
+}
+
+/// Refuse, changing nothing, the plain delete of a torrent the boot left
+/// unloaded while `profile`'s stores still hold its resume file or `.torrent`.
+///
+/// Those files are what the next boot loads it from once the reason its add
+/// failed is fixed, and for a torrent not adopted from the pool the only copy
+/// of its metadata, so deleting them would turn a load failure into a lost
+/// torrent. A store that cannot say whether it holds the file refuses too.
+fn refuse_unloaded_with_store_files(
+    s: &AppState,
+    ih: &InfoHash,
+    profile: &ProfileId,
+) -> Result<(), DeleteTorrentError> {
+    let resume = s
+        .resume
+        .exists(profile, ih)
+        .map_err(|e| DeleteTorrentError::Internal {
+            detail: format!(
+                "{} Nothing was changed; retry the delete.",
+                internal("checking for the torrent's resume file", e)
+            ),
+        })?;
+    // A `.torrent` with no resume file that the pool index records `drifted`
+    // is one the boot held back on purpose: its verification failed, no boot
+    // loads it, and deleting it and adopting it again is how it is verified
+    // again. Where the index cannot be read it is kept.
+    let torrent = s.torrents.exists(profile, ih) && (resume || !recorded_drifted(s, ih));
+    let held: Vec<String> = [(resume, "resume"), (torrent, "torrent")]
+        .into_iter()
+        .filter(|(present, _)| *present)
+        .map(|(_, suffix)| format!("`{}.{suffix}`", ih.to_hex()))
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    Err(DeleteTorrentError::TorrentUnloaded {
+        detail: format!(
+            "the boot left torrent {ih} unloaded, and profile {profile}'s stores still hold {}, \
+             which the next boot loads it from. Nothing was changed. Fix why it did not load \
+             (the boot logged a warning naming it, such as `resume add failed`, `torrent-dir \
+             add failed` or a tracker `allowed_tracker_urls` refuses, and \
+             `torrentd_boot_torrent_load_failures` counts failed adds) and restart the daemon. \
+             To retire it anyway, move those files out of the profile's resume and torrent \
+             directories and retry the delete.",
+            held.join(" and "),
+        ),
+    })
+}
+
+/// Whether the pool index records `ih`'s adoption `drifted`; `false` with no
+/// pool, or where the index cannot be read.
+fn recorded_drifted(s: &AppState, ih: &InfoHash) -> bool {
+    s.pool.as_ref().is_some_and(|pool| {
+        matches!(
+            pool.with_reader(|st| st.adoption_state(&ih.to_hex())),
+            Ok(Some(torrentd_pool::AdoptionState::Drifted))
+        )
+    })
+}
+
+/// Clear the assignment of `ih` to `profile`, which no session holds, with
+/// the resume file and `.torrent` that would re-assign it at the next start.
+fn clear_unheld(
+    s: &AppState,
+    ih: &InfoHash,
+    profile: &ProfileId,
+) -> Result<(), DeleteTorrentError> {
     // The two stores first, then the registry entry.
     //
     // Clearing the registry entry alone does not hold: `startup.rs` re-scans
     // `<resume_dir>/<id>` and `<torrent_dir>/<id>` at the next start and
     // re-`assign`s every info-hash it finds, so the operator's clear would be
     // silently undone the first time the daemon restarts. The engine-backed
-    // path gets this for free through `TorrentRemoved` -> `handlers/add.rs`;
-    // with no session there is no alert, so it is done here.
+    // path deletes them in the request too, under a tombstone, and again in
+    // `TorrentRemoved` -> `handlers/add.rs`; with no session there is no
+    // removal to race and no alert, so the deletes alone are done here.
     //
     // The order is what makes the advice below true. Clearing the registry
     // first and deleting after would mean a failed delete tells the operator
@@ -1495,16 +1841,9 @@ fn clear_sessionless(
                 internal("clearing the torrent's assignment", e)
             ),
         })?;
-    warn!(
-        target: "torrentd::http",
-        infohash = %ih,
-        profile_id = %profile,
-        "cleared an assignment whose profile has no running session, and deleted its resume \
-         and .torrent files so the startup scan does not re-assign it",
-    );
     s.unloaded_at_boot.lock().remove(ih);
     release_index_owner(s, ih, profile, false);
-    Ok(NoContent)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1638,7 +1977,8 @@ from_lookup!(PauseTorrentError);
 /// Pause a torrent.
 ///
 /// Stops it announcing and serving peers until resumed. Allowed on a fenced
-/// profile: pausing puts nothing back on the network.
+/// profile: pausing puts nothing back on the network. A paced resume still
+/// running in the profile, a lifted fence's or a resume-all's, leaves it out.
 #[kynos::post("/torrents/{infohash}/pause", tag = Torrents)]
 pub async fn pause_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1646,11 +1986,17 @@ pub async fn pause_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, PauseTorrentError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
+    if let Some(entry) = s.profiles.resolve(&st.profile_id).active() {
+        entry.exclude_from_resumes(st.handle);
+    }
     blocking(move || engine.pause_torrent(st.handle))
         .await
         .map_err(|e| PauseTorrentError::Internal {
             detail: internal("pausing the torrent", e),
         })?;
+    // Saved now rather than at the next 30-minute sweep: a crash before it
+    // would bring the torrent back running.
+    s.state.queue_resume_save_now(st.handle.infohash);
     Ok(NoContent)
 }
 
@@ -1683,7 +2029,9 @@ from_lookup!(UnfencedControlError, fenced);
 ///
 /// Refused with `409 profile-unavailable` while the torrent's profile is
 /// fenced: un-quarantining a torrent whose tunnel is down would announce it
-/// from the wrong address.
+/// from the wrong address. A profile fenced while the resume goes out is
+/// refused the same way, and the torrent is paused again. A torrent a paced
+/// set-online still held is no longer held once resumed.
 #[kynos::post("/torrents/{infohash}/resume", tag = Torrents)]
 pub async fn resume_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1691,21 +2039,65 @@ pub async fn resume_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    blocking(move || engine.resume_torrent(st.handle))
-        .await
-        .map_err(|e| UnfencedControlError::Internal {
-            detail: internal("resuming the torrent", e),
-        })?;
-    Ok(NoContent)
+    let state = Arc::clone(&s);
+    let resumed = blocking(move || {
+        let resume = || {
+            crate::vpn_monitor::resume_unless_fenced(
+                &state.profiles,
+                &st.profile_id,
+                engine.as_ref(),
+                st.handle,
+                &*state.metrics,
+            )
+        };
+        // Running now by the operator's hand: a paced set-online that still
+        // held it (one whose paced resume was refused, say) no longer pauses
+        // it, so the hold is released, and a re-hash the hold kept queued
+        // starts ([`crate::profile_state::PacedHolds`]). Released after the
+        // resume, so a failed one leaves the torrent held, and serialised
+        // with a set-online's hold-and-pause, so the hold and the torrent's
+        // pause cannot part.
+        match state.profiles.resolve(&st.profile_id).active() {
+            Some(entry) => entry.resume_by_hand(st.handle, resume, |r| {
+                *r == crate::vpn_monitor::SingleResume::Resumed
+            }),
+            None => resume(),
+        }
+    })
+    .await
+    .map_err(|e| UnfencedControlError::Internal {
+        detail: internal("resuming the torrent", e),
+    })?;
+    if resumed == crate::vpn_monitor::SingleResume::Resumed {
+        return Ok(NoContent);
+    }
+    let ProfileProblem::Unavailable { reason, detail } = ProfileProblem::vpn_down() else {
+        unreachable!("vpn_down is an unavailable profile");
+    };
+    Err(UnfencedControlError::ProfileUnavailable {
+        detail,
+        profile_status: reason.as_str(),
+    })
 }
 
 /// Re-verify a torrent's payload.
 ///
 /// Re-hashes the payload against the piece hashes. `202`: libtorrent checks
-/// asynchronously, and the torrent's `phase` reports `checking` until it is
-/// done. Needs no `[pool]`. A recheck drops seed mode, which is safe because
-/// the no-download invariant rests on upload mode, and that survives it.
-/// Refused while the profile is fenced, as resuming is.
+/// asynchronously, and the torrent's `phase` reports `checking` from the
+/// moment the check starts until it is done. Needs no `[pool]`. With `[pool]`
+/// configured, the check is queued rather than started, and a queued check
+/// leaves the torrent in its old `phase` until the verify queue starts it:
+/// the queue starts it once a slot is free, at
+/// most `[pool] max_concurrent_verify` checks at once together with
+/// adoptions' verifications and `POST /v1/pool/verifications`' re-hashes, and
+/// `GET /v1/pool` counts it in `verify_queue_depth` while it waits and
+/// `verify_in_flight` while it hashes. Asking again for a torrent already
+/// waiting or checking queues nothing more. Without `[pool]`, and for a
+/// paused torrent or one still without metadata (which libtorrent does not
+/// hash until it is resumed or its metadata arrives), libtorrent is asked at
+/// once. A recheck drops seed mode, which is safe because the no-download
+/// invariant rests on upload mode, and that survives it. Refused while the
+/// profile is fenced, as resuming is.
 #[kynos::post("/torrents/{infohash}/recheck", tag = Torrents)]
 pub async fn recheck_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1713,11 +2105,43 @@ pub async fn recheck_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    blocking(move || engine.force_recheck(st.handle))
-        .await
-        .map_err(|e| UnfencedControlError::Internal {
-            detail: internal("rechecking the torrent", e),
-        })?;
+    // Every check started at once used to run beside every other: libtorrent
+    // bounds checking only for auto-managed torrents, and none is one here.
+    // A scripted recheck of a whole library hashed it all at once, and each
+    // check disconnects its torrent's peers until it ends. The verify queue
+    // is that bound, and its admission checks again everything this request
+    // checked (still loaded, profile on the network), holding the check
+    // while the profile is fenced or a paced resume has yet to reach it.
+    //
+    // Its verdict is not recorded in the pool index: this endpoint never
+    // paused a torrent that failed, or cleared one `drifted`, and
+    // `POST /v1/pool/verifications` is the request that does.
+    //
+    // A paused torrent, or one with no metadata, starts no disk work now:
+    // libtorrent marks it to check once it can. The queue drops such a
+    // re-hash rather than hold a slot for it, so it is asked for directly,
+    // as it always was.
+    let hashes_now = !matches!(
+        st.phase,
+        torrentd_engine::TorrentPhase::Paused | torrentd_engine::TorrentPhase::AwaitingMetadata
+    );
+    if let Some(pool) = s.pool.as_ref().filter(|_| hashes_now) {
+        pool.verify_queue()
+            .enqueue_recheck(st.handle.infohash.to_hex(), false);
+        return Ok(Accepted::new(()));
+    }
+    let state = Arc::clone(&s);
+    blocking(move || {
+        crate::pool_service::force_recheck_marking_checking(
+            engine.as_ref(),
+            &state.state,
+            st.handle,
+        )
+    })
+    .await
+    .map_err(|e| UnfencedControlError::Internal {
+        detail: internal("rechecking the torrent", e),
+    })?;
     Ok(Accepted::new(()))
 }
 
@@ -1915,9 +2339,21 @@ pub async fn list_torrent_files(
     .map_err(|_| ListFilesError::InvalidCursor)?;
     invalid.finish()?;
     let (st, engine) = loaded(&s, p.infohash.get())?;
-    // A torrent can list up to 250,000 files, and the shim copies them all;
-    // that is blocking work, kept off the async workers.
-    let files = match blocking_files(&engine, st.handle).await {
+    // The page starts strictly after the cursor's index. A key is a checked
+    // ten-digit decimal, which can name an index past any torrent's last
+    // file: that is an empty last page, as it was when the whole list was
+    // read and skipped through.
+    let start = page
+        .after
+        .as_deref()
+        .and_then(|key| key.parse::<u64>().ok())
+        .map_or(0, |after| u32::try_from(after + 1).unwrap_or(u32::MAX));
+    let limit = u32::try_from(page.limit).unwrap_or(u32::MAX);
+    // Only this page is copied out of the session, under its lock: every
+    // engine call and the alert loop's drain wait on that lock, so a page of
+    // a 250,000-file torrent must not copy the whole list. Still blocking
+    // work, kept off the async workers.
+    let files = match blocking_files(&engine, st.handle, start, limit).await {
         Ok(Some(files)) => files,
         Ok(None) => return Err(ListFilesError::MetadataPending),
         Err(e) if e.is_gone() => return Err(ListFilesError::TorrentNotFound),
@@ -1927,9 +2363,13 @@ pub async fn list_torrent_files(
             })
         }
     };
-    let (items, next_cursor) = paginate(&listing, files, |f| file_key(f.index), &page);
+    let next_cursor = files
+        .files
+        .last()
+        .filter(|last| u64::from(last.index) + 1 < u64::from(files.total))
+        .map(|last| crate::http::page::encode(&listing, &file_key(last.index)));
     Ok(Json(TorrentFilePage {
-        items: items.into_iter().map(TorrentFile::from).collect(),
+        items: files.files.into_iter().map(TorrentFile::from).collect(),
         next_cursor,
     }))
 }
@@ -2004,9 +2444,10 @@ pub async fn set_file_priority(
     body.validate()?;
     let (st, engine) = loaded(&s, p.infohash.get())?;
     // libtorrent ignores an index past the end without saying so; the file
-    // list is what tells a missing file from a set priority.
-    let count = match blocking_files(&engine, st.handle).await {
-        Ok(Some(files)) => files.len(),
+    // list's length is what tells a missing file from a set priority. An
+    // empty page reads it without copying a file.
+    let count = match blocking_files(&engine, st.handle, 0, 0).await {
+        Ok(Some(files)) => files.total as usize,
         Ok(None) => return Err(SetFilePriorityError::MetadataPending),
         Err(e) if e.is_gone() => return Err(SetFilePriorityError::TorrentNotFound),
         Err(e) => {
@@ -2030,16 +2471,19 @@ pub async fn set_file_priority(
     }
 }
 
-/// `engine.torrent_files(handle)`, on the blocking pool.
+/// `engine.torrent_files_page(handle, start, limit)`, on the blocking pool.
 ///
 /// A task that panicked is reported as the engine error it stands in for: the
 /// listing was not produced, and the caller's `500` says so.
 async fn blocking_files(
     engine: &Arc<dyn TorrentEngine>,
     handle: torrentd_engine::TorrentHandle,
-) -> Result<Option<Vec<torrentd_engine::TorrentFile>>, FilesFailure> {
+    start: u32,
+    limit: u32,
+) -> Result<Option<torrentd_engine::FilePage>, FilesFailure> {
     let engine = Arc::clone(engine);
-    match tokio::task::spawn_blocking(move || engine.torrent_files(handle)).await {
+    match tokio::task::spawn_blocking(move || engine.torrent_files_page(handle, start, limit)).await
+    {
         Ok(Ok(files)) => Ok(files),
         Ok(Err(e)) => Err(FilesFailure::Engine(e)),
         Err(join) => Err(FilesFailure::Task(join)),

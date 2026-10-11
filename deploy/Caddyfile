@@ -10,8 +10,40 @@
 # automatic certificate; `:80` alone serves plain HTTP, which is fine on a
 # private network and is not fine anywhere else.
 
+# Client timeouts, so a connection that never finishes its request head, or
+# never sends a next one, is closed here rather than held open against the
+# daemon's 256-connection cap. These tighten Caddy's own defaults, which
+# are 1m for `read_header` and 5m for `idle`.
+#
+# There is deliberately no `read_body`. Caddy streams a request body upstream
+# as it arrives, and the daemon bounds every body itself: it checks the
+# credential before reading one, and cuts off a body that has not arrived
+# within 30 s (300 s for `POST /v1/torrents`) with 408. `read_body` is Go's
+# read deadline for the whole request, and it can cut off a long-lived
+# `/v1/events` stream too, so setting it trades a bound the daemon already
+# has for an event stream that drops.
+{
+	servers {
+		timeouts {
+			read_header 10s
+			idle 2m
+		}
+	}
+}
+
 torrentd.example.com {
 	encode zstd gzip
+
+	# The largest body the API accepts: `POST /v1/torrents`, whose 96 MiB
+	# limit is the daemon's own (`MAX_ADD_BODY_BYTES`). Caddy does not check
+	# `Content-Length` against this: it counts the body as it streams it
+	# upstream, and answers 413 once the count passes the cap. Up to 96 MiB
+	# of a larger body, declared or chunked, is therefore forwarded first;
+	# the daemon refuses an oversized declared length itself, before it
+	# reads any of the body.
+	request_body {
+		max_size 96MiB
+	}
 
 	# The headers torrentd reads: X-Forwarded-For, X-Forwarded-Proto and
 	# RFC 7239 Forwarded. All three, which is why there are three

@@ -24,6 +24,7 @@ use torrentd_engine::RecordedCall;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentFile;
+use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentHandle;
 use torrentd_engine::TorrentPhase;
 use torrentd_engine::TorrentState;
@@ -258,6 +259,98 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         h.state.registry.lookup(&STALE).is_some(),
         "the entry stays, to clear with a plain delete"
     );
+    // A torrent the boot left unloaded on a live profile: no session holds
+    // it either, so `delete_files` is refused before anything changes, rather
+    // than answered 204 over a payload nothing touched.
+    h.state.unloaded_at_boot.lock().insert(ADDING);
+    let live = ProfileId::new("p");
+    h.state
+        .resume
+        .write(&live, &ADDING, b"resume-bytes")
+        .unwrap();
+    let resp = h
+        .write(
+            "DELETE",
+            &format!(
+                "/v1/torrents/{}?delete_files=true&confirm={}",
+                hex(ADDING),
+                hex(ADDING)
+            ),
+        )
+        .await;
+    assert_problem(&resp, 409, "payload-untrashable");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("unloaded"), "{detail}");
+    assert!(detail.contains("delete_files"), "{detail}");
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
+    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+    assert!(
+        h.state
+            .resume
+            .load_all(&live)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING),
+        "a refused delete leaves the resume file in place"
+    );
+    // Without `delete_files` too, while its resume file is there: the boot's
+    // add of it failed, and the next boot loads it from that file (#354).
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 409, "torrent-unloaded");
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
+    // An adoption the pool index records `drifted`, with a `.torrent` and no
+    // resume file, is one no boot loads: the delete clears it and its
+    // `.torrent`, so it can be adopted again and verified.
+    h.state.resume.delete(&live, &ADDING).unwrap();
+    h.state
+        .torrents
+        .write(&live, &ADDING, b"torrent-bytes")
+        .unwrap();
+    let drift = |state| {
+        h.state
+            .pool
+            .as_ref()
+            .unwrap()
+            .with_store_mut(|st| {
+                st.upsert_torrent(
+                    &torrentd_pool::PoolTorrent {
+                        infohash: hex(ADDING),
+                        infohash_v1: None,
+                        infohash_v2: None,
+                        name: "A".into(),
+                        total_size: 1,
+                        num_files: 1,
+                        source_path: dir.path().join("a.torrent"),
+                        fastresume_path: None,
+                        declared_save_path: None,
+                        category: None,
+                        tags: vec![],
+                        profile: Some("p".into()),
+                    },
+                    0,
+                )?;
+                st.set_adoption(&hex(ADDING), state, None, None, None, Some(1), None)
+            })
+            .unwrap();
+    };
+    // Recorded `adopted`, the `.torrent` is what the next boot loads.
+    drift(torrentd_pool::AdoptionState::Adopted);
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 409, "torrent-unloaded");
+    assert!(h.state.torrents.exists(&live, &ADDING));
+    drift(torrentd_pool::AdoptionState::Drifted);
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert!(h.state.registry.lookup(&ADDING).is_none());
+    assert!(!h.state.torrents.exists(&live, &ADDING));
+    // Back to what the rest of this test expects: assigned, held by no
+    // session, and not one the boot left unloaded.
+    h.state.registry.assign(ADDING, live.clone()).unwrap();
     // A cross-seed claims the same file in the pool index: deleting this
     // torrent's payload would delete that one's, so it is refused, and the
     // torrent stays loaded.
@@ -333,10 +426,65 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         .iter()
         .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
 
-    // Scanned and claimed: the torrent leaves its session with libtorrent
-    // deleting nothing, and the file moves to the root's trash intact.
+    // Scanned and claimed, so the index proves it this torrent's alone. Every
+    // other torrent the daemon holds must also be shown not to have a file at
+    // the same path, which the index cannot say for one added through
+    // `POST /v1/torrents`.
     pool.scan().unwrap();
     add(&hex(LOADED)).unwrap();
+    let untouched = |resp: &TestResponse, problem: &str, names: InfoHash| {
+        assert_problem(resp, 409, problem);
+        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        assert!(detail.contains(&hex(names)), "{detail}");
+        assert!(data.exists());
+        assert!(h.state.registry.lookup(&LOADED).is_some());
+        assert!(!engines
+            .p
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
+    };
+    // Other torrents are compared in infohash order: FENCED, ADDING, STALE.
+    // A torrent with no metadata yet could write anything under its save
+    // path, and the mock's default save path is `/`.
+    let fenced = handle(&engines.f, FENCED);
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-shared", FENCED);
+    // A cross-seed in another profile, with the same file under its own save
+    // path and file list.
+    engines.f.set_torrent_details(
+        fenced,
+        TorrentDetails {
+            save_path: root.join("X").to_string_lossy().into_owned(),
+            ..MockEngine::default_details()
+        },
+    );
+    engines
+        .f
+        .set_torrent_files(fenced, Some(vec![file(0, "data.bin")]));
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-shared", FENCED);
+    // A session that cannot report one is no proof either.
+    engines
+        .f
+        .inject_error("torrent_files", injected("torrent_files"));
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-untrashable", FENCED);
+    engines
+        .f
+        .set_torrent_files(fenced, Some(vec![file(0, "other.bin")]));
+    // Assigned but held by no session — mid-add, or on a profile that failed
+    // to come up: its files cannot be read, so they cannot be compared.
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-untrashable", ADDING);
+    h.state.registry.remove(&ADDING).unwrap();
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-untrashable", STALE);
+    h.state.registry.remove(&STALE).unwrap();
+
+    // Nothing else has a file there: the torrent leaves its session with
+    // libtorrent deleting nothing, and the file moves to the root's trash
+    // intact.
     let resp = h.write("DELETE", &delete_files).await;
     resp.assert_status(StatusCode::NO_CONTENT);
     assert!(called(
@@ -897,6 +1045,30 @@ pub(super) async fn body_framework_rejections(
         waited + Duration::from_secs(1) > deadline && waited <= deadline + Duration::from_secs(1),
         "{method} {path}: cut off at {deadline:?}, not before or long after: {waited:?}",
     );
+    // So is one that declares no length, which the body limit reads whole.
+    let (status, waited) = h.stalled_chunked_body(method, path, Some(&token)).await;
+    assert_eq!(
+        status.as_u16(),
+        408,
+        "{method} {path}: stalled chunked body"
+    );
+    assert!(
+        waited + Duration::from_secs(1) > deadline && waited <= deadline + Duration::from_secs(1),
+        "{method} {path}: chunked body cut off at {waited:?}, not {deadline:?}",
+    );
+    // Without a credential, that body is refused from the head, before a
+    // byte of it is read: it can neither hold the connection until the
+    // deadline nor be buffered up to the limit.
+    let (status, waited) = h.stalled_chunked_body(method, path, None).await;
+    assert_eq!(
+        status.as_u16(),
+        401,
+        "{method} {path}: unauthenticated chunked body"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "{method} {path}: answered only after {waited:?}"
+    );
 }
 
 async fn controls(h: &Harness, e: &Engines) {
@@ -948,6 +1120,28 @@ async fn controls(h: &Harness, e: &Engines) {
             .all(|c| matches!(c, RecordedCall::PauseTorrent(_))),
         "a fenced profile's torrent must not resume or announce: {fenced_calls:?}"
     );
+
+    // A recheck marks a torrent in `DiskError` `Checking` before it starts,
+    // so a check that fails before any status update is not read as a
+    // failed peer read; one that fails to start leaves `DiskError` in place;
+    // any other phase is left for the status updates to move.
+    let recheck = format!("/v1/torrents/{}/recheck", hex(LOADED));
+    let set_phase = |phase| h.state.state.update(&LOADED, |st| st.phase = phase);
+    let phase = || h.state.state.get(&LOADED).unwrap().phase;
+    set_phase(TorrentPhase::DiskError);
+    h.write("POST", &recheck)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    assert_eq!(phase(), TorrentPhase::Checking);
+    set_phase(TorrentPhase::DiskError);
+    e.p.inject_error("force_recheck", injected("force_recheck"));
+    assert_problem(&h.write("POST", &recheck).await, 500, "internal");
+    assert_eq!(phase(), TorrentPhase::DiskError);
+    set_phase(TorrentPhase::Seeding);
+    h.write("POST", &recheck)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    assert_eq!(phase(), TorrentPhase::Seeding);
 
     // Unloaded — never loaded, or mid-add — is 404; a session error is 500.
     for (verb, op) in [
@@ -1162,6 +1356,51 @@ async fn files(h: &Harness, e: &Engines) {
         .await;
     assert_problem(&resp, 404, "torrent-not-found");
     body_framework_rejections(h, "PUT", &priority(0), crate::http::v1::REQUEST_DEADLINE).await;
+
+    // A page of the largest torrent the shim admits copies that page out of
+    // the session, not the whole list: every engine call and the alert loop
+    // wait on the session lock while it copies.
+    const LARGE: u32 = 250_000;
+    let large: Vec<TorrentFile> = (0..LARGE).map(|i| file(i, &format!("d/f{i}"))).collect();
+    e.p.set_torrent_files(loaded, Some(large));
+    let mid = crate::http::page::encode(&format!("files:{}", hex(LOADED)), &file_key(124_999));
+    let page: Value = h.read(&format!("{list}?cursor={mid}")).await.json();
+    let indices: Vec<u64> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["index"].as_u64().unwrap())
+        .collect();
+    assert_eq!(indices, (125_000..125_100).collect::<Vec<u64>>());
+    assert!(page["next_cursor"].is_string());
+    // Every earlier call in this fixture read at most a dozen files.
+    assert_eq!(e.p.largest_files_copy(), 100, "copied past the page");
+    // The priority route reads the count alone.
+    h.write_json("PUT", &priority(LARGE - 1), json!({"priority": 1}))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_problem(
+        &h.write_json("PUT", &priority(LARGE), json!({"priority": 1}))
+            .await,
+        404,
+        "file-not-found",
+    );
+    assert_eq!(e.p.largest_files_copy(), 100);
+    // The last page has no cursor, and a cursor past every file, which a
+    // ten-digit key can name, is an empty last page.
+    let last = crate::http::page::encode(&format!("files:{}", hex(LOADED)), &file_key(LARGE - 3));
+    let page: Value = h.read(&format!("{list}?cursor={last}")).await.json();
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+    assert!(page["next_cursor"].is_null());
+    let past = crate::http::page::encode(&format!("files:{}", hex(LOADED)), "9999999999");
+    let page: Value = h.read(&format!("{list}?cursor={past}")).await.json();
+    assert_eq!(page["items"], json!([]));
+    assert!(page["next_cursor"].is_null());
+}
+
+/// A file listing's cursor key, as the handler spells it.
+fn file_key(index: u32) -> String {
+    format!("{index:010}")
 }
 
 async fn trackers(h: &Harness, e: &Engines) {
@@ -1287,8 +1526,66 @@ async fn deleting(h: &Harness, e: &Engines) {
         .await;
     assert_problem(&resp, 409, "torrent-adding");
     assert!(h.state.registry.lookup(&ADDING).is_some());
-    // Once the boot is known to have left it unloaded, it is clearable.
+    // Once the boot is known to have left it unloaded, a plain delete still
+    // refuses while its stores hold the resume file or `.torrent` its failed
+    // add left (#354): those are what the next boot loads it from, once the
+    // reason the add failed is fixed.
     h.state.unloaded_at_boot.lock().insert(ADDING);
+    let live = ProfileId::new("p");
+    let in_resume = |h: &Harness| {
+        h.state
+            .resume
+            .load_all(&live)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING)
+    };
+    let in_torrents = |h: &Harness| {
+        h.state
+            .torrents
+            .load_all(&live)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING)
+    };
+    for (resume, torrent) in [(true, true), (true, false), (false, true)] {
+        if resume {
+            h.state
+                .resume
+                .write(&live, &ADDING, b"resume-bytes")
+                .unwrap();
+        }
+        if torrent {
+            h.state
+                .torrents
+                .write(&live, &ADDING, b"torrent-bytes")
+                .unwrap();
+        }
+        let resp = h
+            .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+            .await;
+        assert_problem(&resp, 409, "torrent-unloaded");
+        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        for (held, name) in [
+            (resume, format!("{}.resume", hex(ADDING))),
+            (torrent, format!("{}.torrent", hex(ADDING))),
+        ] {
+            assert_eq!(detail.contains(&name), held, "{name}: {detail}");
+        }
+        assert!(
+            detail.contains("torrentd_boot_torrent_load_failures"),
+            "{detail}"
+        );
+        assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
+        assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+        assert_eq!(in_resume(h), resume, "the refusal touched the resume file");
+        assert_eq!(in_torrents(h), torrent, "the refusal touched the .torrent");
+        // What the operator does to retire it anyway: move the files out.
+        h.state.resume.delete(&live, &ADDING).unwrap();
+        h.state.torrents.delete(&live, &ADDING).unwrap();
+    }
+    // A claim with nothing behind it, as a crash between an add's claim and
+    // its first record leaves, is cleared.
     h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
         .await
         .assert_status(StatusCode::NO_CONTENT);
@@ -1343,6 +1640,129 @@ async fn deleting(h: &Harness, e: &Engines) {
 #[tokio::test]
 async fn torrents_behave_as_documented() {
     scenarios(&Coverage::new()).await;
+}
+
+/// Issue #352: `POST /v1/torrents/{ih}/recheck` sent for twelve torrents in a
+/// row, with `[pool] max_concurrent_verify = 4`, never has more than four
+/// checking at once, and starts the rest as earlier checks end. Each used to
+/// call `force_recheck` itself, so all twelve hashed at once, each with its
+/// peers disconnected, while `torrentd_pool_verify_in_flight` read 0.
+#[tokio::test]
+async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+    cfg.pool.as_mut().unwrap().max_concurrent_verify = 4;
+    let pool = crate::pool_service::PoolService::open(&cfg)
+        .unwrap()
+        .expect("the config has [pool]");
+    let hashes: Vec<InfoHash> = (0..12u8).map(|i| InfoHash([0x40 + i; 20])).collect();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        for ih in &hashes {
+            load(s, &e.p, *ih, "p", TorrentPhase::Seeding);
+        }
+        s.pool = Some(Arc::clone(&pool));
+        engine = Some(e.p);
+    });
+    let engine = engine.unwrap();
+    let rechecked = || -> Vec<InfoHash> {
+        engine
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                RecordedCall::ForceRecheck(h) => Some(h.infohash),
+                _ => None,
+            })
+            .collect()
+    };
+    let recheck = |ih: InfoHash| {
+        let h = &h;
+        async move {
+            h.write("POST", &format!("/v1/torrents/{}/recheck", hex(ih)))
+                .await
+                .assert_status(StatusCode::ACCEPTED);
+        }
+    };
+
+    for ih in &hashes {
+        recheck(*ih).await;
+    }
+    // Asked for twice, queued once.
+    recheck(hashes[0]).await;
+    assert!(
+        rechecked().is_empty(),
+        "nothing hashes before the verify queue admits it: {:?}",
+        engine.calls(),
+    );
+    let q = pool.verify_queue();
+    assert_eq!(q.depth(), 12);
+    let resp = h.read("/v1/pool").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["verify_queue_depth"], 12);
+
+    let tick = || {
+        crate::pool_service::admit_tick_for_tests(
+            &pool,
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    let mut finished = std::collections::HashSet::new();
+    let mut peak = 0;
+    for n in 0..100 {
+        tick();
+        let started = rechecked();
+        let checking = started.iter().filter(|h| !finished.contains(*h)).count();
+        assert!(checking <= 4, "tick {n}: {checking} checking at once");
+        assert_eq!(q.in_flight(), checking, "tick {n}");
+        assert_eq!(q.depth(), 12 - started.len(), "tick {n}");
+        peak = peak.max(checking);
+        if started.len() == hashes.len() && checking == 0 {
+            break;
+        }
+        // The session reports the oldest running check over, as
+        // `torrent_checked` does: after the start, on any clock resolution.
+        if let Some(ih) = started.iter().find(|h| !finished.contains(*h)) {
+            std::thread::sleep(Duration::from_millis(2));
+            h.state
+                .state
+                .update(ih, |st| st.checked_at = Some(Instant::now()));
+            finished.insert(*ih);
+        }
+    }
+    assert_eq!(
+        rechecked(),
+        hashes,
+        "every torrent re-hashed once, in order"
+    );
+    assert_eq!(peak, 4, "the limit is reached, not merely respected");
+    assert_eq!(q.in_flight(), 0);
+
+    // A paused torrent starts no disk work, and the queue would drop its
+    // re-hash: libtorrent is asked at once, as it always was, and marks it
+    // to check once it is resumed.
+    h.state
+        .state
+        .update(&LOADED, |st| st.phase = TorrentPhase::Paused);
+    recheck(LOADED).await;
+    assert_eq!(rechecked().last(), Some(&LOADED));
+    assert_eq!(q.depth(), 0);
+
+    // So does a magnet still without metadata: there is nothing to hash
+    // against yet, and libtorrent checks it once its metadata arrives.
+    let magnet = hashes[1];
+    h.state
+        .state
+        .update(&magnet, |st| st.phase = TorrentPhase::AwaitingMetadata);
+    let before = rechecked().len();
+    recheck(magnet).await;
+    assert_eq!(rechecked().len(), before + 1);
+    assert_eq!(rechecked().last(), Some(&magnet));
+    assert_eq!(q.depth(), 0);
+    assert_eq!(q.in_flight(), 0);
 }
 
 /// Drop the write bit on `dir`, returning the mode to restore afterwards.
@@ -1551,6 +1971,83 @@ async fn a_same_profile_add_that_loses_the_claim_race_is_refused_and_keeps_the_w
     assert_eq!(h.state.registry.lookup(&ih), Some(ProfileId::new("p")));
 }
 
+/// Issue #212: a registry that cannot be written is not a duplicate. The add
+/// used to answer `409 torrent-exists`, which the docs tell a client to read
+/// as "already added", so an automation stopped retrying a torrent that was
+/// never assigned and whose re-read answered 404.
+#[tokio::test]
+async fn an_add_whose_registry_write_fails_answers_500_and_assigns_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+        // Every insert into the registry fails, as on a full or read-only
+        // state directory.
+        let db = dir.path().join("failing.db");
+        s.registry = Arc::new(AssignmentRegistry::new_empty(&db));
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_insert BEFORE INSERT ON assignment \
+                   BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+    });
+    let engine = engine.unwrap();
+    let ih = InfoHash([1; 20]); // MAGNET's btih
+
+    let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
+    assert_problem(&resp, 500, "internal");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains("registry"),
+        "the detail names what failed: {detail}"
+    );
+    assert!(
+        h.state.registry.lookup(&ih).is_none(),
+        "a failed write assigns nothing"
+    );
+    assert!(
+        !engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::AddTorrent(_))),
+        "the add reached the session: {:?}",
+        engine.calls()
+    );
+    let text = String::from_utf8(h.state.metrics.render()).unwrap();
+    assert!(
+        text.contains("profile_assignment_registry_errors_total{profile_id=\"p\"} 1"),
+        "{text}"
+    );
+    let resp = h.read(&format!("/v1/torrents/{}", hex(ih))).await;
+    assert_eq!(resp.status().as_u16(), 404, "nothing was added to re-read");
+}
+
+/// The other half of issue #212: a real duplicate that only `assign` finds —
+/// a row another process wrote for another profile — is still
+/// `torrent-exists`.
+#[tokio::test]
+async fn an_add_whose_infohash_another_process_assigned_elsewhere_is_still_torrent_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg_path = dir.path().join("reg.db");
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+        s.registry = Arc::new(AssignmentRegistry::new_empty(&reg_path));
+    });
+    let engine = engine.unwrap();
+    let ih = InfoHash([1; 20]); // MAGNET's btih
+    AssignmentRegistry::new_empty(&reg_path)
+        .assign(ih, ProfileId::new("strict"))
+        .unwrap();
+
+    let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
+    assert_problem(&resp, 409, "torrent-exists");
+    assert!(engine.calls().is_empty(), "{:?}", engine.calls());
+    assert_eq!(h.state.registry.lookup(&ih), Some(ProfileId::new("strict")));
+}
+
 #[tokio::test]
 async fn an_add_whose_profile_is_fenced_mid_add_pauses_the_torrent() {
     // The add passed the fence check, then the VPN monitor fenced the profile
@@ -1588,6 +2085,89 @@ async fn an_add_whose_profile_is_fenced_mid_add_pauses_the_torrent() {
         called(&engine, &RecordedCall::PauseTorrent(th)),
         "{:?}",
         engine.calls()
+    );
+}
+
+#[tokio::test]
+async fn an_add_the_kill_switch_fences_mid_add_is_resumed_by_the_fences_lift() {
+    // The kill-switch fence lands while `add_torrent` runs: its walk of the
+    // state map misses the torrent, so the add's own re-check pauses it, and
+    // has to record it with the fence through `AppState::kill_switch`, or
+    // the lift resumes the rest and leaves this one paused in a profile that
+    // reads active.
+    use crate::vpn::killswitch::Fence as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut wired = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let engines = fixture(s, dir.path());
+        // `p`'s entry fences and lifts through the engine its session adds
+        // through, as the daemon's do.
+        let p = test_entry("p", ProfileStatus::Active);
+        let p = ProfileEntry::new(p.config, engines.p.clone(), p.session_ip, None, 0);
+        s.profiles = Arc::new(ProfileRegistry::new(vec![p]));
+        let healthy: crate::vpn_monitor::Prober =
+            Arc::new(|_, _| crate::vpn_monitor::TunnelProbes {
+                ip: Ok(Some(std::net::IpAddr::from([10, 2, 0, 2]))),
+                route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
+                handshake: None,
+            });
+        let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+            s.profiles.clone(),
+            s.state.clone(),
+            s.metrics.clone(),
+            healthy,
+        ));
+        s.kill_switch = Some(fence.clone());
+        wired = Some((engines.p, fence));
+    });
+    let (engine, fence) = wired.unwrap();
+    let held = engine.hold_next("add_torrent");
+    let entered = tokio::task::spawn_blocking(move || {
+        held.wait_entered();
+        held
+    });
+    let req = h.write_json("POST", "/v1/torrents", magnet("p"));
+    let fence_mid_add = async {
+        let held = entered.await.unwrap();
+        fence.fence_all();
+        held.release();
+    };
+    let (resp, ()) = tokio::join!(req, fence_mid_add);
+    resp.assert_status(StatusCode::CREATED);
+    // The mock derives the handle's infohash from the magnet's first 20 bytes.
+    let mut synthetic = [0u8; 20];
+    synthetic.copy_from_slice(&MAGNET.as_bytes()[..20]);
+    let th = handle(&engine, InfoHash(synthetic));
+    assert!(
+        !h.state.state.contains(&th.infohash),
+        "the fence's walk cannot have found it"
+    );
+    assert!(
+        called(&engine, &RecordedCall::PauseTorrent(th)),
+        "the add pauses it: {:?}",
+        engine.calls()
+    );
+
+    fence.lift();
+    eventually("the lift resumes the added torrent", || {
+        called(&engine, &RecordedCall::ResumeTorrent(th))
+    })
+    .await;
+    let loaded = handle(&engine, LOADED);
+    eventually("and the torrent its walk paused", || {
+        called(&engine, &RecordedCall::ResumeTorrent(loaded))
+    })
+    .await;
+    assert_eq!(
+        h.state
+            .profiles
+            .resolve(&ProfileId::new("p"))
+            .active()
+            .unwrap()
+            .health()
+            .status,
+        ProfileStatus::Active
     );
 }
 
@@ -1649,8 +2229,9 @@ async fn a_magnet_whose_trackers_are_all_allowed_is_added() {
     // if a magnet naming nothing but allowed ones still gets through,
     // whichever spelling of `tr` it uses.
     let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
     let h = Harness::authed(&Coverage::new(), |s| {
-        fixture(s, dir.path());
+        engine = Some(fixture(s, dir.path()).p);
     });
     let allowed = format!(
         "{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce\
@@ -1672,6 +2253,27 @@ async fn a_magnet_whose_trackers_are_all_allowed_is_added() {
             .as_str(),
         "strict"
     );
+
+    // `strict` is a host profile set up for a tracker account, so it trusts
+    // a torrent's own `private` bit, and a magnet has none until its
+    // metadata arrives: the add itself keeps it off DHT, PEX and LSD.
+    let adds: Vec<_> = engine
+        .unwrap()
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            RecordedCall::AddTorrent(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(adds.len(), 1, "{adds:?}");
+    assert!(
+        adds[0].flags_set().contains(
+            TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_LSD
+        ),
+        "{adds:?}"
+    );
+    assert!(adds[0].forbids_downloading(), "{adds:?}");
 }
 
 #[tokio::test]
@@ -1726,6 +2328,96 @@ async fn one_foreign_tracker_refuses_a_torrent_whatever_else_it_announces_to() {
             .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap()),
         None
     );
+}
+
+/// A one-file `.torrent` announcing to `url` alone; `name` sets its infohash.
+fn announcing(url: &str, name: char) -> Vec<u8> {
+    let mut t = format!(
+        "d8:announce{}:{url}4:infod6:lengthi1e4:name1:{name}12:piece lengthi16384e6:pieces20:",
+        url.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// Issue 166: account B's profile, bound to B's passkey, refuses account A's
+/// torrent on every source `POST /v1/torrents` takes — a `.torrent` in the
+/// body, one on disk (`server_path`), a magnet's `tr=` — though A's tracker
+/// is on B's domain list, and says why in the detail. B's own is added.
+#[tokio::test]
+async fn another_accounts_passkey_is_refused_on_every_api_source() {
+    const A: &str = "https://tracker.allowed.example/PASS-A/announce";
+    const B: &str = "https://tracker.allowed.example/PASS-B/announce";
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(MockEngine::new());
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let mut b = test_host_entry("acct_b").config;
+        b.allowed_tracker_domains = vec!["tracker.allowed.example".to_owned()];
+        b.allowed_tracker_urls = vec!["https://tracker.allowed.example/PASS-B/".to_owned()];
+        s.profiles = Arc::new(ProfileRegistry::new(vec![ProfileEntry::new(
+            b,
+            engine.clone(),
+            None,
+            None,
+            0,
+        )]));
+        s.source = Arc::new(ProfileSource::new(vec![(
+            ProfileId::new("acct_b"),
+            engine.clone() as Arc<dyn TorrentEngine>,
+        )]));
+        s.registry = Arc::new(AssignmentRegistry::new_empty(dir.path().join("reg.json")));
+        s.default_save_path = dir.path().to_path_buf();
+        s.torrent_dir = dir.path().to_path_buf();
+    });
+    let foreign_account = |resp: &TestResponse| {
+        assert_problem(resp, 422, "tracker-not-allowed");
+        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        assert!(detail.contains("allowed_tracker_urls"), "{detail}");
+    };
+
+    foreign_account(
+        &h.write_json(
+            "POST",
+            "/v1/torrents",
+            metainfo("acct_b", &announcing(A, 'a')),
+        )
+        .await,
+    );
+    let on_disk = dir.path().join("a.torrent");
+    std::fs::write(&on_disk, announcing(A, 'd')).unwrap();
+    foreign_account(
+        &h.write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "acct_b", "source": {"kind": "server_path", "path": on_disk}}),
+        )
+        .await,
+    );
+    let tr = A.replace(':', "%3A").replace('/', "%2F");
+    foreign_account(
+        &h.write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "acct_b", "source": {"kind": "magnet", "uri": format!("{MAGNET}&tr={tr}")}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap()),
+        None
+    );
+
+    h.write_json(
+        "POST",
+        "/v1/torrents",
+        metainfo("acct_b", &announcing(B, 'b')),
+    )
+    .await
+    .assert_status(StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -1789,6 +2481,56 @@ async fn status_counts_every_phase_across_profiles() {
     assert_eq!(status["profile_count"], 3);
 }
 
+/// The saves queued since the last call, as `(infohash, unconditional)`.
+fn queued_saves(h: &Harness) -> Vec<(InfoHash, bool)> {
+    h.state
+        .state
+        .dispatch_resume_saves(usize::MAX)
+        .into_iter()
+        .map(|(ih, flags)| {
+            h.state.state.note_resume_settled(&ih);
+            (ih, flags.is_empty())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_pause_the_api_takes_queues_an_unconditional_resume_save() {
+    // Issue #311: a pause is saved at once, not at the next 30-minute sweep,
+    // so a crash before it cannot bring the torrent back running. A torrent
+    // whose pause the engine refused is not paused, and queues nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engines = None;
+    let h = Harness::authed(&Coverage::new(), |s| engines = Some(fixture(s, dir.path())));
+    let e = engines.unwrap();
+    assert_eq!(queued_saves(&h), []);
+
+    h.write("POST", &format!("/v1/torrents/{}/pause", hex(LOADED)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(queued_saves(&h), [(LOADED, true)]);
+
+    let resp = h.write("POST", "/v1/profiles/p/pause-all").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["torrent_count"], 1);
+    assert_eq!(queued_saves(&h), [(LOADED, true)]);
+
+    e.p.inject_error("pause_torrent", injected("pause_torrent"));
+    let resp = h.write("POST", "/v1/profiles/p/pause-all").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["failed_count"], 1);
+    assert_eq!(queued_saves(&h), []);
+
+    // Daemon-wide, the fenced profile's torrent is paused again, and saved
+    // too.
+    let resp = h.write("POST", "/v1/torrents/pause-all").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["torrent_count"], 2);
+    let mut saves = queued_saves(&h);
+    saves.sort_by_key(|(ih, _)| ih.0);
+    assert_eq!(saves, [(LOADED, true), (FENCED, true)]);
+}
+
 #[tokio::test]
 async fn a_torrent_outside_the_allow_list_is_counted_as_a_registry_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -1822,6 +2564,7 @@ fn deliver(h: &Harness, profile: &str, alert: &torrentd_engine::Alert) {
         clock: &clock,
         engine: &engine,
         profile_fenced: None,
+        fence_hold: None,
         profile_id: ProfileId::new(profile),
         span: tracing::info_span!("test"),
     };
@@ -1920,8 +2663,330 @@ async fn a_torrent_re_added_right_after_delete_keeps_its_files_and_entry() {
         "the new add's save path, not the removed torrent's"
     );
     let st = h.state.state.get(&ih).expect("the new torrent is tracked");
-    assert_eq!((st.handle, st.profile_id), (new, p));
+    assert_eq!((st.handle, st.profile_id.clone()), (new, p.clone()));
     assert_eq!(h.state.registry.lookup(&ih).unwrap().as_str(), "p");
+    assert!(
+        h.state.resume.tombstones(&p).unwrap().is_empty(),
+        "the removal's tombstone is spent, or the next boot deletes the re-add's files"
+    );
+}
+
+#[tokio::test]
+async fn delete_removes_the_stores_files_before_it_answers_and_the_removal_settles_its_tombstone() {
+    // The files used to go only when the session's `torrent_removed_alert`
+    // was handled, after the 204: a SIGKILL in between left the resume file
+    // for the next boot to load the torrent from.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p)
+    });
+    let engine = engine.unwrap();
+    let bytes = torrent_bytes('d');
+    let ih = libtorrent_safe::info_hash_from_torrent(&bytes).unwrap();
+    load(&h.state, &engine, ih, "p", TorrentPhase::Seeding);
+    let p = ProfileId::new("p");
+    h.state.torrents.write(&p, &ih, &bytes).unwrap();
+    h.state.torrents.write_save_path(&p, &ih, "/old").unwrap();
+    h.state.resume.write(&p, &ih, b"resume").unwrap();
+
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ih)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
+    assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
+    assert_eq!(
+        h.state.resume.tombstones(&p).unwrap(),
+        vec![ih],
+        "the tombstone stands until the removal alert, the torrent's last"
+    );
+
+    // A resume save libtorrent queued before the removal lands after the
+    // request's delete; the removal's handler deletes it and spends the
+    // tombstone.
+    h.state.resume.write(&p, &ih, b"late").unwrap();
+    deliver(&h, "p", &removed(ih));
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert!(h.state.resume.tombstones(&p).unwrap().is_empty());
+}
+
+/// A resume store whose tombstone writes fail and whose files delete.
+#[derive(Debug, Default)]
+struct UntombstonableResume(torrentd_engine::MemoryResumeStore);
+impl torrentd_engine::ResumeStore for UntombstonableResume {
+    fn scan(
+        &self,
+        p: &ProfileId,
+    ) -> Result<
+        torrentd_engine::resume_store::Scan<libtorrent_safe::ResumeData>,
+        torrentd_engine::resume_store::ResumeStoreError,
+    > {
+        self.0.scan(p)
+    }
+    fn write(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+        d: &[u8],
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.write(p, ih, d)
+    }
+    fn delete(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.delete(p, ih)
+    }
+    fn exists(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<bool, torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.exists(p, ih)
+    }
+    fn write_tombstone(
+        &self,
+        _: &ProfileId,
+        _: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into())
+    }
+    fn clear_tombstone(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.clear_tombstone(p, ih)
+    }
+    fn tombstones(
+        &self,
+        p: &ProfileId,
+    ) -> Result<Vec<InfoHash>, torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.tombstones(p)
+    }
+}
+
+#[tokio::test]
+async fn a_delete_whose_tombstone_write_fails_counts_it_and_still_answers_204() {
+    // A full disk must not block a delete, which is often how an operator
+    // frees space: the failed tombstone write is counted, and the request's
+    // own deletes carry the durability.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+        s.resume = Arc::new(UntombstonableResume::default());
+    });
+    let engine = engine.unwrap();
+    let bytes = torrent_bytes('t');
+    let ih = libtorrent_safe::info_hash_from_torrent(&bytes).unwrap();
+    load(&h.state, &engine, ih, "p", TorrentPhase::Seeding);
+    let p = ProfileId::new("p");
+    h.state.torrents.write(&p, &ih, &bytes).unwrap();
+    h.state.torrents.write_save_path(&p, &ih, "/old").unwrap();
+    h.state.resume.write(&p, &ih, b"resume").unwrap();
+
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ih)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
+    assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
+    assert!(h.state.resume.tombstones(&p).unwrap().is_empty());
+    assert!(h.state.registry.lookup(&ih).is_none());
+    let text = String::from_utf8(h.state.metrics.render()).unwrap();
+    let counted: Vec<_> = text
+        .lines()
+        .filter(|l| l.starts_with("torrentd_torrent_remove_cleanup_errors_total{"))
+        .collect();
+    assert_eq!(
+        counted,
+        ["torrentd_torrent_remove_cleanup_errors_total{profile_id=\"p\",store=\"tombstone\"} 1"],
+        "only the tombstone write failed: {text}"
+    );
+}
+
+/// A resume store that cannot say whether it holds a file, and otherwise
+/// works.
+#[derive(Debug, Default)]
+struct UncheckableResume(torrentd_engine::MemoryResumeStore);
+impl torrentd_engine::ResumeStore for UncheckableResume {
+    fn scan(
+        &self,
+        p: &ProfileId,
+    ) -> Result<
+        torrentd_engine::resume_store::Scan<libtorrent_safe::ResumeData>,
+        torrentd_engine::resume_store::ResumeStoreError,
+    > {
+        self.0.scan(p)
+    }
+    fn write(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+        d: &[u8],
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.write(p, ih, d)
+    }
+    fn delete(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.delete(p, ih)
+    }
+    fn exists(
+        &self,
+        _: &ProfileId,
+        _: &InfoHash,
+    ) -> Result<bool, torrentd_engine::resume_store::ResumeStoreError> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+    }
+    fn write_tombstone(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.write_tombstone(p, ih)
+    }
+    fn clear_tombstone(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.clear_tombstone(p, ih)
+    }
+    fn tombstones(
+        &self,
+        p: &ProfileId,
+    ) -> Result<Vec<InfoHash>, torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.tombstones(p)
+    }
+}
+
+#[tokio::test]
+async fn an_unloaded_delete_whose_resume_store_cannot_answer_answers_500_and_changes_nothing() {
+    // Whether the resume file is there decides whether the delete may clear
+    // the claim (#354). A store that cannot say must not be read as "absent",
+    // or a load failure becomes a lost torrent.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+        s.resume = Arc::new(UncheckableResume::default());
+    });
+    let p = ProfileId::new("p");
+    h.state.unloaded_at_boot.lock().insert(ADDING);
+    h.state.resume.write(&p, &ADDING, b"resume-bytes").unwrap();
+    h.state
+        .torrents
+        .write(&p, &ADDING, b"torrent-bytes")
+        .unwrap();
+
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 500, "internal");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("resume file"), "{detail}");
+    assert!(detail.contains("Nothing was changed"), "{detail}");
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(p.clone()));
+    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+    assert!(
+        h.state
+            .resume
+            .load_all(&p)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING),
+        "the resume file is kept"
+    );
+    assert!(h.state.torrents.exists(&p, &ADDING), "the .torrent is kept");
+}
+
+#[tokio::test]
+async fn an_unloaded_delete_whose_pool_index_cannot_be_read_keeps_a_resume_less_torrent() {
+    // A `.torrent` with no resume file is cleared only where the pool index
+    // records its adoption `drifted`. An index that cannot be read says
+    // nothing of the kind, so the `.torrent` is what the next boot loads and
+    // the delete refuses.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::config::Config::minimal_for_tests(dir.path(), true);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+        s.pool = crate::pool_service::PoolService::open(&cfg).unwrap();
+    });
+    let p = ProfileId::new("p");
+    h.state.unloaded_at_boot.lock().insert(ADDING);
+    h.state
+        .torrents
+        .write(&p, &ADDING, b"torrent-bytes")
+        .unwrap();
+    h.state
+        .pool
+        .as_ref()
+        .unwrap()
+        .with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: hex(ADDING),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "A".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join("a.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: Some("p".into()),
+                },
+                0,
+            )?;
+            st.set_adoption(
+                &hex(ADDING),
+                torrentd_pool::AdoptionState::Drifted,
+                None,
+                None,
+                None,
+                Some(1),
+                None,
+            )
+        })
+        .unwrap();
+    // The reader fails from here on, as on a corrupt or unreadable index.
+    let index = rusqlite::Connection::open(cfg.pool_db_path()).unwrap();
+    index
+        .execute_batch("ALTER TABLE adoption RENAME TO adoption_unreadable")
+        .unwrap();
+
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 409, "torrent-unloaded");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains(&format!("{}.torrent", hex(ADDING))),
+        "{detail}"
+    );
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(p.clone()));
+    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+    assert!(h.state.torrents.exists(&p, &ADDING), "the .torrent is kept");
+
+    // The unreadable index is what refused: readable again, the `drifted`
+    // record clears it.
+    index
+        .execute_batch("ALTER TABLE adoption_unreadable RENAME TO adoption")
+        .unwrap();
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert!(h.state.registry.lookup(&ADDING).is_none());
+    assert!(!h.state.torrents.exists(&p, &ADDING));
 }
 
 #[tokio::test]

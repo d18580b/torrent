@@ -151,6 +151,107 @@ fn every_error_is_a_problem_and_every_problem_type_is_catalogued() {
     }
 }
 
+fn reference(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/api")
+            .join(name),
+    )
+    .unwrap()
+}
+
+/// The prose under `## `slug`` in `docs/api/problems.md`, up to the next
+/// heading, with its line breaks folded to spaces.
+fn problem_text(catalogue: &str, slug: &str) -> String {
+    let heading = format!("## `{slug}`");
+    let start = catalogue
+        .find(&heading)
+        .unwrap_or_else(|| panic!("problems.md has no heading for `{slug}`"))
+        + heading.len();
+    let rest = &catalogue[start..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn the_reference_names_every_patch_operation() {
+    // The conventions once said `v1` has no `PATCH` while one existed, and
+    // the fence-lifting docs sent operators to it.
+    let readme = reference("README.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !readme.contains("has no `PATCH`"),
+        "README.md denies a PATCH"
+    );
+    let mut seen = 0;
+    for (method, path, _) in operations(&doc()) {
+        if method == "PATCH" {
+            seen += 1;
+            assert!(
+                readme.contains(&format!("`PATCH {path}`")),
+                "docs/api/README.md does not name `PATCH {path}`"
+            );
+        }
+    }
+    assert!(seen > 0, "the document has no PATCH operation to check");
+}
+
+#[test]
+fn the_problem_catalogue_says_what_the_handlers_do() {
+    let catalogue = reference("problems.md");
+
+    // Every operation under a torrent acts through its session, and answers
+    // `torrent-not-found` for one that is assigned but not loaded, while the
+    // listing and the torrent's own resource still show it.
+    let not_found = problem_text(&catalogue, "torrent-not-found");
+    assert!(not_found.contains("not loaded"), "{not_found}");
+    let mut seen = 0;
+    for (method, path, _) in operations(&doc()) {
+        let Some(sub) = path.strip_prefix("/v1/torrents/{infohash}/") else {
+            continue;
+        };
+        seen += 1;
+        let segment = sub.rsplit('/').find(|s| !s.starts_with('{')).unwrap();
+        assert!(
+            not_found.contains(&format!("`{segment}`")),
+            "{method} {path}: `torrent-not-found` does not name `{segment}`: {not_found}"
+        );
+    }
+    assert!(seen >= 8, "only {seen} operations under a torrent");
+
+    // A torrent mid-add is listed with phase `unknown` from the start, so its
+    // appearing in the listing says nothing about whether a delete will pass.
+    let adding = problem_text(&catalogue, "torrent-adding");
+    assert!(adding.contains("a phase other than `unknown`"), "{adding}");
+
+    // The token mixes in the index generation, which every rescan moves.
+    let generation = 7;
+    let steps = [];
+    assert_ne!(
+        torrentd_pool::plan::confirm_token(1, generation, &steps),
+        torrentd_pool::plan::confirm_token(1, generation + 1, &steps),
+        "a rescan no longer changes the token; the catalogue says it does"
+    );
+    let mismatch = problem_text(&catalogue, "confirm-token-mismatch");
+    for needle in ["generation", "rescan", "GET /v1/pool/plans/{plan_id}"] {
+        assert!(mismatch.contains(needle), "{needle}: {mismatch}");
+    }
+
+    // A `failed` plan with a step still `in_progress` is claimable, but the
+    // executor refuses it on every apply; the catalogue once promised that
+    // any `failed` plan retries.
+    for slug in ["plan-not-draft", "apply-failed"] {
+        let text = problem_text(&catalogue, slug);
+        assert!(text.contains("still `in_progress`"), "{slug}: {text}");
+    }
+    let apply_failed = problem_text(&catalogue, "apply-failed");
+    for needle in ["rescan", "discard the plan"] {
+        assert!(apply_failed.contains(needle), "{needle}: {apply_failed}");
+    }
+}
+
 #[test]
 fn every_page_limit_publishes_its_bounds() {
     // kynos describes a query parameter by its type alone, so a bound
@@ -173,7 +274,7 @@ fn every_page_limit_publishes_its_bounds() {
             );
         }
     }
-    assert_eq!(seen, 6, "every paged listing takes a `limit`");
+    assert_eq!(seen, 7, "every paged listing takes a `limit`");
 }
 
 #[test]
@@ -193,16 +294,18 @@ fn a_bulk_outcome_publishes_how_many_failures_it_names() {
 fn only_operations_with_a_body_declare_a_deadline() {
     // `408` comes from the deadline a body-bearing group carries; one on an
     // operation without a body would be a promise nothing can produce, and
-    // one missing from a body-bearing operation (bar the plan apply, which
-    // waits for minutes by design) is a slow body nothing bounds.
+    // one missing from a body-bearing operation is a slow body nothing
+    // bounds. The plan apply and adopting or creating a plan wait for minutes
+    // by design, so their deadline bounds the body read alone, and still
+    // declares the `408`; only the alert drill's test surface has none.
     let doc = doc();
     for (method, path, op) in operations(&doc) {
         let has_body = op.get("requestBody").is_some();
         let has_deadline = op["responses"].get("408").is_some();
-        let long = path == "/v1/pool/plans/{plan_id}/apply" || path == "/v1/faults";
+        let unbounded = path == "/v1/faults";
         assert_eq!(
             has_deadline,
-            has_body && !long,
+            has_body && !unbounded,
             "{method} {path}: body {has_body}, 408 {has_deadline}"
         );
     }

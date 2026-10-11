@@ -109,6 +109,26 @@ fn withheld_reloadable_keys(
 const NON_RELOADABLE_WARNING: &str =
     "SIGHUP: change to non-reloadable field requires daemon restart; ignored";
 
+/// What an ignored `[auth]` change is told, after `NON_RELOADABLE_WARNING`.
+///
+/// The generic line says a restart is needed; this one says what that costs
+/// for credentials, because the usual reason to edit `[auth]` under a live
+/// daemon is revoking a leaked `[[auth.token]]`, and a reload that answered
+/// `202` reads as done. The authenticator is built once at startup, so the
+/// removed token keeps every scope it had until the restart.
+const AUTH_NOT_RELOADED_WARNING: &str = "SIGHUP: [auth] is read only at startup; the running \
+     password, session TTL and [[auth.token]] table are unchanged, and a token removed from the \
+     file keeps working until the daemon restarts";
+
+/// The second line a non-reloadable change gets, where ignoring it has a
+/// consequence the generic warning does not convey.
+fn non_reloadable_consequence(field: &str) -> Option<&'static str> {
+    match field {
+        "auth" => Some(AUTH_NOT_RELOADED_WARNING),
+        _ => None,
+    }
+}
+
 /// What a change to a profile's identity is told.
 ///
 /// Safety Rule 7: identity-critical profile fields cannot change under a live
@@ -155,8 +175,13 @@ pub async fn run(
         let next = match Config::load(&config_path) {
             Ok(c) => c,
             Err(e) => {
+                // `{e:#}`, not `%e`: `Config::load` wraps the toml or
+                // validation error in `parse <path>`, and an anyhow error's
+                // plain Display prints only that outermost context, so the
+                // journal named the file and not the key, line or reason the
+                // operator needs to fix it.
                 warn!(
-                    error.cause = %e,
+                    error.cause = %format_args!("{e:#}"),
                     "SIGHUP: failed to reload config; keeping current settings",
                 );
                 failed("load");
@@ -170,6 +195,9 @@ pub async fn run(
         }
         for nr in &diff.non_reloadable_changes {
             warn!(changed_field = %nr, "{NON_RELOADABLE_WARNING}");
+            if let Some(consequence) = non_reloadable_consequence(nr) {
+                warn!(changed_field = %nr, "{consequence}");
+            }
         }
         // A reloadable key the operator deleted. The sample config documents
         // deletion as the way back to the preset default, and that default is
@@ -202,7 +230,10 @@ pub async fn run(
                     info!(new_log_level = level.as_str(), "SIGHUP: log level applied");
                 }
                 Err(e) => {
-                    warn!(error.cause = %e, "SIGHUP: failed to apply log level");
+                    warn!(
+                        error.cause = %format_args!("{e:#}"),
+                        "SIGHUP: failed to apply log level",
+                    );
                     failed("log_level");
                 }
             }
@@ -245,7 +276,11 @@ pub async fn run(
                     .apply_settings(&patch.settings)
                     .context("apply_settings")
                 {
-                    warn!(profile_id = %profile, error.cause = %e, "SIGHUP: apply_settings failed");
+                    warn!(
+                        profile_id = %profile,
+                        error.cause = %format_args!("{e:#}"),
+                        "SIGHUP: apply_settings failed",
+                    );
                     failed("apply_settings");
                     settings_applied = false;
                 } else {
@@ -341,6 +376,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit,
         }
     }
@@ -377,6 +413,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -517,7 +554,7 @@ mod tests {
         // second SIGHUP answered `config unchanged` about an `http_listen`
         // the daemon was not listening on.
         let (first, second, running) = reload_twice(|c| {
-            c.http_listen = std::net::SocketAddr::from(([127, 0, 0, 1], 9090));
+            c.http_listen = crate::config::HttpListen::Unix("/run/torrentd/api.sock".into());
             c.connections_limit = Some(20_000);
         });
         assert_eq!(first.non_reloadable_changes, vec!["http_listen"]);
@@ -536,8 +573,61 @@ mod tests {
         assert_eq!(running.connections_limit, Some(20_000));
         assert_eq!(
             running.http_listen,
-            std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+            crate::config::HttpListen::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))),
             "the running config keeps the address the daemon bound",
+        );
+    }
+
+    #[test]
+    fn a_static_token_removed_from_the_file_survives_every_reload_and_says_so() {
+        // The property: `[auth]` is restart-only, so a reload that drops a
+        // `[[auth.token]]` leaves the running daemon holding it, reports the
+        // change on every reload until the restart, and tells the operator
+        // the removed token still works. The 409 and the docs once said a
+        // reload revoked it.
+        use crate::auth::AuthConfig;
+        use crate::auth::Scope;
+        use crate::auth::TokenConfig;
+        let token = |name: &str| TokenConfig {
+            name: name.into(),
+            sha256: format!("{:0>64}", name.len()),
+            scopes: vec![Scope::Read, Scope::Write],
+        };
+        let auth = |tokens: Vec<TokenConfig>| AuthConfig {
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            session_ttl_secs: 43_200,
+            token: tokens,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut boot = Config::minimal_for_tests(dir.path(), true);
+        boot.auth = Some(auth(vec![token("ci"), token("scrape")]));
+        let mut file = boot.clone();
+        file.auth = Some(auth(vec![token("scrape")]));
+
+        let first = Config::diff(&boot, &file);
+        assert_eq!(first.non_reloadable_changes, vec!["auth"]);
+        let running = running_config(&boot, &file, &first, true, first.log_level.is_some());
+        assert_eq!(
+            running.auth, boot.auth,
+            "the authenticator is the boot one, so the removed `ci` token still authenticates",
+        );
+        let second = Config::diff(&running, &file);
+        assert_eq!(
+            second.non_reloadable_changes,
+            vec!["auth"],
+            "the restart the first reload asked for has not happened",
+        );
+
+        let consequence = non_reloadable_consequence("auth").expect("auth has a second line");
+        assert!(
+            consequence
+                .contains("a token removed from the file keeps working until the daemon restarts"),
+            "{consequence}",
+        );
+        assert_eq!(
+            non_reloadable_consequence("http_listen"),
+            None,
+            "only a change whose cost the generic warning hides gets a second line",
         );
     }
 
@@ -727,6 +817,10 @@ listen_interfaces = "0.0.0.0:6881"
         let log = log.text();
         let count = |line: &str| log.matches(line).count();
         assert_eq!(count("SIGHUP: apply_settings failed"), 1, "{log}");
+        assert!(
+            log.contains("boom"),
+            "the engine's own error, under the `apply_settings` context, is logged: {log}",
+        );
         assert_eq!(count("SIGHUP: settings applied"), 1, "{log}");
         assert_eq!(
             count("SIGHUP: log level applied"),
@@ -734,6 +828,47 @@ listen_interfaces = "0.0.0.0:6881"
             "an applied level advances and is not set again on the retry: {log}",
         );
         assert_eq!(count("SIGHUP: config unchanged"), 1, "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_an_unparseable_config_logs_the_toml_error() {
+        // `Config::load` wraps the toml error as `parse <path>`, and an anyhow
+        // error's plain Display prints only that outermost context: the
+        // journal named the file and nothing an operator could act on. The
+        // reason the toml parser gave has to reach the log.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.toml");
+        let boot = Config::minimal_for_tests(dir.path(), true);
+        // A value toml reads and the schema refuses: the reason names it,
+        // and holds no character the JSON log would escape, so it can be
+        // matched verbatim.
+        std::fs::write(&path, "connections_limit = -1\n").unwrap();
+        let root = Config::load(&path).unwrap_err().root_cause().to_string();
+        let reason = root.lines().last().unwrap().to_owned();
+        assert!(reason.contains("-1"), "{root}");
+
+        let registry = Arc::new(crate::profile_registry::ProfileRegistry::new(vec![]));
+        let source: Arc<dyn AlertSource> = Arc::new(torrentd_engine::ProfileSource::new(vec![]));
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+
+        let log = crate::tracing_init::Buf::default();
+        let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(()).unwrap();
+        drop(tx);
+        run(path, boot, source, registry, rx, log_handle, metrics).await;
+
+        let log = log.text();
+        assert!(
+            log.contains("SIGHUP: failed to reload config; keeping current settings"),
+            "{log}",
+        );
+        assert!(
+            log.contains(&reason),
+            "the toml error's reason {reason:?} is logged: {log}"
+        );
     }
 
     #[test]

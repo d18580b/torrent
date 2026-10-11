@@ -21,6 +21,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use tokio::sync::broadcast;
+use torrentd_engine::port_forward::Pacer;
+use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
@@ -35,8 +37,10 @@ use tracing::info;
 use tracing::warn;
 
 use crate::metrics_sink::PromSink;
+use crate::profile_registry::Gated;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ResumeGate;
 use crate::vpn;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -55,8 +59,10 @@ pub(crate) enum DownReason {
     /// wins the lookup.
     RouteMismatch,
     /// The address is intact but the WireGuard handshake is older than
-    /// allowed, and its profile has had torrents to carry for longer than
-    /// that: traffic went into the tunnel and no handshake answered it.
+    /// allowed, and the link has sent bytes nothing answered for longer than
+    /// that: its `tx` counter grew while its `rx` stayed still. Where the
+    /// link's counters were never readable in the run, the time its profile
+    /// has had torrents to carry stands in for that.
     HandshakeStale,
     /// A WireGuard tunnel that has never handshaked, for longer than the
     /// handshake threshold while its profile had torrents to carry: wrong key,
@@ -144,10 +150,12 @@ pub(crate) struct Observation {
     /// How long a WireGuard tunnel has had traffic to carry with no handshake
     /// answering it, counted only over the current run of polls that saw
     /// torrents in its profile that can send (not paused): for a handshaked
-    /// tunnel, the time since that run began or the handshake's age, whichever
-    /// is shorter; for a never-handshaked one, the time since the first poll
-    /// in it that saw no handshake. Zero on any poll whose profile has nothing
-    /// to send, which ends the run. [`unanswered_clock`] keeps it.
+    /// tunnel, the time since the link's byte counters first showed it
+    /// sending with nothing received, or the handshake's age, whichever is
+    /// shorter (the time since the run began where the counters cannot be
+    /// read); for a never-handshaked one, the time since the first poll in it
+    /// that saw no handshake. Zero on any poll whose profile has nothing to
+    /// send, which ends the run. [`unanswered_clock`] keeps it.
     ///
     /// Not time since bring-up, and not the handshake's age alone. WireGuard
     /// handshakes only when it has a packet to send, and a profile with no
@@ -155,7 +163,9 @@ pub(crate) struct Observation {
     /// one that never handshaked stays so. Judged on either, a fresh
     /// deployment's empty profile, or one whose torrents are all paused, was
     /// fenced for having nothing to do, and fencing, which pauses nothing
-    /// there, still needed an operator to undo.
+    /// there, still needed an operator to undo. A seeding profile with no
+    /// peer connected sends only its announces, half an hour apart, and was
+    /// fenced between two of them on the time it had carried alone.
     pub unanswered_for: Duration,
 }
 
@@ -226,6 +236,9 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
         // the `continue` in the poll loop running before the probe does.
         if e.config.vpn_type() == Some(VpnType::Wireguard) {
             metrics.set_gauge("profile_vpn_handshake_probe_ok", 1.0, &labels);
+            // The byte counters the aged-handshake rule reads, on the same
+            // terms: a `0` is a host-tooling fault, never a boot failure.
+            metrics.set_gauge("profile_vpn_transfer_probe_ok", 1.0, &labels);
         }
         // The route and address probes run for both tunnel types. Same
         // reasoning as the handshake series: `0` means the probe could not run
@@ -317,7 +330,22 @@ struct Unanswered {
     /// The first poll of that run that saw the tunnel never handshaked, since
     /// the last poll that saw a handshake.
     never_since: Option<Instant>,
+    /// The tunnel's byte counters at the last poll of this run that could
+    /// read them.
+    counters: Option<vpn::WireguardTransfer>,
+    /// The first poll of this run that saw the tunnel send (`tx` grew) with
+    /// nothing received (`rx` still), since the last poll that saw `rx` grow.
+    sent_unanswered_since: Option<Instant>,
+    /// How many polls in a row, ending with the latest, could not read the
+    /// counters. A reading resets it.
+    unread_polls: u32,
 }
+
+/// How many polls in a row may fail to read a WireGuard link's byte counters
+/// before [`unanswered_clock`] judges an aged handshake on the time the
+/// profile has carried traffic instead: a poll that fails once in a while,
+/// with readings either side, is not a probe that has stopped working.
+const TRANSFER_PROBE_GRACE_POLLS: u32 = 2;
 
 /// Advance one profile's unanswered clock and read it
 /// ([`Observation::unanswered_for`]).
@@ -330,11 +358,34 @@ struct Unanswered {
 ///   handshake while carrying. A handshake resets this, so a link re-raised
 ///   under the profile (its handshake gone again) gets the whole threshold to
 ///   handshake, as a fresh one does.
-/// - **Handshaked:** the time since the profile started carrying, capped at
-///   the handshake's age. A handshake inside the run answered the traffic up
-///   to it; one older than the run predates any traffic it could have
-///   answered, so an idle link's handshake, however old, is no fault until
-///   the profile has carried for the threshold with none.
+/// - **Handshaked:** the time since the tunnel sent something nothing has
+///   answered, capped at the handshake's age. `transfer` is the link's byte
+///   counters this poll: the clock starts at the first poll that sees `tx`
+///   grow with `rx` still, and any growth in `rx` stops it, since the peer
+///   answered. A link whose `tx` stays flat has sent nothing to answer, so a
+///   quiet seed's handshake, however old, is no fault: with no keepalive and
+///   no peer connected it sends only an announce every half hour, and judged
+///   on the time it had carried, it was fenced between two of them. A
+///   handshake inside the run answered the traffic up to it.
+///
+///   Counters that dropped (the link was re-raised and they restarted) are a
+///   new baseline with nothing outstanding. The first poll of a run that
+///   reads them is a baseline too, since what was sent before it is unknown.
+/// - **Handshaked, counters unreadable:** for the first
+///   [`TRANSFER_PROBE_GRACE_POLLS`] polls in a row that cannot read them, the
+///   clock reads as the counters last left it (zero where none started it),
+///   so one transient failure does not fence a quiet seed whose handshake and
+///   carrying run are both past the threshold. From the next failed poll on,
+///   it reads the time since the profile started carrying, capped at the
+///   handshake's age, whether or not an earlier poll in the run read the
+///   counters: a quiet seed may then be fenced, but a dead tunnel still is.
+///   The run's start is never later than a clock the counters started, so
+///   this never reads less than that clock would. An unread poll leaves the
+///   counters' baseline and that clock as they stand, so a later reading
+///   picks up where the last one left off. Reading zero for as long as the
+///   probe failed, after one good reading, let a transfer probe that failed
+///   steadily switch the stale-handshake fence off however old the handshake
+///   grew.
 ///
 /// A poll whose handshake probe could not run ([`Handshake::NoSignal`]) says
 /// nothing about the handshake, so while the profile carries traffic it leaves
@@ -345,6 +396,7 @@ fn unanswered_clock(
     clocks: &mut std::collections::HashMap<torrentd_engine::ProfileId, Unanswered>,
     id: &torrentd_engine::ProfileId,
     handshake: Handshake,
+    transfer: Option<vpn::WireguardTransfer>,
     carrying: bool,
     now: Instant,
 ) -> Duration {
@@ -355,12 +407,36 @@ fn unanswered_clock(
     let clock = clocks.entry(id.clone()).or_insert(Unanswered {
         carrying_since: now,
         never_since: None,
+        counters: None,
+        sent_unanswered_since: None,
+        unread_polls: 0,
     });
+    if transfer.is_some() {
+        clock.unread_polls = 0;
+    } else {
+        clock.unread_polls = clock.unread_polls.saturating_add(1);
+    }
+    if let Some(seen) = transfer {
+        if let Some(last) = clock.counters.replace(seen) {
+            if seen.rx != last.rx || seen.tx < last.tx {
+                clock.sent_unanswered_since = None;
+            } else if seen.tx > last.tx {
+                clock.sent_unanswered_since.get_or_insert(now);
+            }
+        }
+    }
     match handshake {
         Handshake::Never => now.saturating_duration_since(*clock.never_since.get_or_insert(now)),
         Handshake::Age(age) => {
             clock.never_since = None;
-            now.saturating_duration_since(clock.carrying_since).min(age)
+            let since = if clock.unread_polls > TRANSFER_PROBE_GRACE_POLLS {
+                Some(clock.carrying_since)
+            } else {
+                clock.sent_unanswered_since
+            };
+            since.map_or(Duration::ZERO, |since| {
+                now.saturating_duration_since(since).min(age)
+            })
         }
         Handshake::NoSignal => Duration::ZERO,
     }
@@ -401,6 +477,14 @@ pub(crate) type Prober = Arc<dyn Fn(&str, bool) -> TunnelProbes + Send + Sync>;
 pub(crate) fn host_prober() -> Prober {
     Arc::new(probe_tunnel)
 }
+
+/// How [`run_with`] reads a WireGuard tunnel's byte counters:
+/// [`vpn::wireguard_transfer`] outside tests. Apart from [`Prober`] because
+/// only the poll loop reads them: [`recovery_check`] does not judge the
+/// handshake.
+type CounterProber = Arc<
+    dyn Fn(&str) -> Result<vpn::WireguardTransfer, vpn::HandshakeProbeUnavailable> + Send + Sync,
+>;
 
 /// Whether a fenced profile's tunnel is healthy enough to lift the fence,
 /// asked when the operator sets the profile online. Blocking: it shells out.
@@ -461,7 +545,23 @@ pub(crate) fn recovery_check(
 /// after the walk left a window in which neither side paused it. The
 /// `SeqCst` fence pairs with the one in the add handler between its insert and
 /// its read of the mark, so at least one side sees the other.
-fn fence(
+///
+/// The pauses are not paced, unlike every bulk resume ([`resume_paced`]):
+/// stopping the profile's traffic is the point of a fence, and pacing it
+/// would leave most of a large profile seeding for minutes over a tunnel that
+/// is gone. Each paused torrent sends its trackers a `stopped` announce, so
+/// fencing tens of thousands of torrents sends that many announces within a
+/// second or so, and can overflow the session's alert queue
+/// (`TorrentdAlertQueueOverflow`). Its lift is paced, which is the burst a
+/// flapping tunnel or ruleset would otherwise repeat at full size.
+///
+/// The generation is bumped in the same update that marks the profile and
+/// starts the count over, so the boot scans, which can read the profile
+/// between this fence's mark and its walk, never see the new mark under the
+/// old generation ([`ProfileHealth::fence_generation`]).
+///
+/// [`ProfileHealth::fence_generation`]: crate::profile_registry::ProfileHealth::fence_generation
+pub(crate) fn fence(
     entry: &ProfileEntry,
     state: &StateMap,
     current: Option<IpAddr>,
@@ -472,6 +572,7 @@ fn fence(
         h.status = ProfileStatus::VpnDown;
         h.tunnel_ip = current;
         h.paused_for_vpn = 0;
+        h.fence_generation += 1;
     });
     atomic::fence(atomic::Ordering::SeqCst);
     let labels = [("profile_id", profile_id.as_str())];
@@ -521,8 +622,18 @@ fn fence(
 /// and one whose tunnel no longer passes [`recovery_check`] stays fenced for
 /// the operator, as any fence on a failing tunnel does. Only the torrents that
 /// were not paused when it fenced are resumed, so a torrent the operator had
-/// paused stays paused. A profile set online and then fenced again resumes
-/// what was running at that latest fence.
+/// paused stays paused. So does one paused while the fence stands, by the
+/// operator or for a failed verification, and a pause of the whole profile
+/// then leaves all of it paused: the fence opens a resume gate on the profile
+/// as it fences ([`FenceRecord::gate`]), which every such pause closes
+/// ([`ProfileEntry::exclude_from_resumes`], [`ProfileEntry::halt_resumes`]),
+/// and its lift keeps to it. A profile set online and then fenced again
+/// resumes what was running at that latest fence.
+///
+/// The lift resumes them a batch per [`REANNOUNCE_PACE`] ([`spawn_lift`]),
+/// from a task that outlives the check that lifted it. A
+/// fence that lands before that task ends stops it, and the next lift
+/// resumes the torrents it had not reached as well as what was running.
 pub(crate) struct KillSwitchFence {
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -530,7 +641,31 @@ pub(crate) struct KillSwitchFence {
     probe: Prober,
     /// The profiles this fence marked `vpn_down`, each with the torrents it
     /// found running and paused.
-    fenced: parking_lot::Mutex<std::collections::HashMap<ProfileId, Vec<TorrentHandle>>>,
+    fenced: parking_lot::Mutex<Fenced>,
+}
+
+/// [`KillSwitchFence`]'s record, under its lock.
+#[derive(Default)]
+struct Fenced {
+    /// How many profiles it has ever marked, the last mark's number.
+    marks: u64,
+    profiles: std::collections::HashMap<ProfileId, FenceRecord>,
+}
+
+/// One profile [`KillSwitchFence`] holds fenced.
+pub(crate) struct FenceRecord {
+    /// Which mark put the profile under this fence, unique to it: a record
+    /// with a number its reader has not seen is a fence that landed since,
+    /// though a lift came and went between the two reads.
+    pub(crate) mark: u64,
+    /// What its lift resumes.
+    pub(crate) handles: Vec<TorrentHandle>,
+    /// Opened on the profile before the fence read what was running, and
+    /// kept to by its lift's run ([`ProfileEntry::begin_resume_with`]): a
+    /// torrent paused since is left out of [`FenceRecord::handles`] when the
+    /// lift reaches it, and a pause of the whole profile since halts the lift
+    /// before it resumes any.
+    gate: Arc<ResumeGate>,
 }
 
 impl KillSwitchFence {
@@ -548,6 +683,59 @@ impl KillSwitchFence {
             fenced: Default::default(),
         }
     }
+
+    /// Run `hold` with this fence's record of what its lift resumes in
+    /// `profile_id`: `Some` while this fence holds the profile, `None` while
+    /// it does not.
+    ///
+    /// For the boot scans (`startup::ScanFence`), which add torrents no
+    /// state-map walk reaches: a fence that lands mid-scan records none of
+    /// them, so its lift would leave paused every one the scans paused for it.
+    /// `hold` runs under the lock [`vpn::killswitch::Fence::fence_all`] and
+    /// [`vpn::killswitch::Fence::lift`] each hold from their first mark to
+    /// their last, so this fence neither marks nor lifts the profile between
+    /// `hold`'s read of its status and its record. The record's
+    /// [`FenceRecord::mark`] tells `hold` whether the fence is the one it saw
+    /// last, so a lift and a new fence between two calls are not mistaken for
+    /// the fence still standing.
+    pub(crate) fn with_record<R>(
+        &self,
+        profile_id: &ProfileId,
+        hold: impl FnOnce(Option<&mut FenceRecord>) -> R,
+    ) -> R {
+        hold(self.fenced.lock().profiles.get_mut(profile_id))
+    }
+
+    /// Run `hold`, an add path's check and pause of `handle` just added to
+    /// `profile_id`, under this fence's lock, and record `handle` for the
+    /// lift where `hold` answers that it found the profile fenced and this
+    /// fence holds it.
+    ///
+    /// For the runtime add paths ([`hold_if_fenced`], and the add handler
+    /// through `torrentd_engine::FenceHold`). A torrent whose add lands after
+    /// [`vpn::killswitch::Fence::fence_all`]'s walk of the state map, or
+    /// that the walk read as paused, is otherwise paused with no record, and
+    /// stays paused once the lift resumes the rest. Under the lock, this
+    /// fence neither marks nor lifts the profile between `hold`'s read of its
+    /// status and the record, so a lift either resumed the profile before
+    /// `hold` read it (and `hold` pauses nothing) or finds the handle in its
+    /// record. Recorded whether or not the pause took, as the boot scans do.
+    /// A handle recorded twice, by both add paths or by them and the walk,
+    /// is resumed once: the lift drops repeats.
+    pub(crate) fn hold_recorded(
+        &self,
+        profile_id: &ProfileId,
+        handle: TorrentHandle,
+        hold: impl FnOnce() -> bool,
+    ) {
+        self.with_record(profile_id, |record| {
+            if hold() {
+                if let Some(record) = record {
+                    record.handles.push(handle);
+                }
+            }
+        });
+    }
 }
 
 impl vpn::killswitch::Fence for KillSwitchFence {
@@ -562,7 +750,11 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             if health.status == ProfileStatus::VpnDown {
                 continue;
             }
-            let running: Vec<TorrentHandle> = self
+            // Opened before the read of what is running, so a pause that
+            // lands after that read, too late to read as paused, still closes
+            // it, and the lift does not resume what it paused.
+            let gate = e.open_gate();
+            let mut running: Vec<TorrentHandle> = self
                 .state
                 .handles_for_profile(e.id())
                 .into_iter()
@@ -572,10 +764,28 @@ impl vpn::killswitch::Fence for KillSwitchFence {
                         .is_some_and(|s| s.phase != TorrentPhase::Paused)
                 })
                 .collect();
+            // A lift still resuming this profile a batch at a time is stopped
+            // here, and every torrent it was asked to resume is this fence's
+            // to resume too: those it has not reached yet read as paused
+            // above, and would otherwise stay paused after the next lift.
+            if let Some(unfinished) = e.take_resume() {
+                let mut seen: std::collections::HashSet<TorrentHandle> =
+                    running.iter().copied().collect();
+                running.extend(unfinished.into_iter().filter(|h| seen.insert(*h)));
+            }
             let paused = fence(e, &self.state, health.tunnel_ip, self.metrics.as_ref());
             // Not fenced now, so any earlier record is one the operator's lift
             // already undid: what is running now replaces it.
-            fenced.insert(e.id().clone(), running);
+            fenced.marks += 1;
+            let mark = fenced.marks;
+            fenced.profiles.insert(
+                e.id().clone(),
+                FenceRecord {
+                    mark,
+                    handles: running,
+                    gate,
+                },
+            );
             self.metrics.inc_counter(
                 "profile_vpn_fenced_total",
                 &[
@@ -593,8 +803,60 @@ impl vpn::killswitch::Fence for KillSwitchFence {
     }
 
     fn lift(&self) {
-        let fenced = std::mem::take(&mut *self.fenced.lock());
-        for (profile_id, handles) in fenced {
+        // The tunnel checks run first, outside the lock: each shells out to
+        // `ip` (up to its timeout), and every add alert on the alert loop's
+        // one thread waits on this lock (`hold_recorded`), so probing under
+        // it would stall the loop for as long as the probes take. Each
+        // verdict is kept with the record's mark and the profile's fence
+        // generation, read with the status it was checked under, and applied
+        // below only to the record and the fence it was taken for.
+        let marked: Vec<(ProfileId, u64)> = self
+            .fenced
+            .lock()
+            .profiles
+            .iter()
+            .map(|(id, record)| (id.clone(), record.mark))
+            .collect();
+        let checked: Vec<_> = marked
+            .into_iter()
+            .map(|(id, mark)| {
+                let checked = self.profiles.resolve(&id).active().and_then(|e| {
+                    let health = e.health();
+                    (health.status == ProfileStatus::VpnDown)
+                        .then(|| (health.fence_generation, recovery_check(e, &self.probe)))
+                });
+                (id, mark, checked)
+            })
+            .collect();
+        // Held from the take of each record to its mark, not taken and
+        // released: a boot scan or an add recording what it paused for this
+        // fence (`with_record`) between the take and the mark below would
+        // find no record, and its torrents would stay paused in a profile
+        // lifted around them.
+        let mut fenced = self.fenced.lock();
+        for (profile_id, mark, checked) in checked {
+            // A record whose mark is not the one checked above is a fence
+            // that landed since; it stays, unchecked, for the next lift.
+            if fenced.profiles.get(&profile_id).map(|r| r.mark) != Some(mark) {
+                continue;
+            }
+            let Some(FenceRecord {
+                mut handles, gate, ..
+            }) = fenced.profiles.remove(&profile_id)
+            else {
+                continue;
+            };
+            // A torrent the scans paused again after a lift stopped part-way
+            // can be in the record twice: once from the fence's take of the
+            // unfinished lift, once from the scans.
+            let mut seen = std::collections::HashSet::with_capacity(handles.len());
+            handles.retain(|h| seen.insert(*h));
+            // The operator paused the whole profile while it was fenced: its
+            // torrents stay paused, though the fence lifts. One paused alone
+            // is left out by the gate as the run reaches it.
+            if gate.halted() {
+                handles.clear();
+            }
             let resolved = self.profiles.resolve(&profile_id);
             let Some(entry) = resolved
                 .active()
@@ -602,7 +864,28 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             else {
                 continue;
             };
-            if let Err(reason) = recovery_check(entry, &self.probe) {
+            // Not checked: the profile did not read fenced when the checks
+            // ran, so whatever fenced it since (the monitor) owns that fence.
+            let Some((generation, healthy)) = checked else {
+                continue;
+            };
+            // Fenced again since the check: the operator set the profile
+            // online and the monitor fenced it for its tunnel while the other
+            // profiles were probed. The mark above cannot tell, since neither
+            // touches this fence's record, and the profile reads `vpn_down`
+            // as it did; but every fence bumps the generation, so the verdict
+            // is one on a tunnel that has failed since. That fence owns the
+            // profile now, as it does an unchecked one.
+            if entry.health().fence_generation != generation {
+                info!(
+                    target: "torrentd::vpn_monitor",
+                    profile_id = %profile_id,
+                    "network kill switch back in force, but this profile was fenced again \
+                     after its tunnel was checked; it stays fenced",
+                );
+                continue;
+            }
+            if let Err(reason) = healthy {
                 warn!(
                     target: "torrentd::vpn_monitor",
                     profile_id = %profile_id,
@@ -613,33 +896,374 @@ impl vpn::killswitch::Fence for KillSwitchFence {
                 continue;
             }
             let labels = [("profile_id", profile_id.as_str())];
+            let torrent_count = handles.len();
+            // Recorded before the profile reads active, so a queued re-hash
+            // never finds it active with no run to resume its torrents.
+            let run = entry.begin_resume_with(handles, gate);
             entry.update_health(|h| {
                 h.status = ProfileStatus::Active;
                 h.paused_for_vpn = 0;
                 self.metrics
                     .set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
             });
-            let mut resumed = 0u64;
-            for h in handles {
-                match entry.engine.resume_torrent(h) {
-                    Ok(()) => resumed += 1,
-                    Err(err) => error!(
-                        target: "torrentd::vpn_monitor",
-                        profile_id = %profile_id,
-                        infohash = %h.infohash,
-                        error.cause = %err,
-                        "could not resume a torrent while lifting the kill-switch fence",
-                    ),
-                }
-            }
             info!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %profile_id,
-                torrent_count = resumed,
-                "network kill switch back in force; lifted the profile's fence",
+                torrent_count,
+                "network kill switch back in force; lifted the profile's fence, and resuming \
+                 its torrents a batch at a time",
             );
+            spawn_run(&self.profiles, &self.metrics, entry, run, Lift::KillSwitch);
         }
     }
+}
+
+/// Which pause a [`spawn_lift`] is undoing, for its logs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Lift {
+    /// The kill-switch watch's fence, once the ruleset checks intact again.
+    KillSwitch,
+    /// Any fence, by the operator setting the profile online.
+    SetOnline,
+    /// The operator's offline, by setting the profile online or by
+    /// online-all ([`OnlinePace`]).
+    Offline,
+}
+
+impl Lift {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KillSwitch => "kill_switch",
+            Self::SetOnline => "set_online",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+/// How the daemon paces a profile going online
+/// ([`crate::profile_registry::OnlinePacing`]): the running torrents are read
+/// from the state map, and resumed through [`spawn_lift`].
+pub(crate) struct OnlinePace<'a> {
+    pub(crate) profiles: &'a Arc<ProfileRegistry>,
+    pub(crate) state: &'a StateMap,
+    pub(crate) metrics: &'a Arc<PromSink>,
+}
+
+impl crate::profile_registry::OnlinePacing for OnlinePace<'_> {
+    fn torrents(&self, id: &ProfileId) -> Vec<(TorrentHandle, bool)> {
+        // The torrent's own paused flag, as its last state update reported
+        // it: the session's pause does not set it. The kill-switch fence
+        // reads what is running the same way.
+        self.state
+            .handles_for_profile(id)
+            .into_iter()
+            .map(|h| {
+                let running = self
+                    .state
+                    .get(&h.infohash)
+                    .is_some_and(|s| s.phase != TorrentPhase::Paused);
+                (h, running)
+            })
+            .collect()
+    }
+
+    fn start(&self, entry: &ProfileEntry, handles: Vec<TorrentHandle>) {
+        info!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %entry.id(),
+            torrent_count = handles.len(),
+            "profile set online; resuming its torrents a batch at a time",
+        );
+        spawn_lift(self.profiles, self.metrics, entry, handles, Lift::Offline);
+    }
+}
+
+/// Resume `handles`, the torrents a fence or a profile's offline paused in
+/// `entry`, from a task on the runtime through [`resume_paced`]: a batch per
+/// [`REANNOUNCE_PACE`], since each one resumed sends its trackers a `started`
+/// announce. The profile is marked lifted, or its session resumed, by the
+/// caller, before this. A fence's lift instead records its run first and
+/// drives it through [`spawn_run`].
+///
+/// The run is recorded on the entry ([`ProfileEntry::begin_resume`]), so a
+/// fence that lands before it ends stops it and takes back what it had not
+/// reached, a newer lift replaces and stops it, setting the profile offline
+/// stops it and holds what it had not reached, and a pause in the profile
+/// halts it or leaves the paused torrent out ([`ProfileEntry::halt_resumes`],
+/// [`ProfileEntry::exclude_from_resumes`]). What it resumed, or left out for
+/// the operator's pause, is then released from what a paced set-online holds,
+/// if the run is still the profile's ([`ProfileEntry::end_resume`]); what it
+/// did not reach, or refused, stays held. Must
+/// be called inside the runtime: every caller runs on its blocking pool.
+pub(crate) fn spawn_lift(
+    profiles: &Arc<ProfileRegistry>,
+    metrics: &Arc<PromSink>,
+    entry: &ProfileEntry,
+    handles: Vec<TorrentHandle>,
+    lift: Lift,
+) -> tokio::task::JoinHandle<Resumed> {
+    let run = entry.begin_resume(handles);
+    spawn_run(profiles, metrics, entry, run, lift)
+}
+
+/// Drive `run`, already recorded on `entry` by [`ProfileEntry::begin_resume`]
+/// or [`ProfileEntry::begin_resume_with`], as [`spawn_lift`] does. A fence's
+/// lift records its run before it marks the profile active, so a profile that
+/// reads active while its torrents still read paused always has the run that
+/// will resume them ([`ProfileEntry::resume_pending`]).
+pub(crate) fn spawn_run(
+    profiles: &Arc<ProfileRegistry>,
+    metrics: &Arc<PromSink>,
+    entry: &ProfileEntry,
+    run: Arc<crate::profile_registry::PacedResume>,
+    lift: Lift,
+) -> tokio::task::JoinHandle<Resumed> {
+    let (profiles, metrics, id) = (profiles.clone(), metrics.clone(), entry.id().clone());
+    tokio::runtime::Handle::current().spawn(async move {
+        let mut failed = std::collections::HashSet::new();
+        let resumed = resume_paced(
+            profiles.clone(),
+            id.clone(),
+            run.handles(),
+            REANNOUNCE_PACE,
+            || run.cancelled(),
+            run.gate().clone(),
+            metrics,
+            |h, err| {
+                failed.insert(h);
+                error!(
+                    target: "torrentd::vpn_monitor",
+                    profile_id = %id,
+                    lift = lift.as_str(),
+                    infohash = %h.infohash,
+                    error.cause = %err,
+                    "could not resume a torrent while lifting the profile's fence",
+                )
+            },
+        )
+        .await;
+        // The run goes in order, so what it reached is the front of its
+        // list: resumed, left out for a pause, or refused. A refused one is
+        // still paused by the pace, so it stays held.
+        let reached: Vec<TorrentHandle> = run.handles()
+            [..run.handles().len() - resumed.not_reached]
+            .iter()
+            .filter(|h| !failed.contains(*h))
+            .copied()
+            .collect();
+        // Released only while the run is still the profile's: one a
+        // set-offline, fence, pause or newer lift stopped leaves what is held
+        // to whatever stopped it ([`ProfileEntry::end_resume`]).
+        let release = {
+            let (profiles, id, run) = (profiles.clone(), id.clone(), run.clone());
+            tokio::task::spawn_blocking(move || {
+                if let Some(entry) = profiles.resolve(&id).active() {
+                    entry.end_resume(&run, &reached);
+                }
+            })
+        };
+        if let Err(e) = release.await {
+            if e.is_panic() {
+                std::panic::resume_unwind(e.into_panic());
+            }
+        }
+        info!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %id,
+            lift = lift.as_str(),
+            torrent_count = resumed.resumed,
+            failed_count = resumed.refused,
+            not_reached = resumed.not_reached,
+            excluded_count = resumed.excluded,
+            halted = resumed.halted,
+            "finished resuming the torrents of a lifted fence; any not reached were stopped \
+             by a fence, a newer lift or a pause of the profile that landed first",
+        );
+        resumed
+    })
+}
+
+/// What a [`resume_paced`] run reached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Resumed {
+    /// Torrents the session resumed.
+    pub(crate) resumed: u64,
+    /// Torrents the session refused to resume.
+    pub(crate) refused: u64,
+    /// Torrents left paused because the run stopped before them: the profile
+    /// was fenced or paused, or the run was cancelled.
+    pub(crate) not_reached: usize,
+    /// Torrents left out because the operator paused each while the run ran.
+    pub(crate) excluded: u64,
+    /// Whether a pause of the whole profile stopped the run.
+    pub(crate) halted: bool,
+}
+
+/// How one batch of [`resume_paced`] ended.
+enum Batch {
+    /// Resumed, each refusal with why, unless a pause stopped it partway.
+    Done {
+        resumed: u64,
+        refused: Vec<(TorrentHandle, torrentd_engine::EngineError)>,
+        excluded: u64,
+        /// How many of the batch a pause of the profile left unreached.
+        halted: Option<usize>,
+    },
+    /// Not started: the profile is fenced, or gone.
+    Stopped,
+    /// Fenced while the batch went out; what it resumed was paused again.
+    Fenced,
+}
+
+/// Resume `handles` in `id`'s session a batch at a time, `pace` apart,
+/// through the shared [`Pacer`], and count what the session resumed
+/// and refused. Each refusal is also handed to `refused`.
+///
+/// Every bulk resume goes through this. Each torrent resumed announces
+/// `started` to its trackers, and one resumed with the rest of a profile at
+/// once hands the trackers a flood from one address and the session's alert
+/// queue more tracker alerts than it holds. Each batch runs on the blocking
+/// pool, since every call takes the session's lock; between batches the run
+/// holds no thread.
+///
+/// The run stops before a batch once the profile is fenced (`vpn_down`) or
+/// `cancelled` says so, and what it has not reached stays paused. A fence can
+/// also land while a batch is going out, its walk pausing some of the batch
+/// before this resumes them. So after each batch the profile's mark is read
+/// again: the fence marks before it walks, so either this read sees the mark
+/// and pauses the batch again, or the mark, and the walk after it, came after
+/// every resume in the batch.
+///
+/// A pause in the profile while the run goes on is kept to through `gate`
+/// ([`ResumeGate`]): a pause of the whole profile stops the run, its
+/// remainder counted as not reached, and a torrent paused on its own is left
+/// out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resume_paced(
+    profiles: Arc<ProfileRegistry>,
+    id: ProfileId,
+    handles: &[TorrentHandle],
+    pace: Duration,
+    cancelled: impl Fn() -> bool,
+    gate: Arc<ResumeGate>,
+    metrics: Arc<PromSink>,
+    mut refused: impl FnMut(TorrentHandle, torrentd_engine::EngineError),
+) -> Resumed {
+    let mut out = Resumed::default();
+    let mut pacer = Pacer::new(handles.len(), pace);
+    while let Some(range) = pacer.next_batch().await {
+        let left = handles.len() - range.start;
+        let end = range.end;
+        if gate.halted() {
+            out.not_reached = left;
+            out.halted = true;
+            break;
+        }
+        if cancelled() {
+            out.not_reached = left;
+            break;
+        }
+        let batch = handles[range].to_vec();
+        let ran = tokio::task::spawn_blocking({
+            let (profiles, id, metrics, gate) =
+                (profiles.clone(), id.clone(), metrics.clone(), gate.clone());
+            move || resume_batch(&profiles, &id, batch, &gate, metrics.as_ref())
+        })
+        .await;
+        match ran {
+            Ok(Batch::Done {
+                resumed,
+                refused: failed,
+                excluded,
+                halted,
+            }) => {
+                out.resumed += resumed;
+                out.refused += failed.len() as u64;
+                out.excluded += excluded;
+                for (h, err) in failed {
+                    refused(h, err);
+                }
+                if let Some(in_batch) = halted {
+                    out.not_reached = in_batch + (handles.len() - end);
+                    out.halted = true;
+                    break;
+                }
+            }
+            Ok(Batch::Stopped | Batch::Fenced) => {
+                out.not_reached = left;
+                break;
+            }
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Only a runtime shutting down cancels a blocking task.
+            Err(_) => {
+                out.not_reached = left;
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// One batch of [`resume_paced`], on the blocking pool.
+fn resume_batch(
+    profiles: &ProfileRegistry,
+    id: &ProfileId,
+    batch: Vec<TorrentHandle>,
+    gate: &ResumeGate,
+    metrics: &dyn MetricsSink,
+) -> Batch {
+    let Some(entry) = profiles.resolve(id).active() else {
+        return Batch::Stopped;
+    };
+    if entry.health().status == ProfileStatus::VpnDown {
+        return Batch::Stopped;
+    }
+    let mut resumed = Vec::with_capacity(batch.len());
+    let mut refused = Vec::new();
+    let mut excluded = 0u64;
+    let mut halted = None;
+    let total = batch.len();
+    for (i, h) in batch.into_iter().enumerate() {
+        match gate.resume(h, || entry.engine.resume_torrent(h)) {
+            Ok(Ok(())) => resumed.push(h),
+            Ok(Err(err)) => refused.push((h, err)),
+            Err(Gated::Excluded) => excluded += 1,
+            Err(Gated::Halted) => {
+                halted = Some(total - i);
+                break;
+            }
+        }
+    }
+    // Pairs with the fence's, between its mark and its walk.
+    atomic::fence(atomic::Ordering::SeqCst);
+    if entry.health().status != ProfileStatus::VpnDown {
+        return Batch::Done {
+            resumed: resumed.len() as u64,
+            refused,
+            excluded,
+            halted,
+        };
+    }
+    let labels = [("profile_id", id.as_str())];
+    for h in resumed {
+        if let Err(err) = entry.engine.pause_torrent(h) {
+            error!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %id,
+                infohash = %h.infohash,
+                error.cause = %err,
+                "could not pause again a torrent resumed as the profile was fenced",
+            );
+            metrics.inc_counter("profile_fence_pause_errors_total", &labels);
+        }
+    }
+    warn!(
+        target: "torrentd::vpn_monitor",
+        profile_id = %id,
+        "profile fenced while its torrents were being resumed; paused the last batch again \
+         and stopped",
+    );
+    Batch::Fenced
 }
 
 /// Pause `handle`, which the caller has just added to `profile_id`'s session,
@@ -654,20 +1278,60 @@ impl vpn::killswitch::Fence for KillSwitchFence {
 /// What this pauses is not added to `paused_for_vpn` or its gauge, and neither
 /// is what the add handler pauses: the two (and the fence's walk) can pause the
 /// same torrent, so the count stays what the fence itself paused.
+///
+/// Where the kill switch is on, `kill_switch` is its watch's fence, which
+/// lifts by resuming only what it recorded: this pauses under that fence's
+/// lock and records the torrent with it ([`KillSwitchFence::hold_recorded`]),
+/// so the lift resumes it too.
 pub(crate) fn hold_if_fenced(
     profiles: &ProfileRegistry,
+    kill_switch: Option<&KillSwitchFence>,
     profile_id: &ProfileId,
     engine: &dyn TorrentEngine,
     handle: TorrentHandle,
     metrics: &dyn MetricsSink,
 ) {
+    let hold = || pause_if_fenced(profiles, profile_id, engine, handle, metrics);
+    match kill_switch {
+        Some(ks) => ks.hold_recorded(profile_id, handle, hold),
+        None => {
+            hold();
+        }
+    }
+}
+
+/// The add handler's [`torrentd_engine::FenceHold`]: its pause of a torrent
+/// whose add alert lands in a fenced profile, run as [`hold_if_fenced`] runs
+/// its own, recorded with `kill_switch` where the kill switch is on.
+pub(crate) fn fence_hold(kill_switch: Option<Arc<KillSwitchFence>>) -> torrentd_engine::FenceHold {
+    Arc::new(
+        move |id: &ProfileId, handle: TorrentHandle, hold: &mut dyn FnMut() -> bool| {
+            match kill_switch.as_deref() {
+                Some(ks) => ks.hold_recorded(id, handle, hold),
+                None => {
+                    hold();
+                }
+            }
+        },
+    )
+}
+
+/// [`hold_if_fenced`]'s check and pause. Returns whether the profile was
+/// fenced, whether or not the pause took.
+fn pause_if_fenced(
+    profiles: &ProfileRegistry,
+    profile_id: &ProfileId,
+    engine: &dyn TorrentEngine,
+    handle: TorrentHandle,
+    metrics: &dyn MetricsSink,
+) -> bool {
     atomic::fence(atomic::Ordering::SeqCst);
     let fenced = profiles
         .resolve(profile_id)
         .active()
         .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
     if !fenced {
-        return;
+        return false;
     }
     match engine.pause_torrent(handle) {
         Ok(()) => warn!(
@@ -690,6 +1354,70 @@ pub(crate) fn hold_if_fenced(
             );
         }
     }
+    true
+}
+
+/// How a [`resume_unless_fenced`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SingleResume {
+    /// The session resumed the torrent, and the profile was not fenced.
+    Resumed,
+    /// The profile was fenced as the torrent was resumed; it was paused again.
+    Fenced,
+}
+
+/// Resume `handle` in `profile_id`'s session, then pause it again if the VPN
+/// monitor fenced the profile meanwhile.
+///
+/// The caller refuses a fenced profile before this, but a fence can land
+/// between that check and the resume. The fence marks the profile and then
+/// walks the state map pausing what it holds, so a resume that comes after
+/// its walk passed this torrent would leave it running in a `vpn_down`
+/// profile, and the monitor never fences a profile already marked. The
+/// `SeqCst` fence pairs with the fence's, between its mark and its walk:
+/// either the read below sees the mark and pauses the torrent again, or the
+/// mark, and the walk after it, came after the resume.
+///
+/// What this pauses is not added to `paused_for_vpn`, for the reason
+/// [`hold_if_fenced`] gives.
+pub(crate) fn resume_unless_fenced(
+    profiles: &ProfileRegistry,
+    profile_id: &ProfileId,
+    engine: &dyn TorrentEngine,
+    handle: TorrentHandle,
+    metrics: &dyn MetricsSink,
+) -> Result<SingleResume, torrentd_engine::EngineError> {
+    engine.resume_torrent(handle)?;
+    atomic::fence(atomic::Ordering::SeqCst);
+    let fenced = profiles
+        .resolve(profile_id)
+        .active()
+        .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
+    if !fenced {
+        return Ok(SingleResume::Resumed);
+    }
+    match engine.pause_torrent(handle) {
+        Ok(()) => warn!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            "profile was fenced while the torrent was being resumed; paused it again",
+        ),
+        Err(err) => {
+            error!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %profile_id,
+                infohash = %handle.infohash,
+                error.cause = %err,
+                "could not pause again a torrent resumed as its profile was fenced",
+            );
+            metrics.inc_counter(
+                "profile_fence_pause_errors_total",
+                &[("profile_id", profile_id.as_str())],
+            );
+        }
+    }
+    Ok(SingleResume::Fenced)
 }
 
 pub async fn run(
@@ -706,12 +1434,14 @@ pub async fn run(
         handshake_max_age,
         shutdown,
         host_prober(),
+        Arc::new(vpn::wireguard_transfer),
     )
     .await;
 }
 
-/// [`run`] with the host probes behind `probe`, so a test can drive the poll
-/// loop — the gauges it sets, the clock it keeps, the fence — without a tunnel.
+/// [`run`] with the host probes behind `probe` and `counters`, so a test can
+/// drive the poll loop — the gauges it sets, the clock it keeps, the fence —
+/// without a tunnel.
 async fn run_with(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -719,6 +1449,7 @@ async fn run_with(
     handshake_max_age: Duration,
     mut shutdown: broadcast::Receiver<ShutdownReason>,
     probe: Prober,
+    counters: CounterProber,
 ) {
     seed_baselines(&profiles, &metrics);
     // Per profile: when its current run of polls with torrents to carry
@@ -762,11 +1493,12 @@ async fn run_with(
             let probed = tokio::task::spawn_blocking({
                 let iface = iface.clone();
                 let probe = probe.clone();
-                move || probe(&iface, is_wg)
+                let counters = counters.clone();
+                move || (probe(&iface, is_wg), is_wg.then(|| counters(&iface)))
             })
             .await;
-            let (addr_probe, route_probe, handshake_probe) = match probed {
-                Ok(p) => (p.ip, p.route, p.handshake),
+            let (addr_probe, route_probe, handshake_probe, transfer_probe) = match probed {
+                Ok((p, transfer)) => (p.ip, p.route, p.handshake, transfer),
                 Err(e) => {
                     error!(
                         target: "torrentd::vpn_monitor",
@@ -865,6 +1597,31 @@ async fn run_with(
                     Handshake::Age(age)
                 }
             };
+            let transfer = match transfer_probe {
+                Some(Ok(t)) => {
+                    metrics.set_gauge("profile_vpn_transfer_probe_ok", 1.0, &labels);
+                    Some(t)
+                }
+                Some(Err(why)) => {
+                    // Once this has failed more than TRANSFER_PROBE_GRACE_POLLS
+                    // polls in a row, an aged handshake is judged on the time
+                    // the profile has carried traffic, not on the link's
+                    // traffic, so a quiet seed may be fenced handshake_stale.
+                    // A log line alone left that silent to alerting.
+                    metrics.set_gauge("profile_vpn_transfer_probe_ok", 0.0, &labels);
+                    warn!(
+                        target: "torrentd::vpn_monitor",
+                        profile_id = %profile_id,
+                        vpn_iface = %iface,
+                        reason = why.as_str(),
+                        "wireguard transfer probe unavailable; an aged handshake is \
+                         judged on the profile's torrents alone, so a quiet seed may \
+                         be fenced",
+                    );
+                    None
+                }
+                None => None,
+            };
             // A WireGuard tunnel with nothing to send does not handshake, so
             // on a profile with nothing to carry its handshake, never made or
             // aging, says nothing about the tunnel: the clock reads zero and
@@ -882,6 +1639,7 @@ async fn run_with(
                 &mut unanswered,
                 &profile_id,
                 handshake,
+                transfer,
                 carrying,
                 // The runtime's clock, which is the wall clock outside tests
                 // and the one the poll interval is measured on.
@@ -953,6 +1711,8 @@ async fn run_with(
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
 
     use super::*;
     use crate::vpn::route::RouteProbe;
@@ -1152,28 +1912,29 @@ mod tests {
         let later = t0 + Duration::from_secs(600);
 
         assert_eq!(
-            unanswered_clock(&mut since, &id, Handshake::Never, false, t0),
+            unanswered_clock(&mut since, &id, Handshake::Never, None, false, t0),
             Duration::ZERO
         );
         assert_eq!(
-            unanswered_clock(&mut since, &id, Handshake::Never, false, later),
+            unanswered_clock(&mut since, &id, Handshake::Never, None, false, later),
             Duration::ZERO,
             "no torrents, however long: nothing was sent to answer",
         );
 
         assert_eq!(
-            unanswered_clock(&mut since, &id, Handshake::Never, true, later),
+            unanswered_clock(&mut since, &id, Handshake::Never, None, true, later),
             Duration::ZERO,
             "starts when the first torrent is there",
         );
         let then = later + MAX + Duration::from_secs(1);
-        assert!(unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX);
+        assert!(unanswered_clock(&mut since, &id, Handshake::Never, None, true, then) > MAX);
 
         assert_eq!(
             unanswered_clock(
                 &mut since,
                 &id,
                 Handshake::Age(Duration::from_secs(1)),
+                None,
                 true,
                 then
             ),
@@ -1185,6 +1946,7 @@ mod tests {
                 &mut since,
                 &id,
                 Handshake::Never,
+                None,
                 true,
                 then + Duration::from_secs(30)
             ),
@@ -1192,13 +1954,15 @@ mod tests {
             "a handshake resets the never-handshaked clock: a link re-raised \
              under the profile gets the whole threshold",
         );
-        unanswered_clock(&mut since, &id, Handshake::Never, false, then);
+        unanswered_clock(&mut since, &id, Handshake::Never, None, false, then);
         assert!(since.is_empty());
     }
 
-    /// An aged handshake counts only from when the profile started carrying:
-    /// a handshake older than that predates any traffic it could have
-    /// answered. Within the run the clock is the handshake's age.
+    /// With no byte counters to read, an aged handshake counts only from when
+    /// the profile started carrying: a handshake older than that predates any
+    /// traffic it could have answered. Within the run the clock is the
+    /// handshake's age. The first [`TRANSFER_PROBE_GRACE_POLLS`] unread polls
+    /// in a row read zero.
     #[test]
     fn an_aged_handshake_counts_only_from_when_the_profile_started_carrying() {
         let id = torrentd_engine::ProfileId::new("acct_a");
@@ -1207,18 +1971,23 @@ mod tests {
         let ancient = Handshake::Age(Duration::from_secs(3600));
 
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, false, t0),
+            unanswered_clock(&mut since, &id, ancient, None, false, t0),
             Duration::ZERO,
             "nothing to carry, however old the handshake",
         );
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, true, t0),
+            unanswered_clock(&mut since, &id, ancient, None, true, t0),
             Duration::ZERO,
             "starts when the first torrent that can send is there",
         );
+        assert_eq!(
+            unanswered_clock(&mut since, &id, ancient, None, true, t0 + MAX),
+            Duration::ZERO,
+            "the second unread poll in a row is still inside the grace",
+        );
         let then = t0 + MAX + Duration::from_secs(1);
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, true, then),
+            unanswered_clock(&mut since, &id, ancient, None, true, then),
             MAX + Duration::from_secs(1),
         );
         assert_eq!(
@@ -1226,6 +1995,7 @@ mod tests {
                 &mut since,
                 &id,
                 Handshake::Age(Duration::from_secs(5)),
+                None,
                 true,
                 then
             ),
@@ -1233,10 +2003,208 @@ mod tests {
             "a handshake inside the run caps it",
         );
         assert_eq!(
-            unanswered_clock(&mut since, &id, ancient, false, then),
+            unanswered_clock(&mut since, &id, ancient, None, false, then),
             Duration::ZERO,
         );
         assert!(since.is_empty(), "nothing to carry ends the run");
+    }
+
+    /// With the link's byte counters, an aged handshake counts only from the
+    /// first poll that saw the link send with nothing received: a quiet seed
+    /// whose `tx` stays flat is never judged, however old its handshake.
+    #[test]
+    fn an_aged_handshake_counts_only_from_traffic_nothing_answered() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let ancient = Handshake::Age(Duration::from_secs(3600));
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let seen = |rx: u64, tx: u64| Some(vpn::WireguardTransfer { rx, tx });
+        let mut clock = |t: Option<vpn::WireguardTransfer>, now| {
+            unanswered_clock(&mut since, &id, ancient, t, true, now)
+        };
+
+        assert_eq!(clock(seen(10, 10), at(0)), Duration::ZERO, "a baseline");
+        assert_eq!(
+            clock(seen(10, 10), at(600)),
+            Duration::ZERO,
+            "nothing sent, however long: nothing to answer",
+        );
+        assert_eq!(clock(seen(10, 20), at(630)), Duration::ZERO, "sent: starts");
+        assert_eq!(
+            clock(seen(10, 20), at(700)),
+            Duration::from_secs(70),
+            "sent and unanswered, though nothing more is sent",
+        );
+        assert_eq!(
+            clock(seen(11, 30), at(730)),
+            Duration::ZERO,
+            "something came back: answered",
+        );
+        assert_eq!(clock(seen(11, 40), at(760)), Duration::ZERO);
+        assert_eq!(
+            clock(None, at(790)),
+            Duration::from_secs(30),
+            "one unread poll after a reading: the counters' clock as it stood",
+        );
+        assert_eq!(
+            clock(seen(11, 40), at(800)),
+            Duration::from_secs(40),
+            "the unread poll left the counters' clock where it stood",
+        );
+        assert_eq!(
+            clock(seen(0, 5), at(830)),
+            Duration::ZERO,
+            "counters that dropped are a re-raised link: a new baseline",
+        );
+        assert_eq!(clock(seen(0, 5), at(1000)), Duration::ZERO);
+        assert_eq!(
+            unanswered_clock(
+                &mut since,
+                &id,
+                Handshake::Age(Duration::from_secs(5)),
+                seen(0, 9),
+                true,
+                at(1100),
+            ),
+            Duration::ZERO,
+            "sent: starts",
+        );
+        assert_eq!(
+            unanswered_clock(
+                &mut since,
+                &id,
+                Handshake::Age(Duration::from_secs(5)),
+                seen(0, 9),
+                true,
+                at(1400),
+            ),
+            Duration::from_secs(5),
+            "a handshake inside the run caps it",
+        );
+    }
+
+    /// A transfer probe that fails steadily after one good reading fails
+    /// safe: an aged handshake on a profile carrying traffic is fenced
+    /// `handshake_stale` once the run is older than the threshold, as it is
+    /// where no poll ever read the counters. Reading zero there instead let a
+    /// tunnel whose peer had gone seed on unfenced for as long as `wg show
+    /// transfer` failed.
+    #[test]
+    fn a_failing_transfer_probe_after_one_good_reading_still_fences_an_aged_handshake() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let aged = |s: u64| Handshake::Age(Duration::from_secs(s));
+        let judge = |handshake, unanswered_for| {
+            evaluate(
+                &Observation {
+                    handshake,
+                    unanswered_for,
+                    ..healthy()
+                },
+                MAX,
+            )
+        };
+
+        let good = Some(vpn::WireguardTransfer { rx: 10, tx: 10 });
+        let first = unanswered_clock(&mut since, &id, aged(30), good, true, at(0));
+        assert_eq!(judge(aged(30), first), Ok(()), "one good reading");
+
+        let mut verdict = Ok(());
+        for s in (30..=MAX.as_secs() + 60).step_by(30) {
+            let handshake = aged(30 + s);
+            let unanswered = unanswered_clock(&mut since, &id, handshake, None, true, at(s));
+            verdict = judge(handshake, unanswered);
+            if s <= MAX.as_secs() {
+                assert_eq!(verdict, Ok(()), "inside the threshold at {s}s");
+            }
+        }
+        assert_eq!(
+            verdict,
+            Err(DownReason::HandshakeStale),
+            "a handshake aged past the threshold while the probe fails is fenced",
+        );
+    }
+
+    /// A transfer probe that fails now and then, with readings between, does
+    /// not fence a quiet seed whose handshake and carrying run are both past
+    /// the threshold: only a failure that outlasts
+    /// [`TRANSFER_PROBE_GRACE_POLLS`] polls in a row fails safe. Before the
+    /// grace, one failed poll fenced it, and only an operator could lift that.
+    #[test]
+    fn a_transient_transfer_probe_failure_does_not_fence_a_quiet_seed() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let flat = Some(vpn::WireguardTransfer { rx: 10, tx: 10 });
+        let mut poll = |s: u64, transfer| {
+            let handshake = Handshake::Age(Duration::from_secs(600 + s));
+            let unanswered_for = unanswered_clock(
+                &mut since,
+                &id,
+                handshake,
+                transfer,
+                true,
+                t0 + Duration::from_secs(s),
+            );
+            evaluate(
+                &Observation {
+                    handshake,
+                    unanswered_for,
+                    ..healthy()
+                },
+                MAX,
+            )
+        };
+
+        let mut s = 0;
+        while s <= MAX.as_secs() + 60 {
+            assert_eq!(poll(s, flat), Ok(()), "quiet with readings at {s}s");
+            s += 30;
+        }
+        assert_eq!(poll(s, None), Ok(()), "one failed poll is in the grace");
+        assert_eq!(poll(s + 30, flat), Ok(()), "a reading ends the streak");
+        for n in 1..=TRANSFER_PROBE_GRACE_POLLS {
+            let at = s + 30 + 30 * u64::from(n);
+            assert_eq!(poll(at, None), Ok(()), "failed poll {n} in a row");
+        }
+        let past = s + 30 + 30 * u64::from(TRANSFER_PROBE_GRACE_POLLS + 1);
+        assert_eq!(
+            poll(past, None),
+            Err(DownReason::HandshakeStale),
+            "a failure that outlasts the grace fails safe",
+        );
+    }
+
+    /// The other side of failing safe: with the transfer probe working, a
+    /// quiet seed whose sent bytes stay flat is never fenced, however old its
+    /// handshake grows while it carries.
+    #[test]
+    fn a_quiet_seed_with_a_working_transfer_probe_is_not_fenced() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let flat = Some(vpn::WireguardTransfer { rx: 10, tx: 10 });
+
+        for s in (0..=3600).step_by(30) {
+            let handshake = Handshake::Age(Duration::from_secs(30 + s));
+            let unanswered = unanswered_clock(
+                &mut since,
+                &id,
+                handshake,
+                flat,
+                true,
+                t0 + Duration::from_secs(s),
+            );
+            let obs = Observation {
+                handshake,
+                unanswered_for: unanswered,
+                ..healthy()
+            };
+            assert_eq!(evaluate(&obs, MAX), Ok(()), "quiet at {s}s");
+        }
     }
 
     /// A probe that could not run says nothing about the handshake, so it
@@ -1248,12 +2216,13 @@ mod tests {
         let mut since = std::collections::HashMap::new();
         let t0 = Instant::now();
 
-        unanswered_clock(&mut since, &id, Handshake::Never, true, t0);
+        unanswered_clock(&mut since, &id, Handshake::Never, None, true, t0);
         assert_eq!(
             unanswered_clock(
                 &mut since,
                 &id,
                 Handshake::NoSignal,
+                None,
                 true,
                 t0 + Duration::from_secs(60)
             ),
@@ -1262,11 +2231,11 @@ mod tests {
         );
         let then = t0 + MAX + Duration::from_secs(1);
         assert!(
-            unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX,
+            unanswered_clock(&mut since, &id, Handshake::Never, None, true, then) > MAX,
             "the clock kept its start across the failed probe",
         );
 
-        unanswered_clock(&mut since, &id, Handshake::NoSignal, false, then);
+        unanswered_clock(&mut since, &id, Handshake::NoSignal, None, false, then);
         assert!(
             since.is_empty(),
             "with nothing to carry, a failed probe resets it like any other poll",
@@ -1371,11 +2340,43 @@ mod tests {
         (health.status, exported)
     }
 
+    /// A transfer probe that cannot run, so the poll loop judges an aged
+    /// handshake on the profile's torrents alone.
+    fn no_counters() -> CounterProber {
+        Arc::new(|_| Err(vpn::HandshakeProbeUnavailable::NoTool))
+    }
+
+    /// A transfer probe whose `tx` grows by `tx_step` and `rx` by `rx_step`
+    /// on each poll.
+    fn counting(rx_step: u64, tx_step: u64) -> CounterProber {
+        let polls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Arc::new(move |_| {
+            let n = polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vpn::WireguardTransfer {
+                rx: 1000 + n * rx_step,
+                tx: 1000 + n * tx_step,
+            })
+        })
+    }
+
     /// [`poll_acct_a_held`], returning the profile's whole health.
     async fn poll_acct_a_health(
         state: StateMap,
         max_age: Duration,
         probe: Prober,
+        polls: u32,
+        offline: bool,
+    ) -> (crate::profile_registry::ProfileHealth, String) {
+        poll_acct_a_counted(state, max_age, probe, no_counters(), polls, offline).await
+    }
+
+    /// [`poll_acct_a_health`], with the link's byte counters read by
+    /// `counters`.
+    async fn poll_acct_a_counted(
+        state: StateMap,
+        max_age: Duration,
+        probe: Prober,
+        counters: CounterProber,
         polls: u32,
         offline: bool,
     ) -> (crate::profile_registry::ProfileHealth, String) {
@@ -1396,6 +2397,7 @@ mod tests {
                         )
                     },
                     &*metrics,
+                    &crate::profile_registry::NoTorrents,
                 )
                 .unwrap();
         }
@@ -1407,6 +2409,7 @@ mod tests {
             max_age,
             rx,
             probe,
+            counters,
         ));
         tokio::time::sleep(POLL_INTERVAL * polls + Duration::from_secs(1)).await;
         tx.send(ShutdownReason::Test).unwrap();
@@ -1630,6 +2633,71 @@ mod tests {
         assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
     }
 
+    /// The acceptance test for a quiet seed: a seeding profile with no
+    /// keepalive and no peer connected sends nothing between announces, so
+    /// its handshake is long past the threshold while its link's `tx` stays
+    /// flat. It stays up across many polls. The same link with `tx` growing
+    /// and `rx` flat sent into a tunnel nobody answers, and is fenced
+    /// `handshake_stale`; with `rx` growing beside it, it is answered.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_judges_an_aged_handshake_on_traffic_nothing_answered() {
+        let max_age = Duration::from_secs(60);
+        let stale = || {
+            scripted(
+                Some(Ok(RouteProbe::ViaTunnel)),
+                Ok(Some(Duration::from_secs(3600))),
+            )
+        };
+        let seeding = || {
+            let s = StateMap::new();
+            loaded(&s, 1, "acct_a", TorrentPhase::Seeding);
+            s
+        };
+
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(0, 0), 8, false).await;
+        assert_eq!(
+            health.status,
+            ProfileStatus::Active,
+            "a quiet seed sent nothing to be answered: {exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            "{exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"acct_a\"} 1"),
+            "the counters were read: {exported}"
+        );
+
+        // A transfer probe that cannot run says so on its gauge, not only in
+        // a log line.
+        let (_, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), no_counters(), 1, false).await;
+        assert!(
+            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"acct_a\"} 0"),
+            "{exported}"
+        );
+
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(64, 512), 8, false).await;
+        assert_eq!(
+            health.status,
+            ProfileStatus::Active,
+            "sent and answered: {exported}"
+        );
+
+        // The first poll is the baseline and the second sees `tx` grow, so
+        // the threshold is passed at the fifth (90s > 60s), not the fourth.
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(0, 512), 4, false).await;
+        assert_eq!(health.status, ProfileStatus::Active, "{exported}");
+        let (health, exported) =
+            poll_acct_a_counted(seeding(), max_age, stale(), counting(0, 512), 5, false).await;
+        assert_eq!(health.status, ProfileStatus::VpnDown, "{exported}");
+        assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
+    }
+
     /// A profile the operator holds offline has its session paused and sends
     /// nothing, whatever its torrents' phases, so its tunnel's handshake —
     /// never made, or aging — fences it on no rule while the address and
@@ -1695,6 +2763,7 @@ mod tests {
             max_age,
             rx,
             scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
+            no_counters(),
         ));
         let entry = profiles.iter().next().unwrap();
 
@@ -1838,6 +2907,16 @@ mod tests {
                 .contains("torrentd_profile_vpn_handshake_probe_ok{profile_id=\"account_a\"} 1"),
             "a live WireGuard profile still baselines at 1; got:\n{exported}",
         );
+        assert!(
+            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"account_a\"} 1"),
+            "and so does its transfer probe; got:\n{exported}",
+        );
+        for absent in ["account_c", "account_d"] {
+            assert!(
+                !exported.contains(&format!("transfer_probe_ok{{profile_id=\"{absent}\"}}")),
+                "a boot-failed or OpenVPN profile has no transfer probe; got:\n{exported}",
+            );
+        }
         assert!(
             !exported.contains("handshake_probe_ok{profile_id=\"account_d\"}"),
             "there is no handshake to probe on an OpenVPN profile, failed or \
@@ -2079,6 +3158,286 @@ mod tests {
         (fence, engine)
     }
 
+    /// Wait, on the test's paused clock, for every lift's paced resume to end.
+    async fn settle(fence: &KillSwitchFence) {
+        for _ in 0..100_000 {
+            if !fence.profiles.iter().any(|e| e.is_resuming()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a paced resume never ended");
+    }
+
+    /// [`kill_switch_fence`] over `n` seeding torrents, ids `1..=n`, with a
+    /// healthy tunnel.
+    fn kill_switch_fence_over(n: u64) -> (KillSwitchFence, Arc<torrentd_engine::MockEngine>) {
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        for id in 1..=n {
+            loaded(&state, id, "acct_a", TorrentPhase::Seeding);
+        }
+        let fence = KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            answering(ip(2), Some(RouteProbe::ViaTunnel), None),
+        );
+        (fence, engine)
+    }
+
+    fn sorted_ids(handles: &[TorrentHandle]) -> Vec<u64> {
+        let mut ids: Vec<u64> = handles.iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A lift over more torrents than a batch resumes a batch at once and
+    /// the next only a pace later, so no second of it sends more than a
+    /// batch of `started` announces; the fence's pauses are not paced.
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_lift_resumes_a_batch_per_pace() {
+        use vpn::killswitch::Fence;
+        let n = 2 * REANNOUNCE_BATCH as u64 + 50;
+        let (fence, engine) = kill_switch_fence_over(n);
+        fence.fence_all();
+        assert_eq!(pauses(&engine).len() as u64, n, "the fence pauses at once");
+
+        let start = tokio::time::Instant::now();
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::Active, "lifted at once");
+        // Read half a pace after each batch is due, so no read races one.
+        let half = REANNOUNCE_PACE / 2;
+        tokio::time::sleep(half).await;
+        assert_eq!(resumes(&engine).len(), REANNOUNCE_BATCH, "the first batch");
+        tokio::time::sleep(REANNOUNCE_PACE).await;
+        assert_eq!(resumes(&engine).len(), 2 * REANNOUNCE_BATCH, "a pace later");
+        tokio::time::sleep(REANNOUNCE_PACE).await;
+        assert_eq!(resumes(&engine).len() as u64, n, "the rest, a pace after");
+        settle(&fence).await;
+        assert!(start.elapsed() < 3 * REANNOUNCE_PACE);
+        assert_eq!(
+            sorted_ids(&resumes(&engine)),
+            (1..=n).collect::<Vec<_>>(),
+            "each torrent once",
+        );
+    }
+
+    /// A fence that lands while a lift is still resuming stops it, and the
+    /// next lift resumes what the first had not reached as well as what it
+    /// had: the first reads as paused in the state map, the second as
+    /// running.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_during_a_paced_lift_stops_it_and_the_next_lift_resumes_the_rest() {
+        use vpn::killswitch::Fence;
+        let n = 2 * REANNOUNCE_BATCH as u64 + 50;
+        let (fence, engine) = kill_switch_fence_over(n);
+        fence.fence_all();
+        // The alert loop records the fence's pauses.
+        for id in 1..=n {
+            loaded(&fence.state, id, "acct_a", TorrentPhase::Paused);
+        }
+        fence.lift();
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        assert_eq!(resumes(&engine).len(), REANNOUNCE_BATCH);
+
+        fence.fence_all();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        settle(&fence).await;
+        tokio::time::sleep(3 * REANNOUNCE_PACE).await;
+        assert_eq!(
+            resumes(&engine).len(),
+            REANNOUNCE_BATCH,
+            "nothing resumed into a fenced profile",
+        );
+
+        let before = resumes(&engine).len();
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(
+            sorted_ids(&resumes(&engine)[before..]),
+            (1..=n).collect::<Vec<_>>(),
+            "the second lift resumes every torrent the first was asked to",
+        );
+    }
+
+    /// A batch that goes out as the profile is fenced is paused again: the
+    /// fence's walk may already have passed those torrents.
+    #[tokio::test]
+    async fn a_batch_resumed_as_the_profile_is_fenced_is_paused_again() {
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+        let held = engine.hold_next("resume_torrent");
+        let resuming = tokio::spawn({
+            let profiles = profiles.clone();
+            async move {
+                resume_paced(
+                    profiles,
+                    ProfileId::new("acct_a"),
+                    &[handle(1), handle(2)],
+                    REANNOUNCE_PACE,
+                    || false,
+                    Arc::new(ResumeGate::default()),
+                    Arc::new(PromSink::new()),
+                    |_, _| {},
+                )
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || {
+            held.wait_entered();
+            profiles
+                .iter()
+                .next()
+                .unwrap()
+                .update_health(|h| h.status = ProfileStatus::VpnDown);
+            held.release();
+        })
+        .await
+        .unwrap();
+        let resumed = resuming.await.unwrap();
+        assert_eq!(
+            resumed,
+            Resumed {
+                resumed: 0,
+                refused: 0,
+                not_reached: 2,
+                ..Resumed::default()
+            },
+        );
+        assert_eq!(resumes(&engine), [handle(1), handle(2)]);
+        assert_eq!(pauses(&engine), [handle(1), handle(2)], "both paused again");
+    }
+
+    /// A lift that starts while an earlier one is still resuming replaces
+    /// it: the earlier run stops before its next batch and reports what it
+    /// had not reached, and the newer one resumes every torrent it was given.
+    /// Here a monitor fence lands mid-lift and the operator sets the profile
+    /// online again within the pace window, before the first run's next
+    /// batch reads the profile fenced.
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_lift_stops_the_run_it_replaces_and_reports_its_remainder() {
+        let n = 2 * REANNOUNCE_BATCH as u64 + 50;
+        let (fence, engine) = kill_switch_fence_over(n);
+        let entry = fence.profiles.iter().next().unwrap();
+        let handles: Vec<TorrentHandle> = (1..=n).map(handle).collect();
+        let first = spawn_lift(
+            &fence.profiles,
+            &fence.metrics,
+            entry,
+            handles.clone(),
+            Lift::KillSwitch,
+        );
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        assert_eq!(resumes(&engine).len(), REANNOUNCE_BATCH, "the first batch");
+
+        entry.update_health(|h| h.status = ProfileStatus::VpnDown);
+        entry.update_health(|h| h.status = ProfileStatus::Active);
+        let second = spawn_lift(
+            &fence.profiles,
+            &fence.metrics,
+            entry,
+            handles,
+            Lift::SetOnline,
+        );
+        assert_eq!(
+            first.await.unwrap(),
+            Resumed {
+                resumed: REANNOUNCE_BATCH as u64,
+                not_reached: n as usize - REANNOUNCE_BATCH,
+                ..Resumed::default()
+            },
+            "the replaced run stops and reports its remainder",
+        );
+        assert_eq!(
+            second.await.unwrap(),
+            Resumed {
+                resumed: n,
+                ..Resumed::default()
+            },
+        );
+        assert_eq!(resumes(&engine).len() as u64, REANNOUNCE_BATCH as u64 + n);
+        assert!(!entry.is_resuming(), "the newer run cleared itself");
+    }
+
+    /// A torrent the operator paused during a lift is left out of what a
+    /// kill-switch fence takes back from the run, so the next lift does not
+    /// resume it either.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_paused_during_a_lift_is_not_taken_back_by_the_next_fence() {
+        use vpn::killswitch::Fence;
+        let n = 2 * REANNOUNCE_BATCH as u64 + 50;
+        let (fence, engine) = kill_switch_fence_over(n);
+        fence.fence_all();
+        for id in 1..=n {
+            loaded(&fence.state, id, "acct_a", TorrentPhase::Paused);
+        }
+        fence.lift();
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        assert_eq!(resumes(&engine).len(), REANNOUNCE_BATCH);
+        fence
+            .profiles
+            .iter()
+            .next()
+            .unwrap()
+            .exclude_from_resumes(handle(n));
+
+        fence.fence_all();
+        settle(&fence).await;
+        let before = resumes(&engine).len();
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(
+            sorted_ids(&resumes(&engine)[before..]),
+            (1..n).collect::<Vec<_>>(),
+            "every torrent but the one paused by hand",
+        );
+    }
+
+    /// A torrent the operator pauses while the kill-switch fence stands, by
+    /// the pause route's own step, stays paused when the fence lifts; the
+    /// rest of what the fence paused is resumed.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_paused_during_a_kill_switch_fence_stays_paused_after_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(3);
+        fence.fence_all();
+        // `POST /v1/torrents/{infohash}/pause`, before its pause.
+        fence
+            .profiles
+            .iter()
+            .next()
+            .unwrap()
+            .exclude_from_resumes(handle(2));
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            sorted_ids(&resumes(&engine)),
+            [1, 3],
+            "every torrent the fence paused but the one paused during it",
+        );
+    }
+
+    /// A pause of the whole profile while the kill-switch fence stands, by
+    /// the pause-all routes' own step, leaves every torrent paused once the
+    /// fence lifts, though the profile itself is lifted.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_all_during_a_kill_switch_fence_leaves_the_profile_paused_after_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(3);
+        fence.fence_all();
+        // `POST /v1/profiles/{id}/pause-all`, before its walk.
+        fence.profiles.iter().next().unwrap().halt_resumes();
+
+        fence.lift();
+        settle(&fence).await;
+        tokio::time::sleep(3 * REANNOUNCE_PACE).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active, "the fence lifts");
+        assert!(resumes(&engine).is_empty(), "and resumes nothing");
+    }
+
     fn status_of(fence: &KillSwitchFence) -> ProfileStatus {
         fence.profiles.iter().next().unwrap().health().status
     }
@@ -2098,8 +3457,8 @@ mod tests {
     /// The kill switch's fence is the monitor's: the profile is marked
     /// `vpn_down` and every torrent in it paused. Lifted once the ruleset is
     /// verified, it resumes only the torrent it found running.
-    #[test]
-    fn the_kill_switch_fence_pauses_every_torrent_and_lifts_what_it_paused() {
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_fence_pauses_every_torrent_and_lifts_what_it_paused() {
         use vpn::killswitch::Fence;
         let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
         fence.fence_all();
@@ -2118,6 +3477,7 @@ mod tests {
         );
 
         fence.lift();
+        settle(&fence).await;
         assert_eq!(status_of(&fence), ProfileStatus::Active);
         assert_eq!(
             resumes(&engine),
@@ -2129,12 +3489,13 @@ mod tests {
     /// A profile fenced again while it is still fenced is not fenced twice,
     /// and a profile the monitor had fenced already is not the kill switch's
     /// to lift.
-    #[test]
-    fn the_kill_switch_fence_leaves_a_profile_the_monitor_fenced() {
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_fence_leaves_a_profile_the_monitor_fenced() {
         use vpn::killswitch::Fence;
         let (fence, engine) = kill_switch_fence(ProfileStatus::VpnDown, true);
         fence.fence_all();
         fence.lift();
+        settle(&fence).await;
         assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
         assert!(pauses(&engine).is_empty() && resumes(&engine).is_empty());
         assert_eq!(
@@ -2149,14 +3510,15 @@ mod tests {
         assert_eq!(pauses(&engine).len(), 2, "fenced once");
         assert_eq!(kill_switch_fenced(&fence), Some(1.0), "and counted once");
         fence.lift();
+        settle(&fence).await;
         assert_eq!(resumes(&engine), [handle(1)], "and lifted once");
     }
 
     /// A profile the operator set online while fenced is theirs: the lift
     /// leaves it alone. Fenced again while still not in force, it is the kill
     /// switch's once more, and the lift resumes what was running then, once.
-    #[test]
-    fn the_kill_switch_fence_yields_a_profile_set_online_and_refences_it() {
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_fence_yields_a_profile_set_online_and_refences_it() {
         use vpn::killswitch::Fence;
         let set_online = |fence: &KillSwitchFence| {
             fence
@@ -2171,6 +3533,7 @@ mod tests {
         fence.fence_all();
         set_online(&fence);
         fence.lift();
+        settle(&fence).await;
         assert_eq!(status_of(&fence), ProfileStatus::Active);
         assert!(
             resumes(&engine).is_empty(),
@@ -2184,6 +3547,7 @@ mod tests {
         assert_eq!(status_of(&fence), ProfileStatus::VpnDown, "fenced again");
         assert_eq!(pauses(&engine).len(), 4, "every torrent, each time");
         fence.lift();
+        settle(&fence).await;
         assert_eq!(status_of(&fence), ProfileStatus::Active);
         assert_eq!(
             resumes(&engine),
@@ -2204,6 +3568,81 @@ mod tests {
         assert!(resumes(&engine).is_empty());
     }
 
+    /// A single resume re-checks the fence after `resume_torrent`, and pauses
+    /// the torrent again only when the profile was fenced while it went out.
+    #[test]
+    fn a_resume_pauses_its_torrent_again_only_when_the_profile_was_fenced_meanwhile() {
+        let id = ProfileId::new("acct_a");
+        for fenced in [true, false] {
+            let (entry, engine) = mock_entry(ProfileStatus::Active);
+            let profiles = ProfileRegistry::new(vec![entry]);
+            let held = engine.hold_next("resume_torrent");
+            let out = std::thread::scope(|s| {
+                let resuming = s.spawn(|| {
+                    resume_unless_fenced(
+                        &profiles,
+                        &id,
+                        engine.as_ref(),
+                        handle(1),
+                        &PromSink::new(),
+                    )
+                });
+                held.wait_entered();
+                if fenced {
+                    profiles
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .update_health(|h| h.status = ProfileStatus::VpnDown);
+                }
+                held.release();
+                resuming.join().unwrap().unwrap()
+            });
+            let (want, paused) = if fenced {
+                (SingleResume::Fenced, vec![handle(1)])
+            } else {
+                (SingleResume::Resumed, vec![])
+            };
+            assert_eq!(out, want, "fenced: {fenced}");
+            assert_eq!(pauses(&engine), paused, "fenced: {fenced}");
+            assert_eq!(resumes(&engine), [handle(1)], "fenced: {fenced}");
+        }
+    }
+
+    /// A re-pause the session refuses still reports the resume as `Fenced`,
+    /// so the caller answers 409 rather than 204, and counts the failure in
+    /// `profile_fence_pause_errors_total`.
+    #[test]
+    fn a_resume_whose_re_pause_fails_is_still_fenced_and_counted() {
+        let id = ProfileId::new("acct_a");
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let profiles = ProfileRegistry::new(vec![entry]);
+        let metrics = PromSink::new();
+        engine.inject_error("pause_torrent", torrentd_engine::EngineError::Shutdown);
+        let held = engine.hold_next("resume_torrent");
+        let out = std::thread::scope(|s| {
+            let resuming = s.spawn(|| {
+                resume_unless_fenced(&profiles, &id, engine.as_ref(), handle(1), &metrics)
+            });
+            held.wait_entered();
+            profiles
+                .iter()
+                .next()
+                .unwrap()
+                .update_health(|h| h.status = ProfileStatus::VpnDown);
+            held.release();
+            resuming.join().unwrap().unwrap()
+        });
+        assert_eq!(out, SingleResume::Fenced);
+        assert_eq!(pauses(&engine), [handle(1)], "the re-pause was attempted");
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        let line = "torrentd_profile_fence_pause_errors_total{profile_id=\"acct_a\"} 1";
+        assert!(
+            exported.lines().any(|l| l == line),
+            "expected `{line}`; got:\n{exported}",
+        );
+    }
+
     /// An add re-checks the fence after `add_torrent` and pauses what it just
     /// added only when the profile was fenced in between.
     #[test]
@@ -2220,8 +3659,322 @@ mod tests {
             let label = format!("{status:?}");
             let (entry, engine) = mock_entry(status);
             let profiles = ProfileRegistry::new(vec![entry]);
-            hold_if_fenced(&profiles, &id, engine.as_ref(), th, &PromSink::new());
+            hold_if_fenced(&profiles, None, &id, engine.as_ref(), th, &PromSink::new());
             assert_eq!(pauses(&engine), want, "{label}");
         }
+    }
+
+    /// Hand `handle`'s `add_torrent_alert` to the add handler, wired as the
+    /// daemon wires it: fenced where the registry reads the profile
+    /// `vpn_down`, and holding through [`fence_hold`] over `fence`.
+    fn deliver_add(fence: &Arc<KillSwitchFence>, engine: Arc<dyn TorrentEngine>, h: TorrentHandle) {
+        let profiles = fence.profiles.clone();
+        let profile_fenced: torrentd_engine::ProfileFenced = Arc::new(move |id: &ProfileId| {
+            profiles
+                .resolve(id)
+                .active()
+                .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
+        });
+        let hold = fence_hold(Some(fence.clone()));
+        let resume = torrentd_engine::MemoryResumeStore::new();
+        let torrents = torrentd_engine::MemoryTorrentStore::new();
+        let clock = torrentd_engine::MockClock::new();
+        let mut ctx = torrentd_engine::handlers::HandlerCtx {
+            state: &fence.state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &torrentd_engine::NoopSink,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: Some(&profile_fenced),
+            fence_hold: Some(&hold),
+            profile_id: ProfileId::new("acct_a"),
+            span: tracing::info_span!("test"),
+        };
+        torrentd_engine::handlers::add::handle(
+            &torrentd_engine::Alert::AddTorrent {
+                hdr: libtorrent_safe::alert::AlertHeader {
+                    kind: torrentd_engine::AlertKind::AddTorrent,
+                    infohash: Some(h.infohash),
+                    handle: Some(h),
+                    timestamp_us: 0,
+                },
+                error_code: 0,
+                message: None,
+            },
+            &mut ctx,
+        );
+    }
+
+    fn resumes_of(engine: &torrentd_engine::MockEngine, h: TorrentHandle) -> usize {
+        resumes(engine).into_iter().filter(|r| *r == h).count()
+    }
+
+    /// An add in flight as the kill-switch fence lands: its walk of the state
+    /// map does not find the torrent, so the add's own re-check pauses it.
+    /// That pause is recorded with the fence, and the lift resumes it with
+    /// the rest rather than leaving it paused in a profile that reads active.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_an_add_pauses_under_the_kill_switch_fence_is_resumed_by_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(1);
+        let id = ProfileId::new("acct_a");
+        let added = handle(3);
+        fence.fence_all();
+        hold_if_fenced(
+            &fence.profiles,
+            Some(&fence),
+            &id,
+            engine.as_ref(),
+            added,
+            &PromSink::new(),
+        );
+        assert!(pauses(&engine).contains(&added), "the add pauses it");
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            sorted_ids(&resumes(&engine)),
+            [1, 3],
+            "each once, the add's too"
+        );
+    }
+
+    /// The same through the add handler, whose alert lands after the fence
+    /// walked the state map: the handler's pause runs through the daemon's
+    /// hold, which records the torrent with the fence.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_whose_add_alert_lands_after_the_kill_switch_fence_is_resumed_by_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(1);
+        let fence = Arc::new(fence);
+        let added = handle(3);
+        fence.fence_all();
+        assert!(!fence.state.contains(&added.infohash), "the walk missed it");
+        deliver_add(&fence, engine.clone(), added);
+        assert!(pauses(&engine).contains(&added), "the handler pauses it");
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            sorted_ids(&resumes(&engine)),
+            [1, 3],
+            "each once, the add's too"
+        );
+    }
+
+    /// The add's re-check pauses under one fence, which lifts, and a second
+    /// fence lands before the add's alert: the walk misses the torrent again,
+    /// and the handler pauses it under the second. Each lift resumes it once:
+    /// the first's record does not carry into the second, and the second
+    /// does not lose it.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_paused_across_a_lift_and_a_second_kill_switch_fence_is_resumed_once_by_each() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(1);
+        let fence = Arc::new(fence);
+        let id = ProfileId::new("acct_a");
+        let added = handle(3);
+
+        fence.fence_all();
+        hold_if_fenced(
+            &fence.profiles,
+            Some(&fence),
+            &id,
+            engine.as_ref(),
+            added,
+            &PromSink::new(),
+        );
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(resumes_of(&engine, added), 1, "the first lift resumes it");
+
+        fence.fence_all();
+        assert!(!fence.state.contains(&added.infohash), "the walk missed it");
+        let paused_before = pauses(&engine).iter().filter(|p| **p == added).count();
+        deliver_add(&fence, engine.clone(), added);
+        assert_eq!(
+            pauses(&engine).iter().filter(|p| **p == added).count(),
+            paused_before + 1,
+            "the handler pauses it under the second fence",
+        );
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            resumes_of(&engine, added),
+            2,
+            "the second lift resumes it once"
+        );
+        assert_eq!(resumes_of(&engine, handle(1)), 2, "as it does the walk's");
+    }
+
+    /// The lift's tunnel check runs with the fence's lock free, so an add
+    /// alert's hold (`hold_recorded`, on the alert loop's one thread) never
+    /// waits out the `ip` probes. The lift still resumes what the add
+    /// recorded.
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_lift_checks_each_tunnel_without_holding_the_fence_lock() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let probed_free = Arc::new(AtomicUsize::new(0));
+        let probed_held = Arc::new(AtomicUsize::new(0));
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            let (free, held) = (probed_free.clone(), probed_held.clone());
+            move |iface: &str, wg: bool| {
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let counter = if fence.fenced.try_lock().is_some() {
+                    &free
+                } else {
+                    &held
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        let added = handle(3);
+        fence.fence_all();
+        deliver_add(&fence, engine.clone(), added);
+
+        fence.lift();
+        assert_eq!(
+            probed_free.load(Ordering::SeqCst),
+            1,
+            "probed once, unlocked"
+        );
+        assert_eq!(
+            probed_held.load(Ordering::SeqCst),
+            0,
+            "never under the lock"
+        );
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(sorted_ids(&resumes(&engine)), [1, 3]);
+    }
+
+    /// A fence that lands between the lift's tunnel check and its take of
+    /// the records is not lifted on that check: its record stays for the
+    /// next lift.
+    #[test]
+    fn a_record_marked_after_the_lifts_check_stays_for_the_next_lift() {
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            move |iface: &str, wg: bool| {
+                // Stands in for a fence landing mid-check: the record now
+                // carries a mark the lift did not check.
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let mut fenced = fence.fenced.lock();
+                fenced.marks += 1;
+                let mark = fenced.marks;
+                for record in fenced.profiles.values_mut() {
+                    record.mark = mark;
+                }
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        fence.fence_all();
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown, "still fenced");
+        assert!(resumes(&engine).is_empty());
+        assert!(
+            fence.with_record(&ProfileId::new("acct_a"), |r| r.is_some()),
+            "the record stays for the next lift",
+        );
+    }
+
+    /// A profile set online and fenced again by the monitor while the lift
+    /// checks the tunnels is not lifted on the verdict taken before: the
+    /// record's mark is unchanged and the profile reads `vpn_down` as it did,
+    /// but the monitor's fence is a newer one, which keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn a_profile_fenced_again_during_the_lifts_check_is_not_lifted_on_it() {
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            move |iface: &str, wg: bool| {
+                // The verdict is the healthy tunnel's; between it and the
+                // lift's lock, the operator sets the profile online and the
+                // monitor fences it for a tunnel that went down since.
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let resolved = fence.profiles.resolve(&ProfileId::new("acct_a"));
+                let entry = resolved.active().expect("the profile");
+                entry.update_health(|h| h.status = ProfileStatus::Active);
+                super::fence(entry, &fence.state, None, fence.metrics.as_ref());
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        fence.fence_all();
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(
+            status_of(&fence),
+            ProfileStatus::VpnDown,
+            "the monitor's fence stands"
+        );
+        assert!(resumes(&engine).is_empty(), "nothing resumed");
+    }
+
+    /// Without the kill switch no fence lifts by its own record, so the add
+    /// handler's hold has nothing to record with and runs alone.
+    #[test]
+    fn the_add_handlers_hold_without_a_kill_switch_still_runs() {
+        let hold = fence_hold(None);
+        let mut ran = false;
+        hold(&ProfileId::new("acct_a"), handle(3), &mut || {
+            ran = true;
+            true
+        });
+        assert!(ran);
     }
 }

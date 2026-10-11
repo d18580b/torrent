@@ -20,6 +20,7 @@
 //! one.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -42,7 +43,37 @@ use crate::model::VerifyQueueRow;
 
 /// Bumped whenever the schema changes; `migrate` walks forward from whatever
 /// the file reports. A file from the future is refused rather than guessed at.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+
+/// The version [`PoolStore::migrate_v6`] brings a file to.
+const V6: i64 = 6;
+
+/// v7 makes plan ids non-reusable: `plan.id` becomes `AUTOINCREMENT`.
+///
+/// Declared `INTEGER PRIMARY KEY` alone, SQLite hands out `max(id) + 1`, so
+/// discarding the newest plan gave its id to the next one, and a delete
+/// plan's trash directory is named after its id. SQLite cannot add
+/// `AUTOINCREMENT` to a column in place, so the table is rebuilt and its rows
+/// copied with their ids; `sqlite_sequence` starts at the highest id copied.
+/// `plan_step` refers to `plan` by name, so it follows the rebuilt table.
+/// Run with foreign keys off: dropping the old table with them on would
+/// cascade-delete every step.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE plan_v7 (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    applied_at INTEGER,
+    -- draft | applying | applied | failed | cancelled
+    status     TEXT    NOT NULL,
+    spec       TEXT    NOT NULL
+);
+INSERT INTO plan_v7 (id, kind, created_at, applied_at, status, spec)
+    SELECT id, kind, created_at, applied_at, status, spec FROM plan;
+DROP TABLE plan;
+ALTER TABLE plan_v7 RENAME TO plan;
+CREATE INDEX plan_by_status ON plan(status);
+"#;
 
 /// The version [`PoolStore::migrate_v4`] brings a file to.
 const V4: i64 = 4;
@@ -230,7 +261,8 @@ CREATE INDEX claim_by_torrent ON claim(infohash);
 "#;
 
 /// The mutation journal, which v2 added: part of a new file, and the step a
-/// v1 file takes.
+/// v1 file takes. v7 rebuilds `plan` with an `AUTOINCREMENT` id
+/// ([`SCHEMA_V7`]); a new file takes that step like any other.
 const SCHEMA_JOURNAL: &str = r#"
 CREATE TABLE plan (
     id         INTEGER PRIMARY KEY,
@@ -270,10 +302,103 @@ DROP INDEX torrent_by_slot;
 CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
 "#;
 
+/// An unclaimed file from [`PoolStore::orphan_files_sized`]: its root-relative
+/// path, indexed size, and indexed `(dev, ino)`.
+pub type SizedOrphan = (String, u64, (u64, u64));
+
 pub struct PoolStore {
     conn: Connection,
     /// Nesting depth for [`PoolStore::in_transaction`]; 0 means autocommit.
     tx_depth: u32,
+    /// This writer's advisory lock on the index's `.lock` file, held for the
+    /// life of the store: shared from [`PoolStore::open`], exclusive from
+    /// [`PoolStore::open_exclusive`]. `None` for an in-memory store or a
+    /// read-only connection, which take no lock.
+    _hold: Option<std::fs::File>,
+}
+
+/// The advisory lock file beside the index at `db`: `pool.db.lock` for
+/// `pool.db`.
+///
+/// Not the database file itself. SQLite takes its own byte-range locks on
+/// that, and where `flock` is emulated over `fcntl` (NFS) a whole-file lock
+/// there would collide with them.
+fn lock_path(db: &Path) -> PathBuf {
+    let mut name = db.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    db.with_file_name(name)
+}
+
+/// Take the advisory lock that says which processes hold the index at `db`
+/// for writing, without waiting: [`PoolError::Busy`] when it is held in a
+/// mode that excludes this one.
+///
+/// `None` where the lock file neither exists nor can be created, in a
+/// directory this process may not write: no process of the same user can
+/// hold a lock there either, so there is nothing to exclude. `None` too, with
+/// a warning, where it exists but this process may not even read it: a file
+/// another user left unreadable must not keep the daemon from booting.
+fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolError> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+    let path = lock_path(db);
+    // The lock needs an open file, not a writable one. A `.lock` file another
+    // user created (a CLI run as root before the daemon's user) is still
+    // lockable read-only.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => {
+            // Readable by every user whatever the umask, so a root CLI run
+            // under umask 077 leaves a file the daemon's user can still
+            // open read-only and lock. Best effort: only the owner may
+            // chmod, and an owner who can open it for writing already can.
+            if let Ok(meta) = file.metadata() {
+                let mode = meta.permissions().mode();
+                if mode & 0o044 != 0o044 {
+                    let _ = file
+                        .set_permissions(std::fs::Permissions::from_mode((mode | 0o044) & 0o7777));
+                }
+            }
+            file
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            match std::fs::File::open(&path) {
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "cannot open the pool index lock file even read-only; \
+                         opening the index without the lock that keeps a CLI \
+                         `pool scan` off it",
+                    );
+                    return Ok(None);
+                }
+                other => other?,
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let taken = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    match taken {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(PoolError::Busy),
+        Err(std::fs::TryLockError::Error(e)) => Err(PoolError::Io(e)),
+    }
 }
 
 impl std::fmt::Debug for PoolStore {
@@ -283,13 +408,41 @@ impl std::fmt::Debug for PoolStore {
 }
 
 impl PoolStore {
-    /// Open (creating if needed) the pool database at `path`.
+    /// Open (creating if needed) the pool database at `path` as one of any
+    /// number of concurrent writers: the daemon, or a short CLI command such
+    /// as `pool check`.
+    ///
+    /// Holds a shared lock on `pool.db.lock` for the life of the store, which
+    /// is what makes [`PoolStore::open_exclusive`] refuse while the daemon
+    /// runs. [`PoolError::Busy`] while an exclusive holder has it.
     pub fn open(path: &Path) -> Result<Self, PoolError> {
+        Self::open_held(path, false)
+    }
+
+    /// Open the pool database at `path` as its only writer, for a CLI
+    /// `pool scan`.
+    ///
+    /// That scan is one write transaction for its whole duration, an hour on
+    /// a large pool, and SQLite refuses every other writer at once for all of
+    /// it. Beside a running daemon that is every daemon write: a plan's step
+    /// journal, a verification's verdict, a released owner. So it refuses to
+    /// start, with [`PoolError::Busy`], while any other [`PoolStore::open`]
+    /// holds the index, and while it runs no other one can open it.
+    pub fn open_exclusive(path: &Path) -> Result<Self, PoolError> {
+        Self::open_held(path, true)
+    }
+
+    fn open_held(path: &Path, exclusive: bool) -> Result<Self, PoolError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Before the connection, so an exclusive holder also keeps a second
+        // process from migrating the schema under it.
+        let hold = hold_index(path, exclusive)?;
         let conn = Connection::open(path)?;
-        Self::from_conn(conn)
+        let mut store = Self::from_conn(conn)?;
+        store._hold = hold;
+        Ok(store)
     }
 
     /// In-memory store, for tests.
@@ -311,15 +464,21 @@ impl PoolStore {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // A scan takes the database's write lock for its whole duration (see
-        // `in_transaction`). A second writer — the CLI `pool scan` racing the
-        // daemon — must fail fast with SQLITE_BUSY so the caller can say so,
-        // not block for hours.
+        // `in_transaction`). A second writer that meets it — a `pool check`
+        // beside the daemon's scan — must fail fast with SQLITE_BUSY so the
+        // caller can say so, not block for hours. The CLI `pool scan` cannot
+        // be that scan beside the daemon: `open_exclusive` refuses it first.
         conn.busy_timeout(std::time::Duration::from_millis(0))?;
-        let mut store = Self { conn, tx_depth: 0 };
+        let mut store = Self {
+            conn,
+            tx_depth: 0,
+            _hold: None,
+        };
         store.migrate()?;
         store.migrate_v4()?;
         store.migrate_v5()?;
         store.migrate_v6()?;
+        store.migrate_v7()?;
         Ok(store)
     }
 
@@ -355,7 +514,11 @@ impl PoolStore {
                 expected: SCHEMA_VERSION,
             });
         }
-        Ok(Self { conn, tx_depth: 0 })
+        Ok(Self {
+            conn,
+            tx_depth: 0,
+            _hold: None,
+        })
     }
 
     /// Run `f` inside one read transaction, so every query it makes sees the
@@ -733,12 +896,45 @@ impl PoolStore {
         let found: i64 = self
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found >= V6 {
+            return Ok(());
+        }
+        self.step(found, V6, |st| Ok(st.conn.execute_batch(SCHEMA_V6)?))
+    }
+
+    /// Step a v6 file to v7: `plan.id` becomes `AUTOINCREMENT`, so a
+    /// discarded plan's id is never handed out again.
+    ///
+    /// `PRAGMA foreign_keys` is a no-op inside a transaction, so it is turned
+    /// off around the step rather than in it, and turned back on whatever the
+    /// step's outcome. `foreign_key_check` runs before the commit, so a
+    /// rebuild that left a step without its plan rolls back instead.
+    fn migrate_v7(&mut self) -> Result<(), PoolError> {
+        let found: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
         if found >= SCHEMA_VERSION {
             return Ok(());
         }
-        self.step(found, SCHEMA_VERSION, |st| {
-            Ok(st.conn.execute_batch(SCHEMA_V6)?)
-        })
+        self.conn.pragma_update(None, "foreign_keys", "OFF")?;
+        let stepped = self.step(found, SCHEMA_VERSION, |st| {
+            st.conn.execute_batch(SCHEMA_V7)?;
+            let dangling: i64 = st.conn.query_row(
+                "SELECT count(*) FROM pragma_foreign_key_check('plan_step')",
+                [],
+                |r| r.get(0),
+            )?;
+            if dangling != 0 {
+                return Err(PoolError::Io(std::io::Error::other(format!(
+                    "{dangling} plan steps would be left without their plan by rebuilding the \
+                     plan table"
+                ))));
+            }
+            Ok(())
+        });
+        let restored = self.conn.pragma_update(None, "foreign_keys", "ON");
+        stepped?;
+        Ok(restored?)
     }
 
     // -- verify queue ------------------------------------------------------
@@ -1623,6 +1819,46 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Up to `limit` steps of `plan_id` after `after_seq` (from the first
+    /// when `None`), in `seq` order: one page, read off the primary key
+    /// whatever the plan's size.
+    pub fn plan_steps_page(
+        &self,
+        plan_id: i64,
+        after_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PlanStepRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT seq, op, src, dst, status, error FROM plan_step
+             WHERE plan_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![plan_id, after_seq.unwrap_or(-1), limit], |r| {
+            Ok(PlanStepRow {
+                seq: r.get(0)?,
+                op: r.get(1)?,
+                src: r.get(2)?,
+                dst: r.get(3)?,
+                status: r.get(4)?,
+                error: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// How many of `plan_id`'s steps stand in each status, as `(status,
+    /// count)` pairs in status order. A status no step holds is absent.
+    pub fn plan_step_counts(&self, plan_id: i64) -> Result<Vec<(String, u64)>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT status, count(*) FROM plan_step WHERE plan_id = ?1
+             GROUP BY status ORDER BY status",
+        )?;
+        let rows = st.query_map(params![plan_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn set_step_status(
         &self,
         plan_id: i64,
@@ -1635,6 +1871,43 @@ impl PoolStore {
             params![plan_id, seq, status, error],
         )?;
         Ok(())
+    }
+
+    /// Set the status and error of several of `plan_id`'s steps, each
+    /// `(seq, status, error)`, in one transaction: one commit, so one WAL
+    /// fsync, however many steps it records. Either every row is written or
+    /// none is.
+    pub fn set_steps_status(
+        &mut self,
+        plan_id: i64,
+        steps: &[(i64, &str, Option<&str>)],
+    ) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        {
+            let mut up = tx.prepare(
+                "UPDATE plan_step SET status = ?3, error = ?4 WHERE plan_id = ?1 AND seq = ?2",
+            )?;
+            for (seq, status, error) in steps {
+                up.execute(params![plan_id, seq, status, error])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count every transaction this connection commits from now on, into
+    /// the returned counter. Replaces any counter installed before.
+    ///
+    /// Each commit of the writer is a WAL fsync under `synchronous=FULL`, so
+    /// this is how a test holds a loop to the number of fsyncs it makes.
+    pub fn count_commits(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = std::sync::Arc::clone(&counter);
+        self.conn.commit_hook(Some(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }));
+        counter
     }
 
     // -- rollups -----------------------------------------------------------
@@ -1820,16 +2093,20 @@ impl PoolStore {
         Ok(self
             .orphan_files_sized(root_id, prefix)?
             .into_iter()
-            .map(|(p, _)| p)
+            .map(|(p, ..)| p)
             .collect())
     }
 
-    /// [`PoolStore::orphan_files`], with each file's indexed size.
+    /// [`PoolStore::orphan_files`], with each file's indexed size and
+    /// `(dev, ino)` identity.
+    ///
+    /// The identity lets the delete planner drop an orphan that is a claimed
+    /// file reached by another path (see [`PoolStore::claimed_identities`]).
     pub fn orphan_files_sized(
         &self,
         root_id: i64,
         prefix: &str,
-    ) -> Result<Vec<(String, u64)>, PoolError> {
+    ) -> Result<Vec<SizedOrphan>, PoolError> {
         let like = if prefix.is_empty() {
             String::new()
         } else {
@@ -1837,7 +2114,7 @@ impl PoolStore {
         };
         let upper = prefix_upper_bound(&like);
         let mut st = self.conn.prepare(
-            "SELECT f.rel_path, f.size FROM file f
+            "SELECT f.rel_path, f.size, f.dev, f.ino FROM file f
              WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
                AND NOT EXISTS (
                  SELECT 1 FROM claim c
@@ -1846,7 +2123,11 @@ impl PoolStore {
              ORDER BY f.rel_path",
         )?;
         let rows = st.query_map(params![root_id, like, upper], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                (r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64),
+            ))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -1941,6 +2222,23 @@ impl PoolStore {
             |r| r.get(0),
         )?;
         Ok(known != 0)
+    }
+
+    /// The indexed `(dev, ino)` of every claimed file, under every root.
+    ///
+    /// A path is not the only way to reach a file: a hard link, or the same
+    /// directory listed twice through a bind mount, is a second path to the
+    /// claimed bytes that [`PoolStore::is_orphan`] reads as unclaimed. The
+    /// delete step refuses any file whose identity is in this set.
+    pub fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT f.dev, f.ino FROM claim c
+             JOIN file f ON f.root_id = c.root_id AND f.rel_path = c.rel_path",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+        })?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
 
     /// Distinct adoption states of every torrent claiming a file under
@@ -2204,4 +2502,175 @@ fn row_to_torrent(r: &rusqlite::Row<'_>) -> rusqlite::Result<PoolTorrent> {
             .unwrap_or_default(),
         profile: r.get(11)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon and a CLI `pool check` may write side by side; a CLI
+    /// `pool scan` may not run beside either, and nothing opens beside it.
+    #[test]
+    fn an_exclusive_writer_and_any_other_writer_exclude_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+
+        let daemon = PoolStore::open(&db).unwrap();
+        let check = PoolStore::open(&db).expect("shared writers coexist");
+        assert!(matches!(
+            PoolStore::open_exclusive(&db),
+            Err(PoolError::Busy)
+        ));
+        drop(check);
+        assert!(
+            matches!(PoolStore::open_exclusive(&db), Err(PoolError::Busy)),
+            "refused while any one writer remains",
+        );
+        // A reader takes no lock: the API reads through one during a scan.
+        drop(PoolStore::open_read_only(&db).unwrap());
+        drop(daemon);
+
+        let scan = PoolStore::open_exclusive(&db).expect("alone, the scan opens");
+        assert!(matches!(PoolStore::open(&db), Err(PoolError::Busy)));
+        assert!(matches!(
+            PoolStore::open_exclusive(&db),
+            Err(PoolError::Busy)
+        ));
+        drop(PoolStore::open_read_only(&db).unwrap());
+        drop(scan);
+        PoolStore::open(&db).expect("released when the scan's store drops");
+        assert!(dir.path().join("pool.db.lock").exists());
+    }
+
+    /// Whether this process can open `path` for writing despite its mode: a
+    /// root or CAP_DAC_OVERRIDE test run, where the permission tests below
+    /// cannot set up the situation they check.
+    fn bypasses_permissions(path: &Path) -> bool {
+        std::fs::OpenOptions::new().write(true).open(path).is_ok()
+    }
+
+    /// A lock file this process may not write (another user's, here 0444) is
+    /// opened read-only and still locks: the scan and any other writer still
+    /// exclude each other through it.
+    #[test]
+    fn a_lock_file_that_cannot_be_written_still_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        let lock = dir.path().join("pool.db.lock");
+        drop(PoolStore::open(&db).unwrap());
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if bypasses_permissions(&lock) {
+            return;
+        }
+
+        let daemon = PoolStore::open(&db).expect("a read-only lock file opens");
+        assert!(daemon._hold.is_some(), "and is locked");
+        assert!(matches!(
+            PoolStore::open_exclusive(&db),
+            Err(PoolError::Busy)
+        ));
+        drop(daemon);
+
+        let scan = PoolStore::open_exclusive(&db).expect("alone, the scan opens");
+        assert!(scan._hold.is_some());
+        assert!(matches!(PoolStore::open(&db), Err(PoolError::Busy)));
+        drop(scan);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "a file this process cannot write is not chmodded",
+        );
+    }
+
+    /// A lock file created under a restrictive umask is made readable by
+    /// every user, so another user's process can still open it to lock; one
+    /// this process cannot read at all opens the index without the lock,
+    /// rather than refusing it.
+    #[test]
+    fn the_lock_file_is_left_readable_and_an_unreadable_one_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        let lock = dir.path().join("pool.db.lock");
+        std::fs::File::create(&lock).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        drop(PoolStore::open(&db).unwrap());
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o644,
+        );
+
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if bypasses_permissions(&lock) {
+            return;
+        }
+        let store = PoolStore::open(&db).expect("an unreadable lock file does not refuse the open");
+        assert!(store._hold.is_none());
+    }
+
+    fn plan_of(store: &mut PoolStore, n: usize) -> i64 {
+        let id = store.create_plan("delete_orphans", "{}", 0).unwrap();
+        let steps: Vec<PlanStep> = (0..n)
+            .map(|i| PlanStep {
+                op: "delete_file".into(),
+                src: format!("/r/f{i}"),
+                dst: None,
+            })
+            .collect();
+        store.add_plan_steps(id, &steps).unwrap();
+        id
+    }
+
+    /// Pages walk every step once, in order, and stop at the plan's end; a
+    /// plan's steps never leak into another's pages.
+    #[test]
+    fn plan_step_pages_cover_the_plan_once_in_order() {
+        let mut store = PoolStore::open_in_memory().unwrap();
+        let id = plan_of(&mut store, 7);
+        let other = plan_of(&mut store, 3);
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store.plan_steps_page(id, after, 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|s| s.seq);
+            seen.extend(page.into_iter().map(|s| s.seq));
+        }
+        assert_eq!(seen, (0..7).collect::<Vec<i64>>());
+        assert_eq!(store.plan_steps_page(other, Some(1), 10).unwrap().len(), 1);
+    }
+
+    /// Several step outcomes are one commit, and the counts read them back.
+    #[test]
+    fn step_outcomes_written_together_are_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PoolStore::open(&dir.path().join("pool.db")).unwrap();
+        let id = plan_of(&mut store, 5);
+        let commits = store.count_commits();
+        store
+            .set_steps_status(
+                id,
+                &[
+                    (0, "done", None),
+                    (1, "done", None),
+                    (2, "failed", Some("boom")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            store.plan_step_counts(id).unwrap(),
+            vec![
+                ("done".to_owned(), 2),
+                ("failed".to_owned(), 1),
+                ("pending".to_owned(), 2),
+            ],
+        );
+        let failed = &store.plan_steps_page(id, Some(1), 1).unwrap()[0];
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+    }
 }

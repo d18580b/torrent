@@ -513,7 +513,7 @@ fn a_rescan_demotes_an_adopted_torrent_nothing_holds() {
     // behind any more refused every later adoption until pool.db was edited.
     let dir = tempfile::tempdir().unwrap();
     let mut store = adopted_store(dir.path());
-    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
     // Loaded in a session: kept.
     torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
@@ -531,6 +531,196 @@ fn a_rescan_demotes_an_adopted_torrent_nothing_holds() {
     let stats = torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
     assert_eq!(stats.matched, 1);
+}
+
+#[test]
+fn a_rescan_keeps_a_held_adopted_torrent_adopted_while_its_payload_is_gone() {
+    // A held torrent whose files left read `missing`, then `matched` once
+    // they were back: the index offered a torrent a session seeds for
+    // adoption, and every adopt refused it as already loaded.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut store = adopted_store(root);
+    let base = store.adoption_base("aa").unwrap();
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
+
+    std::fs::remove_file(root.join("T/a.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let stats = torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(stats.missing, 1);
+    assert_eq!(store.adoption_base("aa").unwrap(), base);
+
+    // With no session view (`torrentd pool scan`) it stands too.
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+
+    write_file(root, "T/a.bin", 64);
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(store.adoption_base("aa").unwrap(), base);
+
+    // Nothing holds it: the missing payload demotes it.
+    std::fs::remove_file(root.join("T/a.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Missing);
+}
+
+#[test]
+fn a_rescan_keeps_a_held_adopted_torrent_adopted_while_its_payload_is_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "T/b.bin", 32);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "ab",
+        "T",
+        None,
+        &[("T/a.bin", 64), ("T/b.bin", 32)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    let base = store.adoption_base("ab").unwrap();
+    let (r, b) = base.clone().unwrap();
+    store
+        .set_adoption(
+            "ab",
+            AdoptionState::Adopted,
+            Some(r),
+            Some(&b),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+    store.set_profile("ab", Some("p")).unwrap();
+
+    std::fs::remove_file(root.join("T/b.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    // Not loaded yet, but its profile owns it.
+    let stats = torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    assert_eq!(state_of(&store, "ab"), AdoptionState::Adopted);
+    assert_eq!(stats.partial, 1);
+    assert_eq!(store.adoption_base("ab").unwrap(), base);
+    // What did resolve is still claimed, so it is no orphan.
+    let orphans = store.orphan_files(r, "").unwrap();
+    assert!(!orphans.contains(&"T/a.bin".to_owned()), "{orphans:?}");
+
+    // Owner released and nothing loads it: demoted to what the payload is.
+    store.set_profile("ab", None).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    assert_eq!(state_of(&store, "ab"), AdoptionState::Partial);
+}
+
+/// `ab`, files `src/T/a.bin` (64) and `src/T/b.bin` (32), adopted at `src`
+/// and held by a session, after `b.bin` moved to `misc/b.bin` and a rescan
+/// kept it `adopted` with its payload partial. Plus an unrelated loose file
+/// in `misc/`.
+fn held_adopted_with_a_file_moved_away(root: &Path) -> (PoolStore, i64) {
+    write_file(root, "src/T/a.bin", 64);
+    write_file(root, "src/T/b.bin", 32);
+    write_file(root, "misc/junk.txt", 9);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "ab",
+        "T",
+        None,
+        &[("T/a.bin", 64), ("T/b.bin", 32)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        store.adoption_base("ab").unwrap(),
+        Some((root_id, "src".to_owned()))
+    );
+    store
+        .set_adoption(
+            "ab",
+            AdoptionState::Adopted,
+            Some(root_id),
+            Some("src"),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+    std::fs::create_dir_all(root.join("misc")).unwrap();
+    std::fs::rename(root.join("src/T/b.bin"), root.join("misc/b.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let loaded = std::collections::HashMap::from([("ab".to_owned(), None)]);
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "ab"), AdoptionState::Adopted);
+    (store, root_id)
+}
+
+#[test]
+fn a_delete_plan_guards_the_payload_a_held_adopted_torrent_has_not_found() {
+    // Kept `adopted` with a file it did not find, the torrent read as
+    // complete to the delete planner: its moved file was planned for
+    // deletion and nothing under its own base was protected.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (store, root_id) = held_adopted_with_a_file_moved_away(root);
+
+    // A file the size of the one it is missing is held back.
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "misc".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("misc/junk.txt"), "{steps:?}");
+
+    // Where it expects its payload, nothing is deleted at all.
+    let err = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "src/T".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(err.contains("not fully present"), "{err}");
+
+    // The executor's guard agrees.
+    let guard = torrentd_pool::plan::DeleteGuard::load(&store, root_id, root).unwrap();
+    assert!(guard.refusal("misc/b.bin", 32).is_some());
+    assert!(guard.refusal("misc/junk.txt", 9).is_none());
+}
+
+#[test]
+fn relocating_a_held_adopted_torrent_with_a_file_missing_is_refused() {
+    // Had nothing held it, the rescan would have read it `partial`, which a
+    // relocate refuses; held, it keeps `adopted` and must be refused too.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (store, root_id) = held_adopted_with_a_file_moved_away(root);
+    let err = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "ab".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(err.contains("not all present"), "{err}");
 }
 
 #[test]
@@ -1222,7 +1412,7 @@ fn a_v4_index_migrates_to_the_materialised_tree() {
     }
 
     let store = PoolStore::open(&db).unwrap();
-    assert_eq!(user_version(&db), 6);
+    assert_eq!(user_version(&db), 7);
     let root_id = store.root_id(&root).unwrap();
     assert_eq!(
         store.children(root_id, "").unwrap(),
@@ -1253,7 +1443,7 @@ fn a_v5_index_migrates_to_an_empty_persisted_verify_queue() {
     }
 
     let store = PoolStore::open(&db).unwrap();
-    assert_eq!(user_version(&db), 6);
+    assert_eq!(user_version(&db), 7);
     assert!(store.verify_queue().unwrap().is_empty());
 }
 
@@ -1805,6 +1995,44 @@ fn relocating_onto_existing_files_is_refused() {
     assert!(e.contains("already contains"), "got {e}");
 }
 
+/// A dangling symlink where a file of the torrent would land is still an
+/// entry a move would replace. `Path::exists()` follows the link, finds
+/// nothing, and calls the way clear; the destination check must not.
+#[cfg(unix)]
+#[test]
+fn relocating_onto_a_dangling_symlink_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    write_file(&root, "src/T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "x1", "T", Some("src"), &[("T/a.bin", 128)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    let link = root.join("dest/T/a.bin");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+    assert!(
+        !link.exists(),
+        "the link must dangle for this test to mean anything"
+    );
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        &root,
+    )
+    .unwrap_err();
+    assert!(e.contains("already contains T/a.bin"), "got {e}");
+}
+
 #[test]
 fn relocating_from_the_root_itself_is_refused() {
     // The matcher admits the root as a placement candidate, so a torrent whose
@@ -2132,7 +2360,7 @@ fn a_rescan_keeps_an_adopted_torrent_at_its_recorded_base() {
     // copy at `T/`, and the copy the session seeds from read as orphans.
     let dir = tempfile::tempdir().unwrap();
     let (mut store, root_id) = adopted_at_the_second_copy(dir.path());
-    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
     torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
@@ -2154,13 +2382,72 @@ fn a_rescan_keeps_an_adopted_torrent_at_its_recorded_base() {
 }
 
 #[test]
+fn a_rescan_prefers_where_the_session_holds_a_torrent_over_its_recorded_base() {
+    // Recorded at `seed`, both copies complete, and the session reading from
+    // the root - a crash before the resume save, or a half-done move. The
+    // copy the session reads is the one that must be claimed.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (mut store, root_id) = adopted_at_the_second_copy(root);
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), Some(root.to_path_buf()))]);
+
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, String::new()))
+    );
+    let orphans = store.orphan_files(root_id, "").unwrap();
+    assert!(!orphans.contains(&"T/a.bin".to_owned()), "{orphans:?}");
+    assert!(orphans.contains(&"seed/T/a.bin".to_owned()), "{orphans:?}");
+}
+
+#[test]
+fn a_rescan_falls_back_to_the_recorded_base_when_the_session_path_is_not_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (mut store, root_id) = adopted_at_the_second_copy(root);
+
+    // Under the root, but holding nothing of the torrent; and outside every
+    // root. Either way the recorded base stands.
+    for at in [root.join("elsewhere"), PathBuf::from("/nonexistent/pool")] {
+        let loaded = std::collections::HashMap::from([("aa".to_owned(), Some(at.clone()))]);
+        torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+        assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted, "{at:?}");
+        assert_eq!(
+            store.adoption_base("aa").unwrap(),
+            Some((root_id, "seed".to_owned())),
+            "{at:?}"
+        );
+    }
+}
+
+#[test]
+fn a_held_torrent_missing_everywhere_keeps_the_base_its_session_reads_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (mut store, root_id) = adopted_at_the_second_copy(root);
+    std::fs::remove_file(root.join("T/a.bin")).unwrap();
+    std::fs::remove_file(root.join("seed/T/a.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), Some(root.join("moved")))]);
+
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, "moved".to_owned()))
+    );
+}
+
+#[test]
 fn a_rescan_moves_an_adopted_torrent_off_a_recorded_base_that_is_no_longer_complete() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let (mut store, root_id) = adopted_at_the_second_copy(root);
     std::fs::remove_file(root.join("seed/T/a.bin")).unwrap();
     torrentd_pool::scan_root(&mut store, root).unwrap();
-    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
     torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
@@ -2194,7 +2481,7 @@ fn a_rescan_keeps_a_loaded_drifted_torrent_at_its_recorded_base() {
     // says it is served.
     let dir = tempfile::tempdir().unwrap();
     let (mut store, root_id) = drifted_at_the_second_copy(dir.path());
-    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
 
     torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
     assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
@@ -2238,7 +2525,7 @@ fn a_delete_plan_refuses_every_copy_of_a_torrent_complete_more_than_once() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let (mut store, root_id) = adopted_at_the_second_copy(root);
-    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+    let loaded = std::collections::HashMap::from([("aa".to_owned(), None)]);
     torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
 
     // `T` holds the unclaimed copy, `seed` the claimed one; neither is
@@ -2518,6 +2805,105 @@ fn nothing_is_pruned_from_a_library_that_was_not_read_in_full() {
     assert!(store.torrent(&ihs[0]).unwrap().is_none());
 }
 
+/// Run `f` with `dir` at mode 0o000, restoring its mode afterwards, or skip
+/// `f` where permissions do not bind (running as root) and the directory
+/// still lists.
+fn with_unlistable(dir: &Path, f: impl FnOnce()) {
+    use std::os::unix::fs::PermissionsExt;
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let binds = std::fs::read_dir(dir).is_err();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if binds {
+            f();
+        }
+    }));
+    std::fs::set_permissions(dir, original).unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// jwalk reports a directory it cannot list on the directory's own `Ok`
+/// entry, not as an `Err`, so a scan reading only `Err`s indexed an
+/// unreadable subdirectory as an empty one with `errors: 0`.
+#[test]
+fn an_unlistable_subdirectory_is_a_walk_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "a.bin", 1);
+    write_file(root, "locked/b.bin", 1);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    with_unlistable(&root.join("locked"), || {
+        let stats = torrentd_pool::scan_root(&mut store, root).unwrap();
+        assert!(stats.errors >= 1, "{stats:?}");
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert_eq!(stats.files_indexed, 1, "the readable rest is indexed");
+    });
+}
+
+/// A root that cannot be listed, or is gone, is a walk error and keeps the
+/// index it had: committing the empty walk would read every torrent over it
+/// as `missing`.
+#[test]
+fn an_unreadable_root_keeps_its_previous_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    write_file(&root, "a.bin", 1);
+    write_file(&root, "sub/b.bin", 1);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert_eq!(store.file_count().unwrap(), 2);
+
+    with_unlistable(&root, || {
+        let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert_eq!(store.file_count().unwrap(), 2, "previous index kept");
+    });
+
+    let moved = dir.path().join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+    assert_eq!(store.file_count().unwrap(), 2, "previous index kept");
+
+    // Readable again, the root is re-indexed as usual.
+    std::fs::rename(&moved, &root).unwrap();
+    std::fs::remove_file(root.join("a.bin")).unwrap();
+    let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert_eq!(stats.errors, 0, "{stats:?}");
+    assert_eq!(store.file_count().unwrap(), 1);
+}
+
+/// The library walk reads the same field: an unlistable subdirectory of
+/// `library_dir` is a walk error, so the torrents under it are not pruned.
+#[test]
+fn an_unlistable_library_subdirectory_is_a_walk_error_and_prunes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    let sub = library.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pad_file.torrent"),
+        sub.join("pad_file.torrent"),
+    )
+    .unwrap();
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let ih = store.torrents().unwrap()[0].infohash.clone();
+
+    with_unlistable(&sub, || {
+        let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert!(store.torrent(&ih).unwrap().is_some(), "kept");
+    });
+    with_unlistable(&library, || {
+        let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert!(store.torrent(&ih).unwrap().is_some(), "kept");
+    });
+}
+
 #[test]
 fn a_root_no_longer_configured_leaves_the_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -2592,6 +2978,101 @@ fn plan_steps_are_journaled_before_they_run() {
     let steps = store.plan_steps(id).unwrap();
     assert_eq!(steps[0].status, "done");
     assert_eq!(steps[1].status, "pending");
+}
+
+#[test]
+fn a_discarded_plans_id_is_never_handed_out_again() {
+    // A delete plan's trash directory is named after its id. Before v7 the id
+    // was `max(id) + 1`, so discarding the newest plan gave the next one the
+    // same id, and the same directory.
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let first = store.create_plan("delete_orphans", "{}", 100).unwrap();
+    store.delete_plan(first).unwrap();
+    let second = store.create_plan("delete_orphans", "{}", 100).unwrap();
+    assert_ne!(first, second, "a discarded plan's id came back");
+    assert!(second > first);
+}
+
+#[test]
+fn a_v6_index_migrates_its_plans_to_ids_that_are_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    {
+        let store = PoolStore::open(&db).unwrap();
+        let id = store.create_plan("relocate", "{}", 123).unwrap();
+        assert_eq!(id, 1);
+    }
+    // Take the file back to what a v6 build wrote: `plan.id` without
+    // `AUTOINCREMENT`, holding plans 1 and 3 and plan 3's steps. Plan 4 was
+    // the newest and has been discarded, which a v6 file does not remember.
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE plan_v6 (
+                 id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+                 created_at INTEGER NOT NULL, applied_at INTEGER,
+                 status TEXT NOT NULL, spec TEXT NOT NULL);
+             INSERT INTO plan_v6 SELECT * FROM plan;
+             DROP TABLE plan;
+             ALTER TABLE plan_v6 RENAME TO plan;
+             CREATE INDEX plan_by_status ON plan(status);
+             DELETE FROM sqlite_sequence WHERE name = 'plan';
+             INSERT INTO plan VALUES (3, 'delete_orphans', 456, 789, 'applied', '{}');
+             INSERT INTO plan_step VALUES (3, 0, 'delete_file', '/r/a', NULL, 'done', NULL);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+    }
+
+    let mut store = PoolStore::open(&db).unwrap();
+    assert_eq!(user_version(&db), 7);
+    let sql: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'plan'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+
+    // Every plan and step survives the rebuild, under its own id: dropping
+    // the old table with foreign keys on would have cascaded to the steps.
+    let plans = store.plans().unwrap();
+    assert_eq!(
+        plans.iter().map(|p| p.id).collect::<Vec<_>>(),
+        [3, 1],
+        "{plans:?}"
+    );
+    let applied = store.plan(3).unwrap().unwrap();
+    assert_eq!(
+        (
+            applied.created_at,
+            applied.applied_at,
+            applied.status.as_str()
+        ),
+        (456, Some(789), "applied"),
+    );
+    let steps = store.plan_steps(3).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].src, "/r/a");
+
+    // From here on an id is never reused: discarding the newest plan does not
+    // give its id to the next one.
+    let next = store.create_plan("delete_orphans", "{}", 1000).unwrap();
+    assert_eq!(next, 4);
+    store.delete_plan(next).unwrap();
+    assert_eq!(store.create_plan("delete_orphans", "{}", 1001).unwrap(), 5);
+
+    // The migration turned foreign keys off around the rebuild and back on
+    // after it: a step for a plan that does not exist is still refused.
+    let orphan_step = torrentd_pool::model::PlanStep {
+        op: "delete_file".into(),
+        src: "/r/b".into(),
+        dst: None,
+    };
+    assert!(store.add_plan_steps(999, &[orphan_step]).is_err());
 }
 
 /// Hand-build a genuine v1 index at `db`, carrying one torrent assigned to
@@ -2839,7 +3320,7 @@ fn an_ordinary_v3_index_is_opened_without_touching_it() {
 
     PoolStore::open(&db).expect("a second open is an ordinary v3 open");
 
-    assert_eq!(user_version(&db), 6);
+    assert_eq!(user_version(&db), 7);
     assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
     assert!(
         !backup.exists(),
@@ -3007,7 +3488,7 @@ fn a_real_backup_already_at_the_path_is_replaced_by_a_fresh_copy_once_the_migrat
 
     PoolStore::open(&db).expect("the migration runs");
 
-    assert_eq!(user_version(&db), 6, "the migration really ran");
+    assert_eq!(user_version(&db), 7, "the migration really ran");
     assert_eq!(
         user_version(&backup),
         2,

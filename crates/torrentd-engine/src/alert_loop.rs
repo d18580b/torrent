@@ -15,8 +15,10 @@
 //!     when `next_attempt <= now` and libtorrent still holds an error on the
 //!     torrent, we call `engine.resume_torrent(handle)` (which clears the
 //!     error and the pause libtorrent put on it) and schedule the next
-//!     attempt with exponential backoff. A torrent with no error left has
-//!     its timer retired instead.
+//!     attempt with exponential backoff. A torrent still in `DiskError` with
+//!     no libtorrent error — a failed peer read, which libtorrent neither
+//!     pauses nor errors — is re-checked instead, on the same backoff. A
+//!     torrent with neither has its timer retired.
 //!   - Shutdown: on signal, queue a resume save (`ONLY_IF_MODIFIED`) for
 //!     every torrent, then loop dispatching and draining until
 //!     `pending_resume_count == 0` or the drain deadline (default
@@ -28,11 +30,19 @@
 //!     rebind waits on before it reports and announces a new port. A
 //!     `listen_failed` on the port a rebind is moving onto, at any address
 //!     ([`ListenEvents::rebind_in_progress`]) is the rebind's to revert and
-//!     is never fatal; the revert's own failure is.
+//!     is never fatal; the revert's own failure is. Each profile's
+//!     `session_stats` alert also clears a listen failure that belongs to no
+//!     socket once every socket that came up is still held
+//!     ([`handlers::listen::recheck`]).
+//!   - Lost alerts: after every drain, each session's count of alerts the
+//!     shim popped and could not translate is read, and what it rose by is
+//!     added to `alert_translate_errors_total` and warned about. Such an
+//!     alert never reaches a handler, so this is the only trace it leaves.
 //!   - Liveness: every iteration stamps a wall-clock heartbeat that
 //!     `GET /healthz` reads. A wedged or panicked loop makes the daemon
 //!     report unready instead of quietly serving a stale state map.
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -48,6 +58,7 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use libtorrent_safe::Alert;
 use libtorrent_safe::ResumeFlags;
+use libtorrent_safe::TorrentFlags;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -57,6 +68,8 @@ use tracing::Span;
 
 use crate::clock::Clock;
 use crate::engine::TorrentEngine;
+use crate::handlers::listen::ListenFailures;
+use crate::handlers::warning::TrackerFailureLog;
 use crate::handlers::HandlerCtx;
 use crate::handlers::{self};
 use crate::metrics::MetricsSink;
@@ -117,10 +130,23 @@ pub struct AlertLoopBuilder {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    fence_hold: Option<FenceHold>,
+    magnet_guard_lift: Option<MagnetGuardLift>,
     listen_events: Option<Arc<ListenEvents>>,
     listen_device_check: Option<ListenDeviceCheck>,
     shutdown_deadline: Duration,
 }
+
+/// "Which discovery guards does a magnet in this profile shed once its
+/// metadata shows it is public?" — supplied by the daemon, which holds each
+/// profile's config, and answered with
+/// [`policy::public_magnet_lift`](crate::policy::public_magnet_lift).
+///
+/// Asked by the `metadata_received` handler. A magnet is added with DHT, PEX
+/// and LSD disabled on every profile because its `private` bit is unknown
+/// until then; the answer is the part of that guard the profile's own posture
+/// does not keep.
+pub type MagnetGuardLift = Arc<dyn Fn(&ProfileId) -> TorrentFlags + Send + Sync>;
 
 /// "Are this profile's sockets on this listen endpoint held to the right
 /// device?" — supplied by the daemon, which knows each profile's tunnel.
@@ -139,6 +165,21 @@ pub type FatalCallback = Arc<dyn Fn(ShutdownReason) + Send + Sync>;
 /// own schedule, and resuming one in a profile the VPN monitor has fenced
 /// un-quarantines it behind the operator's back.
 pub type ProfileFenced = Arc<dyn Fn(&ProfileId) -> bool + Send + Sync>;
+
+/// "Hold this torrent, and tell whoever lifts the fence" — supplied by the
+/// daemon, whose kill-switch watch lifts its own fence and resumes only the
+/// torrents it recorded.
+///
+/// Called by the add handler with the profile, the torrent it just took into
+/// the state map, and `hold`: the handler's own check of
+/// [`ProfileFenced`] and pause, which answers whether it found the profile
+/// fenced. The daemon runs `hold` under that fence's lock and, where `hold`
+/// answers `true` and the fence holds the profile, records the torrent for
+/// its lift. A torrent whose add alert lands after the fence walked the state
+/// map is otherwise paused with no record, and stays paused once the fence
+/// lifts around it.
+pub type FenceHold =
+    Arc<dyn Fn(&ProfileId, libtorrent_safe::TorrentHandle, &mut dyn FnMut() -> bool) + Send + Sync>;
 
 impl std::fmt::Debug for AlertLoopBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -165,6 +206,8 @@ impl AlertLoopBuilder {
             fatal_listen_failure: false,
             on_fatal: None,
             profile_fenced: None,
+            fence_hold: None,
+            magnet_guard_lift: None,
             listen_events: None,
             listen_device_check: None,
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
@@ -216,6 +259,9 @@ impl AlertLoopBuilder {
     /// failure on the port a NAT-PMP rebind is moving onto, with any
     /// number of sessions ([`ListenEvents::rebind_in_progress`]): the rebind
     /// reverts to its previous port, and a failure of that revert is fatal.
+    /// Nor is an `accept()` that failed with `EMFILE`
+    /// ([`handlers::listen::is_accept_emfile`]): libtorrent keeps accepting
+    /// on that socket.
     pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
         self.fatal_listen_failure = yes;
         self
@@ -226,6 +272,23 @@ impl AlertLoopBuilder {
     /// profiles alone, and tests.
     pub fn profile_fenced(mut self, f: ProfileFenced) -> Self {
         self.profile_fenced = Some(f);
+        self
+    }
+
+    /// Supply what the add handler runs its hold of a torrent added into a
+    /// fenced profile through. Without one, the hold runs alone, which is
+    /// correct where no fence lifts by its own record: a deployment without
+    /// the kill switch, and tests.
+    pub fn fence_hold(mut self, f: FenceHold) -> Self {
+        self.fence_hold = Some(f);
+        self
+    }
+
+    /// Supply which discovery guards a magnet sheds once its metadata shows
+    /// it is public. Without one, nothing is lifted: every magnet keeps DHT,
+    /// PEX and LSD disabled, which is safe and only costs it peers.
+    pub fn magnet_guard_lift(mut self, f: MagnetGuardLift) -> Self {
+        self.magnet_guard_lift = Some(f);
         self
     }
 
@@ -266,6 +329,8 @@ impl AlertLoopBuilder {
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
+                let fence_hold = self.fence_hold.clone();
+                let magnet_guard_lift = self.magnet_guard_lift.clone();
                 let listen_events = self.listen_events.clone();
                 let listen_device_check = self.listen_device_check.clone();
                 let shutdown_deadline = self.shutdown_deadline;
@@ -294,6 +359,8 @@ impl AlertLoopBuilder {
                                 fatal_listen_failure,
                                 on_fatal,
                                 profile_fenced,
+                                fence_hold,
+                                magnet_guard_lift,
                                 unsaved_at_shutdown,
                                 listen_events,
                                 listen_device_check,
@@ -435,6 +502,8 @@ struct LoopHooks {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    fence_hold: Option<FenceHold>,
+    magnet_guard_lift: Option<MagnetGuardLift>,
     unsaved_at_shutdown: Arc<AtomicU64>,
     listen_events: Option<Arc<ListenEvents>>,
     listen_device_check: Option<ListenDeviceCheck>,
@@ -455,6 +524,15 @@ fn run(
     let mut last_post_updates = clock.now();
     let mut last_post_stats = clock.now();
     let mut last_resume_save = clock.now();
+    // Which of each profile's listen sockets are failed. Kept here rather
+    // than derived from the last listen alert: a profile's sockets each
+    // report on their own.
+    let mut listen_failures = ListenFailures::default();
+    // How many tracker failures each profile has warned about in its current
+    // window, so an outage across every torrent is a bounded number of lines.
+    let mut tracker_failures = TrackerFailureLog::default();
+    // What each profile's translation failure count was when last published.
+    let mut translate_errors = TranslateErrors::default();
 
     loop {
         // 0) Liveness stamp. Written at the top of every iteration so a loop
@@ -474,7 +552,14 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.fence_hold.as_ref(),
+                hooks.magnet_guard_lift.as_ref(),
+                &mut listen_failures,
+                &mut tracker_failures,
             );
+            // The shutdown's own drains can lose alerts too, resume answers
+            // among them.
+            translate_errors.publish(&source, &metrics);
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
         }
@@ -492,7 +577,12 @@ fn run(
             // endpoint's port: the failure is published below to the waiting
             // rebind, which puts the previous port back. Asked before the
             // publish, which is what wakes the rebind and ends it.
-            if let Alert::ListenFailed { endpoint, .. } = &alert {
+            //
+            // An accept that ran out of file descriptors is none of this:
+            // libtorrent keeps accepting on that socket, so it is neither
+            // fatal nor published, and its handler counts it apart.
+            let accept_emfile = handlers::listen::is_accept_emfile(&alert);
+            if let (Alert::ListenFailed { endpoint, .. }, false) = (&alert, accept_emfile) {
                 let rebinding = hooks
                     .listen_events
                     .as_ref()
@@ -558,7 +648,9 @@ fn run(
                     }
                     Alert::ListenFailed {
                         endpoint, message, ..
-                    } => events.publish(&profile, endpoint, Some(message.clone())),
+                    } if !accept_emfile => {
+                        events.publish(&profile, endpoint, Some(message.clone()))
+                    }
                     _ => {}
                 }
             }
@@ -572,8 +664,15 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.fence_hold.as_ref(),
+                hooks.magnet_guard_lift.as_ref(),
+                &mut listen_failures,
+                &mut tracker_failures,
             );
         }
+        // After every drain, an empty one included: a pop whose every alert
+        // failed to translate comes back empty.
+        translate_errors.publish(&source, &metrics);
         if let Some(why) = fatal {
             hooks.listen_failed.store(true, Ordering::Relaxed);
             error!(target: "torrentd_engine::alert_loop", "{why}");
@@ -590,7 +689,14 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                hooks.fence_hold.as_ref(),
+                hooks.magnet_guard_lift.as_ref(),
+                &mut listen_failures,
+                &mut tracker_failures,
             );
+            // The shutdown's own drains can lose alerts too, resume answers
+            // among them.
+            translate_errors.publish(&source, &metrics);
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
         }
@@ -640,6 +746,51 @@ fn run(
         // 5) Sleep if there's nothing to do.
         if was_empty {
             clock.sleep(POLL_IDLE_INTERVAL);
+        }
+    }
+}
+
+/// Each profile's [`TorrentEngine::alert_translate_errors`] as last
+/// published, so what is added to `alert_translate_errors_total` is the rise
+/// since then.
+///
+/// Starts at 0 for every profile, which is where a session's count starts:
+/// what the boot's backlog lost is published by the first drain, before
+/// anything scrapes, and the `boot_alert_translate_errors` gauge carries it.
+#[derive(Debug, Default)]
+struct TranslateErrors {
+    published: HashMap<ProfileId, u64>,
+}
+
+impl TranslateErrors {
+    /// Add each profile's rise to the counter, and warn about it.
+    fn publish(&mut self, source: &Arc<dyn AlertSource>, metrics: &Arc<dyn MetricsSink>) {
+        for profile in source.profiles() {
+            let Some(engine) = source.engine_for(&profile) else {
+                continue;
+            };
+            let count = engine.alert_translate_errors();
+            let published = self.published.entry(profile.clone()).or_insert(0);
+            // The count is monotonic for a session, so a lower one is a
+            // session other than the one last read, counted from its own 0.
+            let lost = count.checked_sub(*published).unwrap_or(count);
+            *published = count;
+            if lost == 0 {
+                continue;
+            }
+            metrics.add_counter(
+                "alert_translate_errors_total",
+                lost,
+                &[("profile_id", profile.as_str())],
+            );
+            warn!(
+                target: "torrentd_engine::alert_loop",
+                profile_id = %profile,
+                lost,
+                total = count,
+                "libtorrent alerts were dropped because they could not be translated; the \
+                 state map may have missed a torrent's removal or a resume save's answer",
+            );
         }
     }
 }
@@ -698,6 +849,10 @@ fn dispatch_alert(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    fence_hold: Option<&FenceHold>,
+    magnet_guard_lift: Option<&MagnetGuardLift>,
+    listen_failures: &mut ListenFailures,
+    tracker_failures: &mut TrackerFailureLog,
 ) {
     let Some(engine) = source.engine_for(&profile) else {
         warn!(
@@ -720,9 +875,13 @@ fn dispatch_alert(
         clock: clock.as_ref(),
         engine: &engine,
         profile_fenced,
+        fence_hold,
         profile_id: profile,
         span,
     };
+    // Any alert of the profile closes a tracker-failure window that has run
+    // its length, so its summary is written even after the tracker goes quiet.
+    handlers::warning::close_failure_window(&ctx, tracker_failures);
 
     match &alert {
         Alert::AddTorrent { .. } | Alert::TorrentRemoved { .. } => {
@@ -738,17 +897,27 @@ fn dispatch_alert(
             handlers::error::handle(&alert, &mut ctx)
         }
         Alert::ListenFailed { .. } | Alert::ListenSucceeded { .. } => {
-            handlers::listen::handle(&alert, &mut ctx)
+            handlers::listen::handle(&alert, &mut ctx, listen_failures)
         }
         Alert::AlertsDropped { .. } => handlers::dropped::handle(&alert, &mut ctx),
         Alert::TorrentLog { .. } | Alert::Log { .. } => handlers::log_msg::handle(&alert, &mut ctx),
-        Alert::SessionStats { .. } => handlers::stats::handle(&alert, &mut ctx),
-        Alert::MetadataReceived { .. } => handlers::metadata::handle(&alert, &mut ctx),
+        Alert::SessionStats { .. } => {
+            handlers::stats::handle(&alert, &mut ctx);
+            // Posted after any reopen whose alerts precede it has returned,
+            // so the sockets it kept are known (see `ListenFailures`).
+            handlers::listen::recheck(&mut ctx, listen_failures);
+        }
+        Alert::MetadataReceived { .. } => {
+            // Without the daemon's answer nothing is lifted: a magnet keeps
+            // the guards it was added with.
+            let lift = magnet_guard_lift.map_or_else(TorrentFlags::empty, |f| f(&ctx.profile_id));
+            handlers::metadata::handle(&alert, &mut ctx, lift)
+        }
         Alert::TorrentChecked { .. }
         | Alert::StorageMoved { .. }
         | Alert::StorageMovedFailed { .. } => handlers::storage::handle(&alert, &mut ctx),
         Alert::TrackerError { .. } | Alert::Warning { .. } | Alert::TrackerReply { .. } => {
-            handlers::warning::handle(&alert, &mut ctx)
+            handlers::warning::handle(&alert, &mut ctx, tracker_failures)
         }
 
         // Peer disconnects are per-peer churn, not an operational condition;
@@ -813,19 +982,27 @@ fn execute_due_retries(
         }
         // What a `file_error_alert` leaves behind under this daemon's flags
         // (vendor/libtorrent/src/torrent.cpp, `handle_disk_error` and
-        // `on_piece_hashed`): a read failure, or any failure while checking,
-        // sets an error on the torrent and pauses it. A write failure of the
-        // disk-full / read-only kind only sets upload mode, which every
-        // torrent here already carries (`policy::no_download`), and ENOMEM
-        // only disconnects the peer. So the one thing there is to recover is
-        // an error-paused torrent, and `resume()` is what recovers it:
-        // `torrent::do_resume` unpauses and calls `clear_error`, which
-        // re-checks the files if the error came from a check.
+        // `on_piece_hashed`): any failure while checking, or a failed
+        // `read_piece`, sets an error on the torrent and pauses it. That
+        // error-paused torrent is the first thing to recover, and `resume()`
+        // recovers it: `torrent::do_resume` unpauses and calls `clear_error`,
+        // which re-checks the files if the error came from a check.
         //
-        // A torrent with no error left has nothing for the retry to do — it
-        // recovered, an operator resumed it, or the error never paused it —
-        // and resuming it anyway would undo an operator's pause every hour,
-        // forever, because nothing else ever clears the timer. Retire it.
+        // The rest set no error and pause nothing. A disk read for a peer's
+        // request that fails (vendor/libtorrent/src/peer_connection.cpp,
+        // `on_disk_read_complete`) rejects the request, posts the alert and
+        // carries on seeding; a write failure of the disk-full / read-only
+        // kind only sets upload mode, which every torrent here already
+        // carries (`policy::no_download`); ENOMEM only disconnects the peer.
+        // The status updates keep such a torrent in `DiskError`, and nothing
+        // libtorrent reports says whether its files are readable again, so
+        // the retry re-checks it. A check that fails takes the error-paused
+        // route above; one that passes leaves the torrent seeding.
+        //
+        // A torrent in neither state has nothing for the retry to do — it
+        // recovered, or an operator paused or resumed it — and acting on it
+        // anyway would undo an operator's pause every hour, forever, because
+        // nothing else ever clears the timer. Retire it.
         //
         // Except while the torrent is checking. `clear_error` empties the
         // error before the re-check it starts, so a check still running when
@@ -850,7 +1027,7 @@ fn execute_due_retries(
             });
             continue;
         }
-        if !st.has_error {
+        if !st.has_error && st.phase != TorrentPhase::DiskError {
             debug!(
                 target: "torrentd_engine::alert_loop",
                 profile_id = %st.profile_id,
@@ -866,6 +1043,10 @@ fn execute_due_retries(
             defer_retry(state, clock, &handle.infohash);
             continue;
         };
+        if !st.has_error {
+            recheck_unpaused_disk_error(engine.as_ref(), state, clock, handle, &st.profile_id);
+            continue;
+        }
         match engine.resume_torrent(handle) {
             Ok(()) => {
                 info!(
@@ -904,6 +1085,55 @@ fn execute_due_retries(
             }
         }
     }
+}
+
+/// The disk-error retry for a torrent in `DiskError` that libtorrent kept
+/// serving: re-check it, and back off as for a resume.
+///
+/// The phase moves to `Checking` here rather than waiting for a status update
+/// to report it. A check that passes leaves `DiskError` either way: libtorrent
+/// posts `torrent_finished_alert` when it does, and that handler sets
+/// `Seeding`. Setting `Checking` now does two other things. The phase filter
+/// and `/status` show the check from the moment it starts, not `DiskError`
+/// until the next update. And a check that fails before any update arrives
+/// posts its `file_error` on a `Checking` torrent, which the file-error
+/// handler records as libtorrent's error-and-pause; on a torrent still in
+/// `DiskError` with no error it would read as one more failed peer read, and
+/// `has_error` would stay wrong until the next update reported the error.
+///
+/// Not counted in `disk_error_retry_attempts_total` or
+/// `disk_error_retry_errors_total`, which count resumes; the check it starts
+/// is counted in `torrents_checked_total` when it completes.
+fn recheck_unpaused_disk_error(
+    engine: &dyn TorrentEngine,
+    state: &StateMap,
+    clock: &Arc<dyn Clock>,
+    handle: libtorrent_safe::TorrentHandle,
+    profile_id: &ProfileId,
+) {
+    let outcome = engine.force_recheck(handle);
+    match &outcome {
+        Ok(()) => info!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            "disk-error retry: re-checking a torrent libtorrent kept seeding after a file error",
+        ),
+        Err(e) => warn!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            error.cause = %e,
+            "disk-error retry: re-check failed to start",
+        ),
+    }
+    state.update(&handle.infohash, |s| {
+        if outcome.is_ok() {
+            s.phase = TorrentPhase::Checking;
+        }
+        let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
+        s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
+    });
 }
 
 /// Schedule another look at a due retry that was skipped without an attempt,
@@ -974,6 +1204,10 @@ fn run_shutdown(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    fence_hold: Option<&FenceHold>,
+    magnet_guard_lift: Option<&MagnetGuardLift>,
+    listen_failures: &mut ListenFailures,
+    tracker_failures: &mut TrackerFailureLog,
 ) -> u64 {
     let started = clock.now();
     let started_count = state.len();
@@ -991,6 +1225,10 @@ fn run_shutdown(
         metrics,
         clock,
         profile_fenced,
+        fence_hold,
+        magnet_guard_lift,
+        listen_failures,
+        tracker_failures,
     ) && clock.now() < stop_at
     {}
 
@@ -1005,6 +1243,12 @@ fn run_shutdown(
     // drain outlast its deadline. A save whose answer was lost is re-asked
     // without the flag (see the dropped-alerts handler), because libtorrent
     // cleared its modified bit when it produced the answer nobody received.
+    //
+    // A torrent with a save already queued keeps that one: it is an add's
+    // first save or such a re-ask, and both must stay unconditional. A
+    // torrent the boot loaded from its own resume file has none queued (the
+    // add handler skips it), so the requests here are not crowded out by
+    // saves of files the boot has just read.
     let handles = state.handles();
     info!(
         target: "torrentd_engine::alert_loop",
@@ -1030,6 +1274,10 @@ fn run_shutdown(
             metrics,
             clock,
             profile_fenced,
+            fence_hold,
+            magnet_guard_lift,
+            listen_failures,
+            tracker_failures,
         );
         if state.pending_resume_count() == 0 {
             break;
@@ -1074,6 +1322,7 @@ fn run_shutdown(
 }
 
 /// Dispatch one `source.drain()`; true when it returned any alert.
+#[allow(clippy::too_many_arguments)]
 fn drain_once(
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
@@ -1082,6 +1331,10 @@ fn drain_once(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    fence_hold: Option<&FenceHold>,
+    magnet_guard_lift: Option<&MagnetGuardLift>,
+    listen_failures: &mut ListenFailures,
+    tracker_failures: &mut TrackerFailureLog,
 ) -> bool {
     let alerts = source.drain();
     let drained = !alerts.is_empty();
@@ -1096,6 +1349,10 @@ fn drain_once(
             metrics,
             clock,
             profile_fenced,
+            fence_hold,
+            magnet_guard_lift,
+            listen_failures,
+            tracker_failures,
         );
     }
     drained
@@ -1233,6 +1490,132 @@ mod tests {
         );
         handle.join().expect("loop thread panicked");
         assert_eq!(*seen.lock(), vec![ShutdownReason::ListenFailed]);
+    }
+
+    /// A `listen_failed_alert` from `operation` with `errno`, on the
+    /// session's listen socket.
+    fn listen_failed_with(operation: &str, errno: i32) -> Alert {
+        match listen_failed_alert() {
+            Alert::ListenFailed {
+                hdr,
+                endpoint,
+                iface,
+                ..
+            } => Alert::ListenFailed {
+                hdr,
+                error_code: errno,
+                operation: operation.into(),
+                endpoint,
+                iface,
+                message: std::io::Error::from_raw_os_error(errno).to_string(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Run the only live session's loop over `alert` until it has been
+    /// handled, then shut it down. Returns whether the loop took it as
+    /// fatal, the reasons `on_fatal` saw, and the metrics.
+    fn run_the_only_session_over(alert: Alert) -> (bool, Vec<ShutdownReason>, Arc<RecordingSink>) {
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(alert);
+        let metrics = Arc::new(RecordingSink::new());
+        let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine)),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .fatal_listen_failure(true)
+        .on_fatal({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |r| seen.lock().push(r)) as FatalCallback
+        })
+        .spawn();
+        let handled = || {
+            metrics.count_for("listen_failures_total")
+                + metrics.count_for(crate::metrics::LISTEN_ACCEPT_ERRORS)
+                > 0
+        };
+        assert!(wait_for(handled), "the loop never handled the alert");
+        // A loop that took it as fatal has already returned; one that did
+        // not stops here. Either way the outcome is final once joined.
+        handle.signal_shutdown(ShutdownReason::Test);
+        let listen_failed = Arc::clone(&handle.listen_failed);
+        handle.join().expect("loop thread panicked");
+        let seen = seen.lock().clone();
+        (listen_failed.load(Ordering::Relaxed), seen, metrics)
+    }
+
+    /// libtorrent re-arms an accept that failed with `EMFILE` on the same
+    /// socket, so the only live session is still listening: no shutdown.
+    #[test]
+    fn an_accept_out_of_descriptors_on_the_only_session_is_not_fatal() {
+        let (fatal, seen, metrics) =
+            run_the_only_session_over(listen_failed_with("sock_accept", libc::EMFILE));
+        assert!(!fatal, "the listener keeps accepting");
+        assert!(seen.is_empty(), "on_fatal saw {seen:?}");
+        assert_eq!(metrics.count_for(crate::metrics::LISTEN_ACCEPT_ERRORS), 1);
+        assert_eq!(metrics.count_for("listen_failures_total"), 0);
+    }
+
+    /// The same errno from opening the socket is a socket that failed, and
+    /// any other accept error, `ENFILE` included, stops the listener.
+    #[test]
+    fn other_listen_failures_on_the_only_session_are_still_fatal() {
+        for (operation, errno) in [
+            ("sock_open", libc::EMFILE),
+            ("sock_accept", libc::ENFILE),
+            ("sock_accept", libc::ECONNABORTED),
+        ] {
+            let (fatal, seen, metrics) =
+                run_the_only_session_over(listen_failed_with(operation, errno));
+            assert!(fatal, "{operation} errno {errno} should be fatal");
+            assert_eq!(
+                seen,
+                vec![ShutdownReason::ListenFailed],
+                "{operation} {errno}"
+            );
+            assert_eq!(metrics.count_for(crate::metrics::LISTEN_ACCEPT_ERRORS), 0);
+        }
+    }
+
+    /// A rebind waiting on the endpoint is not told an accept `EMFILE` is
+    /// a failure: the next outcome there is what it reads.
+    #[test]
+    fn an_accept_out_of_descriptors_is_not_published_to_a_rebind() {
+        use crate::port_forward::ListenConfirmation;
+
+        let engine = Arc::new(MockEngine::new());
+        let events = Arc::new(ListenEvents::new());
+        let cursor = events.cursor();
+        engine.push_alert(listen_failed_with("sock_accept", libc::EMFILE));
+        engine.push_alert(listen_succeeded_alert("0.0.0.0:6881"));
+        let handle = builder_with(engine)
+            .fatal_listen_failure(true)
+            .listen_events(events.clone())
+            .spawn();
+
+        let p = ProfileId::new("p");
+        assert_eq!(
+            events.wait_for(
+                &p,
+                cursor,
+                "0.0.0.0:6881".parse().unwrap(),
+                Duration::from_secs(5)
+            ),
+            ListenConfirmation::Succeeded,
+        );
+        assert!(
+            handle.signal_shutdown(ShutdownReason::Test),
+            "the loop is still running",
+        );
+        let listen_failed = Arc::clone(&handle.listen_failed);
+        handle.join().expect("loop thread panicked");
+        assert!(!listen_failed.load(Ordering::Relaxed));
     }
 
     /// A metrics sink that panics, to drive a genuine panic through a handler.
@@ -1535,6 +1918,65 @@ mod tests {
         );
     }
 
+    fn rechecked(engine: &MockEngine) -> usize {
+        engine
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, crate::mock::RecordedCall::ForceRecheck(_)))
+            .count()
+    }
+
+    #[test]
+    fn a_disk_error_libtorrent_kept_seeding_is_rechecked_not_retired() {
+        // A failed peer read posts `file_error` and nothing else: libtorrent
+        // neither errors nor pauses the torrent. Retiring the timer because
+        // `has_error` is false left a torrent that cannot serve a block with
+        // no retry at all; resuming it does nothing. A re-check is the probe
+        // that settles it, and it backs off like a resume.
+        let (engine, state, metrics) = run_due_retry_in(false, TorrentPhase::DiskError, 2);
+        assert_eq!(rechecked(&engine), 1, "the torrent was not re-checked");
+        assert!(!resumed(&engine), "an unpaused torrent was resumed");
+        let st = state.get(&InfoHash([9u8; 20])).unwrap();
+        assert_eq!(
+            st.phase,
+            TorrentPhase::Checking,
+            "a check that passes between two status updates must not leave it in DiskError",
+        );
+        let retry = st.retry.expect("the timer stays armed through the check");
+        assert_eq!(retry.attempts, 3, "the next attempt backs off");
+        assert!(
+            !metrics.calls().iter().any(|c| matches!(
+                c,
+                MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
+            )),
+            "the retry counters count resumes",
+        );
+    }
+
+    #[test]
+    fn a_recheck_that_fails_to_start_keeps_the_disk_error_and_backs_off() {
+        let engine = Arc::new(MockEngine::new());
+        engine.inject_error("force_recheck", crate::engine::EngineError::Shutdown);
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let (state, h) = state_with_a_due_retry(clock.now());
+        state.update(&h.infohash, |s| {
+            s.has_error = false;
+            s.phase = TorrentPhase::DiskError;
+        });
+        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        assert_eq!(rechecked(&engine), 1);
+        let st = state.get(&h.infohash).unwrap();
+        assert_eq!(st.phase, TorrentPhase::DiskError);
+        let retry = st.retry.expect("a failed re-check stays scheduled");
+        assert_eq!(retry.attempts, 2, "a failed re-check backs off");
+        assert!(retry.next_attempt > clock.now());
+    }
+
     #[test]
     fn a_check_that_fails_again_resumes_on_the_kept_backoff() {
         // The check the previous resume started failed: libtorrent paused the
@@ -1588,6 +2030,7 @@ mod tests {
                 clock: &mock_clock,
                 engine: &ctx_engine,
                 profile_fenced: None,
+                fence_hold: None,
                 profile_id: ProfileId::new("p"),
                 span: tracing::info_span!("test"),
             };
@@ -1671,6 +2114,59 @@ mod tests {
         // Give the loop a chance to process the alert and keep going.
         std::thread::sleep(Duration::from_millis(200));
         assert!(!handle.listen_failed());
+
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
+    }
+
+    /// The loop keeps which listen sockets are failed across drains: a
+    /// success on another endpoint, in a later drain than the failure,
+    /// leaves `listen_failure_active` at 1.
+    #[test]
+    fn a_listen_failure_outlives_another_socket_coming_up_in_a_later_drain() {
+        let engine = Arc::new(MockEngine::new());
+        let metrics = Arc::new(RecordingSink::new());
+        let gauge = {
+            let metrics = metrics.clone();
+            move || -> Vec<f64> {
+                metrics
+                    .calls()
+                    .into_iter()
+                    .filter_map(|c| match c {
+                        MetricCall::SetGauge { name, value, .. }
+                            if name == "listen_failure_active" =>
+                        {
+                            Some(value)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+        };
+        engine.push_alert(listen_failed_alert());
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine.clone())),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .fatal_listen_failure(false)
+        .spawn();
+        assert!(wait_for(|| gauge() == vec![1.0]));
+
+        engine.push_alert(Alert::ListenSucceeded {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenSucceeded,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            endpoint: ":::6881".into(),
+        });
+        assert!(wait_for(|| gauge().len() == 2));
+        assert_eq!(gauge(), vec![1.0, 1.0], "the IPv4 socket is still failed");
 
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread panicked");
@@ -2223,6 +2719,203 @@ mod tests {
         handle.join().expect("loop thread panicked");
     }
 
+    /// Counts the `warn` events dispatched to it on the current thread.
+    #[derive(Default)]
+    struct WarnCounter(std::sync::atomic::AtomicUsize);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// `alert_translate_errors_total`'s additions, by profile, in order.
+    fn translate_error_adds(metrics: &RecordingSink) -> Vec<(String, u64)> {
+        metrics
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                MetricCall::AddCounter {
+                    name,
+                    value,
+                    labels,
+                } if name == "alert_translate_errors_total" => {
+                    assert_eq!(labels.len(), 1);
+                    assert_eq!(labels[0].0, "profile_id");
+                    Some((labels[0].1.clone(), value))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn translate_errors_publish_each_profiles_rise_once_and_warn_with_it() {
+        let a = Arc::new(MockEngine::new());
+        let b = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![
+            (ProfileId::new("a"), a.clone() as Arc<dyn TorrentEngine>),
+            (ProfileId::new("b"), b.clone() as Arc<dyn TorrentEngine>),
+        ]));
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = recording.clone();
+        let mut published = TranslateErrors::default();
+        let warns = Arc::new(WarnCounter::default());
+
+        tracing::subscriber::with_default(Arc::clone(&warns), || {
+            // Nothing lost: nothing published, nothing warned.
+            published.publish(&source, &metrics);
+            a.set_alert_translate_errors(3);
+            published.publish(&source, &metrics);
+            // Unchanged since: the 3 are not published again.
+            published.publish(&source, &metrics);
+            a.set_alert_translate_errors(5);
+            b.set_alert_translate_errors(1);
+            published.publish(&source, &metrics);
+            // A lower count is a session counting from its own 0.
+            b.set_alert_translate_errors(0);
+            published.publish(&source, &metrics);
+            b.set_alert_translate_errors(2);
+            published.publish(&source, &metrics);
+        });
+
+        assert_eq!(
+            translate_error_adds(&recording),
+            [
+                ("a".to_string(), 3),
+                ("a".to_string(), 2),
+                ("b".to_string(), 1),
+                ("b".to_string(), 2),
+            ],
+        );
+        assert_eq!(warns.0.load(Ordering::Relaxed), 4, "one warn per rise");
+    }
+
+    #[test]
+    fn the_running_loop_publishes_a_sessions_translate_errors_as_they_rise() {
+        let engine = Arc::new(MockEngine::new());
+        let recording = Arc::new(RecordingSink::new());
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine.clone())),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            recording.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .spawn();
+
+        // No alert is queued: an alert the shim could not translate never
+        // reaches the loop, so the drain that lost it comes back empty.
+        engine.set_alert_translate_errors(2);
+        assert!(wait_for(|| recording
+            .count_for("alert_translate_errors_total")
+            == 2));
+        engine.set_alert_translate_errors(7);
+        assert!(wait_for(|| recording
+            .count_for("alert_translate_errors_total")
+            == 7));
+
+        handle.signal_shutdown(ShutdownReason::Test);
+        handle.join().expect("loop thread panicked");
+        assert_eq!(
+            translate_error_adds(&recording),
+            [("p".to_string(), 2), ("p".to_string(), 5)],
+            "the delta since the last publish, labelled by profile",
+        );
+    }
+
+    #[test]
+    fn the_shutdown_publishes_what_its_own_drains_lost() {
+        // The shutdown is signalled before the loop's first iteration, so
+        // only the publish after the shutdown drain can count these.
+        let engine = Arc::new(MockEngine::new());
+        let state = Arc::new(StateMap::new());
+        let recording = Arc::new(RecordingSink::new());
+        let (tx, rx) = bounded(1);
+        tx.send(ShutdownReason::Test).unwrap();
+        engine.set_alert_translate_errors(4);
+        run(
+            rx,
+            Arc::new(single_profile_source(engine.clone())),
+            state,
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            recording.clone(),
+            Arc::new(MockClock::new()),
+            LoopHooks {
+                heartbeat: Arc::new(AtomicU64::new(0)),
+                listen_failed: Arc::new(AtomicBool::new(false)),
+                fatal_listen_failure: false,
+                on_fatal: None,
+                profile_fenced: None,
+                fence_hold: None,
+                magnet_guard_lift: None,
+                unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
+                listen_events: None,
+                listen_device_check: None,
+                shutdown_deadline: Duration::from_millis(1),
+            },
+        );
+        assert_eq!(translate_error_adds(&recording), [("p".to_string(), 4)]);
+    }
+
+    #[test]
+    fn the_fatal_shutdown_publishes_what_its_own_drains_lost() {
+        // The drain that carries the fatal listen failure publishes 1. The
+        // count then rises to 4 in `on_fatal`, after that publish and before
+        // the shutdown drains, so only the publish after the fatal path's
+        // `run_shutdown` can count the 3.
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(listen_failed_alert());
+        engine.set_alert_translate_errors(1);
+        let recording = Arc::new(RecordingSink::new());
+        let (_tx, rx) = bounded::<ShutdownReason>(1);
+        let listen_failed = Arc::new(AtomicBool::new(false));
+        run(
+            rx,
+            Arc::new(single_profile_source(engine.clone())),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            recording.clone(),
+            Arc::new(MockClock::new()),
+            LoopHooks {
+                heartbeat: Arc::new(AtomicU64::new(0)),
+                listen_failed: listen_failed.clone(),
+                fatal_listen_failure: true,
+                on_fatal: Some({
+                    let engine = engine.clone();
+                    Arc::new(move |_| engine.set_alert_translate_errors(4)) as FatalCallback
+                }),
+                profile_fenced: None,
+                fence_hold: None,
+                magnet_guard_lift: None,
+                unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
+                listen_events: None,
+                listen_device_check: None,
+                shutdown_deadline: Duration::from_millis(1),
+            },
+        );
+        assert!(listen_failed.load(Ordering::Relaxed), "took the fatal path");
+        assert_eq!(
+            translate_error_adds(&recording),
+            [("p".to_string(), 1), ("p".to_string(), 3)],
+        );
+    }
+
     #[test]
     fn dispatch_add_torrent_inserts_into_state() {
         let engine = Arc::new(MockEngine::new());
@@ -2243,10 +2936,241 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.len(), 1);
         assert!(state.contains(&InfoHash([0x42; 20])));
+    }
+
+    /// The daemon's lift reaches the metadata handler for the alert's own
+    /// profile, and without one a public magnet keeps its guards.
+    #[test]
+    fn public_metadata_is_lifted_by_what_the_daemon_answers_for_the_profile() {
+        let metadata = || Alert::MetadataReceived {
+            hdr: AlertHeader {
+                kind: AlertKind::MetadataReceived,
+                infohash: Some(InfoHash([0x43; 20])),
+                handle: Some(TorrentHandle {
+                    id: 1,
+                    infohash: InfoHash([0x43; 20]),
+                }),
+                timestamp_us: 0,
+            },
+            info_section: b"d4:name1:ae".to_vec(),
+        };
+        let unset = |engine: &MockEngine| -> Vec<TorrentFlags> {
+            engine
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    crate::mock::RecordedCall::UnsetFlags { flags, .. } => Some(flags),
+                    _ => None,
+                })
+                .collect()
+        };
+        let asked = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let lift: MagnetGuardLift = {
+            let asked = asked.clone();
+            Arc::new(move |p: &ProfileId| {
+                asked.lock().push(p.clone());
+                TorrentFlags::DISABLE_DHT
+            })
+        };
+
+        for (hook, want) in [
+            (Some(&lift), vec![TorrentFlags::DISABLE_DHT]),
+            (None, vec![]),
+        ] {
+            let engine = Arc::new(MockEngine::new());
+            let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+            dispatch_alert(
+                ProfileId::new("p"),
+                metadata(),
+                &source,
+                &Arc::new(StateMap::new()),
+                &(Arc::new(MemoryResumeStore::new()) as Arc<dyn ResumeStore>),
+                &(Arc::new(MemoryTorrentStore::new()) as Arc<dyn TorrentStore>),
+                &(Arc::new(NoopSink) as Arc<dyn MetricsSink>),
+                &(Arc::new(MockClock::new()) as Arc<dyn Clock>),
+                None,
+                None,
+                hook,
+                &mut ListenFailures::default(),
+                &mut TrackerFailureLog::default(),
+            );
+            assert_eq!(unset(&engine), want);
+        }
+        assert_eq!(*asked.lock(), vec![ProfileId::new("p")]);
+    }
+
+    /// Dispatch each of `alerts` for profile `p`, then hand the saves they
+    /// queued to the engine as the loop does after a drain, and return the
+    /// flags of every `save_resume_data` the engine was asked for.
+    fn saves_after(
+        engine: &Arc<MockEngine>,
+        state: &Arc<StateMap>,
+        alerts: Vec<Alert>,
+    ) -> Vec<ResumeFlags> {
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+        let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        for alert in alerts {
+            dispatch_alert(
+                ProfileId::new("p"),
+                alert,
+                &source,
+                state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+                None,
+                None,
+                None,
+                &mut ListenFailures::default(),
+                &mut TrackerFailureLog::default(),
+            );
+        }
+        dispatch_saves(&source, state, &metrics);
+        save_flags(engine)
+    }
+
+    /// A torrent in the state map, as the boot's resume scan leaves it: no
+    /// save queued for it.
+    fn tracked(engine: &MockEngine, state: &StateMap, byte: u8) -> TorrentHandle {
+        let h = engine.register_handle(InfoHash([byte; 20]));
+        state.insert(
+            h.infohash,
+            crate::state::TorrentState::newly_added(h, ProfileId::new("p"), Instant::now()),
+        );
+        h
+    }
+
+    fn checked_alert(h: TorrentHandle) -> Alert {
+        Alert::TorrentChecked {
+            hdr: AlertHeader {
+                kind: AlertKind::TorrentChecked,
+                infohash: Some(h.infohash),
+                handle: Some(h),
+                timestamp_us: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_recheck_saves_resume_data_at_once_and_the_add_time_check_does_not() {
+        // The check every add runs changes nothing a boot-loaded torrent's
+        // file does not already hold; a re-hash's verdict is what a crash
+        // must not lose, since libtorrent trusts a saved bitfield.
+        let engine = Arc::new(MockEngine::new());
+        let state = Arc::new(StateMap::new());
+        let h = tracked(&engine, &state, 0x51);
+        assert_eq!(saves_after(&engine, &state, vec![checked_alert(h)]), vec![]);
+        assert_eq!(
+            saves_after(&engine, &state, vec![checked_alert(h)]),
+            vec![ResumeFlags::empty()],
+            "the recheck's verdict is saved unconditionally",
+        );
+    }
+
+    #[test]
+    fn a_completed_move_saves_resume_data_at_once() {
+        let engine = Arc::new(MockEngine::new());
+        let state = Arc::new(StateMap::new());
+        let h = tracked(&engine, &state, 0x52);
+        let moved = Alert::StorageMoved {
+            hdr: AlertHeader {
+                kind: AlertKind::StorageMoved,
+                infohash: Some(h.infohash),
+                handle: Some(h),
+                timestamp_us: 0,
+            },
+            path: "/data/b".into(),
+        };
+        assert_eq!(
+            saves_after(&engine, &state, vec![moved]),
+            vec![ResumeFlags::empty()]
+        );
+    }
+
+    /// A reopen that keeps every socket posts a port-0 failure and no
+    /// `listen_succeeded`; the profile's next `session_stats` alert finds
+    /// the socket that came up still held and clears the gauge.
+    #[test]
+    fn session_stats_clears_a_port_0_listen_failure_while_every_socket_is_held() {
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+        let state = Arc::new(StateMap::new());
+        let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = recording.clone();
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        let mut listen_failures = ListenFailures::default();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = socket.local_addr().unwrap().to_string();
+        let hdr = |kind| AlertHeader {
+            kind,
+            infohash: None,
+            handle: None,
+            timestamp_us: 0,
+        };
+        let alerts = [
+            Alert::ListenSucceeded {
+                hdr: hdr(AlertKind::ListenSucceeded),
+                endpoint: endpoint.clone(),
+            },
+            Alert::ListenFailed {
+                hdr: hdr(AlertKind::ListenFailed),
+                error_code: 19,
+                operation: "enum_route".into(),
+                endpoint: "0.0.0.0:0".into(),
+                iface: String::new(),
+                message: "No such device".into(),
+            },
+            Alert::SessionStats {
+                hdr: hdr(AlertKind::SessionStats),
+                counters: Vec::new(),
+                timestamp_ns: 0,
+            },
+        ];
+        let gauge = || {
+            recording
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    MetricCall::SetGauge { name, value, .. } if name == "listen_failure_active" => {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for alert in alerts {
+            dispatch_alert(
+                ProfileId::new("p"),
+                alert,
+                &source,
+                &state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+                None,
+                None,
+                None,
+                &mut listen_failures,
+                &mut TrackerFailureLog::default(),
+            );
+        }
+        assert_eq!(gauge(), vec![0.0, 1.0, 0.0]);
+        drop(socket);
     }
 
     #[test]
@@ -2287,6 +3211,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2317,6 +3245,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -2359,6 +3291,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2407,6 +3343,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
         (
             unsaved,
@@ -2539,6 +3479,10 @@ mod tests {
                 &metrics,
                 &clock,
                 None,
+                None,
+                None,
+                &mut ListenFailures::default(),
+                &mut TrackerFailureLog::default(),
             )
         };
 
@@ -2607,6 +3551,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2641,6 +3589,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -2702,6 +3654,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(unsaved, 0, "every save settles inside the deadline");
@@ -2743,6 +3699,10 @@ mod tests {
             &metrics,
             &clock,
             None,
+            None,
+            None,
+            &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(unsaved, 0);

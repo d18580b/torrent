@@ -3,14 +3,18 @@
 //!
 //! A graceful shutdown removes the kill-switch table and lowers the tunnels
 //! the daemon raised itself. A `kill -9`, an OOM kill or a panic abort runs
-//! none of that, and the `torrentd_ks` table, the WireGuard links and their
+//! none of that, and the `torrentd_ks_<uid>` table, the WireGuard links and their
 //! `ip rule`s stay. The packaged unit runs this as `ExecStopPost=`, which
 //! systemd runs after every exit of the daemon, clean or not.
 //!
 //! It removes only what a daemon of this state directory is known to have put
 //! there, by the same rules shutdown uses:
 //!
-//! - the `torrentd_ks` table, which only this daemon installs;
+//! - the daemon's uid's `torrentd_ks_<uid>` table, which only a daemon of that
+//!   uid installs (run by root, the state directory owner's), and a table an
+//!   earlier release left under the shared name `torrentd_ks` where it
+//!   confines that uid alone. Another uid's table is another daemon's kill
+//!   switch, in force, and is left standing;
 //! - every WireGuard link a raised-interface record vouches for (raised on
 //!   this boot of the host, carrying the key the record names), with its
 //!   per-source rules. A link the daemon adopted, which it never raised, is
@@ -59,6 +63,13 @@ pub fn cleanup(cfg: &Config) -> anyhow::Result<()> {
         .iter()
         .filter_map(|p| p.vpn_interface())
         .collect();
+    let uid = kill_switch_uid(
+        vpn::killswitch::current_uid().ok(),
+        std::fs::metadata(&state_dir)
+            .ok()
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m)),
+    );
+    let table = uid.map_or_else(vpn::killswitch::own_table_name, vpn::killswitch::table_name);
     cleanup_with(net_admin, &cfg.instance_lock_path(), || {
         run_steps(
             || vpn::release_recorded_wireguard(&state_dir, |_| false),
@@ -67,9 +78,28 @@ pub fn cleanup(cfg: &Config) -> anyhow::Result<()> {
                     .release_recorded(|iface| configured.contains(iface))
             },
             vpn::killswitch::nft_available(),
-            vpn::killswitch::remove_table,
+            &table,
+            || match uid {
+                Some(uid) => vpn::killswitch::remove_table_for(uid),
+                None => Err(io::Error::other(
+                    "neither this process's uid nor the state directory's owner could be read",
+                )),
+            },
         )
     })
+}
+
+/// Whose kill-switch table this cleanup removes: the uid it runs as, which
+/// under the packaged unit's `User=` is the daemon's own; or, run by root,
+/// the owner of the state directory. The kill switch refuses uid 0, so a
+/// root daemon never has a table, and root running this by hand is acting
+/// for the daemon whose state directory it names. Another uid's table is
+/// another daemon's, and is never this cleanup's to remove.
+fn kill_switch_uid(euid: Option<u32>, state_dir_owner: Option<u32>) -> Option<u32> {
+    match euid {
+        Some(0) | None => state_dir_owner.or(euid),
+        Some(uid) => Some(uid),
+    }
 }
 
 /// [`cleanup`] with the host calls handed in: `net_admin` is what
@@ -115,6 +145,7 @@ fn run_steps(
     release_wireguard: impl FnOnce() -> io::Result<Vec<(String, ReleasedWireguard)>>,
     release_openvpn: impl FnOnce() -> io::Result<Vec<(String, ReleasedOpenvpn)>>,
     nft_available: bool,
+    table: &str,
     remove_kill_switch: impl FnOnce() -> io::Result<bool>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -152,14 +183,10 @@ fn run_steps(
     // No `nft`, no table: nothing on this host could have installed one.
     if nft_available {
         match remove_kill_switch() {
-            Ok(true) => info!(
-                table = vpn::killswitch::TABLE,
-                "net-cleanup: removed the network kill-switch table",
-            ),
+            Ok(true) => info!(table, "net-cleanup: removed the network kill-switch table"),
             Ok(false) => {}
             Err(e) => failures.push(format!(
-                "could not remove the kill-switch table (nft delete table inet {}): {e}",
-                vpn::killswitch::TABLE,
+                "could not remove the kill-switch table (nft delete table inet {table}): {e}",
             )),
         }
     }
@@ -218,6 +245,7 @@ mod tests {
                 ])
             },
             true,
+            T,
             || {
                 removed.set(true);
                 Ok(true)
@@ -227,7 +255,45 @@ mod tests {
         assert!(removed.get(), "the kill switch is removed");
 
         // Idempotent: nothing left, nothing to report.
-        assert!(run_steps(|| Ok(vec![]), || Ok(vec![]), true, || Ok(false)).is_empty());
+        assert!(run_steps(|| Ok(vec![]), || Ok(vec![]), true, T, || Ok(false)).is_empty());
+    }
+
+    /// The table every test cleanup removes: uid 998's.
+    const T: &str = "torrentd_ks_998";
+
+    /// #168: the OpenVPN daemon, kill switch off, stops beside a WireGuard
+    /// daemon whose kill switch is in force under another uid. Its cleanup
+    /// lists that table and leaves it standing.
+    #[test]
+    fn a_cleanup_leaves_another_daemons_table() {
+        let failures = run_steps(
+            || Ok(vec![]),
+            || Ok(vec![]),
+            true,
+            "torrentd_ks_1000",
+            || {
+                vpn::killswitch::disable_with(
+                    1000,
+                    || Ok(format!("table ip filter\ntable inet {T}\n")),
+                    |_| panic!("no legacy table is listed"),
+                    |name| panic!("{name} is the other daemon's kill switch, and stays"),
+                )
+            },
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// Run as the daemon's own uid, as the unit's `User=` runs it, the table
+    /// is that uid's; run by root, it is the state directory owner's, since
+    /// root never has one of its own.
+    #[test]
+    fn the_table_removed_is_the_daemons_uids() {
+        assert_eq!(kill_switch_uid(Some(998), Some(0)), Some(998));
+        assert_eq!(kill_switch_uid(Some(998), None), Some(998));
+        assert_eq!(kill_switch_uid(Some(0), Some(998)), Some(998));
+        assert_eq!(kill_switch_uid(None, Some(998)), Some(998));
+        assert_eq!(kill_switch_uid(Some(0), None), Some(0));
+        assert_eq!(kill_switch_uid(None, None), None);
     }
 
     /// A failed step does not stop the next one, and each failure is named.
@@ -238,6 +304,7 @@ mod tests {
             || Err(io::Error::other("permission denied")),
             || Err(io::Error::other("permission denied")),
             true,
+            T,
             || {
                 removed.set(true);
                 Err(io::Error::other("nft delete table exited 1"))
@@ -247,12 +314,13 @@ mod tests {
         assert_eq!(failures.len(), 3, "{failures:?}");
         assert!(failures[0].contains("raised-interface records"));
         assert!(failures[1].contains("OpenVPN records"));
-        assert!(failures[2].contains("nft delete table inet torrentd_ks"));
+        assert!(failures[2].contains("nft delete table inet torrentd_ks_998"));
 
         let failures = run_steps(
             || Ok(vec![("wg-a".to_string(), ReleasedWireguard::LeftStanding)]),
             || Ok(vec![]),
             false,
+            T,
             || panic!("no nft, so no table to ask about"),
         );
         assert_eq!(failures.len(), 1, "{failures:?}");
@@ -274,6 +342,7 @@ mod tests {
                 ])
             },
             false,
+            T,
             || panic!("no nft, so no table to ask about"),
         );
         assert_eq!(failures.len(), 2, "{failures:?}");

@@ -74,6 +74,41 @@ fn null_and_unknown_handle_ops_are_safe() {
         unsafe { lt_torrent_force_reannounce(ptr::null_mut(), 1) },
         LT_ERR
     );
+    assert_eq!(
+        unsafe { lt_torrent_unset_flags(s, 999_999, LT_TF_DISABLE_DHT) },
+        LT_ERR
+    );
+    assert_eq!(
+        unsafe { lt_torrent_unset_flags(ptr::null_mut(), 1, LT_TF_DISABLE_DHT) },
+        LT_ERR
+    );
+    unsafe { lt_session_destroy(s) };
+}
+
+/// `lt_torrent_unset_flags` clears the discovery guards and refuses every
+/// other bit, upload mode first among them, without touching the torrent.
+#[test]
+fn unset_flags_clears_only_the_discovery_guards() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    let guards = LT_TF_DISABLE_PEX | LT_TF_DISABLE_DHT | LT_TF_DISABLE_LSD;
+    assert_eq!(
+        unsafe { lt_torrent_unset_flags(s, h, guards) },
+        LT_OK as i32
+    );
+    assert_eq!(unsafe { lt_torrent_unset_flags(s, h, 0) }, LT_OK as i32);
+    for refused in [
+        LT_TF_UPLOAD_MODE,
+        LT_TF_PAUSED,
+        LT_TF_SEED_MODE,
+        LT_TF_DISABLE_DHT | LT_TF_UPLOAD_MODE,
+    ] {
+        assert_eq!(
+            unsafe { lt_torrent_unset_flags(s, h, refused) },
+            LT_ERR,
+            "bits {refused:#x} must be refused",
+        );
+    }
     unsafe { lt_session_destroy(s) };
 }
 
@@ -536,7 +571,12 @@ fn multi_file_tracker_torrent() -> Vec<u8> {
 }
 
 fn add_file(s: *mut lt_session, bytes: &[u8]) -> lt_handle {
-    let save = CString::new("/tmp").unwrap();
+    add_file_at(s, bytes, "/tmp")
+}
+
+/// Added paused, so libtorrent creates nothing under `save_path`.
+fn add_file_at(s: *mut lt_session, bytes: &[u8], save_path: &str) -> lt_handle {
+    let save = CString::new(save_path).unwrap();
     let mut ih = [0u8; 20];
     let mut err = [0 as c_char; 512];
     let h = unsafe {
@@ -584,12 +624,129 @@ fn c_buf(buf: &[c_char]) -> String {
     String::from_utf8_lossy(&bytes[..nul]).into_owned()
 }
 
-fn details(s: *mut lt_session, h: lt_handle) -> lt_torrent_details {
+/// `lt_torrent_details`, copied out and freed.
+struct Details {
+    name: String,
+    save_path: String,
+    total_size: u64,
+    added_time: i64,
+    upload_limit: u32,
+    has_metadata: u8,
+}
+
+fn details(s: *mut lt_session, h: lt_handle) -> Details {
     let mut d: lt_torrent_details = unsafe { std::mem::zeroed() };
     let mut err = [0 as c_char; 512];
     let rc = unsafe { lt_torrent_details(s, h, &mut d, err.as_mut_ptr(), 512) };
     assert_eq!(rc, LT_OK as i32, "lt_torrent_details: {}", c_buf(&err));
-    d
+    let out = Details {
+        name: sized_c_str(d.name, d.name_len),
+        save_path: sized_c_str(d.save_path, d.save_path_len),
+        total_size: d.total_size,
+        added_time: d.added_time,
+        upload_limit: d.upload_limit,
+        has_metadata: d.has_metadata,
+    };
+    unsafe { lt_torrent_details_free(&mut d) };
+    assert!(d.strings.is_null() && d.name.is_null() && d.save_path.is_null());
+    // Idempotent, and safe on null.
+    unsafe { lt_torrent_details_free(&mut d) };
+    unsafe { lt_torrent_details_free(ptr::null_mut()) };
+    out
+}
+
+/// A v1 single-root `.torrent` whose one file sits under directories deep
+/// enough to push its torrent-relative path past the 1 023 bytes the shim's
+/// fixed path buffers used to hold. Every component stays under the 255-byte
+/// file-name limit, so the path is one a filesystem can hold.
+fn long_path_torrent() -> (Vec<u8>, String) {
+    let dirs: Vec<String> = (0..6).map(|i| format!("{i}{}", "d".repeat(199))).collect();
+    let bstr = |s: &str| format!("{}:{s}", s.len());
+    let mut path = String::new();
+    for d in &dirs {
+        path.push_str(&bstr(d));
+    }
+    path.push_str(&bstr("leaf.bin"));
+    let mut out = Vec::new();
+    out.extend_from_slice(b"d4:infod5:filesl");
+    out.extend_from_slice(format!("d6:lengthi1000e4:pathl{path}ee").as_bytes());
+    out.extend_from_slice(b"e");
+    out.extend_from_slice(format!("4:name{}", bstr("long-root")).as_bytes());
+    out.extend_from_slice(b"12:piece lengthi16384e");
+    out.extend_from_slice(b"6:pieces20:");
+    out.extend(std::iter::repeat_n(0xAB_u8, 20));
+    out.extend_from_slice(b"ee");
+    let rel = format!("long-root/{}/leaf.bin", dirs.join("/"));
+    (out, rel)
+}
+
+#[test]
+fn files_and_details_return_paths_past_the_old_buffer_whole() {
+    let (bytes, rel) = long_path_torrent();
+    assert!(rel.len() > 1_023, "the path must outgrow the old buffer");
+    // Never created: the torrent is added paused.
+    let deep = format!("/tmp/{}", vec!["s".repeat(200); 6].join("/"));
+    assert!(
+        deep.len() > 1_023,
+        "the save path must outgrow the old buffer"
+    );
+    let s = make_session();
+    let h = add_file_at(s, &bytes, &deep);
+
+    let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut list, err.as_mut_ptr(), 512) };
+    assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
+    assert_eq!(list.num_files, 1);
+    let f = unsafe { &*list.files };
+    assert_eq!(f.path_len, rel.len());
+    assert_eq!(sized_c_str(f.path, f.path_len), rel);
+    unsafe { lt_torrent_file_list_free(&mut list) };
+    assert!(list.files.is_null() && list.strings.is_null());
+
+    let d = details(s, h);
+    assert_eq!(d.save_path, deep);
+    assert_eq!(d.name, "long-root");
+    unsafe { lt_session_destroy(s) };
+}
+
+#[test]
+fn storage_moved_reports_a_destination_past_the_old_buffer_whole() {
+    // The relocation step records this path as the torrent's base and its
+    // boot-scan save path, so a cut one would name another directory.
+    let base = std::env::temp_dir().join(format!("lt-shim-long-move-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let dst = base.join(vec!["m".repeat(200); 6].join("/"));
+    let dst = dst.to_str().unwrap().to_owned();
+    assert!(
+        dst.len() > 1_023,
+        "the destination must outgrow the old buffer"
+    );
+
+    let (bytes, _) = long_path_torrent();
+    let s = make_session();
+    let h = add_file_at(s, &bytes, src.to_str().unwrap());
+    let want = CString::new(dst.clone()).unwrap();
+    let rc = unsafe { lt_torrent_move_storage(s, h, want.as_ptr(), LT_MOVE_DONT_REPLACE) };
+    assert_eq!(rc, LT_OK as i32);
+
+    let moved = wait_for(s, |u| {
+        if u.kind == lt_alert_kind_LT_ALERT_STORAGE_MOVED_FAILED {
+            let p = unsafe { &u.payload.storage_moved_failed };
+            panic!("move failed: {}", c_buf(&p.message));
+        }
+        (u.kind == lt_alert_kind_LT_ALERT_STORAGE_MOVED && u.handle == h).then(|| {
+            let p = unsafe { &u.payload.storage_moved };
+            (p.path_len, sized_c_str(p.path, p.path_len))
+        })
+    });
+    assert_eq!(moved, Some((dst.len(), dst.clone())));
+    // The session serves from the whole path too.
+    assert_eq!(details(s, h).save_path, dst);
+    unsafe { lt_session_destroy(s) };
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
@@ -602,12 +759,8 @@ fn details_without_metadata_report_the_magnet_name_and_no_size() {
     let d = details(s, h);
     assert_eq!(d.has_metadata, 0);
     assert_eq!(d.total_size, 0, "no metadata, no size");
-    assert_eq!(
-        c_buf(&d.name),
-        "pending-name",
-        "dn= is the name until metadata"
-    );
-    assert_eq!(c_buf(&d.save_path), "/tmp");
+    assert_eq!(d.name, "pending-name", "dn= is the name until metadata");
+    assert_eq!(d.save_path, "/tmp");
     assert_eq!(d.upload_limit, 0, "a fresh torrent is unlimited");
     assert!(d.added_time > 1_600_000_000, "added_time is unix seconds");
     unsafe { lt_session_destroy(s) };
@@ -620,7 +773,7 @@ fn details_with_metadata_report_size_name_and_upload_limit() {
     let d = details(s, h);
     assert_eq!(d.has_metadata, 1);
     assert_eq!(d.total_size, 61_000);
-    assert_eq!(c_buf(&d.name), "multi-root");
+    assert_eq!(d.name, "multi-root");
 
     assert_eq!(
         unsafe { lt_torrent_set_upload_limit(s, h, 50_000) },
@@ -652,14 +805,21 @@ fn files_list_every_file_with_size_progress_and_priority() {
     for _ in 0..100 {
         let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
         let mut err = [0 as c_char; 512];
-        let rc = unsafe { lt_torrent_files(s, h, &mut list, err.as_mut_ptr(), 512) };
+        let rc = unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut list, err.as_mut_ptr(), 512) };
         assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
         assert_eq!(list.has_metadata, 1);
         assert_eq!(list.num_files, 3);
         let files = unsafe { std::slice::from_raw_parts(list.files, list.num_files) };
         got = files
             .iter()
-            .map(|f| (c_buf(&f.path), f.size, f.downloaded, f.priority))
+            .map(|f| {
+                (
+                    sized_c_str(f.path, f.path_len),
+                    f.size,
+                    f.downloaded,
+                    f.priority,
+                )
+            })
             .collect::<Vec<(String, u64, u64, u8)>>();
         unsafe { lt_torrent_file_list_free(&mut list) };
         assert!(list.files.is_null() && list.num_files == 0);
@@ -684,6 +844,55 @@ fn files_list_every_file_with_size_progress_and_priority() {
 }
 
 #[test]
+fn files_page_copies_only_the_requested_range_and_reports_the_total() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    // (start, limit) -> (first_index, paths)
+    let page = |start: usize, limit: usize| {
+        let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
+        let mut err = [0 as c_char; 512];
+        let rc = unsafe { lt_torrent_files(s, h, start, limit, &mut list, err.as_mut_ptr(), 512) };
+        assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
+        assert_eq!(list.has_metadata, 1);
+        assert_eq!(
+            list.total_files, 3,
+            "the whole torrent's count, whatever the page"
+        );
+        let paths: Vec<String> = if list.num_files == 0 {
+            assert!(list.files.is_null(), "an empty page allocates nothing");
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(list.files, list.num_files) }
+                .iter()
+                .map(|f| sized_c_str(f.path, f.path_len))
+                .collect()
+        };
+        let first = list.first_index;
+        unsafe { lt_torrent_file_list_free(&mut list) };
+        (first, paths)
+    };
+    assert_eq!(
+        page(1, 1),
+        (1, vec!["multi-root/docs/notes.txt".to_string()])
+    );
+    assert_eq!(
+        page(1, 100),
+        (
+            1,
+            vec![
+                "multi-root/docs/notes.txt".to_string(),
+                "multi-root/data/blob.bin".to_string()
+            ]
+        )
+    );
+    // A count alone, and a start at or past the end: empty, not an error.
+    assert_eq!(page(0, 0), (0, vec![]));
+    assert_eq!(page(3, 10), (3, vec![]));
+    assert_eq!(page(usize::MAX, usize::MAX), (3, vec![]));
+    unsafe { lt_session_destroy(s) };
+}
+
+#[test]
 fn files_without_metadata_is_ok_and_empty() {
     let s = make_session();
     let h = add_magnet(
@@ -692,7 +901,7 @@ fn files_without_metadata_is_ok_and_empty() {
     );
     let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
     let mut err = [0 as c_char; 512];
-    let rc = unsafe { lt_torrent_files(s, h, &mut list, err.as_mut_ptr(), 512) };
+    let rc = unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut list, err.as_mut_ptr(), 512) };
     assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
     assert_eq!(list.has_metadata, 0);
     assert_eq!(list.num_files, 0);
@@ -740,6 +949,112 @@ fn trackers_report_every_url_with_its_tier() {
     unsafe { lt_tracker_list_free(&mut list) };
     unsafe { lt_tracker_list_free(ptr::null_mut()) };
     unsafe { lt_session_destroy(s) };
+}
+
+/// A tracker error carries the category its code belongs to: an announce to
+/// a closed loopback port is refused with an `errno`, in the system category,
+/// and was not cancelled.
+#[test]
+fn a_refused_announce_reports_a_system_category_error_not_an_abort() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    assert_eq!(unsafe { lt_torrent_resume(s, h) }, LT_OK as i32);
+    assert_eq!(unsafe { lt_torrent_force_reannounce(s, h) }, LT_OK as i32);
+
+    let got = wait_for(s, |u| {
+        if u.kind != lt_alert_kind_LT_ALERT_TRACKER_ERROR {
+            return None;
+        }
+        let e = unsafe { u.payload.tracker_error };
+        Some((e.error_code, e.error_category, e.aborted))
+    });
+    let (code, category, aborted) = got.expect("no tracker_error alert");
+    assert_ne!(code, 0);
+    assert_eq!(
+        category as u32, lt_error_category_LT_ERROR_CATEGORY_SYSTEM,
+        "code {code}"
+    );
+    assert_eq!(aborted, 0, "a refused announce is not a cancelled one");
+    unsafe { lt_session_destroy(s) };
+}
+
+/// Add [`multi_file_tracker_torrent`] with `url` as its only tracker, start
+/// it, and return the first tracker error's code, category and abort flag.
+fn first_tracker_error_announcing_to(url: &str) -> (i32, i32, u8) {
+    let s = make_session();
+    let bytes = multi_file_tracker_torrent();
+    let url = CString::new(url).unwrap();
+    let ptrs = [url.as_ptr()];
+    let tiers = [0i32];
+    let save = CString::new("/tmp").unwrap();
+    let mut ih = [0u8; 20];
+    let mut err = [0 as c_char; 512];
+    let h = unsafe {
+        lt_add_torrent_file(
+            s,
+            bytes.as_ptr(),
+            bytes.len(),
+            save.as_ptr(),
+            LT_TF_PAUSED,
+            ptrs.as_ptr(),
+            tiers.as_ptr(),
+            ptrs.len(),
+            ih.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "add .torrent failed: {}", c_buf(&err));
+    assert_eq!(unsafe { lt_torrent_resume(s, h) }, LT_OK as i32);
+    assert_eq!(unsafe { lt_torrent_force_reannounce(s, h) }, LT_OK as i32);
+    let got = wait_for(s, |u| {
+        if u.kind != lt_alert_kind_LT_ALERT_TRACKER_ERROR {
+            return None;
+        }
+        let e = unsafe { u.payload.tracker_error };
+        Some((e.error_code, e.error_category, e.aborted))
+    });
+    unsafe { lt_session_destroy(s) };
+    got.expect("no tracker_error alert")
+}
+
+/// A tracker URL whose scheme libtorrent has no connection for fails with
+/// `errors::unsupported_url_protocol`, in the libtorrent category.
+#[test]
+fn an_unsupported_tracker_scheme_reports_a_libtorrent_category_error() {
+    let (code, category, aborted) = first_tracker_error_announcing_to("gopher://127.0.0.1:1/");
+    assert_eq!(
+        category as u32, lt_error_category_LT_ERROR_CATEGORY_LIBTORRENT,
+        "code {code}"
+    );
+    assert_ne!(code, 0);
+    assert_eq!(aborted, 0);
+}
+
+/// An HTTP tracker that answers with a non-200 status fails with that status,
+/// in the HTTP category.
+#[test]
+fn an_http_tracker_status_reports_an_http_category_error() {
+    use std::io::Read;
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = conn.read(&mut buf);
+        let _ = conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+    });
+    let (code, category, aborted) =
+        first_tracker_error_announcing_to(&format!("http://127.0.0.1:{port}/announce"));
+    server.join().unwrap();
+    assert_eq!(
+        category as u32, lt_error_category_LT_ERROR_CATEGORY_HTTP,
+        "code {code}"
+    );
+    assert_eq!(code, 404);
+    assert_eq!(aborted, 0);
 }
 
 /// Trackers given with a `.torrent` add replace its announce list, tiers
@@ -805,6 +1120,8 @@ fn a_file_add_announces_to_the_trackers_given_in_place_of_its_own() {
             ptr::null(),
             0,
             csv.as_ptr(),
+            ptr::null(),
+            0,
             err.as_mut_ptr(),
             512,
         )
@@ -835,11 +1152,85 @@ fn the_tracker_guard_reports_no_trackers_on_its_own() {
             ptr::null(),
             0,
             domains.as_ptr(),
+            ptr::null(),
+            0,
             err.as_mut_ptr(),
             512,
         )
     };
     assert_eq!(rc, LT_NO_TRACKERS as i32, "{}", c_buf(&err));
+}
+
+/// With an account binding, a tracker on an allowed host under another
+/// account's passkey is told apart from a foreign tracker.
+#[test]
+fn the_tracker_guard_holds_a_tracker_to_the_account_prefixes() {
+    let enc = |u: &str| {
+        u.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('?', "%3F")
+    };
+    let magnet = |tr: &str| {
+        CString::new(format!(
+            "magnet:?xt=urn:btih:0505050505050505050505050505050505050505&tr={}",
+            enc(tr)
+        ))
+        .unwrap()
+    };
+    let domains = CString::new("tracker.example").unwrap();
+    let prefix = CString::new("https://tracker.example/PASS-A/").unwrap();
+    let prefixes = [prefix.as_ptr()];
+    let mut err = [0 as c_char; 512];
+    let mut verdict = |uri: &CString, n: usize| unsafe {
+        lt_add_trackers_allowed(
+            uri.as_ptr(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            domains.as_ptr(),
+            prefixes.as_ptr(),
+            n,
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    let ours = magnet("https://tracker.example/PASS-A/announce");
+    let theirs = magnet("https://tracker.example/PASS-B/announce");
+    let foreign = magnet("https://other.example/PASS-A/announce");
+    assert_eq!(verdict(&ours, 1), 1);
+    assert_eq!(verdict(&theirs, 1), LT_TRACKER_ACCOUNT_MISMATCH as i32);
+    assert_eq!(verdict(&foreign, 1), 0);
+    // No binding: the host alone decides.
+    assert_eq!(verdict(&theirs, 0), 1);
+}
+
+#[test]
+fn an_announce_url_prefix_matches_at_a_boundary_only() {
+    let has = |url: &str, prefix: &str| {
+        let (u, p) = (CString::new(url).unwrap(), CString::new(prefix).unwrap());
+        unsafe { lt_announce_url_has_prefix(u.as_ptr(), p.as_ptr()) == 1 }
+    };
+    let q = "https://t.example/announce.php?passkey=abc";
+    assert!(has(q, q));
+    assert!(has("https://t.example/announce.php?passkey=abc&x=1", q));
+    assert!(!has("https://t.example/announce.php?passkey=abcd", q));
+    // Scheme and authority case-insensitively, the rest exactly.
+    assert!(has("HTTPS://T.Example/announce.php?passkey=abc", q));
+    assert!(!has("https://t.example/announce.php?passkey=ABC", q));
+    let p = "https://t.example/abc/";
+    assert!(has("https://t.example/abc/announce", p));
+    assert!(!has("https://t.example:443/abc/announce", p));
+    assert!(!has("https://t.example.evil/abc/announce", p));
+    assert!(!has("https://t.example@evil.example/abc/", p));
+    assert!(!has("http://t.example/abc/announce", p));
+    // A prefix with no path, or no scheme, matches nothing.
+    assert!(!has("https://t.example/abc", "https://t.example"));
+    assert!(!has("https://t.example/abc", "t.example/abc"));
+    assert!(!has("https://t.example/abc", "https:///abc"));
 }
 
 #[test]
@@ -917,11 +1308,12 @@ fn queries_on_unknown_or_removed_handles_fail_with_the_marker() {
             LT_ERR
         );
         assert_eq!(c_buf(&err), marker);
+        assert!(d.strings.is_null(), "no allocation on failure");
 
         let mut err = [0 as c_char; 512];
         let mut files: lt_torrent_file_list = unsafe { std::mem::zeroed() };
         assert_eq!(
-            unsafe { lt_torrent_files(s, h, &mut files, err.as_mut_ptr(), 512) },
+            unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut files, err.as_mut_ptr(), 512) },
             LT_ERR
         );
         assert_eq!(c_buf(&err), marker);
@@ -944,7 +1336,7 @@ fn queries_on_unknown_or_removed_handles_fail_with_the_marker() {
         LT_ERR
     );
     assert_eq!(
-        unsafe { lt_torrent_files(s, 1, ptr::null_mut(), err.as_mut_ptr(), 512) },
+        unsafe { lt_torrent_files(s, 1, 0, usize::MAX, ptr::null_mut(), err.as_mut_ptr(), 512) },
         LT_ERR
     );
     assert_eq!(
@@ -1094,6 +1486,7 @@ fn a_re_added_info_hash_gets_a_live_handle() {
         "{}",
         c_buf(&err)
     );
+    unsafe { lt_torrent_details_free(&mut d) };
     unsafe { lt_session_destroy(s) };
 }
 
@@ -1129,6 +1522,7 @@ fn a_removal_drained_after_the_re_add_leaves_the_new_id_live() {
         "the re-added id still resolves: {}",
         c_buf(&err)
     );
+    unsafe { lt_torrent_details_free(&mut d) };
     assert_eq!(
         unsafe { lt_save_resume_data(s, again, 0) },
         LT_OK as i32,
@@ -1224,6 +1618,187 @@ fn an_out_of_range_integer_setting_is_refused() {
         LT_ERR
     );
     assert!(c_buf(&err).contains("out of range"), "{}", c_buf(&err));
+    unsafe { lt_session_destroy(s) };
+}
+
+// ---------------------------------------------------------------------------
+// Web seeds
+// ---------------------------------------------------------------------------
+
+const URL_SEED_HOST: &str = "urlseed.invalid";
+const HTTP_SEED_HOST: &str = "httpseed.invalid";
+const MAGNET_SEED_HOST: &str = "magnetseed.invalid";
+
+/// `multi_file_tracker_torrent` with a `url-list` and an `httpseeds` entry,
+/// each on a host under no tracker domain.
+fn web_seeded_torrent() -> Vec<u8> {
+    let plain = multi_file_tracker_torrent();
+    let info = plain
+        .windows(7)
+        .position(|w| w == b"4:infod")
+        .expect("info key");
+    let http = format!("http://{HTTP_SEED_HOST}/seed");
+    let url = format!("http://{URL_SEED_HOST}/files/");
+    let mut out = plain[..info].to_vec();
+    // Top-level keys in bencode byte order: httpseeds < info < url-list.
+    out.extend_from_slice(format!("9:httpseedsl{}:{http}e", http.len()).as_bytes());
+    out.extend_from_slice(&plain[info..plain.len() - 1]);
+    out.extend_from_slice(format!("8:url-listl{}:{url}e", url.len()).as_bytes());
+    out.extend_from_slice(b"e");
+    out
+}
+
+/// The resume data `h` saves now: what the torrent holds, web seeds included,
+/// since libtorrent writes every web seed the torrent has into `url-list` and
+/// `httpseeds`.
+fn saved_resume(s: *mut lt_session, h: lt_handle) -> Vec<u8> {
+    assert_eq!(unsafe { lt_save_resume_data(s, h, 0) }, LT_OK as i32);
+    wait_for(s, |u| match u.kind {
+        k if k == lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA => {
+            let r = unsafe { u.payload.save_resume };
+            Some(Ok(
+                unsafe { std::slice::from_raw_parts(r.buf, r.len) }.to_vec()
+            ))
+        }
+        k if k == lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA_FAILED => Some(Err(())),
+        _ => None,
+    })
+    .expect("no save_resume_data alert")
+    .expect("save_resume_data failed")
+}
+
+fn holds(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+}
+
+fn assert_no_web_seeds(resume: &[u8]) {
+    for host in [URL_SEED_HOST, HTTP_SEED_HOST, MAGNET_SEED_HOST] {
+        assert!(
+            !holds(resume, host),
+            "the torrent kept a web seed on {host}: {}",
+            String::from_utf8_lossy(resume)
+        );
+    }
+}
+
+fn add_resume(s: *mut lt_session, resume: &[u8], torrent: &[u8]) -> lt_handle {
+    let mut ih = [0u8; 20];
+    let mut err = [0 as c_char; 512];
+    let h = unsafe {
+        lt_add_torrent_resume_ex(
+            s,
+            resume.as_ptr(),
+            resume.len(),
+            torrent.as_ptr(),
+            torrent.len(),
+            ptr::null(),
+            LT_TF_PAUSED,
+            0,
+            ih.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "resume add failed: {}", c_buf(&err));
+    h
+}
+
+/// Hand-built resume data for `ih`, with a `url-list` and an `httpseeds`
+/// entry when `seeds` is set and neither key otherwise.
+fn resume_for(ih: &[u8; 20], seeds: bool) -> Vec<u8> {
+    let http = format!("http://{HTTP_SEED_HOST}/resume");
+    let url = format!("http://{URL_SEED_HOST}/resume/");
+    let mut resume = Vec::new();
+    resume.extend_from_slice(b"d11:file-format22:libtorrent resume file");
+    resume.extend_from_slice(b"12:file-versioni1e");
+    if seeds {
+        resume.extend_from_slice(format!("9:httpseedsl{}:{http}e", http.len()).as_bytes());
+    }
+    resume.extend_from_slice(b"9:info-hash20:");
+    resume.extend_from_slice(ih);
+    resume.extend_from_slice(b"9:save_path4:/tmp");
+    if seeds {
+        resume.extend_from_slice(format!("8:url-listl{}:{url}e", url.len()).as_bytes());
+    }
+    resume.extend_from_slice(b"e");
+    resume
+}
+
+/// A `.torrent`'s `url-list` and `httpseeds` never reach the torrent, and the
+/// resume data it saves records it with none.
+#[test]
+fn a_file_add_drops_the_torrent_s_web_seeds() {
+    let bytes = web_seeded_torrent();
+    // The fixture does carry them, so their absence below is the add's doing.
+    assert!(holds(&bytes, URL_SEED_HOST) && holds(&bytes, HTTP_SEED_HOST));
+    let s = make_session();
+    let h = add_file(s, &bytes);
+    assert_no_web_seeds(&saved_resume(s, h));
+    unsafe { lt_session_destroy(s) };
+}
+
+/// A magnet's `ws=` never reaches the torrent.
+#[test]
+fn a_magnet_add_drops_its_ws_web_seed() {
+    let s = make_session();
+    let h = add_magnet(
+        s,
+        &format!(
+            "magnet:?xt=urn:btih:0606060606060606060606060606060606060606\
+             &ws=http%3A%2F%2F{MAGNET_SEED_HOST}%2Ffile"
+        ),
+    );
+    assert_no_web_seeds(&saved_resume(s, h));
+    unsafe { lt_session_destroy(s) };
+}
+
+/// A resume add drops the web seeds in the resume data's own `url-list` and
+/// `httpseeds`, and those of the `.torrent` attached to resume data that has
+/// neither key, which libtorrent would otherwise load from the metadata.
+#[test]
+fn a_resume_add_drops_web_seeds_from_the_resume_data_and_the_torrent() {
+    let bytes = web_seeded_torrent();
+    let mut hashes: lt_info_hashes = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+    assert_eq!(
+        unsafe {
+            lt_torrent_info_hashes(
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut hashes,
+                err.as_mut_ptr(),
+                512,
+            )
+        },
+        LT_OK as i32,
+        "{}",
+        c_buf(&err)
+    );
+    assert_eq!(hashes.has_v1, 1, "the web-seeded torrent is v1");
+    let ih = hashes.v1;
+    for seeds in [true, false] {
+        let s = make_session();
+        let h = add_resume(s, &resume_for(&ih, seeds), &bytes);
+        assert_no_web_seeds(&saved_resume(s, h));
+        unsafe { lt_session_destroy(s) };
+    }
+}
+
+/// What a web-seeded `.torrent` add saves comes back through a resume add, in
+/// a session of its own, still without a web seed.
+#[test]
+fn web_seeds_stay_dropped_across_a_resume_round_trip() {
+    let bytes = web_seeded_torrent();
+    let s = make_session();
+    let h = add_file(s, &bytes);
+    let first = saved_resume(s, h);
+    unsafe { lt_session_destroy(s) };
+
+    let s = make_session();
+    let h = add_resume(s, &first, &bytes);
+    assert_no_web_seeds(&saved_resume(s, h));
     unsafe { lt_session_destroy(s) };
 }
 

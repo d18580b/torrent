@@ -25,6 +25,7 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::batch_writer::remove_if_present;
+use crate::batch_writer::sync_dir;
 use crate::batch_writer::write_atomic;
 use crate::batch_writer::BatchWriter;
 use crate::batch_writer::WriteErrorHook;
@@ -81,9 +82,54 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     /// Return once every batched write accepted so far is durable.
     fn flush(&self) {}
 
-    /// Delete the resume file for `(profile, ih)`. Missing files are not an
-    /// error.
+    /// Delete the resume file for `(profile, ih)`, and any write queued for
+    /// it, durably before returning. Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
+
+    /// Whether `(profile, ih)` has a resume file, on disk or queued for one.
+    ///
+    /// The add handler asks this to skip the save a torrent loaded from its
+    /// own resume file does not need. A store that cannot tell answers
+    /// `false`, which costs a save rather than leaving a torrent with no file.
+    fn exists(&self, _profile: &ProfileId, _ih: &InfoHash) -> Result<bool, ResumeStoreError> {
+        Ok(false)
+    }
+
+    /// Record, durably before returning, that `(profile, ih)` was removed.
+    ///
+    /// `DELETE` writes one before it removes the torrent from its session,
+    /// and it stands until every file that would bring the torrent back is
+    /// gone: the resume file, the `.torrent` and its save path. The boot
+    /// honours one before its scans: it deletes those files and loads
+    /// nothing for `(profile, ih)`, unless the registry assigns `ih` to
+    /// `profile` again, which means it was added again since. So a delete
+    /// that fails, or one a crash cuts short, is retried at the next boot
+    /// rather than the torrent loading and announcing again.
+    ///
+    /// A store that keeps nothing across a restart has nothing for a boot to
+    /// resurrect, and keeps no tombstone: the default does nothing.
+    fn write_tombstone(
+        &self,
+        _profile: &ProfileId,
+        _ih: &InfoHash,
+    ) -> Result<(), ResumeStoreError> {
+        Ok(())
+    }
+
+    /// Remove `(profile, ih)`'s tombstone, durably before returning. Missing
+    /// is not an error.
+    fn clear_tombstone(
+        &self,
+        _profile: &ProfileId,
+        _ih: &InfoHash,
+    ) -> Result<(), ResumeStoreError> {
+        Ok(())
+    }
+
+    /// Every info-hash `profile` holds a tombstone for.
+    fn tombstones(&self, _profile: &ProfileId) -> Result<Vec<InfoHash>, ResumeStoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Read every `<infohash><suffix>` file in `dir`, skipping — with a warning
@@ -210,6 +256,27 @@ impl PartitionedDir {
         scan_dir(&self.dir_for(profile), self.suffix, profile, self.what)
     }
 
+    /// The info-hash of every file in `profile`'s directory, by name alone:
+    /// unlike [`PartitionedDir::scan`], a file that cannot be read is still
+    /// listed.
+    pub(crate) fn names(&self, profile: &ProfileId) -> std::io::Result<Vec<InfoHash>> {
+        let dir = self.dir_for(profile);
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let name = entry?.file_name();
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(self.suffix)) else {
+                continue;
+            };
+            if let Some(ih) = InfoHash::from_hex(stem) {
+                out.push(ih);
+            }
+        }
+        Ok(out)
+    }
+
     /// Replace the file durably before returning: temp file, `fsync`,
     /// `rename`, `fsync` of the directory.
     pub(crate) fn write(
@@ -255,12 +322,33 @@ impl PartitionedDir {
         }
     }
 
+    /// Remove the file and any write queued for it, then `fsync` the
+    /// directory, so a crash or power loss after this returns cannot bring
+    /// the file back for the next boot's scan to load.
     pub(crate) fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> std::io::Result<()> {
         let path = self.path_for(profile, ih);
         match &self.writer {
-            Some(w) => w.delete_now(&path),
-            None => remove_if_present(&path),
+            Some(w) => w.delete_now(&path)?,
+            None => remove_if_present(&path)?,
         }
+        // Best effort, as after a rename, and counted the same way. A
+        // directory never created holds nothing to make durable.
+        let dir = self.dir_for(profile);
+        if dir.is_dir() {
+            sync_dir(&dir);
+        }
+        Ok(())
+    }
+
+    /// Whether `(profile, ih)` has a file on disk or a write queued for one.
+    /// The queue is read first: a batch drops its entry once the rename has
+    /// landed, so a file between the two is seen in one or the other.
+    pub(crate) fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> std::io::Result<bool> {
+        let path = self.path_for(profile, ih);
+        if self.pending(&path).is_some() {
+            return Ok(true);
+        }
+        path.try_exists()
     }
 
     /// The bytes queued for `path` and not yet on disk, if any.
@@ -273,31 +361,52 @@ impl PartitionedDir {
 // FsResumeStore
 // ---------------------------------------------------------------------------
 
+/// `<infohash>.resume` files, each with an `<infohash>.removed` tombstone in
+/// the same directory while a removal is unfinished (see
+/// [`ResumeStore::write_tombstone`]). The resume scan reads only its own
+/// suffix, so the tombstones never show up as entries.
 #[derive(Debug)]
-pub struct FsResumeStore(PartitionedDir);
+pub struct FsResumeStore {
+    resume: PartitionedDir,
+    tombstones: PartitionedDir,
+}
+
+/// The tombstone's suffix, beside `<infohash>.resume`.
+const TOMBSTONE_SUFFIX: &str = ".removed";
 
 impl FsResumeStore {
     pub fn new(base: impl Into<PathBuf>) -> Self {
-        Self(PartitionedDir::new(base.into(), ".resume", "resume"))
+        let base = base.into();
+        Self {
+            resume: PartitionedDir::new(base.clone(), ".resume", "resume"),
+            tombstones: PartitionedDir::new(base, TOMBSTONE_SUFFIX, "tombstone"),
+        }
     }
 
     /// Queue `write_batched` onto a writer thread of the store's own, which
     /// reports each failure to `on_error`.
     pub fn with_batched_writes(mut self, on_error: Option<WriteErrorHook>) -> Self {
-        self.0.batch_writes("torrentd-resume-writer", on_error);
+        self.resume.batch_writes("torrentd-resume-writer", on_error);
         self
     }
 
     /// Pin `profile` to an explicit directory rather than the derived one.
     pub fn with_profile_dir(mut self, profile: ProfileId, dir: impl Into<PathBuf>) -> Self {
-        self.0.pin(profile, dir.into());
+        let dir = dir.into();
+        self.resume.pin(profile.clone(), dir.clone());
+        self.tombstones.pin(profile, dir);
         self
+    }
+
+    /// Where the tombstone for `(profile, ih)` lives.
+    pub fn tombstone_path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
+        self.tombstones.path_for(profile, ih)
     }
 }
 
 impl ResumeStore for FsResumeStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
-        let raw = self.0.scan(profile)?;
+        let raw = self.resume.scan(profile)?;
         Ok(Scan {
             entries: raw
                 .entries
@@ -314,7 +423,7 @@ impl ResumeStore for FsResumeStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), ResumeStoreError> {
-        Ok(self.0.write(profile, ih, data)?)
+        Ok(self.resume.write(profile, ih, data)?)
     }
 
     fn write_batched(
@@ -323,15 +432,31 @@ impl ResumeStore for FsResumeStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), ResumeStoreError> {
-        Ok(self.0.write_batched(profile, ih, data)?)
+        Ok(self.resume.write_batched(profile, ih, data)?)
     }
 
     fn flush(&self) {
-        self.0.flush();
+        self.resume.flush();
     }
 
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-        Ok(self.0.delete(profile, ih)?)
+        Ok(self.resume.delete(profile, ih)?)
+    }
+
+    fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> Result<bool, ResumeStoreError> {
+        Ok(self.resume.exists(profile, ih)?)
+    }
+
+    fn write_tombstone(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
+        Ok(self.tombstones.write(profile, ih, b"")?)
+    }
+
+    fn clear_tombstone(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
+        Ok(self.tombstones.delete(profile, ih)?)
+    }
+
+    fn tombstones(&self, profile: &ProfileId) -> Result<Vec<InfoHash>, ResumeStoreError> {
+        Ok(self.tombstones.names(profile)?)
     }
 }
 
@@ -342,6 +467,7 @@ impl ResumeStore for FsResumeStore {
 #[derive(Debug, Default)]
 pub struct MemoryResumeStore {
     inner: DashMap<(ProfileId, InfoHash), Vec<u8>>,
+    tombstones: DashMap<(ProfileId, InfoHash), ()>,
 }
 
 impl MemoryResumeStore {
@@ -392,6 +518,29 @@ impl ResumeStore for MemoryResumeStore {
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
         self.inner.remove(&(profile.clone(), *ih));
         Ok(())
+    }
+
+    fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> Result<bool, ResumeStoreError> {
+        Ok(self.inner.contains_key(&(profile.clone(), *ih)))
+    }
+
+    fn write_tombstone(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
+        self.tombstones.insert((profile.clone(), *ih), ());
+        Ok(())
+    }
+
+    fn clear_tombstone(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
+        self.tombstones.remove(&(profile.clone(), *ih));
+        Ok(())
+    }
+
+    fn tombstones(&self, profile: &ProfileId) -> Result<Vec<InfoHash>, ResumeStoreError> {
+        Ok(self
+            .tombstones
+            .iter()
+            .filter(|e| e.key().0 == *profile)
+            .map(|e| e.key().1)
+            .collect())
     }
 }
 
@@ -461,6 +610,58 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, kept);
         assert_eq!(loaded[0].1.as_bytes(), b"kept");
+    }
+
+    #[test]
+    fn exists_sees_a_queued_write_a_landed_one_and_not_a_deleted_one() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path()).with_batched_writes(None);
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let ih = InfoHash([0x03u8; 20]);
+        assert!(!store.exists(&p, &ih).unwrap(), "nothing written yet");
+        // Queued or already renamed by the writer thread: either way it is
+        // the torrent's file.
+        store.write_batched(&p, &ih, b"queued").unwrap();
+        assert!(store.exists(&p, &ih).unwrap());
+        store.flush();
+        assert!(store.exists(&p, &ih).unwrap());
+        assert!(!store.exists(&q, &ih).unwrap(), "another profile's file");
+        store.delete(&p, &ih).unwrap();
+        assert!(!store.exists(&p, &ih).unwrap());
+    }
+
+    #[test]
+    fn a_tombstone_is_listed_until_cleared_and_never_scanned_as_resume_data() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let (gone, kept) = (InfoHash([0x05u8; 20]), InfoHash([0x06u8; 20]));
+        assert!(store.tombstones(&p).unwrap().is_empty(), "no directory yet");
+        store.write(&p, &kept, b"kept").unwrap();
+        store.write_tombstone(&p, &gone).unwrap();
+        assert!(store.tombstone_path_for(&p, &gone).exists());
+        assert_eq!(store.tombstones(&p).unwrap(), vec![gone]);
+        assert!(
+            store.tombstones(&q).unwrap().is_empty(),
+            "another profile's"
+        );
+        let loaded = store.load_all(&p).unwrap();
+        assert_eq!(loaded.len(), 1, "the tombstone is not a resume file");
+        assert_eq!(loaded[0].0, kept);
+        store.clear_tombstone(&p, &gone).unwrap();
+        store.clear_tombstone(&p, &gone).unwrap();
+        assert!(store.tombstones(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_tombstone_that_cannot_be_read_is_still_listed() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let p = ProfileId::new("p");
+        let ih = InfoHash([0x07u8; 20]);
+        // A directory reads as EISDIR, as an unreadable file would fail.
+        std::fs::create_dir_all(store.tombstone_path_for(&p, &ih)).unwrap();
+        assert_eq!(store.tombstones(&p).unwrap(), vec![ih]);
     }
 
     #[test]

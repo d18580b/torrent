@@ -217,12 +217,17 @@ pub fn update(dialog: &mut Option<Dialog>, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effec
             result: Err(failure),
             ..
         } => {
-            // A real adoption that failed without an answer, or with a 5xx
-            // (the daemon's own, or a proxy's timeout), may still have
-            // adopted some or all of them; sending it again would refuse
-            // every torrent already adopted. Close the dialog and say so.
-            // A 4xx is a refusal before anything changed.
-            if !dry_run && failure.status.is_none_or(|status| status >= 500) {
+            // A real adoption that failed without an answer, with a 5xx (the
+            // daemon's own, or a proxy's timeout), or with a 408 (a timeout
+            // that cut the request off, the work possibly still running), may
+            // still have adopted some or all of them; sending it again would
+            // refuse every torrent already adopted. Close the dialog and say
+            // so. Any other 4xx is a refusal before anything changed.
+            if !dry_run
+                && failure
+                    .status
+                    .is_none_or(|status| status == 408 || status >= 500)
+            {
                 *dialog = None;
                 return vec![Effect::toast(crate::app::Toast::failure(
                     "adopting — it may still have gone through; refresh the library before retrying",

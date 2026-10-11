@@ -6,7 +6,8 @@
  * use fixed-size character buffers (LT_PATH_MAX, LT_MSG_MAX) for short
  * strings — if the source string is longer, it is truncated and NUL
  * terminated. Variants that carry bulk data (resume buffers, stats counter
- * arrays, torrent_status arrays) hold heap-allocated pointers; the caller
+ * arrays, torrent_status arrays) or a path a decision rests on (the
+ * storage_moved save path) hold heap-allocated pointers; the caller
  * must invoke lt_alert_payload_free() exactly once after consumption.
  */
 #ifndef LIBTORRENT_SHIM_ALERT_UNION_H
@@ -132,8 +133,25 @@ struct lt_alert_alerts_dropped {
 /* Tracker / peer / log variants                                       */
 /* ------------------------------------------------------------------ */
 
+/* The error category a tracker_error_alert's `error_code` belongs to. The
+ * bare value is ambiguous: 36 is libtorrent's `errors::timed_out`, but
+ * ENAMETOOLONG in the system category. */
+enum lt_error_category {
+    LT_ERROR_CATEGORY_OTHER = 0,
+    LT_ERROR_CATEGORY_LIBTORRENT = 1,   /* lt::libtorrent_category() */
+    LT_ERROR_CATEGORY_SYSTEM = 2,       /* system_category or generic_category */
+    LT_ERROR_CATEGORY_HTTP = 3          /* lt::http_category(): an HTTP status */
+};
+
 struct lt_alert_tracker_error {
     int32_t error_code;
+    int32_t error_category;  /* lt_error_category */
+    /* 1 iff the announce was cancelled rather than answered or timed out:
+     * asio's operation_aborted, or libtorrent's torrent_aborted,
+     * session_is_closing or destructing_torrent. A pause, stop or shutdown
+     * causes these; no tracker failed. */
+    uint8_t aborted;
+    uint8_t _pad[3];
     int32_t times_in_row;
     char    tracker_url[LT_PATH_MAX];
     char    message[LT_MSG_MAX];
@@ -164,8 +182,13 @@ struct lt_alert_log {
 /* Storage / verification variants                                     */
 /* ------------------------------------------------------------------ */
 
+/* The new save_path, at its full length: `path_len` bytes followed by a NUL,
+ * on the heap and freed by lt_alert_payload_free. It is never truncated: the
+ * relocation step records it as the torrent's base and boot-scan save path,
+ * and a path cut short names another directory. */
 struct lt_alert_storage_moved {
-    char    path[LT_PATH_MAX];      /* the new save_path */
+    char*   path;
+    size_t  path_len;
 };
 
 struct lt_alert_storage_moved_failed {

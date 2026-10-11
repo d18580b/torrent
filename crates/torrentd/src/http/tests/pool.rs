@@ -165,7 +165,16 @@ const OPERATIONS: &[(&str, &str)] = &[
     ("GET", "/v1/pool/plans"),
     ("POST", "/v1/pool/plans"),
     ("GET", "/v1/pool/plans/1"),
+    ("GET", "/v1/pool/plans/1/steps"),
     ("DELETE", "/v1/pool/plans/1"),
+    ("POST", "/v1/pool/plans/1/apply"),
+];
+
+/// The body-taking operations mounted without `REQUEST_DEADLINE`, whose body
+/// read alone is bounded, by `BODY_DEADLINE`.
+const UNTIMED: &[(&str, &str)] = &[
+    ("POST", "/v1/pool/adoptions"),
+    ("POST", "/v1/pool/plans"),
     ("POST", "/v1/pool/plans/1/apply"),
 ];
 
@@ -192,6 +201,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     adoption(cov).await;
     verification(cov).await;
     plans(cov).await;
+    large_plan(cov).await;
     unconfigured_and_unauthorised(cov).await;
     internal_failures(cov).await;
     malformed_requests(cov).await;
@@ -499,6 +509,80 @@ async fn every_read_answers_while_a_scan_holds_the_writer() {
 }
 
 #[tokio::test]
+async fn an_adoption_or_plan_waiting_on_a_scan_answers_with_its_outcome_past_the_deadline() {
+    // Adopting and creating a plan wait on the writer, which a scan holds
+    // for its whole run. Under `REQUEST_DEADLINE` either answered `408`
+    // after 30 s and then ran to completion all the same, so the client
+    // never saw the outcome and torrentctl offered the adoption again.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let held = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let w = h.tokens.write.clone();
+
+    for (path, body) in [
+        (
+            "/v1/pool/adoptions",
+            adopt(
+                "p",
+                false,
+                json!({"kind": "infohashes", "infohashes": [IH_A]}),
+            ),
+        ),
+        (
+            "/v1/pool/plans",
+            Some(json!({"kind": "delete_orphans", "root_id": root_id, "prefix": "junk"})),
+        ),
+    ] {
+        // A scan in progress.
+        let held = Arc::clone(&held);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            held.with_store_mut(|st| {
+                st.in_transaction(|_| {
+                    locked_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    Ok::<(), torrentd_pool::PoolError>(())
+                })
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        // Run the clock past the deadline while the request waits on the
+        // writer, then let the scan finish.
+        tokio::time::pause();
+        let (resp, ()) = tokio::join!(h.send("POST", path, Some(&w), body), async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(crate::http::v1::REQUEST_DEADLINE + Duration::from_secs(1)).await;
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            release_tx.send(()).unwrap();
+        });
+        tokio::time::resume();
+        holder.join().unwrap();
+
+        assert!(
+            resp.status().is_success(),
+            "{path}: answered {} once the scan finished",
+            resp.status()
+        );
+    }
+    let a = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    assert_eq!(
+        h.state.registry.lookup(&a),
+        Some(torrentd_engine::ProfileId::new("p")),
+        "adopted, and said so",
+    );
+}
+
+#[tokio::test]
 async fn a_token_read_before_a_scan_does_not_apply_after_it() {
     // The plan reads come from the read connection, which shows the index
     // as it was before a running scan. A confirm token taken from that view
@@ -722,6 +806,7 @@ async fn adoption(cov: &Arc<Coverage>) {
             .change_states(
                 |r| r.set(&torrentd_engine::ProfileId::new("p"), state),
                 &torrentd_engine::NoopSink,
+                &crate::profile_registry::NoTorrents,
             )
             .unwrap()
     };
@@ -1079,6 +1164,311 @@ async fn a_delete_clears_the_pool_index_owner_it_set() {
     }
 }
 
+/// How long [`hold_writer_as_a_scan`] holds the writer at most. A handler
+/// that waits on it on the test's current-thread runtime stalls every timer,
+/// so a regression shows up as an answer later than this rather than a test
+/// that never ends.
+const SCAN_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hold the writer inside a transaction, as a running scan does, until the
+/// returned sender is used or dropped, or [`SCAN_HOLD`] passes.
+fn hold_writer_as_a_scan(
+    pool: &Arc<PoolService>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let held = Arc::clone(pool);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store_mut(|st| {
+            st.in_transaction(|_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(SCAN_HOLD);
+                Ok::<(), torrentd_pool::PoolError>(())
+            })
+        })
+        .unwrap();
+    });
+    locked_rx.recv().unwrap();
+    (release_tx, holder)
+}
+
+/// Issue #217: a delete of a loaded torrent answers while a scan holds the
+/// writer. It used to wait out the scan to release the index's owner record,
+/// after the torrent was already gone from the registry, so a client that
+/// timed out and retried got `404` for a delete that had succeeded. The
+/// release lands once the scan lets go.
+#[tokio::test]
+async fn a_delete_answers_while_a_scan_holds_the_writer_and_releases_the_owner_after() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.pool = Some(pool);
+    });
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    let p = torrentd_engine::ProfileId::new("p");
+    h.state.registry.assign(hash, p.clone()).unwrap();
+    h.state.state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(
+            torrentd_engine::TorrentHandle {
+                id: 1,
+                infohash: hash,
+            },
+            p,
+            std::time::Instant::now(),
+        ),
+    );
+    index.with_store(|st| st.set_profile(IH_A, Some("p")).unwrap());
+    let owner = || index.with_reader(|st| st.profile_of(IH_A).unwrap());
+
+    let (release, holder) = hold_writer_as_a_scan(&index);
+    let asked = std::time::Instant::now();
+    let resp = h.write("DELETE", &format!("/v1/torrents/{IH_A}")).await;
+    assert!(
+        asked.elapsed() < SCAN_HOLD / 2,
+        "the delete waited {:?} on the writer",
+        asked.elapsed(),
+    );
+    resp.assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.state.registry.lookup(&hash),
+        None,
+        "the assignment is gone"
+    );
+    assert_eq!(
+        owner().as_deref(),
+        Some("p"),
+        "the owner record waits for the writer",
+    );
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    // Nothing else takes the writer: the release lands on its own.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while owner().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner record was never released once the writer was free",
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Issue #217: `delete_files`' co-claimant check reads the committed index,
+/// so a refusal answers while a scan holds the writer rather than after it.
+#[tokio::test]
+async fn a_shared_payload_delete_is_refused_while_a_scan_holds_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    pool.with_store_mut(|st| {
+        st.replace_claims(IH_B, &[(root_id, "movies/a.bin".to_owned())])
+            .unwrap();
+    });
+    let index = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+
+    let (release, holder) = hold_writer_as_a_scan(&index);
+    let asked = std::time::Instant::now();
+    let resp = h
+        .write(
+            "DELETE",
+            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
+        )
+        .await;
+    assert!(
+        asked.elapsed() < SCAN_HOLD / 2,
+        "the co-claimant check waited {:?} on the writer",
+        asked.elapsed(),
+    );
+    assert_problem(&resp, 409, "payload-shared");
+    release.send(()).unwrap();
+    holder.join().unwrap();
+}
+
+/// The handler's early co-claimant check reads the committed index, which a
+/// running scan can rewrite before it lets go of the writer. A cross-seed
+/// that commits a claim on this torrent's files after that check, and before
+/// the payload is proven, is refused there rather than having its files
+/// moved to the trash.
+#[tokio::test]
+async fn a_co_claimant_committed_after_the_early_check_is_refused_before_the_trash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let index = Arc::clone(&pool);
+    let engine = Arc::new(torrentd_engine::MockEngine::new());
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    let p = torrentd_engine::ProfileId::new("p");
+    let handle = engine.register_handle(hash);
+    engine.set_torrent_details(
+        handle,
+        torrentd_engine::TorrentDetails {
+            save_path: dir
+                .path()
+                .join("pool/movies")
+                .to_string_lossy()
+                .into_owned(),
+            ..torrentd_engine::MockEngine::default_details()
+        },
+    );
+    engine.set_torrent_files(
+        handle,
+        Some(
+            ["a.bin", "b.bin"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, path)| torrentd_engine::TorrentFile {
+                    index: u32::try_from(i).unwrap(),
+                    path: path.into(),
+                    size: 0,
+                    downloaded: 0,
+                    priority: 4,
+                })
+                .collect(),
+        ),
+    );
+    let session = Arc::clone(&engine);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            p.clone(),
+            session as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+        s.pool = Some(pool);
+    });
+    h.state.registry.assign(hash, p.clone()).unwrap();
+    h.state.state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(handle, p, std::time::Instant::now()),
+    );
+
+    // Park the delete just past the early check, commit the cross-seed's
+    // claim as a scan ending then would, and let it go on to the writer.
+    let held = engine.hold_next("torrent_files");
+    let commit = tokio::task::spawn_blocking(move || {
+        held.wait_entered();
+        index.with_store_mut(|st| {
+            st.replace_claims(IH_B, &[(root_id, "movies/a.bin".to_owned())])
+                .unwrap();
+        });
+        held.release();
+    });
+    let resp = h
+        .write(
+            "DELETE",
+            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
+        )
+        .await;
+    commit.await.unwrap();
+
+    assert_problem(&resp, 409, "payload-shared");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains(IH_B) && detail.contains("pool index"),
+        "{detail}"
+    );
+    assert!(dir.path().join("pool/movies/a.bin").exists());
+    assert!(dir.path().join("pool/movies/b.bin").exists());
+    assert_eq!(
+        h.state.registry.lookup(&hash),
+        Some(torrentd_engine::ProfileId::new("p"))
+    );
+    assert!(
+        !engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::RemoveTorrent { .. })),
+        "a refused delete leaves the torrent in its session",
+    );
+}
+
+/// Issue #292: a `delete_files` delete of a torrent whose payload is
+/// provable answers while a scan holds the writer. Its proof read the claims
+/// and every file's row on the writer, so it waited out the scan before
+/// anything was removed.
+#[tokio::test]
+async fn a_provable_payload_delete_answers_while_a_scan_holds_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), true);
+    let index = Arc::clone(&pool);
+    let engine = Arc::new(torrentd_engine::MockEngine::new());
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    let p = torrentd_engine::ProfileId::new("p");
+    let handle = engine.register_handle(hash);
+    let movies = dir.path().join("pool/movies");
+    engine.set_torrent_details(
+        handle,
+        torrentd_engine::TorrentDetails {
+            save_path: movies.to_string_lossy().into_owned(),
+            ..torrentd_engine::MockEngine::default_details()
+        },
+    );
+    engine.set_torrent_files(
+        handle,
+        Some(
+            ["a.bin", "b.bin"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, path)| torrentd_engine::TorrentFile {
+                    index: u32::try_from(i).unwrap(),
+                    path: path.into(),
+                    size: 0,
+                    downloaded: 0,
+                    priority: 4,
+                })
+                .collect(),
+        ),
+    );
+    let session = Arc::clone(&engine);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            p.clone(),
+            session as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+        s.pool = Some(pool);
+    });
+    h.state.registry.assign(hash, p.clone()).unwrap();
+    h.state.state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(handle, p, std::time::Instant::now()),
+    );
+
+    let (release, holder) = hold_writer_as_a_scan(&index);
+    let asked = std::time::Instant::now();
+    let resp = h
+        .write(
+            "DELETE",
+            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
+        )
+        .await;
+    assert!(
+        asked.elapsed() < SCAN_HOLD / 2,
+        "the payload proof waited {:?} on the writer",
+        asked.elapsed(),
+    );
+    resp.assert_status(StatusCode::NO_CONTENT);
+    assert!(!movies.join("a.bin").exists() && !movies.join("b.bin").exists());
+    let trash = dir.path().join("pool/.torrentd-trash");
+    let bucket = std::fs::read_dir(&trash)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(bucket.len(), 1, "{bucket:?}");
+    assert!(bucket[0].join("movies/a.bin").exists());
+    assert!(bucket[0].join("movies/b.bin").exists());
+    assert_eq!(
+        h.state.registry.lookup(&hash),
+        None,
+        "the assignment is gone"
+    );
+    release.send(()).unwrap();
+    holder.join().unwrap();
+}
+
 /// Issue #111's acceptance: a torrent adopted into one profile, deleted
 /// without its files, adopts into another. The delete used to leave the
 /// index's `adopted` verdict behind, and adoption refuses `adopted` outright.
@@ -1405,9 +1795,17 @@ async fn plans(cov: &Arc<Coverage>) {
     assert_eq!(plan["steps"][0]["op"], "delete_file");
     assert_eq!(plan["steps"][0]["status"], "pending");
     assert_eq!(plan["steps"][0]["dst"], Value::Null);
+    assert_eq!(
+        plan["step_counts"],
+        json!({"total": 1, "pending": 1, "in_progress": 0, "done": 0, "failed": 0, "skipped": 0})
+    );
+    assert_eq!(plan["steps_next_cursor"], Value::Null);
     let token = plan["confirm_token"].as_str().unwrap().to_owned();
     let fetched: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
     assert_eq!(fetched, plan);
+    let steps: Value = h.read(&format!("/v1/pool/plans/{id}/steps")).await.json();
+    assert_eq!(steps["items"], plan["steps"]);
+    assert_eq!(steps["next_cursor"], Value::Null);
 
     // The planner's refusal is a 409 with its reason.
     let resp = h
@@ -1598,6 +1996,8 @@ async fn plans(cov: &Arc<Coverage>) {
     }
     let resp = h.read("/v1/pool/plans/abc").await;
     assert_eq!(resp.status().as_u16(), 400);
+    let resp = h.read(&format!("/v1/pool/plans/{id}/steps")).await;
+    assert_problem(&resp, 404, "plan-not-found");
 
     // The body of an apply is required, and closed.
     let resp = h
@@ -1645,6 +2045,101 @@ async fn plans(cov: &Arc<Coverage>) {
         .await;
     assert_problem(&resp, 403, "mutations-disabled");
     h.assert_conformance();
+}
+
+/// A plan of 10,000 steps: reading it is a bounded body carrying its counts,
+/// and its steps listing pages through every one exactly once.
+async fn large_plan(cov: &Arc<Coverage>) {
+    const STEPS: usize = 10_000;
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let root = pool.root_path_of(root_id).unwrap();
+    let (id, small) = pool.with_store_mut(|st| {
+        let mut add = |n: usize| {
+            let id = st.create_plan("delete_orphans", "{}", 0).unwrap();
+            let steps: Vec<torrentd_pool::model::PlanStep> = (0..n)
+                .map(|i| torrentd_pool::model::PlanStep {
+                    op: "delete_file".into(),
+                    src: root
+                        .join(format!(
+                            "orphans/a-fairly-long-directory-name/file-{i:05}.bin"
+                        ))
+                        .to_string_lossy()
+                        .into_owned(),
+                    dst: None,
+                })
+                .collect();
+            st.add_plan_steps(id, &steps).unwrap();
+            id
+        };
+        (add(STEPS), add(1))
+    });
+    pool.with_store_mut(|st| {
+        st.set_steps_status(id, &[(0, "done", None), (1, "failed", Some("boom"))])
+    })
+    .unwrap();
+    let h = Harness::authed(cov, |s| s.pool = Some(pool));
+
+    let resp = h.read(&format!("/v1/pool/plans/{id}")).await;
+    resp.assert_status(StatusCode::OK);
+    let body = resp.text();
+    assert!(
+        body.len() < 64 * 1024,
+        "a 10,000-step plan reads as {} bytes",
+        body.len()
+    );
+    let plan: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        plan["step_counts"],
+        json!({"total": STEPS, "pending": STEPS - 2, "in_progress": 0, "done": 1, "failed": 1, "skipped": 0})
+    );
+    assert_eq!(items_of(&plan["steps"]).len(), 100);
+    assert!(plan["confirm_token"].is_string());
+
+    // From the plan's own cursor, then a page at a time, every step once and
+    // in order.
+    let mut seqs: Vec<i64> = items_of(&plan["steps"])
+        .iter()
+        .map(|s| s["seq"].as_i64().unwrap())
+        .collect();
+    let mut cursor = plan["steps_next_cursor"].as_str().unwrap().to_owned();
+    let mut pages = 0;
+    loop {
+        let page: Value = h
+            .read(&format!(
+                "/v1/pool/plans/{id}/steps?limit=1000&cursor={cursor}"
+            ))
+            .await
+            .json();
+        pages += 1;
+        seqs.extend(items(&page).iter().map(|s| s["seq"].as_i64().unwrap()));
+        match page["next_cursor"].as_str() {
+            Some(next) => cursor = next.to_owned(),
+            None => break,
+        }
+    }
+    assert_eq!(seqs, (0..STEPS as i64).collect::<Vec<_>>());
+    assert_eq!(pages, 10);
+    let first: Value = h.read(&format!("/v1/pool/plans/{id}/steps")).await.json();
+    assert_eq!(first["items"], plan["steps"]);
+    assert_eq!(first["items"][1]["error"], "boom");
+
+    // A cursor is bound to its plan, and a page to its documented size.
+    let resp = h
+        .read(&format!("/v1/pool/plans/{small}/steps?cursor={cursor}"))
+        .await;
+    assert_problem(&resp, 400, "invalid-cursor");
+    let resp = h
+        .read(&format!("/v1/pool/plans/{id}/steps?cursor=!!"))
+        .await;
+    assert_problem(&resp, 400, "invalid-cursor");
+    let resp = h.read(&format!("/v1/pool/plans/{id}/steps?limit=0")).await;
+    assert_problem(&resp, 422, "validation-failed");
+    h.assert_conformance();
+}
+
+fn items_of(v: &Value) -> &Vec<Value> {
+    v.as_array().unwrap()
 }
 
 async fn unconfigured_and_unauthorised(cov: &Arc<Coverage>) {
@@ -1717,13 +2212,62 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
             .send(method, path, Some(&w), Some(json!({"pad": huge})))
             .await;
         assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
-        // Applying a plan waits for every step and carries no deadline, so
-        // a stalled body there is bounded by nothing but `write`; every
-        // other operation cuts one off.
-        if !path.ends_with("/apply") {
-            let (status, _) = h.slow_body(method, path, Some(&w)).await;
-            assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
+        // Applying a plan waits for every step, and adopting or creating a
+        // plan waits on a scan, so the three bound their body read and not
+        // their handler; a stalled body is cut off at the same 30 s either
+        // way, whether it declared its length or not.
+        let deadline = if UNTIMED.contains(&(*method, *path)) {
+            crate::http::v1::BODY_DEADLINE
+        } else {
+            crate::http::v1::REQUEST_DEADLINE
+        };
+        for (framing, (status, waited)) in [
+            ("declared", h.slow_body(method, path, Some(&w)).await),
+            (
+                "chunked",
+                h.stalled_chunked_body(method, path, Some(&w)).await,
+            ),
+        ] {
+            assert_eq!(
+                status.as_u16(),
+                408,
+                "{method} {path}: stalled {framing} body"
+            );
+            assert!(
+                waited + std::time::Duration::from_secs(1) > deadline
+                    && waited <= deadline + std::time::Duration::from_secs(1),
+                "{method} {path}: stalled {framing} body cut off at {waited:?}, not {deadline:?}",
+            );
         }
+        // Without a credential, a body that declares no length is refused
+        // from the head: nothing reads it, so it can neither stall the
+        // connection nor be buffered.
+        let (status, waited) = h.stalled_chunked_body(method, path, None).await;
+        assert_eq!(
+            status.as_u16(),
+            401,
+            "{method} {path}: unauthenticated chunked body"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "{method} {path}: answered only after {waited:?}"
+        );
+        // A body that declares more than the limit is refused from the head,
+        // before a byte of it is read: none is sent, so a server that read it
+        // first would answer 408 at the deadline rather than 413 at once.
+        // For the untimed three this is `TimedBody`'s own check, since the
+        // in-process client's oversized body above declares no length.
+        let declared = u64::try_from(crate::http::v1::MAX_BODY_BYTES).unwrap() + 1;
+        let (status, waited) = h.oversized_body(method, path, Some(&w), declared).await;
+        assert_eq!(
+            status.as_u16(),
+            413,
+            "{method} {path}: declared oversized body"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "{method} {path}: declared oversized body answered only after {waited:?}"
+        );
     }
     h.assert_conformance();
 }
@@ -1754,7 +2298,7 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let pool = service(dir.path(), true);
     let root_id = pool.roots()[0].0;
     const BAD: &str = "not-an-infohash";
-    pool.with_store_mut(|st| {
+    let bogus_step_plan = pool.with_store_mut(|st| {
         // Two files whose sizes sum past `i64::MAX`. The materialised tree
         // saturates rather than failing the scan over them; the reads fail
         // on the corrupt rows written below.
@@ -1785,8 +2329,20 @@ async fn internal_failures(cov: &Arc<Coverage>) {
             None,
         )
         .unwrap();
+        // A plan whose step is an operation this build has no name for.
+        let bogus_step = st.create_plan("relocate", "{}", 0).unwrap();
+        st.add_plan_steps(
+            bogus_step,
+            &[torrentd_pool::model::PlanStep {
+                op: "bogus".into(),
+                src: "/x".into(),
+                dst: None,
+            }],
+        )
+        .unwrap();
         // A plan of a kind this build has no name for.
         st.create_plan("bogus", "{}", 0).unwrap();
+        bogus_step
     });
     // Directory rows whose byte total does not read back as a number, as a
     // corrupt index would hold: the overview and both listings fail to load
@@ -1838,6 +2394,10 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     assert_internal(&h.write("POST", "/v1/pool/drift-check").await);
     assert_internal(&h.read("/v1/pool/plans").await);
     assert_internal(&h.read(&format!("/v1/pool/plans/{bogus_plan}")).await);
+    assert_internal(
+        &h.read(&format!("/v1/pool/plans/{bogus_step_plan}/steps"))
+            .await,
+    );
     assert_internal(
         &h.send(
             "POST",

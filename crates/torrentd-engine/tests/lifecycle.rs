@@ -24,6 +24,9 @@
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
 //!     for a magnet (which `SEED_MODE` cannot cover at all), and holds through
 //!     the verification failure that drops `SEED_MODE`.
+//!   - a magnet on a DHT-enabled host profile reaches the session with DHT,
+//!     PEX and LSD disabled while it has no metadata, sheds them once its
+//!     metadata shows it public, and keeps them when it shows it private.
 //!   - disk-error recovery: an unreadable payload leaves the torrent paused
 //!     with a libtorrent error (not newly in upload mode), and `resume()`
 //!     clears both and seeds, with `UPLOAD_MODE` untouched.
@@ -583,6 +586,228 @@ fn a_magnet_add_carries_upload_mode_without_metadata() {
         "upload_mode is what actually holds for a magnet; flags={flags:?}",
     );
     assert_eq!(last.download_rate, 0);
+}
+
+/// A magnet on a DHT-enabled host profile, before its metadata arrives.
+///
+/// A host profile trusts a torrent's own `private` bit, and a magnet has none
+/// until its metadata is fetched; libtorrent announces a torrent without valid
+/// metadata on the DHT regardless. So the flags the policy composes for a
+/// magnet must reach the session with DHT, PEX and LSD disabled, and stay
+/// there while the torrent has no metadata.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn a_magnet_on_a_dht_host_profile_carries_the_discovery_guards() {
+    use torrentd_engine::policy::magnet_flags;
+    use torrentd_engine::ProfileConfig;
+    use torrentd_engine::ProfileId;
+    use torrentd_engine::ProfileNetwork;
+
+    let profile = ProfileConfig {
+        id: ProfileId::new("public"),
+        network: ProfileNetwork::Host {
+            listen_interfaces: "127.0.0.1:0".into(),
+            dht: true,
+        },
+        peer_fingerprint: None,
+        user_agent: None,
+        resume_dir: None,
+        torrent_dir: None,
+        allowed_tracker_domains: vec!["tracker.example".into()],
+        allowed_tracker_urls: vec![],
+        upload_rate_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::new(&support::local_seed_settings()).unwrap();
+    let h = s
+        .add_torrent(AddParams::Magnet {
+            uri: "magnet:?xt=urn:btih:0202020202020202020202020202020202020202\
+                  &tr=https%3A%2F%2Ftracker.example%2Fannounce"
+                .into(),
+            save_path: dir.path().to_str().unwrap().to_string(),
+            flags: magnet_flags(&profile),
+        })
+        .unwrap();
+
+    let last = support::settle_status(&s, h, Duration::from_secs(5))
+        .expect("the torrent should report status");
+    assert!(!last.has_metadata, "no peer can have supplied metadata");
+    assert!(
+        TorrentFlags::from_bits_truncate(last.flags).contains(TorrentFlags::UPLOAD_MODE),
+        "flags={:?}",
+        last.flags,
+    );
+
+    // The status view does not report the discovery bits; the resume data
+    // libtorrent writes does, and it is also what carries them across a
+    // restart.
+    s.save_resume_data(h, ResumeFlags::empty()).unwrap();
+    let blob = support::pump_until(&s, Duration::from_secs(15), |a| match a {
+        Alert::SaveResumeData { data, .. } => Some(data.as_bytes().to_vec()),
+        Alert::SaveResumeDataFailed { message, .. } => {
+            panic!("save_resume_data failed: {message}")
+        }
+        _ => None,
+    })
+    .expect("a save_resume_data alert should arrive");
+    let has = |needle: &[u8]| blob.windows(needle.len()).any(|w| w == needle);
+    for key in [
+        &b"11:disable_dhti1e"[..],
+        b"11:disable_pexi1e",
+        b"11:disable_lsdi1e",
+    ] {
+        assert!(
+            has(key),
+            "{} missing from the resume data",
+            String::from_utf8_lossy(key),
+        );
+    }
+}
+
+/// A magnet on a DHT-enabled host profile sheds its discovery guards once its
+/// metadata shows it public, and keeps them when it shows it private.
+///
+/// Real session, real resume data: the `metadata_received` handler is handed
+/// the alert a peer's metadata would raise, for a real magnet handle, and the
+/// resume data libtorrent then writes says whether DHT, PEX and LSD are off.
+/// The alert is constructed rather than fetched from a peer: this layer has
+/// one session and no network, and a libtorrent seed never serves a private
+/// torrent's metadata, so the private case could not be fetched at all.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn public_magnet_metadata_lifts_the_discovery_guards_and_private_keeps_them() {
+    use std::sync::Arc;
+
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
+    use torrentd_engine::handlers::metadata;
+    use torrentd_engine::handlers::HandlerCtx;
+    use torrentd_engine::policy::magnet_flags;
+    use torrentd_engine::policy::public_magnet_lift;
+    use torrentd_engine::MemoryResumeStore;
+    use torrentd_engine::MemoryTorrentStore;
+    use torrentd_engine::MockClock;
+    use torrentd_engine::NoopSink;
+    use torrentd_engine::ProfileConfig;
+    use torrentd_engine::ProfileId;
+    use torrentd_engine::ProfileNetwork;
+    use torrentd_engine::RealEngine;
+    use torrentd_engine::StateMap;
+    use torrentd_engine::TorrentEngine;
+
+    let profile = ProfileConfig {
+        id: ProfileId::new("public"),
+        network: ProfileNetwork::Host {
+            listen_interfaces: "127.0.0.1:0".into(),
+            dht: true,
+        },
+        peer_fingerprint: None,
+        user_agent: None,
+        resume_dir: None,
+        torrent_dir: None,
+        allowed_tracker_domains: vec![],
+        allowed_tracker_urls: vec![],
+        upload_rate_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let engine: Arc<dyn TorrentEngine> =
+        Arc::new(RealEngine::new(&support::local_seed_settings()).unwrap());
+    let state = StateMap::new();
+    let resume = MemoryResumeStore::new();
+    let torrents = MemoryTorrentStore::new();
+    let metrics = NoopSink;
+    let clock = MockClock::new();
+
+    // The discovery bits as the resume data libtorrent writes for `h` holds
+    // them, each `Some(off)`.
+    let discovery_in_resume = |h| {
+        engine.save_resume_data(h, ResumeFlags::empty()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let blob = loop {
+            assert!(std::time::Instant::now() < deadline, "no resume data");
+            let found = engine.pop_alerts().into_iter().find_map(|a| match a {
+                Alert::SaveResumeData { hdr, data } if hdr.infohash == Some(h.infohash) => {
+                    Some(data.as_bytes().to_vec())
+                }
+                Alert::SaveResumeDataFailed { message, .. } => {
+                    panic!("save_resume_data failed: {message}")
+                }
+                _ => None,
+            });
+            if let Some(b) = found {
+                break b;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        };
+        let has = |needle: &[u8]| blob.windows(needle.len()).any(|w| w == needle);
+        ["dht", "pex", "lsd"].map(|k| {
+            let on = has(format!("11:disable_{k}i0e").as_bytes());
+            let off = has(format!("11:disable_{k}i1e").as_bytes());
+            assert!(on != off, "disable_{k} should be in the resume data once");
+            off
+        })
+    };
+
+    for (byte, info, kept) in [
+        (0x31u8, &b"d6:lengthi5e4:name1:ae"[..], false),
+        (0x32, b"d6:lengthi5e4:name1:a7:privatei1ee", true),
+    ] {
+        let hex = format!("{byte:02x}").repeat(20);
+        let h = engine
+            .add_torrent(AddParams::Magnet {
+                uri: format!("magnet:?xt=urn:btih:{hex}"),
+                save_path: dir.path().to_str().unwrap().to_string(),
+                flags: magnet_flags(&profile),
+            })
+            .unwrap();
+        assert_eq!(discovery_in_resume(h), [true; 3], "added guarded");
+
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            fence_hold: None,
+            profile_id: profile.id.clone(),
+            span: tracing::info_span!("test"),
+        };
+        let alert = Alert::MetadataReceived {
+            hdr: AlertHeader {
+                kind: AlertKind::MetadataReceived,
+                infohash: Some(h.infohash),
+                handle: Some(h),
+                timestamp_us: 0,
+            },
+            info_section: info.to_vec(),
+        };
+        metadata::handle(&alert, &mut ctx, public_magnet_lift(&profile));
+
+        assert_eq!(
+            discovery_in_resume(h),
+            [kept; 3],
+            "private={kept}: the guards should be {}",
+            if kept { "kept" } else { "lifted" },
+        );
+        // A public magnet's save is queued so the lift reaches its resume
+        // file; a private one queues nothing.
+        let queued: Vec<_> = state
+            .dispatch_resume_saves(usize::MAX)
+            .into_iter()
+            .map(|(ih, _)| ih)
+            .collect();
+        let want = if kept { vec![] } else { vec![h.infohash] };
+        assert_eq!(queued, want);
+        for ih in queued {
+            state.note_resume_settled(&ih);
+        }
+    }
+
+    // Nothing but the discovery guards can be cleared.
+    let h = engine.torrents().unwrap()[0];
+    assert!(engine.unset_flags(h, TorrentFlags::UPLOAD_MODE).is_err());
 }
 
 /// What the disk-error retry actually recovers, on a real session.

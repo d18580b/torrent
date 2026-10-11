@@ -53,7 +53,7 @@ There are two kinds.
 
 | Kind | Prefix | Issued by | Scopes | Lifetime |
 | --- | --- | --- | --- | --- |
-| Static token | `tdp_` | `torrentd new-token --name … --scopes …`; only its SHA-256 goes in `[[auth.token]]` | as configured: any of `read`, `write`, `metrics` | until removed from the config |
+| Static token | `tdp_` | `torrentd new-token --name … --scopes …`; only its SHA-256 goes in `[[auth.token]]` | as configured: any of `read`, `write`, `metrics` | until removed from the config and the daemon restarted; a reload does not revoke it |
 | Session token | `tds_` | `POST /v1/sessions` with the operator password | `read`, `write` | `[auth] session_ttl_secs` (default 12 h), or until `DELETE /v1/sessions/current`; a restart ends every session |
 
 Each operation declares its scope in its `security` requirement, and that same
@@ -74,18 +74,58 @@ Refusals:
   budget for its memory-hard password check. A throttled attempt is a `429`
   [`login-throttled`](problems.md#login-throttled) with `Retry-After`.
 
-With no cookies, there is no cross-site request forgery to defend against, and
-no CORS: the API has no browser clients.
+There is no CORS: the API has no browser clients. A bearer token is not an
+ambient credential, since a page on another site cannot make a browser
+attach one, so a daemon with `[auth]` needs no defence against cross-site
+request forgery. A daemon without `[auth]` does, and has one (below).
 
 **A daemon without `[auth]`.** With `allow_unauthenticated = true`, which the
-daemon permits only on a loopback `http_listen`, every operation admits every
-request, with or without a token. An `Authorization` header that is present
-but is not a well-formed bearer credential is still a `401`: a client that
+daemon permits only on a loopback `http_listen` or a unix socket that not
+every user may connect to, every operation admits every request, with or
+without a token. Every local user can reach `127.0.0.1`, so on loopback this
+is safe only on a single-user host, or in a network namespace or container no
+other uid shares; anywhere else, serve the API on a unix socket
+(`http_listen = "unix:/run/torrentd/api.sock"`), whose mode and group the
+kernel enforces, or configure `[auth]`
+([running.md §6](../running.md#6-authentication--required-one-way-or-the-other)).
+
+**Over a unix socket** the API is the same, spoken as HTTP/1.1 with any
+`Host` a loopback name (`curl --unix-socket /run/torrentd/api.sock
+http://localhost/v1/server`). Two things differ from TCP: a request carries no
+client address, so `trusted_proxies` never applies and the login throttle
+counts every caller as one client; and a request body is read whole before
+the operation sees it, and before the request is authorized, under the same
+deadline; a body over 64 KiB, or over 96 MiB for `POST /v1/torrents`, is
+answered `413` with an `about:blank` problem before routing.
+An `Authorization` header that is present but is not a well-formed bearer credential is still a `401`: a client that
 sent a credential nobody checked is not an anonymous one. That includes any
 other scheme — a `Basic` header a reverse proxy adds or passes through from
 its own login is a `401` on every operation — so a proxy in front of such a
 daemon must strip `Authorization` before forwarding (nginx:
 `proxy_set_header Authorization "";`, Caddy: `header_up -Authorization`).
+
+Loopback keeps out the network, not the operator's own browser: any page it
+visits can submit a form to `127.0.0.1`, and a page whose name rebinds to
+`127.0.0.1` is same-origin with the API. So a daemon without `[auth]`
+refuses, with a `403` whose `type` is `about:blank`:
+
+- every request whose `Host` is neither a loopback name or address
+  (`localhost`, `127.0.0.0/8`, `[::1]`) nor listed in `allowed_hosts`;
+- every request other than `GET`, `HEAD` and `OPTIONS` that carries
+  `Sec-Fetch-Site` other than `same-origin` or `none`, an `Origin` whose host
+  and port are not the request's `Host`, or a `Content-Type` other than
+  `application/json`.
+
+A client that is not a browser — `curl`, `torrentctl`, a script — sends none
+of those, or only a loopback `Host`, and is admitted. A reverse proxy in
+front of the daemon must pass the client's `Host` through (Caddy does by
+default; nginx needs `proxy_set_header Host $host;`) and the daemon's config
+must list that name in `allowed_hosts`. A proxy that does its own login, such
+as HTTP Basic, turns that login into an ambient credential a browser re-sends
+on a cross-site form, so the proxy must enforce cross-site request forgery
+protection of its own: the daemon's checks are a second line, not the only
+one.
+
 The document still describes the bearer
 requirement, because it is the contract every deployment with credentials
 keeps. `GET /v1/server` reports which case applies as `auth.mode`.
@@ -101,8 +141,9 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   names its methods after.
 - **Actions** are `POST` on a verb under the resource, as in
   `POST /v1/torrents/{infohash}/recheck`. A single settable property is `PUT`
-  on a sub-resource, as in `PUT /v1/torrents/{infohash}/upload-limit`. `v1`
-  has no `PATCH`.
+  on a sub-resource, as in `PUT /v1/torrents/{infohash}/upload-limit`. The
+  one `PATCH` is `PATCH /v1/profiles/{profile_id}`, which sets a profile
+  online or offline.
 - **Status codes.**
   - `200` carries a result.
   - `201` creates something, and `Location` names it.
@@ -146,9 +187,15 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   effects already started: an add may still complete, so a retry can get a
   `409` [`torrent-exists`](problems.md#torrent-exists) (re-read the torrent
   rather than adding it again), and a `POST /v1/pool/verifications` may still
-  start its rechecks.
-  `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step of a plan,
-  has no deadline. The server also closes an HTTP/1 connection whose request
+  queue its rechecks.
+  Three pool operations put no deadline on their work and answer only once it
+  is done: `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step
+  of a plan, and `POST /v1/pool/adoptions` and `POST /v1/pool/plans`, which
+  wait for a running scan to release the pool index and, for an adoption,
+  take as long as its selection does. Their 30 seconds bound only the body's
+  arrival, so they answer `408` only to a body that stalls, before any work
+  starts. The server
+  also closes an HTTP/1 connection whose request
   head takes more than 10 seconds to arrive, closes an HTTP/2 connection that
   leaves a ping unanswered for 10 seconds (pings go every 20), and holds at
   most 256 connections at once. A connection that sends nothing at all is
@@ -177,6 +224,14 @@ Collections that can be large page with **cursors**; none page with offsets.
 
 Small, bounded collections come back whole: `GET /v1/profiles`, a torrent's
 trackers.
+
+A mutation plan has a step per file it touches, so a `delete_orphans` plan
+over a large subtree can hold hundreds of thousands. `POST /v1/pool/plans` and
+`GET /v1/pool/plans/{plan_id}` answer with `step_counts`, how many steps stand
+in each status, and the plan's first 100 `steps`; its `steps_next_cursor`
+continues at `GET /v1/pool/plans/{plan_id}/steps`, which pages through every
+step. Poll the plan for progress and read `step_counts`; the body stays the
+same size whatever the plan's.
 
 ## Errors
 
@@ -273,4 +328,5 @@ change.
   freshness.
 - **`Idempotency-Key`.** Adding a torrent is naturally idempotent: a repeat
   answers `409` [`torrent-exists`](problems.md#torrent-exists).
-- **`PATCH`**, field selection, and CORS.
+- **`PATCH`** beyond `PATCH /v1/profiles/{profile_id}`, field selection, and
+  CORS.

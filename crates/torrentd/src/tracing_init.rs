@@ -33,10 +33,13 @@
 //!
 //! The hash is stable across runs, so two announce URLs on one host stay
 //! distinguishable in a log without the secret. URLs that carry none of these
-//! pass through unchanged — except in libtorrent's own log messages, which
-//! quote tracker URLs in every shape a tracker invents: there every URL is cut
-//! at its host unless it is a bare `scheme://host[:port]/announce`-style URL,
-//! the same fail-closed rule the API applies to announce URLs.
+//! pass through unchanged — except under the targets in `HOST_ONLY_TARGETS`:
+//! libtorrent's own log messages, and the tracker warning, scrape-failed and
+//! announce-failed lines under `torrentd_engine::handler::tracker`, whose
+//! messages libtorrent builds from the announce URL. These quote tracker URLs
+//! in every shape a tracker invents, so there every URL is cut at its host
+//! unless it is a bare `scheme://host[:port]/announce`-style URL, the same
+//! fail-closed rule the API applies to announce URLs.
 //! `CONTRIBUTING.md` § Reporting bugs promises this to bug reporters; change
 //! the two together.
 
@@ -80,12 +83,18 @@ const CREDENTIAL_KEYS: &[&str] = &[
     "pass",
 ];
 
-/// The target libtorrent's own log messages arrive under
-/// (`torrentd_engine::handlers::log_msg`). They quote tracker URLs verbatim,
-/// in whatever shape the tracker uses, so every URL in them is held to the
-/// fail-closed rule the API uses ([`display_announce_url`]) rather than to
-/// the credential shapes [`redact_urls`] recognises.
-const LIBTORRENT_LOG_TARGET: &str = "torrentd_engine::handler::log";
+/// The targets whose lines quote tracker URLs verbatim, in whatever shape the
+/// tracker uses: libtorrent's own log messages
+/// (`torrentd_engine::handlers::log_msg`), and the tracker alert lines
+/// (`torrentd_engine::handlers::warning`), whose `message()` libtorrent builds
+/// from the announce URL. Every URL in them is held to the fail-closed rule
+/// the API uses ([`display_announce_url`]) rather than to the credential
+/// shapes [`redact_urls`] recognises, so a passkey of any shape (a UUID, a
+/// short key, a base64url key) stays out of the log.
+const HOST_ONLY_TARGETS: &[&str] = &[
+    "torrentd_engine::handler::log",
+    "torrentd_engine::handler::tracker",
+];
 
 /// Separators that start a URL's authority: `://` literally, and the same
 /// percent-encoded once and twice, which is how a URL nested in another URL's
@@ -121,7 +130,7 @@ where
     ) -> fmt::Result {
         let mut line = String::new();
         self.0.format_event(ctx, Writer::new(&mut line), event)?;
-        let redacted = if event.metadata().target() == LIBTORRENT_LOG_TARGET {
+        let redacted = if HOST_ONLY_TARGETS.contains(&event.metadata().target()) {
             redact_urls_host_only(&line)
         } else {
             redact_urls(&line)
@@ -860,6 +869,42 @@ mod tests {
         assert!(out.contains("https://t.example/[redacted:"), "{out}");
         // Other targets keep the credential rules, and a clean URL whole.
         assert!(out.contains("https://t.example/docs?page=2"), "{out}");
+    }
+
+    #[test]
+    fn the_daemon_layer_holds_tracker_warnings_to_the_host_only_rule() {
+        // A UUID path passkey is no credential shape `redact_urls` knows, but
+        // libtorrent quotes the announce URL in a tracker warning's and a
+        // scrape failure's message, which `handlers::warning` logs as
+        // `error.cause` under this target.
+        const UUID: &str = "6f1c2a9e-0d4b-4c1e-9a77-3b2f5e8d1c40";
+        let url = format!("https://t.example/{UUID}/announce");
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::registry().with(fmt_layer(buf.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(
+                target: "torrentd_engine::handler::tracker",
+                infohash = "aa",
+                kind = "warning",
+                error.code = 0,
+                error.cause = %format!("{url} warning: slow down"),
+                "tracker warning",
+            );
+            tracing::debug!(
+                target: "torrentd_engine::handler::tracker",
+                kind = "scrape_failed",
+                error.cause = %format!("{url} scrape failed: timed out"),
+                "tracker warning",
+            );
+        });
+        let out = buf.text();
+        assert!(!out.contains(UUID), "{out}");
+        for line in out.lines() {
+            let line: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
+            let cause = line["error.cause"].as_str().expect("error.cause");
+            assert!(cause.starts_with("https://t.example/[redacted:"), "{cause}");
+        }
+        assert_eq!(out.lines().count(), 2, "{out}");
     }
 
     #[test]

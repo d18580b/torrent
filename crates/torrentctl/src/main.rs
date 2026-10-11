@@ -24,7 +24,8 @@ use color_eyre::eyre::WrapErr as _;
 #[derive(Debug, Parser)]
 #[command(name = "torrentctl", version, about)]
 struct Cli {
-    /// The daemon's base URL [env: TORRENTCTL_URL] [default: http://127.0.0.1:8080].
+    /// The daemon's base URL, or `unix:/path` for its socket [env: TORRENTCTL_URL]
+    /// [default: unix:/run/torrentd/api.sock when it exists, else http://127.0.0.1:8080].
     #[arg(long, value_name = "URL")]
     url: Option<String>,
     /// A bearer token (`tdp_…`). Prefer --token-file or TORRENTCTL_TOKEN: a

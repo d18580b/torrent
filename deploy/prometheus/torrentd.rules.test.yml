@@ -79,6 +79,36 @@ tests:
             exp_annotations:
               summary: "The exporter dropped samples (labels); some series are missing or stale"
 
+  # A sample the exporter dropped at boot, before the first scrape: 1 at the
+  # first sample, flat. The boot gauge fires it, past the 15-minute window.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_metrics_dropped_samples_total{reason="labels"}'
+        values: '1x40'
+      - series: 'torrentd_boot_metrics_dropped_samples{reason="labels"}'
+        values: '1x40'
+      - series: 'torrentd_metrics_dropped_samples_total{reason="registration"}'
+        values: '0x40'
+      - series: 'torrentd_boot_metrics_dropped_samples{reason="registration"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdMetricsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: labels
+            exp_annotations:
+              summary: "The exporter dropped samples (labels); some series are missing or stale"
+      - eval_time: 30m
+        alertname: TorrentdMetricsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: labels
+            exp_annotations:
+              summary: "The exporter dropped samples (labels); some series are missing or stale"
+
   # acct_a never came up; acct_b's tunnel drops at 2m, leaving nothing serving.
   - interval: 1m
     input_series:
@@ -166,6 +196,37 @@ tests:
             exp_annotations:
               summary: "Fencing profile acct_a failed to pause some torrents; they may still be seeding without the tunnel"
 
+  # Boot-scan torrents the boot could not pause on a profile fenced at boot:
+  # 2 at the first sample, flat after it. The boot gauge fires it, past the
+  # 15-minute window. acct_b's boot counted none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_fence_pause_errors_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_fence_pause_errors{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_profile_fence_pause_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_fence_pause_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdFencePauseFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Fencing profile acct_a failed to pause some torrents; they may still be seeding without the tunnel"
+      - eval_time: 30m
+        alertname: TorrentdFencePauseFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Fencing profile acct_a failed to pause some torrents; they may still be seeding without the tunnel"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_profile_vpn_handshake_probe_ok{profile_id="acct_a"}'
@@ -182,6 +243,47 @@ tests:
               profile_id: acct_a
             exp_annotations:
               summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); only IP presence is checked"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_transfer_probe_ok{profile_id="acct_a"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdTransferProbeUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: TorrentdTransferProbeUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The WireGuard transfer probe cannot run for acct_a; an aged handshake is judged on the profile's torrents alone, so a quiet seed may be fenced handshake_stale"
+
+  # A route probe that recovers before the hold stays quiet; one that stays
+  # down fires.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_route_probe_ok{profile_id="acct_a"}'
+        values: '0 0 0 1 0x10'
+      - series: 'torrentd_profile_vpn_route_probe_ok{profile_id="acct_b"}'
+        values: '1x14'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdRouteProbeUnavailable
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: TorrentdRouteProbeUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: TorrentdRouteProbeUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The route probe cannot run for acct_a; the tunnel's routing is not being checked, so route loss will not fence it"
 
   # Handshakes landing late, over and over, without yet crossing the fence:
   # one every five minutes.
@@ -441,6 +543,38 @@ tests:
             exp_annotations:
               summary: "Resume data for profile acct_a could not be written; a restart loses progress"
 
+  # Resume data the alert loop produced from the boot's backlog that could
+  # not be written: 3 at the first sample, flat after it, so increase() is 0.
+  # The boot gauge fires it, and keeps it firing past the 15-minute window.
+  # acct_b's boot counted none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_resume_write_errors_total{profile_id="acct_a"}'
+        values: '3x40'
+      - series: 'torrentd_boot_resume_write_errors{profile_id="acct_a"}'
+        values: '3x40'
+      - series: 'torrentd_resume_write_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_resume_write_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdResumeWriteErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Resume data for profile acct_a could not be written; a restart loses progress"
+      - eval_time: 30m
+        alertname: TorrentdResumeWriteErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Resume data for profile acct_a could not be written; a restart loses progress"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_resume_save_failures_total{profile_id="acct_a"}'
@@ -456,6 +590,55 @@ tests:
               profile_id: acct_a
             exp_annotations:
               summary: "save_resume_data is failing for profile acct_a"
+
+  # Resume saves from the boot's backlog that libtorrent failed (acct_a) or
+  # that failed before reaching it (acct_b), all before the first scrape:
+  # flat from the first sample. The boot gauges fire it for both.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_resume_save_failures_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_resume_save_failures{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_resume_save_dispatch_errors_total{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_boot_resume_save_dispatch_errors{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_resume_save_failures_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_resume_save_failures{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_resume_save_dispatch_errors_total{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_boot_resume_save_dispatch_errors{profile_id="acct_b"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdResumeSaveFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_a"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_b"
+      - eval_time: 30m
+        alertname: TorrentdResumeSaveFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_a"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_b"
 
   - interval: 1m
     input_series:
@@ -483,7 +666,86 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind"
+              summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
+
+  # Overflows during the boot scans: the counter's first sample is already 5
+  # and never moves, so increase() is 0. The boot gauge fires it, and keeps it
+  # firing past the 15-minute window. acct_b's boot counted none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_alert_queue_overflows_total{profile_id="acct_a"}'
+        values: '5x40'
+      - series: 'torrentd_boot_alert_queue_overflows{profile_id="acct_a"}'
+        values: '5x40'
+      - series: 'torrentd_alert_queue_overflows_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_alert_queue_overflows{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdAlertQueueOverflow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
+      - eval_time: 30m
+        alertname: TorrentdAlertQueueOverflow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
+
+  # One alert lost in the running daemon fires it. acct_b lost none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_a"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_b"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdAlertTranslateErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The daemon dropped libtorrent alerts for profile acct_a it could not translate; a torrent's removal or resume save may have gone unseen"
+
+  # Lost while the boot's backlog drained: the counter's first sample is
+  # already 2 and never moves, so increase() is 0. The boot gauge fires it,
+  # past the 15-minute window too. acct_b's boot lost none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_alert_translate_errors{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_alert_translate_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_alert_translate_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdAlertTranslateErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The daemon dropped libtorrent alerts for profile acct_a it could not translate; a torrent's removal or resume save may have gone unseen"
+      - eval_time: 30m
+        alertname: TorrentdAlertTranslateErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The daemon dropped libtorrent alerts for profile acct_a it could not translate; a torrent's removal or resume save may have gone unseen"
 
   # The alert is a fraction of announces held for 30 minutes.
   #   acct_a: three of every four announces fail (a tracker outage). Fires.
@@ -492,17 +754,17 @@ tests:
   #   acct_c: one failed announce among steady replies. Never fires.
   - interval: 1m
     input_series:
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="error"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_a", kind="error"}'
         values: '0+3x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="reply"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_a", kind="reply"}'
         values: '0+1x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="error"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_b", kind="error"}'
         values: '0+1x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="reply"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_b", kind="reply"}'
         values: '0+4x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="error"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_c", kind="error"}'
         values: '0 1x90'
-      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="reply"}'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="seedbox:8080", profile_id="acct_c", kind="reply"}'
         values: '0+2x90'
     alert_rule_test:
       - eval_time: 10m
@@ -513,17 +775,47 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+              job: torrentd
+              instance: seedbox:8080
               profile_id: acct_a
             exp_annotations:
-              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
+              summary: "Most tracker announces for profile acct_a on seedbox:8080 have been failing for 30 minutes"
       - eval_time: 90m
         alertname: TorrentdTrackerErrors
         exp_alerts:
           - exp_labels:
               severity: warning
+              job: torrentd
+              instance: seedbox:8080
               profile_id: acct_a
             exp_annotations:
-              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
+              summary: "Most tracker announces for profile acct_a on seedbox:8080 have been failing for 30 minutes"
+
+  # Two hosts run the same profile_id. Every announce fails on host-a (its
+  # tunnel blocks the tracker) and every announce replies on host-b. Summed
+  # across both, the fraction was 0.5 and never fired; per host, it fires for
+  # host-a alone and names it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-a:8080", profile_id="acct_a", kind="error"}'
+        values: '0+2x90'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-a:8080", profile_id="acct_a", kind="reply"}'
+        values: '0x90'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-b:8080", profile_id="acct_a", kind="error"}'
+        values: '0x90'
+      - series: 'torrentd_tracker_alerts_total{job="torrentd", instance="host-b:8080", profile_id="acct_a", kind="reply"}'
+        values: '0+2x90'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TorrentdTrackerErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: torrentd
+              instance: host-a:8080
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Most tracker announces for profile acct_a on host-a:8080 have been failing for 30 minutes"
 
   - interval: 1m
     input_series:
@@ -541,6 +833,39 @@ tests:
               kind: scrape_failed
             exp_annotations:
               summary: "Trackers returned scrape_failed for profile acct_a"
+
+  # Tracker warnings answering the boot's first announces: 3 at the first
+  # sample, flat after it. The boot gauge fires it, past the hour window too.
+  # The gauge carries only the kinds this alert reads.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="warning"}'
+        values: '3x90'
+      - series: 'torrentd_boot_tracker_alerts{profile_id="acct_a", kind="warning"}'
+        values: '3x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="scrape_failed"}'
+        values: '0x90'
+      - series: 'torrentd_boot_tracker_alerts{profile_id="acct_a", kind="scrape_failed"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTrackerWarnings
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              kind: warning
+            exp_annotations:
+              summary: "Trackers returned warning for profile acct_a"
+      - eval_time: 90m
+        alertname: TorrentdTrackerWarnings
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              kind: warning
+            exp_annotations:
+              summary: "Trackers returned warning for profile acct_a"
 
   - interval: 1m
     input_series:
@@ -570,6 +895,38 @@ tests:
             exp_annotations:
               summary: "libtorrent raised a performance warning for profile acct_a; see the journal"
 
+  # Fast-resume data the boot's resume scan handed over and libtorrent
+  # rejected: 40 at the first sample, flat after it. The boot gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_session_alerts_total{profile_id="acct_a", kind="fastresume_rejected"}'
+        values: '40x40'
+      - series: 'torrentd_boot_session_alerts{profile_id="acct_a", kind="fastresume_rejected"}'
+        values: '40x40'
+      - series: 'torrentd_session_alerts_total{profile_id="acct_a", kind="portmap_error"}'
+        values: '0x40'
+      - series: 'torrentd_boot_session_alerts{profile_id="acct_a", kind="portmap_error"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdSessionErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              kind: fastresume_rejected
+            exp_annotations:
+              summary: "libtorrent reported fastresume_rejected for profile acct_a"
+      - eval_time: 30m
+        alertname: TorrentdSessionErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              kind: fastresume_rejected
+            exp_annotations:
+              summary: "libtorrent reported fastresume_rejected for profile acct_a"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_torrent_errors_total{profile_id="acct_a"}'
@@ -590,6 +947,124 @@ tests:
             exp_annotations:
               summary: "Torrents in profile acct_a are failing"
 
+  # The boot's adds: acct_a's resume adds put two torrents in libtorrent's
+  # error state, and libtorrent rejected one of acct_b's adds, all before the
+  # first scrape. Each counter is flat from its first sample; the boot gauges
+  # fire the alert for both, past the 15-minute window. acct_c counted none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_errors_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_torrent_errors{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_torrent_add_errors_total{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_add_errors{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_torrent_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_errors{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_torrent_add_errors_total{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_boot_torrent_add_errors{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_torrent_errors_total{profile_id="acct_c"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_errors{profile_id="acct_c"}'
+        values: '0x40'
+      - series: 'torrentd_torrent_add_errors_total{profile_id="acct_c"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_add_errors{profile_id="acct_c"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+      - eval_time: 30m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+
+  # A disk-error retry whose resume failed a minute into the boot, before a
+  # slow first scrape: 1 at the first sample, flat. The boot gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_disk_error_retry_errors_total{profile_id="acct_a"}'
+        values: '1x40'
+      - series: 'torrentd_boot_disk_error_retry_errors{profile_id="acct_a"}'
+        values: '1x40'
+      - series: 'torrentd_disk_error_retry_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_disk_error_retry_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+      - eval_time: 30m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+
+  # A step of a pool plan the boot re-drove whose storage move failed before
+  # the first scrape: 1 at the first sample, flat. The boot gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_storage_move_failures_total{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_boot_storage_move_failures{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_storage_move_failures_total{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_boot_storage_move_failures{profile_id="acct_b"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+      - eval_time: 30m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+
   # disk_errors_total is labelled by libtorrent operation and so is not
   # seeded; the first error creates the series, and the rule matches that.
   - interval: 1m
@@ -608,7 +1083,29 @@ tests:
               profile_id: acct_a
               op: file_open
             exp_annotations:
-              summary: "File errors (file_open) in profile acct_a; the torrent is in the disk-error phase"
+              summary: "File errors (file_open) in profile acct_a; the journal names the torrent and file"
+
+  # A quick restart: the previous run counted one file_open error and ran to
+  # 20m; the next boot, scraped from 23m, counted one too before its first
+  # scrape. Same labels, same value, so increase() sees no rise, and the
+  # previous run's series is still there 15 minutes back, so the appearance
+  # clause is quiet. The boot gauge, which only the new run exports, fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_disk_errors_total{profile_id="acct_a", op="file_open"}'
+        values: '1x20 _ _ 1x20'
+      - series: 'torrentd_boot_disk_errors{profile_id="acct_a", op="file_open"}'
+        values: '_x22 1x20'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: TorrentdDiskErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              op: file_open
+            exp_annotations:
+              summary: "File errors (file_open) in profile acct_a; the journal names the torrent and file"
 
   # ---- boot and persistence ---------------------------------------------
   - interval: 1m
@@ -627,6 +1124,33 @@ tests:
               source: torrent_dir_add
             exp_annotations:
               summary: "2 torrents in profile acct_a failed to load at boot (torrent_dir_add)"
+
+  # Torrents the boot torrent-dir scan re-added at default_save_path: 3 at the
+  # first sample, flat, since nothing after the boot counts them. Fires from
+  # that sample and still past any window; a profile at zero stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_boot_save_path_fallbacks_total{profile_id="acct_a"}'
+        values: '3x40'
+      - series: 'torrentd_boot_save_path_fallbacks_total{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdBootSavePathFallbacks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no usable save path was recorded; they will not seed until moved to their data"
+      - eval_time: 30m
+        alertname: TorrentdBootSavePathFallbacks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "3 torrents in profile acct_a were re-added at default_save_path at boot because no usable save path was recorded; they will not seed until moved to their data"
 
   - interval: 1m
     input_series:
@@ -656,6 +1180,34 @@ tests:
             exp_annotations:
               summary: "Loads or adds for profile acct_a were refused by the assignment registry"
 
+  # Resume files in the wrong profile's directory, refused by the boot scans:
+  # the counter's first sample is 2 and stays there. The boot gauge fires it.
+  # A refusal after the first scrape then raises the counter too, and the two
+  # halves of the rule yield one alert, not a duplicate.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_assignment_registry_errors_total{profile_id="acct_a"}'
+        values: '2x20 3x20'
+      - series: 'torrentd_boot_registry_errors{profile_id="acct_a"}'
+        values: '2x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdRegistryErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Loads or adds for profile acct_a were refused by the assignment registry"
+      - eval_time: 22m
+        alertname: TorrentdRegistryErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Loads or adds for profile acct_a were refused by the assignment registry"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_torrent_file_persist_errors_total{profile_id="acct_a", source="metadata"}'
@@ -673,6 +1225,97 @@ tests:
             exp_annotations:
               summary: "A .torrent for profile acct_a could not be written (metadata)"
 
+  # The pool library's .torrent the boot's torrent-dir scan could not copy
+  # into the torrent store: 1 at the first sample, flat. The boot gauge fires
+  # it, for that source only.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_file_persist_errors_total{profile_id="acct_a", source="api"}'
+        values: '1x40'
+      - series: 'torrentd_boot_torrent_file_persist_errors{profile_id="acct_a", source="api"}'
+        values: '1x40'
+      - series: 'torrentd_torrent_file_persist_errors_total{profile_id="acct_a", source="metadata"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_file_persist_errors{profile_id="acct_a", source="metadata"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentPersistFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              source: api
+            exp_annotations:
+              summary: "A .torrent for profile acct_a could not be written (api)"
+      - eval_time: 30m
+        alertname: TorrentdTorrentPersistFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              source: api
+            exp_annotations:
+              summary: "A .torrent for profile acct_a could not be written (api)"
+
+  # A DELETE whose tombstone write failed after the first scrape: increase()
+  # fires it, and it resolves once the 15-minute window has passed.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="tombstone"}'
+        values: '0 0 1x20'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="tombstone"}'
+        values: '0x22'
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="resume"}'
+        values: '0x22'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="resume"}'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              store: tombstone
+            exp_annotations:
+              summary: "Cleaning up a removed torrent in profile acct_a failed (tombstone); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
+      - eval_time: 20m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts: []
+
+  # The boot could not delete what a tombstone names: 2 at the first sample,
+  # flat. The boot gauge fires it, past the window, for that store only.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="torrent"}'
+        values: '2x40'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="torrent"}'
+        values: '2x40'
+      - series: 'torrentd_torrent_remove_cleanup_errors_total{profile_id="acct_a", store="tombstone"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_remove_cleanup_errors{profile_id="acct_a", store="tombstone"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              store: torrent
+            exp_annotations:
+              summary: "Cleaning up a removed torrent in profile acct_a failed (torrent); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
+      - eval_time: 30m
+        alertname: TorrentdRemoveCleanupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              store: torrent
+            exp_annotations:
+              summary: "Cleaning up a removed torrent in profile acct_a failed (torrent); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_store_write_errors_total{store="pool_index"}'
@@ -689,6 +1332,36 @@ tests:
             exp_annotations:
               summary: "A write to the pool_index failed; it no longer matches what the daemon did"
 
+  # A registry write the boot's torrent-dir scan could not make: 1 at the
+  # first sample, flat. The boot gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_store_write_errors_total{store="registry"}'
+        values: '1x40'
+      - series: 'torrentd_boot_store_write_errors{store="registry"}'
+        values: '1x40'
+      - series: 'torrentd_store_write_errors_total{store="pool_index"}'
+        values: '0x40'
+      - series: 'torrentd_boot_store_write_errors{store="pool_index"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdStoreWriteFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              store: registry
+            exp_annotations:
+              summary: "A write to the registry failed; it no longer matches what the daemon did"
+      - eval_time: 30m
+        alertname: TorrentdStoreWriteFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              store: registry
+            exp_annotations:
+              summary: "A write to the registry failed; it no longer matches what the daemon did"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_dir_fsync_errors_total'
@@ -702,6 +1375,37 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+            exp_annotations:
+              summary: "A state directory could not be fsynced; renames into it may not survive a power loss (see the log)"
+
+  # Directory fsyncs that failed while the boot wrote its stores: 1 at the
+  # first sample, flat. The boot gauge fires it; a boot that counted none
+  # stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_dir_fsync_errors_total{instance="a"}'
+        values: '1x40'
+      - series: 'torrentd_boot_dir_fsync_errors{instance="a"}'
+        values: '1x40'
+      - series: 'torrentd_dir_fsync_errors_total{instance="b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_dir_fsync_errors{instance="b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdDirFsyncFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: a
+            exp_annotations:
+              summary: "A state directory could not be fsynced; renames into it may not survive a power loss (see the log)"
+      - eval_time: 30m
+        alertname: TorrentdDirFsyncFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: a
             exp_annotations:
               summary: "A state directory could not be fsynced; renames into it may not survive a power loss (see the log)"
 
@@ -784,6 +1488,36 @@ tests:
             exp_annotations:
               summary: "A pool plan stopped (step_failed); inspect it before resuming"
 
+  # The boot re-drive of an interrupted plan failed before the first scrape:
+  # 1 at the first sample, flat. The boot gauge fires it, past the window.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_plan_failures_total{kind="resume_failed"}'
+        values: '1x40'
+      - series: 'torrentd_boot_pool_plan_failures{kind="resume_failed"}'
+        values: '1x40'
+      - series: 'torrentd_pool_plan_failures_total{kind="step_failed"}'
+        values: '0x40'
+      - series: 'torrentd_boot_pool_plan_failures{kind="step_failed"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdPoolPlanFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: resume_failed
+            exp_annotations:
+              summary: "A pool plan stopped (resume_failed); inspect it before resuming"
+      - eval_time: 30m
+        alertname: TorrentdPoolPlanFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: resume_failed
+            exp_annotations:
+              summary: "A pool plan stopped (resume_failed); inspect it before resuming"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_pool_scan_errors_total{kind="stat"}'
@@ -810,6 +1544,43 @@ tests:
               severity: warning
             exp_annotations:
               summary: "Adopted torrents failed verification"
+
+  # An adoption the boot re-queued failed against an unmounted pool root
+  # before the first scrape: 1 at the first sample, flat. The boot gauge fires
+  # it, past the hour increase() would need.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_verify_failed_total'
+        values: '1x90'
+      - series: 'torrentd_boot_pool_verify_failed'
+        values: '1x90'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdPoolVerifyFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Adopted torrents failed verification"
+      - eval_time: 80m
+        alertname: TorrentdPoolVerifyFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Adopted torrents failed verification"
+
+  # A boot that failed none stays quiet while nothing fails.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_verify_failed_total'
+        values: '0x90'
+      - series: 'torrentd_boot_pool_verify_failed'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: TorrentdPoolVerifyFailed
+        exp_alerts: []
 
   # Work queued, nothing finishing either way: fires only once the counters
   # hold an hour of history with no completion, and that has lasted the `for:`

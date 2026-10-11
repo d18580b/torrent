@@ -541,6 +541,17 @@ void fill_state_view(lt_torrent_status_view& v, lt_session* s, const lt::torrent
     v.has_error = st.errc ? 1 : 0;
 }
 
+// Which lt_error_category `ec` belongs to, so the Rust side can tell
+// libtorrent's 36 (`errors::timed_out`) from the system category's.
+std::int32_t tracker_error_category(const lt::error_code& ec) {
+    auto const& c = ec.category();
+    if (c == lt::libtorrent_category()) return LT_ERROR_CATEGORY_LIBTORRENT;
+    if (c == lt::http_category()) return LT_ERROR_CATEGORY_HTTP;
+    if (c == boost::system::system_category() || c == boost::system::generic_category())
+        return LT_ERROR_CATEGORY_SYSTEM;
+    return LT_ERROR_CATEGORY_OTHER;
+}
+
 // Translate one libtorrent alert into our union. Returns false if the alert
 // type is not one we surface; the caller drops it silently.
 bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
@@ -716,6 +727,12 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     if (auto* x = lt::alert_cast<lt::tracker_error_alert>(a)) {
         out.kind = LT_ALERT_TRACKER_ERROR;
         out.payload.tracker_error.error_code = x->error.value();
+        out.payload.tracker_error.error_category = tracker_error_category(x->error);
+        out.payload.tracker_error.aborted =
+            (x->error == boost::asio::error::operation_aborted
+             || x->error == lt::errors::torrent_aborted
+             || x->error == lt::errors::session_is_closing
+             || x->error == lt::errors::destructing_torrent) ? 1 : 0;
         out.payload.tracker_error.times_in_row = x->times_in_row;
         copy_str_truncated(out.payload.tracker_error.tracker_url, LT_PATH_MAX,
                            x->tracker_url());
@@ -753,8 +770,18 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     }
     if (auto* x = lt::alert_cast<lt::storage_moved_alert>(a)) {
         out.kind = LT_ALERT_STORAGE_MOVED;
-        copy_str_truncated(out.payload.storage_moved.path, LT_PATH_MAX,
-                           std::string(x->storage_path()));
+        // Whole, on the heap: the relocation step records this as the
+        // torrent's base and boot-scan save path, and a path cut short
+        // names another directory. `kind` is set first, so a throw below
+        // leaves lt_alert_payload_free exactly what was allocated.
+        char const* const path = x->storage_path();
+        std::size_t const n = std::strlen(path);
+        auto* buf = static_cast<char*>(std::malloc(n + 1));
+        if (!buf) throw std::bad_alloc{};
+        std::memcpy(buf, path, n);
+        buf[n] = '\0';
+        out.payload.storage_moved.path = buf;
+        out.payload.storage_moved.path_len = n;
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
@@ -1011,12 +1038,29 @@ extern "C" int lt_session_is_paused(lt_session* s) {
 
 namespace {
 
+// Drop every web seed the params would give the torrent: a .torrent's
+// `url-list` and `httpseeds`, a magnet's `ws=`, a resume file's `url-list` and
+// `httpseeds`. A seeding-only daemon downloads nothing from them, yet
+// libtorrent resolves a web seed's host on every retry while the torrent is
+// not finished — before upload mode refuses the connection — and that lookup
+// is a name under none of the profile's `allowed_tracker_domains`, so it
+// leaves by the host's resolver rather than the profile's tunnel.
+// `override_web_seeds` keeps torrent::torrent() from reloading the metadata's
+// own list. Applied after any flags assignment, which would otherwise reset it.
+void drop_web_seeds(lt::add_torrent_params& atp)
+{
+    atp.url_seeds.clear();
+    atp.http_seeds.clear();
+    atp.flags |= lt::torrent_flags::override_web_seeds;
+}
+
 void apply_add_params_common(lt::add_torrent_params& atp,
                              const char* save_path,
                              std::uint32_t flags)
 {
     if (save_path && *save_path) atp.save_path = save_path;
     atp.flags = build_torrent_flags(flags);
+    drop_web_seeds(atp);
 }
 
 // Replace the metadata's trackers with the caller's, the way read_resume_data
@@ -1130,6 +1174,10 @@ extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
     // reporting zero progress and never advancing out of its initial state.
     atp.flags |= lt::torrent_flags::update_subscribe;
 
+    // After flags_set/flags_clear, so neither can bring the metadata's web
+    // seeds back by clearing override_web_seeds.
+    drop_web_seeds(atp);
+
     // Last, so neither the resume data nor flags_set can undo it. A foreign
     // .fastresume carrying auto_managed=1 would otherwise have libtorrent lift
     // upload mode after optimistic_disk_retry, and our own resume saves would
@@ -1216,7 +1264,55 @@ bool tracker_url_allowed(const std::string& url, const std::vector<std::string>&
     return false;
 }
 
+char ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+// Whether `url` is announced under the announce-URL prefix `prefix`: the
+// account binding a profile's `allowed_tracker_urls` states, since a private
+// tracker puts the account's passkey in the path or query that the host
+// check above never reads.
+//
+// `prefix` is `scheme://authority/...`. Its scheme and authority are compared
+// case-insensitively and must equal the URL's exactly, which the `/` closing
+// the authority enforces: a URL with userinfo, another port or a longer host
+// differs before it. Everything after is compared byte for byte, and must end
+// at a boundary, so `?passkey=a` does not admit `?passkey=ab`: either the
+// prefix itself ends in `/`, `?` or `&`, or the URL ends with it or goes on
+// with one of `/?&#;`. A prefix of any other shape matches nothing.
+bool announce_url_has_prefix(const std::string& url, const std::string& prefix) {
+    auto const sep = prefix.find("://");
+    if (sep == std::string::npos || sep == 0) return false;
+    auto const path = prefix.find('/', sep + 3);
+    if (path == std::string::npos || path == sep + 3) return false;
+    if (url.size() < prefix.size()) return false;
+    for (std::size_t i = 0; i < path; ++i) {
+        if (ascii_lower(url[i]) != ascii_lower(prefix[i])) return false;
+    }
+    if (url.compare(path, prefix.size() - path, prefix, path, std::string::npos) != 0)
+        return false;
+    if (url.size() == prefix.size()) return true;
+    auto const is_one_of = [](char c, const char* set) {
+        return std::strchr(set, c) != nullptr;
+    };
+    return is_one_of(prefix.back(), "/?&") || is_one_of(url[prefix.size()], "/?&#;");
+}
+
+bool tracker_url_bound(const std::string& url, const std::vector<std::string>& prefixes) {
+    for (auto const& p : prefixes) {
+        if (announce_url_has_prefix(url, p)) return true;
+    }
+    return false;
+}
+
 }  // namespace
+
+extern "C" int lt_announce_url_has_prefix(const char* url, const char* prefix) {
+    if (!url || !prefix) return 0;
+    LT_SHIM_TRY
+    return announce_url_has_prefix(url, prefix) ? 1 : 0;
+    LT_SHIM_CATCH(nullptr, 0, 0)
+}
 
 extern "C" int lt_torrent_metadata(const uint8_t* data, size_t len,
                                    struct lt_torrent_meta* out,
@@ -1332,9 +1428,13 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
                                        const int* tracker_tiers, size_t num_trackers,
                                        const uint8_t* resume_buf, size_t resume_len,
                                        const char* domains_csv,
+                                       const char* const* url_prefixes, size_t num_prefixes,
                                        char* err_out, int err_len)
 {
-    if (!domains_csv) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    if (!domains_csv || (num_prefixes > 0 && !url_prefixes)) {
+        set_err(err_out, err_len, "null arg");
+        return LT_ERR;
+    }
     LT_SHIM_TRY
     std::vector<std::string> domains;
     {
@@ -1390,6 +1490,18 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
     for (auto const& url : urls) {
         if (!tracker_url_allowed(url, domains)) return 0;
     }
+    // Every host is allowed; with an account binding, every URL must also be
+    // announced under one of its prefixes. Checked second, so a foreign
+    // tracker is reported as one even where it also misses the binding.
+    if (num_prefixes > 0) {
+        std::vector<std::string> prefixes;
+        for (size_t i = 0; i < num_prefixes; ++i) {
+            if (url_prefixes[i] && *url_prefixes[i]) prefixes.emplace_back(url_prefixes[i]);
+        }
+        for (auto const& url : urls) {
+            if (!tracker_url_bound(url, prefixes)) return LT_TRACKER_ACCOUNT_MISMATCH;
+        }
+    }
     return 1;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
 }
@@ -1443,6 +1555,21 @@ extern "C" int lt_torrent_force_reannounce(lt_session* s, lt_handle h) {
     if (!th.is_valid()) return LT_ERR;
     // Every tracker, now: the defaults are seconds = 0, tracker_index = -1.
     th.force_reannounce();
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
+extern "C" int lt_torrent_unset_flags(lt_session* s, lt_handle h, std::uint32_t flags) {
+    if (!s) return LT_ERR;
+    // The discovery guards and nothing else: upload mode is what keeps a
+    // torrent from requesting pieces, and no caller may lift it here.
+    constexpr std::uint32_t clearable =
+        LT_TF_DISABLE_PEX | LT_TF_DISABLE_DHT | LT_TF_DISABLE_LSD;
+    if (flags & ~clearable) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    if (flags != 0) th.unset_flags(translate_torrent_flags(flags));
     return LT_OK;
     LT_SHIM_CATCH(nullptr, 0, LT_ERR)
 }
@@ -1599,8 +1726,23 @@ extern "C" int lt_torrent_details(lt_session* s, lt_handle h,
                               | lt::torrent_handle::query_save_path);
     auto const ti = th.torrent_file();
     std::string const& name = (st.name.empty() && ti) ? ti->name() : st.name;
-    copy_utf8_truncated(out->name, LT_PATH_MAX, name);
-    copy_utf8_truncated(out->save_path, LT_PATH_MAX, st.save_path);
+    auto const upload_limit = normalise_rate_limit(th.upload_limit());
+
+    // Both strings come back whole, in one block: a save path cut short
+    // names another directory, and the delete guards join the torrent's
+    // files onto it. Everything that can throw runs before anything is
+    // published to *out, and the unique_ptr releases the block if it does.
+    std::size_t const bytes = name.size() + 1 + st.save_path.size() + 1;
+    std::unique_ptr<char, decltype(&std::free)> strings(
+        static_cast<char*>(std::malloc(bytes)), &std::free);
+    if (!strings) throw std::bad_alloc{};
+    char* const name_ptr = strings.get();
+    std::memcpy(name_ptr, name.data(), name.size());
+    name_ptr[name.size()] = '\0';
+    char* const save_ptr = name_ptr + name.size() + 1;
+    std::memcpy(save_ptr, st.save_path.data(), st.save_path.size());
+    save_ptr[st.save_path.size()] = '\0';
+
     // has_metadata and torrent_file() are read separately, so require both:
     // a torrent_info without metadata reports a size of 0 anyway, but the
     // flag is what the caller branches on.
@@ -1608,13 +1750,29 @@ extern "C" int lt_torrent_details(lt_session* s, lt_handle h,
         out->has_metadata = 1;
         out->total_size = static_cast<std::uint64_t>(ti->total_size());
     }
-    out->upload_limit = normalise_rate_limit(th.upload_limit());
+    out->upload_limit = upload_limit;
     out->added_time = static_cast<std::int64_t>(st.added_time);
+    out->name = name_ptr;
+    out->name_len = name.size();
+    out->save_path = save_ptr;
+    out->save_path_len = st.save_path.size();
+    out->strings = strings.release();
     return LT_OK;
     LT_SHIM_CATCH_HANDLE(err_out, err_len, LT_ERR)
 }
 
+extern "C" void lt_torrent_details_free(struct lt_torrent_details* d) {
+    if (!d) return;
+    std::free(d->strings);
+    d->strings = nullptr;
+    d->name = nullptr;
+    d->name_len = 0;
+    d->save_path = nullptr;
+    d->save_path_len = 0;
+}
+
 extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
+                                std::size_t start, std::size_t limit,
                                 struct lt_torrent_file_list* out,
                                 char* err_out, int err_len)
 {
@@ -1628,31 +1786,66 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
     if (!ti || !ti->is_valid()) return LT_OK;   // metadata not yet received
 
     lt::file_storage const& fs = ti->files();
-    auto const n = static_cast<std::size_t>(fs.num_files());
-    // Same bound, for the same reason, as lt_torrent_metadata: each entry
-    // carries a fixed LT_PATH_MAX buffer.
+    auto const total = static_cast<std::size_t>(fs.num_files());
+    auto const first = std::min(start, total);
+    auto const n = std::min(limit, total - first);
+    // Same bounds, for the same reasons, as lt_torrent_metadata. Applied to
+    // the page, which is all that is copied.
     if (n > LT_MAX_TORRENT_FILES) {
         set_err(err_out, err_len, "torrent declares an implausible number of files");
         return LT_ERR;
     }
+    // Paths come back whole: the delete guards join each onto the save
+    // path, and a path cut short names a file that is not the torrent's, so
+    // the guard would skip the real one as never written. One block holds
+    // every path, sized by a first pass so that a page past the bound is
+    // refused before anything is allocated for it.
+    std::size_t bytes = 0;
+    for (std::size_t j = 0; j < n; ++j) {
+        bytes += fs.file_path(lt::file_index_t{static_cast<int>(first + j)}).size() + 1;
+        if (bytes > LT_MAX_TORRENT_PATH_BYTES) {
+            set_err(err_out, err_len, "torrent file paths exceed the metadata size bound");
+            return LT_ERR;
+        }
+    }
+    if (n == 0) {
+        out->has_metadata = 1;
+        out->total_files = total;
+        out->first_index = first;
+        return LT_OK;
+    }
     // piece_granularity counts only completed pieces, which is cheap (no
     // per-block walk) and is what "downloaded" means for a seeding client.
+    // Both cover the whole torrent (libtorrent has no ranged form); only the
+    // page is copied out of them.
     auto const progress = th.file_progress(lt::torrent_handle::piece_granularity);
     auto const prios = th.get_file_priorities();
 
-    out->has_metadata = 1;
-    if (n == 0) return LT_OK;
-    // Published to *out only once fully built; the unique_ptr releases it if
-    // anything below throws, so LT_ERR never leaves an allocation behind.
+    // Published to *out only once fully built; the unique_ptrs release both
+    // blocks if anything below throws, so LT_ERR never leaves an allocation
+    // behind.
+    std::unique_ptr<char, decltype(&std::free)> strings(
+        static_cast<char*>(std::malloc(bytes)), &std::free);
+    if (!strings) throw std::bad_alloc{};
     std::unique_ptr<lt_torrent_file_entry, decltype(&std::free)> arr(
         static_cast<lt_torrent_file_entry*>(std::calloc(n, sizeof(lt_torrent_file_entry))),
         &std::free);
     if (!arr) throw std::bad_alloc{};
-    for (std::size_t i = 0; i < n; ++i) {
-        auto& e = arr.get()[i];
+    std::size_t used = 0;
+    for (std::size_t j = 0; j < n; ++j) {
+        auto& e = arr.get()[j];
+        auto const i = first + j;
         auto const idx = lt::file_index_t{static_cast<int>(i)};
         // Empty save_path: the torrent-relative path, like lt_torrent_metadata.
-        copy_utf8_truncated(e.path, LT_PATH_MAX, fs.file_path(idx));
+        std::string const path = fs.file_path(idx);
+        if (path.size() + 1 > bytes - used)
+            throw std::logic_error("torrent file paths changed between passes");
+        char* const dst = strings.get() + used;
+        std::memcpy(dst, path.data(), path.size());
+        dst[path.size()] = '\0';
+        used += path.size() + 1;
+        e.path = dst;
+        e.path_len = path.size();
         e.size = static_cast<std::uint64_t>(fs.file_size(idx));
         if (i < progress.size() && progress[i] > 0)
             e.downloaded = static_cast<std::uint64_t>(progress[i]);
@@ -1661,8 +1854,12 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
         e.priority = static_cast<std::uint8_t>(
             i < prios.size() ? prios[i] : lt::default_priority);
     }
+    out->has_metadata = 1;
+    out->total_files = total;
+    out->first_index = first;
     out->files = arr.release();
     out->num_files = n;
+    out->strings = strings.release();
     return LT_OK;
     LT_SHIM_CATCH_HANDLE(err_out, err_len, LT_ERR)
 }
@@ -1670,8 +1867,10 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
 extern "C" void lt_torrent_file_list_free(struct lt_torrent_file_list* l) {
     if (!l) return;
     std::free(l->files);
+    std::free(l->strings);
     l->files = nullptr;
     l->num_files = 0;
+    l->strings = nullptr;
 }
 
 extern "C" int lt_torrent_trackers(lt_session* s, lt_handle h,
@@ -1798,6 +1997,11 @@ extern "C" void lt_alert_payload_free(lt_alert_union* u) {
             std::free(u->payload.session_stats.counters);
             u->payload.session_stats.counters = nullptr;
             u->payload.session_stats.count = 0;
+            break;
+        case LT_ALERT_STORAGE_MOVED:
+            std::free(u->payload.storage_moved.path);
+            u->payload.storage_moved.path = nullptr;
+            u->payload.storage_moved.path_len = 0;
             break;
         default:
             break;

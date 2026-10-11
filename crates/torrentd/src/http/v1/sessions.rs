@@ -22,6 +22,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::app_state::AppState;
+use crate::auth::Admission;
 use crate::auth::Scope;
 use crate::http::forwarded::Client;
 use crate::http::security::Bearer;
@@ -145,8 +146,10 @@ impl Describe for ClientAddr {
 ///
 /// The token carries `read` and `write` and expires after
 /// `[auth] session_ttl_secs` (`GET /v1/server` reports it). Failed attempts
-/// are throttled per client, and every attempt spends from one daemon-wide
-/// budget for the memory-hard password hash; either limit answers
+/// are throttled per client, and attempts spend from one daemon-wide budget
+/// for the memory-hard password hash. Once that budget is spent, a client
+/// that has logged in since the daemon started spends from a small reserve
+/// that only such clients share instead. Either limit answers
 /// `429 login-throttled` with `Retry-After`.
 #[kynos::post("/sessions", tag = Sessions)]
 pub async fn create_session(
@@ -199,19 +202,32 @@ pub async fn create_session(
     // the KDF. The per-client consult above cannot bound this on its own:
     // every address a caller holds brings a bucket of its own, so without
     // one shared budget the Argon2 rate — and the guessing rate — scale with
-    // the number of addresses. See `LoginThrottle`.
-    if let Err(wait) = auth.throttle.admit_verification() {
-        warn!(
-            target: "torrentd::auth",
-            client_ip,
-            retry_after_secs = wait.as_secs(),
-            "login refused: daemon-wide password verification budget spent",
-        );
-        refused("verification_budget");
-        return Err(throttled(
-            "too many login attempts; try again shortly",
-            wait,
-        ));
+    // the number of addresses. A client that has logged in before falls back
+    // on a reserve once it is spent, so a few polling addresses cannot keep
+    // a returning operator out. See `LoginThrottle`.
+    match auth.throttle.admit_verification(client.ip) {
+        Ok(Admission::Shared) => {}
+        Ok(Admission::Reserve) => {
+            warn!(
+                target: "torrentd::auth",
+                client_ip,
+                "login admitted from the returning-client reserve: \
+                 daemon-wide password verification budget spent",
+            );
+        }
+        Err(wait) => {
+            warn!(
+                target: "torrentd::auth",
+                client_ip,
+                retry_after_secs = wait.as_secs(),
+                "login refused: daemon-wide password verification budget spent",
+            );
+            refused("verification_budget");
+            return Err(throttled(
+                "too many login attempts; try again shortly",
+                wait,
+            ));
+        }
     }
 
     // ~50 ms of deliberate CPU per call: run on the blocking pool, not on an
@@ -297,9 +313,13 @@ pub async fn get_current_session(caller: Scoped<Bearer, Read>) -> Json<Principal
 #[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
 pub enum RevokeSessionError {
     /// The credential is a static token from the config (or authentication is
-    /// disabled). Static tokens are revoked by removing them from the config
-    /// and reloading.
-    #[error("only a session token can be revoked here; static tokens are removed from the config")]
+    /// disabled). A static token is revoked by removing it from the config and
+    /// restarting the daemon: `[auth]` is read once at startup, so a reload
+    /// leaves a removed token working.
+    #[error(
+        "only a session token can be revoked here; revoke a static token by removing it from the \
+         config and restarting the daemon (a reload does not revoke it)"
+    )]
     #[problem(status = 409, title = "Not a session token")]
     NotASession,
 }
@@ -326,4 +346,45 @@ pub async fn delete_current_session(
 /// A wall-clock time as the API reports it.
 pub(crate) fn timestamp(t: SystemTime) -> jiff::Timestamp {
     jiff::Timestamp::try_from(t).unwrap_or(jiff::Timestamp::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RevokeSessionError;
+
+    /// The `not-a-session` entry in docs/api/problems.md, heading excluded,
+    /// with its line wrapping collapsed to single spaces.
+    fn not_a_session_entry() -> String {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api/problems.md");
+        let catalogue = std::fs::read_to_string(&path).unwrap();
+        let (_, rest) = catalogue
+            .split_once("## `not-a-session`")
+            .expect("problems.md has a `not-a-session` heading");
+        let entry = rest.split("\n## ").next().unwrap();
+        entry.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The property: an operator told how to revoke a static token is told
+    /// the step that does it. `[auth]` is not reloadable, so "remove it from
+    /// the config and reload" left a leaked token working after a `202`.
+    #[test]
+    fn the_not_a_session_answer_sends_a_static_token_to_a_restart() {
+        let detail = RevokeSessionError::NotASession.to_string();
+        assert!(
+            detail.contains("removing it from the config and restarting the daemon"),
+            "{detail}",
+        );
+        assert!(detail.contains("a reload does not revoke it"), "{detail}");
+
+        let entry = not_a_session_entry();
+        assert!(
+            entry.contains("remove it from the config and restart the daemon"),
+            "{entry}",
+        );
+        assert!(
+            !entry.contains("remove it from the config and reload"),
+            "problems.md still says a reload revokes a static token: {entry}",
+        );
+    }
 }

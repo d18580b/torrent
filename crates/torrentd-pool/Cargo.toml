@@ -12,8 +12,9 @@ publish = false
 libtorrent-safe = { workspace = true }
 
 # Index store. `bundled` compiles SQLite from source, which this workspace
-# already pays for many times over with Boost + libtorrent.
-rusqlite = { workspace = true }
+# already pays for many times over with Boost + libtorrent. `hooks` exposes
+# the commit hook `PoolStore::count_commits` counts the writer's fsyncs with.
+rusqlite = { workspace = true, features = ["hooks"] }
 
 # Parallel filesystem walk — a managed root can hold millions of files.
 jwalk = { workspace = true }

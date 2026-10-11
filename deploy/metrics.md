@@ -11,7 +11,11 @@ table should hold.
   `each vpn profile` and `each natpmp profile` narrow that.
 - **Present** — when the series first exists. `from boot, at 0` series are
   written at zero for every instance and every label value before the alert
-  loop starts, so `increase()` sees their first event. `from boot: …` series
+  loop starts, so `increase()` sees an event that follows the first scrape.
+  What a boot counts comes before any scrape, so it is already in the first
+  sample; the `torrentd_boot_*` gauges hold what each such counter an alert
+  reads had counted at that first scrape (`torrentd_boot_disk_errors`, like
+  the counter it mirrors, only for what was counted). `from boot: …` series
   are written with their real starting value by the code that owns them, for
   the instances named. `on first event` series appear when something first
   happens; the alert rules that read one also match its appearance.
@@ -28,6 +32,7 @@ hold.
 | --- | --- | --- | --- | --- | --- |
 | `torrentd_torrents_added_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents a session accepted. |
 | `torrentd_torrents_removed_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents removed from a session. |
+| `torrentd_torrent_remove_cleanup_errors_total` | counter | `profile_id`; `store`: `resume`, `torrent`, `tombstone` | each profile | from boot, at 0 | Failed attempts to delete a removed torrent's resume file or its .torrent and save path, or to write or clear the tombstone that stands until they are gone; the next boot deletes what a tombstone names rather than loading it. |
 | `torrentd_torrent_add_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Adds libtorrent rejected after accepting the call. |
 | `torrentd_torrents_finished_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that finished downloading. |
 | `torrentd_torrent_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that entered libtorrent's error state. |
@@ -41,12 +46,15 @@ hold.
 | `torrentd_resume_save_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | save_resume_data requests libtorrent failed. |
 | `torrentd_resume_save_dispatch_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | save_resume_data requests that failed before reaching libtorrent. |
 | `torrentd_listen_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | Listen sockets that failed. |
-| `torrentd_listen_failure_active` | gauge | `profile_id` | each profile | from boot, at 0 | 1 while the profile's listen socket is failed. |
+| `torrentd_listen_failure_active` | gauge | `profile_id` | each profile | from boot, at 0 | 1 while any of the profile's listen sockets is failed (one socket per `listen_interfaces` endpoint), 0 once each has come up or a socket is up on its address at another port. |
+| `torrentd_listen_accept_errors_total` | counter | `profile_id`; `errno`: `EMFILE` | each profile | from boot, at 0 | Accepts on a listen socket that ran out of file descriptors; libtorrent accepts again at once and keeps listening, first dropping a peer and lowering `connections_limit` while that limit is above 10 and a torrent has a peer to drop. Not a listen failure. |
 | `torrentd_disk_error_retry_attempts_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents the disk-error retry timer resumed to clear a libtorrent error. |
 | `torrentd_disk_error_retry_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Retry-timer resumes that failed. |
 | `torrentd_alert_queue_overflows_total` | counter | `profile_id` | each profile | from boot, at 0 | Times libtorrent's alert queue overflowed and dropped alerts. |
+| `torrentd_alert_translate_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Alerts libtorrent posted that the daemon dropped because it could not translate them; each may be a torrent's removal or a resume save's answer the daemon never saw. |
 | `torrentd_resume_saves_requeued_total` | counter | `profile_id` | each profile | from boot, at 0 | Resume saves asked for again because an overflow of this profile's alert queue may have dropped their answer. |
-| `torrentd_tracker_alerts_total` | counter | `profile_id`; `kind`: `error`, `reply`, `warning`, `scrape_failed` | each profile | from boot, at 0 | Tracker announce errors, successful announces (reply), tracker warnings, and scrape failures. |
+| `torrentd_removals_reconciled_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrent removals settled because an overflow of this profile's alert queue dropped torrent-removed alerts and the session no longer held the torrent: its state-map entry dropped and its files deleted. The torrent's own alert may have been lost or only late; a late one is counted again in torrentd_torrents_removed_total. |
+| `torrentd_tracker_alerts_total` | counter | `profile_id`; `kind`: `error`, `reply`, `warning`, `scrape_failed`, `stopped` | each profile | from boot, at 0 | Tracker announce errors, successful announces (reply), tracker warnings, scrape failures, and announces that failed because the torrent was stopping (stopped): paused, fenced, removed, or the announce cancelled. |
 | `torrentd_session_alerts_total` | counter | `profile_id`; `kind`: `portmap_error`, `udp_error`, `fastresume_rejected`, `performance_warning` | each profile | from boot, at 0 | Port-mapping and UDP socket errors, rejected fast-resume data, and performance warnings. |
 | `torrentd_torrent_file_persist_errors_total` | counter | `profile_id`; `source`: `metadata`, `api` | each profile | from boot, at 0 | .torrent files, or the save paths recorded beside them, that could not be written: magnet metadata, or an API add. |
 | `torrentd_profile_assignment_registry_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Loads and adds refused because the assignment registry disagreed or could not be written. |
@@ -56,6 +64,27 @@ hold.
 | `torrentd_boot_torrent_load_failures` | gauge | `profile_id`; `source`: `resume_add`, `torrent_read`, `torrent_dir_add`, `resume_file`, `torrent_file` | each profile | from boot: always | Torrents the boot scans could not load: a resume add that failed, a .torrent that could not be read, a torrent-dir add that failed, or a resume or torrent-dir file the scan could not read and skipped. |
 | `torrentd_profile_unloaded_registry_torrents` | gauge | `profile_id` | each profile | from boot: live profiles | Torrents the assignment registry claims for the profile that no boot scan loaded. |
 | `torrentd_boot_save_path_fallbacks_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents the boot torrent-dir scan placed at default_save_path because no usable save path was recorded beside their .torrent. |
+| `torrentd_boot_registry_errors` | gauge | `profile_id` | each profile | from boot: always | profile_assignment_registry_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_alert_queue_overflows` | gauge | `profile_id` | each profile | from boot: always | alert_queue_overflows_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_alert_translate_errors` | gauge | `profile_id` | each profile | from boot: always | alert_translate_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_session_alerts` | gauge | `profile_id`; `kind`: `portmap_error`, `udp_error`, `fastresume_rejected` | each profile | from boot: always | session_alerts_total for these kinds as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_store_write_errors` | gauge | `store`: `registry`, `pool_index` | daemon | from boot: always | store_write_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_dir_fsync_errors` | gauge | — | daemon | from boot: always | dir_fsync_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_torrent_add_errors` | gauge | `profile_id` | each profile | from boot: always | torrent_add_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_torrent_errors` | gauge | `profile_id` | each profile | from boot: always | torrent_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_resume_write_errors` | gauge | `profile_id` | each profile | from boot: always | resume_write_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_tracker_alerts` | gauge | `profile_id`; `kind`: `warning`, `scrape_failed` | each profile | from boot: always | tracker_alerts_total for these kinds as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_disk_errors` | gauge | `profile_id`; `op` | each profile | on first event | disk_errors_total as of the first scrape, for each operation the boot counted one under; fixed for the life of the process. |
+| `torrentd_boot_resume_save_failures` | gauge | `profile_id` | each profile | from boot: always | resume_save_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_resume_save_dispatch_errors` | gauge | `profile_id` | each profile | from boot: always | resume_save_dispatch_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_torrent_file_persist_errors` | gauge | `profile_id`; `source`: `metadata`, `api` | each profile | from boot: always | torrent_file_persist_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_fence_pause_errors` | gauge | `profile_id` | each profile | from boot: always | profile_fence_pause_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_disk_error_retry_errors` | gauge | `profile_id` | each profile | from boot: always | disk_error_retry_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_storage_move_failures` | gauge | `profile_id` | each profile | from boot: always | storage_move_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_pool_plan_failures` | gauge | `kind`: `step_failed`, `index_diverged`, `resume_failed`, `redrive_timed_out` | daemon | from boot: always | pool_plan_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_torrent_remove_cleanup_errors` | gauge | `profile_id`; `store`: `resume`, `torrent`, `tombstone` | each profile | from boot: always | torrent_remove_cleanup_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_pool_verify_failed` | gauge | — | daemon | from boot: always | pool_verify_failed_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_metrics_dropped_samples` | gauge | `reason`: `registration`, `labels` | daemon | from boot: always | metrics_dropped_samples_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |
@@ -74,6 +103,7 @@ hold.
 | `torrentd_profile_vpn_tunnel_ip_changes_total` | counter | `profile_id` | each vpn profile | from boot: live vpn profiles | Tunnel address losses or changes. |
 | `torrentd_profile_vpn_fenced_total` | counter | `profile_id`; `reason`: `ip_lost_or_changed`, `route_mismatch`, `handshake_stale`, `no_handshake`, `kill_switch` | each vpn profile | from boot: live vpn profiles | Times the VPN monitor fenced the profile, by reason; kill_switch when the kill-switch watch fenced it because the nftables table was missing or drifted. |
 | `torrentd_profile_vpn_handshake_probe_ok` | gauge | `profile_id` | each vpn profile | from boot: live wireguard profiles | 1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or unprivileged). |
+| `torrentd_profile_vpn_transfer_probe_ok` | gauge | `profile_id` | each vpn profile | from boot: live wireguard profiles | 1 while the WireGuard transfer probe (wg show transfer) runs; 0 when it cannot, and an aged handshake is not judged on the link's byte counters. |
 | `torrentd_profile_vpn_route_probe_ok` | gauge | `profile_id` | each vpn profile | from boot: live vpn profiles | 1 while the route probe (ip route get from the tunnel address) runs; 0 when it cannot, or is not asked because the address probe cannot run, and the tunnel's routing is not being checked. |
 | `torrentd_profile_vpn_addr_probe_ok` | gauge | `profile_id` | each vpn profile | from boot: live vpn profiles | 1 while the address probe (ip addr show on the tunnel interface) runs; 0 when ip cannot be run or times out, and the tunnel's address and routing are not being checked. |
 | `torrentd_profile_vpn_handshake_age_seconds` | gauge | `profile_id` | each vpn profile | on first event | Age of the last WireGuard handshake. |
@@ -90,6 +120,7 @@ hold.
 | `torrentd_task_up` | gauge | `task`: `vpn_monitor`, `port_forward_monitor`, `reload`, `verify_queue`, `kill_switch_watch` | daemon | from boot: always | 1 while a supervised background task runs; 0 once it has exited or panicked. Only the tasks this configuration starts are present. |
 | `torrentd_auth_login_failures_total` | counter | `reason`: `bad_password`, `throttled`, `verification_budget` | daemon | from boot, at 0 | Refused logins: a wrong password, a client locked out by the throttle, or the daemon-wide verification budget spent. |
 | `torrentd_auth_token_scope_denials_total` | counter | — | daemon | from boot, at 0 | Requests carrying a valid token without the scope the route needs. |
+| `torrentd_auth_cross_site_refusals_total` | counter | `reason`: `host`, `sec_fetch_site`, `origin`, `content_type` | daemon | from boot, at 0 | Requests a daemon without [auth] refused as sent by a browser from another site, by the header that refused them: a Host neither loopback nor in allowed_hosts, a cross-site Sec-Fetch-Site, a foreign Origin, or a body type an HTML form can send. |
 | `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings` | daemon | from boot, at 0 | Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed. |
 | `torrentd_kill_switch_active` | gauge | — | daemon | from boot: always | 1 while the daemon holds the nftables kill switch installed. |
 | `torrentd_kill_switch_table_present` | gauge | — | daemon | from boot: kill switch on | 1 if the kill switch's nftables table was present and matched the rendered ruleset at the last check; 0 if it was missing or had drifted. |
@@ -97,12 +128,13 @@ hold.
 | `torrentd_kill_switch_lost_total` | counter | `outcome`: `reinstalled`, `lost` | daemon | from boot, at 0 | Times a runtime check found the kill switch's nftables table missing or drifted, by whether the one reinstall checked intact (reinstalled) or not (lost). Each loss counts once; the checks that repeat while it stays lost do not. |
 | `torrentd_last_shutdown_unsaved_resumes` | gauge | — | daemon | from boot: always | Resume saves the previous run's shutdown drain left unsaved; 0 if unknown. |
 | `torrentd_last_shutdown_kill_switch_removal_failed` | gauge | — | daemon | from boot: always | 1 if the previous run could not remove the kill switch on its way out. |
-| `torrentd_pool_plan_failures_total` | counter | `kind`: `step_failed`, `index_diverged`, `resume_failed` | daemon | from boot, at 0 | Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, or re-driving an interrupted plan failed. |
+| `torrentd_pool_plan_failures_total` | counter | `kind`: `step_failed`, `index_diverged`, `resume_failed`, `redrive_timed_out` | daemon | from boot, at 0 | Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, re-driving an interrupted plan failed, or the boot re-drive gave up waiting for the loaded torrents to reach the state map and left interrupted plans applying. |
 | `torrentd_pool_scan_errors_total` | counter | `kind`: `walk`, `stat`, `path`, `read`, `parse` | daemon | from boot, at 0 | Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or unparseable .torrent files. |
 | `torrentd_pool_verify_completed_total` | counter | — | daemon | from boot, at 0 | Adopted torrents that verified and are seeding. |
 | `torrentd_pool_verify_failed_total` | counter | — | daemon | from boot, at 0 | Adopted torrents whose verification failed or was dropped. |
-| `torrentd_pool_verify_queue_depth` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions waiting to verify. |
-| `torrentd_pool_verify_in_flight` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions verifying now. |
+| `torrentd_pool_recheck_dropped_total` | counter | `reason`: `not_loaded`, `paused`, `no_metadata`, `no_engine`, `start_failed` | daemon | from boot, at 0 | Re-hashes POST /v1/pool/verifications or POST /v1/torrents/{infohash}/recheck queued that the queue dropped instead of starting, by why: the torrent was no longer loaded, it was paused (by the operator, or because libtorrent refused its resume during a fence's lift and the lift has ended), it had no metadata, its profile had no session, or libtorrent refused to start the check. |
+| `torrentd_pool_verify_queue_depth` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions waiting to verify, and re-hashes POST /v1/pool/verifications or POST /v1/torrents/{infohash}/recheck queued that have not started. |
+| `torrentd_pool_verify_in_flight` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions verifying and queued re-hashes checking now, together bounded by [pool] max_concurrent_verify. The first check of a .torrent added with no resume data, a disk-error retry's check and a magnet's check once its metadata arrives are neither counted nor bounded. |
 | `torrentd_pool_index_profile_disagreements` | gauge | — | daemon | from boot: pool configured | Torrents whose pool-index profile disagrees with the assignment registry at boot. |
 | `torrentd_dir_fsync_errors_total` | counter | — | daemon | from boot, at 0 | Directory fsyncs after a rename that failed, every one rather than only the logged first; the renamed file is on disk, but a power loss may revert its name. |
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |

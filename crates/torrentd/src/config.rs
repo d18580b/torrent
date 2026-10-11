@@ -39,17 +39,127 @@ impl LogLevel {
     }
 }
 
+/// Where the control API listens: a TCP address, or a unix socket written
+/// `unix:/run/torrentd/api.sock`.
+///
+/// A TCP port on loopback is reachable by every uid on the host, and while
+/// the daemon is down any of them can bind it and receive the next client's
+/// credentials. A unix socket is reachable only by those its file mode and
+/// group admit, and its path cannot be taken over by a user who cannot write
+/// to its directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HttpListen {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+/// What a `unix:` value is written with.
+const UNIX_PREFIX: &str = "unix:";
+
+/// The longest socket path the kernel binds: `sun_path` is 108 bytes on
+/// Linux, one of them the terminating NUL.
+const MAX_UNIX_PATH_BYTES: usize = 107;
+
+impl HttpListen {
+    /// The TCP address, when this is one.
+    pub fn tcp(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Tcp(addr) => Some(*addr),
+            Self::Unix(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for HttpListen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(addr) => write!(f, "{addr}"),
+            Self::Unix(path) => write!(f, "{UNIX_PREFIX}{}", path.display()),
+        }
+    }
+}
+
+impl std::str::FromStr for HttpListen {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(path) = s.strip_prefix(UNIX_PREFIX) {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "{s:?} names a relative socket path; write an absolute one, as in \
+                     \"unix:/run/torrentd/api.sock\""
+                ));
+            }
+            // The daemon binds the socket first at a staging path beside this
+            // one, which is longer: that is the path the kernel must accept.
+            let Some((_, staged)) = crate::api_socket::staging_paths(&path, u32::MAX) else {
+                return Err(format!("{s:?} names a directory, not a socket file"));
+            };
+            if staged.as_os_str().len() > MAX_UNIX_PATH_BYTES {
+                let longest =
+                    MAX_UNIX_PATH_BYTES - (staged.as_os_str().len() - path.as_os_str().len());
+                return Err(format!(
+                    "{s:?} is longer than the {longest} bytes a socket path may be here: the \
+                     daemon binds it first at a staging path beside it, and a unix socket path \
+                     may be at most {MAX_UNIX_PATH_BYTES} bytes"
+                ));
+            }
+            return Ok(Self::Unix(path));
+        }
+        s.parse::<SocketAddr>().map(Self::Tcp).map_err(|_| {
+            format!(
+                "{s:?} is neither an IP address and port (\"127.0.0.1:8080\") nor a unix \
+                 socket (\"unix:/run/torrentd/api.sock\")"
+            )
+        })
+    }
+}
+
+impl Serialize for HttpListen {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for HttpListen {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The mode a `unix:` socket is created with when `http_socket_mode` is
+/// absent: the daemon's user and its group, nobody else.
+pub const DEFAULT_HTTP_SOCKET_MODE: u32 = 0o660;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub default_save_path: PathBuf,
     pub resume_dir: PathBuf,
     pub torrent_dir: PathBuf,
-    /// Where the control API listens. Defaults to loopback, the only address
-    /// safe without `[auth]`; inside a network namespace (a container) it has
-    /// to be set to a routable address for the published port to reach it.
+    /// Where the control API listens. Defaults to loopback, the only TCP
+    /// address safe without `[auth]`; inside a network namespace (a
+    /// container) it has to be set to a routable address for the published
+    /// port to reach it. `unix:/path` serves it on a unix socket instead, and
+    /// on no TCP port at all.
     #[serde(default = "Config::default_http_listen")]
-    pub http_listen: SocketAddr,
+    pub http_listen: HttpListen,
+
+    /// Permission bits a `unix:` `http_listen` socket is given, written as an
+    /// octal TOML integer (`0o660`). Default [`DEFAULT_HTTP_SOCKET_MODE`].
+    /// Connecting takes write permission, so these bits are who may call the
+    /// API. Refused beside a TCP `http_listen`, where nothing reads it.
+    #[serde(default)]
+    pub http_socket_mode: Option<u32>,
+
+    /// The group a `unix:` `http_listen` socket is given, by name or number,
+    /// so its members reach the API through the group bits of
+    /// `http_socket_mode`. Absent, the socket keeps the daemon's own group.
+    /// Refused beside a TCP `http_listen`.
+    #[serde(default)]
+    pub http_socket_group: Option<String>,
 
     /// Peers whose forwarding headers are believed, as IPs or CIDR blocks:
     /// the address the reverse proxy connects from, and only that, since
@@ -64,6 +174,14 @@ pub struct Config {
     /// available — but it has to be typed, never arrived at by omission.
     #[serde(default)]
     pub allow_unauthenticated: bool,
+
+    /// Host names, beyond loopback, that a daemon with
+    /// `allow_unauthenticated` answers to: the names a reverse proxy in front
+    /// of it passes through as `Host`. A request naming any other `Host` is
+    /// refused, which is what stops a DNS-rebound page from reading the API.
+    /// Refused beside `[auth]`, where nothing reads it.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
 
@@ -154,9 +272,10 @@ pub struct PoolConfig {
     #[serde(default)]
     pub db_path: Option<PathBuf>,
 
-    /// How many torrents may be hashing at once during a bulk adopt. Adopting
-    /// a large subtree otherwise saturates the disk and starves whatever is
-    /// already seeding.
+    /// How many torrents may be hashing at once, adoptions' verifications and
+    /// `POST /v1/pool/verifications` re-hashes together. Adopting a large
+    /// subtree, or re-hashing a library, otherwise saturates the disk and
+    /// starves whatever is already seeding.
     #[serde(default = "PoolConfig::default_max_concurrent_verify")]
     pub max_concurrent_verify: usize,
 
@@ -202,8 +321,13 @@ fn is_json(p: &Path) -> bool {
 const TOP_LEVEL_FINGERPRINT: &str = "top-level peer_fingerprint";
 
 impl Config {
-    fn default_http_listen() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 8080))
+    fn default_http_listen() -> HttpListen {
+        HttpListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 8080)))
+    }
+
+    /// The mode a `unix:` `http_listen` socket is created with.
+    pub fn http_socket_mode(&self) -> u32 {
+        self.http_socket_mode.unwrap_or(DEFAULT_HTTP_SOCKET_MODE)
     }
 
     fn default_log_level() -> LogLevel {
@@ -270,6 +394,14 @@ impl Config {
                      `allow_unauthenticated` from the config."
                 );
             }
+            if !self.allowed_hosts.is_empty() {
+                anyhow::bail!(
+                    "[auth] is configured and allowed_hosts is set as well. allowed_hosts \
+                     only widens which Host names a daemon without [auth] answers to; a \
+                     daemon with [auth] answers to any, because a page cannot present its \
+                     token. Delete `allowed_hosts` from the config."
+                );
+            }
             return Ok(());
         }
         if !self.allow_unauthenticated {
@@ -283,9 +415,28 @@ impl Config {
                 listen = self.http_listen,
             );
         }
+        let addr = match &self.http_listen {
+            HttpListen::Tcp(addr) => *addr,
+            // A socket is reached by whoever its mode admits, so a mode that
+            // admits every uid is the unix form of a routable bind.
+            HttpListen::Unix(_) => {
+                let mode = self.http_socket_mode();
+                if mode & 0o002 != 0 {
+                    anyhow::bail!(
+                        "allow_unauthenticated = true with http_listen = {listen} and \
+                         http_socket_mode = {mode:#o}, which lets every user on the host \
+                         connect. That is an unauthenticated API that mutates state, open \
+                         to all of them. Drop the \"other\" write bit (0o660, with \
+                         http_socket_group naming who may call it), or configure [auth].",
+                        listen = self.http_listen,
+                    );
+                }
+                return Ok(());
+            }
+        };
         // `::ffff:127.0.0.1` is loopback too; `Ipv6Addr::is_loopback` says
         // so only of `::1`.
-        let listen_ip = match self.http_listen.ip() {
+        let listen_ip = match addr.ip() {
             std::net::IpAddr::V6(v6) => v6
                 .to_ipv4_mapped()
                 .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
@@ -328,11 +479,14 @@ impl Config {
         self.validate_effective_store_dirs()
             .context("[[profile]] validation failed")?;
         self.validate_http_listen_port()?;
+        self.validate_http_socket()?;
 
         // Not gated on `check_auth_posture`: a malformed or `/0` entry is a
         // refusal for operator tools too.
         crate::http::forwarded::TrustedProxies::parse(&self.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
+        crate::http::security::HostAllowlist::parse(&self.allowed_hosts)
+            .map_err(|e| anyhow::anyhow!("allowed_hosts: {e}"))?;
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -409,6 +563,11 @@ impl Config {
                     }
                 }
             }
+            // Canonicalisation resolves symlinks, not bind mounts: the same
+            // directory reached through two mount points passes the lexical
+            // check above and is indexed twice all the same.
+            let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok();
+            check_roots_do_not_alias(&resolved, mountinfo.as_deref())?;
 
             // The daemon's own state must not sit inside a managed root.
             // Nothing in the library claims those files, so they are orphans by
@@ -471,7 +630,10 @@ impl Config {
             resume_dir: new_resume_dir,
             torrent_dir: new_torrent_dir,
             http_listen: new_http_listen,
+            http_socket_mode: new_http_socket_mode,
+            http_socket_group: new_http_socket_group,
             allow_unauthenticated: new_allow_unauthenticated,
+            allowed_hosts: new_allowed_hosts,
             log_level: new_log_level,
             registry_path: new_registry_path,
             connections_limit: new_connections_limit,
@@ -548,14 +710,26 @@ impl Config {
         if old.user_agent != *new_user_agent {
             d.non_reloadable_changes.push("user_agent");
         }
+        // Restart-only by decision (#209): the authenticator is built once at
+        // startup, so a `[[auth.token]]` removed here keeps authenticating
+        // until the daemon restarts, and the reload pump says so.
         if old.auth != *new_auth {
             d.non_reloadable_changes.push("auth");
         }
         if old.allow_unauthenticated != *new_allow_unauthenticated {
             d.non_reloadable_changes.push("allow_unauthenticated");
         }
+        if old.allowed_hosts != *new_allowed_hosts {
+            d.non_reloadable_changes.push("allowed_hosts");
+        }
         if old.http_listen != *new_http_listen {
             d.non_reloadable_changes.push("http_listen");
+        }
+        if old.http_socket_mode != *new_http_socket_mode {
+            d.non_reloadable_changes.push("http_socket_mode");
+        }
+        if old.http_socket_group != *new_http_socket_group {
+            d.non_reloadable_changes.push("http_socket_group");
         }
         if old.trusted_proxies != *new_trusted_proxies {
             d.non_reloadable_changes.push("trusted_proxies");
@@ -816,11 +990,49 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse a socket key beside a TCP `http_listen`, where it would be
+    /// silently inert, a mode with bits beyond `0o777`, and an empty group.
+    fn validate_http_socket(&self) -> anyhow::Result<()> {
+        if let HttpListen::Tcp(addr) = self.http_listen {
+            for (key, set) in [
+                ("http_socket_mode", self.http_socket_mode.is_some()),
+                ("http_socket_group", self.http_socket_group.is_some()),
+            ] {
+                if set {
+                    anyhow::bail!(
+                        "{key} is set, but http_listen = {addr} is a TCP address, and {key} \
+                         applies only to a unix socket (http_listen = \
+                         \"unix:/run/torrentd/api.sock\"). Delete {key}, or move \
+                         http_listen to a socket."
+                    );
+                }
+            }
+        }
+        if let Some(mode) = self.http_socket_mode {
+            if mode & !0o777 != 0 {
+                anyhow::bail!(
+                    "http_socket_mode = {mode:#o} sets bits beyond permission bits; write it \
+                     as an octal integer no larger than 0o777, as in 0o660"
+                );
+            }
+        }
+        if self
+            .http_socket_group
+            .as_deref()
+            .is_some_and(|g| g.trim().is_empty())
+        {
+            anyhow::bail!("http_socket_group is empty; name a group, or delete the key");
+        }
+        Ok(())
+    }
+
     /// Refuse an `http_listen` port a profile's session also listens on: the
     /// session binds first and the HTTP listener then fails. Compared on the
     /// port alone, since a vpn profile's address is known only at runtime.
     fn validate_http_listen_port(&self) -> anyhow::Result<()> {
-        let port = self.http_listen.port();
+        let Some(port) = self.http_listen.tcp().map(|a| a.port()) else {
+            return Ok(());
+        };
         if let Some(p) = self
             .profile
             .iter()
@@ -1008,6 +1220,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
             resume_dir,
             torrent_dir,
             allowed_tracker_domains,
+            allowed_tracker_urls,
             upload_rate_limit,
         } = a;
         let ProfileConfig {
@@ -1018,6 +1231,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
             resume_dir: b_resume_dir,
             torrent_dir: b_torrent_dir,
             allowed_tracker_domains: b_allowed_tracker_domains,
+            allowed_tracker_urls: b_allowed_tracker_urls,
             upload_rate_limit: b_upload_rate_limit,
         } = b;
         // Compared whole: which tunnel, which port, whether DHT runs.
@@ -1040,6 +1254,12 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         field(
             "allowed_tracker_domains",
             allowed_tracker_domains != b_allowed_tracker_domains,
+            NonIdentity,
+        );
+        // Named, never shown: each entry holds a passkey.
+        field(
+            "allowed_tracker_urls",
+            allowed_tracker_urls != b_allowed_tracker_urls,
             NonIdentity,
         );
     }
@@ -1164,7 +1384,10 @@ impl Config {
             resume_dir: dir.join("resume"),
             torrent_dir: dir.join("torrents"),
             http_listen: Self::default_http_listen(),
+            http_socket_mode: None,
+            http_socket_group: None,
             allow_unauthenticated: true,
+            allowed_hosts: vec![],
             log_level: Self::default_log_level(),
             registry_path: None,
             connections_limit: None,
@@ -1192,6 +1415,155 @@ impl Config {
             trusted_proxies: vec![],
         }
     }
+}
+
+/// Refuse two `[pool] roots` that reach the same files by different paths,
+/// which the lexical roots-must-not-nest check cannot see.
+///
+/// Two independent tests, either of which refuses:
+///
+/// 1. **Ancestor chain.** Neither root's `(st_dev, st_ino)` may be the
+///    identity of the other root or of any directory above it. That catches a
+///    root which is a bind mount of the other root or of one of its
+///    ancestors, without reading the mount table.
+/// 2. **Mount table.** Each root is located on its filesystem through
+///    `mountinfo` (`/proc/self/mountinfo`'s text): the mount it sits on gives
+///    the device and the directory of that filesystem mounted there, so the
+///    root's path *within the filesystem* follows. Two roots on one device
+///    whose filesystem paths nest are one tree seen twice — a bind mount of a
+///    descendant, which the ancestor chain misses, or two container volumes
+///    taken from nested host directories.
+///
+/// A root that cannot be stat'ed is skipped by the first test, and the second
+/// is skipped where `mountinfo` is `None`. FUSE union views (shfs, mergerfs)
+/// sit on their own device with their own inode numbers, so neither test can
+/// relate one to its branches. The delete step's `(dev, ino)` check does not
+/// cover them either: a file seen through the view carries the view's device,
+/// which never equals the branch file's. That case is not covered;
+/// `docs/operations.md` forbids listing a view beside its branches.
+fn check_roots_do_not_alias(roots: &[PathBuf], mountinfo: Option<&str>) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let identity = |p: &Path| fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    for (i, a) in roots.iter().enumerate() {
+        for (j, b) in roots.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let Some(b_id) = identity(b) else { continue };
+            if let Some(same) = a.ancestors().find(|anc| identity(anc) == Some(b_id)) {
+                anyhow::bail!(
+                    "[pool] roots alias the same files: {} is {} reached by another path \
+                     (a bind mount?), so {} sits inside it. List one of them, not both",
+                    b.display(),
+                    same.display(),
+                    a.display(),
+                );
+            }
+        }
+    }
+
+    let Some(mountinfo) = mountinfo else {
+        return Ok(());
+    };
+    let mounts = parse_mountinfo(mountinfo);
+    let located: Vec<Option<(&str, PathBuf)>> = roots
+        .iter()
+        .map(|r| locate_on_filesystem(&mounts, r))
+        .collect();
+    for (i, a) in located.iter().enumerate() {
+        for (j, b) in located.iter().enumerate().skip(i + 1) {
+            let (Some((dev_a, fs_a)), Some((dev_b, fs_b))) = (a, b) else {
+                continue;
+            };
+            if dev_a == dev_b && (fs_a.starts_with(fs_b) || fs_b.starts_with(fs_a)) {
+                anyhow::bail!(
+                    "[pool] roots alias the same files: {} and {} are {} and {} of one \
+                     filesystem (device {dev_a}), reached through different mounts. \
+                     List one of them, not both",
+                    roots[i].display(),
+                    roots[j].display(),
+                    fs_a.display(),
+                    fs_b.display(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One line of `/proc/self/mountinfo`: the device (`major:minor`), the
+/// directory of that filesystem mounted here, and where it is mounted.
+#[derive(Debug)]
+struct MountEntry<'a> {
+    dev: &'a str,
+    fs_root: PathBuf,
+    mount_point: PathBuf,
+}
+
+/// Parse `mountinfo`'s fields 3-5, skipping any line too short to carry them.
+fn parse_mountinfo(text: &str) -> Vec<MountEntry<'_>> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split(' ');
+            let dev = f.nth(2)?;
+            let fs_root = f.next()?;
+            let mount_point = f.next()?;
+            Some(MountEntry {
+                dev,
+                fs_root: PathBuf::from(unescape_mountinfo(fs_root)),
+                mount_point: PathBuf::from(unescape_mountinfo(mount_point)),
+            })
+        })
+        .collect()
+}
+
+/// Undo the kernel's octal escapes (`\040` for a space, and so on) in a
+/// `mountinfo` path field.
+fn unescape_mountinfo(field: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes.get(i + 1..i + 4).and_then(|d| {
+            d.iter()
+                .all(|c| (b'0'..=b'7').contains(c))
+                .then(|| u8::from_str_radix(std::str::from_utf8(d).ok()?, 8).ok())
+                .flatten()
+        });
+        match (bytes[i], octal) {
+            (b'\\', Some(b)) => {
+                out.push(b);
+                i += 4;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
+/// The device `path` lives on and its path within that filesystem: the
+/// mount with the longest mount point above `path` (the last listed, where
+/// one is mounted over another), its mounted directory joined with the rest.
+fn locate_on_filesystem<'a>(mounts: &[MountEntry<'a>], path: &Path) -> Option<(&'a str, PathBuf)> {
+    let mut best: Option<&MountEntry<'a>> = None;
+    for m in mounts {
+        if path.starts_with(&m.mount_point)
+            && best.is_none_or(|b| {
+                m.mount_point.components().count() >= b.mount_point.components().count()
+            })
+        {
+            best = Some(m);
+        }
+    }
+    let m = best?;
+    let rest = path.strip_prefix(&m.mount_point).ok()?;
+    Some((m.dev, m.fs_root.join(rest)))
 }
 
 #[cfg(test)]
@@ -1304,6 +1676,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -1324,6 +1697,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -1445,7 +1819,7 @@ vpn_interface        = "wg1"
 listen_port          = 6882
 peer_fingerprint     = "-AA1000-"
 user_agent           = "ua-b"
-allowed_tracker_domains = ["t.example"]
+allowed_tracker_domains = ["u.example"]
 "#
         );
         let p = write_cfg(dir.path(), &body);
@@ -1905,6 +2279,54 @@ listen_interfaces = "eth0:6882"
         }
     }
 
+    /// The `"..."` value of a `key = "..."` line, commented or not. `None` for
+    /// any other line, including a longer key that `key` is a prefix of.
+    fn sample_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let rest = line.trim_start_matches(['#', ' ']).strip_prefix(key)?;
+        let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        Some(&rest[..rest.find('"')?])
+    }
+
+    #[test]
+    fn every_sample_identity_names_a_libtorrent_based_client() {
+        // Only the peer-id prefix and the user agent change; the rest of the
+        // peer id, the extension handshake and the announces stay
+        // libtorrent's. A Transmission identity on that wire is one a tracker
+        // can tell is spoofed, so the samples name only clients built on
+        // libtorrent, each prefix beside its own client's user agent. The
+        // scan covers commented lines too: an example the operator uncomments
+        // is never parsed before then.
+        const LIBTORRENT_CLIENTS: [(&str, &str); 2] = [("-qB", "qBittorrent/"), ("-DE", "Deluge/")];
+        for name in ["torrentd.sample.toml", "torrentd.multi-account.sample.toml"] {
+            let text = fs::read_to_string(sample(name)).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut seen = 0;
+            for (i, line) in lines.iter().enumerate() {
+                let Some(fp) = sample_value(line, "peer_fingerprint") else {
+                    continue;
+                };
+                seen += 1;
+                let (_, agent_prefix) = LIBTORRENT_CLIENTS
+                    .iter()
+                    .find(|(prefix, _)| fp.starts_with(prefix))
+                    .unwrap_or_else(|| {
+                        panic!("{name}:{}: {fp:?} is not a libtorrent-based client", i + 1)
+                    });
+                let agent = lines[i + 1..]
+                    .iter()
+                    .find_map(|l| sample_value(l, "user_agent"))
+                    .unwrap_or_else(|| panic!("{name}:{}: {fp:?} has no user_agent", i + 1));
+                assert!(
+                    agent.starts_with(agent_prefix),
+                    "{name}:{}: {fp:?} beside user agent {agent:?}",
+                    i + 1,
+                );
+            }
+            assert!(seen > 0, "{name} shows no peer_fingerprint at all");
+        }
+    }
+
     #[test]
     fn a_reload_does_not_overwrite_a_per_profile_upload_rate_limit() {
         // `startup.rs` applies a per-profile `upload_rate_limit` over the
@@ -2020,6 +2442,7 @@ listen_interfaces = "eth0:6882"
             resume_dir,
             torrent_dir,
             allowed_tracker_domains,
+            allowed_tracker_urls,
             upload_rate_limit,
         } = base;
         let with = |edit: &dyn Fn(&mut ProfileConfig)| {
@@ -2037,6 +2460,7 @@ listen_interfaces = "eth0:6882"
         let new_resume_dir = Some(PathBuf::from("/var/lib/torrentd/resume-public"));
         let new_torrent_dir = Some(PathBuf::from("/var/lib/torrentd/torrents-public"));
         let new_domains = vec!["tracker.example.com".to_string()];
+        let new_urls = vec!["https://tracker.example.com/PASS/".to_string()];
         let new_rate = Some(100_000);
         assert_ne!(network, &new_network);
         assert_ne!(peer_fingerprint, &new_fingerprint);
@@ -2044,6 +2468,7 @@ listen_interfaces = "eth0:6882"
         assert_ne!(resume_dir, &new_resume_dir);
         assert_ne!(torrent_dir, &new_torrent_dir);
         assert_ne!(allowed_tracker_domains, &new_domains);
+        assert_ne!(allowed_tracker_urls, &new_urls);
         assert_ne!(upload_rate_limit, &new_rate);
 
         use ProfileChangeKind::Identity;
@@ -2078,6 +2503,11 @@ listen_interfaces = "eth0:6882"
                 "allowed_tracker_domains",
                 NonIdentity,
                 with(&|p| p.allowed_tracker_domains = new_domains.clone()),
+            ),
+            (
+                "allowed_tracker_urls",
+                NonIdentity,
+                with(&|p| p.allowed_tracker_urls = new_urls.clone()),
             ),
             (
                 "upload_rate_limit",
@@ -2293,10 +2723,17 @@ upload_rate_limit = 0"#,
                 c.allow_unauthenticated = !c.allow_unauthenticated
             }),
             ("http_listen", |c| {
-                c.http_listen = SocketAddr::from(([127, 0, 0, 1], 9090))
+                c.http_listen = HttpListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 9090)))
+            }),
+            ("http_socket_mode", |c| c.http_socket_mode = Some(0o600)),
+            ("http_socket_group", |c| {
+                c.http_socket_group = Some("torrentd".into())
             }),
             ("trusted_proxies", |c| {
                 c.trusted_proxies = vec!["172.28.0.2".into()]
+            }),
+            ("allowed_hosts", |c| {
+                c.allowed_hosts = vec!["torrentd.example.com".into()]
             }),
             ("registry_path", |c| {
                 c.registry_path = Some("/var/lib/torrentd/assignments.json".into())
@@ -2328,6 +2765,36 @@ upload_rate_limit = 0"#,
             assert!(d.reloadable_changes.is_empty(), "{key}");
             assert!(d.profile_changes.is_empty(), "{key}");
         }
+    }
+
+    /// Removing one `[[auth.token]]` is the revocation an operator reaches
+    /// for, and it is an `[auth]` change like any other: reported as
+    /// needing a restart, and never applied.
+    #[test]
+    fn removing_one_static_token_is_a_non_reloadable_auth_change() {
+        use crate::auth::AuthConfig;
+        use crate::auth::Scope;
+        use crate::auth::TokenConfig;
+        let token = |name: &str, sha: char| TokenConfig {
+            name: name.into(),
+            sha256: sha.to_string().repeat(64),
+            scopes: vec![Scope::Read],
+        };
+        let auth = |token: Vec<TokenConfig>| AuthConfig {
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            session_ttl_secs: 43_200,
+            token,
+        };
+        let dir = tempdir().unwrap();
+        let mut a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        a.auth = Some(auth(vec![token("ci", 'a'), token("scrape", 'b')]));
+        let mut b = a.clone();
+        b.auth = Some(auth(vec![token("scrape", 'b')]));
+        let d = Config::diff(&a, &b);
+        assert!(!d.is_empty());
+        assert_eq!(d.non_reloadable_changes, vec!["auth"]);
+        assert!(d.reloadable_changes.is_empty(), "{d:?}");
+        assert!(d.profile_changes.is_empty(), "{d:?}");
     }
 
     #[test]
@@ -2482,6 +2949,57 @@ upload_rate_limit = 0"#,
         );
     }
 
+    /// `TOP_LEVEL`, with `allowed_hosts = [<hosts>]` after the opt-out.
+    fn top_level_allowing(hosts: &str) -> String {
+        TOP_LEVEL.replace(
+            "allow_unauthenticated = true\n",
+            &format!("allow_unauthenticated = true\nallowed_hosts = [{hosts}]\n"),
+        )
+    }
+
+    #[test]
+    fn allowed_hosts_takes_bare_names_and_addresses() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{}{ONE_HOST_PROFILE}",
+            top_level_allowing(r#""torrentd.example.com", "192.0.2.7", "[2001:db8::1]""#),
+        );
+        let cfg = Config::load(&write_cfg(dir.path(), &body)).unwrap();
+        assert_eq!(cfg.allowed_hosts.len(), 3);
+
+        for entry in [
+            r#""https://torrentd.example.com""#,
+            r#""torrentd.example.com:443""#,
+            r#""torrentd.example.com/v1""#,
+            r#""""#,
+        ] {
+            let msg = refusal(&format!("{}{ONE_HOST_PROFILE}", top_level_allowing(entry)));
+            assert!(msg.contains("allowed_hosts"), "{entry}: got: {msg}");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_alongside_configured_auth_is_refused() {
+        // Nothing reads it there, and left in place it reads as though the
+        // daemon confined its Host names.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{}{ONE_HOST_PROFILE}\n[auth]\npassword_hash = \"{}\"\n",
+            top_level_no_opt_out().replace(
+                "http_listen",
+                "allowed_hosts = [\"torrentd.example.com\"]\nhttp_listen"
+            ),
+            crate::auth::hash_password("hunter2").unwrap(),
+        );
+        assert!(body.contains("allowed_hosts = ["));
+        let msg = format!(
+            "{:#}",
+            Config::load(&write_cfg(dir.path(), &body)).unwrap_err()
+        );
+        assert!(msg.contains("allowed_hosts"), "got: {msg}");
+        assert!(msg.contains("Delete"), "got: {msg}");
+    }
+
     #[test]
     fn http_listen_defaults_to_loopback() {
         // The README claimed this default for a long time while the key was
@@ -2490,8 +3008,118 @@ upload_rate_limit = 0"#,
         let top = TOP_LEVEL.replace("http_listen = \"127.0.0.1:8080\"\n", "");
         let p = write_cfg(dir.path(), &format!("{top}{ONE_HOST_PROFILE}"));
         let cfg = Config::load(&p).unwrap();
-        assert!(cfg.http_listen.ip().is_loopback());
-        assert_eq!(cfg.http_listen.port(), 8080);
+        let addr = cfg.http_listen.tcp().expect("a TCP address by default");
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn a_unix_http_listen_parses_and_round_trips() {
+        let listen: HttpListen = "unix:/run/torrentd/api.sock".parse().unwrap();
+        assert_eq!(listen, HttpListen::Unix("/run/torrentd/api.sock".into()));
+        assert_eq!(listen.to_string(), "unix:/run/torrentd/api.sock");
+        assert_eq!(listen.tcp(), None);
+        let tcp: HttpListen = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(tcp.to_string(), "127.0.0.1:8080");
+
+        for bad in [
+            "unix:run/api.sock",
+            "unix:",
+            "localhost:8080",
+            "unix:/",
+            &format!("unix:/{}", "a".repeat(MAX_UNIX_PATH_BYTES)),
+        ] {
+            assert!(bad.parse::<HttpListen>().is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// Validation holds a socket path to the length of the staging path it is
+    /// bound at first, so a path `--check-config` accepts is one boot binds.
+    #[test]
+    fn a_unix_path_is_refused_when_its_staging_path_would_not_bind() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().as_os_str().len() + 1;
+        let accepted = (1..=MAX_UNIX_PATH_BYTES - base)
+            .rev()
+            .map(|n| dir.path().join("a".repeat(n)))
+            .find(|p| {
+                format!("unix:{}", p.display())
+                    .parse::<HttpListen>()
+                    .is_ok()
+            })
+            .expect("some path in a temp dir is short enough");
+        // The longest accepted path binds, and one byte more is refused.
+        let socket = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { crate::api_socket::bind(&accepted, 0o600, None).map(drop) });
+        socket.unwrap_or_else(|e| panic!("{} bytes: {e:#}", accepted.as_os_str().len()));
+        let longer = format!("unix:{}a", accepted.display());
+        let msg = longer.parse::<HttpListen>().unwrap_err();
+        assert!(msg.contains("staging path"), "{msg}");
+        // Without the staging allowance, a path the kernel accepts as is
+        // would have passed and failed at boot.
+        assert!(longer.len() - "unix:".len() <= MAX_UNIX_PATH_BYTES);
+    }
+
+    /// `TOP_LEVEL` with `http_listen` replaced by `listen`, and `extra` keys
+    /// after it, plus one host profile.
+    fn with_listen(dir: &Path, listen: &str, extra: &str) -> anyhow::Result<Config> {
+        let top = TOP_LEVEL.replace(
+            "http_listen = \"127.0.0.1:8080\"\n",
+            &format!("http_listen = \"{listen}\"\n{extra}"),
+        );
+        Config::load(&write_cfg(dir, &format!("{top}{ONE_HOST_PROFILE}")))
+    }
+
+    #[test]
+    fn a_unix_socket_is_local_enough_for_allow_unauthenticated_unless_everyone_may_connect() {
+        let dir = tempdir().unwrap();
+        assert!(TOP_LEVEL.contains("allow_unauthenticated = true"));
+        let cfg = with_listen(dir.path(), "unix:/run/torrentd/api.sock", "").unwrap();
+        assert_eq!(cfg.http_socket_mode(), DEFAULT_HTTP_SOCKET_MODE);
+        with_listen(
+            dir.path(),
+            "unix:/run/torrentd/api.sock",
+            "http_socket_mode = 0o660\nhttp_socket_group = \"torrentd\"\n",
+        )
+        .unwrap();
+
+        let msg = format!(
+            "{:#}",
+            with_listen(
+                dir.path(),
+                "unix:/run/torrentd/api.sock",
+                "http_socket_mode = 0o666\n"
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("every user on the host"), "got: {msg}");
+    }
+
+    #[test]
+    fn socket_keys_are_refused_beside_a_tcp_listen_and_checked_beside_a_socket() {
+        let dir = tempdir().unwrap();
+        for extra in [
+            "http_socket_mode = 0o660\n",
+            "http_socket_group = \"torrentd\"\n",
+        ] {
+            let msg = format!(
+                "{:#}",
+                with_listen(dir.path(), "127.0.0.1:8080", extra).unwrap_err()
+            );
+            assert!(
+                msg.contains("applies only to a unix socket"),
+                "{extra}: {msg}"
+            );
+        }
+        for extra in ["http_socket_mode = 0o4660\n", "http_socket_group = \" \"\n"] {
+            assert!(
+                with_listen(dir.path(), "unix:/run/torrentd/api.sock", extra).is_err(),
+                "{extra} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -2761,7 +3389,7 @@ upload_rate_limit = 0"#,
         let ovpn = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"openvpn\"\n\
                     vpn_config = \"/etc/openvpn/acct_b.conf\"\nvpn_interface = \"tun-b\"\n\
                     listen_port = 6892\npeer_fingerprint = \"-BB1000-\"\n\
-                    user_agent = \"ua-b\"\nallowed_tracker_domains = [\"t.example\"]\n";
+                    user_agent = \"ua-b\"\nallowed_tracker_domains = [\"u.example\"]\n";
 
         let body = format!("{TOP_LEVEL}\nnetwork_kill_switch = true\n\n{wg}\n{ovpn}");
         let msg = format!(
@@ -2776,6 +3404,57 @@ upload_rate_limit = 0"#,
         let body = format!("{TOP_LEVEL}\n{wg}\n{ovpn}");
         Config::load(&write_cfg(dir.path(), &body))
             .expect("an OpenVPN profile without the kill switch is accepted");
+    }
+
+    /// Issue 166: two accounts on one tracker. The domain lists alone cannot
+    /// tell them apart, so the load — and with it `--check-config` and a
+    /// reload — refuses them until each binds its account's announce URL, and
+    /// the refusal never echoes a passkey.
+    #[test]
+    fn two_accounts_on_one_tracker_are_refused_until_each_binds_its_passkey() {
+        let dir = tempdir().unwrap();
+        let account = |id: &str, n: u8, extra: &str| {
+            format!(
+                "[[profile]]\nid = \"{id}\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
+                 vpn_config = \"/etc/wireguard/wg{n}.conf\"\nvpn_interface = \"wg{n}\"\n\
+                 listen_port = 689{n}\npeer_fingerprint = \"-AA100{n}-\"\n\
+                 user_agent = \"ua-{n}\"\nallowed_tracker_domains = [\"tracker.example.com\"]\n\
+                 {extra}\n"
+            )
+        };
+        let load = |a: &str, b: &str| {
+            let body = format!(
+                "{TOP_LEVEL}\n{}\n{}",
+                account("acct_a", 1, a),
+                account("acct_b", 2, b)
+            );
+            Config::load(&write_cfg(dir.path(), &body)).map_err(|e| format!("{e:#}"))
+        };
+        let msg = load("", "").unwrap_err();
+        assert!(
+            msg.contains("acct_a")
+                && msg.contains("acct_b")
+                && msg.contains("allowed_tracker_urls"),
+            "got: {msg}"
+        );
+        let a = r#"allowed_tracker_urls = ["https://tracker.example.com/PASSKEY-A/"]"#;
+        let b = r#"allowed_tracker_urls = ["https://tracker.example.com/PASSKEY-B/"]"#;
+        load(a, "").unwrap_err();
+        load(a, b).expect("two accounts bound to their own passkeys are accepted");
+        let msg = load(a, a.replace("PASSKEY-A", "PASSKEY-A/x").as_str()).unwrap_err();
+        assert!(
+            msg.contains("overlap") && !msg.contains("PASSKEY"),
+            "got: {msg}"
+        );
+        let msg = load(
+            a,
+            r#"allowed_tracker_urls = ["tracker.example.com/PASSKEY-B/"]"#,
+        )
+        .unwrap_err();
+        assert!(
+            msg.contains("allowed_tracker_urls[0]") && !msg.contains("PASSKEY"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -3011,6 +3690,91 @@ library_dir = "{d}/library"
         assert!(msg.contains("must not nest"), "got: {msg}");
     }
 
+    /// A root whose `(st_dev, st_ino)` is an ancestor of another root is the
+    /// same tree, whatever its path. A bind mount needs privileges a test
+    /// lacks, so an uncanonicalised symlink stands in for the second path:
+    /// `metadata` follows it to the ancestor's identity just as it would see
+    /// through a bind mount.
+    #[test]
+    fn a_root_that_is_another_roots_ancestor_by_identity_is_refused() {
+        let dir = tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("inner")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&tree, &alias).unwrap();
+
+        let msg = check_roots_do_not_alias(&[tree.join("inner"), alias.clone()], None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("alias the same files"), "got: {msg}");
+        let msg = check_roots_do_not_alias(&[alias, tree.join("inner")], None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("alias the same files"), "got: {msg}");
+
+        // Siblings share an ancestor, which is not an alias.
+        std::fs::create_dir_all(tree.join("other")).unwrap();
+        check_roots_do_not_alias(&[tree.join("inner"), tree.join("other")], None)
+            .expect("sibling roots are allowed");
+    }
+
+    /// `/data/b` is a bind mount of `/srv/a`, a descendant of the root `/srv`:
+    /// no ancestor of either root has the other's identity, and only the
+    /// mount table relates them.
+    #[test]
+    fn a_bind_mount_of_a_directory_inside_another_root_is_refused() {
+        let mountinfo = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 22 8:1 /srv/a /data/b rw,relatime shared:1 - ext4 /dev/sda1 rw
+41 22 0:50 / /mnt/usb rw,relatime shared:9 - vfat /dev/sdb1 rw
+";
+        let roots = |a: &str, b: &str| [PathBuf::from(a), PathBuf::from(b)];
+        let msg = check_roots_do_not_alias(&roots("/srv", "/data/b"), Some(mountinfo))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("alias the same files"), "got: {msg}");
+        assert!(msg.contains("/srv/a"), "names the filesystem path: {msg}");
+        check_roots_do_not_alias(&roots("/data/b/x", "/srv/a"), Some(mountinfo))
+            .expect_err("a root inside the bind mount nests in the other");
+
+        // A sibling of the bound directory, and another device, are distinct.
+        check_roots_do_not_alias(&roots("/srv/c", "/data/b"), Some(mountinfo))
+            .expect("siblings on one filesystem are allowed");
+        check_roots_do_not_alias(&roots("/mnt/usb/media", "/media"), Some(mountinfo))
+            .expect("roots on different devices are allowed");
+    }
+
+    #[test]
+    fn mountinfo_paths_are_unescaped_and_the_deepest_mount_wins() {
+        let mountinfo = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+40 22 8:1 /my\\040disk /mnt/a\\040b rw - ext4 /dev/sda1 rw
+41 40 0:60 / /mnt/a\\040b/over rw - tmpfs tmpfs rw
+";
+        let mounts = parse_mountinfo(mountinfo);
+        let (dev, fs_path) = locate_on_filesystem(&mounts, Path::new("/mnt/a b/x")).unwrap();
+        assert_eq!((dev, fs_path), ("8:1", PathBuf::from("/my disk/x")));
+        let (dev, fs_path) = locate_on_filesystem(&mounts, Path::new("/mnt/a b/over/y")).unwrap();
+        assert_eq!((dev, fs_path), ("0:60", PathBuf::from("/y")));
+        check_roots_do_not_alias(
+            &[PathBuf::from("/my disk"), PathBuf::from("/mnt/a b/x")],
+            Some(mountinfo),
+        )
+        .expect_err("the escaped bind mount is seen through");
+    }
+
+    /// The real mount table, with two sibling roots, refuses nothing.
+    #[test]
+    fn sibling_roots_pass_against_this_hosts_mount_table() {
+        let dir = tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok();
+        let roots = [a.canonicalize().unwrap(), b.canonicalize().unwrap()];
+        check_roots_do_not_alias(&roots, mountinfo.as_deref()).expect("siblings are allowed");
+    }
+
     #[test]
     fn out_of_range_numbers_are_rejected_at_startup() {
         let dir = tempdir().unwrap();
@@ -3067,6 +3831,7 @@ library_dir = "{d}/library"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         };
         let msg = format!("{:#}", c.validate_http_listen_port().unwrap_err());

@@ -2,8 +2,9 @@
 //!
 //! Matching is `(relative path, size)` against a **candidate base** — the
 //! directory a torrent's relative paths hang off. A torrent a session serves
-//! tries the base it is recorded at first, and keeps it while it is complete:
-//! that is where the session reads from. Candidates otherwise come from three
+//! tries the save path that session reports first, then the base it is
+//! recorded at, and keeps the first that is complete: that is where the
+//! session reads from. Candidates otherwise come from three
 //! places, cheapest first:
 //!
 //! 1. The save path the previous client recorded in its `.fastresume`. On a
@@ -22,6 +23,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::path::PathBuf;
 
 use tracing::info;
 
@@ -44,6 +46,11 @@ pub struct MatchStats {
 
 /// What a torrent still marked drifted reads as after a rescan.
 const DRIFT_NOTE: &str = "on-disk stats changed since the last scan; needs verification";
+
+/// What a held `adopted` torrent whose payload the rescan found nowhere reads
+/// as. It stays `adopted`: a session still holds it.
+const HELD_MISSING_NOTE: &str =
+    "no payload found under any managed root; still adopted while a session holds it";
 
 /// One torrent's placement: which root and base directory its files resolve
 /// against, and how completely.
@@ -81,22 +88,39 @@ pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
 
 /// [`match_all`], where the caller knows what the sessions serve.
 ///
-/// `loaded` is the hex info-hashes every session holds. An `adopted` torrent
-/// in none of them, and with no owner recorded in the index, is held by
-/// nothing: it is demoted to the verdict its payload earns, so it can be
-/// adopted again. One the index still records an owner for keeps `adopted`:
-/// that profile may be offline, or its session may not have reported the
-/// torrent yet, and the owner record refuses other profiles either way.
+/// `loaded` maps the hex info-hash of every torrent a session holds to the
+/// `save_path` that session holds it at, or `None` where it could not be
+/// read. An `adopted` torrent in none of them, and with no owner recorded in
+/// the index, is held by nothing: it is demoted to the verdict its payload
+/// earns, so it can be adopted again. One the index still records an owner
+/// for keeps `adopted`: that profile may be offline, or its session may not
+/// have reported the torrent yet, and the owner record refuses other profiles
+/// either way.
+///
+/// A loaded torrent's session `save_path`, where it lies under a managed
+/// root, is tried before its recorded base and kept while it is complete:
+/// the session reads from there whatever the index recorded, and the two
+/// disagree after a crash before a resume save or a half-done move.
 pub fn match_all_serving(
     store: &mut PoolStore,
-    loaded: &HashSet<String>,
+    loaded: &HashMap<String, Option<PathBuf>>,
 ) -> Result<MatchStats, PoolError> {
     store.in_transaction(|store| match_all_inner(store, Some(loaded)))
 }
 
+/// `(root_id, base)` of `save_path` under the managed root holding it, or
+/// `None` outside every root. Configuration refuses nested roots, so at most
+/// one root holds it.
+fn base_under_roots(roots: &[(i64, PathBuf)], save_path: &Path) -> Option<(i64, String)> {
+    roots.iter().find_map(|(id, root)| {
+        let rel = save_path.strip_prefix(root).ok()?;
+        Some((*id, normalize(&rel.to_string_lossy())))
+    })
+}
+
 fn match_all_inner(
     store: &mut PoolStore,
-    loaded: Option<&HashSet<String>>,
+    loaded: Option<&HashMap<String, Option<PathBuf>>>,
 ) -> Result<MatchStats, PoolError> {
     let roots = store.roots()?;
     let torrents = store.torrents()?;
@@ -142,18 +166,34 @@ fn match_all_inner(
         // `torrentd pool scan`, or a boot scan before the sessions report —
         // and one whose profile is offline: `release_owner` clears it once
         // nothing holds the torrent.
+        //
+        // Where the session that holds it reports a save path under a managed
+        // root, that comes first: it is where the session actually reads
+        // from, and it parts from the recorded base after a crash before a
+        // resume save or a half-done move. The recorded base is next.
         let served = prior == Some(AdoptionState::Adopted)
             || t.profile.is_some()
-            || loaded.is_some_and(|l| l.contains(&t.infohash));
+            || loaded.is_some_and(|l| l.contains_key(&t.infohash));
         let recorded = if served {
             store.adoption_base(&t.infohash)?
         } else {
             None
         };
+        let session = loaded
+            .and_then(|l| l.get(&t.infohash))
+            .and_then(Option::as_deref)
+            .and_then(|sp| base_under_roots(&roots, sp));
+        // Where a held torrent that is no longer complete is recorded at.
+        let held_at = session.as_ref().or(recorded.as_ref());
+        let preferred: Vec<(i64, &str)> = session
+            .iter()
+            .chain(recorded.iter())
+            .map(|(r, b)| (*r, b.as_str()))
+            .collect();
         let search = search_placements(
             store,
             &roots,
-            recorded.as_ref().map(|(r, b)| (*r, b.as_str())),
+            &preferred,
             t.declared_save_path.as_deref(),
             &t.name,
             &files,
@@ -161,16 +201,21 @@ fn match_all_inner(
         let copies = search.complete.len();
         let best = search.best;
 
+        // Preserve an existing `adopted` verdict: matching runs on every
+        // rescan and must not relabel a torrent the daemon is seeding, whatever
+        // its payload now reads as. A root unmounted for maintenance, or files
+        // moved out from under a session, would otherwise turn it `missing`,
+        // then `matched` once they return, and the index would offer it for
+        // adoption while a session still serves it. One nothing holds any
+        // more is demoted, or adoption would refuse it for good.
+        let held = loaded.is_none_or(|l| l.contains_key(&t.infohash) || t.profile.is_some());
+        let keep_adopted = prior == Some(AdoptionState::Adopted) && held;
+
         match best {
             Some(p) if p.is_complete() => {
-                // Preserve an existing `adopted` verdict: matching runs on
-                // every rescan and must not demote a torrent the daemon is
-                // already seeding back to `matched`. One nothing holds any
-                // more is demoted, or adoption would refuse it for good.
-                let held = loaded.is_none_or(|l| l.contains(&t.infohash) || t.profile.is_some());
                 let state = if drift_at.is_some() {
                     AdoptionState::Drifted
-                } else if prior == Some(AdoptionState::Adopted) && held {
+                } else if keep_adopted {
                     AdoptionState::Adopted
                 } else {
                     AdoptionState::Matched
@@ -196,27 +241,48 @@ fn match_all_inner(
                 // Claim what did resolve, so a partially-present torrent still
                 // marks those bytes as spoken for and they are not offered up
                 // as orphans to delete.
+                //
+                // A held `adopted` torrent keeps its verdict and the base it
+                // is served from; the note says what the payload reads as,
+                // and the stats count it as partial, which is what it is.
                 store.replace_claims(&t.infohash, &p.claims)?;
+                let note = format!("{} of {} files present", p.resolved, p.total);
+                let (state, (root_id, base_rel)) = if keep_adopted {
+                    (
+                        AdoptionState::Adopted,
+                        held_at.map_or((p.root_id, p.base_rel.as_str()), |(r, b)| (*r, b.as_str())),
+                    )
+                } else {
+                    (AdoptionState::Partial, (p.root_id, p.base_rel.as_str()))
+                };
                 store.set_adoption(
                     &t.infohash,
-                    AdoptionState::Partial,
-                    Some(p.root_id),
-                    Some(&p.base_rel),
+                    state,
+                    Some(root_id),
+                    Some(base_rel),
                     None,
                     drift_at,
-                    Some(&format!("{} of {} files present", p.resolved, p.total)),
+                    Some(&note),
                 )?;
                 stats.partial += 1;
             }
             None => {
+                // A held `adopted` torrent keeps its verdict and the base it
+                // is served from, so the next rescan looks there first once
+                // the payload is back.
+                let (state, base, note) = if keep_adopted {
+                    (AdoptionState::Adopted, held_at, Some(HELD_MISSING_NOTE))
+                } else {
+                    (AdoptionState::Missing, None, None)
+                };
                 store.set_adoption(
                     &t.infohash,
-                    AdoptionState::Missing,
-                    None,
-                    None,
+                    state,
+                    base.map(|(r, _)| *r),
+                    base.map(|(_, b)| b.as_str()),
                     None,
                     drift_at,
-                    None,
+                    note,
                 )?;
                 stats.missing += 1;
             }
@@ -398,20 +464,20 @@ struct Search {
 
 /// Try every candidate base across every root.
 ///
-/// `preferred`, where given, is tried first and wins whenever it is complete.
-/// Every candidate is tried even after a complete one is found, because a
-/// second complete copy is something a delete plan has to know about: which
+/// `preferred` is tried first, in order, and the first of it that is complete
+/// wins. Every candidate is tried even after a complete one is found, because
+/// a second complete copy is something a delete plan has to know about: which
 /// of two identical copies a session reads from is not in the index.
 fn search_placements(
     store: &PoolStore,
-    roots: &[(i64, std::path::PathBuf)],
-    preferred: Option<(i64, &str)>,
+    roots: &[(i64, PathBuf)],
+    preferred: &[(i64, &str)],
     declared_save_path: Option<&str>,
     torrent_name: &str,
     files: &[TorrentFileRow],
 ) -> Result<Search, PoolError> {
     let mut candidates: Vec<(i64, String)> = Vec::new();
-    if let Some((root_id, base)) = preferred {
+    for &(root_id, base) in preferred {
         // A base recorded against a root no longer configured resolves
         // nothing; leave it out rather than look it up.
         if roots.iter().any(|(id, _)| *id == root_id) {
@@ -476,10 +542,11 @@ pub(crate) fn complete_copies(
     }
     let roots = store.roots()?;
     let recorded = store.adoption_base(&torrent.infohash)?;
+    let preferred: Vec<(i64, &str)> = recorded.iter().map(|(r, b)| (*r, b.as_str())).collect();
     Ok(search_placements(
         store,
         &roots,
-        recorded.as_ref().map(|(r, b)| (*r, b.as_str())),
+        &preferred,
         torrent.declared_save_path.as_deref(),
         &torrent.name,
         files,

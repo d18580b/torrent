@@ -355,6 +355,95 @@ mod tests {
         assert_eq!(b["profiles_failed"], 0);
     }
 
+    /// `docs/running.md`'s migration note tells an operator what to rewrite a
+    /// `/healthz` check to. It once named `all_profiles_fenced` as a key, which
+    /// this report has never had, so a check written from it never fired.
+    /// Every new name it gives must be a key of the serialised report or a
+    /// `reason` value, and it must name every profile count the report has.
+    #[test]
+    fn the_running_docs_healthz_migration_note_names_real_report_keys() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/running.md"
+        ))
+        .unwrap();
+        let start = doc
+            .find("`/healthz`'s path is unchanged")
+            .expect("running.md no longer has the /healthz migration note");
+        let note = &doc[start..];
+        let note = &note[..note.find("\n\n").unwrap_or(note.len())];
+
+        let report = serde_json::to_value(HealthReport {
+            ok: true,
+            reason: None,
+            profiles: 0,
+            profiles_fenced: 0,
+            profiles_failed: 0,
+            heartbeat_age_secs: None,
+        })
+        .unwrap();
+        let keys: Vec<&str> = report
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let reasons: Vec<String> = [
+            HealthReason::NoSessions,
+            HealthReason::AlertLoopStalled,
+            HealthReason::AllProfilesFenced,
+        ]
+        .iter()
+        .map(|r| {
+            serde_json::to_value(r)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+
+        let is_ident =
+            |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        let spans: Vec<&str> = note.split('`').skip(1).step_by(2).collect();
+        for span in &spans {
+            // The old names are the ones being retired.
+            if span.contains("slot") {
+                continue;
+            }
+            // `.reason == "x"` or `"x"`: the quoted value must be a reason.
+            for quoted in span.split('"').skip(1).step_by(2) {
+                assert!(
+                    reasons.iter().any(|r| r == quoted),
+                    "the note quotes {quoted:?}, which is not a `reason` value: {reasons:?}"
+                );
+            }
+            // `.field == …`: the field must be a key.
+            if let Some(field) = span.strip_prefix('.') {
+                let field = field
+                    .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                    .next()
+                    .unwrap();
+                assert!(
+                    keys.contains(&field),
+                    "the note checks `.{field}`, which is not a key: {keys:?}"
+                );
+            }
+            if is_ident(span) {
+                assert!(
+                    keys.contains(span),
+                    "the note names `{span}` as a key, and the report has none: {keys:?}"
+                );
+            }
+        }
+        for key in keys.iter().filter(|k| k.starts_with("profiles")) {
+            assert!(
+                spans.contains(key),
+                "the note does not name the report's `{key}`: {note}"
+            );
+        }
+    }
+
     #[test]
     fn stalled_alert_loop_is_unready() {
         let s = build_test_state(None);

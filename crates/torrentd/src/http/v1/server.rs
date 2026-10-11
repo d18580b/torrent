@@ -508,7 +508,10 @@ pub enum ReloadError {
 /// `connections_limit`, `aio_threads`, `enable_lsd`,
 /// `max_concurrent_http_announces`); the reload task logs what it applied and
 /// warns about anything that needs a restart. `202` means the request was
-/// queued, not that it succeeded.
+/// queued, not that it succeeded, and it is also the answer when nothing in
+/// the file could be applied. `[auth]` is one of the restart-only sections:
+/// a `[[auth.token]]` removed from the file keeps authenticating until the
+/// daemon restarts.
 #[kynos::post("/config/reload", tag = Server)]
 pub async fn reload_config(
     _caller: Scoped<Bearer, Write>,

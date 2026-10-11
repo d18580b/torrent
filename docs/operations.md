@@ -18,12 +18,15 @@ The small state files are described in full in
 | `registry.db`, plus `registry.db-wal` and `registry.db-shm` while the daemon runs (`registry_path`) | Which profile owns each info-hash. This is the authority: the pool index's owner column defers to it. | Ownership of every torrent. | The next boot. Its resume and torrent-dir scans re-assign every info-hash they load to the profile whose directory holds it. Claims whose files are gone are not rebuilt, and do not need to be. |
 | `profile_assignments.json.imported` (also `.imported.N`, or `slot_assignments.json.imported`) | The legacy JSON registry, already imported into `registry.db` and renamed so it is not read again. | Nothing the daemon reads. It is the rollback copy for a build that predates `registry.db`. | Nothing. |
 | `pool.db`, plus `pool.db-wal` and `pool.db-shm` (`[pool] db_path`) | The library index (roots, files, torrents, matches, claims) and the mutation journal (`plan` and `plan_step`). | The index, each torrent's adoption state and owner, and every plan with its steps. | A rescan (`POST /v1/pool/scan`) rebuilds the file index and the matches. It does **not** rebuild the plan journal, `adopted` verdicts, owners, or drift markers. |
+| `pool.db.lock` (beside `pool.db`) | Nothing. Every process that writes the index holds an advisory lock on it: shared for the daemon and `pool check`, exclusive for a CLI `pool scan`, which is how that scan refuses to run beside the daemon. It is made readable by every user, so a `pool scan` run as root leaves one the daemon's user can still lock; one a process cannot read at all is skipped with a warning, and the index opens without the lock. | Nothing. The lock is the kernel's and goes with the process. | Every open of the index for writing. |
 | `pool.db.pre-v3.bak` | The index as it stood before this build's one-way schema migration. | Nothing the daemon reads. It is the only way back to a pre-v3 build. | Nothing. |
 | `resume/<profile>/<infohash>.resume` (`resume_dir`, or a profile's own `resume_dir`) | libtorrent resume data: save path, piece state, and settings. | Piece state and settings. A torrent whose `.torrent` survives is re-added at the save path recorded beside it and hashed there, or, with no such record, at `default_save_path`, which is logged and counted in `torrentd_boot_save_path_fallbacks_total`. | Nothing. Pool torrents can be re-adopted after a rescan. |
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
+| `library/` (`[pool] library_dir`; the sample config puts it here, though it can sit anywhere outside a managed root) | The `.torrent` files the pool index is built from: each scan indexes every torrent in it and matches it against the roots. | The pool's metainfo, including the only remaining copy of a pool torrent whose `torrents/<profile>/` file is gone. A scan of a missing `library_dir` logs `torrent library directory does not exist` and changes nothing; a scan of an empty one drops from the index every torrent no session is serving. | Nothing. Whatever filled it: you, or the client whose state directory it was copied from. |
 | `torrents/<profile>/<infohash>.save_path` (beside the `.torrent`) | The save path a torrent was added at through `POST /v1/torrents` or adopted at from the pool, as UTF-8 text. | Where a torrent with no resume file is re-added: without it, `default_save_path`. | Nothing. Each API add and each adoption writes it, and a pool relocation of a loaded torrent rewrites it. |
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
 | `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
+| `paced_holds.json` | The torrents a profile set online paused itself and has not started again yet. Going online pauses every torrent that was running, then starts them 100 a second; this names them, so a boot in the middle loads them unpaused rather than as paused as their resume data says. Written before those pauses, and again as they start or as you pause one of them. | Those torrents come back paused after a restart in the middle of a set-online, like ones you paused yourself. `POST /v1/profiles/{id}/resume-all` starts them, and any you paused on purpose with them. | Nothing. Each set-online writes it again. |
 | `last_shutdown.json` | The last exit's unsaved-resume count and kill-switch-removal result. The next boot exports it as the `torrentd_last_shutdown_*` gauges, then deletes it. | One boot's report. | Every graceful exit writes a new one. |
 | `torrentd.lock` | The single-instance lock, holding the running daemon's pid. | Nothing while the daemon is stopped. | Every start. |
 | `wireguard-<iface>.raised` | A note that this boot of this host raised the WireGuard link standing under that name, with the public key it carried. | For every profile: shutdown leaves the daemon's own link standing instead of removing it, because teardown removes only a link this record names by the key it carries. A config that carries its private key is still adopted by that key at the next start. For a keyless config (`PostUp = wg set %i private-key …`) the record is the only ground for adoption, so a restart finds the link still standing, after an unclean exit or after that shutdown, and cannot adopt it: that profile stays dark until you remove the link by hand and restart. | Every WireGuard bring-up. |
@@ -32,8 +35,8 @@ The small state files are described in full in
 
 The plan journal is the one record here that a rescan cannot reconstruct.
 Losing it loses the trail of what each delete plan moved where, and with it the
-mapping from `<root>/.torrentd-trash/<plan id>/` back to the plan that filled
-that directory.
+mapping from `<root>/.torrentd-trash/<plan id>-<created_at>/` back to the plan
+that filled that directory.
 
 ### Backing up
 
@@ -52,9 +55,14 @@ dest=/backup/torrentd/$(date +%F)
 sudo install -d -o torrentd -g torrentd -m0750 "$dest"
 sudo -u torrentd sqlite3 /var/lib/torrentd/registry.db ".backup '$dest/registry.db'"
 sudo -u torrentd sqlite3 /var/lib/torrentd/pool.db     ".backup '$dest/pool.db'"
-# The stores after the databases.
-sudo rsync -a /var/lib/torrentd/resume /var/lib/torrentd/torrents "$dest/"
+# The stores after the databases, and the pool's library with them.
+sudo rsync -a /var/lib/torrentd/resume /var/lib/torrentd/torrents \
+              /var/lib/torrentd/library "$dest/"
 ```
+
+`library` is the sample config's `[pool] library_dir`. Where yours points
+outside the state directory, copy that directory into `$dest/library` instead;
+where there is no `[pool]` section, leave it out.
 
 Copy `resume/` and `torrents/` **after** the databases. A torrent added between
 the two copies then has its files in the backup but no claim in it. The next
@@ -77,6 +85,9 @@ sudo rsync -a /var/lib/torrentd/ /backup/torrentd/$(date +%F)/
 sudo systemctl start torrentd
 ```
 
+This holds the library only when `[pool] library_dir` is inside the state
+directory, as in the sample config; copy one that is elsewhere on its own.
+
 Copy the `-wal` and `-shm` files along with their databases if they are
 present. Do not delete them: a `-wal` can still hold committed data that has
 not yet been folded into its database.
@@ -96,8 +107,31 @@ its resume and `.torrent` files. It clears its registry claim and clears the
 index's owner for it, so the info-hash can be added again. The payload stays
 where it is. When the torrent's profile has no running session, the delete
 removes the two store files itself. When the boot left the torrent unloaded
-while its session runs, the delete clears the claim and the owner, and nothing
-else.
+while its session runs, the delete clears the claim and the owner only when
+the profile's stores hold no resume file and no `.torrent` for it, as after a
+crash between an add's claim and its first record, and deletes them as well
+for an adoption the pool index records `drifted` with no resume file, which
+no boot loads. Where either file is still there otherwise, the boot's add of
+it failed or was refused, and those files are what the next boot loads it
+from: the delete is refused with `409`
+[`torrent-unloaded`](api/problems.md#torrent-unloaded), changing nothing, and
+names them. Fix the cause and restart, as
+[After a crash](#after-a-crash) describes; to retire the torrent anyway, move
+the named files out of the profile's resume and torrent directories and
+delete again.
+
+The daemon stops tracking the removed torrent when libtorrent reports the
+removal. If the alert queue overflows and drops that report (the log shows
+"libtorrent alert queue overflowed; alerts dropped"), the daemon settles every
+removal it asked for whose torrent the session no longer holds, as the report
+would have: it drops the torrent and deletes its files. It leaves the
+tombstone, because the report may be only late and a resume save can still
+land before it; the late report, or the next boot, settles it. It logs how many
+it settled and counts them in `torrentd_removals_reconciled_total`, which also
+counts a report that was only late, and that report is then counted again in
+`torrentd_torrents_removed_total`. Before this fix, a dropped report left the
+torrent tracked until a restart, and every `delete_files` and pool delete plan
+on the host was refused for a torrent that could not be read from its session.
 
 What stays behind:
 
@@ -148,8 +182,11 @@ touches nothing until it is applied.
 
 - **`relocate`** moves one `matched` or `adopted` torrent's payload to a
   directory under a managed root. An adopted torrent moves through its
-  session. A cross-device move of an unloaded torrent's directory is refused:
-  move the data yourself and rescan.
+  session. A torrent no session holds is moved by the daemon only when
+  nothing owns it: one the registry assigns, the verify queue holds, or the
+  index records an owner for is refused until its profile loads it. A
+  cross-device move of an unloaded torrent's directory is refused: move the
+  data yourself and rescan.
 - **`delete_orphans`** moves every unclaimed file under a root, or a subtree of
   one, into the trash.
 
@@ -174,30 +211,92 @@ index stands. A plan that deletes data applies only with its `confirm_token`.
 The token changes when a rescan moves the index under the plan. Re-read the
 plan for its current token rather than reusing one you noted earlier. Applying stops at the first failed step and
 answers `status: failed`, with the steps saying which one failed and why. A
+step is recorded `in_progress` before it runs, and one the index cannot record
+that way is not run: it fails with `not started: the plan journal could not
+record the step`, and nothing it would have moved is touched. A
 `failed` plan can be applied again.
 
+The journal is written a batch at a time. Every journal write is a commit
+of the index under `synchronous=FULL`, a WAL fsync each, and writing two per
+step cost a 200,000-file delete 400,000 fsyncs before any of its own. Up to
+64 consecutive `delete_file` steps are marked `in_progress` in one commit,
+run, and their outcomes recorded in one more; a `move_torrent` step is a
+batch of its own. A step a stop or a failure kept the batch from reaching
+goes back to `pending`. A process killed inside a batch leaves every step
+of it `in_progress`, see [After a crash](#after-a-crash).
+
+A plan's body carries how many steps stand in each status (`step_counts`)
+and its first 100 steps; poll it for progress. Page through every step with
+`GET /v1/pool/plans/$PLAN/steps`, which the script below does.
+
 **The trash.** A deleted file is moved, never unlinked, to
-`<root>/.torrentd-trash/<plan id>/<its path relative to the root>`, on the same
-filesystem. The scanner never indexes the trash, so trashed files never read as
-orphans again and never match a torrent. Nothing ever empties it. That is left
-to you, and until you do, the bytes still take up space on the root.
+`<root>/.torrentd-trash/<plan id>-<created_at>/<its path relative to the root>`,
+on the same filesystem, where `created_at` is the second the plan was created,
+in unix seconds. The scanner never indexes the trash, so trashed files never
+read as orphans again and never match a torrent. Nothing ever empties it. That
+is left to you, and until you do, the bytes still take up space on the root.
 
-Before emptying `<root>/.torrentd-trash/<plan id>/`:
+The creation second is in the name because a plan id alone can come back.
+A discarded plan's id is never handed out again, but restoring an older
+`pool.db` ([Restoring from backup](#restoring-from-backup)) takes the id
+sequence back with it, and the next plan then repeats an id whose trash may
+still be on disk. A plan applied by a build older than pool schema v7 filed
+into `<root>/.torrentd-trash/<plan id>/`; one that build left part-way and this
+one finishes has files in both directories.
 
-1. Check that the plan is `applied`:
-   `curl -s localhost:8080/v1/pool/plans/$PLAN -H "Authorization: Bearer $TOKEN"`.
+Before emptying a plan's trash directory:
+
+1. Check that the plan is `applied`, and work out its directory from the
+   plan itself:
+
+   ```bash
+   ROOT=/data/torrents
+   plan=$(curl -s localhost:8080/v1/pool/plans/$PLAN -H "Authorization: Bearer $TOKEN")
+   jq -r .status <<<"$plan"
+   BUCKET=$(jq -r '"\(.id)-\(.created_at | fromdateiso8601)"' <<<"$plan")
+   ```
+
    A plan in `applying` is still running, or was interrupted and is re-driven
    at the next boot. A `failed` plan stopped part-way, and applying it again
-   finishes the rest.
-2. Check that everything that should still seed is seeding. To undo a
+   finishes the rest, unless a step is still `in_progress`: that step's
+   outcome is unknown, nothing marks it resolved, and applying again always
+   refuses. Look at its path, rescan, discard the plan and build a new one
+   ([After a crash](#after-a-crash)).
+2. Check that the directory holds that plan's files and nothing else. This
+   prints nothing when every file in it is one of the plan's done
+   `delete_file` steps and every such step's file is in it:
+
+   ```bash
+   # Every step of the plan, one JSON object per line, a page at a time.
+   steps() {
+     local cursor= page
+     while :; do
+       page=$(curl -s "localhost:8080/v1/pool/plans/$PLAN/steps?limit=1000${cursor:+&cursor=$cursor}" \
+                   -H "Authorization: Bearer $TOKEN")
+       jq -c '.items[]' <<<"$page"
+       cursor=$(jq -r '.next_cursor // empty' <<<"$page")
+       [ -n "$cursor" ] || break
+     done
+   }
+   diff <(sudo -u torrentd find "$ROOT/.torrentd-trash/$BUCKET" -type f -printf '%P\n' | sort) \
+        <(steps | jq -r --arg root "$ROOT/" '
+            select(.op == "delete_file" and .status == "done")
+            | .src | ltrimstr($root)' | sort)
+   ```
+
+   A line marked `<` is a file the plan did not put there: leave the
+   directory alone until you know whose it is. A line marked `>` is a file
+   the plan moved that is no longer in its trash, which someone has already
+   moved back or removed.
+3. Check that everything that should still seed is seeding. To undo a
    deletion, move the file back to its original path and rescan.
-3. Then remove the directory, as a user that can write to the root:
-   `sudo -u torrentd rm -rf -- /data/torrents/.torrentd-trash/$PLAN`.
+4. Then remove the directory, as a user that can write to the root:
+   `sudo -u torrentd rm -rf -- "$ROOT/.torrentd-trash/$BUCKET"`.
 
 Discarding a plan (`DELETE /v1/pool/plans/{plan_id}`) removes its record and
 leaves the disk unchanged. It neither restores nor empties that plan's trash.
-Empty the trash first if you also want the record gone, because the plan id is
-what ties a trash directory to the steps that filled it.
+Empty the trash first if you also want the record gone, because the plan's
+steps are the only record of which files its trash directory should hold.
 
 ### Retiring a profile
 
@@ -220,8 +319,9 @@ done < retire.txt
 This works the same when the profile's session failed to come up: each `DELETE`
 clears the claim and deletes the resume and `.torrent` files. Only
 `delete_files` is refused (`profile-unavailable`), because no session can reach
-the payload. Every caveat from retiring a torrent applies to each of these:
-adopted torrents stay `adopted` (#111).
+the payload. Everything [Retiring a torrent](#retiring-a-torrent) says stays
+behind applies to each of these: an adopted torrent's index entry is reset
+from `adopted`, so it can be adopted again into another profile.
 
 Then:
 
@@ -266,7 +366,7 @@ A `last_shutdown.json` that reported `kill_switch_removal_failed` is a
 different case. The exit was graceful and its tunnels were already down; only
 the removal of the nftables kill-switch table failed. The next boot replaces
 the table with `network_kill_switch = true` and removes it with the kill switch
-off. To remove it now: `sudo nft delete table inet torrentd_ks`.
+off. To remove it now: `sudo nft delete table inet torrentd_ks_$(id -u torrentd)`.
 
 ### Housekeeping
 
@@ -297,8 +397,19 @@ A stop runs four stages, each with its own bound:
 
 1. **The HTTP drain,** 10 s. A client still connected after that is cut off,
    and the exit is still `0`.
-2. **Pool work,** up to 20 s. An apply stops at its next step boundary and
-   stays `applying`, and the next boot re-drives it from that step. A scan or
+2. **Pool work,** up to 20 s. An apply between steps stops at its next step
+   boundary and stays `applying`, and the next boot re-drives it from that
+   step. A relocate whose move libtorrent is still copying is not at a
+   boundary: it gets 15 s more to land, and one still copying then is cut
+   off. Its step stays `in_progress`, the plan is parked `failed`, and the
+   journal line `shutting down while libtorrent is still moving the payload`
+   names the torrent and its destination. The cut-off ends only the wait:
+   libtorrent goes on moving the payload through the resume drain, so the move
+   may still finish and delete the source before the sessions close, or stop
+   part way with a partial copy at the destination. Before removing anything,
+   find which of the source and the destination holds the complete payload,
+   then recover it as for a plan killed inside a step
+   ([After a crash](#after-a-crash)). A scan or
    drift check still running at the bound is cut off: run it again after the
    boot.
 3. **The resume drain,** `shutdown_drain_secs` (default 60). It saves resume
@@ -326,9 +437,15 @@ curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics \
 ```
 
 - **`torrentd_last_shutdown_unsaved_resumes` above 0.** The resume drain ran
-  out of time with that many saves outstanding. Those torrents came back from
-  older resume data, or with none (see [After a crash](#after-a-crash)). Raise
-  `shutdown_drain_secs`.
+  out of time with that many saves queued or still waiting on libtorrent's
+  answer. Each is a torrent whose state at the stop may not be on disk. One
+  that already had a resume file came back from that file, missing whatever
+  changed since it was written. One that was still waiting on its first save,
+  because it was added shortly before the stop, came back with none (see
+  [After a crash](#after-a-crash)). The drain asks for every torrent, but one
+  unchanged since its last save is answered "not modified" without a write,
+  and most of a large count is torrents that changed, or were added, before
+  the stop. Raise `shutdown_drain_secs`.
 - **`torrentd_last_shutdown_kill_switch_removal_failed` is 1.** The tunnels
   went down, but the nftables table stayed. A boot with
   `network_kill_switch = true` replaces it, and one with the kill switch off
@@ -345,10 +462,13 @@ which is exactly what a crash leaves. A 0 does not prove the last exit was
 graceful. `journalctl -u torrentd -b -1` (or without `-b -1` if the host did
 not reboot) shows how it ended.
 
-Adopted torrents come back with no metadata after any restart (#108), because
-adoption never writes their `.torrent` into the profile's `torrent_dir`. They
-sit in `awaiting_metadata`, and on a private profile they stay there. The boot
-warns `resume entries with no .torrent on disk`.
+Adopted torrents come back with their metadata after a restart: adoption
+writes each one's `.torrent` and its save path into the profile's
+`torrent_dir`, as `POST /v1/torrents` does. For a torrent adopted by a build
+that predates that, the boot falls back to the library `.torrent` the pool
+index names, when it still describes the torrent, and copies it into the
+store. One with neither comes back in `awaiting_metadata`, and the boot warns
+`resume entries with no .torrent on disk`.
 
 ### After a crash
 
@@ -366,7 +486,7 @@ what it has a record of:
   anyway.
 - An OpenVPN profile's bring-up clears the rules its `openvpn-<iface>.table`
   record names, as long as the host has not rebooted.
-- The `torrentd_ks` table is replaced when `network_kill_switch = true`. When
+- The daemon's `torrentd_ks_<uid>` table is replaced when `network_kill_switch = true`. When
   it is `false`, for instance because you turned it off to debug, the boot
   removes the stale table before any session opens a socket and warns
   `removed a stale network kill-switch table left by an earlier run`. Left in
@@ -378,9 +498,13 @@ what it has a record of:
   check for the table and remove it by hand:
 
   ```bash
-  sudo nft list table inet torrentd_ks
-  sudo nft delete table inet torrentd_ks
+  sudo nft list table inet torrentd_ks_$(id -u torrentd)
+  sudo nft delete table inet torrentd_ks_$(id -u torrentd)
   ```
+
+  Only the daemon's own uid's table is removed: another uid's
+  `torrentd_ks_<uid>` is another daemon's kill switch, in force (running.md
+  §11, "Two daemons in one network namespace need separate uids").
 
 - A profile no longer in the config is taken down: a WireGuard link its
   `wireguard-<iface>.raised` record vouches for, and an OpenVPN profile's
@@ -410,8 +534,21 @@ That leaves a claim with nothing behind it, so no scan loads the torrent, and
 adopting it again is refused with `info-hash already loaded in profile …`.
 The boot counts these per profile in
 `torrentd_profile_unloaded_registry_torrents`, which does not count the
-adoptions it queued again. Where it is above 0, list them: the registry lists
-them, and their phase is `unknown` because no session holds them.
+adoptions it queued again.
+
+That gauge also counts every claimed torrent whose add failed at boot, and
+those are not crash leftovers. Check `torrentd_boot_torrent_load_failures`
+first, and the boot's `resume add failed` and `torrent-dir add failed`
+warnings, which name each torrent. A save path on a disk that had not mounted
+yet, or a resume file libtorrent refused, fails the add and keeps the claim,
+the resume file and the `.torrent`, which is what the next boot loads the
+torrent from. Fix the cause and restart the daemon for those; do not delete
+them. The `DELETE` below refuses them anyway, with `409`
+[`torrent-unloaded`](api/problems.md#torrent-unloaded) naming the files, so
+running it over the whole list changes nothing for them.
+
+Where the gauge is still above 0, list the claims: the registry lists them,
+and their phase is `unknown` because no session holds them.
 
 ```bash
 # Repeat with ?cursor= while next_cursor is set.
@@ -422,8 +559,10 @@ curl -s "localhost:8080/v1/torrents?profile_id=acct_a&phase=unknown&limit=1000" 
 Run this once the boot has finished. A torrent still being added also reads
 `unknown` until its first state update arrives, and so does an adoption the
 boot queued again, until the queue adds it. The `DELETE` below refuses both
-with 409 and prints `failed:`; leave those. Then clear each claim with a
-plain `DELETE` (no `delete_files`), and adopt the torrent again
+with 409 and prints `failed:`; leave those, and the load failures it refuses
+the same way. Then clear each claim with a plain `DELETE` (no
+`delete_files`), which succeeds only for a claim with no resume file and no
+`.torrent` behind it, and adopt the torrent again
 (`POST /v1/pool/adoptions`):
 
 ```bash
@@ -448,22 +587,49 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
   `applied`, or `failed` at a step that fails.
 - A plan killed inside a step cannot be resumed. Whether that step happened is
   unknown, so the boot parks it as `failed` with that step still
-  `in_progress`. The journal line `resume failed` names the step and its path,
-  and applying it again fails the same way. Look at that path, rescan,
-  discard the plan, and build a new one.
+  `in_progress`. A delete plan is journalled up to 64 steps at a time, so a
+  kill anywhere in a batch leaves all of its steps `in_progress`, those that
+  ran and those that had not started alike. The journal line `resume failed`
+  names the first step and its path and counts the others, which
+  `GET /v1/pool/plans/$PLAN/steps` lists, and applying it again fails the same
+  way, since nothing marks a step resolved. Look at those paths, rescan,
+  discard the plan, and build a new one: the rescan finds which files are
+  still there, and the new plan deletes only those.
+  For a relocate, look at its destination too, and find which of the two
+  holds the complete payload before removing anything: a move whose wait was
+  cut off can still finish and delete the source, so the destination may hold
+  the only whole copy, or the destination may hold a partial one. A new plan
+  refuses to move onto a file already there (`destination … already
+  contains`), so once you know which copy is complete, remove only the other
+  before building it. A relocate libtorrent never reported on within 600 s,
+  or one a stop cut off, is parked the same way.
 - With `[pool] allow_mutations` off, nothing is re-driven. The plan stays
   `applying` until a boot that allows mutations.
 
 **Resume data (#109, #110).** A torrent's first resume file is saved as soon
-as the session adds it; after that, resume data is saved every 30 minutes and
-by the shutdown drain. A crash loses whatever changed since the last save,
-such as a pause. A torrent killed before its first save landed has no resume
-file at all:
+as the session adds it, unless the profile already holds one for it, as it
+does for every torrent the boot loads from its resume file. It is saved
+again at once when a recheck finishes (`POST /v1/torrents/{ih}/recheck`, the
+verify queue's, the disk-error retry's), when a pool relocation's move
+completes, and when `POST /v1/torrents/{ih}/pause` or a failed verification
+pauses the torrent. Otherwise resume data is saved every 30 minutes and by the
+shutdown drain, so a crash loses whatever else changed since the last save,
+such as the pauses of a profile's `pause-all`, of `POST /v1/torrents/pause-all`
+and of a VPN fence. A torrent whose resume file still names the
+directory a relocation moved it from, because the crash came before that
+save landed, is re-added where its `.save_path` record and the pool index
+both say it went. A torrent killed before its first save landed has no
+resume file at all:
 
 - **Added through `POST /v1/torrents` or adopted from the pool.** The boot
   finds its `.torrent` and re-adds it at the save path recorded beside it
   (the `save_path` it was added with, or the library path it was adopted
-  at), hashing it there. Where that record is missing, because its write
+  at). It is hashed before it seeds, as `POST /v1/torrents` adds, so it shows
+  `checking` first. An adoption still waiting in the verify queue is
+  added by the queue after the scans instead, hashed. One the pool index
+  records `drifted` stays unloaded, because its verification failed or its
+  files changed: it is one of the unloaded claims above, so `DELETE` it and
+  adopt it again to verify it. Where that record is missing, because its write
   failed (`torrentd_torrent_file_persist_errors_total`) or the torrent
   predates it, the boot re-adds it at `default_save_path` instead, logs a
   warning, and counts it in `torrentd_boot_save_path_fallbacks_total`. If its
@@ -507,7 +673,16 @@ network throughout.
 
 Lifting the fence resumes **every** torrent in the profile, including any you
 had paused on purpose before the fence, because the fence did not record which
-ones it paused. Pause those again afterwards. While `offline_all` is on, the
+ones it paused. Pause those again afterwards. The torrents are resumed 100 a
+second after the request returns, since each one announces to its trackers,
+so a profile of 20,000 takes over three minutes; a fence that lands meanwhile
+stops it. `resume-all` is paced the same way and answers once its last torrent
+is resumed. So is setting a profile online that you had set offline, by
+`PATCH` or by `online-all`: the torrents that were running when it went
+offline are started again 100 a second after the request returns, and a
+torrent you had paused stays paused. Setting it offline again meanwhile stops
+that, and the next set-online starts the rest; a restart meanwhile loads the
+rest running, as recorded in `paced_holds.json`. While `offline_all` is on, the
 lifted profile stays offline, its session paused, until
 `POST /v1/profiles/online-all`.
 
@@ -537,7 +712,8 @@ sudo mv /var/lib/torrentd /var/lib/torrentd.before-restore
 sudo install -d -o torrentd -g torrentd -m0750 /var/lib/torrentd
 
 src=/backup/torrentd/2026-10-01
-sudo rsync -a "$src/registry.db" "$src/pool.db" "$src/resume" "$src/torrents" /var/lib/torrentd/
+sudo rsync -a "$src/registry.db" "$src/pool.db" "$src/resume" "$src/torrents" \
+              "$src/library" /var/lib/torrentd/
 # An offline backup may also hold registry.db-wal or pool.db-wal and -shm.
 # Restore those with their databases, never on their own.
 # The online/offline choices: the current ones, else the backup's.
@@ -547,6 +723,11 @@ done
 sudo chown -R torrentd:torrentd /var/lib/torrentd
 sudo systemctl start torrentd
 ```
+
+`$src/library` is the `[pool] library_dir` the backup copied. Where yours is
+outside the state directory, the `mv` leaves it where it is: drop
+`"$src/library"` from the copy, and restore it to its own path only if it was
+lost with the state.
 
 A restore keeps `profile_state.json`. It records which profiles you hold
 offline now, not anything the databases depend on, so the copy from the
@@ -579,7 +760,10 @@ Once it is up:
    step whose file is already gone or changed fails instead of acting twice.
    Expect such a plan to end `failed`, then read it and discard it. A trash
    directory left by a plan the backup never recorded has no plan to tie it
-   to. Its contents are what that plan deleted.
+   to. Its contents are what that plan deleted. The next plan may repeat
+   that plan's id, because the backup holds the id sequence as it stood, but
+   not its directory: the directory is named by the id and the second the
+   plan was created ([Archiving payload](#archiving-payload)).
 
 What changed after the backup is lost. A torrent added since then is gone
 from the stores, while its payload stays on disk, so add or adopt it again. A
@@ -638,8 +822,17 @@ sudo systemctl enable --now torrentd
 ```
 
 If a drift check already ran, the drifted torrents need
-`POST /v1/pool/verifications` with their info-hashes, which re-hashes each
-one.
+`POST /v1/pool/verifications` with their info-hashes, at most 1000 to a
+request. The request only queues the re-hashes and answers `202` at once; the
+verify queue runs them `[pool] max_concurrent_verify` at a time, sharing
+that bound with adoptions and `POST /v1/torrents/{ih}/recheck`, so sending
+the whole library in batches does not start every check at once. The bound
+does not cover a `.torrent` added or found in `torrent_dir` with no resume
+file, which is hashed at once ([import.md §7](import.md#7-monitoring-the-queue)). Each re-hash disconnects the torrent's peers until
+it ends. `torrentd_pool_verify_queue_depth` shows the backlog draining and
+`torrentd_pool_verify_in_flight` the checks running. The queue is held in
+memory, so after a restart send the requests again for what is still
+`drifted`.
 
 Then run the checks in [Planned restart](#planned-restart) and `running.md`
 §9, and `torrentd vpn check --profile <id>` for each `vpn` profile.
@@ -659,8 +852,19 @@ new one until you set it online.
   whatever port the gateway hands out, and announces it.
 
 **If a path has to change.** Mount the disks at the old paths if you can, for
-example with a bind mount, and list them in `ReadWritePaths`. Nothing
-re-points stored paths. If a path changes anyway:
+example with a bind mount, and list them in `ReadWritePaths`. List the bind
+mount as a root in place of the directory it shows, never beside it: two roots
+that reach the same files index them twice, and the copy no torrent claims
+reads as an orphan that a delete plan would move into the trash. The daemon
+refuses to start on two roots that alias one tree through a bind mount
+(`[pool] roots alias the same files`). It cannot see through a FUSE union
+view such as unRAID's `/mnt/user` (shfs) or a mergerfs pool, which has its own
+device and inode numbers, so never list a union view beside one of its
+branches (`/mnt/user/media` with `/mnt/disk3/media`): list the view, or the
+branches, not both. A delete plan leaves out, and a delete step refuses, a
+file that is a hard link to a claimed file, but neither catches an alias
+through a union view: the view's device number never matches the branch's.
+Nothing re-points stored paths. If a path changes anyway:
 
 - **A `[pool] roots` entry.** The next scan drops the old root from the
   index, with every claim under it. It indexes the new path as a new root and

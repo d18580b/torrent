@@ -12,6 +12,8 @@
 //!   - Per-handle query data: `set_torrent_details` / `set_torrent_files` /
 //!     `set_torrent_trackers` preload what the matching query returns; an
 //!     unset handle gets a metadata-less default.
+//!   - Session counters: `set_alert_translate_errors(n)` sets the shim's
+//!     count of alerts it could not translate.
 //!   - Fault injection beyond errors: `inject_panic(op)` makes the next call
 //!     to that op panic, and `stall_next_pop(d)` makes the next `pop_alerts`
 //!     block for `d`, which wedges whatever loop is draining it.
@@ -31,6 +33,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -40,6 +43,7 @@ use libtorrent_safe::alert::AlertHeader;
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
 use libtorrent_safe::AlertKind;
+use libtorrent_safe::FilePage;
 use libtorrent_safe::InfoHash;
 use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeData;
@@ -83,6 +87,10 @@ pub enum RecordedCall {
     PostStats,
     ForceRecheck(TorrentHandle),
     ForceReannounce(TorrentHandle),
+    UnsetFlags {
+        handle: TorrentHandle,
+        flags: TorrentFlags,
+    },
     MoveStorage {
         handle: TorrentHandle,
         new_path: String,
@@ -95,6 +103,11 @@ pub enum RecordedCall {
     ResumeSession,
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
+    TorrentFilesPage {
+        handle: TorrentHandle,
+        start: u32,
+        limit: u32,
+    },
     TorrentTrackers(TorrentHandle),
     Close,
 }
@@ -254,14 +267,23 @@ pub struct MockEngine {
     /// When set, `force_recheck` / `move_storage` synthesize their completion
     /// alert immediately, mirroring libtorrent's async behaviour.
     auto_check: AtomicBool,
+    /// When set, every successful `add_torrent` queues the
+    /// `Alert::AddTorrent` libtorrent posts for it.
+    add_alerts: AtomicBool,
     /// infohash → what `torrent_details` returns. Unset: `default_details`.
     details: DashMap<InfoHash, TorrentDetails>,
     /// infohash → what `torrent_files` returns. Unset: `None` (no metadata).
     files: DashMap<InfoHash, Option<Vec<TorrentFile>>>,
+    /// The most file entries one `torrent_files` or `torrent_files_page`
+    /// call has copied out, which the real session copies under its lock.
+    largest_files_copy: AtomicUsize,
     /// infohash → what `torrent_trackers` returns. Unset: empty.
     trackers: DashMap<InfoHash, Vec<TrackerEntry>>,
     /// Whether `pause_session` is in force.
     session_paused: AtomicBool,
+    /// What `alert_translate_errors` returns. See
+    /// [`MockEngine::set_alert_translate_errors`].
+    translate_errors: AtomicU64,
 }
 
 impl Default for MockEngine {
@@ -286,10 +308,13 @@ impl MockEngine {
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
             auto_check: AtomicBool::new(false),
+            add_alerts: AtomicBool::new(false),
             details: DashMap::new(),
             files: DashMap::new(),
+            largest_files_copy: AtomicUsize::new(0),
             trackers: DashMap::new(),
             session_paused: AtomicBool::new(false),
+            translate_errors: AtomicU64::new(0),
         }
     }
 
@@ -320,12 +345,19 @@ impl MockEngine {
         self.auto_check.store(on, Ordering::SeqCst);
     }
 
+    /// Queue an `AddTorrent` alert for every successful `add_torrent`, as
+    /// libtorrent does, subject to the alert capacity like any other alert.
+    pub fn with_add_alerts(self, on: bool) -> Self {
+        self.add_alerts.store(on, Ordering::SeqCst);
+        self
+    }
+
     // --- test fixture helpers -----------------------------------------------
 
     /// Bound the alert queue at `n`, dropping what overflows it the way
     /// libtorrent does: silently, reported afterwards only as a bitset of the
-    /// alert *types* lost. Saves are the one type mapped to their real bit
-    /// (37/38, `alert_types.hpp`); any other lost type sets bit 0.
+    /// alert *types* lost. Saves and adds are the types mapped to their real
+    /// bits (37/38 and 67, `alert_types.hpp`); any other lost type sets bit 0.
     pub fn with_alert_capacity(self, n: usize) -> Self {
         *self.alert_capacity.lock() = Some(n);
         self
@@ -335,12 +367,13 @@ impl MockEngine {
     pub fn push_alert(&self, a: Alert) {
         let mut q = self.alerts.lock();
         if self.alert_capacity.lock().is_some_and(|cap| q.len() >= cap) {
-            let bit = match a.kind() {
+            let bit: u32 = match a.kind() {
                 AlertKind::SaveResumeData => 37,
                 AlertKind::SaveResumeDataFailed => 38,
+                AlertKind::AddTorrent => 67,
                 _ => 0,
             };
-            self.dropped_bits.lock()[0] |= 1u64 << bit;
+            self.dropped_bits.lock()[(bit / 64) as usize] |= 1u64 << (bit % 64);
             return;
         }
         q.push_back(a);
@@ -406,6 +439,13 @@ impl MockEngine {
         self.handles.len()
     }
 
+    /// What `alert_translate_errors` returns from now on: the shim's count of
+    /// alerts it popped and could not translate. A test raises it to model
+    /// alerts lost that way.
+    pub fn set_alert_translate_errors(&self, n: u64) {
+        self.translate_errors.store(n, Ordering::SeqCst);
+    }
+
     /// What `torrent_details(h)` returns from now on.
     pub fn set_torrent_details(&self, h: TorrentHandle, details: TorrentDetails) {
         self.details.insert(h.infohash, details);
@@ -415,6 +455,13 @@ impl MockEngine {
     /// whose metadata has not arrived.
     pub fn set_torrent_files(&self, h: TorrentHandle, files: Option<Vec<TorrentFile>>) {
         self.files.insert(h.infohash, files);
+    }
+
+    /// The most file entries any one `torrent_files` or `torrent_files_page`
+    /// call has returned so far: what a real session would have copied
+    /// while holding its lock.
+    pub fn largest_files_copy(&self) -> usize {
+        self.largest_files_copy.load(Ordering::SeqCst)
     }
 
     /// What `torrent_trackers(h)` returns from now on.
@@ -482,7 +529,20 @@ impl TorrentEngine for MockEngine {
                 InfoHash(buf)
             }
         };
-        Ok(self.register_handle(ih))
+        let h = self.register_handle(ih);
+        if self.add_alerts.load(Ordering::SeqCst) {
+            self.push_alert(Alert::AddTorrent {
+                hdr: AlertHeader {
+                    kind: AlertKind::AddTorrent,
+                    infohash: Some(ih),
+                    handle: Some(h),
+                    timestamp_us: 0,
+                },
+                error_code: 0,
+                message: None,
+            });
+        }
+        Ok(h)
     }
 
     fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<(), EngineError> {
@@ -563,6 +623,21 @@ impl TorrentEngine for MockEngine {
     fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
         self.record(RecordedCall::ForceReannounce(h));
         self.check_error("force_reannounce")
+    }
+
+    fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError> {
+        self.record(RecordedCall::UnsetFlags { handle: h, flags });
+        self.check_error("unset_flags")?;
+        // The session refuses every bit but the discovery guards; so does
+        // the mock, so a test cannot pass on a call production would refuse.
+        let clearable =
+            TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD;
+        if !clearable.contains(flags) {
+            return Err(EngineError::Safe(libtorrent_safe::Error::InvalidInput(
+                "only DISABLE_PEX, DISABLE_DHT and DISABLE_LSD can be cleared",
+            )));
+        }
+        Ok(())
     }
 
     fn move_storage(
@@ -665,7 +740,42 @@ impl TorrentEngine for MockEngine {
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
         self.record(RecordedCall::TorrentFiles(h));
         self.check_error("torrent_files")?;
-        Ok(self.files.get(&h.infohash).and_then(|f| f.clone()))
+        let files = self.files.get(&h.infohash).and_then(|f| f.clone());
+        let copied = files.as_ref().map_or(0, Vec::len);
+        self.largest_files_copy.fetch_max(copied, Ordering::SeqCst);
+        Ok(files)
+    }
+
+    /// Pages what `set_torrent_files` preloaded, by position. Shares
+    /// `torrent_files`'s op name for `inject_error`, `inject_panic` and
+    /// `hold_next`: both are the one session query.
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError> {
+        self.record(RecordedCall::TorrentFilesPage {
+            handle: h,
+            start,
+            limit,
+        });
+        self.check_error("torrent_files")?;
+        let Some(entry) = self.files.get(&h.infohash) else {
+            return Ok(None);
+        };
+        let Some(all) = entry.as_ref() else {
+            return Ok(None);
+        };
+        let first = (start as usize).min(all.len());
+        let end = first.saturating_add(limit as usize).min(all.len());
+        let files = all[first..end].to_vec();
+        self.largest_files_copy
+            .fetch_max(files.len(), Ordering::SeqCst);
+        Ok(Some(FilePage {
+            total: u32::try_from(all.len()).unwrap_or(u32::MAX),
+            files,
+        }))
     }
 
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
@@ -676,6 +786,19 @@ impl TorrentEngine for MockEngine {
             .get(&h.infohash)
             .map(|t| t.clone())
             .unwrap_or_default())
+    }
+
+    /// Every handle `add_torrent` or `register_handle` issued that
+    /// `remove_torrent` has not taken back. Not recorded: it is a query.
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
+        self.check_error("torrents")?;
+        Ok(self.handles.iter().map(|e| *e.value()).collect())
+    }
+
+    /// What `set_alert_translate_errors` last set. Not recorded: the alert
+    /// loop asks after every drain.
+    fn alert_translate_errors(&self) -> u64 {
+        self.translate_errors.load(Ordering::SeqCst)
     }
 
     fn close(&self) {
@@ -823,6 +946,48 @@ mod tests {
         // Preloading `None` models metadata that has not arrived.
         m.set_torrent_files(a, None);
         assert_eq!(m.torrent_files(a).unwrap(), None);
+    }
+
+    #[test]
+    fn a_file_page_copies_only_its_slice_and_reports_the_total() {
+        let m = MockEngine::new();
+        let h = m.register_handle(InfoHash([8u8; 20]));
+        assert_eq!(m.torrent_files_page(h, 0, 10).unwrap(), None);
+        let files: Vec<TorrentFile> = (0..25)
+            .map(|i| TorrentFile {
+                index: i,
+                path: format!("d/f{i}"),
+                size: 1,
+                downloaded: 0,
+                priority: 4,
+            })
+            .collect();
+        m.set_torrent_files(h, Some(files.clone()));
+
+        let page = m.torrent_files_page(h, 20, 10).unwrap().unwrap();
+        assert_eq!(page.total, 25);
+        assert_eq!(page.files, files[20..]);
+        let count = m.torrent_files_page(h, 0, 0).unwrap().unwrap();
+        assert_eq!((count.total, count.files.len()), (25, 0));
+        let past = m
+            .torrent_files_page(h, u32::MAX, u32::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!((past.total, past.files.len()), (25, 0));
+        assert_eq!(m.largest_files_copy(), 5);
+        assert!(matches!(
+            m.calls()[1],
+            RecordedCall::TorrentFilesPage { handle, start: 20, limit: 10 } if handle == h
+        ));
+        // The whole list is the largest copy once it is read.
+        m.torrent_files(h).unwrap();
+        assert_eq!(m.largest_files_copy(), 25);
+        // Shares `torrent_files`'s injection.
+        m.inject_error("torrent_files", EngineError::Shutdown);
+        assert!(matches!(
+            m.torrent_files_page(h, 0, 1),
+            Err(EngineError::Shutdown)
+        ));
     }
 
     #[test]

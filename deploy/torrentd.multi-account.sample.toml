@@ -25,9 +25,12 @@ http_listen       = "127.0.0.1:8080"
 log_level         = "info"
 
 # This sample binds loopback, so it states the opt-out rather than configuring
-# [auth]: the daemon refuses to start unless one of the two is stated. Delete
-# this line and configure [auth] — see deploy/torrentd.sample.toml — before
-# exposing the API anywhere. Read once, at startup, like [auth] and
+# [auth]: the daemon refuses to start unless one of the two is stated. That is
+# safe only on a single-user host, or in a network namespace or container no
+# other uid shares: every local user can reach 127.0.0.1, and without [auth]
+# any of them controls the daemon (docs/running.md §6). Delete this line and
+# configure [auth] — see deploy/torrentd.sample.toml — on a shared host, and
+# before exposing the API anywhere. Read once, at startup, like [auth] and
 # http_listen: editing it takes a restart, not a SIGHUP.
 allow_unauthenticated = true
 
@@ -95,18 +98,35 @@ network_kill_switch = false
 #
 #     The two keys must also agree with each other: a tracker reads both, and
 #     a peer-id prefix of one client beside the user agent of another is a
-#     client that does not exist. Each profile below presents as one real
-#     client — `-qB5030-` is qBittorrent 5.0.3's prefix, `-TR4060-`
-#     Transmission 4.0.6's. Nothing checks the pairing; it is on the operator.
-#     What is checked is that no profile writes libtorrent's own `-LT` code.
+#     client that does not exist. Nothing checks the pairing; it is on the
+#     operator. What is checked is that no profile writes libtorrent's own
+#     `-LT` code.
 #
-# Two account-isolation rules apply to the `vpn` profiles in particular:
+#     Only the prefix and the strings change. The rest of the peer id, the
+#     extension handshake, the announce parameters and every other protocol
+#     detail stay libtorrent's, and a tracker that compares them with the
+#     claimed client sees a libtorrent client. So name a client that is built
+#     on libtorrent 2.0, in a version that ships on it: qBittorrent or Deluge,
+#     as below — `-qB5030-` is qBittorrent 5.0.3's prefix, `-DE211s-` Deluge
+#     2.1.1's, whose user agent also names the libtorrent it runs on. A
+#     Transmission or rTorrent identity is one this daemon cannot keep up on
+#     the wire.
+#
+# These account-isolation rules apply to the `vpn` profiles in particular:
 #
 #   * `allowed_tracker_domains` is required on each. Every torrent the profile
 #     takes, on every add path — the API, pool adoption, and the startup scans
 #     of its resume and `.torrent` directories — must announce only to
 #     trackers on those domains (or their subdomains), and to at least one.
-#     A torrent with a single tracker outside the list is refused.
+#     A torrent with a single tracker outside the list is refused. The list
+#     compares only the tracker's host, so it separates the two accounts here
+#     only because they are on different trackers.
+#   * Two accounts on one tracker each set `allowed_tracker_urls` as well:
+#     the start of the account's announce URLs, up to and including its
+#     passkey, such as ["https://tracker.example.com/<passkey>/"]. Every
+#     announce URL must then fall under one of them too. Two profiles whose
+#     domain lists overlap are refused at load unless both set it, with
+#     prefixes that do not overlap.
 #   * A host profile beside them may not listen on `0.0.0.0` or `[::]`.
 #     libtorrent expands the unspecified address to every interface that is
 #     up, the tunnels included, and announces from each, so the host profile
@@ -157,6 +177,6 @@ vpn_config              = "/etc/wireguard/proton-b.conf"
 vpn_interface           = "proton-b"
 port_forward            = "natpmp"
 port_forward_gateway    = "10.2.0.1"
-peer_fingerprint        = "-TR4060-"
-user_agent              = "Transmission/4.0.6"
+peer_fingerprint        = "-DE211s-"
+user_agent              = "Deluge/2.1.1 libtorrent/2.0.14.0"
 allowed_tracker_domains = ["tracker-b.example.com"]

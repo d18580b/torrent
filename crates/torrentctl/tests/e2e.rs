@@ -28,6 +28,9 @@ const PROFILE: &str = "e2e";
 const PASSWORD: &str = "correct-horse-battery";
 const HTTP: &str = "127.0.0.1:18191";
 const LISTEN_PORT: u16 = 16991;
+/// The socket test's peer port. The tests run in parallel, and a daemon
+/// whose only session cannot bind its listen socket exits.
+const SOCKET_TEST_LISTEN_PORT: u16 = 16992;
 const MAGNET_HEX: &str = "0505050505050505050505050505050505050505";
 
 fn torrentd() -> PathBuf {
@@ -38,6 +41,12 @@ fn torrentd() -> PathBuf {
 }
 
 fn config(dir: &Path, auth: Option<&str>) -> PathBuf {
+    config_listening(dir, auth, &format!("\"{HTTP}\""), LISTEN_PORT)
+}
+
+/// [`config`], with `listen` as the TOML value of `http_listen` and whatever
+/// keys follow it, and the profile's peer socket on `port`.
+fn config_listening(dir: &Path, auth: Option<&str>, listen: &str, port: u16) -> PathBuf {
     for sub in ["data", "resume", "torrents"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
@@ -52,14 +61,14 @@ fn config(dir: &Path, auth: Option<&str>) -> PathBuf {
             "default_save_path = \"{d}/data\"\n\
              resume_dir = \"{d}/resume\"\n\
              torrent_dir = \"{d}/torrents\"\n\
-             http_listen = \"{HTTP}\"\n\
+             http_listen = {listen}\n\
              log_level = \"warn\"\n\
              enable_lsd = false\n\
              {access}\n\
              [[profile]]\n\
              id = \"{PROFILE}\"\n\
              network = \"host\"\n\
-             listen_interfaces = \"127.0.0.1:{LISTEN_PORT}\"\n\
+             listen_interfaces = \"127.0.0.1:{port}\"\n\
              dht = false\n",
             d = dir.display()
         ),
@@ -107,15 +116,23 @@ impl Drop for Daemon {
 async fn start(dir: &Path) -> (Daemon, String) {
     let hash = password_hash(dir);
     let cfg = config(dir, Some(&hash));
+    let daemon = spawn(&cfg);
+    let base = format!("http://{HTTP}");
+    wait_ready(&api::Client::new(&base).unwrap()).await;
+    (daemon, base)
+}
+
+fn spawn(cfg: &Path) -> Daemon {
     let child = Command::new(torrentd())
         .arg("--config")
-        .arg(&cfg)
+        .arg(cfg)
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn torrentd");
-    let daemon = Daemon(child);
-    let base = format!("http://{HTTP}");
-    let client = api::Client::new(&base).unwrap();
+    Daemon(child)
+}
+
+async fn wait_ready(client: &api::Client) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(ok) = client.get_health().await {
@@ -126,7 +143,68 @@ async fn start(dir: &Path) -> (Daemon, String) {
         assert!(Instant::now() < deadline, "the daemon did not become ready");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    (daemon, base)
+}
+
+/// A generated client that connects to the unix socket at `path`.
+fn socket_client(path: &Path) -> api::Client {
+    let http = reqwest::Client::builder()
+        .unix_socket(path)
+        .build()
+        .unwrap();
+    api::Client::with_client(http, "http://localhost").unwrap()
+}
+
+#[tokio::test]
+#[ignore = "spawns torrentd; run with `mise run test-torrentctl`"]
+async fn a_daemon_on_a_unix_socket_serves_the_api_there_with_the_configured_mode() {
+    use std::os::unix::fs::FileTypeExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hash = password_hash(dir.path());
+    let sock = dir.path().join("api.sock");
+    let cfg = config_listening(
+        dir.path(),
+        Some(&hash),
+        &format!("\"unix:{}\"\nhttp_socket_mode = 0o600", sock.display()),
+        SOCKET_TEST_LISTEN_PORT,
+    );
+    let daemon = spawn(&cfg);
+    let anonymous = socket_client(&sock);
+    wait_ready(&anonymous).await;
+
+    let meta = std::fs::symlink_metadata(&sock).unwrap();
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    // A login: the request body reaches the handler, and the throttle's
+    // reading of the peer address holds for a socket peer.
+    let grant = anonymous
+        .create_session(&types::CreateSession {
+            password: PASSWORD.to_owned(),
+        })
+        .await
+        .expect("sign in over the socket")
+        .into_inner();
+    let client = socket_client(&sock).with_credential(
+        "bearer",
+        api::Credential::Bearer(api::SecretString::from(grant.token)),
+    );
+    let server = client.get_server().await.unwrap().into_inner();
+    assert_eq!(server.api_version, "1");
+
+    // A streamed response is delivered as it is written.
+    let mut events = client.stream_events().await.expect("open /v1/events");
+    let first = tokio::time::timeout(Duration::from_secs(15), events.next())
+        .await
+        .expect("a tick within 15s")
+        .expect("the stream stays open")
+        .expect("a well-formed event");
+    assert!(matches!(first.kind, types::ServerEventkind::Tick));
+    drop(events);
+
+    drop(daemon);
+    assert!(!sock.exists(), "a stopped daemon removes its socket");
 }
 
 #[tokio::test]

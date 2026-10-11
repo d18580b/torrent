@@ -116,6 +116,18 @@ fn build_relocate(
         }
     }
 
+    // A held adopted torrent keeps `adopted` across a rescan that finds its
+    // payload partial or gone, which would read `partial` or `missing` had
+    // nothing held it. A move of a payload that is not all there is refused
+    // the same way for both.
+    if state == Some(AdoptionState::Adopted) && has_unplaced_files(store, infohash)? {
+        return Ok(Err(Refused(
+            "its payload is not all present as of the last rescan; rescan once it is back \
+             before moving it"
+                .into(),
+        )));
+    }
+
     // An adopted torrent keeps `adopted` across a rescan that finds another
     // torrent over its files, so the state alone does not rule sharing out.
     if store.shares_claims(infohash)? {
@@ -175,20 +187,8 @@ fn build_relocate(
         return Ok(Err(Refused("destination is the current location".into())));
     }
 
-    // Refuse rather than merge: an existing destination file is either a
-    // different copy of this payload or someone else's data, and both are
-    // reasons to stop and let a person look.
-    for f in store.torrent_files(infohash)? {
-        if !f.is_on_disk() {
-            continue;
-        }
-        let candidate = dest_dir.join(&f.rel_path);
-        if candidate.exists() {
-            return Ok(Err(Refused(format!(
-                "destination already contains {}",
-                f.rel_path,
-            ))));
-        }
+    if let Some(rel) = existing_destination_file(store, infohash, &dest_dir)? {
+        return Ok(Err(Refused(format!("destination already contains {rel}"))));
     }
 
     // One step. libtorrent moves the payload itself so the session's storage
@@ -201,6 +201,37 @@ fn build_relocate(
         src: src_dir.to_string_lossy().into_owned(),
         dst: Some(dest_dir.to_string_lossy().into_owned()),
     }]))
+}
+
+/// The first of `infohash`'s files that already has an entry under
+/// `dest_dir`, as its torrent-relative path.
+///
+/// A relocate refuses on one rather than merging: an existing destination
+/// file is either a different copy of this payload or someone else's data,
+/// and both are reasons to stop and let a person look. The planner asks when
+/// the plan is built and the executor asks again just before the move, since
+/// a file can land there in between and libtorrent's `dont_replace` skips it
+/// silently, leaving the payload split between the two places.
+///
+/// Any directory entry counts, a dangling symlink included: a move onto one
+/// replaces it, which is still an overwrite. So does a path that cannot be
+/// examined for any reason but its absence, since nothing then shows the way
+/// is clear.
+pub fn existing_destination_file(
+    store: &PoolStore,
+    infohash: &str,
+    dest_dir: &Path,
+) -> Result<Option<String>, PoolError> {
+    for f in store.torrent_files(infohash)? {
+        if !f.is_on_disk() {
+            continue;
+        }
+        match dest_dir.join(&f.rel_path).symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Ok(Some(f.rel_path)),
+        }
+    }
+    Ok(None)
 }
 
 fn build_delete_orphans(
@@ -247,14 +278,24 @@ fn build_delete_orphans(
         return Ok(Err(Refused(copies_refusal(ih, area))));
     }
 
+    // A file unclaimed by path can still be a claimed file reached another
+    // way: a hard link, or the claimed file seen through a second root that
+    // aliases the first. The executor refuses those steps, and a refused step
+    // stops the plan, so they are left out here rather than emitted to fail.
+    let claimed = store.claimed_identities()?;
     let mut held_back = 0usize;
+    let mut aliased = 0usize;
     let orphans: Vec<String> = store
         .orphan_files_sized(root_id, prefix)?
         .into_iter()
-        .filter_map(|(rel, size)| {
+        .filter_map(|(rel, size, identity)| {
             // `.torrentd-trash` is where deleted files go; it is never indexed,
             // but an index from before that rule may still list it.
             if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
+                return None;
+            }
+            if claimed.contains(&identity) {
+                aliased += 1;
                 return None;
             }
             if unresolved.sizes.contains(&size) {
@@ -265,10 +306,11 @@ fn build_delete_orphans(
         })
         .collect();
     if orphans.is_empty() {
-        return Ok(Err(Refused(if held_back > 0 {
+        return Ok(Err(Refused(if held_back + aliased > 0 {
             format!(
-                "every unclaimed file under that path ({held_back}) has the size of a file a \
-                 torrent in the library has not found, so none is provably unwanted"
+                "no unclaimed file under that path is provably unwanted: {held_back} have the \
+                 size of a file a torrent in the library has not found, and {aliased} are the \
+                 same file (device and inode) as one a torrent claims"
             )
         } else {
             "no unclaimed files under that path".into()
@@ -381,11 +423,29 @@ fn copies_refusal(ih: &str, area: &str) -> String {
     )
 }
 
+/// Whether the last rescan left any of `infohash`'s on-disk files unclaimed.
+///
+/// The adoption state alone does not say: a held `adopted` torrent keeps
+/// `adopted` across a rescan that finds its payload partial or gone, and then
+/// claims only what resolved, or nothing. A rescan rebuilds the claim table
+/// from one placement per torrent, one claim per file it found, so fewer
+/// claims than on-disk files is exactly a file it did not find.
+pub fn has_unplaced_files(store: &PoolStore, infohash: &str) -> Result<bool, PoolError> {
+    let on_disk = store
+        .torrent_files(infohash)?
+        .iter()
+        .filter(|f| f.is_on_disk())
+        .count();
+    Ok(store.claims_of(infohash)?.len() < on_disk)
+}
+
 /// Collect [`Unresolved`] for `root_id`.
 ///
-/// Only `partial`, `missing` and `overlap` torrents can have unplaced files:
-/// `matched`, `shared` and `adopted` are complete by definition, and `drifted`
-/// is complete as of the last rescan. Those complete ones are where a second
+/// `partial`, `missing` and `overlap` torrents can have unplaced files, and
+/// so can an `adopted` one a session holds while its payload is partial or
+/// gone, which [`has_unplaced_files`] tells apart. `matched` and `shared` are
+/// complete by definition, `drifted` is complete as of the last rescan, and
+/// so is every other `adopted` one. Those complete ones are where a second
 /// complete copy can be, and every copy of each such torrent is collected.
 fn unresolved_payload(
     store: &PoolStore,
@@ -395,12 +455,15 @@ fn unresolved_payload(
     let mut out = Unresolved::default();
     for t in store.torrents()? {
         let state = store.adoption_state(&t.infohash)?;
-        if !matches!(
-            state,
-            None | Some(AdoptionState::Partial)
-                | Some(AdoptionState::Missing)
-                | Some(AdoptionState::Overlap)
-        ) {
+        let incomplete = match state {
+            None
+            | Some(AdoptionState::Partial)
+            | Some(AdoptionState::Missing)
+            | Some(AdoptionState::Overlap) => true,
+            Some(AdoptionState::Adopted) => has_unplaced_files(store, &t.infohash)?,
+            _ => false,
+        };
+        if !incomplete {
             // Complete: nothing unplaced, but possibly more than one copy.
             let files = store.torrent_files(&t.infohash)?;
             let copies = crate::matcher::complete_copies(store, &t, &files)?;
