@@ -28,6 +28,9 @@ const PROFILE: &str = "e2e";
 const PASSWORD: &str = "correct-horse-battery";
 const HTTP: &str = "127.0.0.1:18191";
 const LISTEN_PORT: u16 = 16991;
+/// The socket test's peer port. The tests run in parallel, and a daemon
+/// whose only session cannot bind its listen socket exits.
+const SOCKET_TEST_LISTEN_PORT: u16 = 16992;
 const MAGNET_HEX: &str = "0505050505050505050505050505050505050505";
 
 fn torrentd() -> PathBuf {
@@ -38,12 +41,12 @@ fn torrentd() -> PathBuf {
 }
 
 fn config(dir: &Path, auth: Option<&str>) -> PathBuf {
-    config_listening(dir, auth, &format!("\"{HTTP}\""))
+    config_listening(dir, auth, &format!("\"{HTTP}\""), LISTEN_PORT)
 }
 
 /// [`config`], with `listen` as the TOML value of `http_listen` and whatever
-/// keys follow it.
-fn config_listening(dir: &Path, auth: Option<&str>, listen: &str) -> PathBuf {
+/// keys follow it, and the profile's peer socket on `port`.
+fn config_listening(dir: &Path, auth: Option<&str>, listen: &str, port: u16) -> PathBuf {
     for sub in ["data", "resume", "torrents"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
@@ -65,7 +68,7 @@ fn config_listening(dir: &Path, auth: Option<&str>, listen: &str) -> PathBuf {
              [[profile]]\n\
              id = \"{PROFILE}\"\n\
              network = \"host\"\n\
-             listen_interfaces = \"127.0.0.1:{LISTEN_PORT}\"\n\
+             listen_interfaces = \"127.0.0.1:{port}\"\n\
              dht = false\n",
             d = dir.display()
         ),
@@ -164,6 +167,7 @@ async fn a_daemon_on_a_unix_socket_serves_the_api_there_with_the_configured_mode
         dir.path(),
         Some(&hash),
         &format!("\"unix:{}\"\nhttp_socket_mode = 0o600", sock.display()),
+        SOCKET_TEST_LISTEN_PORT,
     );
     let daemon = spawn(&cfg);
     let anonymous = socket_client(&sock);
