@@ -246,6 +246,7 @@ mod tests {
     use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
     use crate::state::StateMap;
+    use crate::state::TorrentState;
     use crate::torrent_store::MemoryTorrentStore;
     use crate::torrent_store::TorrentStore;
 
@@ -351,16 +352,35 @@ mod tests {
         info: &[u8],
         lift: TorrentFlags,
     ) -> (Vec<TorrentFlags>, Vec<InfoHash>) {
+        receive_as(engine, h, Some(h), None, info, lift)
+    }
+
+    /// [`receive`], with the alert carrying `alert_handle` and, where `owner`
+    /// is set, `h` tracked in the state map under that profile.
+    fn receive_as(
+        engine: Arc<MockEngine>,
+        h: TorrentHandle,
+        alert_handle: Option<TorrentHandle>,
+        owner: Option<&str>,
+        info: &[u8],
+        lift: TorrentFlags,
+    ) -> (Vec<TorrentFlags>, Vec<InfoHash>) {
         let alert = Alert::MetadataReceived {
             hdr: AlertHeader {
                 kind: AlertKind::MetadataReceived,
                 infohash: Some(h.infohash),
-                handle: Some(h),
+                handle: alert_handle,
                 timestamp_us: 0,
             },
             info_section: info.to_vec(),
         };
         let state = StateMap::new();
+        if let Some(owner) = owner {
+            state.insert(
+                h.infohash,
+                TorrentState::newly_added(h, ProfileId::new(owner), std::time::Instant::now()),
+            );
+        }
         let resume = MemoryResumeStore::new();
         let torrents = MemoryTorrentStore::new();
         let metrics = NoopSink;
@@ -467,6 +487,38 @@ mod tests {
         let (unset, saves) = receive(engine, tracked(0x66), PUBLIC, GUARDS);
         assert_eq!(unset, vec![GUARDS], "the clear was asked for");
         assert!(saves.is_empty(), "{saves:?}");
+    }
+
+    #[test]
+    fn a_handleless_alert_lifts_through_the_profiles_own_state_entry() {
+        let h = tracked(0x67);
+        let (unset, saves) = receive_as(
+            Arc::new(MockEngine::new()),
+            h,
+            None,
+            Some("p"),
+            PUBLIC,
+            GUARDS,
+        );
+        assert_eq!(unset, vec![GUARDS]);
+        assert_eq!(saves, vec![h.infohash]);
+    }
+
+    #[test]
+    fn a_handleless_alert_with_no_entry_of_its_profile_keeps_the_guards() {
+        // No entry at all, and an entry another profile owns.
+        for owner in [None, Some("other")] {
+            let (unset, saves) = receive_as(
+                Arc::new(MockEngine::new()),
+                tracked(0x68),
+                None,
+                owner,
+                PUBLIC,
+                GUARDS,
+            );
+            assert!(unset.is_empty(), "{owner:?}: {unset:?}");
+            assert!(saves.is_empty(), "{owner:?}: {saves:?}");
+        }
     }
 
     #[test]
