@@ -1704,6 +1704,38 @@ pub async fn boot(
     // resolved by whichever code path a reader happened to be in. Name both
     // values instead. Read-only: rewriting an operator's index during boot is
     // not this check's business.
+    //
+    // A record the registry does not back at all is another matter: nothing
+    // owns the torrent, and the record is a release that never landed - a
+    // `DELETE` queued it behind a scan holding the writer and the daemon
+    // stopped first, or its write failed. Left alone it refused the torrent
+    // every adoption into another profile and every relocation, and `DELETE`
+    // cannot clear it any more. With the sessions loaded and the verify queue
+    // restored, whatever still owns the torrent has said so, so each such
+    // record is cleared here, before the disagreements are counted.
+    if let Some(pool) = pool.as_ref() {
+        match pool.clear_unbacked_owners(&state) {
+            Ok(cleared) => {
+                for (infohash, index_profile) in &cleared {
+                    warn!(
+                        infohash = %infohash,
+                        index_profile = %index_profile,
+                        "the pool index named an owner for this torrent that no registry \
+                         assignment, session or verify-queue item backs, most likely a \
+                         `DELETE`'s release lost to a restart; cleared it, so the torrent can \
+                         be adopted into any profile again",
+                    );
+                }
+                if !cleared.is_empty() {
+                    info!(
+                        cleared = cleared.len(),
+                        "cleared pool index owner records nothing backs",
+                    );
+                }
+            }
+            Err(e) => pool.note_store_error("clear_unbacked_owners", &e),
+        }
+    }
     if let Some(pool) = pool.as_ref() {
         let stale = pool.with_store(|st| {
             let mut out: Vec<(String, String, String)> = Vec::new();

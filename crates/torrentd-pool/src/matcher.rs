@@ -83,19 +83,24 @@ pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     // enumerates every file in every root as an orphan.
     //
     // No session's view is available, so every `adopted` verdict stands.
-    store.in_transaction(|store| match_all_inner(store, None))
+    store.in_transaction(|store| match_all_inner(store, None, None))
 }
 
 /// [`match_all`], where the caller knows what the sessions serve.
 ///
 /// `loaded` maps the hex info-hash of every torrent a session holds to the
 /// `save_path` that session holds it at, or `None` where it could not be
-/// read. An `adopted` torrent in none of them, and with no owner recorded in
-/// the index, is held by nothing: it is demoted to the verdict its payload
-/// earns, so it can be adopted again. One the index still records an owner
-/// for keeps `adopted`: that profile may be offline, or its session may not
-/// have reported the torrent yet, and the owner record refuses other profiles
-/// either way.
+/// read. `owned` holds every other info-hash a profile still owns without a
+/// session serving it: assigned in the registry (its profile may be offline,
+/// or its session may not have reported the torrent yet) or waiting in the
+/// verify queue. An `adopted` torrent in neither is held by nothing: it is
+/// demoted to the verdict its payload earns, so it can be adopted again.
+///
+/// The index's own owner record does not keep it `adopted`. That record is
+/// a cache of the registry, and a release a `DELETE` queued behind a held
+/// writer is lost when the daemon stops first: left to stand on the record
+/// alone, the verdict refused every later adoption, into any profile, and
+/// no rescan cleared it.
 ///
 /// A loaded torrent's session `save_path`, where it lies under a managed
 /// root, is tried before its recorded base and kept while it is complete:
@@ -104,8 +109,9 @@ pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
 pub fn match_all_serving(
     store: &mut PoolStore,
     loaded: &HashMap<String, Option<PathBuf>>,
+    owned: &HashSet<String>,
 ) -> Result<MatchStats, PoolError> {
-    store.in_transaction(|store| match_all_inner(store, Some(loaded)))
+    store.in_transaction(|store| match_all_inner(store, Some(loaded), Some(owned)))
 }
 
 /// `(root_id, base)` of `save_path` under the managed root holding it, or
@@ -121,6 +127,7 @@ fn base_under_roots(roots: &[(i64, PathBuf)], save_path: &Path) -> Option<(i64, 
 fn match_all_inner(
     store: &mut PoolStore,
     loaded: Option<&HashMap<String, Option<PathBuf>>>,
+    owned: Option<&HashSet<String>>,
 ) -> Result<MatchStats, PoolError> {
     let roots = store.roots()?;
     let torrents = store.torrents()?;
@@ -160,12 +167,12 @@ fn match_all_inner(
         // instead would leave the served files unclaimed, and a delete plan
         // offers unclaimed files up as orphans.
         //
-        // Served means `adopted`, held by a session, or owned by a profile in
-        // the index. The owner record is what reaches a torrent marked
-        // `drifted` while it was seeding when no session view is available —
-        // `torrentd pool scan`, or a boot scan before the sessions report —
-        // and one whose profile is offline: `release_owner` clears it once
-        // nothing holds the torrent.
+        // Served means `adopted`, held by a session, owned by a profile the
+        // caller names, or owned in the index. The owner record is what
+        // reaches a torrent marked `drifted` while it was seeding when no
+        // session view is available — `torrentd pool scan`, or a boot scan
+        // before the sessions report — and one whose profile is offline:
+        // `release_owner` clears it once nothing holds the torrent.
         //
         // Where the session that holds it reports a save path under a managed
         // root, that comes first: it is where the session actually reads
@@ -173,7 +180,8 @@ fn match_all_inner(
         // resume save or a half-done move. The recorded base is next.
         let served = prior == Some(AdoptionState::Adopted)
             || t.profile.is_some()
-            || loaded.is_some_and(|l| l.contains_key(&t.infohash));
+            || loaded.is_some_and(|l| l.contains_key(&t.infohash))
+            || owned.is_some_and(|o| o.contains(&t.infohash));
         let recorded = if served {
             store.adoption_base(&t.infohash)?
         } else {
@@ -207,8 +215,12 @@ fn match_all_inner(
         // moved out from under a session, would otherwise turn it `missing`,
         // then `matched` once they return, and the index would offer it for
         // adoption while a session still serves it. One nothing holds any
-        // more is demoted, or adoption would refuse it for good.
-        let held = loaded.is_none_or(|l| l.contains_key(&t.infohash) || t.profile.is_some());
+        // more is demoted, or adoption would refuse it for good. The index's
+        // owner record alone is not a holder: a lost release leaves it behind
+        // ([`match_all_serving`]), and only the caller's `owned` set says a
+        // profile really still owns the torrent.
+        let held = loaded.is_none_or(|l| l.contains_key(&t.infohash))
+            || owned.is_some_and(|o| o.contains(&t.infohash));
         let keep_adopted = prior == Some(AdoptionState::Adopted) && held;
 
         match best {
