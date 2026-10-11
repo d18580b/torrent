@@ -1050,6 +1050,27 @@ mod tests {
     }
 
     #[test]
+    fn no_rule_or_panel_says_a_fence_lasts_until_the_daemon_restarts() {
+        // Setting a fenced profile online lifts the fence live
+        // (`PATCH /v1/profiles/{id}`); text that sends the operator to a
+        // restart takes every other profile off the network for nothing.
+        for file in [
+            "prometheus/torrentd.rules.yml",
+            "prometheus/torrentd.rules.test.yml",
+            "dashboard.json",
+        ] {
+            let text = deploy(file).to_lowercase();
+            for stale in ["until the daemon restarts", "until a restart"] {
+                assert!(
+                    !text.contains(stale),
+                    "deploy/{file} says a fence lasts \"{stale}\", though setting the \
+                     profile online lifts it without one",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_rule_reading_a_first_event_series_also_matches_its_appearance() {
         // `increase()` needs a sample before the event; a series that only
         // appears with its first event has none. Any rule reading one must
