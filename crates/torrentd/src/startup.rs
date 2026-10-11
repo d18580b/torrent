@@ -645,9 +645,10 @@ pub struct DaemonHandle {
     pool: Option<Arc<crate::pool_service::PoolService>>,
     registry: Arc<AssignmentRegistry>,
     profile_registry: Arc<ProfileRegistry>,
-    /// Whether the nftables kill switch was installed, so graceful shutdown
-    /// tears it down. `boot` started its watch.
-    kill_switch_active: bool,
+    /// The kill-switch watch's fence, where the nftables kill switch was
+    /// installed: graceful shutdown tears the table down, and the API's adds
+    /// record what they pause with the fence. `boot` started its watch.
+    kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: torrentd_engine::AlertLoopHandle,
     /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
@@ -1183,6 +1184,9 @@ pub async fn boot(
         pool.set_source(Arc::clone(&source));
         pool.set_registry(Arc::clone(&registry));
         pool.set_torrent_store(Arc::clone(&torrent_store));
+        if let Some(fence) = kill_switch.as_ref() {
+            pool.set_kill_switch(Arc::clone(fence));
+        }
     }
 
     // Resume scan: load every saved resume file per profile. The shim
@@ -1776,6 +1780,11 @@ pub async fn boot(
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
+    // The kill-switch watch lifts its own fence by resuming only what it
+    // recorded, and its walk of the state map misses a torrent whose add
+    // alert lands after it: the add handler's pause of that torrent is
+    // recorded with the fence, under its lock, so the lift resumes it too.
+    .fence_hold(crate::vpn_monitor::fence_hold(kill_switch.clone()))
     // A magnet is added with DHT, PEX and LSD disabled because its `private`
     // bit is unknown; once its metadata shows it public, the engine lifts
     // what the profile's own posture does not keep. A profile the registry
@@ -1817,7 +1826,7 @@ pub async fn boot(
         pool,
         registry,
         profile_registry,
-        kill_switch_active: kill_switch.is_some(),
+        kill_switch,
         log_handle,
         alert_loop,
         unloaded_at_boot,
@@ -2947,7 +2956,7 @@ impl DaemonHandle {
             pool,
             registry,
             profile_registry,
-            kill_switch_active,
+            kill_switch,
             log_handle,
             alert_loop,
             unloaded_at_boot,
@@ -3032,6 +3041,7 @@ impl DaemonHandle {
             work: Arc::clone(&work),
             events: Arc::default(),
             tunnel_probe: crate::vpn_monitor::host_prober(),
+            kill_switch: kill_switch.clone(),
         };
 
         // The trust set the process runs with, once: effective blocks, and
@@ -3244,7 +3254,7 @@ impl DaemonHandle {
             })
             .collect();
         teardown_network(engines, tunnels, || {
-            if kill_switch_active {
+            if kill_switch.is_some() {
                 finish_kill_switch_removal(
                     crate::vpn::killswitch::disable(),
                     &metrics,
@@ -6415,12 +6425,15 @@ mod tests {
         assert_eq!(t.resumes(), hs, "each resumed once");
     }
 
-    /// A scan that reaches the kill-switch fence while its lift is running
-    /// waits for the lift, rather than finding the record already taken and
-    /// the profile not yet marked: that would pause its torrent with nothing
-    /// to resume it. Here it finds the profile lifted, and its torrent runs.
+    /// A scan that reaches the kill-switch fence while its lift is checking
+    /// the tunnel does not wait out the check, which runs with the fence's
+    /// lock free: it finds the profile still fenced and its record still
+    /// there, pauses its torrent and records it, and the lift, which takes
+    /// the record only after the check, resumes it with the rest. Never the
+    /// record already taken and the profile not yet marked: that would pause
+    /// its torrent with nothing to resume it.
     #[tokio::test(start_paused = true)]
-    async fn a_scan_that_reaches_the_kill_switch_fence_mid_lift_waits_for_the_lift() {
+    async fn a_scan_that_reaches_the_kill_switch_fence_mid_lift_is_resumed_by_the_lift() {
         use crate::vpn::killswitch::Fence as _;
 
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
@@ -6449,27 +6462,23 @@ mod tests {
             }
         });
         entered_rx.recv().unwrap();
-        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
-        let adding = std::thread::spawn({
-            let (profiles, metrics, a) = (t.profiles.clone(), t.metrics.clone(), t.a.clone());
-            move || {
-                reached_tx.send(()).unwrap();
-                scan.added(&profiles, &metrics, &a, h2);
-            }
-        });
-        reached_rx.recv().unwrap();
-        // Long enough for the add to reach the fence's lock. Were the lock
-        // not held across the lift, the add would be done by now.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!adding.is_finished(), "the add waits for the lift");
+        // The add completes while the lift's check is still held: were the
+        // lock held across the check, this join would never return.
+        let (profiles, metrics, a) = (t.profiles.clone(), t.metrics.clone(), t.a.clone());
+        std::thread::spawn(move || scan.added(&profiles, &metrics, &a, h2))
+            .join()
+            .unwrap();
+        assert_eq!(t.pauses(), [h1, h2], "the add finds the profile fenced");
 
         release_tx.send(()).unwrap();
         lifting.join().unwrap();
-        adding.join().unwrap();
         t.settle().await;
         assert_eq!(t.status(), ProfileStatus::Active);
-        assert_eq!(t.pauses(), [h1], "an add to a lifted profile runs");
-        assert_eq!(t.resumes(), [h1]);
+        assert_eq!(
+            t.resumes(),
+            [h1, h2],
+            "the lift resumes what the add recorded"
+        );
     }
 
     /// A supervised task stopped through the handle `spawn_supervised`

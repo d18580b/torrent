@@ -277,6 +277,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
@@ -324,6 +325,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
@@ -394,6 +396,7 @@ mod tests {
             clock: &clock,
             engine: &dyn_engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };

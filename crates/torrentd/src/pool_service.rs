@@ -94,6 +94,10 @@ pub struct PoolService {
     /// torrent whose profile failed at boot is here and not in `loaded`, and
     /// a plan must still treat its payload as owned.
     registry: std::sync::OnceLock<Arc<AssignmentRegistry>>,
+    /// The kill-switch watch's fence, where the kill switch is on. Set once
+    /// by the daemon. An adoption that finds its profile fenced as it adds
+    /// records what it paused with the fence, so the fence's lift resumes it.
+    kill_switch: std::sync::OnceLock<Arc<crate::vpn_monitor::KillSwitchFence>>,
 }
 
 /// An owner release waiting for the writer: [`PoolStore::release_owner`]'s
@@ -162,7 +166,15 @@ impl PoolService {
             source: std::sync::OnceLock::new(),
             torrents: std::sync::OnceLock::new(),
             registry: std::sync::OnceLock::new(),
+            kill_switch: std::sync::OnceLock::new(),
         })))
+    }
+
+    /// The kill-switch watch's fence, which records what an adoption pauses
+    /// into a profile it fenced. The daemon sets this once after opening,
+    /// where the kill switch is on; a second call is ignored.
+    pub(crate) fn set_kill_switch(&self, fence: Arc<crate::vpn_monitor::KillSwitchFence>) {
+        let _ = self.kill_switch.set(fence);
     }
 
     /// The assignment registry, so a plan knows every torrent the daemon
@@ -1512,6 +1524,7 @@ fn admit_adoption(
             // can have dropped since.
             crate::vpn_monitor::hold_if_fenced(
                 profiles,
+                pool.kill_switch.get().map(Arc::as_ref),
                 &item.profile,
                 engine.as_ref(),
                 handle,
@@ -2194,6 +2207,7 @@ pub fn execute_adopt(
                         pool.metrics.get().map_or(&noop, |m| m.as_ref());
                     crate::vpn_monitor::hold_if_fenced(
                         profiles,
+                        pool.kill_switch.get().map(Arc::as_ref),
                         &profile,
                         engine.as_ref(),
                         handle,

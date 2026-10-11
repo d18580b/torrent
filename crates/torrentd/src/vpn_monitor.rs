@@ -673,6 +673,37 @@ impl KillSwitchFence {
     ) -> R {
         hold(self.fenced.lock().profiles.get_mut(profile_id))
     }
+
+    /// Run `hold`, an add path's check and pause of `handle` just added to
+    /// `profile_id`, under this fence's lock, and record `handle` for the
+    /// lift where `hold` answers that it found the profile fenced and this
+    /// fence holds it.
+    ///
+    /// For the runtime add paths ([`hold_if_fenced`], and the add handler
+    /// through `torrentd_engine::FenceHold`). A torrent whose add lands after
+    /// [`vpn::killswitch::Fence::fence_all`]'s walk of the state map, or
+    /// that the walk read as paused, is otherwise paused with no record, and
+    /// stays paused once the lift resumes the rest. Under the lock, this
+    /// fence neither marks nor lifts the profile between `hold`'s read of its
+    /// status and the record, so a lift either resumed the profile before
+    /// `hold` read it (and `hold` pauses nothing) or finds the handle in its
+    /// record. Recorded whether or not the pause took, as the boot scans do.
+    /// A handle recorded twice, by both add paths or by them and the walk,
+    /// is resumed once: the lift drops repeats.
+    pub(crate) fn hold_recorded(
+        &self,
+        profile_id: &ProfileId,
+        handle: TorrentHandle,
+        hold: impl FnOnce() -> bool,
+    ) {
+        self.with_record(profile_id, |record| {
+            if hold() {
+                if let Some(record) = record {
+                    record.handles.push(handle);
+                }
+            }
+        });
+    }
 }
 
 impl vpn::killswitch::Fence for KillSwitchFence {
@@ -740,18 +771,49 @@ impl vpn::killswitch::Fence for KillSwitchFence {
     }
 
     fn lift(&self) {
-        // Held to the end, not taken and released: a boot scan recording what
-        // it paused for this fence (`with_record`) between the take and the
-        // mark below would find no record, and its torrents would stay paused
-        // in a profile lifted around them.
+        // The tunnel checks run first, outside the lock: each shells out to
+        // `ip` (up to its timeout), and every add alert on the alert loop's
+        // one thread waits on this lock (`hold_recorded`), so probing under
+        // it would stall the loop for as long as the probes take. Each
+        // verdict is kept with the record's mark, and applied below only to
+        // the record it was taken for.
+        let marked: Vec<(ProfileId, u64)> = self
+            .fenced
+            .lock()
+            .profiles
+            .iter()
+            .map(|(id, record)| (id.clone(), record.mark))
+            .collect();
+        let checked: Vec<_> = marked
+            .into_iter()
+            .map(|(id, mark)| {
+                let healthy = self
+                    .profiles
+                    .resolve(&id)
+                    .active()
+                    .filter(|e| e.health().status == ProfileStatus::VpnDown)
+                    .map(|e| recovery_check(e, &self.probe));
+                (id, mark, healthy)
+            })
+            .collect();
+        // Held from the take of each record to its mark, not taken and
+        // released: a boot scan or an add recording what it paused for this
+        // fence (`with_record`) between the take and the mark below would
+        // find no record, and its torrents would stay paused in a profile
+        // lifted around them.
         let mut fenced = self.fenced.lock();
-        for (
-            profile_id,
-            FenceRecord {
+        for (profile_id, mark, healthy) in checked {
+            // A record whose mark is not the one checked above is a fence
+            // that landed since; it stays, unchecked, for the next lift.
+            if fenced.profiles.get(&profile_id).map(|r| r.mark) != Some(mark) {
+                continue;
+            }
+            let Some(FenceRecord {
                 mut handles, gate, ..
-            },
-        ) in fenced.profiles.drain()
-        {
+            }) = fenced.profiles.remove(&profile_id)
+            else {
+                continue;
+            };
             // A torrent the scans paused again after a lift stopped part-way
             // can be in the record twice: once from the fence's take of the
             // unfinished lift, once from the scans.
@@ -770,7 +832,12 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             else {
                 continue;
             };
-            if let Err(reason) = recovery_check(entry, &self.probe) {
+            // Not checked: the profile did not read fenced when the checks
+            // ran, so whatever fenced it since (the monitor) owns that fence.
+            let Some(healthy) = healthy else {
+                continue;
+            };
+            if let Err(reason) = healthy {
                 warn!(
                     target: "torrentd::vpn_monitor",
                     profile_id = %profile_id,
@@ -1163,20 +1230,60 @@ fn resume_batch(
 /// What this pauses is not added to `paused_for_vpn` or its gauge, and neither
 /// is what the add handler pauses: the two (and the fence's walk) can pause the
 /// same torrent, so the count stays what the fence itself paused.
+///
+/// Where the kill switch is on, `kill_switch` is its watch's fence, which
+/// lifts by resuming only what it recorded: this pauses under that fence's
+/// lock and records the torrent with it ([`KillSwitchFence::hold_recorded`]),
+/// so the lift resumes it too.
 pub(crate) fn hold_if_fenced(
     profiles: &ProfileRegistry,
+    kill_switch: Option<&KillSwitchFence>,
     profile_id: &ProfileId,
     engine: &dyn TorrentEngine,
     handle: TorrentHandle,
     metrics: &dyn MetricsSink,
 ) {
+    let hold = || pause_if_fenced(profiles, profile_id, engine, handle, metrics);
+    match kill_switch {
+        Some(ks) => ks.hold_recorded(profile_id, handle, hold),
+        None => {
+            hold();
+        }
+    }
+}
+
+/// The add handler's [`torrentd_engine::FenceHold`]: its pause of a torrent
+/// whose add alert lands in a fenced profile, run as [`hold_if_fenced`] runs
+/// its own, recorded with `kill_switch` where the kill switch is on.
+pub(crate) fn fence_hold(kill_switch: Option<Arc<KillSwitchFence>>) -> torrentd_engine::FenceHold {
+    Arc::new(
+        move |id: &ProfileId, handle: TorrentHandle, hold: &mut dyn FnMut() -> bool| {
+            match kill_switch.as_deref() {
+                Some(ks) => ks.hold_recorded(id, handle, hold),
+                None => {
+                    hold();
+                }
+            }
+        },
+    )
+}
+
+/// [`hold_if_fenced`]'s check and pause. Returns whether the profile was
+/// fenced, whether or not the pause took.
+fn pause_if_fenced(
+    profiles: &ProfileRegistry,
+    profile_id: &ProfileId,
+    engine: &dyn TorrentEngine,
+    handle: TorrentHandle,
+    metrics: &dyn MetricsSink,
+) -> bool {
     atomic::fence(atomic::Ordering::SeqCst);
     let fenced = profiles
         .resolve(profile_id)
         .active()
         .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
     if !fenced {
-        return;
+        return false;
     }
     match engine.pause_torrent(handle) {
         Ok(()) => warn!(
@@ -1199,6 +1306,7 @@ pub(crate) fn hold_if_fenced(
             );
         }
     }
+    true
 }
 
 /// How a [`resume_unless_fenced`] ended.
@@ -3371,8 +3479,275 @@ mod tests {
             let label = format!("{status:?}");
             let (entry, engine) = mock_entry(status);
             let profiles = ProfileRegistry::new(vec![entry]);
-            hold_if_fenced(&profiles, &id, engine.as_ref(), th, &PromSink::new());
+            hold_if_fenced(&profiles, None, &id, engine.as_ref(), th, &PromSink::new());
             assert_eq!(pauses(&engine), want, "{label}");
         }
+    }
+
+    /// Hand `handle`'s `add_torrent_alert` to the add handler, wired as the
+    /// daemon wires it: fenced where the registry reads the profile
+    /// `vpn_down`, and holding through [`fence_hold`] over `fence`.
+    fn deliver_add(fence: &Arc<KillSwitchFence>, engine: Arc<dyn TorrentEngine>, h: TorrentHandle) {
+        let profiles = fence.profiles.clone();
+        let profile_fenced: torrentd_engine::ProfileFenced = Arc::new(move |id: &ProfileId| {
+            profiles
+                .resolve(id)
+                .active()
+                .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
+        });
+        let hold = fence_hold(Some(fence.clone()));
+        let resume = torrentd_engine::MemoryResumeStore::new();
+        let torrents = torrentd_engine::MemoryTorrentStore::new();
+        let clock = torrentd_engine::MockClock::new();
+        let mut ctx = torrentd_engine::handlers::HandlerCtx {
+            state: &fence.state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &torrentd_engine::NoopSink,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: Some(&profile_fenced),
+            fence_hold: Some(&hold),
+            profile_id: ProfileId::new("acct_a"),
+            span: tracing::info_span!("test"),
+        };
+        torrentd_engine::handlers::add::handle(
+            &torrentd_engine::Alert::AddTorrent {
+                hdr: libtorrent_safe::alert::AlertHeader {
+                    kind: torrentd_engine::AlertKind::AddTorrent,
+                    infohash: Some(h.infohash),
+                    handle: Some(h),
+                    timestamp_us: 0,
+                },
+                error_code: 0,
+                message: None,
+            },
+            &mut ctx,
+        );
+    }
+
+    fn resumes_of(engine: &torrentd_engine::MockEngine, h: TorrentHandle) -> usize {
+        resumes(engine).into_iter().filter(|r| *r == h).count()
+    }
+
+    /// An add in flight as the kill-switch fence lands: its walk of the state
+    /// map does not find the torrent, so the add's own re-check pauses it.
+    /// That pause is recorded with the fence, and the lift resumes it with
+    /// the rest rather than leaving it paused in a profile that reads active.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_an_add_pauses_under_the_kill_switch_fence_is_resumed_by_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(1);
+        let id = ProfileId::new("acct_a");
+        let added = handle(3);
+        fence.fence_all();
+        hold_if_fenced(
+            &fence.profiles,
+            Some(&fence),
+            &id,
+            engine.as_ref(),
+            added,
+            &PromSink::new(),
+        );
+        assert!(pauses(&engine).contains(&added), "the add pauses it");
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            sorted_ids(&resumes(&engine)),
+            [1, 3],
+            "each once, the add's too"
+        );
+    }
+
+    /// The same through the add handler, whose alert lands after the fence
+    /// walked the state map: the handler's pause runs through the daemon's
+    /// hold, which records the torrent with the fence.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_whose_add_alert_lands_after_the_kill_switch_fence_is_resumed_by_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(1);
+        let fence = Arc::new(fence);
+        let added = handle(3);
+        fence.fence_all();
+        assert!(!fence.state.contains(&added.infohash), "the walk missed it");
+        deliver_add(&fence, engine.clone(), added);
+        assert!(pauses(&engine).contains(&added), "the handler pauses it");
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            sorted_ids(&resumes(&engine)),
+            [1, 3],
+            "each once, the add's too"
+        );
+    }
+
+    /// The add's re-check pauses under one fence, which lifts, and a second
+    /// fence lands before the add's alert: the walk misses the torrent again,
+    /// and the handler pauses it under the second. Each lift resumes it once:
+    /// the first's record does not carry into the second, and the second
+    /// does not lose it.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_paused_across_a_lift_and_a_second_kill_switch_fence_is_resumed_once_by_each() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(1);
+        let fence = Arc::new(fence);
+        let id = ProfileId::new("acct_a");
+        let added = handle(3);
+
+        fence.fence_all();
+        hold_if_fenced(
+            &fence.profiles,
+            Some(&fence),
+            &id,
+            engine.as_ref(),
+            added,
+            &PromSink::new(),
+        );
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(resumes_of(&engine, added), 1, "the first lift resumes it");
+
+        fence.fence_all();
+        assert!(!fence.state.contains(&added.infohash), "the walk missed it");
+        let paused_before = pauses(&engine).iter().filter(|p| **p == added).count();
+        deliver_add(&fence, engine.clone(), added);
+        assert_eq!(
+            pauses(&engine).iter().filter(|p| **p == added).count(),
+            paused_before + 1,
+            "the handler pauses it under the second fence",
+        );
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            resumes_of(&engine, added),
+            2,
+            "the second lift resumes it once"
+        );
+        assert_eq!(resumes_of(&engine, handle(1)), 2, "as it does the walk's");
+    }
+
+    /// The lift's tunnel check runs with the fence's lock free, so an add
+    /// alert's hold (`hold_recorded`, on the alert loop's one thread) never
+    /// waits out the `ip` probes. The lift still resumes what the add
+    /// recorded.
+    #[tokio::test(start_paused = true)]
+    async fn the_kill_switch_lift_checks_each_tunnel_without_holding_the_fence_lock() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let probed_free = Arc::new(AtomicUsize::new(0));
+        let probed_held = Arc::new(AtomicUsize::new(0));
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            let (free, held) = (probed_free.clone(), probed_held.clone());
+            move |iface: &str, wg: bool| {
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let counter = if fence.fenced.try_lock().is_some() {
+                    &free
+                } else {
+                    &held
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        let added = handle(3);
+        fence.fence_all();
+        deliver_add(&fence, engine.clone(), added);
+
+        fence.lift();
+        assert_eq!(
+            probed_free.load(Ordering::SeqCst),
+            1,
+            "probed once, unlocked"
+        );
+        assert_eq!(
+            probed_held.load(Ordering::SeqCst),
+            0,
+            "never under the lock"
+        );
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(sorted_ids(&resumes(&engine)), [1, 3]);
+    }
+
+    /// A fence that lands between the lift's tunnel check and its take of
+    /// the records is not lifted on that check: its record stays for the
+    /// next lift.
+    #[test]
+    fn a_record_marked_after_the_lifts_check_stays_for_the_next_lift() {
+        use std::sync::OnceLock;
+        use std::sync::Weak;
+
+        use vpn::killswitch::Fence;
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let slot: Arc<OnceLock<Weak<KillSwitchFence>>> = Arc::new(OnceLock::new());
+        let healthy = answering(ip(2), Some(RouteProbe::ViaTunnel), None);
+        let prober: Prober = Arc::new({
+            let slot = slot.clone();
+            move |iface: &str, wg: bool| {
+                // Stands in for a fence landing mid-check: the record now
+                // carries a mark the lift did not check.
+                let fence = slot.get().and_then(Weak::upgrade).expect("the fence");
+                let mut fenced = fence.fenced.lock();
+                fenced.marks += 1;
+                let mark = fenced.marks;
+                for record in fenced.profiles.values_mut() {
+                    record.mark = mark;
+                }
+                healthy(iface, wg)
+            }
+        });
+        let fence = Arc::new(KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            prober,
+        ));
+        slot.set(Arc::downgrade(&fence)).expect("set once");
+        fence.fence_all();
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown, "still fenced");
+        assert!(resumes(&engine).is_empty());
+        assert!(
+            fence.with_record(&ProfileId::new("acct_a"), |r| r.is_some()),
+            "the record stays for the next lift",
+        );
+    }
+
+    /// Without the kill switch no fence lifts by its own record, so the add
+    /// handler's hold has nothing to record with and runs alone.
+    #[test]
+    fn the_add_handlers_hold_without_a_kill_switch_still_runs() {
+        let hold = fence_hold(None);
+        let mut ran = false;
+        hold(&ProfileId::new("acct_a"), handle(3), &mut || {
+            ran = true;
+            true
+        });
+        assert!(ran);
     }
 }

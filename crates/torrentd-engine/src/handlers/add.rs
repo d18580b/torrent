@@ -289,10 +289,27 @@ fn queue_first_resume_save(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
 /// A torrent paused here is not added to the profile's `paused_for_vpn`
 /// count: the fence's walk and the daemon's own post-add re-check can pause
 /// the same torrent, so counting each pause would overcount.
+///
+/// Run through [`HandlerCtx::fence_hold`] where the daemon gave one, so the
+/// kill-switch fence records what this pauses and its lift resumes it: that
+/// fence resumes only what it recorded, and its walk did not find this one.
 fn hold_if_fenced(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
+    let mut hold = || pause_if_fenced(handle, ctx);
+    match ctx.fence_hold {
+        Some(f) => f(&ctx.profile_id, handle, &mut hold),
+        None => {
+            hold();
+        }
+    }
+}
+
+/// [`hold_if_fenced`]'s check and pause. Returns whether the profile was
+/// fenced, whether or not the pause took: one that failed leaves the torrent
+/// running, and a lift that resumes it changes nothing.
+fn pause_if_fenced(handle: TorrentHandle, ctx: &HandlerCtx<'_>) -> bool {
     fence(Ordering::SeqCst);
     if !ctx.profile_fenced.is_some_and(|f| f(&ctx.profile_id)) {
-        return;
+        return false;
     }
     match ctx.engine.pause_torrent(handle) {
         Ok(()) => info!(
@@ -313,6 +330,7 @@ fn hold_if_fenced(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
             );
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -377,6 +395,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -436,6 +455,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -489,6 +509,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -537,6 +558,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -606,6 +628,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile,
             span: tracing::info_span!("test"),
         };
@@ -655,6 +678,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -693,6 +717,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -769,6 +794,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile,
             span: tracing::info_span!("test"),
         };
@@ -847,6 +873,7 @@ mod tests {
                 clock: &clock,
                 engine: &engine,
                 profile_fenced: None,
+                fence_hold: None,
                 profile_id: profile.clone(),
                 span: tracing::info_span!("test"),
             };
@@ -962,6 +989,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -1084,6 +1112,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: None,
+            fence_hold: None,
             profile_id: profile,
             span: tracing::info_span!("test"),
         };
@@ -1096,15 +1125,16 @@ mod tests {
 
     /// Add a torrent to a mock session, let `fenced_after_add` decide whether
     /// the profile is fenced before its `add_torrent_alert` is handled, then
-    /// handle it. Returns the handle and the engine's recorded calls.
-    fn add_then_handle_alert(
-        fenced_after_add: bool,
-    ) -> (TorrentHandle, Vec<crate::mock::RecordedCall>) {
+    /// handle it. Returns the handle, the engine's recorded calls, and what
+    /// the handler ran through its fence hold: each handle with what the hold
+    /// answered, and the engine's calls by the time it had.
+    fn add_then_handle_alert(fenced_after_add: bool) -> AddedUnderFence {
         use std::sync::atomic::AtomicBool;
 
         use libtorrent_safe::AddParams;
         use libtorrent_safe::TorrentFlags;
 
+        use crate::alert_loop::FenceHold;
         use crate::alert_loop::ProfileFenced;
 
         let profile = ProfileId::new("p");
@@ -1119,6 +1149,18 @@ mod tests {
         let profile_fenced: ProfileFenced = {
             let fenced = fenced.clone();
             Arc::new(move |_: &ProfileId| fenced.load(Ordering::SeqCst))
+        };
+        let held = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let fence_hold: FenceHold = {
+            let held = held.clone();
+            let mock = mock.clone();
+            Arc::new(
+                move |id: &ProfileId, h: TorrentHandle, hold: &mut dyn FnMut() -> bool| {
+                    assert_eq!(id.as_str(), "p");
+                    let answered = hold();
+                    held.lock().push((h, answered, mock.calls()));
+                },
+            )
         };
 
         let th = engine
@@ -1141,6 +1183,7 @@ mod tests {
             clock: &clock,
             engine: &engine,
             profile_fenced: Some(&profile_fenced),
+            fence_hold: Some(&fence_hold),
             profile_id: profile,
             span: tracing::info_span!("test"),
         };
@@ -1158,14 +1201,28 @@ mod tests {
             &mut ctx,
         );
         assert!(state.contains(&th.infohash));
-        (th, mock.calls())
+        let held = std::mem::take(&mut *held.lock());
+        AddedUnderFence {
+            th,
+            calls: mock.calls(),
+            held,
+        }
+    }
+
+    /// What [`add_then_handle_alert`] observed.
+    struct AddedUnderFence {
+        th: TorrentHandle,
+        calls: Vec<crate::mock::RecordedCall>,
+        /// Each handle run through the fence hold, what the hold answered,
+        /// and the engine's calls once it had.
+        held: Vec<(TorrentHandle, bool, Vec<crate::mock::RecordedCall>)>,
     }
 
     #[test]
     fn a_torrent_whose_profile_is_fenced_before_its_add_alert_lands_is_paused() {
         use crate::mock::RecordedCall;
 
-        let (th, calls) = add_then_handle_alert(true);
+        let AddedUnderFence { th, calls, .. } = add_then_handle_alert(true);
         assert!(
             calls
                 .iter()
@@ -1174,16 +1231,43 @@ mod tests {
         );
     }
 
+    /// The daemon's kill-switch fence resumes only what it recorded, and its
+    /// walk did not find this torrent: the pause runs inside the hold, where
+    /// the daemon holds that fence's lock, and is answered as fenced so the
+    /// daemon records the handle for the lift.
+    #[test]
+    fn a_torrent_paused_into_a_fenced_profile_is_held_through_the_fence_hold() {
+        use crate::mock::RecordedCall;
+
+        let AddedUnderFence { th, held, .. } = add_then_handle_alert(true);
+        let [(h, answered, calls)] = held.as_slice() else {
+            panic!("the hold must run once, through the hook: {held:?}");
+        };
+        assert_eq!(*h, th);
+        assert!(*answered, "a fenced profile must answer the hold as fenced");
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PauseTorrent(p) if *p == th)),
+            "the pause must land inside the hold, under the daemon's lock: {calls:?}",
+        );
+    }
+
     #[test]
     fn a_torrent_added_to_an_unfenced_profile_is_not_paused() {
         use crate::mock::RecordedCall;
 
-        let (_, calls) = add_then_handle_alert(false);
+        let AddedUnderFence { th, calls, held } = add_then_handle_alert(false);
         assert!(
             !calls
                 .iter()
                 .any(|c| matches!(c, RecordedCall::PauseTorrent(_))),
             "{calls:?}",
+        );
+        // Asked, and answered unfenced, so the daemon records nothing.
+        assert!(
+            matches!(held.as_slice(), [(h, false, _)] if *h == th),
+            "{held:?}",
         );
     }
 }

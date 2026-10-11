@@ -86,6 +86,10 @@ pub struct AppState {
     /// How setting a fenced profile online probes its tunnel before it lifts
     /// the fence: the host's own probes outside tests.
     pub tunnel_probe: crate::vpn_monitor::Prober,
+    /// The kill-switch watch's fence, where `network_kill_switch` is on. An
+    /// add that finds its profile fenced records what it paused with it, so
+    /// the fence's lift resumes that too.
+    pub kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
@@ -304,6 +308,7 @@ pub(crate) fn build_test_state_with_sessions(
             route: None,
             handshake: None,
         }),
+        kill_switch: None,
     }
 }
 
