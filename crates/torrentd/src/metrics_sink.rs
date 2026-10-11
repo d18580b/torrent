@@ -360,6 +360,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
          unparseable .torrent files.";
     "pool_verify_completed_total" Counter Daemon Zero => "Adopted torrents that verified and are seeding.";
     "pool_verify_failed_total" Counter Daemon Zero => "Adopted torrents whose verification failed or was dropped.";
+    "pool_recheck_dropped_total" Counter Daemon
+        ("reason": &["not_loaded", "paused", "no_metadata", "no_engine", "start_failed"]) Zero =>
+        "Re-hashes POST /v1/pool/verifications queued that the queue dropped instead of starting, \
+         by why: the torrent was no longer loaded, the operator paused it, it had no metadata, its \
+         profile had no session, or libtorrent refused to start the check.";
     "pool_verify_queue_depth" Gauge Daemon Owner("pool configured, from the first queue tick") =>
         "Adoptions waiting to verify, and re-hashes POST /v1/pool/verifications queued that have not started.";
     "pool_verify_in_flight" Gauge Daemon Owner("pool configured, from the first queue tick") =>

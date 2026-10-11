@@ -297,6 +297,7 @@ changing it needs a restart).
 | `torrentd_pool_verify_in_flight` | Torrents libtorrent is hashing now, adoptions and re-hashes |
 | `torrentd_pool_verify_completed_total` | Verified and seeding; the index records them `adopted` |
 | `torrentd_pool_verify_failed_total` | Failed or dropped |
+| `torrentd_pool_recheck_dropped_total` | Queued re-hashes dropped before they started, by `reason` |
 
 `GET /v1/pool` reports the first two as `verify_queue_depth` and
 `verify_in_flight`, and the bundled dashboard plots all four.
@@ -311,14 +312,17 @@ changing it needs a restart).
   verify`, or reads `verify dropped: …` or `verify add failed`.
 - **A fenced or offline profile** holds the queue: nothing is admitted for it
   until it is back (`verify held: profile is off the network`, or `re-hash
-  held: …` for a queued re-hash, logged once per profile each second).
+  held: …` for a queued re-hash, logged once per profile each second). A
+  queued re-hash also waits while the profile's fence is lifted, until the
+  lift's paced resume reaches its torrent.
 - **A re-hash paused while it checks** keeps its slot until the check ends,
   because libtorrent goes on with it once the torrent is resumed. Resume or
   remove the torrent to free the slot; otherwise it is freed after 24 hours.
 - **A dropped re-hash** never started: by the time a slot was free its
   torrent had been removed, paused, or had no metadata, or libtorrent refused
   the request. The log reads `re-hash dropped: …`, or ends `dropping the
-  re-hash` or `dropping it`. Verify it again once the cause is fixed.
+  re-hash` or `dropping it`, and `torrentd_pool_recheck_dropped_total`
+  counts it by `reason`. Verify it again once the cause is fixed.
 
 **The adoption queue survives a restart.** It is kept in `pool.db`, and the boot
 queues every torrent still waiting in it again, in order, so

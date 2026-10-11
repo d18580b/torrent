@@ -1148,6 +1148,57 @@ mod tests {
         assert!(!listed.contains(&KEY[..43]), "the key leaked: {listed}");
     }
 
+    /// Lifting a fence on set-online marks the profile active before its
+    /// paced run resumes the torrents, so the run is what tells a queued
+    /// re-hash that a torrent still paused is the lift's to resume
+    /// ([`ProfileEntry::resume_pending`]): it names every torrent in the
+    /// profile until the run ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_lifted_fence_names_what_its_run_has_yet_to_resume() {
+        use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+        use torrentd_engine::InfoHash;
+        use torrentd_engine::TorrentHandle;
+        use torrentd_engine::TorrentState;
+
+        use crate::app_state::build_test_state;
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "p",
+            EngineProfileStatus::VpnDown,
+        )]));
+        let s = build_test_state(Some(reg));
+        let id = ProfileId::new("p");
+        let n = u8::try_from(REANNOUNCE_BATCH + 1).unwrap();
+        for b in 1..=n {
+            let ih = InfoHash([b; 20]);
+            let h = TorrentHandle {
+                id: u64::from(b),
+                infohash: ih,
+            };
+            s.state.insert(
+                ih,
+                TorrentState::newly_added(h, id.clone(), std::time::Instant::now()),
+            );
+        }
+        let last = InfoHash([n; 20]);
+        let entry = s.profiles.resolve(&id).active().unwrap();
+        assert!(!entry.resume_pending(&last), "no run before the lift");
+
+        lift_fence(&s, entry);
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        assert_eq!(entry.health().status, EngineProfileStatus::Active);
+        assert!(
+            entry.resume_pending(&last),
+            "the first batch went out; the last torrent is still the run's to resume",
+        );
+
+        tokio::time::sleep(REANNOUNCE_PACE * 3).await;
+        assert!(!entry.is_resuming(), "the run ended");
+        assert!(!entry.resume_pending(&last));
+    }
+
     #[test]
     fn failures_are_counted_exactly_and_named_up_to_the_cap_smallest_first() {
         use torrentd_engine::InfoHash;

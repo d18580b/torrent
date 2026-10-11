@@ -128,6 +128,7 @@ hold.
 | `torrentd_pool_scan_errors_total` | counter | `kind`: `walk`, `stat`, `path`, `read`, `parse` | daemon | from boot, at 0 | Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or unparseable .torrent files. |
 | `torrentd_pool_verify_completed_total` | counter | — | daemon | from boot, at 0 | Adopted torrents that verified and are seeding. |
 | `torrentd_pool_verify_failed_total` | counter | — | daemon | from boot, at 0 | Adopted torrents whose verification failed or was dropped. |
+| `torrentd_pool_recheck_dropped_total` | counter | `reason`: `not_loaded`, `paused`, `no_metadata`, `no_engine`, `start_failed` | daemon | from boot, at 0 | Re-hashes POST /v1/pool/verifications queued that the queue dropped instead of starting, by why: the torrent was no longer loaded, the operator paused it, it had no metadata, its profile had no session, or libtorrent refused to start the check. |
 | `torrentd_pool_verify_queue_depth` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions waiting to verify, and re-hashes POST /v1/pool/verifications queued that have not started. |
 | `torrentd_pool_verify_in_flight` | gauge | — | daemon | from boot: pool configured, from the first queue tick | Adoptions verifying and re-hashes checking now, together bounded by [pool] max_concurrent_verify. |
 | `torrentd_pool_index_profile_disagreements` | gauge | — | daemon | from boot: pool configured | Torrents whose pool-index profile disagrees with the assignment registry at boot. |

@@ -14,6 +14,7 @@ use std::sync::Weak;
 
 use parking_lot::Mutex;
 use torrentd_engine::EngineError;
+use torrentd_engine::InfoHash;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
@@ -238,6 +239,30 @@ impl ProfileEntry {
                 .copied()
                 .collect(),
         )
+    }
+
+    /// Whether the paced resume running in this profile is still to resume
+    /// `ih`: the run was asked to resume it, and neither a pause of the
+    /// profile nor the operator's pause of the torrent has stopped it.
+    ///
+    /// A fence's lift marks the profile active and then resumes its torrents
+    /// a batch at a time, recording nothing in [`PacedHolds`], so a torrent
+    /// its run has not reached yet reads as paused in an active profile. It
+    /// is paused by the daemon, not the operator, and runs again once its
+    /// batch comes. The run is not told which torrents it has reached, so
+    /// one it has already resumed reads as pending too until the run ends,
+    /// which is the same answer a moment early.
+    pub fn resume_pending(&self, ih: &InfoHash) -> bool {
+        let resuming = self.resuming.lock();
+        let Some(run) = resuming.as_ref() else {
+            return false;
+        };
+        if run.cancelled() || run.gate.halted() {
+            return false;
+        }
+        run.handles
+            .iter()
+            .any(|h| h.infohash == *ih && !run.gate.excludes(h))
     }
 
     /// A gate for a paced resume about to run in this profile, which every
