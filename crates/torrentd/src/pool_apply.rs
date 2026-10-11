@@ -274,9 +274,7 @@ impl DeleteScope {
     fn reached_by(&self, live: &LiveTorrent) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
         let save_path = live.save_path.as_path();
-        let bases: Vec<std::path::PathBuf> = std::iter::once(save_path.to_path_buf())
-            .chain(std::fs::canonicalize(save_path).ok())
-            .collect();
+        let bases = live.bases();
         let Some(files) = &live.files else {
             return bases.iter().find_map(|b| {
                 if let Some(r) = self.root_over(b) {
@@ -309,13 +307,7 @@ impl DeleteScope {
                     ));
                 }
             }
-            // A file not written yet resolves through its parent: a symlinked
-            // directory below the save path leads there all the same.
-            let resolved = std::fs::canonicalize(&joined).ok().or_else(|| {
-                let parent = std::fs::canonicalize(joined.parent()?).ok()?;
-                Some(parent.join(joined.file_name()?))
-            });
-            if let Some(p) = resolved {
+            if let Some(p) = live.resolved(rel) {
                 if let Some(r) = self.root_over(&p) {
                     return Some(format!(
                         "lists {rel}, at {}, which a symlink leads to {}, under this plan's \
@@ -1429,9 +1421,7 @@ impl TorrentPayload {
     /// has not arrived yet could write any file under its `save_path`, so
     /// every payload file under it counts as shared.
     pub fn shared_with(&self, other: &LiveTorrent) -> Option<&std::path::Path> {
-        let bases: Vec<std::path::PathBuf> = std::iter::once(other.save_path.clone())
-            .chain(std::fs::canonicalize(&other.save_path).ok())
-            .collect();
+        let bases = other.bases();
         fn forms(f: &PayloadFile) -> impl Iterator<Item = &std::path::PathBuf> {
             std::iter::once(&f.path).chain(f.resolved.as_ref())
         }
@@ -1489,9 +1479,7 @@ impl LiveTorrent {
         let dirs: Vec<std::path::PathBuf> = std::iter::once(dir.to_path_buf())
             .chain(std::fs::canonicalize(dir).ok())
             .collect();
-        let bases: Vec<std::path::PathBuf> = std::iter::once(self.save_path.clone())
-            .chain(std::fs::canonicalize(&self.save_path).ok())
-            .collect();
+        let bases = self.bases();
         let under = |p: &Path| dirs.iter().any(|d| p.starts_with(d));
         let Some(files) = &self.files else {
             return bases
@@ -1500,14 +1488,29 @@ impl LiveTorrent {
                 .then(|| self.save_path.clone());
         };
         files.iter().find_map(|rel| {
-            let joined = self.save_path.join(rel);
-            let resolved = std::fs::canonicalize(&joined).ok().or_else(|| {
-                let parent = std::fs::canonicalize(joined.parent()?).ok()?;
-                Some(parent.join(joined.file_name()?))
-            });
-            let hit =
-                bases.iter().any(|b| under(&b.join(rel))) || resolved.as_deref().is_some_and(under);
-            hit.then_some(joined)
+            let hit = bases.iter().any(|b| under(&b.join(rel)))
+                || self.resolved(rel).as_deref().is_some_and(under);
+            hit.then(|| self.save_path.join(rel))
+        })
+    }
+
+    /// Its save path as the session spells it, then with its symlinks
+    /// resolved where it resolves: the two bases every comparison of its
+    /// files joins them to.
+    fn bases(&self) -> Vec<std::path::PathBuf> {
+        std::iter::once(self.save_path.clone())
+            .chain(std::fs::canonicalize(&self.save_path).ok())
+            .collect()
+    }
+
+    /// Where its file `rel` lies with every symlink on its full path
+    /// resolved. A file not written yet resolves through its parent, so a
+    /// symlinked directory below the save path leads there all the same.
+    fn resolved(&self, rel: &str) -> Option<std::path::PathBuf> {
+        let joined = self.save_path.join(rel);
+        std::fs::canonicalize(&joined).ok().or_else(|| {
+            let parent = std::fs::canonicalize(joined.parent()?).ok()?;
+            Some(parent.join(joined.file_name()?))
         })
     }
 }
