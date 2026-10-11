@@ -590,8 +590,13 @@ fn fence(
 /// and one whose tunnel no longer passes [`recovery_check`] stays fenced for
 /// the operator, as any fence on a failing tunnel does. Only the torrents that
 /// were not paused when it fenced are resumed, so a torrent the operator had
-/// paused stays paused. A profile set online and then fenced again resumes
-/// what was running at that latest fence.
+/// paused stays paused. So does one paused while the fence stands, by the
+/// operator or for a failed verification, and a pause of the whole profile
+/// then leaves all of it paused: the fence opens a resume gate on the profile
+/// as it fences ([`FenceRecord::gate`]), which every such pause closes
+/// ([`ProfileEntry::exclude_from_resumes`], [`ProfileEntry::halt_resumes`]),
+/// and its lift keeps to it. A profile set online and then fenced again
+/// resumes what was running at that latest fence.
 ///
 /// The lift resumes them a batch per [`REANNOUNCE_PACE`] ([`spawn_lift`]),
 /// from a task that outlives the check that lifted it. A
@@ -623,6 +628,12 @@ pub(crate) struct FenceRecord {
     pub(crate) mark: u64,
     /// What its lift resumes.
     pub(crate) handles: Vec<TorrentHandle>,
+    /// Opened on the profile before the fence read what was running, and
+    /// kept to by its lift's run ([`ProfileEntry::begin_resume_with`]): a
+    /// torrent paused since is left out of [`FenceRecord::handles`] when the
+    /// lift reaches it, and a pause of the whole profile since halts the lift
+    /// before it resumes any.
+    gate: Arc<ResumeGate>,
 }
 
 impl KillSwitchFence {
@@ -676,6 +687,10 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             if health.status == ProfileStatus::VpnDown {
                 continue;
             }
+            // Opened before the read of what is running, so a pause that
+            // lands after that read, too late to read as paused, still closes
+            // it, and the lift does not resume what it paused.
+            let gate = e.open_gate();
             let mut running: Vec<TorrentHandle> = self
                 .state
                 .handles_for_profile(e.id())
@@ -705,6 +720,7 @@ impl vpn::killswitch::Fence for KillSwitchFence {
                 FenceRecord {
                     mark,
                     handles: running,
+                    gate,
                 },
             );
             self.metrics.inc_counter(
@@ -729,12 +745,24 @@ impl vpn::killswitch::Fence for KillSwitchFence {
         // mark below would find no record, and its torrents would stay paused
         // in a profile lifted around them.
         let mut fenced = self.fenced.lock();
-        for (profile_id, FenceRecord { mut handles, .. }) in fenced.profiles.drain() {
+        for (
+            profile_id,
+            FenceRecord {
+                mut handles, gate, ..
+            },
+        ) in fenced.profiles.drain()
+        {
             // A torrent the scans paused again after a lift stopped part-way
             // can be in the record twice: once from the fence's take of the
             // unfinished lift, once from the scans.
             let mut seen = std::collections::HashSet::with_capacity(handles.len());
             handles.retain(|h| seen.insert(*h));
+            // The operator paused the whole profile while it was fenced: its
+            // torrents stay paused, though the fence lifts. One paused alone
+            // is left out by the gate as the run reaches it.
+            if gate.halted() {
+                handles.clear();
+            }
             let resolved = self.profiles.resolve(&profile_id);
             let Some(entry) = resolved
                 .active()
@@ -756,7 +784,7 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             let torrent_count = handles.len();
             // Recorded before the profile reads active, so a queued re-hash
             // never finds it active with no run to resume its torrents.
-            let run = entry.begin_resume(handles);
+            let run = entry.begin_resume_with(handles, gate);
             entry.update_health(|h| {
                 h.status = ProfileStatus::Active;
                 h.paused_for_vpn = 0;
@@ -863,11 +891,11 @@ pub(crate) fn spawn_lift(
     spawn_run(profiles, metrics, entry, run, lift)
 }
 
-/// Drive `run`, already recorded on `entry` by [`ProfileEntry::begin_resume`],
-/// as [`spawn_lift`] does. A fence's lift records its run before it marks the
-/// profile active, so a profile that reads active while its torrents still
-/// read paused always has the run that will resume them
-/// ([`ProfileEntry::resume_pending`]).
+/// Drive `run`, already recorded on `entry` by [`ProfileEntry::begin_resume`]
+/// or [`ProfileEntry::begin_resume_with`], as [`spawn_lift`] does. A fence's
+/// lift records its run before it marks the profile active, so a profile that
+/// reads active while its torrents still read paused always has the run that
+/// will resume them ([`ProfileEntry::resume_pending`]).
 pub(crate) fn spawn_run(
     profiles: &Arc<ProfileRegistry>,
     metrics: &Arc<PromSink>,
@@ -3076,6 +3104,50 @@ mod tests {
             (1..n).collect::<Vec<_>>(),
             "every torrent but the one paused by hand",
         );
+    }
+
+    /// A torrent the operator pauses while the kill-switch fence stands, by
+    /// the pause route's own step, stays paused when the fence lifts; the
+    /// rest of what the fence paused is resumed.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_paused_during_a_kill_switch_fence_stays_paused_after_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(3);
+        fence.fence_all();
+        // `POST /v1/torrents/{infohash}/pause`, before its pause.
+        fence
+            .profiles
+            .iter()
+            .next()
+            .unwrap()
+            .exclude_from_resumes(handle(2));
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            sorted_ids(&resumes(&engine)),
+            [1, 3],
+            "every torrent the fence paused but the one paused during it",
+        );
+    }
+
+    /// A pause of the whole profile while the kill-switch fence stands, by
+    /// the pause-all routes' own step, leaves every torrent paused once the
+    /// fence lifts, though the profile itself is lifted.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_all_during_a_kill_switch_fence_leaves_the_profile_paused_after_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence_over(3);
+        fence.fence_all();
+        // `POST /v1/profiles/{id}/pause-all`, before its walk.
+        fence.profiles.iter().next().unwrap().halt_resumes();
+
+        fence.lift();
+        settle(&fence).await;
+        tokio::time::sleep(3 * REANNOUNCE_PACE).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active, "the fence lifts");
+        assert!(resumes(&engine).is_empty(), "and resumes nothing");
     }
 
     fn status_of(fence: &KillSwitchFence) -> ProfileStatus {

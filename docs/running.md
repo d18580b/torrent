@@ -822,8 +822,9 @@ update `vpn_config`.
 
 **An OpenVPN profile's `vpn_config` is executable configuration.** An `.ovpn`
 can run programs (`up`, `route-up` and the other hooks, once `script-security
-2` allows them), load a shared library into `openvpn` (`plugin`), and open a
-socket that drives it (`management`) — all as the daemon's user, holding
+2` allows them), load a shared library into `openvpn` (`plugin`, and
+`pkcs11-providers`, `engine`, or `providers` naming a path, which
+`--script-security` does not gate at all), and open a socket that drives it (`management`) — all as the daemon's user, holding
 whatever `CAP_NET_ADMIN` it has, with which a hook could re-point another
 profile's routing. Treat a provider's bundle, or a file in a shared
 directory, as code. The daemon closes this two ways, as it refuses
@@ -836,9 +837,12 @@ directory, as code. The daemon closes this two ways, as it refuses
   and the directive — when it carries any of `up`, `down`, `route-up`,
   `route-pre-down`, `ipchange`, `tls-verify`, `auth-user-pass-verify`,
   `tls-crypt-v2-verify`, `client-connect`, `client-disconnect`,
-  `learn-address`, `iproute`, `plugin`, `management`, `script-security`
-  above 1, `daemon`, `chroot`, `cd`, `config` (a nested include), or one
-  that has `openvpn` create or overwrite a path the file chooses as the
+  `learn-address`, `dns-updown` (unless it is `dns-updown disable`),
+  `iproute`, `plugin`, `pkcs11-providers`, `show-pkcs11-ids`, `engine`,
+  `providers` with an argument holding a `/` (a bare name such as
+  `providers legacy default` loads only from OpenSSL's own module directory
+  and is allowed), `management`, `script-security` above 1, `daemon`,
+  `chroot`, `cd`, `config` (a nested include), or one that has `openvpn` create or overwrite a path the file chooses as the
   daemon's user — `log`, `log-append`, `status`, `replay-persist`,
   `ifconfig-pool-persist`, `tls-export-cert`, `genkey` (the daemon's
   state, resume and token files are writable by that user). Words are
