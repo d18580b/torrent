@@ -92,7 +92,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 // that fails here keeps the tombstone, so the next boot
                 // deletes the file rather than loading the torrent again.
                 let settled = ctx.state.settle_removal(&ctx.profile_id, &ih, |readded| {
-                    settle_removed_files(ctx, &ih, readded);
+                    settle_removed_files(ctx, &ih, readded, Tombstone::Settle);
                 });
                 // Settle a save that was in flight when the torrent went: its
                 // answer arrives with no info-hash (the shim skips an invalid
@@ -120,13 +120,21 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     }
 }
 
-/// Delete what a settled removal of the profile's `ih` leaves to delete, and
-/// settle its tombstone: its resume file, and its `.torrent` and save path
-/// unless `readded`. A resume file the delete leaves behind is marked stale.
+/// Delete what a settled removal of the profile's `ih` leaves to delete: its
+/// resume file, and its `.torrent` and save path unless `readded`, doing with
+/// its tombstone what `tombstone` says. A resume file the delete leaves behind
+/// is marked stale.
 ///
-/// For `torrent_removed_alert`, and for a removal an overflow may have dropped
-/// that alert of (`handlers::dropped`).
-pub(crate) fn settle_removed_files(ctx: &HandlerCtx<'_>, ih: &InfoHash, readded: bool) {
+/// For `torrent_removed_alert`, which settles the tombstone, and for a removal
+/// an overflow may have dropped that alert of (`handlers::dropped`), which
+/// keeps it: that alert may be only late, and a resume save can still land
+/// before it.
+pub(crate) fn settle_removed_files(
+    ctx: &HandlerCtx<'_>,
+    ih: &InfoHash,
+    readded: bool,
+    tombstone: Tombstone,
+) {
     let left = delete_removed_files(
         ctx.resume,
         ctx.torrents,
@@ -134,7 +142,7 @@ pub(crate) fn settle_removed_files(ctx: &HandlerCtx<'_>, ih: &InfoHash, readded:
         &ctx.profile_id,
         ih,
         readded,
-        Tombstone::Settle,
+        tombstone,
     );
     ctx.state
         .set_stale_resume_file(&ctx.profile_id, ih, left.resume_failed);

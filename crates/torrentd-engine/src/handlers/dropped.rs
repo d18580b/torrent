@@ -14,7 +14,8 @@
 //! When they include `torrent_removed_alert`, every entry of the profile's
 //! whose torrent the daemon asked to remove and the session no longer holds
 //! is settled as that alert would have settled it, since only that alert
-//! drops a torrent from the map.
+//! drops a torrent from the map. Its tombstone is left for that alert, which
+//! may be only late, or for the next boot.
 
 use std::collections::HashSet;
 
@@ -169,8 +170,16 @@ fn reconcile_session(ctx: &HandlerCtx<'_>, adds: bool, removals: bool) {
 /// Settle every one of `entries`, the profile's state-map entries, that the
 /// session no longer holds (`held`) and whose removal the daemon asked for,
 /// as its lost `torrent_removed_alert` would have: drop the entry, delete
-/// the stores' files a re-add does not own, settle the tombstone, and settle
-/// a resume save in flight for it.
+/// the stores' files a re-add does not own, and settle a resume save in
+/// flight for it.
+///
+/// The tombstone `DELETE` left standing is kept, not settled. The session no
+/// longer holding the torrent does not mean its alert was lost: it may be only
+/// late, and a resume save libtorrent queued before the removal can still
+/// write the resume file before it. Cleared here, a crash in that window, or
+/// that alert lost to a second overflow, would leave a resume file with no
+/// tombstone, and the next boot would load the torrent again. The alert, the
+/// torrent's last, settles it where it comes, and the boot where it does not.
 ///
 /// Without this a lost alert leaves the entry until a restart, and the
 /// overlap guards of `DELETE ?delete_files=true` and of a pool delete plan,
@@ -185,7 +194,7 @@ fn reconcile_removals(ctx: &HandlerCtx<'_>, entries: Vec<TorrentHandle>, held: &
     let (mut settled, mut unrecorded) = (0u64, 0u64);
     for h in entries.into_iter().filter(|h| !held.contains(h)) {
         let outcome = ctx.state.reconcile_removal(&ctx.profile_id, h, |readded| {
-            add::settle_removed_files(ctx, &h.infohash, readded);
+            add::settle_removed_files(ctx, &h.infohash, readded, add::Tombstone::Keep);
         });
         match outcome {
             Some(s) => {
@@ -413,6 +422,18 @@ mod tests {
         metrics: &RecordingSink,
         bits: [u64; 2],
     ) {
+        run_alert(engine, state, resume, torrents, metrics, &overflow(bits));
+    }
+
+    /// Handle `alert`, an overflow or an add-side alert, as [`run_with`] does.
+    fn run_alert(
+        engine: Arc<dyn TorrentEngine>,
+        state: &StateMap,
+        resume: &MemoryResumeStore,
+        torrents: &MemoryTorrentStore,
+        metrics: &RecordingSink,
+        alert: &Alert,
+    ) {
         let clock = MockClock::new();
         let mut ctx = HandlerCtx {
             state,
@@ -426,7 +447,10 @@ mod tests {
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
-        handle(&overflow(bits), &mut ctx);
+        match alert {
+            Alert::AlertsDropped { .. } => handle(alert, &mut ctx),
+            _ => add::handle(alert, &mut ctx),
+        }
     }
 
     /// `p` tracks `ih`, holds its files and the tombstone `DELETE` leaves
@@ -497,15 +521,44 @@ mod tests {
         assert!(state.contains(&kept.infohash));
         assert!(resume.snapshot(&p).is_empty());
         assert!(torrents.load_all(&p).unwrap().is_empty());
-        assert!(resume.tombstones(&p).unwrap().is_empty(), "settled");
+        // Kept: the alert may be only late, with a resume save still to land
+        // before it, and it or the next boot settles the tombstone.
+        assert_eq!(resume.tombstones(&p).unwrap(), vec![ih], "kept");
         assert_eq!(state.resume_saves_in_flight(), 0);
         assert_eq!(
             reconciled(&metrics),
             vec![(1, vec![("profile_id".to_string(), "p".to_string())])],
         );
         // A second overflow finds nothing left to settle.
-        run_with(mock, &state, &resume, &torrents, &metrics, REMOVED_DROPPED);
+        run_with(
+            mock.clone(),
+            &state,
+            &resume,
+            &torrents,
+            &metrics,
+            REMOVED_DROPPED,
+        );
         assert_eq!(metrics.count_for("removals_reconciled_total"), 1);
+
+        // The alert was only late: a resume save queued before the removal
+        // lands, and then the alert, the torrent's last, deletes what it
+        // wrote and settles the tombstone.
+        resume.write(&p, &ih, b"late-resume").unwrap();
+        let removed = Alert::TorrentRemoved {
+            hdr: AlertHeader {
+                kind: AlertKind::TorrentRemoved,
+                infohash: Some(ih),
+                handle: None,
+                timestamp_us: 0,
+            },
+        };
+        run_alert(mock, &state, &resume, &torrents, &metrics, &removed);
+        assert!(resume.snapshot(&p).is_empty());
+        assert!(resume.tombstones(&p).unwrap().is_empty(), "settled");
+        assert!(
+            state.get(&kept.infohash).is_some(),
+            "only the removed torrent"
+        );
     }
 
     #[test]
@@ -550,9 +603,8 @@ mod tests {
                 settled,
                 "{bits:?}",
             );
-            if !readd_tracked {
-                assert!(resume.tombstones(&p).unwrap().is_empty());
-            }
+            // Left for the alert or the boot, which spends it on the re-add.
+            assert_eq!(resume.tombstones(&p).unwrap(), vec![ih], "{bits:?}");
         }
     }
 
