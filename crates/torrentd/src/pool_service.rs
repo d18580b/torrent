@@ -2547,10 +2547,19 @@ fn record_verify_outcome(
                 // Left out first, as the operator's pause does: a paced
                 // resume running in the profile, or a kill-switch fence's
                 // lift, would otherwise resume it, and a paced set-online's
-                // hold would load it unpaused at the next boot.
-                if let Some(entry) = profiles.resolve(&st.profile_id).active() {
-                    entry.exclude_from_resumes(st.handle);
-                }
+                // hold would load it unpaused at the next boot. Noted paused
+                // around the exclusion, as that pause notes it too: a
+                // kill-switch fence or a set-online that reads what is
+                // running before a state update reports this pause would
+                // otherwise read it as running, and its lift or pace resume
+                // it.
+                let entry = profiles.resolve(&st.profile_id).active();
+                let before = entry.map(|e| {
+                    let before = e.note_running(st.handle, false);
+                    e.exclude_from_resumes(st.handle);
+                    e.note_running(st.handle, false);
+                    before
+                });
                 let paused = source
                     .engine_for(&st.profile_id)
                     .map(|e| e.pause_torrent(st.handle));
@@ -2560,6 +2569,10 @@ fn record_verify_outcome(
                     // piece hashes just rejected.
                     state.queue_resume_save_now(*hash);
                 } else {
+                    // Its flag did not change, so the note goes back.
+                    if let (Some(e), Some(before)) = (entry, before) {
+                        e.restore_noted(st.handle, before);
+                    }
                     warn!(
                         target: "torrentd::pool",
                         infohash = %ih,
@@ -4843,6 +4856,126 @@ mod tests {
             profiles.holds().held(&id),
             HashSet::from([other.infohash]),
             "the failed torrent is not held to be resumed",
+        );
+    }
+
+    /// Issue #410: a kill-switch fence that lands after a failed
+    /// verification's pause, before a state update reports it, reads the
+    /// torrent as paused, as it reads the operator's pause, so its lift
+    /// leaves it paused and resumes only the rest. Where the engine refused
+    /// the pause the torrent still runs, and the lift resumes it with the
+    /// rest.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_switch_lift_just_after_a_failed_verify_leaves_the_torrent_paused() {
+        use std::net::IpAddr;
+        use std::net::Ipv4Addr;
+
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::StateMap;
+
+        use crate::profile_registry::ProfileEntry;
+        use crate::profile_registry::ProfileRegistry;
+        use crate::vpn::killswitch::Fence;
+        use crate::vpn::route::RouteProbe;
+        use crate::vpn_monitor::KillSwitchFence;
+        use crate::vpn_monitor::TunnelProbes;
+
+        let failed = TorrentHandle {
+            id: 1,
+            infohash: InfoHash([0x11; 20]),
+        };
+        let other = TorrentHandle {
+            id: 2,
+            infohash: InfoHash([0x22; 20]),
+        };
+        let bound = Some(IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+        let loaded = |state: &StateMap, h: TorrentHandle, phase: TorrentPhase| {
+            let mut s = TorrentState::newly_added(h, ProfileId::new("p"), Instant::now());
+            s.phase = phase;
+            state.insert(h.infohash, s);
+        };
+        // Verifies `failed` to a failure, then fences the profile, lets the
+        // fence's pauses reach the state map, and lifts it with the tunnel
+        // healthy: what the lift resumed.
+        let fence_after_failed_verify = |refuse_pause: bool| async move {
+            let id = ProfileId::new("p");
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+            let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+            let engine = Arc::new(MockEngine::new());
+            let entry = ProfileEntry::new(
+                crate::profile_registry::test_vpn_entry("p", ProfileStatus::Active).config,
+                engine.clone(),
+                bound,
+                None,
+                0,
+            );
+            let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+            let source = torrentd_engine::ProfileSource::new(vec![(
+                id.clone(),
+                engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+            )]);
+            let state = Arc::new(StateMap::new());
+            for h in [failed, other] {
+                loaded(&state, h, TorrentPhase::Seeding);
+            }
+            let fence = KillSwitchFence::new(
+                profiles.clone(),
+                state.clone(),
+                Arc::new(crate::metrics_sink::PromSink::new()),
+                Arc::new(move |_, _| TunnelProbes {
+                    ip: Ok(bound),
+                    route: Some(Ok(RouteProbe::ViaTunnel)),
+                    handshake: Some(Ok(None)),
+                }),
+            );
+            if refuse_pause {
+                engine.inject_error("pause_torrent", torrentd_engine::EngineError::Shutdown);
+            }
+            super::record_verify_outcome(
+                &pool,
+                &source,
+                &state,
+                &profiles,
+                &failed.infohash,
+                &failed.infohash.to_hex(),
+                VerifyOutcome::Failed("bad"),
+            );
+            // No state update since: the state map still reads it seeding.
+            fence.fence_all();
+            for h in [failed, other] {
+                loaded(&state, h, TorrentPhase::Paused);
+            }
+            fence.lift();
+            for _ in 0..100_000 {
+                if !profiles.iter().any(|e| e.is_resuming()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!profiles.iter().any(|e| e.is_resuming()), "the lift ends");
+            let mut resumed: Vec<u64> = engine
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::ResumeTorrent(h) => Some(h.id),
+                    _ => None,
+                })
+                .collect();
+            resumed.sort_unstable();
+            resumed
+        };
+
+        assert_eq!(
+            fence_after_failed_verify(false).await,
+            [other.id],
+            "the failed torrent stays paused",
+        );
+        assert_eq!(
+            fence_after_failed_verify(true).await,
+            [failed.id, other.id],
+            "a refused pause left it running, and the lift resumes it",
         );
     }
 
