@@ -14,8 +14,16 @@ RUN dnf install -y \
 
 # Rust toolchain — pinned to whatever rust-toolchain.toml in the repo
 # requests (currently 1.90).
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain none --profile minimal
+#
+# The installer is downloaded to a file and run as a separate command, not
+# piped into `sh`: a pipeline's status is its last command's, so a failed
+# download fed `sh` empty input, `sh` exited 0, and the build broke later with
+# `cargo: command not found`. Joined by `&&`, a failed `curl` now fails this
+# step with its own error. `SHELL ["/bin/bash", "-o", "pipefail", "-c"]` is
+# not used because podman's default OCI image format ignores `SHELL`.
+RUN curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --default-toolchain none --profile minimal \
+    && rm /tmp/rustup-init.sh
 ENV PATH=/root/.cargo/bin:${PATH}
 
 WORKDIR /src
