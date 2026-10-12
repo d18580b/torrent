@@ -724,12 +724,10 @@ fn metainfo(profile: &str, bytes: &[u8]) -> Value {
 }
 
 async fn adding(h: &Harness, e: &Engines, dir: &Path) {
-    // The mock derives a handle's infohash from the first 20 bytes of what it
-    // is given; the 201 carries the details for that handle.
-    let mut synthetic = [0u8; 20];
-    synthetic.copy_from_slice(&MAGNET.as_bytes()[..20]);
+    // The mock keys a handle by the infohash the magnet names, as a session
+    // does; the 201 carries the details for that handle.
     e.p.set_torrent_details(
-        e.p.register_handle(InfoHash(synthetic)),
+        e.p.register_handle(InfoHash::from_hex(MAGNET_HEX).unwrap()),
         TorrentDetails {
             name: Some("from-dn".into()),
             ..MockEngine::default_details()
@@ -2511,10 +2509,8 @@ async fn an_add_whose_profile_is_fenced_mid_add_pauses_the_torrent() {
     };
     let (resp, ()) = tokio::join!(req, fence_mid_add);
     resp.assert_status(StatusCode::CREATED);
-    // The mock derives the handle's infohash from the magnet's first 20 bytes.
-    let mut synthetic = [0u8; 20];
-    synthetic.copy_from_slice(&MAGNET.as_bytes()[..20]);
-    let th = handle(&engine, InfoHash(synthetic));
+    // The mock keys the handle by the infohash the magnet names.
+    let th = handle(&engine, InfoHash::from_hex(MAGNET_HEX).unwrap());
     assert!(
         called(&engine, &RecordedCall::PauseTorrent(th)),
         "{:?}",
@@ -2569,10 +2565,8 @@ async fn an_add_the_kill_switch_fences_mid_add_is_resumed_by_the_fences_lift() {
     };
     let (resp, ()) = tokio::join!(req, fence_mid_add);
     resp.assert_status(StatusCode::CREATED);
-    // The mock derives the handle's infohash from the magnet's first 20 bytes.
-    let mut synthetic = [0u8; 20];
-    synthetic.copy_from_slice(&MAGNET.as_bytes()[..20]);
-    let th = handle(&engine, InfoHash(synthetic));
+    // The mock keys the handle by the infohash the magnet names.
+    let th = handle(&engine, InfoHash::from_hex(MAGNET_HEX).unwrap());
     assert!(
         !h.state.state.contains(&th.infohash),
         "the fence's walk cannot have found it"
@@ -3083,16 +3077,10 @@ async fn delete_then_re_add(h: &Harness, e: &MockEngine, to: &str) -> (InfoHash,
     (ih, old)
 }
 
-/// The handle `e` gave the re-added torrent. The mock keys what it hands out
-/// by the `.torrent`'s first 20 bytes, so its id is read back from that and
-/// carried under the real info-hash.
+/// The handle `e` gave the re-added torrent: the mock keys what it hands out
+/// by the `.torrent`'s infohash, as a session does.
 fn re_added_handle(e: &MockEngine, ih: InfoHash, old: TorrentHandle) -> TorrentHandle {
-    let mut synthetic = [0u8; 20];
-    synthetic.copy_from_slice(&torrent_bytes('r')[..20]);
-    let new = TorrentHandle {
-        id: e.register_handle(InfoHash(synthetic)).id,
-        infohash: ih,
-    };
+    let new = e.register_handle(ih);
     assert_ne!(new.id, old.id, "a distinct torrent");
     new
 }
