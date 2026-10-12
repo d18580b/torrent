@@ -2000,6 +2000,88 @@ async fn a_held_add_follows_the_operators_pause_and_resume() {
     assert!(q.holds().held(&p).is_empty());
 }
 
+/// A `.torrent` the queue already resumed that the operator pauses mid-check
+/// frees its slot and leaves the record at once. So does one whose check
+/// ended while others still wait, whose release from the record waits for
+/// the batched write: a restart before that write would otherwise load it,
+/// queue it again, and resume it over the operator's pause.
+#[tokio::test]
+async fn a_held_add_the_queue_resumed_follows_the_operators_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        engine = Some(e.p);
+    });
+    let engine = engine.unwrap();
+    let p = ProfileId::new("p");
+    let add = |name: char| {
+        let (h, engine, p) = (&h, &engine, &p);
+        async move {
+            let resp = h
+                .write_json("POST", "/v1/torrents", metainfo("p", &torrent_bytes(name)))
+                .await;
+            resp.assert_status(StatusCode::CREATED);
+            let ih =
+                InfoHash::from_hex(resp.json::<Value>()["infohash"].as_str().unwrap()).unwrap();
+            let mut st = TorrentState::newly_added(handle(engine, ih), p.clone(), Instant::now());
+            st.phase = TorrentPhase::Paused;
+            h.state.state.insert(ih, st);
+            ih
+        }
+    };
+    let q = &h.state.checks;
+    let tick = || {
+        crate::pool_service::admit_tick_for_tests(
+            q,
+            None,
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    let pause = |ih: InfoHash| {
+        let h = &h;
+        async move {
+            h.write("POST", &format!("/v1/torrents/{}/pause", hex(ih)))
+                .await
+                .assert_status(StatusCode::NO_CONTENT);
+        }
+    };
+
+    let (checking, ended) = (add('a').await, add('b').await);
+    tick();
+    assert_eq!((q.depth(), q.in_flight()), (0, 2), "the queue resumed both");
+
+    pause(checking).await;
+    assert_eq!(q.in_flight(), 1, "the paused check's slot is free");
+    assert!(
+        !q.holds().holds(&p, &checking),
+        "the pause is the operator's"
+    );
+
+    // `ended`'s check finishes while another add still waits, so its
+    // release from the record is batched.
+    let _waiting = add('c').await;
+    std::thread::sleep(Duration::from_millis(2));
+    h.state.state.update(&ended, |st| {
+        st.checked_at = Some(Instant::now());
+        st.phase = TorrentPhase::Seeding;
+    });
+    tick();
+    assert!(
+        q.holds().holds(&p, &ended),
+        "released with the next batched write"
+    );
+
+    pause(ended).await;
+    assert!(
+        !q.holds().holds(&p, &ended),
+        "the operator's pause releases it at once"
+    );
+}
+
 /// Drop the write bit on `dir`, returning the mode to restore afterwards.
 ///
 /// Restoring matters: `tempfile::TempDir`'s cleanup cannot remove a file from

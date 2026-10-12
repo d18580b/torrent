@@ -1370,10 +1370,18 @@ impl VerifyQueue {
     /// The operator paused `ih`: a held add waiting for a slot is no longer
     /// the queue's to resume, and one it resumed whose check has not ended
     /// frees its slot. Either leaves the record of held adds, so the next
-    /// boot keeps the operator's pause.
+    /// boot keeps the operator's pause, and so does one whose check ended
+    /// and whose release is still waiting for the batched write.
     pub fn forget_add(&self, ih: libtorrent_safe::InfoHash) {
         let hex = ih.to_hex();
         let mut released: Vec<ProfileId> = Vec::new();
+        self.ended_holds.lock().retain(|(profile, h)| {
+            if *h == ih {
+                released.push(profile.clone());
+                return false;
+            }
+            true
+        });
         self.pending_adds.lock().retain(|a| {
             if a.infohash == ih {
                 released.push(a.profile.clone());
@@ -2293,7 +2301,9 @@ fn retire_in_flight(
 /// first. Held, its slot would stay taken until `expiry`, and a few rechecks
 /// of torrents on a failing disk would stall every adoption and re-hash for a
 /// day. Its verdict, where one is recorded, is still waited for, without a
-/// slot. A check not known to start ([`CheckSource::always_checks`]) frees its
+/// slot. A disk-error retry's slot is not freed this way before
+/// [`CHECK_SETTLE`]: it is taken while the torrent still reads error-paused,
+/// and stays so until the status update after the retry's resume. A check not known to start ([`CheckSource::always_checks`]) frees its
 /// slot once the torrent shows none running past [`CHECK_SETTLE`]. One removed
 /// has nothing left to hash. One older than `expiry` ([`RECHECK_EXPIRY`] in
 /// the worker) lost its check, and is forgotten rather than hold a slot for
@@ -2314,7 +2324,13 @@ fn retire_checking(q: &VerifyQueue, state: &StateMap, expiry: Duration) {
         let Some(st) = hash.and_then(|h| state.get(&h)) else {
             return free();
         };
-        if st.checked_at.is_some_and(|t| t > *started) || error_paused(&st) {
+        // A disk-error retry takes its slot on a torrent that reads
+        // error-paused, and its resume clears the error only in the status
+        // update after it: read before a few of those have come, the error
+        // is the one the retry is clearing, not its check failing.
+        let error_ended = error_paused(&st)
+            && (r.source != CheckSource::DiskErrorRetry || started.elapsed() >= CHECK_SETTLE);
+        if st.checked_at.is_some_and(|t| t > *started) || error_ended {
             if r.record {
                 ended.push((r.infohash.clone(), *started));
             }
@@ -5357,6 +5373,47 @@ mod tests {
         super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
         assert_eq!(q.in_flight(), 1);
         assert!(q.try_take(a, DiskErrorRetry));
+    }
+
+    /// The disk-error retry takes its slot on an error-paused torrent and
+    /// resumes it, and the queue's next tick, before any status update has
+    /// cleared the error, still reads it error-paused. That is the error the
+    /// retry is clearing, not its check failing: the slot stays taken, so the
+    /// check `clear_error` starts runs inside the limit. Past the settle a
+    /// torrent still error-paused frees it.
+    #[test]
+    fn a_disk_error_retry_keeps_its_slot_while_the_torrent_still_reads_error_paused() {
+        use super::CheckSource::DiskErrorRetry;
+
+        let q = super::VerifyQueue::new(1);
+        let ih = InfoHash([4; 20]);
+        let state = torrentd_engine::StateMap::new();
+        let mut st = TorrentState::newly_added(
+            TorrentHandle {
+                id: 1,
+                infohash: ih,
+            },
+            ProfileId::new("p"),
+            Instant::now(),
+        );
+        st.phase = TorrentPhase::Paused;
+        st.has_error = true;
+        state.insert(ih, st);
+
+        assert!(q.try_take(ih, DiskErrorRetry));
+        super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
+        assert_eq!(
+            q.in_flight(),
+            1,
+            "the retry's resume has not been reported yet"
+        );
+        assert!(!q.try_take(InfoHash([5; 20]), DiskErrorRetry));
+
+        for (_, started) in q.checking.lock().iter_mut() {
+            *started -= super::CHECK_SETTLE;
+        }
+        super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
+        assert_eq!(q.in_flight(), 0, "still error-paused past the settle");
     }
 
     /// A started re-hash whose torrent is removed frees its slot with no
