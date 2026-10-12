@@ -13,11 +13,11 @@
 //! The assignment registry is the authority for which profile owns which
 //! info-hash. It is what the daemon's resume scan writes, what every load is
 //! gated on, and what the daemon refuses to boot against when it disagrees
-//! with the configured profiles. This column is a copy of it, written by
-//! `pool scan` — which an operator may never run — so it can be stale, and
+//! with the configured profiles. This column is a copy of it, filled in by
+//! `pool scan` and written by adoption and release, so it can be stale, and
 //! nothing here may be read as overriding the file. Where the two disagree
-//! the resume scan warns naming both values rather than silently preferring
-//! one.
+//! the daemon's boot rewrites the column to the registry's profile, warning
+//! with both values; a scan only fills a column that is empty.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1433,6 +1433,19 @@ impl PoolStore {
             params![infohash, profile],
         )?;
         Ok(())
+    }
+
+    /// Move `infohash`'s owner record from `from` to `to`, where it still
+    /// names `from`. Returns whether it did.
+    ///
+    /// For an owner the assignment registry, the authority, gives another
+    /// profile than the record does. Conditional, so a record that changed
+    /// since `from` was read is left as it now stands.
+    pub fn rewrite_owner(&self, infohash: &str, from: &str, to: &str) -> Result<bool, PoolError> {
+        Ok(self.conn.execute(
+            "UPDATE torrent SET profile = ?3 WHERE infohash = ?1 AND profile = ?2",
+            params![infohash, from, to],
+        )? > 0)
     }
 
     /// Forget that `profile` owns `infohash`, now that no session holds it.

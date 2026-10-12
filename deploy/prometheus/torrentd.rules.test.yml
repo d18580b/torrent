@@ -1884,7 +1884,7 @@ tests:
           - exp_labels:
               severity: info
             exp_annotations:
-              summary: "The pool index and the assignment registry disagree about 2 torrents; run `torrentd pool scan`"
+              summary: "The pool index and the assignment registry still disagree about 2 torrents because the boot could not rewrite the index; read the pool index write warning in the boot log, then restart"
 
   # ---- a freshly booted, healthy daemon is silent -----------------------
   # Every counter seeded at zero, every gauge at its healthy value.

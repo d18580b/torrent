@@ -300,6 +300,46 @@ impl PoolService {
         })
     }
 
+    /// Rewrite every pool-index owner record the registry gives another
+    /// profile to the registry's. Returns each `(infohash, registry profile,
+    /// index profile)` rewritten.
+    ///
+    /// The registry is the authority and the record a cache of it, yet
+    /// nothing else corrects a record that names the wrong profile: a scan
+    /// leaves the column alone and fills only an empty one. Left wrong, a
+    /// `DELETE` by the registry's owner released nothing, since a release
+    /// clears only a record naming the releasing profile, so its `adopted`
+    /// verdict stayed and every later adoption was refused. The boot calls
+    /// this once the sessions have loaded. A record the registry does not
+    /// back is [`PoolService::clear_unbacked_owners`]'s, and nothing is
+    /// rewritten where no registry is set.
+    pub fn follow_registry_owners(
+        &self,
+    ) -> Result<Vec<(String, String, String)>, torrentd_pool::PoolError> {
+        let Some(registry) = self.registry.get() else {
+            return Ok(Vec::new());
+        };
+        self.with_store_mut(|store| {
+            let mut rewritten = Vec::new();
+            for t in store.torrents()? {
+                let Some(indexed) = t.profile else {
+                    continue;
+                };
+                let Some(owner) = libtorrent_safe::InfoHash::from_hex(&t.infohash)
+                    .and_then(|ih| registry.lookup(&ih))
+                else {
+                    continue;
+                };
+                if owner.as_str() != indexed
+                    && store.rewrite_owner(&t.infohash, &indexed, owner.as_str())?
+                {
+                    rewritten.push((t.infohash, owner.as_str().to_string(), indexed));
+                }
+            }
+            Ok(rewritten)
+        })
+    }
+
     /// The sessions' torrent store, which adoption writes each adopted
     /// torrent's `.torrent` into. The daemon sets this once after opening; a
     /// second call is ignored.
@@ -3717,6 +3757,53 @@ mod tests {
         let ih = InfoHash([0x93; 20]);
         let pool = pool_with(dir.path(), ih, Some("p"));
         assert!(pool.clear_unbacked_owners(&empty).unwrap().is_empty());
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+    }
+
+    /// An owner record naming `p` where the registry gives the torrent to
+    /// `q` is rewritten to `q` at boot, so a `DELETE` from `q` releases it and
+    /// a later adoption plans the torrent instead of refusing it.
+    #[test]
+    fn the_boot_rewrites_an_owner_record_the_registry_contradicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih) = adopted_by_p(dir.path(), Some("q"));
+        assert!(!pool.with_store_mut(|s| s.release_owner(&ih.to_hex(), "q", false).unwrap()));
+
+        let rewritten = pool.follow_registry_owners().unwrap();
+        assert_eq!(
+            rewritten,
+            vec![(ih.to_hex(), "q".to_owned(), "p".to_owned())]
+        );
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("q"));
+        assert!(
+            pool.follow_registry_owners().unwrap().is_empty(),
+            "nothing disagrees any more",
+        );
+
+        assert!(pool.with_store_mut(|s| s.release_owner(&ih.to_hex(), "q", false).unwrap()));
+        assert_eq!(owner_of(&pool, ih), None);
+        assert_eq!(
+            pool.with_store(|s| s.adoption_state(&ih.to_hex()).unwrap()),
+            Some(super::AdoptionState::Matched),
+        );
+        let plan = adopt_plan(&pool, ih);
+        assert!(!plan.is_refusal(), "{plan:?}");
+    }
+
+    /// A record the registry agrees with, or does not mention, is left
+    /// alone, as is every record where no registry is set.
+    #[test]
+    fn the_boot_rewrites_no_owner_record_the_registry_does_not_contradict() {
+        for claim in [Some("p"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let (pool, ih) = adopted_by_p(dir.path(), claim);
+            assert!(pool.follow_registry_owners().unwrap().is_empty());
+            assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x94; 20]);
+        let pool = pool_with(dir.path(), ih, Some("p"));
+        assert!(pool.follow_registry_owners().unwrap().is_empty());
         assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
     }
 
