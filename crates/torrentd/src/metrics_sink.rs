@@ -427,7 +427,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
          checks_in_flight, with [pool] configured. A magnet's check once its metadata arrives \
          is neither counted nor bounded.";
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
-        "Torrents whose pool-index profile disagrees with the assignment registry at boot.";
+        "Torrents whose pool-index profile still disagrees with the assignment registry once \
+         the boot has rewritten it to the registry's: nonzero only where that write failed.";
     // persistence and the exporter itself
     "dir_fsync_errors_total" Counter Daemon Zero =>
         "Directory fsyncs after a rename that failed, every one rather than only the logged \

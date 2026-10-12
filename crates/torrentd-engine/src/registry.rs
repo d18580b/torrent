@@ -29,9 +29,10 @@
 //! Two artefacts persist a torrent→profile mapping: this one, and the pool
 //! index's `torrent.profile` column. **This one wins.** It is what the resume
 //! scan writes and what the daemon refuses to boot against when it disagrees
-//! with the configured profiles; the index's column is a cache of it, written
-//! by `pool scan`, which an operator may never run. Where they disagree the
-//! scan warns naming both values rather than silently preferring one.
+//! with the configured profiles; the index's column is a cache of it, filled
+//! in by `pool scan` and written by adoption and release. Where they disagree
+//! the daemon's boot rewrites the column to this registry's profile, warning
+//! with both values.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;

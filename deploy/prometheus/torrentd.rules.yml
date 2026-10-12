@@ -571,4 +571,4 @@ groups:
         labels:
           severity: info
         annotations:
-          summary: "The pool index and the assignment registry disagree about {{ $value }} torrents; run `torrentd pool scan`"
+          summary: "The pool index and the assignment registry still disagree about {{ $value }} torrents because the boot could not rewrite the index; read the pool index write warning in the boot log, then restart"
