@@ -154,11 +154,20 @@ pub const PROFILE: &str = "test";
 /// 16893. `cargo test` runs tests in parallel, so a collision was a test that
 /// failed for the other one's sake. A session listens on TCP and UDP, so the
 /// port is checked free for both.
+///
+/// The probe socket is closed on return, so the kernel may hand the same
+/// port to the next probe: a test that took its `http_listen` port and then
+/// its session's listen port got one port for both, and the daemon refused
+/// the config. No port is returned twice in one test process.
 fn free_port() -> u16 {
+    static ISSUED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
     loop {
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
         let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+            && ISSUED.lock().unwrap().insert(port)
+        {
             return port;
         }
     }
