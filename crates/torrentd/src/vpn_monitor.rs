@@ -567,8 +567,18 @@ pub(crate) fn fence(
     current: Option<IpAddr>,
     metrics: &dyn MetricsSink,
 ) -> u64 {
-    let profile_id = entry.id();
-    let labels = [("profile_id", profile_id.as_str())];
+    mark_fenced(entry, current, metrics);
+    walk_fenced(entry, state, metrics)
+}
+
+/// The first half of [`fence`]: mark `entry` `vpn_down` under a new fence
+/// generation, starting its `paused_for_vpn` count over.
+pub(crate) fn mark_fenced(
+    entry: &ProfileEntry,
+    current: Option<IpAddr>,
+    metrics: &dyn MetricsSink,
+) {
+    let labels = [("profile_id", entry.id().as_str())];
     // `profile_vpn_tunnel_up` goes to 0 with the mark, under the same lock,
     // whoever fences: the kill-switch watch's fence left it at the monitor's
     // last 1, and the monitor never polls a fenced profile to correct it, so
@@ -581,19 +591,31 @@ pub(crate) fn fence(
     entry.update_health(|h| {
         h.status = ProfileStatus::VpnDown;
         h.tunnel_ip = current;
-        h.paused_for_vpn = 0;
+        h.start_paused_for_vpn_over();
         h.fence_generation += 1;
         metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
     });
     atomic::fence(atomic::Ordering::SeqCst);
-    // Every torrent is paused below, so what a pause or resume before this
+    // Every torrent is paused by the walk that follows, so what a pause or resume before this
     // noted no longer holds: the kill-switch fence read it before this, and
     // a resume noted after the mark sees it and pauses again.
     entry.forget_noted();
-    let mut paused = 0u64;
+}
+
+/// The second half of [`fence`]: pause every torrent the state map holds in
+/// `entry`, adding each pause that took to the count, and return how many
+/// took.
+pub(crate) fn walk_fenced(
+    entry: &ProfileEntry,
+    state: &StateMap,
+    metrics: &dyn MetricsSink,
+) -> u64 {
+    let profile_id = entry.id();
+    let labels = [("profile_id", profile_id.as_str())];
+    let mut paused = Vec::new();
     for h in state.handles_for_profile(profile_id) {
         match entry.engine.pause_torrent(h) {
-            Ok(()) => paused += 1,
+            Ok(()) => paused.push(h.infohash),
             // A torrent the fence did not pause keeps seeding from a
             // profile whose tunnel is down — the one thing fencing is
             // for. The failure was discarded, so nothing said so.
@@ -610,18 +632,21 @@ pub(crate) fn fence(
         }
     }
     // Added, not assigned: the boot scans' fence (`startup::ScanFence`) acts
-    // as soon as it sees the mark above, which may be before this walk ends,
-    // and adds what it paused to the same count. Both writers set the gauge
-    // from the sum under the health lock, so the last write is the full sum.
+    // as soon as it sees the fence's mark, which may be before this walk ends,
+    // and adds what it paused to the same count. A torrent it already counted
+    // under this fence is not counted again, whichever of the two paused it
+    // first. Both writers set the gauge from the sum under the health lock,
+    // so the last write is the full sum.
+    let walked = paused.len() as u64;
     entry.update_health(|h| {
-        h.paused_for_vpn += paused;
+        h.count_paused_for_vpn(paused);
         metrics.set_gauge(
             "profile_torrents_paused_vpn_down",
             h.paused_for_vpn as f64,
             &labels,
         );
     });
-    paused
+    walked
 }
 
 /// Every torrent the state map holds in `profile_id`, each with whether its

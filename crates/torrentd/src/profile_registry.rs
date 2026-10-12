@@ -38,13 +38,22 @@ pub struct ProfileHealth {
     /// torrent added into an already-fenced profile and paused by the add
     /// handler or `vpn_monitor::hold_if_fenced` is not counted, because both
     /// of those (and the walk) can pause the same torrent.
+    ///
+    /// Both writers add to it through [`Self::count_paused_for_vpn`], so a
+    /// torrent both of them paused under one fence is counted once.
     pub paused_for_vpn: u64,
+    /// The torrents `paused_for_vpn` has counted under the current fence
+    /// generation, started over by every fence with the count. Shared, so a
+    /// [`ProfileEntry::health`] snapshot does not copy it; a count made while
+    /// one is still held copies it then, so a writer holds none across its
+    /// count.
+    pub counted_for_vpn: Arc<HashSet<InfoHash>>,
     /// How many times the profile has been fenced: bumped by every fence
     /// (`vpn_monitor::fence`, which the monitor and the kill-switch watch's
     /// `fence_all` both run) in the same update that marks it `vpn_down` and
     /// starts `paused_for_vpn` over, and reset by no lift. The boot scans'
-    /// `ScanFence` reads a value it has not seen as a new fence, whose count
-    /// the torrents it paused before are not yet in.
+    /// `ScanFence` reads a value it has not seen as a new fence, under which
+    /// the torrents it paused before are paused again.
     pub fence_generation: u64,
     /// Current NAT-PMP-negotiated listening port (natpmp profiles only; `None`
     /// for static profiles).
@@ -56,6 +65,25 @@ pub struct ProfileHealth {
     /// Whether the last port-forward renewal succeeded. Always `true` for
     /// static profiles (nothing to renew).
     pub port_forward_ok: bool,
+}
+
+impl ProfileHealth {
+    /// Start `paused_for_vpn` over for a new fence: nothing is counted under
+    /// it yet.
+    pub fn start_paused_for_vpn_over(&mut self) {
+        self.paused_for_vpn = 0;
+        self.counted_for_vpn = Arc::default();
+    }
+
+    /// Add to `paused_for_vpn` each of `paused`, torrents a fence's pause of
+    /// took, that no writer has counted under the current fence, returning
+    /// how many were added.
+    pub fn count_paused_for_vpn(&mut self, paused: impl IntoIterator<Item = InfoHash>) -> u64 {
+        let counted = Arc::make_mut(&mut self.counted_for_vpn);
+        let added = paused.into_iter().filter(|ih| counted.insert(*ih)).count() as u64;
+        self.paused_for_vpn += added;
+        added
+    }
 }
 
 /// One profile's immutable identity (config + engine) plus its mutable health.
@@ -195,6 +223,7 @@ impl ProfileEntry {
                 status: ProfileStatus::Active,
                 tunnel_ip,
                 paused_for_vpn: 0,
+                counted_for_vpn: Arc::default(),
                 fence_generation: 0,
                 forwarded_port,
                 forwarded_epoch,
