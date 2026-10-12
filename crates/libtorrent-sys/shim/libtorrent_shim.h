@@ -327,6 +327,29 @@ int         lt_magnet_info_hashes(const char* uri,
                                   struct lt_info_hashes* out,
                                   char* err_out, int err_len);
 
+/* The info-hashes the session would give a torrent added from these params,
+ * without adding it: the hashes of the metadata the add would carry, else the
+ * ones the params name. The source is read as lt_add_trackers_allowed reads
+ * it: resume data when `resume_buf` is given (with `torrent_buf` as the
+ * metadata it lacks, as lt_add_torrent_resume_ex attaches it, and ignored
+ * where the resume data carries its own), else the magnet URI, else the
+ * .torrent.
+ *
+ * `*has_metadata_out` (when not null) is 1 where the add would carry
+ * metadata, 0 where the session would have to fetch it. A torrent with no
+ * metadata and no v1 hash is keyed by its truncated v2 hash only until hybrid
+ * metadata arrives, which gives it a v1 hash and the session's key with it.
+ *
+ * Returns LT_OK, or LT_ERR where the add would be refused for its source
+ * alone: the source cannot be parsed, or the attached .torrent names another
+ * torrent than the resume data (err_out populated; *out zeroed). */
+int         lt_add_info_hashes(const char* magnet_uri,
+                               const uint8_t* torrent_buf, size_t torrent_len,
+                               const uint8_t* resume_buf, size_t resume_len,
+                               struct lt_info_hashes* out,
+                               int* has_metadata_out,
+                               char* err_out, int err_len);
+
 /* ------------------------------------------------------------------ */
 /* Torrent metadata extraction (no session required)                   */
 /* ------------------------------------------------------------------ */

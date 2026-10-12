@@ -215,6 +215,107 @@ fn a_hybrid_file_add_reports_its_v1_hash() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// `lt_add_info_hashes` reports the hashes the resume add keys the torrent
+/// by: with a hybrid `.torrent` attached to v2-only resume data, the add
+/// keys it by the `.torrent`'s v1 hash, not the truncated v2 hash the resume
+/// data alone names; without the `.torrent`, the truncated v2 hash, and no
+/// metadata. A `.torrent` naming another torrent than the resume data is
+/// refused, as the add refuses it.
+#[test]
+fn add_info_hashes_report_the_key_the_resume_add_gives() {
+    // In the repository rather than the vendor corpus, so the test runs
+    // without the submodules.
+    let torrent = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent"),
+    )
+    .expect("read the hybrid fixture");
+    let mut hashes: lt_info_hashes = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe {
+        lt_torrent_info_hashes(
+            torrent.as_ptr(),
+            torrent.len(),
+            &mut hashes,
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_eq!(rc, LT_OK as i32, "{}", c_buf(&err));
+    let mut resume = b"d11:file-format22:libtorrent resume file12:file-versioni1e".to_vec();
+    resume.extend_from_slice(b"10:info-hash232:");
+    resume.extend_from_slice(&hashes.v2);
+    resume.extend_from_slice(b"9:save_path4:/tmpe");
+
+    let read = |resume: &[u8], torrent: &[u8]| {
+        let mut out: lt_info_hashes = unsafe { std::mem::zeroed() };
+        let mut has_metadata = -1;
+        let mut err = [0 as c_char; 512];
+        let rc = unsafe {
+            lt_add_info_hashes(
+                ptr::null(),
+                if torrent.is_empty() {
+                    ptr::null()
+                } else {
+                    torrent.as_ptr()
+                },
+                torrent.len(),
+                resume.as_ptr(),
+                resume.len(),
+                &mut out,
+                &mut has_metadata,
+                err.as_mut_ptr(),
+                512,
+            )
+        };
+        (rc, out, has_metadata, c_buf(&err))
+    };
+
+    let (rc, out, has_metadata, err_text) = read(&resume, &torrent);
+    assert_eq!(rc, LT_OK as i32, "{err_text}");
+    assert_eq!(has_metadata, 1);
+    assert_eq!((out.has_v1, out.has_v2), (1, 1));
+    assert_eq!((out.v1, out.v2), (hashes.v1, hashes.v2));
+
+    let (rc, out, has_metadata, err_text) = read(&resume, &[]);
+    assert_eq!(rc, LT_OK as i32, "{err_text}");
+    assert_eq!(has_metadata, 0);
+    assert_eq!((out.has_v1, out.has_v2), (0, 1));
+    assert_eq!(out.v1, [0u8; 20], "v1 hash must be zeroed");
+
+    // The add itself keys it by the attached `.torrent`'s v1 hash.
+    let s = make_session();
+    let mut ih = [0u8; 20];
+    let h = unsafe {
+        lt_add_torrent_resume_ex(
+            s,
+            resume.as_ptr(),
+            resume.len(),
+            torrent.as_ptr(),
+            torrent.len(),
+            ptr::null(),
+            0,
+            0,
+            ih.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "resume add failed: {}", c_buf(&err));
+    assert_eq!(ih, hashes.v1, "the resume add reports the v1 hash");
+    unsafe { lt_session_destroy(s) };
+
+    // Resume data naming another torrent than the `.torrent` attached to it.
+    let mut other = b"d11:file-format22:libtorrent resume file12:file-versioni1e".to_vec();
+    other.extend_from_slice(b"9:info-hash20:");
+    other.extend_from_slice(&[0x05u8; 20]);
+    other.extend_from_slice(b"9:save_path4:/tmpe");
+    let (rc, out, has_metadata, err_text) = read(&other, &torrent);
+    assert_eq!(rc, LT_ERR, "a mismatched .torrent must be refused");
+    assert!(!err_text.is_empty());
+    assert_eq!((out.has_v1, out.has_v2, has_metadata), (0, 0, 0));
+}
+
 #[test]
 fn torrent_info_hashes_bad_buffer_errors_cleanly() {
     let garbage = b"nope";

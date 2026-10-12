@@ -1175,8 +1175,10 @@ pub async fn boot(
     // (`honour_tombstones`).
     let mut removed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
     // Each info-hash the resume scan refused because its torrent's session key
-    // is another one (`rekeyed`), and counted. The torrent-dir scan finds the
-    // `.torrent` filed beside it under the same name, and counts it only once.
+    // is another one, or cannot be read before the add
+    // (`pool_service::resume_key_refusal`), and counted. The torrent-dir scan
+    // finds the `.torrent` filed beside it under the same name, and counts it
+    // only once.
     let mut rekeyed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
 
     // Managed pool. Opened before the alert loop so a bad index path fails
@@ -1338,28 +1340,7 @@ pub async fn boot(
                 }
                 (torrent, _) => torrent,
             };
-            // A torrent filed under a key its session would not give it: a
-            // hybrid an earlier build keyed by its truncated v2 hash, which
-            // its session now keys by its v1 hash. Loaded, every alert would
-            // name a key the registry, the save queue and the stores do not
-            // hold, so it is refused, before anything is claimed, for the
-            // operator to reconcile.
-            if let Some(key) = torrent.as_deref().and_then(|t| rekeyed(t, &ih)) {
-                warn!(
-                    profile_id = %profile,
-                    infohash = %ih,
-                    session_infohash = %key,
-                    scan = "resume",
-                    "boot scan: torrent filed under an infohash its session does not key it by; \
-                     not loaded (operator must reconcile: re-add it under the session's infohash)",
-                );
-                load_failures.entry(profile.clone()).or_default().resume_add += 1;
-                rekeyed_at_boot.insert((profile.clone(), ih));
-                continue;
-            }
-            if torrent.is_none() {
-                missing_metadata += 1;
-            }
+            let without_torrent = torrent.is_none();
             // The flags re-asserted are `torrentd_engine::policy`'s. PAUSED is
             // not cleared: resume data does not say why a torrent was paused,
             // and restarting one an operator paused is not recoverable. The
@@ -1377,6 +1358,44 @@ pub async fn boot(
             // its check waits for a slot again rather than starting now.
             if held_for_check.contains(&ih) {
                 params = with_paused(params);
+            }
+            // A torrent filed under a key its session would not give it: a
+            // hybrid an earlier build keyed by its truncated v2 hash, which
+            // its session now keys by its v1 hash, whether the resume data
+            // or the `.torrent` attached to it says so. Loaded, every alert
+            // would name a key the registry, the save queue and the stores
+            // do not hold, so it is refused, before anything is claimed, for
+            // the operator to reconcile. So is one whose key no add can
+            // know yet: resume data with no v1 hash and no metadata, which
+            // hybrid metadata would rekey once it arrived.
+            if let Some(refusal) = crate::pool_service::resume_key_refusal(&params, &ih) {
+                use crate::pool_service::ResumeKeyRefusal;
+                match refusal {
+                    ResumeKeyRefusal::Rekeyed(key) => warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        session_infohash = %key,
+                        scan = "resume",
+                        "boot scan: torrent filed under an infohash its session does not key it \
+                         by; not loaded (operator must reconcile: re-add it under the session's \
+                         infohash)",
+                    ),
+                    ResumeKeyRefusal::Unkeyable => warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        scan = "resume",
+                        "boot scan: resume data names no v1 infohash and carries no metadata, so \
+                         its session's key could change when the metadata arrives; not loaded \
+                         (operator must reconcile: add its .torrent, or a magnet naming its v1 \
+                         infohash)",
+                    ),
+                }
+                load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                rekeyed_at_boot.insert((profile.clone(), ih));
+                continue;
+            }
+            if without_torrent {
+                missing_metadata += 1;
             }
             // The account-isolation guard, on the trackers this resume data
             // would announce to — its own `trackers` list where it has one.
@@ -1415,8 +1434,9 @@ pub async fn boot(
             }
             match engine.add_torrent(params) {
                 // The session keyed it by another infohash than the one it was
-                // filed under, which the check above cannot see where the
-                // metadata is the resume data's own, or there is none. Taken
+                // filed under, which the check above reads from the params as
+                // the add does, so only a session that reads them otherwise,
+                // or params that check could not read, reach this. Taken
                 // back out where nothing else of this profile's is filed under
                 // the session's key, and refused either way.
                 Ok(h) if h.infohash != ih => {
@@ -4151,7 +4171,8 @@ fn load_session_state(path: &std::path::Path) -> Option<Vec<u8>> {
 struct BootLoadFailures {
     /// A resume file that read but libtorrent refused to add, or whose
     /// torrent its session keys by another infohash than the one it is filed
-    /// under (`rekeyed`).
+    /// under, or by one hybrid metadata would change
+    /// (`pool_service::resume_key_refusal`).
     resume_add: u64,
     /// A `.torrent` that could not be read to re-attach metadata.
     torrent_read: u64,

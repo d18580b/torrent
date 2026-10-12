@@ -2888,6 +2888,59 @@ fn refuse_if_rekeyed(infohash: &str, torrent_path: &std::path::Path) -> Result<(
     }
 }
 
+/// Why resume data may not be added under the infohash it is filed under,
+/// read from the params before the add ([`resume_key_refusal`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumeKeyRefusal {
+    /// The session would key the torrent by this infohash: the one its
+    /// metadata gives it, from the resume data's own info dict or the
+    /// `.torrent` attached to it, else the one the resume data names.
+    Rekeyed(libtorrent_safe::InfoHash),
+    /// No key can be read before the add: the resume data names no v1 hash
+    /// and the add carries no metadata, so the session keys the torrent by
+    /// its truncated v2 hash until hybrid metadata arrives and rekeys it by
+    /// its v1 hash, as `POST /v1/torrents` refuses a btmh-only magnet for.
+    Unkeyable,
+}
+
+/// Whether resume data `params` would be added under another key than
+/// `filed`, or under one that may change, read as the add reads it
+/// (`libtorrent_safe::add_info_hashes`): the `.torrent` attached to it counts
+/// only where the resume data carries no info dict of its own.
+///
+/// `None` where it would be added under `filed` for good, and where the
+/// params cannot be read, which the add then refuses on its own. Where that
+/// is for a `.torrent` that names another torrent than the resume data, the
+/// `.torrent`'s own key is held to `filed`, as it was before the resume data
+/// was read: the boot's torrent-dir scan finds that `.torrent` again and
+/// counts a refusal the resume scan recorded only once.
+pub(crate) fn resume_key_refusal(
+    params: &AddParams,
+    filed: &libtorrent_safe::InfoHash,
+) -> Option<ResumeKeyRefusal> {
+    let read = match libtorrent_safe::add_info_hashes(params) {
+        Ok(read) => read,
+        Err(_) => {
+            let AddParams::Resume {
+                torrent: Some(torrent),
+                ..
+            } = params
+            else {
+                return None;
+            };
+            let key = libtorrent_safe::info_hashes_from_torrent(torrent)
+                .ok()?
+                .key()?;
+            return (key != *filed).then_some(ResumeKeyRefusal::Rekeyed(key));
+        }
+    };
+    match read.stable_key() {
+        None => Some(ResumeKeyRefusal::Unkeyable),
+        Some(key) if key != *filed => Some(ResumeKeyRefusal::Rekeyed(key)),
+        Some(_) => None,
+    }
+}
+
 /// Adopt one torrent: execute whatever `torrentd_pool::adopt::plan` decided.
 ///
 /// The fast path adds immediately in seed mode. The verify path only enqueues —
@@ -3004,6 +3057,37 @@ pub fn execute_adopt(
                     );
                     return verify(torrent_path, save_path, profile);
                 }
+            }
+            // The key the session would give the torrent, read from the
+            // resume data as the add reads it: libtorrent ignores the
+            // `.torrent` where the resume data carries an info dict of its
+            // own, so `refuse_if_rekeyed` above has not seen it. Every
+            // record the adoption keeps is under the index's key, so resume
+            // data the session would key otherwise, or by a key hybrid
+            // metadata would change, is not added; the `.torrent`, whose key
+            // is the index's, is verified instead.
+            if let Some(refusal) = libtorrent_safe::InfoHash::from_hex(infohash)
+                .and_then(|filed| resume_key_refusal(&params, &filed))
+            {
+                let why = match refusal {
+                    ResumeKeyRefusal::Rekeyed(key) => format!(
+                        "resume data keys this torrent by another infohash ({key}) than the \
+                         pool index records"
+                    ),
+                    ResumeKeyRefusal::Unkeyable => "resume data names no v1 infohash and \
+                                                    carries no metadata"
+                        .to_owned(),
+                };
+                if files_renamed {
+                    return Err(no_fallback(&why));
+                }
+                warn!(
+                    target: "torrentd::pool",
+                    infohash = %infohash,
+                    reason = %why,
+                    "resume data keyed otherwise than the pool index; falling back to verification",
+                );
+                return verify(torrent_path, save_path, profile);
             }
             if dry_run {
                 return Ok("fast_path");
@@ -4370,6 +4454,79 @@ mod tests {
         assert!(super::refuse_if_rekeyed(&v1, &path).is_ok());
         let dir = tempfile::tempdir().unwrap();
         assert!(super::refuse_if_rekeyed(&v2, &dir.path().join("missing.torrent")).is_ok());
+    }
+
+    /// Issue #412: resume data is held to the key it is filed under as the
+    /// add reads it, with the `.torrent` attached; and resume data with no v1
+    /// hash and no metadata, whose key hybrid metadata would change, is
+    /// refused whatever it is filed under.
+    #[test]
+    fn resume_data_is_held_to_the_key_its_add_reads() {
+        use super::resume_key_refusal;
+        use super::AddParams;
+        use super::ResumeKeyRefusal;
+        use super::TorrentFlags;
+        let torrent = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../torrentd-pool/tests/fixtures/v2_hybrid.torrent"),
+        )
+        .unwrap();
+        let hashes = libtorrent_safe::info_hashes_from_torrent(&torrent).unwrap();
+        let v1 = hashes.v1.expect("hybrid has v1");
+        let v2 = hashes.v2.expect("hybrid has v2");
+        // v2-only resume data, as another client writes it for a btmh-only
+        // magnet whose metadata it never fetched.
+        let mut resume = b"d11:file-format22:libtorrent resume file12:file-versioni1e".to_vec();
+        resume.extend_from_slice(b"10:info-hash232:");
+        resume.extend_from_slice(&v2.0);
+        resume.extend_from_slice(b"9:save_path4:/tmpe");
+        let params = |torrent: Option<Vec<u8>>| AddParams::Resume {
+            bytes: resume.clone(),
+            torrent,
+            save_path: None,
+            flags_set: TorrentFlags::empty(),
+            flags_clear: TorrentFlags::empty(),
+        };
+
+        // With the hybrid `.torrent` attached, the session keys it by v1.
+        assert_eq!(
+            resume_key_refusal(&params(Some(torrent.clone())), &v2.truncated()),
+            Some(ResumeKeyRefusal::Rekeyed(v1))
+        );
+        assert_eq!(
+            resume_key_refusal(&params(Some(torrent.clone())), &v1),
+            None
+        );
+        // Without it, by its truncated v2 hash until metadata arrives.
+        for filed in [v1, v2.truncated()] {
+            assert_eq!(
+                resume_key_refusal(&params(None), &filed),
+                Some(ResumeKeyRefusal::Unkeyable)
+            );
+        }
+        // Unreadable: the add refuses it on its own.
+        assert_eq!(
+            resume_key_refusal(&AddParams::resume(b"d6:pieces1:\x01e".to_vec()), &v1),
+            None
+        );
+        // A `.torrent` naming another torrent than the resume data, which the
+        // add refuses too, is held to its own key.
+        let mut other = b"d11:file-format22:libtorrent resume file12:file-versioni1e".to_vec();
+        other.extend_from_slice(b"9:info-hash20:");
+        other.extend_from_slice(&[0x05; 20]);
+        other.extend_from_slice(b"9:save_path4:/tmpe");
+        let mismatched = AddParams::Resume {
+            bytes: other,
+            torrent: Some(torrent),
+            save_path: None,
+            flags_set: TorrentFlags::empty(),
+            flags_clear: TorrentFlags::empty(),
+        };
+        assert_eq!(
+            resume_key_refusal(&mismatched, &v2.truncated()),
+            Some(ResumeKeyRefusal::Rekeyed(v1))
+        );
+        assert_eq!(resume_key_refusal(&mismatched, &v1), None);
     }
 
     /// Persisting an adopted torrent writes its save path, then its

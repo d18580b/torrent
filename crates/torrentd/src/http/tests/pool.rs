@@ -23,7 +23,13 @@ use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
 
 /// Matched under `movies/`, claiming both files there.
-const IH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+///
+/// The infohash of every [`metainfo`] torrent, whatever its announce URL, so
+/// the resume data [`fastresume`] writes for one names the key it is filed
+/// under: a fast-path adoption reads the key its session would give the
+/// torrent before the add, and refuses one filed under another (issue #412).
+/// It sorts before [`IH_B`] and [`IH_C`].
+const IH_A: &str = "161198fb49b44a081ed02da0b8f4f036e5cab471";
 /// Partial, based under `movies/`, claiming nothing.
 const IH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 /// In the library, never matched.
@@ -929,6 +935,107 @@ fn fastresume(torrent: &[u8], tracker: Option<&str>) -> Vec<u8> {
     }
     r.extend_from_slice(b"e");
     r
+}
+
+#[test]
+fn ih_a_is_the_infohash_of_every_metainfo_torrent() {
+    for announce in ["http://a.example/announce", "http://b.example/announce"] {
+        assert_eq!(
+            libtorrent_safe::info_hash_from_torrent(&metainfo(announce))
+                .unwrap()
+                .to_hex(),
+            IH_A
+        );
+    }
+}
+
+/// Issue #412: resume data carrying an info dict of its own is keyed by it,
+/// and libtorrent ignores the library's `.torrent` beside it. Where that key
+/// is not the one the pool index records, the fast path does not add it, and
+/// the `.torrent`, whose key is the index's, is verified instead.
+#[tokio::test]
+async fn resume_data_keyed_otherwise_than_the_index_is_verified_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(
+        library.join(format!("{IH_A}.torrent")),
+        metainfo("http://tracker.example/announce"),
+    )
+    .unwrap();
+    // Another torrent's info dict, and the hash it names.
+    let info = b"d6:lengthi2e4:name1:b12:piece lengthi16384e6:pieces20:\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01e";
+    let mut other = b"d4:info".to_vec();
+    other.extend_from_slice(info);
+    other.extend_from_slice(b"8:announce31:http://tracker.example/announcee");
+    let other_ih = libtorrent_safe::info_hash_from_torrent(&other).unwrap();
+    let mut r = b"d11:file-format22:libtorrent resume file12:file-versioni1e4:info".to_vec();
+    r.extend_from_slice(info);
+    r.extend_from_slice(b"9:info-hash20:");
+    r.extend_from_slice(&other_ih.0);
+    r.extend_from_slice(b"6:pieces1:\x019:seed_modei1e");
+    r.extend_from_slice(b"8:trackersll31:http://tracker.example/announceeee");
+    let read = libtorrent_safe::add_info_hashes(&torrentd_engine::AddParams::resume(r.clone()))
+        .expect("the resume data reads");
+    assert_eq!(
+        (read.has_metadata, read.stable_key()),
+        (true, Some(other_ih)),
+        "the resume data is keyed by its own info dict"
+    );
+    let resume = library.join(format!("{IH_A}.fastresume"));
+    std::fs::write(&resume, &r).unwrap();
+    let mut row = torrent(dir.path(), IH_A, 96, 2);
+    row.fastresume_path = Some(resume);
+    index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+
+    let engine = Arc::new(torrentd_engine::MockEngine::new());
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "p",
+            ProfileStatus::Active,
+        )]));
+        *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p"]);
+        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            torrentd_engine::ProfileId::new("p"),
+            engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+        s.pool = Some(pool);
+    });
+    let w = h.tokens.write.clone();
+    for dry_run in [true, false] {
+        let resp = h
+            .send(
+                "POST",
+                "/v1/pool/adoptions",
+                Some(&w),
+                adopt(
+                    "p",
+                    dry_run,
+                    json!({"kind": "infohashes", "infohashes": [IH_A]}),
+                ),
+            )
+            .await;
+        resp.assert_status(StatusCode::OK);
+        let r = resp.json::<Value>();
+        // Reported under the plan's bucket, as every fallback from the fast
+        // path to verification is.
+        assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+        let queue = index.verify_queue();
+        let queued = queue.depth() + queue.in_flight();
+        assert_eq!(queued, usize::from(!dry_run), "dry run {dry_run}: {r}");
+    }
+    assert!(
+        !engine.calls().iter().any(|c| matches!(
+            c,
+            torrentd_engine::mock::RecordedCall::AddTorrent(
+                torrentd_engine::mock::AddParamsSummary::Resume { .. }
+            )
+        )),
+        "the resume data is not added: {:?}",
+        engine.calls()
+    );
 }
 
 /// Issue #72's adoption acceptance: a torrent adopted into a profile with

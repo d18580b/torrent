@@ -521,25 +521,27 @@ impl TorrentEngine for MockEngine {
     fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle, EngineError> {
         self.record(RecordedCall::AddTorrent((&params).into()));
         self.check_error("add_torrent")?;
-        // Synthesize an infohash from the params if none is implicit.
-        // Tests that need a specific infohash should pre-register via
-        // `register_handle` and then push their own AddTorrent alert.
-        let ih = match &params {
-            AddParams::Resume { bytes, .. } | AddParams::File { bytes, .. } => {
-                let mut buf = [0u8; 20];
-                for (i, b) in bytes.iter().take(20).enumerate() {
-                    buf[i] = *b;
-                }
-                InfoHash(buf)
+        // The key the params name where libtorrent can read one, as the real
+        // session reports it (`libtorrent_safe::add_info_hashes`), so a
+        // caller comparing the handle's infohash with the one it filed the
+        // torrent under sees what it would see live. Otherwise synthesized
+        // from the params' bytes; tests that need a specific infohash should
+        // pre-register via `register_handle` and push their own AddTorrent
+        // alert.
+        let named = libtorrent_safe::add_info_hashes(&params)
+            .ok()
+            .and_then(|read| read.hashes.key());
+        let ih = named.unwrap_or_else(|| {
+            let bytes = match &params {
+                AddParams::Resume { bytes, .. } | AddParams::File { bytes, .. } => bytes.as_slice(),
+                AddParams::Magnet { uri, .. } => uri.as_bytes(),
+            };
+            let mut buf = [0u8; 20];
+            for (i, b) in bytes.iter().take(20).enumerate() {
+                buf[i] = *b;
             }
-            AddParams::Magnet { uri, .. } => {
-                let mut buf = [0u8; 20];
-                for (i, b) in uri.as_bytes().iter().take(20).enumerate() {
-                    buf[i] = *b;
-                }
-                InfoHash(buf)
-            }
-        };
+            InfoHash(buf)
+        });
         let h = self.register_handle(ih);
         if self.add_alerts.load(Ordering::SeqCst) {
             self.push_alert(Alert::AddTorrent {
@@ -848,6 +850,35 @@ mod tests {
         let drained = m.pop_alerts();
         assert_eq!(drained.len(), 2);
         assert!(m.pop_alerts().is_empty());
+    }
+
+    /// Issue #412: an add reports the key its params name where libtorrent
+    /// can read one, as a real session does, and a synthesized one otherwise.
+    #[test]
+    fn add_torrent_reports_the_key_the_params_name() {
+        let m = MockEngine::new();
+        let v1 = [0x11u8; 20];
+        let mut resume = b"d11:file-format22:libtorrent resume file12:file-versioni1e".to_vec();
+        resume.extend_from_slice(b"9:info-hash20:");
+        resume.extend_from_slice(&v1);
+        resume.extend_from_slice(b"9:save_path4:/tmpe");
+        let h = m.add_torrent(AddParams::resume(resume)).unwrap();
+        assert_eq!(h.infohash, InfoHash(v1));
+
+        let h = m
+            .add_torrent(AddParams::Magnet {
+                uri: format!("magnet:?xt=urn:btih:{}", "22".repeat(20)),
+                save_path: "/tmp".into(),
+                flags: libtorrent_safe::TorrentFlags::empty(),
+            })
+            .unwrap();
+        assert_eq!(h.infohash, InfoHash([0x22u8; 20]));
+
+        // Not bencode: the first 20 bytes.
+        let h = m
+            .add_torrent(AddParams::resume(b"0123456789abcdefghijKLMN".to_vec()))
+            .unwrap();
+        assert_eq!(h.infohash, InfoHash(*b"0123456789abcdefghij"));
     }
 
     #[test]
