@@ -1223,6 +1223,58 @@ extern "C" int lt_magnet_info_hashes(const char* uri,
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
 }
 
+extern "C" int lt_add_info_hashes(const char* magnet_uri,
+                                  const uint8_t* torrent_buf, size_t torrent_len,
+                                  const uint8_t* resume_buf, size_t resume_len,
+                                  struct lt_info_hashes* out,
+                                  int* has_metadata_out,
+                                  char* err_out, int err_len)
+{
+    if (!out) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    std::memset(out, 0, sizeof(*out));
+    if (has_metadata_out) *has_metadata_out = 0;
+    LT_SHIM_TRY
+    // Built exactly as the matching lt_add_torrent_* builds it, so the hashes
+    // read below are the ones the add would hand libtorrent.
+    lt::add_torrent_params atp;
+    lt::error_code ec;
+    if (resume_buf && resume_len > 0) {
+        atp = lt::read_resume_data(
+            lt::span<char const>(reinterpret_cast<const char*>(resume_buf), resume_len), ec);
+        if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
+        if (!atp.ti && torrent_buf && torrent_len > 0) {
+            atp.ti = std::make_shared<lt::torrent_info>(
+                reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+        }
+    } else if (magnet_uri) {
+        atp = lt::parse_magnet_uri(magnet_uri, ec);
+        if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
+    } else if (torrent_buf && torrent_len > 0) {
+        atp.ti = std::make_shared<lt::torrent_info>(
+            reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+    } else {
+        set_err(err_out, err_len, "no torrent source");
+        return LT_ERR;
+    }
+
+    // session_impl::add_torrent_impl refuses metadata whose hashes disagree
+    // with the ones the params name, then keys the torrent by the metadata's.
+    if (atp.ti) {
+        auto const& ti_ih = atp.ti->info_hashes();
+        if ((atp.info_hashes.has_v1() && atp.info_hashes.v1 != ti_ih.v1)
+            || (atp.info_hashes.has_v2() && atp.info_hashes.v2 != ti_ih.v2)) {
+            set_err(err_out, err_len, "mismatching info-hash");
+            return LT_ERR;
+        }
+        fill_info_hashes(out, ti_ih);
+        if (has_metadata_out) *has_metadata_out = 1;
+    } else {
+        fill_info_hashes(out, atp.info_hashes);
+    }
+    return LT_OK;
+    LT_SHIM_CATCH(err_out, err_len, LT_ERR)
+}
+
 namespace {
 
 // A host or domain in the one spelling they are compared in: ASCII
