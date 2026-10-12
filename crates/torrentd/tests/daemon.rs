@@ -3016,13 +3016,28 @@ fn a_hybrid_torrent_filed_under_its_truncated_v2_hash_is_refused_at_boot() {
     });
 }
 
-/// The same with no `.torrent` beside the resume file, so nothing tells the
-/// scan the session's key before the add: the session's own key is compared,
-/// and the torrent taken back out of the session.
+/// The same with no `.torrent` beside the resume file: the v1 hash the resume
+/// data names is the session's key, which the scan reads before the add
+/// (issue #412), so nothing is added.
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
-fn a_hybrid_resume_file_filed_under_its_truncated_v2_hash_is_taken_back_out_at_boot() {
+fn a_hybrid_resume_file_filed_under_its_truncated_v2_hash_is_refused_at_boot() {
     boot_a_hybrid_filed_under_its_truncated_v2_hash(HybridFiling::default());
+}
+
+/// Issue #412: resume data naming only a v2 hash, with no metadata and no
+/// `.torrent` beside it, as another client writes it for a btmh-only magnet
+/// whose metadata it never fetched. The session would key it by the
+/// truncated v2 hash it is filed under until hybrid metadata arrived and
+/// rekeyed it by its v1 hash, so the boot refuses it, as `POST /v1/torrents`
+/// refuses a btmh-only magnet.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn v2_only_resume_data_with_no_metadata_is_refused_at_boot() {
+    boot_a_hybrid_filed_under_its_truncated_v2_hash(HybridFiling {
+        v2_only: true,
+        ..HybridFiling::default()
+    });
 }
 
 /// Issue #251 as an earlier build left it: the registry claims the torrent
@@ -3039,8 +3054,9 @@ fn a_hybrid_claimed_under_its_truncated_v2_hash_is_refused_with_its_claim_kept()
     });
 }
 
-/// The same with no `.torrent` beside the resume file: the add runs, the
-/// torrent is taken back out, and the claim it held before the boot is kept.
+/// The same with no `.torrent` beside the resume file: the resume data's own
+/// v1 hash refuses it before the add, and the claim it held before the boot
+/// is kept.
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn a_hybrid_resume_file_claimed_under_its_truncated_v2_hash_keeps_its_claim() {
@@ -3051,10 +3067,10 @@ fn a_hybrid_resume_file_claimed_under_its_truncated_v2_hash_keeps_its_claim() {
 }
 
 /// Where the profile files a `.torrent` under the session's key as well, the
-/// torrent the add left in the session stays loaded: taking it out would
-/// delete that `.torrent`. It is claimed under the session's key and counted
-/// loaded, so it is neither seeded unclaimed nor reported as an unloaded
-/// claim.
+/// resume scan refuses the resume file filed under the truncated v2 hash
+/// before the add, and the torrent-dir scan loads that `.torrent` under the
+/// session's key: claimed there and counted loaded, so it is neither seeded
+/// unclaimed nor reported as an unloaded claim.
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn a_hybrid_left_loaded_under_its_session_key_is_claimed_there() {
@@ -3074,6 +3090,8 @@ struct HybridFiling {
     v2_claimed: bool,
     /// A `.torrent` filed under the v1 hash, the session's key.
     v1_torrent: bool,
+    /// The resume data names the v2 hash alone, not the v1 hash too.
+    v2_only: bool,
 }
 
 fn boot_a_hybrid_filed_under_its_truncated_v2_hash(case: HybridFiling) {
@@ -3081,6 +3099,7 @@ fn boot_a_hybrid_filed_under_its_truncated_v2_hash(case: HybridFiling) {
         with_torrent,
         v2_claimed,
         v1_torrent,
+        v2_only,
     } = case;
     let torrent = std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3101,10 +3120,12 @@ fn boot_a_hybrid_filed_under_its_truncated_v2_hash(case: HybridFiling) {
     std::fs::create_dir_all(&resumes).unwrap();
     std::fs::create_dir_all(&torrents).unwrap();
     // Resume data as libtorrent writes it for a hybrid: both hashes and a save
-    // path, no info dict.
-    let mut resume =
-        b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
-    resume.extend_from_slice(&v1.0);
+    // path, no info dict. Or the v2 hash alone, as for a btmh-only magnet.
+    let mut resume = b"d11:file-format22:libtorrent resume file12:file-versioni1e".to_vec();
+    if !v2_only {
+        resume.extend_from_slice(b"9:info-hash20:");
+        resume.extend_from_slice(&v1.0);
+    }
     resume.extend_from_slice(b"10:info-hash232:");
     resume.extend_from_slice(&v2.0);
     let save_path = p.join("data").display().to_string();
