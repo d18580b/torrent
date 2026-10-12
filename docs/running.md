@@ -488,7 +488,9 @@ files in place, and a warning names it.
 
 **`[pool]`** (optional) — `roots` (required, must not nest and must not contain
 the daemon's own state), `library_dir` (required), `db_path`
-(default `<resume_dir>/../pool.db`), `max_concurrent_verify` (default `4`),
+(default `<resume_dir>/../pool.db`), `max_concurrent_verify` (default `4`;
+the daemon's bound on concurrent hash checks of every kind, which keeps the
+default without `[pool]`),
 `import_legacy_registry` (default `true`), and **`allow_mutations`
 (default `false`)**. Leave the last one off until you actually want torrentd
 moving and deleting files inside your roots; the index, matching, adoption and
@@ -1499,35 +1501,42 @@ on the daemon's host, or `{"kind":"metainfo","data":"<base64 .torrent>"}`;
 `save_path: null` uses `default_save_path`.
 
 A `.torrent` added this way, or found in a profile's `torrent_dir` at boot
-with no resume file beside it, is hashed before it seeds: it shows `checking`
-first, for as long as reading the payload takes. A payload that is absent,
-truncated or still being copied ends `incomplete`, never announced as
+with no resume file beside it, is hashed before it seeds. A payload that is
+absent, truncated or still being copied ends `incomplete`, never announced as
 complete, and stays there, since the daemon never downloads. Put the payload
 in place, then `POST /v1/torrents/{infohash}/recheck`.
 
-That first check starts at once, beside every other: nothing bounds how many
-`.torrent` adds, or `torrent_dir` files with no resume file, hash together.
-Add a large set in batches, or adopt it through the pool, whose verifications
-are bounded ([import.md §7](import.md#7-monitoring-the-queue)).
+That first check waits its turn. The daemon bounds hash checks at
+`[pool] max_concurrent_verify` (`4` without `[pool]`) at once, adoptions,
+rechecks and the disk-error retry's checks included, so the torrent is added
+`paused`, and the daemon's check queue resumes it once a slot is free; it
+shows `checking` from then for as long as reading the payload takes. A
+directory of thousands of `.torrent` files, or a script adding them, is
+checked a few at a time. The torrent is recorded in `check_holds.json` in the
+state directory until its check ends, so a restart loads it paused and
+queues it again rather than leaving it paused for good. Pausing it while it
+waits takes it out of the queue; resuming it by hand starts its check at
+once. A magnet's check once its metadata arrives is not bounded: libtorrent
+starts it as the metadata lands ([import.md §7](import.md#7-monitoring-the-queue)).
 
 `POST /v1/torrents/{infohash}/recheck` answers `202`, and the torrent shows
 `checking` from the moment its check starts until it ends. Each check
-disconnects the torrent's peers until it ends. With `[pool]` configured the
-recheck is queued, not started, and a queued recheck shows the torrent's old
-phase until the verify queue starts it: the queue starts it once a slot is
-free, at most
-`[pool] max_concurrent_verify` checks at once together with adoptions and
-`POST /v1/pool/verifications`, so a script that rechecks every torrent does
-not hash them all at once. `GET /v1/pool` counts a queued recheck in
+disconnects the torrent's peers until it ends. The recheck is queued, not
+started, `[pool]` or not, and a queued recheck shows the torrent's old phase
+until the check queue starts it: the queue starts it once a slot is free,
+within the same bound, so a script that rechecks every torrent does not hash
+them all at once. `GET /v1/pool` counts a queued recheck in
 `verify_queue_depth` until it starts and `verify_in_flight` while it hashes,
 as `torrentd_pool_verify_queue_depth` and `torrentd_pool_verify_in_flight`
-do; asking again for a torrent already queued or checking adds nothing. The
-queue starts it only while the profile is on the network, and drops it,
-counted in `torrentd_pool_recheck_dropped_total`, where the torrent was
-removed or paused while it waited. A restart drops the queued rechecks that
-had not started. Without `[pool]`, and for a torrent that is paused or has no
-metadata yet, libtorrent is asked at once, with no bound on how many check
-together; a paused torrent's check starts when it is resumed.
+do, and as `torrentd_check_queue_depth` and `torrentd_checks_in_flight` do
+with or without `[pool]`; asking again for a torrent already queued or
+checking adds nothing. The queue starts it only while the profile is on the
+network, and drops it, counted in `torrentd_pool_recheck_dropped_total`,
+where the torrent was removed or paused while it waited or libtorrent
+refused to start it. A restart drops the queued rechecks that had not
+started. For a torrent that is paused or has no metadata yet, libtorrent is
+asked at once; a paused torrent's check starts when it is resumed.
+`torrentd_checks_started_total` counts every check started, by `source`.
 
 ### Monitoring: Prometheus alerts and a Grafana dashboard
 

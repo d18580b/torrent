@@ -292,12 +292,14 @@ pub struct PoolOverview {
     /// Library torrents by adoption state. A torrent never matched has no
     /// state and is in none of these.
     pub states: AdoptionCounts,
-    /// Adopted torrents, and re-hashes `POST /v1/pool/verifications` or
-    /// `POST /v1/torrents/{infohash}/recheck` queued, waiting for a
-    /// verification slot.
+    /// Adopted torrents, re-hashes `POST /v1/pool/verifications` or
+    /// `POST /v1/torrents/{infohash}/recheck` queued, and `.torrent`s added
+    /// paused for their first check, waiting for a check slot.
     pub verify_queue_depth: u32,
-    /// Adopted torrents and queued re-hashes libtorrent is hashing now: at
-    /// most `[pool] max_concurrent_verify`.
+    /// Adopted torrents verifying, and every other check holding a slot
+    /// (re-hashes, `.torrent`s' first checks, disk-error retries): at most
+    /// `[pool] max_concurrent_verify`, or one over it for each waiting
+    /// `.torrent` the operator resumed by hand.
     pub verify_in_flight: u32,
 }
 

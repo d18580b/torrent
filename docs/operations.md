@@ -830,11 +830,12 @@ If a drift check already ran, the drifted torrents need
 `POST /v1/pool/verifications` with their info-hashes, at most 1000 to a
 request. The request only queues the re-hashes and answers `202` at once; the
 verify queue runs them `[pool] max_concurrent_verify` at a time, sharing
-that bound with adoptions and `POST /v1/torrents/{ih}/recheck`, so sending
-the whole library in batches does not start every check at once. The bound
-does not cover a `.torrent` added or found in `torrent_dir` with no resume
-file, which is hashed at once ([import.md §7](import.md#7-monitoring-the-queue)). Each re-hash disconnects the torrent's peers until
-it ends. `torrentd_pool_verify_queue_depth` shows the backlog draining and
+that bound with adoptions, `POST /v1/torrents/{ih}/recheck`, the first
+checks of `.torrent`s added or found in `torrent_dir` with no resume file,
+and the disk-error retry's checks, so sending the whole library in batches
+does not start every check at once
+([import.md §7](import.md#7-monitoring-the-queue)). Each re-hash disconnects
+the torrent's peers until it ends. `torrentd_pool_verify_queue_depth` shows the backlog draining and
 `torrentd_pool_verify_in_flight` the checks running. The queue is held in
 memory, so after a restart send the requests again for what is still
 `drifted`.

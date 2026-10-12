@@ -643,6 +643,8 @@ pub struct DaemonHandle {
     reload_tx: mpsc::Sender<()>,
     metrics: Arc<PromSink>,
     pool: Option<Arc<crate::pool_service::PoolService>>,
+    /// The daemon's bound on hash checks, the pool's queue where there is one.
+    checks: Arc<crate::pool_service::VerifyQueue>,
     registry: Arc<AssignmentRegistry>,
     profile_registry: Arc<ProfileRegistry>,
     /// The kill-switch watch's fence, where the nftables kill switch was
@@ -1192,6 +1194,30 @@ pub async fn boot(
             pool.set_kill_switch(Arc::clone(fence));
         }
     }
+    // The daemon's one bound on hash checks, and the record of the
+    // `.torrent`s it held paused for a slot when the daemon stopped: the
+    // scans load each paused, and it queues them again.
+    let checks = crate::pool_service::VerifyQueue::for_daemon(pool.as_deref());
+    checks.set_metrics(metrics.clone());
+    {
+        let path = cfg
+            .profile_state_path()
+            .with_file_name(crate::pool_service::CHECK_HOLDS_FILE);
+        let shown = path.display().to_string();
+        let (holds, unreadable) =
+            tokio::task::spawn_blocking(move || crate::profile_state::PacedHolds::load(path))
+                .await
+                .context("read the record of the .torrent adds held for a check slot")?;
+        if let Some(why) = unreadable {
+            error!(
+                path = %shown,
+                error.cause = %why,
+                "the record of the .torrent adds held for a check slot could not be read; any it \
+                 named come back paused, and POST /v1/torrents/{{infohash}}/resume resumes them",
+            );
+        }
+        checks.set_holds(holds);
+    }
 
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
@@ -1226,6 +1252,7 @@ pub async fn boot(
         // operator: loaded unpaused, as they were before the profile went
         // offline.
         let held = profile_registry.holds().held(&profile);
+        let held_for_check = checks.holds().held(&profile);
         let mut unheld = Vec::new();
         let engine = source
             .engine_for(&profile)
@@ -1341,8 +1368,16 @@ pub async fn boot(
             // operator makes over it.
             let relocated = relocated_save_path(&*torrent_store, pool.as_deref(), &profile, &ih);
             let paced = held.contains(&ih);
-            let params =
+            let mut params =
                 resume_scan_params(profile_cfg, data.into_inner(), torrent, relocated, paced);
+            // A `.torrent` the check queue held paused for a slot, or had
+            // resumed and whose check had not ended, when the daemon
+            // stopped: loaded paused whatever its resume data says, and
+            // queued again once the scans are done (`restore_held_adds`), so
+            // its check waits for a slot again rather than starting now.
+            if held_for_check.contains(&ih) {
+                params = with_paused(params);
+            }
             // The account-isolation guard, on the trackers this resume data
             // would announce to — its own `trackers` list where it has one.
             // A file written before the profile's allow-list was set, or
@@ -1561,6 +1596,31 @@ pub async fn boot(
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         let mut added = 0usize;
+        // Every `.torrent` this scan may add is recorded as held for a check
+        // slot before any is added, in one write rather than one per torrent:
+        // a restart before its check ends then loads it paused and queues it
+        // again, rather than leaving it paused for good. What the scan skips
+        // after all is released once the scans are done
+        // (`restore_held_adds`). A record that cannot be written leaves this
+        // profile's adds running, their checks unbounded, as before the
+        // queue held them.
+        let held_for_check = {
+            let candidates = entries.iter().map(|(ih, _)| *ih).filter(|ih| {
+                !loaded.contains(ih) && !removed_at_boot.contains(&(profile.clone(), *ih))
+            });
+            match checks.holds().hold(&profile, candidates) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        profile_id = %profile,
+                        error.cause = %e,
+                        "torrent-dir scan: could not record its torrents as held for a check \
+                         slot; adding them running, their checks outside the check limit",
+                    );
+                    false
+                }
+            }
+        };
         for (i, (ih, bytes)) in entries.into_iter().enumerate() {
             if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 {
                 if shutdown_requested(&mut boot_shutdown) {
@@ -1635,7 +1695,7 @@ pub async fn boot(
             // allow-list like one posted to the API.
             let save_path =
                 torrent_dir_save_path(&*metrics, &*torrent_store, &profile, &ih, &scan_save_path);
-            let params = torrent_dir_scan_params(profile_cfg, bytes, save_path);
+            let mut params = torrent_dir_scan_params(profile_cfg, bytes, save_path);
             if let Err(refusal) =
                 boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "torrent_dir")
             {
@@ -1669,10 +1729,24 @@ pub async fn boot(
                 );
                 continue;
             }
+            // With no resume data the add hashes the payload: added paused,
+            // its check waits for a slot in the check queue like every other,
+            // so a directory of N `.torrent`s does not hash N at once. Its
+            // record was written before the loop (`held_for_check`).
+            if held_for_check {
+                params = with_paused(params);
+            }
             match engine.add_torrent(params) {
                 Ok(h) => {
                     added += 1;
                     loaded.insert(ih);
+                    if held_for_check {
+                        checks.enqueue_add(
+                            profile.clone(),
+                            ih,
+                            crate::pool_service::CheckSource::TorrentDir,
+                        );
+                    }
                     scan_fence.added(&profile_registry, &metrics, &profile, h);
                 }
                 Err(e) => {
@@ -1749,6 +1823,11 @@ pub async fn boot(
             );
         }
     }
+
+    // `.torrent`s held paused for a check slot, by this boot's torrent-dir
+    // scan or by the run before it: each the scans loaded waits for its slot
+    // again, and the record drops what they did not load.
+    checks.restore_held_adds(source.profiles(), &loaded);
 
     // Adoptions a restart caught waiting for verification: their claims are
     // in the registry, no scan loads them, and the verify queue adds them
@@ -1937,6 +2016,9 @@ pub async fn boot(
     // alert lands after it: the add handler's pause of that torrent is
     // recorded with the fence, under its lock, so the lift resumes it too.
     .fence_hold(crate::vpn_monitor::fence_hold(kill_switch.clone()))
+    // The disk-error retry starts checks on the loop's own schedule: each
+    // takes a slot in the daemon's check limit first, or waits for one.
+    .check_slots(Arc::clone(&checks) as Arc<dyn torrentd_engine::CheckSlots>)
     // A magnet is added with DHT, PEX and LSD disabled because its `private`
     // bit is unknown; once its metadata shows it public, the engine lifts
     // what the profile's own posture does not keep. A profile the registry
@@ -1976,6 +2058,7 @@ pub async fn boot(
         reload_tx: reload_tx_for_api,
         metrics,
         pool,
+        checks,
         registry,
         profile_registry,
         kill_switch,
@@ -2698,6 +2781,26 @@ fn torrent_dir_scan_params(
     }
 }
 
+/// `params`, added paused: a `.torrent` whose first check waits for a slot
+/// in the check queue, which resumes it. A resume add is paused whatever its
+/// resume data says, and whatever `paced` cleared.
+fn with_paused(mut params: AddParams) -> AddParams {
+    let paused = libtorrent_safe::TorrentFlags::PAUSED;
+    match &mut params {
+        AddParams::File { flags, .. } => *flags |= paused,
+        AddParams::Resume {
+            flags_set,
+            flags_clear,
+            ..
+        } => {
+            *flags_set |= paused;
+            *flags_clear &= !paused;
+        }
+        AddParams::Magnet { .. } => {}
+    }
+    params
+}
+
 /// The production engine factory for [`build_profiles`]: a real libtorrent
 /// session, restored from `state` where a host profile with DHT kept one.
 fn real_engine(
@@ -3219,6 +3322,7 @@ impl DaemonHandle {
             reload_tx,
             metrics,
             pool,
+            checks,
             registry,
             profile_registry,
             kill_switch,
@@ -3264,23 +3368,24 @@ impl DaemonHandle {
             );
         }
 
-        // Verify queue: admits a bounded number of adopt-time re-hashes so a
-        // bulk adopt cannot starve whatever is already seeding.
-        if let Some(pool) = pool.clone() {
-            spawn_supervised(
-                "verify_queue",
+        // Verify queue: admits a bounded number of checks - adoptions,
+        // re-hashes, `.torrent` adds' first checks - so a bulk adopt, recheck
+        // or add cannot starve whatever is already seeding. Run with or
+        // without `[pool]`.
+        spawn_supervised(
+            "verify_queue",
+            metrics.clone(),
+            crate::pool_service::run_verify_queue(
+                Arc::clone(&checks),
+                pool.clone(),
+                source.clone(),
+                state.clone(),
                 metrics.clone(),
-                crate::pool_service::run_verify_queue(
-                    pool,
-                    source.clone(),
-                    state.clone(),
-                    metrics.clone(),
-                    profile_registry.clone(),
-                    registry.clone(),
-                    shutdown_tx.subscribe(),
-                ),
-            );
-        }
+                profile_registry.clone(),
+                registry.clone(),
+                shutdown_tx.subscribe(),
+            ),
+        );
 
         let trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
             .expect("validated at startup");
@@ -3294,6 +3399,7 @@ impl DaemonHandle {
             metrics: metrics.clone(),
             auth: cfg.auth.clone().map(crate::auth::Auth::new),
             pool,
+            checks,
             alert_heartbeat: alert_loop.heartbeat(),
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
@@ -4490,6 +4596,191 @@ mod shutdown_report_tests {
             counted(&sink, "boot_save_path_fallbacks_total"),
             vec![vec![("profile_id".to_string(), p.as_str().to_string())]; 3],
         );
+    }
+
+    /// Issue #383: the boot's torrent-dir scan of twelve `.torrent`s with no
+    /// resume data, without `[pool]`, never has more than the default check
+    /// limit of four hashing at once. The scan records every torrent it may
+    /// add as held before the first add, adds each paused, and queues it;
+    /// the check queue resumes them a slot at a time. Each used to be added
+    /// running, so all twelve hashed at once.
+    ///
+    /// A restart before every check has ended loads the torrents the record
+    /// names paused, whatever their resume data says, and queues them again,
+    /// so none is left paused for good; the record lets go of what no scan
+    /// loaded.
+    #[test]
+    fn a_torrent_dir_scan_hashes_at_most_the_check_limit_and_survives_a_restart() {
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+
+        use crate::pool_service::CheckSource;
+        use crate::pool_service::VerifyQueue;
+        use crate::pool_service::CHECK_HOLDS_FILE;
+        use crate::profile_state::PacedHolds;
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(CHECK_HOLDS_FILE);
+        let p = ProfileId::new("p");
+        let entry = crate::profile_registry::test_entry("p", ProfileStatus::Active);
+        let profile_cfg = entry.config.clone();
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![(
+            p.clone(),
+            engine.clone() as Arc<dyn TorrentEngine>,
+        )]));
+        let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+        let registry = Arc::new(AssignmentRegistry::new_empty(dir.path().join("reg.json")));
+        let state = StateMap::new();
+        let torrent = |i: u8| {
+            let mut t = format!(
+                "d4:infod6:lengthi1e4:name1:{}12:piece lengthi16384e6:pieces20:",
+                (b'a' + i) as char
+            )
+            .into_bytes();
+            t.extend_from_slice(&[0u8; 20]);
+            t.extend_from_slice(b"ee");
+            t
+        };
+
+        // The scan, as `boot` runs it for one profile.
+        let q = VerifyQueue::for_daemon(None);
+        q.set_holds(PacedHolds::load(record.clone()).0);
+        let files: Vec<_> = (0..12u8)
+            .map(|i| {
+                let bytes = torrent(i);
+                (
+                    libtorrent_safe::info_hash_from_torrent(&bytes).unwrap(),
+                    bytes,
+                )
+            })
+            .collect();
+        q.holds().hold(&p, files.iter().map(|(ih, _)| *ih)).unwrap();
+        let mut added = Vec::new();
+        for (ih, bytes) in &files {
+            let params = with_paused(torrent_dir_scan_params(
+                &profile_cfg,
+                bytes.clone(),
+                "/data".into(),
+            ));
+            engine.add_torrent(params).unwrap();
+            // The mock keys an add by its first bytes, not its info-hash.
+            let h = engine.register_handle(*ih);
+            registry.assign(*ih, p.clone()).unwrap();
+            q.enqueue_add(p.clone(), *ih, CheckSource::TorrentDir);
+            // What the add alert does once the loop runs.
+            let mut st =
+                torrentd_engine::TorrentState::newly_added(h, p.clone(), std::time::Instant::now());
+            st.phase = torrentd_engine::TorrentPhase::Paused;
+            state.insert(*ih, st);
+            added.push(*ih);
+        }
+        let adds: Vec<_> = engine
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::AddTorrent(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(adds.len(), 12);
+        for a in &adds {
+            assert!(
+                a.flags_set()
+                    .contains(libtorrent_safe::TorrentFlags::PAUSED),
+                "added running: {a:?}"
+            );
+        }
+
+        let resumed = || -> Vec<libtorrent_safe::InfoHash> {
+            engine
+                .calls()
+                .iter()
+                .filter_map(|c| match c {
+                    RecordedCall::ResumeTorrent(h) => Some(h.infohash),
+                    _ => None,
+                })
+                .collect()
+        };
+        let tick = |q: &VerifyQueue| {
+            crate::pool_service::admit_tick_for_tests(
+                q, None, &source, &state, &profiles, &registry,
+            );
+        };
+        let mut finished = HashSet::new();
+        let mut peak = 0;
+        // Run until half the checks have ended.
+        for n in 0..100 {
+            tick(&q);
+            let started = resumed();
+            let checking = started.iter().filter(|h| !finished.contains(*h)).count();
+            assert!(checking <= 4, "tick {n}: {checking} checking at once");
+            assert_eq!(q.in_flight(), checking, "tick {n}");
+            peak = peak.max(checking);
+            if finished.len() == 6 {
+                break;
+            }
+            if let Some(ih) = started.iter().find(|h| !finished.contains(*h)) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                state.update(ih, |st| {
+                    st.checked_at = Some(std::time::Instant::now());
+                    st.phase = torrentd_engine::TorrentPhase::Seeding;
+                });
+                finished.insert(*ih);
+            }
+        }
+        assert_eq!(peak, 4, "the limit is reached, not merely respected");
+        assert_eq!(
+            resumed()[..6],
+            added[..6],
+            "in the order the scan added them"
+        );
+        tick(&q);
+        // A check that ended leaves the record in a batch, not a rewrite per
+        // check, while others still wait; every one still waiting is in it.
+        let held = PacedHolds::load(record.clone()).0.held(&p);
+        assert!(added[6..].iter().all(|ih| held.contains(ih)));
+
+        // The restart. Its resume scan loads every torrent the record names
+        // paused, a paced hold's included; one torrent's files are gone.
+        drop(q);
+        let q = VerifyQueue::for_daemon(None);
+        q.set_holds(PacedHolds::load(record.clone()).0);
+        let params = with_paused(resume_scan_params(
+            &profile_cfg,
+            vec![1; 32],
+            None,
+            None,
+            true,
+        ));
+        assert!(params_flags(&params)
+            .0
+            .contains(libtorrent_safe::TorrentFlags::PAUSED));
+        assert!(!params_flags(&params)
+            .1
+            .contains(libtorrent_safe::TorrentFlags::PAUSED));
+        let loaded: HashSet<_> = added[7..].iter().copied().collect();
+        assert_eq!(q.restore_held_adds([p.clone()], &loaded), 5);
+        assert_eq!(q.depth(), 5);
+        assert_eq!(
+            PacedHolds::load(record).0.held(&p),
+            loaded,
+            "what no scan loaded leaves the record"
+        );
+    }
+
+    /// The flags a resume add sets and clears.
+    fn params_flags(
+        params: &AddParams,
+    ) -> (libtorrent_safe::TorrentFlags, libtorrent_safe::TorrentFlags) {
+        match params {
+            AddParams::Resume {
+                flags_set,
+                flags_clear,
+                ..
+            } => (*flags_set, *flags_clear),
+            other => panic!("not a resume add: {other:?}"),
+        }
     }
 
     /// The resume scan re-adds a relocated torrent where its sidecar and the

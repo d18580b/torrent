@@ -387,6 +387,20 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Resume saves the previous run's shutdown drain left unsaved; 0 if unknown.";
     "last_shutdown_kill_switch_removal_failed" Gauge Daemon Owner("always") =>
         "1 if the previous run could not remove the kill switch on its way out.";
+    // hash checks
+    "checks_started_total" Counter Daemon
+        ("source": &["adoption", "recheck", "add", "torrent_dir", "restart", "disk_error_retry", "magnet_metadata"]) Zero =>
+        "Hash checks started, by what started them: an adoption's verification, a re-hash, the \
+         first check of a .torrent POST /v1/torrents or the boot's torrent_dir scan added, one a \
+         restart caught waiting, a disk-error retry, or a magnet's metadata arriving. Every \
+         source but magnet_metadata waits for a slot in the check limit; libtorrent starts a \
+         magnet's check itself.";
+    "check_queue_depth" Gauge Daemon Owner("from the first queue tick") =>
+        "Checks waiting for a slot: adoptions, re-hashes, and .torrent adds held paused for \
+         their first check.";
+    "checks_in_flight" Gauge Daemon Owner("from the first queue tick") =>
+        "Checks holding a slot, bounded by [pool] max_concurrent_verify (4 without [pool]); \
+         a .torrent the operator resumed while it waited takes one over the bound.";
     // pool
     "pool_plan_failures_total" Counter Daemon ("kind": &["step_failed", "index_diverged", "resume_failed", "redrive_timed_out"]) Zero =>
         "Pool plans that stopped: a step failed, the index stopped accounting for what is \
@@ -404,13 +418,14 @@ pub const CATALOGUE: &[Series] = catalogue! {
          libtorrent refused its resume during a fence's lift and the lift has ended), it had no \
          metadata, its profile had no session, or libtorrent refused to start the check.";
     "pool_verify_queue_depth" Gauge Daemon Owner("pool configured, from the first queue tick") =>
-        "Adoptions waiting to verify, and re-hashes POST /v1/pool/verifications or \
-         POST /v1/torrents/{infohash}/recheck queued that have not started.";
+        "Adoptions waiting to verify, re-hashes POST /v1/pool/verifications or \
+         POST /v1/torrents/{infohash}/recheck queued that have not started, and .torrent adds \
+         held paused for their first check: check_queue_depth, with [pool] configured.";
     "pool_verify_in_flight" Gauge Daemon Owner("pool configured, from the first queue tick") =>
-        "Adoptions verifying and queued re-hashes checking now, together bounded by \
-         [pool] max_concurrent_verify. The first check of a .torrent added with no resume data, \
-         a disk-error retry's check and a magnet's check once its metadata arrives are neither \
-         counted nor bounded.";
+        "Adoptions verifying, and every other check holding a slot (re-hashes, .torrent adds' \
+         first checks, disk-error retries), together bounded by [pool] max_concurrent_verify: \
+         checks_in_flight, with [pool] configured. A magnet's check once its metadata arrives \
+         is neither counted nor bounded.";
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
         "Torrents whose pool-index profile disagrees with the assignment registry at boot.";
     // persistence and the exporter itself
