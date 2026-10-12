@@ -2135,6 +2135,64 @@ mod tests {
         }
     }
 
+    /// A fence landing during the retry's resume pauses the torrent again
+    /// before any check could run, so the slot the retry took is given back
+    /// rather than held until a check that never ran ends.
+    #[test]
+    fn a_fence_landing_during_the_retrys_resume_gives_its_check_slot_back() {
+        #[derive(Default)]
+        struct Slots {
+            taken: std::sync::Mutex<Vec<InfoHash>>,
+            released: std::sync::Mutex<Vec<InfoHash>>,
+        }
+        impl CheckSlots for Slots {
+            fn try_take(&self, _: &ProfileId, ih: InfoHash) -> bool {
+                self.taken.lock().unwrap().push(ih);
+                true
+            }
+            fn release(&self, ih: &InfoHash) {
+                self.released.lock().unwrap().push(*ih);
+            }
+        }
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let metrics: Arc<dyn MetricsSink> = Arc::new(RecordingSink::new());
+        let (state, h) = state_with_a_due_retry(clock.now());
+        // Unfenced at the first question, fenced at the one after the resume.
+        let asked = Arc::new(AtomicU64::new(0));
+        let fence: ProfileFenced = {
+            let asked = Arc::clone(&asked);
+            Arc::new(move |_: &ProfileId| asked.fetch_add(1, Ordering::SeqCst) > 0)
+        };
+        let slots = Slots::default();
+
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            Some(&slots),
+            clock.now(),
+        );
+
+        assert!(resumed(&engine));
+        assert!(engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::mock::RecordedCall::PauseTorrent(p) if *p == h)));
+        assert_eq!(*slots.taken.lock().unwrap(), [h.infohash]);
+        assert_eq!(
+            *slots.released.lock().unwrap(),
+            [h.infohash],
+            "the re-paused torrent's slot was not given back",
+        );
+    }
+
     #[test]
     fn the_disk_error_retry_resumes_a_torrent_libtorrent_left_errored() {
         // A read failure or a failed check leaves the torrent paused with an
