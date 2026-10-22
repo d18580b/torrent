@@ -222,7 +222,7 @@ fields have **one** spelling each, because log queries depend on it:
 | --- | --- |
 | `profile_id` | The `id` of a configured `[[profile]]`. Always present — every torrent belongs to exactly one profile, and there is no implicit one. **Never** `slot_id`, its name before profiles; CI fails on that spelling in any `.rs` file under `crates/`. |
 | `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling in any `.rs` file under `crates/`. |
-| `op` | The engine operation: `add_torrent`, `remove_torrent`, `pause_torrent`, `resume_torrent`, `save_resume_data`, `set_upload_limit`, `set_file_priority`, `force_recheck`, `move_storage`, `apply_settings`. |
+| `op` | The operation the event belongs to. Not a closed list: the engine names its own in the `#[instrument(fields(op = …))]` on each `TorrentEngine` method of `RealEngine` in `crates/torrentd-engine/src/real.rs` (e.g. `add_torrent`, `save_resume_data`, `apply_settings`); other events set it where they are logged (e.g. `alert_loop`, `verify_queue`, a pool plan step's own op, libtorrent's `operation` on a listen failure). `grep -rn 'op = ' crates/` finds them all. |
 | `alert_type` | Lowercase `AlertKind`, e.g. `add_torrent`. |
 | `error.kind` / `error.code` / `error.cause` | Short identifier, OS or libtorrent code, human-readable cause. |
 | `vpn_iface`, `tunnel_ip` | Tunnel networking, on `vpn` profiles. |

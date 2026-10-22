@@ -37,9 +37,10 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # [auth]: a non-loopback bind without it is refused outright, and so is a
 # socket whose mode lets every user connect.
 #
-# Read once, at startup, like [auth], http_listen and trusted_proxies: editing
-# any of the four takes effect on restart, not on SIGHUP. A reload after such an
-# edit warns "requires daemon restart; ignored" and changes nothing.
+# Read once, at startup, like every key not listed as reloadable (README.md,
+# "HTTP API"): editing it takes effect on restart, not on SIGHUP. A reload
+# after such an edit warns "requires daemon restart; ignored" and changes
+# nothing.
 allow_unauthenticated = true
 
 # Without [auth], a request whose Host is not loopback (localhost, 127.0.0.0/8,
@@ -74,8 +75,8 @@ allow_unauthenticated = true
 # a range such as 172.16.0.0/12 would trust every container on every Docker
 # network on the host.
 #
-# Read once, at startup, like [auth], http_listen and allow_unauthenticated:
-# the trust set is parsed before anything is served and does not follow a
+# Read once, at startup, like every key not listed as reloadable (README.md,
+# "HTTP API"): the trust set is parsed before anything is served and does not follow a
 # running daemon. Editing this key and sending SIGHUP warns "requires daemon
 # restart; ignored" and changes nothing — decommission a proxy here and the
 # daemon keeps believing its headers until you restart.

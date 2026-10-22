@@ -391,9 +391,10 @@ It is not one to arrive at by omission. The opt-out does not extend to a
 routable address either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
 and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
 inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` and
-`allowed_hosts` alongside them, are read once, at startup: changing any of the
-five takes a restart, not a `SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
+defaults to `127.0.0.1:8080`. Every key not listed as reloadable under
+[HTTP API](#http-api) — these three, `trusted_proxies` and `allowed_hosts`
+among them — is read once, at startup, and takes a restart, not a `SIGHUP`. A
+`SIGHUP` that changes one says so — "requires daemon restart;
 ignored" — rather than reporting the config unchanged.
 
 Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
