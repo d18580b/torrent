@@ -120,8 +120,8 @@ sudo install -d -o torrentd -g torrentd -m0755 /data/torrents
 `deploy/compose.yaml` bind-mounts the host's `/data/torrents`, which hides the
 image's own copy, and the image runs as `USER 1000:1000`. A host directory
 created as above belongs to `torrentd`'s uid, and one Docker creates because
-it was missing belongs to root; either way every download and every plan step
-fails with `EACCES`. Before the first `compose up`:
+it was missing belongs to root; either way every add and every plan step fails
+with `EACCES`. Before the first `compose up`:
 
 ```bash
 sudo install -d -o 1000 -g 1000 -m0755 /data/torrents

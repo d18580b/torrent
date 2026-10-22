@@ -505,8 +505,8 @@ daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 
 ## Deployment
 
-`deploy/` has a hardened systemd unit (`Type=notify`, `--check-config`
-pre-flight, resource limits), a multi-stage `Containerfile`, and a
+`deploy/` has a hardened systemd unit (`Type=notify`,
+`RestartPreventExitStatus=78`, resource limits), a multi-stage `Containerfile`, and a
 `compose.yaml`. Run torrentd as its own user. Setup is
 [`docs/running.md`](docs/running.md).
 
