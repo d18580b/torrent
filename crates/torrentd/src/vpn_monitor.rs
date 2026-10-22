@@ -3397,6 +3397,62 @@ mod tests {
         assert_eq!(pauses(&engine), [handle(1), handle(2)], "both paused again");
     }
 
+    /// A run that passed its cancel check while the profile was fenced, and
+    /// whose batch reaches the session only after a lift replaced it and
+    /// marked the profile active, resumes nothing: the lift's own run
+    /// resumes those torrents, once each.
+    ///
+    /// The set-online pace online-all starts in a fenced profile is such a
+    /// run, and the fence's lift through `PATCH /v1/profiles/{id}` replaces
+    /// it; a batch that slipped between the two resumed the torrent a
+    /// second time (issue 423).
+    #[tokio::test]
+    async fn a_run_a_lift_replaced_before_its_batch_resumes_nothing() {
+        let (entry, engine) = mock_entry(ProfileStatus::VpnDown);
+        let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+        let replaced = Arc::new(atomic::AtomicBool::new(false));
+        // The lift lands right after the run's check before its batch: it
+        // cancels the run, then marks the profile active, as `lift_fence`
+        // does, and only then does the batch reach the session.
+        let cancelled = {
+            let (profiles, replaced) = (profiles.clone(), replaced.clone());
+            move || {
+                if replaced.swap(true, atomic::Ordering::SeqCst) {
+                    return true;
+                }
+                profiles
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .update_health(|h| h.status = ProfileStatus::Active);
+                false
+            }
+        };
+        let resumed = resume_paced(
+            profiles,
+            ProfileId::new("acct_a"),
+            &[handle(1)],
+            REANNOUNCE_PACE,
+            cancelled,
+            Arc::new(ResumeGate::default()),
+            Arc::new(PromSink::new()),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(
+            resumes(&engine),
+            [],
+            "the replaced run leaves the torrent to the lift's run",
+        );
+        assert_eq!(
+            resumed,
+            Resumed {
+                not_reached: 1,
+                ..Resumed::default()
+            },
+        );
+    }
+
     /// A lift that starts while an earlier one is still resuming replaces
     /// it: the earlier run stops before its next batch and reports what it
     /// had not reached, and the newer one resumes every torrent it was given.
