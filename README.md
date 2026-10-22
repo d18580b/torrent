@@ -77,7 +77,7 @@ them, and reports per path:
 | `matched` | Every file resolved on disk; not yet loaded. |
 | `partial` | Only some files present. Adoption is refused — seeding it would advertise pieces the daemon cannot serve. |
 | `missing` | No payload found under any root. |
-| `drifted` | A claimed file's size, mtime or inode changed since the last scan. Stays so across rescans until a verification clears it. |
+| `drifted` | A claimed file's size, mtime, inode or device changed since the last scan. Stays so across rescans until a verification clears it. |
 | `overlap` | Two torrents claim some of the same files, but not the same set. Blocks adoption and any mutation touching those bytes. |
 | `shared` | Another torrent claims exactly the same files — a cross-seed. Adoptable, each into its own profile; never moved or deleted for one of them. |
 
@@ -85,11 +85,13 @@ Plus byte rollups per directory, so an unprotected subtree is visible without
 reading a file listing.
 
 Change detection is tiered because hashing a petabyte is days of I/O: a
-`(size, mtime, inode)` sweep catches essentially every real change cheaply,
-and libtorrent's own piece hashing is the authoritative check, run on adopt
-and on drift. Every torrent, v1, v2 or hybrid, matches on `(path, size)`
-against a small set of candidate directories, and a match is confirmed only
-by that verification.
+`(size, mtime, inode, device)` sweep catches essentially every real change
+cheaply, and libtorrent's own piece hashing is the authoritative check, run on
+drift and on adopt. Every torrent, v1, v2 or hybrid, matches on `(path, size)`
+against a small set of candidate directories, and a match is confirmed by that
+verification, with one exception: a complete, unchanged torrent whose previous
+client's `.fastresume` says so is adopted in seed mode on the strength of that
+client's own check, without hashing (see the tiered adoption paragraph below).
 
 **Migrating from qBittorrent, or another libtorrent-based client, is just the
 first scan** — point `library_dir` at its state directory (qBittorrent's
