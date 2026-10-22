@@ -196,9 +196,8 @@ Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast,
 and each runs as its own CI job.
 
 `mise run vpn-check <config>` verifies a real VPN configuration against the
-real host. It inspects `vpn` profiles, so the config it is given needs one,
-and needs `--profile <id>` naming it if that config also carries `host`
-profiles. It is deliberately not part of any `test` task: it needs real
+real host. It checks every profile unless `--profile <id>` names one; a
+`host` profile has no tunnel and reports `skip`. It is deliberately not part of any `test` task: it needs real
 tunnels and is meaningless in CI.
 
 Deploying it for real — packages, submodules, the service user, directories,

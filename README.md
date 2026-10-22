@@ -248,7 +248,7 @@ listen_interfaces = "eth0:6881"     # not 0.0.0.0 beside a vpn profile
 dht               = true            # off unless written
 
 [[profile]]
-id                      = "account_a"
+id                      = "acct_a"
 network                 = "vpn"     # binds a tunnel; dht/pex/lsd forced off
 vpn_type                = "wireguard"
 vpn_config              = "/etc/wireguard/wg-acct-a.conf"
@@ -274,8 +274,8 @@ gateway (ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the
 live socket rebinding when it changes).
 
 Verify a tunnel before trusting it, with no torrents involved. `vpn check`
-inspects `vpn` profiles and reaches every profile you do not name, so name a
-`vpn` one unless the configuration is all `vpn`:
+checks every profile unless `--profile` names one; a `host` profile has no
+tunnel to check and reports `skip`, which does not change the exit status:
 
 ```bash
 torrentd --config … vpn check --profile acct_a   # --bring-up also raises it
@@ -322,7 +322,7 @@ pre-flight the daemon depends on and reports each part separately, with no
 libtorrent session, no torrents and no tracker contact.
 
 ```bash
-torrentd --config … vpn check                 # only if every profile is vpn
+torrentd --config … vpn check                 # every profile; host ones report skip
 torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
 torrentd --config … vpn check --egress 1.1.1.1:53      # route it via the tunnel, then a reply through it
 ```
@@ -537,12 +537,11 @@ mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```
 
 `mise run vpn-check` verifies a real VPN configuration against a real tunnel,
-with no torrents and no tracker involved. `vpn check` inspects `vpn` profiles,
-so give it a configuration that has one, and name it with `--profile` when the
-configuration also carries `host` profiles:
+with no torrents and no tracker involved. It checks every profile unless
+`--profile` names one; a `host` profile has no tunnel and reports `skip`:
 
 ```bash
-mise run vpn-check /etc/torrentd/torrentd.toml --profile account_a
+mise run vpn-check /etc/torrentd/torrentd.toml --profile acct_a
 ```
 
 ## Contributing & license
