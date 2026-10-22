@@ -2,7 +2,7 @@
 #
 # Stage 1 (builder): Fedora with gcc/cmake/openssl-dev + Rust via rustup.
 # Compiles vendored Boost + libtorrent + the shim + the daemon.
-# Stage 2 (runtime): Fedora minimal + just OpenSSL + ca-certificates.
+# Stage 2 (runtime): Fedora minimal plus the runtime tools listed below.
 
 FROM registry.fedoraproject.org/fedora:43 AS builder
 

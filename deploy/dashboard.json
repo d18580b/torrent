@@ -1,7 +1,7 @@
 {
   "title": "torrentd",
   "uid": "torrentd",
-  "description": "torrentd fleet, disk, durability and VPN health. Every series is described in deploy/metrics.md; the alerts on them are in deploy/prometheus/torrentd.rules.yml.",
+  "description": "torrentd fleet, disk, durability, VPN and pool health. Every series is described in deploy/metrics.md; the alerts on them are in deploy/prometheus/torrentd.rules.yml.",
   "tags": ["torrentd"],
   "editable": true,
   "graphTooltip": 1,

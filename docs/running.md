@@ -100,8 +100,11 @@ the full set of knobs.
 
 ## 4. Service user, binary, directories
 
-Nothing in the repository creates these. The packaged systemd unit assumes all
-three.
+The packaged systemd unit assumes all three. Its `StateDirectory=torrentd`
+creates `/var/lib/torrentd` (mode `0750`, owned by the unit's `User=`) when the
+unit starts; nothing in the repository creates the rest. 4c creates
+`/var/lib/torrentd` too, which is harmless, and leaves it in place for
+anything you put there before the first start.
 
 ```bash
 # 4a. A dedicated user. The kill switch matches on its uid, so it must not be
@@ -1406,7 +1409,9 @@ profile; they are only needed to manage tunnels. A deployment without one
 takes the unit as shipped, which grants no capability and bounds the set to
 empty.
 
-**Signals:** `SIGHUP` reloads log level, rate limits and connection limits.
+**Signals:** `SIGHUP` reloads the six keys the
+[README lists as reloadable](../README.md#http-api); every other key takes a
+restart.
 `SIGTERM` drains resume data (`shutdown_drain_secs`, default 60s), persists session state, brings
 tunnels down, and exits.
 
@@ -1553,8 +1558,8 @@ is part of the compose stack.
 - [`deploy/dashboard.json`](../deploy/dashboard.json) is the dashboard: in
   Grafana, **Dashboards → New → Import** and upload it, or drop it into a
   provisioned dashboards directory. It asks for no datasource at import; pick
-  the Prometheus one from its `Prometheus` selector. Four rows — Fleet, Disk,
-  Durability, VPN — each filtered by the `Instance` and `Profile` selectors.
+  the Prometheus one from its `Prometheus` selector. Five rows — Fleet, Disk,
+  Durability, VPN, Pool — each filtered by the `Instance` and `Profile` selectors.
   The VPN row is empty for a `host` profile, and its port-forward panels are
   empty for any profile without NAT-PMP.
 
@@ -1586,7 +1591,7 @@ torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 | `--profile ID` | Check one profile instead of every configured profile. The bare form checks every `vpn` profile and reports each `host` profile as `skip`, since it has no tunnel to check; a `skip` does not change the exit status. |
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
-| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host, and **the only one that needs root** — see below. |
+| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host, and **the only one that needs `CAP_NET_ADMIN`** — see below. |
 | `--as-uid UID` | Render and dry-run the kill-switch ruleset for this uid instead of this process's own. |
 
 Exit status: `0` clean, `1` any check failed, `2` nothing failed but at least

@@ -4,8 +4,11 @@
 #
 # Run on a scratch host, as root, against a running daemon whose profile on
 # <iface> is healthy. It changes the host: it deletes that tunnel's
-# `from <address> lookup <table>` rules and does not put them back. Restart
-# the daemon afterwards; the rules come back with the tunnel.
+# `from <address> lookup <table>` rules and does not put them back.
+#
+# The drill, what to expect, and how to recover afterwards are described once,
+# in docs/running.md §11 ("Drills worth doing once, before you trust it",
+# drill 5, "Then take its route away and leave the tunnel up"); follow that.
 #
 #   sudo deploy/drill/route-fence.sh <iface>
 #
