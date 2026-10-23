@@ -3,8 +3,7 @@
 //! Subcommands:
 //!   - `alert-throughput`: drive the in-memory state map at high rate and
 //!     report updates/sec — verifies the alert-dispatch hot path keeps up.
-//!
-//! Pure Rust, no libtorrent.
+//!     Pure Rust, no libtorrent.
 //!   - `memory-scaling`: add N real *seeding* torrents to a libtorrent session
 //!     built with the no-op disk backend (`_disabled_disk_io`) and report
 //!     resident-set size per torrent. Using real

@@ -11,7 +11,7 @@
 #
 # `increase(x[15m]) > 0` fires on the first evaluation after an event and
 # resolves 15 minutes after the last one. Why a counter a boot moves is also
-# read through its `torrentd_boot_*` gauge (`or boot_gauge > 0`, holding for
+# read through its boot gauge (`or boot_gauge > 0`, holding for
 # the life of the process), and a first-event series matched on its
 # appearance (`or (x unless x offset 15m)`), is the Present column of
 # ../metrics.md.
