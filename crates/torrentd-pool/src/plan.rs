@@ -187,6 +187,18 @@ fn build_relocate(
         return Ok(Err(Refused("destination is the current location".into())));
     }
 
+    // The index is a snapshot and the move is of the directory itself, so the
+    // check above sees only what the last scan listed. The disk is asked too.
+    if let Some(entry) = unlisted_entry(
+        &src_dir,
+        &src_base,
+        &claimed_under(store, infohash, src_root_id)?,
+    ) {
+        return Ok(Err(Refused(format!(
+            "{src_base} holds {entry}; moving the directory would take it too"
+        ))));
+    }
+
     if let Some(rel) = existing_destination_file(store, infohash, &dest_dir)? {
         return Ok(Err(Refused(format!("destination already contains {rel}"))));
     }
@@ -535,6 +547,80 @@ fn prefixes_overlap(prefix: &str, area: &str) -> bool {
         || p == a
         || a.starts_with(&format!("{p}/"))
         || p.starts_with(&format!("{a}/"))
+}
+
+/// The root-relative paths `infohash` claims under root `root_id`.
+pub fn claimed_under(
+    store: &PoolStore,
+    infohash: &str,
+    root_id: i64,
+) -> Result<HashSet<String>, PoolError> {
+    Ok(store
+        .claims_of(infohash)?
+        .into_iter()
+        .filter(|(r, _)| *r == root_id)
+        .map(|(_, rel)| rel)
+        .collect())
+}
+
+/// The first entry under `dir` (whose root-relative path is `base`) that a
+/// relocate would carry without the plan showing it, described for a refusal;
+/// `None` when every entry is a directory or one of `claimed`.
+///
+/// A relocate renames the whole directory, and the index lists only what the
+/// last scan saw. So the directory is walked with `symlink_metadata` and
+/// every entry has to be accounted for: a regular file in `claimed`, or a
+/// directory whose own entries are. A symlink, a name that is not UTF-8, a
+/// FIFO, socket or device, a file the scan never saw or this torrent does
+/// not claim, and a directory that cannot be listed all refuse, since none
+/// of them can be shown to belong to the payload being moved.
+pub fn unlisted_entry(dir: &Path, base: &str, claimed: &HashSet<String>) -> Option<String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_dir() => {}
+        Ok(_) => {
+            return Some(format!(
+                "{} itself, which is not a directory",
+                dir.display()
+            ))
+        }
+        Err(e) => return Some(format!("{}, which cannot be examined ({e})", dir.display())),
+    }
+    let mut pending = vec![(dir.to_path_buf(), base.trim_matches('/').to_owned())];
+    while let Some((path, rel)) = pending.pop() {
+        let unlistable =
+            |e: std::io::Error| format!("{}, which cannot be listed ({e})", path.display());
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(e) => return Some(unlistable(e)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return Some(unlistable(e)),
+            };
+            let child = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Some(format!("{}, whose name is not UTF-8", child.display()));
+            };
+            let child_rel = join_rel(&rel, &name);
+            let kind = match std::fs::symlink_metadata(&child) {
+                Ok(md) => md.file_type(),
+                Err(e) => return Some(format!("{child_rel}, which cannot be examined ({e})")),
+            };
+            if kind.is_dir() {
+                pending.push((child, child_rel));
+            } else if kind.is_symlink() {
+                return Some(format!("{child_rel}, a symlink"));
+            } else if !kind.is_file() {
+                return Some(format!("{child_rel}, which is not a regular file"));
+            } else if !claimed.contains(&child_rel) {
+                return Some(format!(
+                    "{child_rel}, which the index does not list as this torrent's"
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn join_rel(base: &str, rel: &str) -> String {

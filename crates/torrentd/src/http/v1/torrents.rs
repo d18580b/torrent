@@ -1135,7 +1135,7 @@ fn read_local_torrent(state: &AppState, path: &FsPath) -> Result<Vec<u8>, AddTor
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| refused("no readable .torrent at that path; symlinks are not followed"))?;
     let md = file
@@ -1156,39 +1156,6 @@ fn read_local_torrent(state: &AppState, path: &FsPath) -> Result<Vec<u8>, AddTor
     }
     Ok(bytes)
 }
-
-/// `O_NOFOLLOW`, spelled out rather than pulled from a crate for one
-/// constant (as `pool_apply` does `EXDEV`). Linux-only, which the daemon
-/// already is; the value differs by architecture.
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "m68k",
-    target_arch = "powerpc",
-    target_arch = "powerpc64"
-))]
-const O_NOFOLLOW: i32 = 0x8000;
-#[cfg(not(any(
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "m68k",
-    target_arch = "powerpc",
-    target_arch = "powerpc64"
-)))]
-const O_NOFOLLOW: i32 = 0x20000;
-
-/// `O_NONBLOCK`, likewise.
-#[cfg(any(target_arch = "mips", target_arch = "mips64"))]
-const O_NONBLOCK: i32 = 0x80;
-#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
-const O_NONBLOCK: i32 = 0x4000;
-#[cfg(not(any(
-    target_arch = "mips",
-    target_arch = "mips64",
-    target_arch = "sparc",
-    target_arch = "sparc64"
-)))]
-const O_NONBLOCK: i32 = 0x800;
 
 // ---------------------------------------------------------------------------
 // Removing
@@ -1468,8 +1435,9 @@ pub async fn delete_torrent(
                     return Err(DeleteTorrentError::Internal {
                         detail: format!(
                             "{} The torrent was removed from its session and its assignment \
-                             cleared; {} of {} file(s) were moved to the trash, and {} and \
-                             the rest are where they were. Nothing was unlinked.",
+                             cleared; {} of {} file(s) were moved to the trash before the \
+                             move stopped at {}, and every file after it is where it was. \
+                             Nothing was unlinked.",
                             internal("moving the payload to the trash", why),
                             outcome.moved,
                             payload.file_count(),
