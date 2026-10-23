@@ -989,8 +989,9 @@ pub async fn boot(
     // *next* iteration, so the last profile's 30-second bring-up had no check
     // against it at all — and a one-profile deployment had none anywhere. Ask
     // once more before boot commits to running, while the drop guard still
-    // owns every tunnel this boot raised.
-    if boot_shutdown.try_recv().is_ok() {
+    // owns every tunnel this boot raised. A lagged or closed receiver counts
+    // as a shutdown, as at every other boot check.
+    if shutdown_requested(&mut boot_shutdown) {
         anyhow::bail!("shutdown requested during profile bring-up");
     }
     if profile_entries.is_empty() {
@@ -2886,7 +2887,8 @@ where
     for p in &cfg.profile {
         // A shutdown asked for during a previous profile's bring-up is
         // honoured here rather than after every remaining tunnel is raised.
-        if boot_shutdown.try_recv().is_ok() {
+        // A lagged receiver missed signals, so it counts as one too.
+        if shutdown_requested(boot_shutdown) {
             anyhow::bail!("shutdown requested during profile bring-up");
         }
 
@@ -7986,6 +7988,42 @@ mod profile_construction_tests {
             vpn.bring_up_calls().is_empty(),
             "no tunnel is raised after the shutdown",
         );
+    }
+
+    /// A receiver that lagged past the shutdown missed it, and reads as one:
+    /// the bring-up stops as it does for a signal it saw.
+    #[tokio::test]
+    async fn a_lagged_shutdown_receiver_stops_the_bring_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[vpn("acct_a", "wg-a", 1)]);
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        let vpn_for = vpn.clone();
+        let mut cleanup = BootCleanup::with_vpn_factory(
+            PathBuf::from("/var/lib/torrentd"),
+            Arc::new(move |_t, _dir| {
+                Arc::new(vpn_for.clone()) as Arc<dyn torrentd_engine::VpnManager>
+            }),
+        );
+        let (tx, mut boot_shutdown) = broadcast::channel(1);
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        tx.send(ShutdownReason::Sigterm).unwrap();
+
+        let r = build_profiles(
+            &cfg,
+            &mut cleanup,
+            &MockForwarder::new(),
+            &torrentd_engine::NoopSink,
+            &mut boot_shutdown,
+            &crate::profile_state::Record::default(),
+            |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
+                panic!("no session is built after a shutdown was missed")
+            },
+        )
+        .await;
+
+        assert!(r.is_err(), "the bring-up is abandoned");
+        assert!(vpn.bring_up_calls().is_empty());
     }
 
     /// A profile left offline, read back from the state file a crash left,
