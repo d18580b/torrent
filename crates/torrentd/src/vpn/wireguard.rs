@@ -962,11 +962,14 @@ impl WireguardManager {
 ///    `Table = off` skips this step, as it does for `wg-quick`. The rules and
 ///    table are `vpn::route`'s, shared with OpenVPN.
 /// 5. **The health monitor's route probe, once.** `ip route get 1.1.1.1 from
-///    <address>` must leave by the link, or the profile would be fenced
-///    `route_mismatch` on its first poll. Asked after routing for every
-///    config, so it also catches a `Table = off` link that nothing of the
-///    operator's routes through the tunnel. A split `AllowedIPs` that does not
-///    cover `1.1.1.1` is refused at parse time, before anything is created.
+///    <address>` must leave by the link, and so must
+///    `ip route get 2606:4700:4700::1111 from <address>` from each global
+///    IPv6 `Address`, or the profile would be fenced `route_mismatch` on its
+///    first poll. Asked after routing for every config, so it also catches a
+///    `Table = off` link that nothing of the operator's routes through the
+///    tunnel. A split `AllowedIPs` that does not cover `1.1.1.1`, or (with a
+///    global IPv6 `Address`) `2606:4700:4700::1111`, is refused at parse
+///    time, before anything is created.
 ///
 /// Any failure after step 1 removes what this call made — the rules and the
 /// link — the same way `wg-quick`'s own exit trap does. A failure in step 4
@@ -988,6 +991,7 @@ impl WireguardManager {
 mod native {
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
     use std::path::Path;
 
     use tracing::warn;
@@ -998,6 +1002,7 @@ mod native {
     use super::super::route::RouteProbe;
     use super::super::route::RouteProbeUnavailable;
     use super::super::route::PROBE_DEST;
+    use super::super::route::PROBE_DEST_V6;
 
     /// Why [`up`] did not leave a link up.
     #[derive(Debug, PartialEq, Eq)]
@@ -1020,21 +1025,28 @@ mod native {
         }
     }
 
-    /// Whether the IPv4 prefix `prefix` (`a.b.c.d[/len]`) holds `addr`. A
-    /// prefix that does not parse holds nothing.
-    fn covers(prefix: &str, addr: Ipv4Addr) -> bool {
+    /// Whether the prefix `prefix` (`a.b.c.d[/len]` or `x:y::z[/len]`) holds
+    /// `addr`. A prefix that does not parse, or is of the other address
+    /// family, holds nothing.
+    fn covers(prefix: &str, addr: IpAddr) -> bool {
         let (net, len) = match prefix.split_once('/') {
             Some((net, len)) => (net, len.parse::<u32>().ok()),
-            None => (prefix, Some(32)),
+            None => (prefix, None),
         };
-        let (Ok(net), Some(len)) = (net.trim().parse::<Ipv4Addr>(), len) else {
-            return false;
+        let (bits, net, addr) = match (net.trim().parse::<IpAddr>(), addr) {
+            (Ok(IpAddr::V4(net)), IpAddr::V4(addr)) => {
+                (32, u128::from(u32::from(net)), u128::from(u32::from(addr)))
+            }
+            (Ok(IpAddr::V6(net)), IpAddr::V6(addr)) => (128, u128::from(net), u128::from(addr)),
+            _ => return false,
         };
-        if len > 32 {
+        let len = len.unwrap_or(bits);
+        if len > bits {
             return false;
         }
-        let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
-        u32::from(net) & mask == u32::from(addr) & mask
+        // The bits the prefix fixes are the top `len` of `bits`; a shift of
+        // the whole width (`/0`) leaves nothing to differ.
+        (net ^ addr).checked_shr(bits - len).unwrap_or(0) == 0
     }
 
     /// The first IPv4 `Address`, without its prefix length: the address the
@@ -1043,6 +1055,25 @@ mod native {
         addresses
             .iter()
             .find_map(|a| a.split('/').next().unwrap_or(a).trim().parse().ok())
+    }
+
+    /// The IPv6 `Address`es the health monitor probes from besides the IPv4
+    /// one, without their prefix lengths: those the kernel gives global
+    /// scope, which are the ones `ip -6 addr show scope global` lists
+    /// (`route::v6_sources`). That is every unicast address but loopback,
+    /// link-local (`fe80::/10`) and the deprecated site-local `fec0::/10`.
+    fn probed_v6(addresses: &[String]) -> Vec<Ipv6Addr> {
+        addresses
+            .iter()
+            .filter_map(|a| a.split('/').next().unwrap_or(a).trim().parse().ok())
+            .filter(|a: &Ipv6Addr| {
+                !a.is_unspecified()
+                    && !a.is_loopback()
+                    && !a.is_multicast()
+                    && !a.is_unicast_link_local()
+                    && a.segments()[0] & 0xffc0 != 0xfec0
+            })
+            .collect()
     }
 
     /// `wg-quick`'s MTU for a 1500-byte path, used when the config sets none.
@@ -1269,7 +1300,10 @@ mod native {
         // one, and a link without one never finishes coming up.
         if p.route
             && first_v4(&p.addresses).is_some()
-            && !p.allowed_ips.iter().any(|a| covers(a, PROBE_DEST))
+            && !p
+                .allowed_ips
+                .iter()
+                .any(|a| covers(a, IpAddr::V4(PROBE_DEST)))
         {
             return Err(format!(
                 "AllowedIPs = {} does not cover {PROBE_DEST}: the daemon routes only AllowedIPs \
@@ -1279,6 +1313,30 @@ mod native {
                  (AllowedIPs = 0.0.0.0/0, plus ::/0 for IPv6)",
                 p.allowed_ips.join(", "),
             ));
+        }
+        // The monitor asks the same of each global IPv6 address, toward
+        // `PROBE_DEST_V6`: a session listens on the device and so sends from
+        // each of them. An IPv6 address whose `AllowedIPs` route no IPv6 to
+        // the internet is routed by the main table, and fenced the same way.
+        // Beside an IPv4 address only, as the monitor asks it.
+        if p.route
+            && first_v4(&p.addresses).is_some()
+            && !p
+                .allowed_ips
+                .iter()
+                .any(|a| covers(a, IpAddr::V6(PROBE_DEST_V6)))
+        {
+            if let Some(src) = probed_v6(&p.addresses).first() {
+                return Err(format!(
+                    "AllowedIPs = {} does not cover {PROBE_DEST_V6}: the health monitor also \
+                     asks where a packet from each IPv6 Address to {PROBE_DEST_V6} would go, \
+                     and the daemon routes only AllowedIPs through the tunnel, so with Address \
+                     {src} this profile would be fenced as route_mismatch on its first poll. \
+                     Route the full IPv6 range (add ::/0 to AllowedIPs), or remove the IPv6 \
+                     Address",
+                    p.allowed_ips.join(", "),
+                ));
+            }
         }
         Ok(p)
     }
@@ -1329,7 +1387,7 @@ mod native {
             |iface, addresses, prefixes| {
                 route::install(iface, addresses, prefixes).map_err(|e| e.to_string())
             },
-            |iface, src| route::probe(iface, src, IpAddr::V4(PROBE_DEST)),
+            |iface, src| route::probe(iface, src, route::probe_dest(src)),
         )
     }
 
@@ -1374,7 +1432,7 @@ mod native {
         p: &Parsed,
         mut run: impl FnMut(&str, &[&str], Option<&str>) -> Result<(), String>,
         install: impl FnOnce(&str, &[String], &[String]) -> Result<(), String>,
-        probe: impl FnOnce(&str, IpAddr) -> Result<RouteProbe, RouteProbeUnavailable>,
+        mut probe: impl FnMut(&str, IpAddr) -> Result<RouteProbe, RouteProbeUnavailable>,
     ) -> Result<(), UpFailure> {
         run("wg", &["setconf", iface, "/dev/stdin"], Some(&p.wg_conf))
             .map_err(|e| UpFailure::Refused(redact_echo(&e)))?;
@@ -1396,31 +1454,47 @@ mod native {
         if p.route {
             install(iface, &p.addresses, &p.allowed_ips).map_err(UpFailure::Unrouted)?;
         }
-        // The health monitor's first question, asked now. A probe that cannot
-        // run is the monitor's to report (`profile_vpn_route_probe_ok`), and
-        // it does not fence on one, so neither does this.
-        let Some(src) = first_v4(&p.addresses) else {
+        // The health monitor's first question, asked now, in the monitor's
+        // order: from the IPv4 address, then from each global IPv6 one,
+        // toward the destination of the source's family. The first answer
+        // that is not "by the tunnel" is the answer, as it is there. A probe
+        // that cannot run is the monitor's to report
+        // (`profile_vpn_route_probe_ok`), and it does not fence on one, so
+        // neither does this.
+        let Some(v4) = first_v4(&p.addresses) else {
             return Ok(());
         };
-        match probe(iface, IpAddr::V4(src)) {
-            Ok(RouteProbe::ViaTunnel) | Err(_) => Ok(()),
-            Ok(RouteProbe::Elsewhere(why)) if p.route => Err(UpFailure::Unrouted(format!(
-                "routing was installed, yet a packet from {src} to {PROBE_DEST} does not leave \
-                 by {iface} ({why}); another rule outranks the tunnel's"
-            ))),
-            // A link this call raised has no route of anyone else's naming
-            // it, since such a route can only be added once the link exists,
-            // so under `Table = off` this is what is answered for every link
-            // the daemon raises itself. It is still asked rather than assumed:
-            // the answer is the monitor's, whatever the reason.
-            Ok(RouteProbe::Elsewhere(why)) => Err(UpFailure::Unrouted(format!(
-                "Table = off, and nothing routes the tunnel's traffic through it: a packet from \
-                 {src} to {PROBE_DEST} does not leave by {iface} ({why}). The health monitor \
-                 asks exactly this each poll and would fence the profile as route_mismatch. \
-                 Use Table = auto, or raise the link with your own routing before the daemon \
-                 starts, which the daemon then adopts"
-            ))),
+        let sources = std::iter::once(IpAddr::V4(v4))
+            .chain(probed_v6(&p.addresses).into_iter().map(IpAddr::V6));
+        for src in sources {
+            let dest = route::probe_dest(src);
+            let why = match probe(iface, src) {
+                Ok(RouteProbe::ViaTunnel) => continue,
+                Err(_) => return Ok(()),
+                Ok(RouteProbe::Elsewhere(why)) => why,
+            };
+            return Err(UpFailure::Unrouted(if p.route {
+                format!(
+                    "routing was installed, yet a packet from {src} to {dest} does not leave \
+                     by {iface} ({why}); another rule outranks the tunnel's"
+                )
+            } else {
+                // A link this call raised has no route of anyone else's
+                // naming it, since such a route can only be added once the
+                // link exists, so under `Table = off` this is what is
+                // answered for every link the daemon raises itself. It is
+                // still asked rather than assumed: the answer is the
+                // monitor's, whatever the reason.
+                format!(
+                    "Table = off, and nothing routes the tunnel's traffic through it: a packet \
+                     from {src} to {dest} does not leave by {iface} ({why}). The health \
+                     monitor asks exactly this each poll and would fence the profile as \
+                     route_mismatch. Use Table = auto, or raise the link with your own routing \
+                     before the daemon starts, which the daemon then adopts"
+                )
+            }));
         }
+        Ok(())
     }
 
     /// Remove the link, then the rules this module added for it. Routes in
@@ -2482,10 +2556,144 @@ PublicKey = x
             "1.1.1.1/32",
             "1.1.1.1",
         ] {
-            native::parse(&with(covering)).unwrap_or_else(|e| panic!("{covering}: {e}"));
+            let allowed = format!("{covering}, ::/0");
+            native::parse(&with(&allowed)).unwrap_or_else(|e| panic!("{allowed}: {e}"));
         }
         let off = with("10.0.0.0/8").replace("DNS = 10.2.0.1", "Table = off");
         native::parse(&off).expect("Table = off routes nothing; the bring-up probe judges it");
+    }
+
+    /// #534: the same rule for the IPv6 probe. An IPv6 `Address` beside
+    /// `AllowedIPs` that route no IPv6 to `2606:4700:4700::1111` would come
+    /// up and be fenced `route_mismatch` on the monitor's first poll, which
+    /// asks from each global IPv6 address too. Drop the IPv6 check from
+    /// `parse` and the first assertion fails.
+    #[test]
+    fn an_ipv6_address_the_route_probe_cannot_validate_is_refused_at_parse() {
+        let with = |address: &str, allowed: &str| {
+            PROVIDER_CONF
+                .replace(
+                    "Address = 10.2.0.2/32, fd00::2/128",
+                    &format!("Address = {address}"),
+                )
+                .replace(
+                    "AllowedIPs = 0.0.0.0/0,::/0",
+                    &format!("AllowedIPs = {allowed}"),
+                )
+        };
+        let e = native::parse(&with("10.2.0.2/32, fd00::2/128", "0.0.0.0/0"))
+            .expect_err("an IPv6 address with no IPv6 route");
+        assert!(
+            e.contains("does not cover 2606:4700:4700::1111")
+                && e.contains("fd00::2")
+                && e.contains("route_mismatch"),
+            "got {e}"
+        );
+        native::parse(&with("10.2.0.2/32, 2001:db8::2/128", "0.0.0.0/0, fd00::/8"))
+            .expect_err("a split IPv6 AllowedIPs that misses the probe's destination");
+        for covering in ["::/0", "2606:4700::/32", "2606:4700:4700::1111/128"] {
+            let allowed = format!("0.0.0.0/0, {covering}");
+            native::parse(&with("10.2.0.2/32, fd00::2/128", &allowed))
+                .unwrap_or_else(|e| panic!("{allowed}: {e}"));
+        }
+        // Addresses the monitor never probes from: none, or only a
+        // link-local one, which the kernel does not give global scope.
+        for address in ["10.2.0.2/32", "10.2.0.2/32, fe80::2/64"] {
+            native::parse(&with(address, "0.0.0.0/0")).unwrap_or_else(|e| panic!("{address}: {e}"));
+        }
+        let off =
+            with("10.2.0.2/32, fd00::2/128", "0.0.0.0/0").replace("DNS = 10.2.0.1", "Table = off");
+        native::parse(&off).expect("Table = off routes nothing; the bring-up probe judges it");
+    }
+
+    /// #534: the bring-up asks the monitor's IPv6 question too. With the
+    /// IPv4 route by the tunnel and the IPv6 one leaving by eth0, the link
+    /// is lowered as `Unrouted`, naming the IPv6 source and destination;
+    /// each source is asked once, the IPv4 one first. Ask only the IPv4
+    /// address and the first assertion fails.
+    #[test]
+    fn the_bring_up_probe_asks_from_each_ipv6_address_too() {
+        use super::super::route::RouteProbe;
+        use super::super::route::RouteProbeUnavailable;
+        let ok_run = |_: &str, _: &[&str], _: Option<&str>| Ok(());
+        let v4: IpAddr = "10.2.0.2".parse().unwrap();
+        let v6: IpAddr = "fd00::2".parse().unwrap();
+        for table_off in [false, true] {
+            let mut asked = Vec::new();
+            let refused = native::configure_with(
+                "wg-a",
+                &parsed(table_off),
+                ok_run,
+                |_, _, _| Ok(()),
+                |_, src| {
+                    asked.push(src);
+                    Ok(if src == v6 {
+                        RouteProbe::Elsewhere(format!(
+                            "leaves by eth0: 2606:4700:4700::1111 from {src} via fe80::1 dev eth0"
+                        ))
+                    } else {
+                        RouteProbe::ViaTunnel
+                    })
+                },
+            );
+            assert!(
+                matches!(&refused, Err(native::UpFailure::Unrouted(why))
+                    if why.contains("from fd00::2 to 2606:4700:4700::1111")),
+                "table_off={table_off}: {refused:?}"
+            );
+            assert_eq!(asked, [v4, v6], "table_off={table_off}");
+        }
+
+        // Every source by the tunnel is up; an IPv4 route that already
+        // leaves is the answer, with IPv6 not asked; and a probe that
+        // cannot run stops the questions without failing the bring-up.
+        let mut asked = Vec::new();
+        assert_eq!(
+            native::configure_with(
+                "wg-a",
+                &parsed(false),
+                ok_run,
+                |_, _, _| Ok(()),
+                |_, src| {
+                    asked.push(src);
+                    Ok(RouteProbe::ViaTunnel)
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(asked, [v4, v6]);
+        let mut asked = Vec::new();
+        let refused = native::configure_with(
+            "wg-a",
+            &parsed(false),
+            ok_run,
+            |_, _, _| Ok(()),
+            |_, src| {
+                asked.push(src);
+                elsewhere()
+            },
+        );
+        assert!(
+            matches!(&refused, Err(native::UpFailure::Unrouted(why))
+                if why.contains("from 10.2.0.2 to 1.1.1.1")),
+            "{refused:?}"
+        );
+        assert_eq!(asked, [v4]);
+        let mut asked = Vec::new();
+        assert_eq!(
+            native::configure_with(
+                "wg-a",
+                &parsed(false),
+                ok_run,
+                |_, _, _| Ok(()),
+                |_, src| {
+                    asked.push(src);
+                    Err(RouteProbeUnavailable::NoTool)
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(asked, [v4]);
     }
 
     fn parsed(table_off: bool) -> native::Parsed {
