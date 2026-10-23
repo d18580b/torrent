@@ -352,9 +352,11 @@ as `verify_queue_depth` and `verify_in_flight`.
   admission, or libtorrent rejected the add. Its registry claim is released,
   so it adopts again once the cause is fixed. The log line ends `dropping
   verify`, or reads `verify dropped: …` or `verify add failed`.
-- **A fenced or offline profile** holds the queue: nothing is admitted for it
-  until it is back (`verify held: profile is off the network`, or `re-hash
-  held: …` for a queued re-hash, logged once per profile each second). A
+- **A fenced or offline profile** holds its own items: nothing is admitted
+  for it until it is back, and the items behind them, for other profiles,
+  are admitted meanwhile (`verify held: profile is off the network`, or
+  `re-hash held: …` for a queued re-hash, logged once per profile each
+  second). A
   queued re-hash also waits while the profile's fence is lifted, until the
   lift's paced resume reaches its torrent.
 - **A re-hash paused while it checks** keeps its slot until the check ends,

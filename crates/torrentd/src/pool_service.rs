@@ -1799,14 +1799,20 @@ fn admit(
     let _admitting = q.admit_lock.lock();
     // Which kinds may still admit this tick.
     let mut open = [pool.is_some(), true, true];
-    // One pass at most over the re-hashes and the adds waiting when the tick
-    // began: one held for a profile off the network goes to the back, and
-    // would otherwise be met again in the same tick.
-    let mut budget = [usize::MAX, q.pending_rechecks.len(), q.pending_adds.len()];
+    // One pass at most over the adoptions, re-hashes and adds waiting when
+    // the tick began: one held for a profile off the network goes to the
+    // back, and would otherwise be met again in the same tick.
+    let mut budget = [
+        q.pending.len(),
+        q.pending_rechecks.len(),
+        q.pending_adds.len(),
+    ];
     let mut next = ADOPTIONS;
     // Profiles whose held re-hashes and adds this tick has logged already:
     // one line per profile per tick, not one per torrent it holds.
     let mut held_logged = std::collections::HashSet::new();
+    // The same for held adoptions, whose line is their own.
+    let mut adoptions_held_logged = std::collections::HashSet::new();
     while open.iter().any(|o| *o) && q.in_flight() < q.limit {
         let kind = (next..next + 3).map(|k| k % 3).find(|k| open[*k]);
         let Some(kind) = kind else { break };
@@ -1816,7 +1822,14 @@ fn admit(
         }
         budget[kind] = budget[kind].saturating_sub(1);
         let admission = match (kind, pool) {
-            (ADOPTIONS, Some(pool)) => admit_adoption(pool, source, metrics, profiles, registry),
+            (ADOPTIONS, Some(pool)) => admit_adoption(
+                pool,
+                source,
+                metrics,
+                profiles,
+                registry,
+                &mut adoptions_held_logged,
+            ),
             (RECHECKS, _) => admit_recheck(
                 q,
                 &**source,
@@ -2144,12 +2157,19 @@ fn admit_held_add(
 }
 
 /// Add the adoption at the head of the queue to its session, to verify.
+///
+/// One whose profile is fenced or set offline goes to the back and is
+/// skipped, as a held re-hash or add is: the adoptions behind it, into
+/// profiles still on the network, are admitted this tick rather than wait
+/// for the fence to lift. The hold is logged once per profile per tick:
+/// `held_logged` names the profiles already logged.
 fn admit_adoption(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     metrics: &Arc<crate::metrics_sink::PromSink>,
     profiles: &Arc<crate::profile_registry::ProfileRegistry>,
     registry: &Arc<AssignmentRegistry>,
+    held_logged: &mut std::collections::HashSet<ProfileId>,
 ) -> Admission {
     let q = pool.verify_queue();
     let Some(item) = q.pending.lock().pop_front() else {
@@ -2167,15 +2187,17 @@ fn admit_adoption(
         .active()
         .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
     if fenced || profiles.held_offline(&item.profile) {
-        warn!(
-            target: "torrentd::pool",
-            profile_id = %item.profile,
-            infohash = %item.infohash,
-            reason = if fenced { "vpn_down" } else { "offline" },
-            "verify held: profile is off the network",
-        );
+        if held_logged.insert(item.profile.clone()) {
+            warn!(
+                target: "torrentd::pool",
+                profile_id = %item.profile,
+                infohash = %item.infohash,
+                reason = if fenced { "vpn_down" } else { "offline" },
+                "verify held: profile is off the network",
+            );
+        }
         q.pending.lock().push_back(item);
-        return Admission::Stop;
+        return Admission::Skipped;
     }
     let Some(engine) = source.engine_for(&item.profile) else {
         warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
@@ -5932,6 +5954,63 @@ mod tests {
         w.tick(&pool);
         assert_eq!(order(), "ARARAR");
         assert_eq!(q.depth(), 0);
+    }
+
+    /// Issue #454: an adoption at the head of the queue whose profile is
+    /// fenced is held at the back, and the adoptions behind it, into a
+    /// profile still on the network, are admitted the same tick rather than
+    /// wait for the fence to lift.
+    #[test]
+    fn a_fenced_adoption_at_the_head_does_not_hold_back_the_ones_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = Arc::new(super::VerifyQueue::new(4));
+        let w = Worker::new(dir.path());
+        let q = pool.verify_queue();
+        let fenced = InfoHash([0xD0; 20]);
+        for (i, (ih, profile)) in [
+            (fenced, "down"),
+            (InfoHash([0xD1; 20]), "p"),
+            (InfoHash([0xD2; 20]), "p"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut t = format!("d4:infod6:lengthi1e4:name1:{i}12:piece lengthi16384e6:pieces20:")
+                .into_bytes();
+            t.extend_from_slice(&[0u8; 20]);
+            t.extend_from_slice(b"ee");
+            let path = dir.path().join(format!("{i}.torrent"));
+            std::fs::write(&path, t).unwrap();
+            q.enqueue(super::PendingVerify {
+                torrent_path: path,
+                save_path: dir.path().to_path_buf(),
+                ..pending(ih, profile)
+            });
+        }
+        let adds = || {
+            w.engine
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_)))
+                .count()
+        };
+
+        w.tick(&pool);
+        assert_eq!(adds(), 2, "both adoptions into `p` start");
+        assert_eq!((q.in_flight(), q.depth()), (2, 1));
+        let held: Vec<String> = q
+            .pending
+            .lock()
+            .iter()
+            .map(|v| v.infohash.clone())
+            .collect();
+        assert_eq!(held, [fenced.to_hex()], "the fenced one waits, queued once");
+
+        // Still fenced on the next tick: held again, and nothing else added.
+        w.tick(&pool);
+        assert_eq!(adds(), 2);
+        assert_eq!(q.depth(), 1);
     }
 
     /// Re-hashes held for a fenced profile log the hold once per profile per
