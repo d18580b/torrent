@@ -21,8 +21,8 @@
 //!     match the piece hashes and never seeds when they don't.
 //!   - bounded drains: a bounded drain leaves the rest queued, and
 //!     `RealEngine::pop_alerts` returns at most `MAX_ALERTS_PER_POP`.
-//!   - alert-queue overflow: a tiny `alert_queue_size` flooded without draining
-//!     surfaces `alerts_dropped` and keeps draining cleanly (no hang/panic).
+//!   - alert-queue overflow is covered in `src/real.rs` by
+//!     `torrents_whose_add_alerts_overflowed_the_queue_are_all_tracked`.
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
 //!     for a magnet (which `SEED_MODE` cannot cover at all), and holds through
 //!     the verification failure that drops `SEED_MODE`; and, the one scenario
