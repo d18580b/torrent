@@ -306,6 +306,18 @@ CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
 /// path, indexed size, and indexed `(dev, ino)`.
 pub type SizedOrphan = (String, u64, (u64, u64));
 
+/// What [`PoolStore::delete_plan`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum PlanDelete {
+    /// The plan and its steps are gone.
+    Deleted,
+    /// No plan has this id.
+    NotFound,
+    /// The plan is mid-apply, and nothing was deleted.
+    Applying,
+}
+
 pub struct PoolStore {
     conn: Connection,
     /// Nesting depth for [`PoolStore::in_transaction`]; 0 means autocommit.
@@ -1802,16 +1814,65 @@ impl PoolStore {
         Ok(changed == 1)
     }
 
-    /// Discard a plan and its steps.
+    /// Park a plan an apply refused before claiming it in `failed`, where an
+    /// operator can apply it again or discard it.
     ///
-    /// One transaction: two bare `DELETE`s leave orphaned `plan_step` rows if
-    /// the process dies between them.
-    pub fn delete_plan(&mut self, id: i64) -> Result<(), PoolError> {
+    /// Conditional on the plan being one this caller could have claimed —
+    /// `draft` or `failed`, and with `resume` also `applying` — exactly as
+    /// [`Self::claim_plan_for_apply`] is. An API apply that finds a step
+    /// `in_progress` because another apply is running that step right now
+    /// must not flip the running plan to `failed`: `failed` is claimable, so a
+    /// third apply would then run the same steps alongside the first. Returns
+    /// whether the plan was parked; `false` means it is no longer this
+    /// caller's to touch.
+    pub fn fail_unclaimed_plan(&self, id: i64, resume: bool) -> Result<bool, PoolError> {
+        use crate::model::plan_status as ps;
+        let changed = if resume {
+            self.conn.execute(
+                "UPDATE plan SET status = ?2 WHERE id = ?1 AND status IN (?3, ?4, ?5)",
+                params![id, ps::FAILED, ps::DRAFT, ps::FAILED, ps::APPLYING],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE plan SET status = ?2 WHERE id = ?1 AND status IN (?3, ?4)",
+                params![id, ps::FAILED, ps::DRAFT, ps::FAILED],
+            )?
+        };
+        Ok(changed == 1)
+    }
+
+    /// Discard a plan and its steps, unless it is mid-apply.
+    ///
+    /// The status test is part of the `DELETE` itself, so no apply can claim
+    /// the plan between the test and the delete: a plan read as `draft` and
+    /// then deleted after an apply claimed it lost its step journal while the
+    /// apply went on moving files. One transaction for the plan and its
+    /// steps, so a process dying between the two leaves no orphaned
+    /// `plan_step` rows.
+    pub fn delete_plan(&mut self, id: i64) -> Result<PlanDelete, PoolError> {
+        use crate::model::plan_status as ps;
         let tx = self.conn.savepoint()?;
-        tx.execute("DELETE FROM plan_step WHERE plan_id = ?1", params![id])?;
-        tx.execute("DELETE FROM plan WHERE id = ?1", params![id])?;
+        let deleted = tx.execute(
+            "DELETE FROM plan WHERE id = ?1 AND status <> ?2",
+            params![id, ps::APPLYING],
+        )?;
+        let outcome = if deleted == 1 {
+            tx.execute("DELETE FROM plan_step WHERE plan_id = ?1", params![id])?;
+            PlanDelete::Deleted
+        } else {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM plan WHERE id = ?1)",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if exists {
+                PlanDelete::Applying
+            } else {
+                PlanDelete::NotFound
+            }
+        };
         tx.commit()?;
-        Ok(())
+        Ok(outcome)
     }
 
     pub fn plan_steps(&self, plan_id: i64) -> Result<Vec<PlanStepRow>, PoolError> {

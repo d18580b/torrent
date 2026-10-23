@@ -663,22 +663,46 @@ pub fn contains(root: &Path, candidate: &Path) -> bool {
 /// that a newer scan may since have placed.
 pub fn confirm_token(plan_id: i64, generation: i64, steps: &[crate::model::PlanStepRow]) -> String {
     let mut acc: u64 = 1469598103934665603; // FNV-1a offset basis
-    let mut mix = |b: &[u8]| {
+    confirm_preimage(plan_id, generation, steps, &mut |b| {
         for byte in b {
             acc ^= u64::from(*byte);
             acc = acc.wrapping_mul(1099511628211);
         }
-    };
-    mix(&plan_id.to_le_bytes());
-    mix(&generation.to_le_bytes());
+    });
+    format!("{acc:016x}")
+}
+
+/// Feeds `emit` the bytes [`confirm_token`] hashes: one encoding per plan, and
+/// a different one for any plan that differs. Streamed rather than collected,
+/// so a plan of millions of steps costs no buffer the size of its paths.
+///
+/// Every variable-length field is prefixed with its length, and `dst` with a
+/// tag telling `None` from `Some("")`. Concatenating the fields bare made
+/// `("ab", "c")` and `("a", "bc")` the same plan, and so the same token.
+fn confirm_preimage(
+    plan_id: i64,
+    generation: i64,
+    steps: &[crate::model::PlanStepRow],
+    emit: &mut dyn FnMut(&[u8]),
+) {
+    fn field(emit: &mut dyn FnMut(&[u8]), s: &str) {
+        emit(&(s.len() as u64).to_le_bytes());
+        emit(s.as_bytes());
+    }
+    emit(&plan_id.to_le_bytes());
+    emit(&generation.to_le_bytes());
+    emit(&(steps.len() as u64).to_le_bytes());
     for s in steps {
-        mix(s.op.as_bytes());
-        mix(s.src.as_bytes());
-        if let Some(d) = &s.dst {
-            mix(d.as_bytes());
+        field(emit, &s.op);
+        field(emit, &s.src);
+        match &s.dst {
+            None => emit(&[0]),
+            Some(d) => {
+                emit(&[1]);
+                field(emit, d);
+            }
         }
     }
-    format!("{acc:016x}")
 }
 
 /// Whether a plan kind destroys data and therefore needs the confirm token.
@@ -793,6 +817,94 @@ mod tests {
 
         assert!(super::contains(&root, &root.join("nx/deeper")));
         assert!(super::contains(&root, &root.join("..hidden/x")));
+    }
+
+    fn step(op: &str, src: &str, dst: Option<&str>) -> crate::model::PlanStepRow {
+        crate::model::PlanStepRow {
+            seq: 0,
+            op: op.into(),
+            src: src.into(),
+            dst: dst.map(Into::into),
+            status: "pending".into(),
+            error: None,
+        }
+    }
+
+    /// Plans that differ only in where one field ends and the next begins, or
+    /// in a `dst` that is absent rather than empty, are different plans and
+    /// get different tokens. Each pair here hashed the same bytes before the
+    /// fields were length-prefixed.
+    #[test]
+    fn a_token_tells_apart_plans_that_concatenate_alike() {
+        use super::confirm_token;
+        let pairs = [
+            (
+                vec![step("move", "ab", Some("c"))],
+                vec![step("move", "a", Some("bc"))],
+            ),
+            (
+                vec![step("delete_file", "x", None)],
+                vec![step("delete_file", "x", Some(""))],
+            ),
+            (
+                vec![
+                    step("delete_file", "a", None),
+                    step("delete_file", "b", None),
+                ],
+                vec![
+                    step("delete_file", "a", Some("delete_file")),
+                    step("b", "", None),
+                ],
+            ),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                confirm_token(1, 1, &a),
+                confirm_token(1, 1, &b),
+                "{a:?} and {b:?} share a token"
+            );
+        }
+    }
+
+    /// The encoding the token hashes is injective: over every plan of up to
+    /// two steps built from a small alphabet of fields, chosen so field
+    /// boundaries can shift (`""`, `"a"`, `"aa"`) and `dst` can be absent or
+    /// empty, no two distinct plans encode the same.
+    #[test]
+    fn the_token_preimage_is_injective() {
+        let texts = ["", "a", "aa", "b"];
+        let dsts = [None, Some(""), Some("a"), Some("aa")];
+        let mut one = Vec::new();
+        for op in texts {
+            for src in texts {
+                for dst in dsts {
+                    one.push(step(op, src, dst));
+                }
+            }
+        }
+        let mut plans: Vec<Vec<crate::model::PlanStepRow>> = vec![Vec::new()];
+        plans.extend(one.iter().map(|s| vec![s.clone()]));
+        for a in &one {
+            for b in &one {
+                plans.push(vec![a.clone(), b.clone()]);
+            }
+        }
+        let mut seen = std::collections::HashMap::new();
+        for (plan_id, generation) in [(1, 1), (1, 2), (2, 1)] {
+            for steps in &plans {
+                let mut bytes = Vec::new();
+                super::confirm_preimage(plan_id, generation, steps, &mut |b| {
+                    bytes.extend_from_slice(b)
+                });
+                if let Some(prev) = seen.insert(bytes, (plan_id, generation, steps)) {
+                    panic!(
+                        "{prev:?} and {:?} encode alike",
+                        (plan_id, generation, steps)
+                    );
+                }
+            }
+        }
+        assert_eq!(seen.len(), 3 * plans.len());
     }
 
     #[test]

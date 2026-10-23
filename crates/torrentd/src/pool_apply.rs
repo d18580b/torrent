@@ -31,6 +31,7 @@ use torrentd_engine::StorageMove;
 use torrentd_pool::model::ops;
 use torrentd_pool::model::plan_status;
 use torrentd_pool::model::step_status;
+use torrentd_pool::model::PlanRow;
 use torrentd_pool::model::PlanStepRow;
 use torrentd_pool::AdoptionState;
 use tracing::error;
@@ -56,8 +57,10 @@ pub type StopCheck<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 /// Apply every pending step of `plan_id`, stopping between steps once `stop`
 /// says so.
 ///
-/// Already-`done` steps are skipped, which is what makes this safe to call
-/// again on a plan a crash interrupted.
+/// Only a `draft` or `failed` plan is claimed. Already-`done` steps are
+/// skipped, which is what makes applying a `failed` plan again a retry from
+/// the step that stopped it. A plan a crash left `applying` is not this
+/// function's to take: [`resume_unfinished`] re-drives it at boot.
 pub fn apply(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
@@ -341,6 +344,17 @@ fn ownership_size(pool: &PoolService, state: &StateMap) -> (usize, usize) {
 /// boot re-drive tells a stop from a failure by it.
 const SHUTTING_DOWN: &str = "the daemon is shutting down; apply the plan again once it is back";
 
+/// The refusal for a plan another caller holds: its status as it is now,
+/// which is what moved since `read` was taken.
+fn not_claimable(pool: &PoolService, plan_id: i64, read: &str) -> String {
+    let now = pool
+        .with_store(|s| s.plan(plan_id))
+        .ok()
+        .flatten()
+        .map_or_else(|| read.to_owned(), |p| p.status);
+    format!("plan is {now} and cannot be applied right now")
+}
+
 fn apply_inner(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
@@ -404,8 +418,15 @@ fn apply_inner(
             stuck.op,
             unknown_outcome_remedy(&stuck.src, stuck.dst.as_deref()),
         );
-        if let Err(e) = pool.with_store(|s| s.set_plan_status(plan_id, plan_status::FAILED, None)) {
-            pool.note_store_error("set_plan_status", &e);
+        //
+        // Only a plan this caller could have claimed is parked. An API apply
+        // also finds `in_progress` steps when another apply is running them
+        // right now, and failing that plan would make it claimable by a third
+        // apply that ran the same steps alongside the first.
+        match pool.with_store(|s| s.fail_unclaimed_plan(plan_id, resume)) {
+            Ok(true) => {}
+            Ok(false) => return Err(not_claimable(pool, plan_id, &plan.status)),
+            Err(e) => pool.note_store_error("fail_unclaimed_plan", &e),
         }
         pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
         return Err(msg);
@@ -417,7 +438,18 @@ fn apply_inner(
     let deletes = steps.iter().any(|s| s.op == ops::DELETE_FILE);
     let scope = DeleteScope::of(pool, &steps);
     if deletes {
-        check_index_accounts_for_live_state(pool, source, state, &scope)?;
+        if let Err(msg) = check_index_accounts_for_live_state(pool, source, state, &scope) {
+            // The boot re-drive refusing leaves a plan in `applying`, which
+            // the API can neither apply nor discard; `failed` it can do both
+            // with, once a rescan lets the index account for the torrent. An
+            // API refusal leaves the plan as it was.
+            if resume {
+                if let Err(e) = pool.with_store(|s| s.fail_unclaimed_plan(plan_id, true)) {
+                    pool.note_store_error("fail_unclaimed_plan", &e);
+                }
+            }
+            return Err(msg);
+        }
     }
 
     // Not claimed during a shutdown: the claim would hand the plan to the next
@@ -435,10 +467,7 @@ fn apply_inner(
         .with_store(|s| s.claim_plan_for_apply(plan_id, resume))
         .map_err(|e| e.to_string())?;
     if !claimed {
-        return Err(format!(
-            "plan is {} and cannot be applied right now",
-            plan.status,
-        ));
+        return Err(not_claimable(pool, plan_id, &plan.status));
     }
 
     let mut out = ApplyOutcome {
@@ -2006,12 +2035,19 @@ fn libc_exdev() -> i32 {
 /// a loaded torrent as unloaded — a delete would find the index accounting
 /// for everything "loaded", and a relocate would rename the directory a
 /// session is serving instead of asking libtorrent to move it.
+///
+/// `plans` is [`unfinished_at_boot`], read before the API serves. Only those
+/// plans are re-driven: one an API apply claims while the re-drive waits is
+/// `applying` because that apply is running it, and re-driving it would run
+/// its steps alongside it, or park it `failed` where a third apply could
+/// claim it.
 pub fn spawn_resume_unfinished(
     pool: Arc<PoolService>,
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     work: Arc<crate::app_state::WorkGate>,
     loaded: Vec<libtorrent_safe::InfoHash>,
+    plans: Vec<PlanRow>,
 ) -> tokio::task::JoinHandle<()> {
     let guard = work.enter();
     tokio::task::spawn_blocking(move || {
@@ -2022,10 +2058,27 @@ pub fn spawn_resume_unfinished(
             &source,
             &state,
             &loaded,
+            &plans,
             REDRIVE_SETTLE_DEADLINE,
             &stop,
         );
     })
+}
+
+/// The plans a crash or a kill left mid-apply, as the boot finds them before
+/// the API serves: only the boot re-drive may resume a plan, and every plan
+/// `applying` after that may be an API apply's own. A store error is logged
+/// and counted (`pool_plan_failures_total{kind="resume_failed"}`), and leaves
+/// nothing to re-drive this boot.
+pub fn unfinished_at_boot(pool: &PoolService) -> Vec<PlanRow> {
+    match pool.with_store(|s| s.unfinished_plans()) {
+        Ok(plans) => plans,
+        Err(e) => {
+            warn!(target: "torrentd::pool::apply", reason = %e, "cannot read unfinished plans");
+            pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
+            Vec::new()
+        }
+    }
 }
 
 /// How long the boot re-drive waits for the loaded torrents to appear.
@@ -2048,14 +2101,11 @@ fn redrive_once_loaded(
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
     loaded: &[libtorrent_safe::InfoHash],
+    plans: &[PlanRow],
     within: std::time::Duration,
     stop: StopCheck<'_>,
 ) {
-    let unfinished = pool
-        .with_store(|s| s.unfinished_plans())
-        .map(|p| !p.is_empty())
-        .unwrap_or(true);
-    if unfinished {
+    if !plans.is_empty() {
         match await_loaded(state, loaded, within, stop) {
             Settled::Loaded => {}
             Settled::Stopped => return,
@@ -2077,7 +2127,7 @@ fn redrive_once_loaded(
             }
         }
     }
-    resume_unfinished(pool, source, state, stop);
+    resume_unfinished(pool, source, state, plans, stop);
 }
 
 /// How [`await_loaded`] ended.
@@ -2117,11 +2167,18 @@ fn await_loaded(
     }
 }
 
-/// Re-drive any plan a crash left mid-apply.
+/// Re-drive `plans`, the ones a crash left mid-apply ([`unfinished_at_boot`]).
+///
+/// A plan the re-drive refuses before claiming it — a step whose outcome is
+/// unknown, or a torrent the index cannot account for — is parked `failed`,
+/// where the API can apply it again or discard it. One stopped by a shutdown
+/// stays `applying` for the next boot, and with `[pool] allow_mutations` off
+/// none is re-driven and each stays `applying`.
 pub fn resume_unfinished(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
+    plans: &[PlanRow],
     stop: StopCheck<'_>,
 ) {
     if !pool.allow_mutations() {
@@ -2135,15 +2192,7 @@ pub fn resume_unfinished(
         );
         return;
     }
-    let unfinished = match pool.with_store(|s| s.unfinished_plans()) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(target: "torrentd::pool::apply", reason = %e, "cannot read unfinished plans");
-            pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
-            return;
-        }
-    };
-    for plan in unfinished {
+    for plan in plans {
         warn!(
             target: "torrentd::pool::apply",
             plan_id = plan.id,
@@ -2805,6 +2854,143 @@ mod tests {
         assert_eq!(plan.status, plan_status::FAILED);
     }
 
+    /// A second apply while the first is mid-batch sees the first's own
+    /// `in_progress` steps. It is refused without touching the plan: marking
+    /// it `failed` would make it claimable, and a third apply would run the
+    /// same steps alongside the first.
+    #[test]
+    fn a_racing_apply_leaves_a_running_plan_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [write(&root, "junk/a.bin", 8), write(&root, "junk/b.bin", 8)];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        // The first apply: claimed, and its batch journalled.
+        assert!(pool
+            .with_store(|st| st.claim_plan_for_apply(plan_id, false))
+            .unwrap());
+        pool.with_store_mut(|st| {
+            st.set_steps_status(
+                plan_id,
+                &[
+                    (0, step_status::IN_PROGRESS, None),
+                    (1, step_status::IN_PROGRESS, None),
+                ],
+            )
+        })
+        .unwrap();
+
+        let (source, state) = engine_and_state();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert_eq!(e, "plan is applying and cannot be applied right now");
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::APPLYING);
+        assert!(
+            !pool
+                .with_store(|st| st.claim_plan_for_apply(plan_id, false))
+                .unwrap(),
+            "a third apply claimed the running plan"
+        );
+        assert_eq!(statuses(&pool, plan_id), ["in_progress", "in_progress"]);
+        assert!(orphans.iter().all(|o| o.exists()));
+    }
+
+    /// The boot re-drive runs alongside the API. A plan an API apply claims
+    /// after the boot read its unfinished plans is that apply's: re-driving
+    /// it would park it `failed` on the apply's own `in_progress` steps,
+    /// where a third apply could claim it and run them again.
+    #[test]
+    fn the_boot_redrive_leaves_a_plan_the_api_claimed_after_boot_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [write(&root, "junk/a.bin", 8), write(&root, "junk/b.bin", 8)];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        // Nothing was mid-apply at boot.
+        let plans = unfinished_at_boot(&pool);
+        assert!(plans.is_empty(), "{plans:?}");
+
+        // While the re-drive waits, an API apply claims the plan and
+        // journals its batch.
+        assert!(pool
+            .with_store(|st| st.claim_plan_for_apply(plan_id, false))
+            .unwrap());
+        pool.with_store_mut(|st| {
+            st.set_steps_status(
+                plan_id,
+                &[
+                    (0, step_status::IN_PROGRESS, None),
+                    (1, step_status::IN_PROGRESS, None),
+                ],
+            )
+        })
+        .unwrap();
+
+        let (source, state) = engine_and_state();
+        redrive_once_loaded(
+            &pool,
+            &source,
+            &state,
+            &[],
+            &plans,
+            std::time::Duration::ZERO,
+            &|| false,
+        );
+
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLYING);
+        assert!(
+            !pool
+                .with_store(|st| st.claim_plan_for_apply(plan_id, false))
+                .unwrap(),
+            "a third apply claimed the running plan"
+        );
+        assert_eq!(statuses(&pool, plan_id), ["in_progress", "in_progress"]);
+        assert!(orphans.iter().all(|o| o.exists()));
+    }
+
+    /// The boot re-drive refusing a plan before claiming it — here because a
+    /// loaded torrent the index has never claimed may hold files under the
+    /// root — parks it `failed`, where the API can apply or discard it. Left
+    /// `applying`, the API could do neither, and every boot refused it again.
+    #[test]
+    fn a_re_drive_refused_before_its_claim_parks_the_plan_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, orphan, _other) = one_orphan_delete_plan(dir.path());
+        pool.with_store(|st| st.set_plan_status(plan_id, plan_status::APPLYING, None))
+            .unwrap();
+
+        // Held by profile `q`, which the source has no session for.
+        let (source, _) = engine_and_state();
+        let state = StateMap::new();
+        let hash = libtorrent_safe::InfoHash([0xee; 20]);
+        state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                torrentd_engine::ProfileId::new("q"),
+                std::time::Instant::now(),
+            ),
+        );
+        resume_unfinished(&pool, &source, &state, &unfinished_at_boot(&pool), &|| {
+            false
+        });
+
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::FAILED);
+        assert!(orphan.exists(), "the refused re-drive ran nothing");
+        assert_eq!(statuses(&pool, plan_id), ["pending"]);
+        assert_eq!(
+            pool.with_store_mut(|st| st.delete_plan(plan_id)).unwrap(),
+            torrentd_pool::store::PlanDelete::Deleted,
+            "the API can now discard it"
+        );
+    }
+
     /// The child half of
     /// [`a_kill_9_inside_a_delete_batch_leaves_its_steps_in_progress`]: applies
     /// the plan, and once the batch's first step has moved its file, says so
@@ -3463,8 +3649,10 @@ mod tests {
         })
         .unwrap();
 
+        // The boot re-drive is what owns a plan a crash left `applying`; an
+        // API apply cannot tell it from one running now, and leaves it be.
         let (source, state) = engine_and_state();
-        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        let e = apply_inner(&pool, &source, &state, plan_id, true, &|| false).unwrap_err();
         assert!(
             e.contains("interrupted and its outcome is unknown"),
             "got {e}"
@@ -3483,7 +3671,10 @@ mod tests {
             .unwrap()
             .status;
         assert_eq!(status, torrentd_pool::model::plan_status::FAILED);
-        pool.with_store_mut(|st| st.delete_plan(plan_id)).unwrap();
+        assert_eq!(
+            pool.with_store_mut(|st| st.delete_plan(plan_id)).unwrap(),
+            torrentd_pool::store::PlanDelete::Deleted
+        );
         assert!(pool.with_store(|st| st.plan(plan_id)).unwrap().is_none());
     }
 
@@ -3531,7 +3722,9 @@ mod tests {
         );
 
         // Next boot.
-        resume_unfinished(&pool, &source, &state, &|| false);
+        resume_unfinished(&pool, &source, &state, &unfinished_at_boot(&pool), &|| {
+            false
+        });
         let (status, steps) = plan_state(&pool, plan_id);
         assert_eq!(status, plan_status::APPLIED);
         assert_eq!(steps, vec![step_status::DONE, step_status::DONE]);
@@ -3585,10 +3778,14 @@ mod tests {
         write(&root, "a/one.bin", 16);
         let pool = service(dir.path(), true);
         pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        pool.with_store(|s| s.claim_plan_for_apply(plan_id, false))
+            .unwrap();
+        let plans = unfinished_at_boot(&pool);
         let (source, state) = engine_and_state();
         let work: Arc<crate::app_state::WorkGate> = Arc::default();
 
-        // The re-drive's first act is reading the store, so it blocks here.
+        // The re-drive's first act is reading the plan, so it blocks here.
         let (release, holder) = hold_the_store(&pool);
         let task = spawn_resume_unfinished(
             Arc::clone(&pool),
@@ -3596,6 +3793,7 @@ mod tests {
             Arc::new(state),
             Arc::clone(&work),
             Vec::new(),
+            plans,
         );
         assert!(
             !work.wait_idle(Duration::from_millis(200)).await,
@@ -3636,6 +3834,7 @@ mod tests {
             Arc::clone(&state),
             Arc::clone(&work),
             Vec::new(),
+            unfinished_at_boot(&pool),
         )
         .await
         .unwrap();
@@ -3643,9 +3842,16 @@ mod tests {
         assert_eq!(status, plan_status::APPLYING, "a latched gate stops it");
         assert_eq!(steps, vec![step_status::PENDING, step_status::PENDING]);
 
-        spawn_resume_unfinished(Arc::clone(&pool), source, state, Arc::default(), Vec::new())
-            .await
-            .unwrap();
+        spawn_resume_unfinished(
+            Arc::clone(&pool),
+            source,
+            state,
+            Arc::default(),
+            Vec::new(),
+            unfinished_at_boot(&pool),
+        )
+        .await
+        .unwrap();
         assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLIED);
     }
 
@@ -3673,6 +3879,7 @@ mod tests {
             Arc::clone(&state),
             Arc::clone(&work),
             vec![pending],
+            unfinished_at_boot(&pool),
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(
@@ -3723,6 +3930,7 @@ mod tests {
             &source,
             &state,
             &[pending],
+            &unfinished_at_boot(&pool),
             std::time::Duration::from_secs(600),
             &|| true,
         );
@@ -3736,6 +3944,7 @@ mod tests {
             &source,
             &state,
             &[pending],
+            &unfinished_at_boot(&pool),
             std::time::Duration::ZERO,
             &|| false,
         );
@@ -3773,7 +3982,7 @@ mod tests {
         // Clear for the re-drive's own check, latched for `apply_inner`'s.
         let asked = std::sync::atomic::AtomicUsize::new(0);
         let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
-        resume_unfinished(&pool, &source, &state, &stop);
+        resume_unfinished(&pool, &source, &state, &unfinished_at_boot(&pool), &stop);
 
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
         let (status, steps) = plan_state(&pool, plan_id);
@@ -4489,7 +4698,10 @@ mod tests {
         let first = delete_plan_at(&pool, 0);
         let out = apply(&pool, &source, &state, first, &|| false).unwrap();
         assert_eq!(out.status, "applied", "{out:?}");
-        pool.with_store_mut(|st| st.delete_plan(first)).unwrap();
+        assert_eq!(
+            pool.with_store_mut(|st| st.delete_plan(first)).unwrap(),
+            torrentd_pool::store::PlanDelete::Deleted
+        );
 
         write(&root, "a/two.bin", 16);
         pool.scan().unwrap();

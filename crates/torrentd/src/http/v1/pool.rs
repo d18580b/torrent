@@ -2167,8 +2167,12 @@ pub enum DeletePlanError {
     #[error("no such plan")]
     #[problem(status = 404, title = "Plan not found")]
     PlanNotFound,
-    /// The plan is mid-apply.
-    #[error("plan is mid-apply; it will be resumed rather than discarded")]
+    /// The plan is `applying`: an apply is running it, or a crash left it
+    /// for the next boot to re-drive.
+    #[error(
+        "plan is applying; discard it once it is applied or failed (a plan a crash left \
+         applying is re-driven at the next boot)"
+    )]
     #[problem(status = 409, title = "The plan is being applied")]
     PlanApplying,
     /// The pool index failed; the daemon's log has the cause.
@@ -2180,8 +2184,13 @@ pub enum DeletePlanError {
 /// Discard a mutation plan.
 ///
 /// Removes the plan and its steps, whatever it did. Nothing on disk changes:
-/// discarding an applied plan does not undo it. A plan mid-apply is refused —
-/// startup resumes it rather than losing track of half a change.
+/// discarding an applied plan does not undo it. A plan in `applying` is
+/// refused with `409`, decided in the same statement as the delete, so no
+/// apply can claim the plan in between: an apply is running it now, or a
+/// crash left it, and the next boot re-drives it to `applied`, or to `failed`
+/// when the re-drive refuses it. Either can then be discarded. With
+/// `[pool] allow_mutations` off at boot the re-drive does not run, and the
+/// plan stays `applying` until it is turned back on.
 #[kynos::delete("/pool/plans/{plan_id}", tag = Pool)]
 pub async fn delete_plan(
     _caller: Scoped<Bearer, Write>,
@@ -2192,19 +2201,19 @@ pub async fn delete_plan(
     let fail = |e: torrentd_pool::PoolError| DeletePlanError::Internal {
         detail: internal("discarding a plan", e),
     };
-    // On the blocking pool, and on the writer for the read as well as the
-    // delete: the status that refuses a plan mid-apply must be the one the
-    // delete acts on.
+    // One conditional statement on the writer: the status that refuses a plan
+    // mid-apply is the one the delete acts on, with no window for an apply to
+    // claim the plan between a read and the delete.
     blocking(move || {
-        let Some(plan) = pool.with_store(|st| st.plan(p.plan_id)).map_err(fail)? else {
-            return Err(DeletePlanError::PlanNotFound);
-        };
-        if plan.status == torrentd_pool::model::plan_status::APPLYING {
-            return Err(DeletePlanError::PlanApplying);
+        use torrentd_pool::store::PlanDelete;
+        match pool
+            .with_store_mut(|st| st.delete_plan(p.plan_id))
+            .map_err(fail)?
+        {
+            PlanDelete::Deleted => Ok(NoContent),
+            PlanDelete::NotFound => Err(DeletePlanError::PlanNotFound),
+            PlanDelete::Applying => Err(DeletePlanError::PlanApplying),
         }
-        pool.with_store_mut(|st| st.delete_plan(p.plan_id))
-            .map_err(fail)?;
-        Ok(NoContent)
     })
     .await
 }
@@ -2229,8 +2238,10 @@ pub struct ApplyOutcome {
     pub failed: u32,
     /// Steps already done by an earlier apply, and not repeated.
     pub skipped: u32,
-    /// Where the plan stands now: `applied`, or `failed` when a step failed —
-    /// the plan's steps then show which, and why.
+    /// Where the plan stands now: `applied`; `failed` when a step failed —
+    /// the plan's steps then show which, and why; or `applying` when a
+    /// daemon shutdown stopped the apply between steps, which the next boot
+    /// re-drives.
     pub status: PlanStatus,
 }
 

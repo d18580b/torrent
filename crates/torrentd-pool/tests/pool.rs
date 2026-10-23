@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use torrentd_pool::model::AdoptionState;
 use torrentd_pool::model::PoolTorrent;
 use torrentd_pool::model::TorrentFileRow;
+use torrentd_pool::store::PlanDelete;
 use torrentd_pool::PoolStore;
 
 // ---------------------------------------------------------------------------
@@ -3550,10 +3551,87 @@ fn a_discarded_plans_id_is_never_handed_out_again() {
     // same id, and the same directory.
     let mut store = PoolStore::open_in_memory().unwrap();
     let first = store.create_plan("delete_orphans", "{}", 100).unwrap();
-    store.delete_plan(first).unwrap();
+    assert_eq!(store.delete_plan(first).unwrap(), PlanDelete::Deleted);
     let second = store.create_plan("delete_orphans", "{}", 100).unwrap();
     assert_ne!(first, second, "a discarded plan's id came back");
     assert!(second > first);
+}
+
+/// The status test is part of the delete: a plan an apply has claimed keeps
+/// its row and its step journal, whatever a caller read before the claim, and
+/// every other status deletes. Before, the store deleted whatever it was
+/// asked to, and only the API's earlier, separate read refused `applying`.
+#[test]
+fn a_plan_mid_apply_is_never_deleted() {
+    use torrentd_pool::model::plan_status as ps;
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let step = torrentd_pool::model::PlanStep {
+        op: "delete_file".into(),
+        src: "/r/a".into(),
+        dst: None,
+    };
+
+    let id = store.create_plan("delete_orphans", "{}", 100).unwrap();
+    store
+        .add_plan_steps(id, std::slice::from_ref(&step))
+        .unwrap();
+    // Read as `draft`, then claimed by an apply before the delete runs.
+    assert_eq!(store.plan(id).unwrap().unwrap().status, ps::DRAFT);
+    assert!(store.claim_plan_for_apply(id, false).unwrap());
+    assert_eq!(store.delete_plan(id).unwrap(), PlanDelete::Applying);
+    assert_eq!(store.plan(id).unwrap().unwrap().status, ps::APPLYING);
+    assert_eq!(
+        store.plan_steps(id).unwrap().len(),
+        1,
+        "the journal survives"
+    );
+
+    for status in [ps::DRAFT, ps::FAILED, ps::APPLIED, ps::CANCELLED] {
+        let id = store.create_plan("delete_orphans", "{}", 100).unwrap();
+        store
+            .add_plan_steps(id, std::slice::from_ref(&step))
+            .unwrap();
+        store.set_plan_status(id, status, None).unwrap();
+        assert_eq!(
+            store.delete_plan(id).unwrap(),
+            PlanDelete::Deleted,
+            "{status}"
+        );
+        assert!(store.plan(id).unwrap().is_none(), "{status}");
+        assert!(store.plan_steps(id).unwrap().is_empty(), "{status}");
+        assert_eq!(
+            store.delete_plan(id).unwrap(),
+            PlanDelete::NotFound,
+            "{status}"
+        );
+    }
+}
+
+/// A racing apply that finds a step `in_progress` — the running apply's own
+/// journal — parks the plan `failed` only if it could have claimed it. The
+/// running plan stays `applying`, so no third apply can claim it; the boot
+/// re-drive, which owns an `applying` plan, still parks one.
+#[test]
+fn only_a_claimable_plan_is_parked_failed() {
+    use torrentd_pool::model::plan_status as ps;
+    let store = PoolStore::open_in_memory().unwrap();
+    let id = store.create_plan("delete_orphans", "{}", 100).unwrap();
+
+    assert!(store.claim_plan_for_apply(id, false).unwrap());
+    assert!(!store.fail_unclaimed_plan(id, false).unwrap());
+    assert_eq!(store.plan(id).unwrap().unwrap().status, ps::APPLYING);
+    assert!(!store.claim_plan_for_apply(id, false).unwrap());
+
+    assert!(store.fail_unclaimed_plan(id, true).unwrap());
+    assert_eq!(store.plan(id).unwrap().unwrap().status, ps::FAILED);
+    assert!(
+        store.fail_unclaimed_plan(id, false).unwrap(),
+        "failed stays parkable"
+    );
+
+    store.set_plan_status(id, ps::APPLIED, None).unwrap();
+    assert!(!store.fail_unclaimed_plan(id, true).unwrap());
+    assert_eq!(store.plan(id).unwrap().unwrap().status, ps::APPLIED);
 }
 
 #[test]
@@ -3625,7 +3703,7 @@ fn a_v6_index_migrates_its_plans_to_ids_that_are_never_reused() {
     // give its id to the next one.
     let next = store.create_plan("delete_orphans", "{}", 1000).unwrap();
     assert_eq!(next, 4);
-    store.delete_plan(next).unwrap();
+    assert_eq!(store.delete_plan(next).unwrap(), PlanDelete::Deleted);
     assert_eq!(store.create_plan("delete_orphans", "{}", 1001).unwrap(), 5);
 
     // The migration turned foreign keys off around the rebuild and back on
