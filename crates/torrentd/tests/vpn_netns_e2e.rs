@@ -16,12 +16,14 @@
 //!   this namespace ("host")                  the peer namespace ("provider")
 //!   veth-ks 10.9.0.1/24 2001:db8:9::1/64 --- veth-peer 10.9.0.2/24 2001:db8:9::2/64
 //!   wg-e2e 10.200.0.1/32 (the daemon's)      wg-peer 10.200.0.2/24 listen 51820
+//!          2001:db8:200::1/128                       2001:db8:200::2/64
 //! ```
 //!
 //! `veth-ks` is the host's physical link, holding both default routes, so a
 //! packet that escapes the tunnel has somewhere to go. Everything arriving on
-//! `veth-peer` that is not the tunnel's own transport (UDP to 51820) or
-//! IPv6 neighbour discovery is counted by an nftables counter in the peer
+//! `veth-peer` that is not the tunnel's own transport (UDP to 51820, and the
+//! kernel's port-unreachable answer to it once the link is deleted) or IPv6
+//! neighbour discovery is counted by an nftables counter in the peer
 //! namespace, per family: those counts are the leaks, and they must stay 0.
 //!
 //! Needs `ip`, `wg`, `nft`, `unshare` (util-linux 2.38 or later, for
@@ -65,6 +67,9 @@ const WG: &str = "wg-e2e";
 const HTTP: &str = "127.0.0.1:8080";
 const TUNNEL: &str = "10.200.0.1";
 const PEER_TUNNEL: &str = "10.200.0.2";
+/// The tunnel's IPv6 address, so the kill switch's IPv6 fence is live.
+const TUNNEL_V6: &str = "2001:db8:200::1";
+const PEER_TUNNEL_V6: &str = "2001:db8:200::2";
 const HOST_V4: &str = "10.9.0.1";
 const PEER_V4: &str = "10.9.0.2";
 const HOST_V6: &str = "2001:db8:9::1";
@@ -298,12 +303,17 @@ fn topology(dir: &std::path::Path) -> Peer {
          ip -6 addr add {PEER_V6}/64 dev veth-peer nodad; ip link set veth-peer up; \
          ip link add wg-peer type wireguard; \
          wg set wg-peer private-key {} listen-port {WG_PEER_PORT} \
-             peer {ours_pub} allowed-ips {TUNNEL}/32; \
-         ip addr add {PEER_TUNNEL}/24 dev wg-peer; ip link set wg-peer up",
+             peer {ours_pub} allowed-ips {TUNNEL}/32,{TUNNEL_V6}/128; \
+         ip addr add {PEER_TUNNEL}/24 dev wg-peer; \
+         ip -6 addr add {PEER_TUNNEL_V6}/64 dev wg-peer nodad; ip link set wg-peer up",
         key_path("peer.key"),
     ));
-    // Anything arriving on the physical link but the tunnel's transport and
-    // the neighbour discovery IPv6 needs to work at all.
+    // Anything arriving on the physical link but the tunnel's transport, the
+    // kernel's port-unreachable answer to the provider's transport once the
+    // tunnel's socket is gone (the ICMP error quoting a datagram from UDP
+    // 51820: the inner UDP source port, 28 bytes into an ICMP message and 48
+    // into an ICMPv6 one), and the neighbour discovery IPv6 needs to work at
+    // all.
     peer.sh(
         "nft -f - <<'EOF'
 table inet leak {
@@ -324,6 +334,8 @@ table inet leak {
 		iifname != \"veth-peer\" return
 		udp dport 51820 return
 		icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld2-listener-report } return
+		icmp type destination-unreachable icmp code port-unreachable @th,224,16 51820 return
+		icmpv6 type destination-unreachable icmpv6 code port-unreachable @th,384,16 51820 return
 		meta nfproto ipv4 add @seen4 { ip saddr . ip daddr . meta l4proto } counter name \"v4\"
 		meta nfproto ipv6 add @seen6 { ip6 saddr . ip6 daddr . meta l4proto } counter name \"v6\"
 	}
@@ -353,7 +365,7 @@ EOF",
     std::fs::write(
         wg_config(),
         format!(
-            "[Interface]\nPrivateKey = {ours_key}\nAddress = {TUNNEL}/32\n\n\
+            "[Interface]\nPrivateKey = {ours_key}\nAddress = {TUNNEL}/32, {TUNNEL_V6}/128\n\n\
              [Peer]\nPublicKey = {peer_pub}\nEndpoint = {PEER_V4}:{WG_PEER_PORT}\n\
              AllowedIPs = 0.0.0.0/0, ::/0\n"
         ),
@@ -462,7 +474,7 @@ impl Daemon {
                  vpn_interface = \"{WG}\"\n\
                  peer_fingerprint = \"-qB5030-\"\n\
                  user_agent = \"qBittorrent/5.0.3\"\n\
-                 allowed_tracker_domains = [\"{PEER_TUNNEL}\"]\n\
+                 allowed_tracker_domains = [\"{PEER_TUNNEL}\", \"{PEER_TUNNEL_V6}\"]\n\
                  {profile_extra}\n",
                 d = dir.display(),
                 wg = wg_config(),
@@ -534,11 +546,12 @@ fn compact(addr: SocketAddr) -> Vec<u8> {
     out
 }
 
-/// A one-request HTTP tracker in the peer namespace on [`PEER_TUNNEL`],
-/// recording each announce's source address, and answering with peers the
-/// daemon will try to reach: one inside the tunnel, and one on each family
-/// of the physical link, which a socket that escaped the tunnel would reach
-/// directly.
+/// A one-request HTTP tracker in the peer namespace on both of its tunnel
+/// addresses, [`PEER_TUNNEL`] and [`PEER_TUNNEL_V6`], so the daemon's listen
+/// socket in each family announces to it; recording each announce's source
+/// address, and answering with peers the daemon will try to reach: one inside
+/// the tunnel, and one on each family of the physical link, which a socket
+/// that escaped the tunnel would reach directly.
 fn tracker(peer: &Peer) -> Arc<Mutex<Vec<SocketAddr>>> {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut body = b"d8:intervali30e12:min intervali5e5:peers".to_vec();
@@ -555,10 +568,14 @@ fn tracker(peer: &Peer) -> Arc<Mutex<Vec<SocketAddr>>> {
     body.extend_from_slice(format!("6:peers6{}:", v6.len()).as_bytes());
     body.extend_from_slice(&v6);
     body.push(b'e');
-    let recorded = seen.clone();
-    peer.serve_tcp(
-        format!("{PEER_TUNNEL}:{TRACKER_PORT}").parse().unwrap(),
-        move |mut conn| {
+    let body = Arc::new(body);
+    for bind in [
+        format!("{PEER_TUNNEL}:{TRACKER_PORT}"),
+        format!("[{PEER_TUNNEL_V6}]:{TRACKER_PORT}"),
+    ] {
+        let recorded = seen.clone();
+        let body = body.clone();
+        peer.serve_tcp(bind.parse().unwrap(), move |mut conn| {
             let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
             let mut req = Vec::new();
             let mut buf = [0u8; 4096];
@@ -580,8 +597,8 @@ fn tracker(peer: &Peer) -> Arc<Mutex<Vec<SocketAddr>>> {
                 .as_bytes(),
             );
             let _ = conn.write_all(&body);
-        },
-    );
+        });
+    }
     seen
 }
 
@@ -600,6 +617,50 @@ fn table_listed() -> bool {
     })
 }
 
+/// Prove that only the kill switch stands between this uid — the daemon's —
+/// and the physical link: a datagram from each address in `sources` to the
+/// peer's bare-link address in its family is refused with `EPERM`, which is
+/// an nftables drop, and not `ENETUNREACH`, which would mean the kernel had
+/// no route out of the physical link to leak by in the first place.
+///
+/// Without the kill switch each datagram would be sent and counted as a
+/// leak; the caller's [`Peer::assert_no_leak`] then fails as well.
+fn assert_only_the_kill_switch_stops(sources: &[&str], after: &str) {
+    for src in sources {
+        let src: std::net::IpAddr = src.parse().unwrap();
+        let dst = if src.is_ipv4() { PEER_V4 } else { PEER_V6 };
+        let sent = UdpSocket::bind((src, 0))
+            .unwrap_or_else(|e| panic!("{after}: bind {src}: {e}"))
+            .send_to(b"x", (dst, 9));
+        let err = match sent {
+            Ok(_) => panic!(
+                "{after}: a datagram from {src} to {dst} was sent: the kill switch did not drop it"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{after}: a datagram from {src} to {dst} failed with `{err}`, not the kill switch's \
+             EPERM: the kernel had no route to the physical link, so nothing could have leaked \
+             by it, and the no-leak count proves nothing\n{}",
+            sh("ip rule; ip -6 rule")
+        );
+    }
+}
+
+/// `ip rule flush` removes every rule but `local`'s, so `main`'s and
+/// `default`'s with the tunnel's: with them gone the kernel routes nothing,
+/// and a leak would be impossible rather than prevented. Put back the rules
+/// a host has before any tunnel, so only the tunnel's is missing.
+fn restore_base_rules(flush: &str) {
+    if flush.starts_with("ip -6") {
+        sh("ip -6 rule add pref 32766 table main");
+    } else {
+        sh("ip rule add pref 32766 table main && ip rule add pref 32767 table default");
+    }
+}
+
 /// The daemon, with the kill switch on and one torrent announcing through the
 /// tunnel to a tracker that hands out peers on both families of the bare
 /// link, has its tunnel's protections removed one at a time:
@@ -608,8 +669,11 @@ fn table_listed() -> bool {
 ///    and counts `kill_switch_lost_total{outcome="reinstalled"}`, within
 ///    [`WATCH_BOUND`]; until it does, the source bind alone keeps the
 ///    daemon's traffic in the tunnel, and it does;
-/// 2. `ip -6 rule flush`, then `ip rule flush`: the tunnel's routing rule is
-///    gone, and nothing leaves by the physical link instead;
+/// 2. `ip -6 rule flush`, then `ip rule flush`: the tunnel's routing rules
+///    are gone and the host's own put back ([`restore_base_rules`]), so the
+///    physical link's default routes are live; nothing leaves by them, and
+///    a datagram from the tunnel's addresses is refused by the kill switch
+///    ([`assert_only_the_kill_switch_stops`]);
 /// 3. `ip link del wg-e2e`: the tunnel is gone; nothing leaks, and the VPN
 ///    monitor fences the profile, which `GET /v1/profiles` reports.
 ///
@@ -644,7 +708,9 @@ fn vpn_netns_e2e_no_leak() {
 
     let ih = "4e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e";
     let magnet = format!(
-        "magnet:?xt=urn:btih:{ih}&dn=e2e&tr=http%3A%2F%2F{PEER_TUNNEL}%3A{TRACKER_PORT}%2Fannounce"
+        "magnet:?xt=urn:btih:{ih}&dn=e2e\
+         &tr=http%3A%2F%2F{PEER_TUNNEL}%3A{TRACKER_PORT}%2Fannounce\
+         &tr=http%3A%2F%2F%5B{PEER_TUNNEL_V6}%5D%3A{TRACKER_PORT}%2Fannounce"
     );
     let (code, body) = http(
         "POST",
@@ -657,13 +723,14 @@ fn vpn_netns_e2e_no_leak() {
 
     // The positive control: the daemon announces and reaches a peer, both
     // through the tunnel and from its address.
-    let tunnelled = |seen: &Mutex<Vec<SocketAddr>>| {
+    let from = |seen: &Mutex<Vec<SocketAddr>>, addr: &str| {
         seen.lock()
             .unwrap()
             .iter()
-            .filter(|a| a.ip().to_string().trim_start_matches("::ffff:") == TUNNEL)
+            .filter(|a| a.ip().to_string().trim_start_matches("::ffff:") == addr)
             .count()
     };
+    let tunnelled = |seen: &Mutex<Vec<SocketAddr>>| from(seen, TUNNEL);
     poll(
         "an announce through the tunnel",
         Duration::from_secs(30),
@@ -673,6 +740,14 @@ fn vpn_netns_e2e_no_leak() {
         "a peer connection through the tunnel",
         Duration::from_secs(30),
         || (tunnelled(&connects) > 0).then_some(()),
+    );
+    // The daemon sends IPv6 too, through the tunnel, announcing from its IPv6
+    // listen socket to the tracker's IPv6 address: the IPv6 count below is of
+    // a family it uses.
+    poll(
+        "an IPv6 announce through the tunnel",
+        Duration::from_secs(30),
+        || (from(&announces, TUNNEL_V6) > 0).then_some(()),
     );
     peer.assert_no_leak(base, "with the tunnel and the kill switch intact");
 
@@ -714,20 +789,30 @@ fn vpn_netns_e2e_no_leak() {
     });
     peer.assert_no_leak(base, "across `nft flush ruleset` and the reinstall");
 
-    // 2. The routing rules: IPv6's, then IPv4's, which carry the tunnel's
-    //    `from 10.200.0.1` rule.
-    for flush in ["ip -6 rule flush", "ip rule flush"] {
+    // 2. The routing rules: IPv6's, then IPv4's, each carrying the tunnel's
+    //    `from <tunnel address>` rule. Each flush leaves a source of the
+    //    tunnel's routed out of the physical link; IPv4's still goes through
+    //    the tunnel until its own rule is flushed.
+    for (flush, sources) in [
+        ("ip -6 rule flush", &[TUNNEL_V6, HOST_V4, HOST_V6][..]),
+        ("ip rule flush", &[TUNNEL, TUNNEL_V6, HOST_V4, HOST_V6][..]),
+    ] {
         sh(flush);
+        restore_base_rules(flush);
         prompt(ih);
         thread::sleep(LEAK_WINDOW);
-        peer.assert_no_leak(base, &format!("after `{flush}`"));
+        let after = format!("after `{flush}`");
+        assert_only_the_kill_switch_stops(sources, &after);
+        peer.assert_no_leak(base, &after);
     }
 
-    // 3. The tunnel itself.
+    // 3. The tunnel itself, and its addresses with it.
     sh(&format!("ip link del {WG}"));
     prompt(ih);
     thread::sleep(LEAK_WINDOW);
-    peer.assert_no_leak(base, &format!("after `ip link del {WG}`"));
+    let after = format!("after `ip link del {WG}`");
+    assert_only_the_kill_switch_stops(&[HOST_V4, HOST_V6], &after);
+    peer.assert_no_leak(base, &after);
     poll(
         "the VPN monitor to fence the profile",
         MONITOR_BOUND,
@@ -740,6 +825,7 @@ fn vpn_netns_e2e_no_leak() {
     );
     prompt(ih);
     thread::sleep(LEAK_WINDOW);
+    assert_only_the_kill_switch_stops(&[HOST_V4, HOST_V6], "with the profile fenced");
     peer.assert_no_leak(base, "with the profile fenced");
 
     // The kill switch is removed on a clean stop, and the report says so —
