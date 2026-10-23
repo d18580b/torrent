@@ -322,19 +322,10 @@ Three checks start outside the bound:
 A waiting `.torrent` reads `paused` in `GET /v1/torrents` until the queue
 starts its check.
 
-| Metric | What it says |
-| --- | --- |
-| `torrentd_pool_verify_queue_depth` | Torrents waiting for a slot: adoptions, queued re-hashes and `.torrent` adds held paused |
-| `torrentd_pool_verify_in_flight` | Torrents holding a slot: adoptions verifying, and every other check started |
-| `torrentd_pool_verify_completed_total` | Verified and seeding; the index records them `adopted` |
-| `torrentd_pool_verify_failed_total` | Failed or dropped |
-| `torrentd_pool_recheck_dropped_total` | Queued re-hashes dropped before they started, by `reason` |
-| `torrentd_checks_started_total` | Every check started, by `source`: `adoption`, `recheck`, `add`, `torrent_dir`, `restart`, `disk_error_retry`, `magnet_metadata` |
-
-`GET /v1/pool` reports the first two as `verify_queue_depth` and
-`verify_in_flight`, and the bundled dashboard plots the first four. Without
-`[pool]`, `torrentd_check_queue_depth` and `torrentd_checks_in_flight` report
-the same two numbers.
+The `torrentd_pool_verify_*`, `torrentd_pool_recheck_dropped_total` and
+`torrentd_checks_started_total` series that track this queue are described in
+[`deploy/metrics.md`](../deploy/metrics.md). `GET /v1/pool` reports the queue
+as `verify_queue_depth` and `verify_in_flight`.
 
 - **A failed verification** pauses the torrent and records it `drifted`: the
   payload does not match its piece hashes. The log says `verification did not
