@@ -381,7 +381,11 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                     }
                 }
                 Err(failure) => {
-                    state.list.fail(generation, failure.message());
+                    if state.list.fail(generation, failure.message()) {
+                        // The reload will not settle: a later page must not
+                        // snap the selection back to where it began.
+                        state.restore = None;
+                    }
                     unauthenticated("loading torrents", failure)
                 }
             }

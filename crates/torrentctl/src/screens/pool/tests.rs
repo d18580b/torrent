@@ -887,6 +887,46 @@ fn a_library_refresh_past_1000_rows_keeps_them_and_the_selection() {
 }
 
 #[test]
+fn a_failed_library_refresh_does_not_snap_a_later_page_back() {
+    let mut state = with_library(0, None);
+    let library_page = |state: &State, first: bool, page: types::PoolTorrentPage| {
+        Msg::Library(library::Msg::Page {
+            generation: state.library.items.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    let msg = library_page(&state, true, wide_library(0, 1000, Some("k1000")));
+    send(&mut state, msg, true);
+    state.library.selected = 10;
+
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    let generation = state.library.items.generation;
+    send(
+        &mut state,
+        Msg::Library(library::Msg::Page {
+            generation,
+            first: true,
+            result: Err(problem(500, "internal", None)),
+        }),
+        true,
+    );
+    assert!(!state.library.items.loading);
+
+    // The operator scrolls on, to the end: the next page is fetched.
+    state.library.selected = 998;
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 1);
+    let msg = library_page(&state, false, wide_library(1000, 800, None));
+    send(&mut state, msg, true);
+    assert_eq!(state.library.items.items.len(), 1800);
+    assert_eq!(
+        state.library.selected, 999,
+        "not snapped back to the row selected when the failed refresh began"
+    );
+}
+
+#[test]
 fn verifying_several_asks_first_and_shows_what_started() {
     let mut state = with_library(6, None);
     press(&mut state, KeyCode::Char(' '), true);

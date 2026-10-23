@@ -273,13 +273,17 @@ impl<T> Paged<T> {
     }
 
     /// A page for `generation` failed. A reload in flight is abandoned and
-    /// what is shown kept.
-    pub fn fail(&mut self, generation: u64, error: String) {
-        if generation == self.generation {
-            self.loading = false;
-            self.refill = None;
-            self.error = Some(error);
+    /// what is shown kept. Whether it was the request in flight: when it
+    /// was, a selection the screen meant to restore once it settled will
+    /// never be restored, and must be forgotten.
+    pub fn fail(&mut self, generation: u64, error: String) -> bool {
+        if generation != self.generation {
+            return false;
         }
+        self.loading = false;
+        self.refill = None;
+        self.error = Some(error);
+        true
     }
 }
 
