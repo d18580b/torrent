@@ -958,14 +958,6 @@ fn dispatch_alert(
         Alert::TrackerError { .. } | Alert::Warning { .. } | Alert::TrackerReply { .. } => {
             handlers::warning::handle(&alert, &mut ctx, tracker_failures)
         }
-
-        // Peer disconnects are per-peer churn, not an operational condition;
-        // a debug line keeps them visible in field traces.
-        other => tracing::debug!(
-            target: "torrentd_engine::alert_loop",
-            alert_type = other.kind().as_str(),
-            "unhandled alert kind",
-        ),
     }
 }
 
