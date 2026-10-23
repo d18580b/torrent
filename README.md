@@ -335,9 +335,9 @@ content that wants DHT belongs in a `network = "host"` profile.
 
 **Required, one way or the other.** The daemon refuses to start unless you
 have either configured `[auth]` or written `allow_unauthenticated = true`;
-when running without `[auth]` is safe, and which keys take a restart rather
-than a `SIGHUP`, is
-[docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other).
+[docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other)
+says when running without `[auth]` is safe and which keys take a restart
+rather than a `SIGHUP`.
 
 Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
 there are two kinds, hashed differently on purpose. The **operator password**
