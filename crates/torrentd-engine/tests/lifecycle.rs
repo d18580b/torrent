@@ -851,32 +851,32 @@ fn an_upload_mode_torrent_never_takes_a_piece_from_a_willing_seeder() {
     // One round: read every status, and dial A again from any torrent that
     // is not checking and has lost it. Returns whether the recheck path
     // reported a finished check this round.
+    //
+    // Liveness is read fresh from each session with `torrent_statuses`, not
+    // from `post_torrent_updates`: libtorrent posts a state update only for
+    // a torrent it marked changed, and a peer hanging up does not mark one,
+    // so a seeder lost mid-dwell would go unnoticed and never be redialled.
     let mut a_peers = vec![0i32; PATHS.len()];
     let round = |leechers: &mut Vec<Leecher>, a_peers: &mut Vec<i32>| {
         let mut checked = false;
-        a.post_torrent_updates();
-        for alert in a.drain_alerts() {
-            if let Alert::StateUpdate { statuses, .. } = alert {
-                for st in statuses {
-                    if let Some(i) = a_torrents.iter().position(|h| h.id == st.handle.id) {
-                        a_peers[i] = st.num_peers;
-                    }
-                }
+        a.drain_alerts();
+        for st in a.torrent_statuses().unwrap() {
+            if let Some(i) = a_torrents.iter().position(|h| h.id == st.handle.id) {
+                a_peers[i] = st.num_peers;
             }
         }
         for (i, l) in leechers.iter_mut().enumerate() {
-            l.session.post_torrent_updates();
             for alert in l.session.drain_alerts() {
-                match alert {
-                    Alert::StateUpdate { statuses, .. } => {
-                        if let Some(st) = statuses.iter().find(|st| st.handle.id == l.h.id) {
-                            l.last = Some(st.clone());
-                        }
-                    }
-                    Alert::TorrentChecked { .. } if i == RECHECK => checked = true,
-                    _ => {}
+                if i == RECHECK && matches!(alert, Alert::TorrentChecked { .. }) {
+                    checked = true;
                 }
             }
+            l.last = l
+                .session
+                .torrent_statuses()
+                .unwrap()
+                .into_iter()
+                .find(|st| st.handle.id == l.h.id);
             let checking = l
                 .last
                 .as_ref()
