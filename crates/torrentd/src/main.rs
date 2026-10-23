@@ -961,7 +961,8 @@ http_listen = "127.0.0.1:8080"
         // pre-flight's to establish and not `Config::load`'s: the SIGHUP pump
         // and every operator subcommand load the config too, and probing the
         // host there refuses a reload, and `hash-password`, on a machine
-        // without nftables. The file above loaded; only the probe refuses.
+        // without nftables. The helper's `Config::load` accepted the file;
+        // only the probe refuses it.
         let dir = tempfile::tempdir().unwrap();
         let cfg = kill_switch_over_wireguard(dir.path());
         let msg = format!(
