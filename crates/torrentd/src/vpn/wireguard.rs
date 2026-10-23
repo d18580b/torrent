@@ -58,6 +58,13 @@ pub enum ProbeUnavailable {
     Refused,
     /// `wg` produced output this code could not parse.
     Unparseable,
+    /// The VPN monitor's probes of the tunnel, `wg` among them, did not
+    /// return within its timeout: whether `wg` itself would have answered is
+    /// not known.
+    TimedOut,
+    /// The VPN monitor's probe task failed (it panicked or was cancelled)
+    /// before `wg` answered: a daemon fault, not the tool's.
+    TaskFailed,
 }
 
 impl ProbeUnavailable {
@@ -66,6 +73,8 @@ impl ProbeUnavailable {
             ProbeUnavailable::NoTool => "no_tool",
             ProbeUnavailable::Refused => "refused",
             ProbeUnavailable::Unparseable => "unparseable",
+            ProbeUnavailable::TimedOut => "timed_out",
+            ProbeUnavailable::TaskFailed => "task_failed",
         }
     }
 }

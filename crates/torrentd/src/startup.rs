@@ -7177,7 +7177,13 @@ mod tests {
         // its walk of an empty state map pauses nothing.
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        let walked = crate::vpn_monitor::fence(entry, &StateMap::new(), None, t.metrics.as_ref());
+        let walked = crate::vpn_monitor::fence(
+            entry,
+            &StateMap::new(),
+            None,
+            crate::vpn_monitor::DownReason::NoHandshake,
+            t.metrics.as_ref(),
+        );
         assert_eq!(walked, 0);
         assert_eq!(t.status(), ProfileStatus::VpnDown);
 
@@ -7223,7 +7229,13 @@ mod tests {
         scan.track_all(&state);
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        let walked = crate::vpn_monitor::fence(entry, &state, None, t.metrics.as_ref());
+        let walked = crate::vpn_monitor::fence(
+            entry,
+            &state,
+            None,
+            crate::vpn_monitor::DownReason::IpLostOrChanged,
+            t.metrics.as_ref(),
+        );
         assert_eq!(walked, 2, "the monitor's walk finds the tracked torrents");
         assert_eq!(t.paused_for_vpn(), 2);
 
@@ -7254,7 +7266,13 @@ mod tests {
         scan.track_all(&state);
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        let walked = crate::vpn_monitor::fence(entry, &state, None, t.metrics.as_ref());
+        let walked = crate::vpn_monitor::fence(
+            entry,
+            &state,
+            None,
+            crate::vpn_monitor::DownReason::IpLostOrChanged,
+            t.metrics.as_ref(),
+        );
         assert_eq!(walked, 3);
 
         scan.enforce_all(&t.profiles, &t.metrics);
@@ -7278,7 +7296,7 @@ mod tests {
         }
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        crate::vpn_monitor::mark_fenced(entry, None, t.metrics.as_ref());
+        crate::vpn_monitor::mark_fenced(entry, None, "ip_lost_or_changed", t.metrics.as_ref());
         scan.track_all(&state);
         let walked = crate::vpn_monitor::walk_fenced(entry, &state, t.metrics.as_ref());
         assert_eq!(walked, 3, "the walk finds the tracked torrents");

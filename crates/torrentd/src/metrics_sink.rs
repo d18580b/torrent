@@ -314,8 +314,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
         ("reason": &["ip_lost_or_changed", "route_mismatch", "handshake_stale", "no_handshake", "probe_unavailable", "kill_switch"])
         Owner("live vpn profiles") =>
         "Times the VPN monitor fenced the profile, by reason; probe_unavailable when its \
-         address, route or handshake probe, or the kill-switch watch's check, could not run 3 \
-         times in a row; kill_switch when the kill-switch watch fenced it because the nftables \
+         address or route probe, its handshake probe while it had traffic to carry, or the \
+         kill-switch watch's check, could not run 3 times in a row; kill_switch when the kill-switch watch fenced it because the nftables \
          table was missing or drifted.";
     "profile_vpn_handshake_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
         "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or \
