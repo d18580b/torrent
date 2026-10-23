@@ -864,4 +864,193 @@ mod tests {
         assert_eq!(h.save_path, None);
         assert_eq!(h.category, None);
     }
+
+    mod props {
+        use std::path::Component;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Bytes shaped like bencode: its tokens, lengths that may or may
+        /// not fit, and anything else.
+        fn bencode_soup() -> impl Strategy<Value = Vec<u8>> {
+            let token = prop_oneof![
+                prop::sample::select(vec![
+                    &b"d"[..],
+                    b"l",
+                    b"e",
+                    b"i",
+                    b"0:",
+                    b"1:",
+                    b"4:",
+                    b"999:",
+                    b"18446744073709551616:",
+                    b"i-1e",
+                    b"6:pieces",
+                    b"12:mapped_files",
+                    b"8:trackers",
+                    b"12:qBt-savePath",
+                ])
+                .prop_map(<[u8]>::to_vec),
+                prop::collection::vec(any::<u8>(), 0..6),
+            ];
+            prop::collection::vec(token, 0..24).prop_map(|t| t.concat())
+        }
+
+        /// A string a hint keeps as written: not empty.
+        fn text() -> impl Strategy<Value = String> {
+            ".{1,16}"
+        }
+
+        prop_compose! {
+            /// Hints in the shape a reading of them takes: nothing empty, no
+            /// tag with a comma or surrounding space, no URL with a NUL.
+            fn hints()(
+                save_path in prop::option::of(text()),
+                category in prop::option::of(text()),
+                tags in prop::collection::vec("[a-zA-Z0-9_-]{1,8}", 0..4),
+                pieces in prop::option::of(prop::collection::vec(any::<u8>(), 0..12)),
+                mapped_files in prop::collection::vec(prop::option::of(text()), 0..5),
+                content_layout in prop::option::of(text()),
+                trackers in prop::collection::vec(
+                    prop::collection::vec("[^\u{0}]{1,24}", 1..3),
+                    0..3,
+                ),
+            ) -> (ResumeHints, Option<Vec<u8>>) {
+                let bitfield = pieces.as_ref().map(|bits| Bitfield {
+                    len: bits.len(),
+                    all_had: bits.iter().all(|b| b & 1 == 1),
+                });
+                (
+                    ResumeHints {
+                        save_path,
+                        category,
+                        tags,
+                        bitfield,
+                        mapped_files,
+                        mapped_files_unreadable: 0,
+                        content_layout,
+                        trackers,
+                    },
+                    pieces,
+                )
+            }
+        }
+
+        /// `hints` as a `.fastresume` writes them.
+        fn encode(hints: &ResumeHints, pieces: &Option<Vec<u8>>) -> Vec<u8> {
+            let mut entries: Vec<(&str, Vec<u8>)> = vec![("qBt-seedStatus", bint(1))];
+            let mut opt = |key, v: &Option<String>| {
+                if let Some(v) = v {
+                    entries.push((key, bstr(v)));
+                }
+            };
+            opt("qBt-savePath", &hints.save_path);
+            opt("qBt-category", &hints.category);
+            opt("qBt-contentLayout", &hints.content_layout);
+            if !hints.tags.is_empty() {
+                entries.push(("qBt-tags", bstr(&hints.tags.join(", "))));
+            }
+            if let Some(bits) = pieces {
+                entries.push(("pieces", bbytes(bits)));
+            }
+            let mapped: Vec<&str> = hints
+                .mapped_files
+                .iter()
+                .map(|m| m.as_deref().unwrap_or(""))
+                .collect();
+            entries.push(("mapped_files", blist(&mapped)));
+            entries.push(("nested", bdict(&[("x", blist(&["y"]))])));
+            let tiers: Vec<Vec<&str>> = hints
+                .trackers
+                .iter()
+                .map(|t| t.iter().map(String::as_str).collect())
+                .collect();
+            let tiers: Vec<&[&str]> = tiers.iter().map(Vec::as_slice).collect();
+            entries.push(("trackers", btiers(&tiers)));
+            bdict(&entries)
+        }
+
+        /// A mapped path made of plain names, traversals, roots, empties and
+        /// Windows separators.
+        fn mapped_path() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop::sample::select(vec!["a", "b.mkv", "..", ".", "", "/", "\\", "C:"]),
+                0..5,
+            )
+            .prop_map(|parts| parts.join("/"))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Whatever a sidecar holds, reading it answers.
+            #[test]
+            fn reading_any_bytes_never_panics(
+                bytes in prop_oneof![bencode_soup(), prop::collection::vec(any::<u8>(), 0..64)],
+            ) {
+                let _ = parse_hints(&bytes);
+            }
+
+            /// Hints written as a `.fastresume` writes them read back as
+            /// they were, beside keys and nested values the reader skips.
+            #[test]
+            fn hints_round_trip((hints, pieces) in hints()) {
+                prop_assert_eq!(parse_hints(&encode(&hints, &pieces)), Some(hints));
+            }
+
+            /// Every path a relayout takes from `mapped_files` is relative
+            /// and made of plain names only; a mapped path that is not is
+            /// left at the `.torrent`'s path and counted as refused.
+            #[test]
+            fn a_relayout_takes_only_plain_relative_paths(
+                paths in prop::collection::vec("[a-z]{1,4}(/[a-z]{1,4}){0,2}", 0..5),
+                mapped in prop::collection::vec(prop::option::of(mapped_path()), 0..6),
+                unreadable in 0usize..3,
+                name in "[a-z]{1,4}",
+            ) {
+                let hints = ResumeHints {
+                    mapped_files: mapped.clone(),
+                    mapped_files_unreadable: unreadable,
+                    ..ResumeHints::default()
+                };
+                let Some(out) = hints.relayout(&paths, &name) else {
+                    prop_assert!(unreadable == 0 && mapped.iter().all(Option::is_none));
+                    return Ok(());
+                };
+                prop_assert!(out.in_resume_data);
+                prop_assert_eq!(out.paths.len(), paths.len());
+                // The plain names a path holds, or `None` where it holds
+                // anything else (a root, a `..`, a leading `.`) or nothing.
+                let names = |p: &str| -> Option<Vec<String>> {
+                    let parts: Option<Vec<String>> = Path::new(p)
+                        .components()
+                        .map(|c| match c {
+                            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                            _ => None,
+                        })
+                        .collect();
+                    parts.filter(|p| !p.is_empty())
+                };
+                let mut refused = 0;
+                for (i, (got, was)) in out.paths.iter().zip(&paths).enumerate() {
+                    match mapped.get(i).cloned().flatten() {
+                        Some(m) => match names(&m.replace('\\', "/")) {
+                            Some(want) => {
+                                prop_assert_eq!(names(got), Some(want), "{:?} from {:?}", got, m);
+                                prop_assert_eq!(got, &names(got).unwrap().join("/"));
+                            }
+                            None => {
+                                refused += 1;
+                                prop_assert_eq!(got, was, "{:?} from {:?}", got, m);
+                            }
+                        },
+                        None => prop_assert_eq!(got, was),
+                    }
+                }
+                prop_assert_eq!(out.rejected, unreadable + refused);
+            }
+        }
+    }
 }

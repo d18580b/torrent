@@ -875,4 +875,118 @@ mod tests {
         .unwrap();
         server.join().unwrap();
     }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// A gateway's answer to `req` (RFC 6886 §3.3): the request's opcode
+        /// with the response bit, `result`, the gateway's epoch, the
+        /// request's internal port, and the external port and lifetime it
+        /// granted.
+        fn answer(
+            req: &[u8; 12],
+            result: u16,
+            epoch: u32,
+            external: u16,
+            lifetime: u32,
+        ) -> [u8; 16] {
+            let mut r = [0u8; 16];
+            r[1] = req[1] | RESP_OPCODE_FLAG;
+            r[2..4].copy_from_slice(&result.to_be_bytes());
+            r[4..8].copy_from_slice(&epoch.to_be_bytes());
+            r[8..10].copy_from_slice(&req[4..6]);
+            r[10..12].copy_from_slice(&external.to_be_bytes());
+            r[12..16].copy_from_slice(&lifetime.to_be_bytes());
+            r
+        }
+
+        fn opcode() -> impl Strategy<Value = u8> {
+            prop_oneof![Just(OP_MAP_UDP), Just(OP_MAP_TCP)]
+        }
+
+        proptest! {
+            /// Whatever datagram arrives, decoding it answers.
+            #[test]
+            fn decoding_never_panics(
+                buf in prop::collection::vec(any::<u8>(), 0..40),
+                op in any::<u8>(),
+            ) {
+                let _ = decode_response(&buf, op);
+                let _ = decode_delete(&buf, op);
+            }
+
+            /// A request encodes its fields where RFC 6886 puts them, and a
+            /// gateway's success answer to it decodes to what it granted;
+            /// a port or lifetime of 0 grants nothing.
+            #[test]
+            fn an_answer_to_an_encoded_request_decodes_to_what_it_granted(
+                op in opcode(),
+                internal in any::<u16>(),
+                suggested in any::<u16>(),
+                lifetime in any::<u32>(),
+                epoch in any::<u32>(),
+                external in any::<u16>(),
+                granted in any::<u32>(),
+                trailing in prop::collection::vec(any::<u8>(), 0..4),
+            ) {
+                let req = encode_request(op, internal, suggested, lifetime);
+                prop_assert_eq!(req[0], 0);
+                prop_assert_eq!(req[1], op);
+                prop_assert_eq!(u16::from_be_bytes([req[4], req[5]]), internal);
+                prop_assert_eq!(u16::from_be_bytes([req[6], req[7]]), suggested);
+                prop_assert_eq!(u32::from_be_bytes([req[8], req[9], req[10], req[11]]), lifetime);
+
+                let mut buf = answer(&req, 0, epoch, external, granted).to_vec();
+                buf.extend(trailing);
+                let decoded = decode_response(&buf, op);
+                if external == 0 || granted == 0 {
+                    prop_assert!(matches!(decoded, Err(PortForwardError::Parse(_))), "{:?}", decoded);
+                } else {
+                    prop_assert_eq!(
+                        decoded.unwrap(),
+                        Mapped { port: external, epoch, lifetime_secs: granted }
+                    );
+                }
+                prop_assert!(decode_delete(&buf, op).is_ok());
+            }
+
+            /// A gateway's refusal is its result code, for a mapping and a
+            /// deletion alike, whatever else the answer holds.
+            #[test]
+            fn a_result_code_is_the_gateways_refusal(
+                op in opcode(),
+                result in 1u16..,
+                epoch in any::<u32>(),
+                external in any::<u16>(),
+                granted in any::<u32>(),
+            ) {
+                let buf = answer(&encode_request(op, 1, 1, 60), result, epoch, external, granted);
+                prop_assert!(matches!(
+                    decode_response(&buf, op),
+                    Err(PortForwardError::Gateway(code)) if code == result
+                ));
+                prop_assert!(matches!(
+                    decode_delete(&buf, op),
+                    Err(PortForwardError::Gateway(code)) if code == result
+                ));
+            }
+
+            /// An answer to the other opcode, or a truncated one, is never
+            /// read as this request's.
+            #[test]
+            fn a_short_or_mismatched_answer_is_not_this_requests(
+                op in opcode(),
+                cut in 0usize..16,
+            ) {
+                let other = if op == OP_MAP_UDP { OP_MAP_TCP } else { OP_MAP_UDP };
+                let buf = answer(&encode_request(op, 1, 1, 60), 0, 7, 40_000, 60);
+                prop_assert!(decode_response(&buf, other).is_err());
+                prop_assert!(decode_delete(&buf, other).is_err());
+                prop_assert!(decode_response(&buf[..cut], op).is_err());
+                prop_assert!(decode_delete(&buf[..cut], op).is_err());
+            }
+        }
+    }
 }

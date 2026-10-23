@@ -1585,4 +1585,76 @@ mod tests {
         assert!(!known.contains_key(&filler(0)));
         assert!(known.contains_key(&filler(MAX_KNOWN_CLIENTS)));
     }
+
+    /// `token` with bit `bit` (0..7, so it stays ASCII) of byte `at` flipped.
+    fn flip(token: &str, at: usize, bit: u8) -> String {
+        let mut bytes = token.as_bytes().to_vec();
+        let at = at % bytes.len();
+        bytes[at] ^= 1 << (bit % 7);
+        String::from_utf8(bytes).expect("an ASCII byte with a low bit flipped is ASCII")
+    }
+
+    /// The shape every minted token has: its prefix and 256 bits of
+    /// lowercase hex, and nothing that starts with the other kind's prefix.
+    fn assert_shape(token: &str, prefix: &str, other: &str) {
+        let hex = token
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("{token}"));
+        assert_eq!(hex.len(), 64, "{token}");
+        assert!(
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{token}"
+        );
+        assert!(!token.starts_with(other), "{token}");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// A minted API token resolves to its entry; the same token with any
+        /// one bit flipped resolves to nothing.
+        #[test]
+        fn a_token_resolves_and_no_one_bit_flip_of_it_does(at in 0usize..68, bit in 0u8..7) {
+            let (token, digest) = generate_token();
+            assert_shape(&token, STATIC_TOKEN_PREFIX, SESSION_TOKEN_PREFIX);
+            let mut c = cfg("unused".into());
+            c.token.push(TokenConfig {
+                name: "t".into(),
+                sha256: digest,
+                scopes: vec![Scope::Read],
+            });
+            let auth = Auth::new(c);
+            proptest::prop_assert_eq!(auth.token_scopes(&token).map(|(n, _)| n), Some("t"));
+            let flipped = flip(&token, at, bit);
+            proptest::prop_assert_ne!(&flipped, &token);
+            proptest::prop_assert!(auth.token_scopes(&flipped).is_none(), "{}", flipped);
+        }
+
+        /// A session token is live; the same token with any one bit flipped
+        /// is not, and a static token is never read as a session.
+        #[test]
+        fn a_session_resolves_and_no_one_bit_flip_of_it_does(at in 0usize..68, bit in 0u8..7) {
+            let s = SessionStore::new(Duration::from_secs(60));
+            let (token, _) = s.create();
+            assert_shape(&token, SESSION_TOKEN_PREFIX, STATIC_TOKEN_PREFIX);
+            proptest::prop_assert!(s.is_valid(&token));
+            proptest::prop_assert!(!s.is_valid(&flip(&token, at, bit)));
+            let (static_token, _) = generate_token();
+            proptest::prop_assert!(!s.is_valid(&static_token));
+        }
+    }
+
+    proptest::proptest! {
+        /// `ct_eq` is ordinary equality on every pair, equal or not.
+        #[test]
+        fn ct_eq_is_equality(
+            a in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..40),
+            b in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..40),
+            same in proptest::prelude::any::<bool>(),
+        ) {
+            let b = if same { a.clone() } else { b };
+            proptest::prop_assert_eq!(ct_eq(&a, &b), a == b);
+        }
+    }
 }

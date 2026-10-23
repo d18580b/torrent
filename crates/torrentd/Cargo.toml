@@ -79,6 +79,7 @@ rusqlite = { workspace = true }
 # and the port-forward monitor's pacing tests run on it.
 tokio = { workspace = true, features = ["test-util"] }
 kynos = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

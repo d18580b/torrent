@@ -3585,4 +3585,233 @@ table inet torrentd_ks_1000 {
         assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));
         remove_table_for(998).expect("remove");
     }
+
+    mod props {
+        use std::fmt::Debug;
+
+        use proptest::prelude::*;
+        use serde_json::json;
+        use serde_json::Value;
+
+        use super::*;
+
+        /// The words an `nft -j` listing is made of, and anything else.
+        fn word() -> impl Strategy<Value = String> {
+            prop_oneof![
+                prop::sample::select(vec![
+                    "nftables", "metainfo", "table", "chain", "rule", "set", "expr", "match",
+                    "left", "right", "op", "meta", "key", "payload", "protocol", "field",
+                    "counter", "accept", "drop", "name", "type", "hook", "prio", "policy", "skuid",
+                    "oifname", "ip", "ip6", "udp", "saddr", "daddr", "sport", "dport", "==", "!=",
+                    TABLE, "output",
+                ])
+                .prop_map(str::to_owned),
+                ".{0,8}",
+            ]
+        }
+
+        /// Any JSON value, its keys and strings drawn mostly from [`word`].
+        fn json_value() -> impl Strategy<Value = Value> {
+            let leaf = prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::from),
+                any::<i64>().prop_map(Value::from),
+                any::<u64>().prop_map(Value::from),
+                any::<f64>().prop_map(Value::from),
+                word().prop_map(Value::from),
+            ];
+            leaf.prop_recursive(5, 96, 6, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
+                    prop::collection::vec((word(), inner), 0..6)
+                        .prop_map(|kv| Value::Object(kv.into_iter().collect())),
+                ]
+            })
+        }
+
+        /// The listing of [`installed`]'s table, as nft printed it.
+        fn intact() -> Value {
+            serde_json::from_str(&listing(&[META, FENCE, LO, WG_A, PORT_V4, PORT_V6, DROP]))
+                .unwrap()
+        }
+
+        /// One change to one expression of one rule.
+        #[derive(Clone, Debug)]
+        enum Change {
+            /// Remove it.
+            Remove,
+            /// Put an expression the kill switch never installs in its place.
+            Foreign,
+            /// Give its match another right-hand side, or its verdict the
+            /// other verdict.
+            Value(String),
+            /// Turn its match's operator round.
+            Op,
+            /// Match on another key.
+            Key,
+        }
+
+        fn change() -> impl Strategy<Value = Change> {
+            prop_oneof![
+                Just(Change::Remove),
+                Just(Change::Foreign),
+                "[0-9a-z.:-]{1,12}".prop_map(Change::Value),
+                Just(Change::Op),
+                Just(Change::Key),
+            ]
+        }
+
+        /// `listing` with `change` made to expression `expr` of rule `rule`.
+        fn changed(
+            mut listing: Value,
+            rule: prop::sample::Index,
+            expr: prop::sample::Index,
+            change: &Change,
+        ) -> Value {
+            let rules: Vec<usize> = (0..listing["nftables"].as_array().unwrap().len())
+                .filter(|&i| listing["nftables"][i].get("rule").is_some())
+                .collect();
+            let exprs = listing["nftables"][rules[rule.index(rules.len())]]["rule"]["expr"]
+                .as_array_mut()
+                .unwrap();
+            let at = expr.index(exprs.len());
+            if let Change::Remove = change {
+                exprs.remove(at);
+                return listing;
+            }
+            let e = &mut exprs[at];
+            match change {
+                Change::Remove => unreachable!("removed above"),
+                Change::Foreign => *e = json!({"jump": {"target": "elsewhere"}}),
+                Change::Value(v) => {
+                    if let Some(m) = e.get_mut("match") {
+                        let right = &mut m["right"];
+                        *right = match right {
+                            Value::Number(n) => json!(n.as_u64().unwrap() + 1),
+                            Value::Object(set) => {
+                                // A name the set does not hold: a repeat
+                                // would read back as the same set.
+                                let mut set = set.clone();
+                                set["set"]
+                                    .as_array_mut()
+                                    .unwrap()
+                                    .push(json!(format!("{v}-x")));
+                                Value::Object(set)
+                            }
+                            Value::String(s) if *s == *v => json!(format!("{v}x")),
+                            _ => json!(v),
+                        };
+                    } else if e.get("accept").is_some() {
+                        *e = json!({"drop": null});
+                    } else {
+                        *e = json!({"accept": null});
+                    }
+                }
+                Change::Op => {
+                    if let Some(m) = e.get_mut("match") {
+                        let op = if m["op"] == "==" { "!=" } else { "==" };
+                        m["op"] = json!(op);
+                    } else {
+                        *e = json!({"match": {"op": "!=", "left": {"meta": {"key": "skuid"}}, "right": 998}});
+                    }
+                }
+                Change::Key => match e.get_mut("match") {
+                    Some(m) => m["left"] = json!({"meta": {"key": "mark"}}),
+                    None => *e = json!({"reject": null}),
+                },
+            }
+            listing
+        }
+
+        /// `items` in any order, with any of them repeated.
+        fn reordered<T: Clone + Debug>(items: Vec<T>) -> impl Strategy<Value = Vec<T>> {
+            let n = items.len();
+            prop::collection::vec(any::<prop::sample::Index>(), 0..4).prop_flat_map(move |dups| {
+                let mut all = items.clone();
+                if n > 0 {
+                    all.extend(dups.iter().map(|i| items[i.index(n)].clone()));
+                }
+                Just(all).prop_shuffle()
+            })
+        }
+
+        fn tunnels() -> impl Strategy<Value = Vec<Tunnel>> {
+            prop::collection::vec(
+                (
+                    prop::sample::select(vec!["wg-a", "wg-b", "tun0", "wg_c.1"]),
+                    any::<Ipv4Addr>(),
+                    prop::collection::vec(any::<Ipv6Addr>(), 0..3),
+                )
+                    .prop_map(|(iface, addr, v6)| Tunnel::new(iface, addr).with_v6(v6)),
+                0..5,
+            )
+        }
+
+        fn transports() -> impl Strategy<Value = Vec<Transport>> {
+            prop::collection::vec(
+                (
+                    any::<u16>(),
+                    prop::collection::vec(any::<SocketAddr>(), 0..3),
+                )
+                    .prop_map(|(port, endpoints)| Transport::new(port, endpoints)),
+                0..4,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Whatever `nft -j` prints, reading it back answers.
+            #[test]
+            fn reading_a_listing_never_panics(
+                value in json_value(),
+                entries in prop::collection::vec(json_value(), 0..6),
+            ) {
+                let _ = live_table(&value, TABLE);
+                let _ = skuids(&value);
+                let listing = json!({"nftables": entries});
+                let _ = live_table(&listing, TABLE);
+                let _ = skuids(&listing);
+            }
+
+            /// No change to any one expression of the installed table goes
+            /// unseen.
+            #[test]
+            fn any_single_expression_change_is_drift(
+                rule in any::<prop::sample::Index>(),
+                expr in any::<prop::sample::Index>(),
+                change in change(),
+            ) {
+                let json = changed(intact(), rule, expr, &change).to_string();
+                let verdict = verify_listing(json.clone()).unwrap();
+                prop_assert!(matches!(verdict, Verdict::Drifted(_)), "{:?}: {}", verdict, json);
+            }
+
+            /// The rendered ruleset depends on the set of tunnels and
+            /// transports, not on their order or on repeats.
+            #[test]
+            fn rendering_ignores_order_and_repeats(
+                (tunnels, tunnels2) in tunnels().prop_flat_map(|t| (Just(t.clone()), reordered(t))),
+                (transports, transports2) in
+                    transports().prop_flat_map(|t| (Just(t.clone()), reordered(t))),
+                uid in any::<u32>(),
+            ) {
+                prop_assert_eq!(
+                    render_ruleset_with_transport(uid, &tunnels, &transports).unwrap(),
+                    render_ruleset_with_transport(uid, &tunnels2, &transports2).unwrap(),
+                );
+            }
+
+            /// An interface-name set reads back the same in any order, with
+            /// any name repeated: nft lists a set as it likes.
+            #[test]
+            fn a_listed_name_set_reads_back_in_any_order(
+                names in reordered(vec!["lo", "wg-a"]),
+            ) {
+                let fence = FENCE.replace(r#"["lo", "wg-a"]"#, &json!(names).to_string());
+                let json = listing(&[META, &fence, LO, WG_A, PORT_V4, PORT_V6, DROP]);
+                prop_assert_eq!(verify_listing(json).unwrap(), Verdict::Intact);
+            }
+        }
+    }
 }

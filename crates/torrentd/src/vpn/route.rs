@@ -342,4 +342,72 @@ mod tests {
             "{r:?}"
         );
     }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// An interface name as config validation admits one.
+        const IFACE: &str = "[A-Za-z0-9_=+.-]{1,15}";
+
+        /// Words an `ip route get` answer is made of, around its `dev`.
+        fn words() -> impl Strategy<Value = Vec<String>> {
+            prop::collection::vec("[a-z0-9.:/]{1,12}", 0..6)
+        }
+
+        proptest! {
+            /// Whatever `ip` prints, judging it answers.
+            #[test]
+            fn judging_never_panics(iface in ".*", answer in ".*") {
+                let _ = judge(&iface, &answer);
+            }
+
+            /// A route by a longer interface that starts with the tunnel's
+            /// name is not the tunnel's.
+            #[test]
+            fn a_longer_interface_sharing_the_prefix_is_never_the_tunnel(
+                iface in IFACE,
+                suffix in "[A-Za-z0-9_=+.-]{1,4}",
+                before in words(),
+                after in words(),
+            ) {
+                let answer = format!(
+                    "1.1.1.1 {} dev {iface}{suffix} {}",
+                    before.join(" "),
+                    after.join(" "),
+                );
+                prop_assume!(!answer.split_whitespace().collect::<Vec<_>>()
+                    .windows(2).any(|w| w[0] == "dev" && w[1] == iface));
+                prop_assert!(
+                    matches!(judge(&iface, &answer), RouteProbe::Elsewhere(_)),
+                    "{}", answer
+                );
+            }
+
+            /// The first `dev` of the first line names the tunnel, and only
+            /// a reject route stands in the way; later lines never count.
+            #[test]
+            fn the_first_lines_device_decides(
+                iface in IFACE,
+                reject in prop::option::of(prop_oneof![
+                    Just("unreachable"), Just("prohibit"), Just("blackhole"), Just("throw"),
+                ]),
+                before in words(),
+                after in words(),
+            ) {
+                prop_assume!(!before.iter().any(|w| w == "dev") && iface != "eth0");
+                let first = format!(
+                    "{} 1.1.1.1 {} dev {iface} {}",
+                    reject.unwrap_or(""),
+                    before.join(" "),
+                    after.join(" "),
+                );
+                let via = judge(&iface, &format!("{first}\n    cache dev eth0\n"));
+                prop_assert_eq!(via == RouteProbe::ViaTunnel, reject.is_none(), "{}", first);
+                let later = judge(&iface, &format!("1.1.1.1 dev eth0\n{first}\n"));
+                prop_assert!(matches!(later, RouteProbe::Elsewhere(_)), "{}", first);
+            }
+        }
+    }
 }
