@@ -19,19 +19,28 @@ inputs:
     default: ''
   toolchain:
     description: >-
-      The Rust toolchain to install, or empty to install none and use the
-      runner's own.
+      `rust-toolchain.toml` installs the toolchain and components that file
+      pins, before anything builds. Empty installs none up front: a job that
+      builds nothing needs none, and any cargo run in the checkout still makes
+      rustup fetch the pinned one. Any other value is refused, so no job names
+      a version that file would silently override. The rustfmt nightly and
+      the MSRV are installed by their own mise tasks.
     required: false
-    default: '1.90'
-  components:
-    description: Comma-separated rustup components for the toolchain.
-    required: false
-    default: ''
+    default: rust-toolchain.toml
   cache-prefix:
     description: >-
       Key prefix for the cargo registry and target cache, one per job so jobs
       that build different feature sets do not evict each other's target/.
       Empty disables the cache.
+    required: false
+    default: ''
+  cache-key-file:
+    description: >-
+      One more file pattern whose contents the cache key hashes, beside
+      Cargo.lock and rust-toolchain.toml, for a job whose compiler or build
+      those two do not determine (the msrv job's comes from Cargo.toml's
+      rust-version). An exact key hit is never re-saved, so whatever picks
+      the compiler has to be in the key.
     required: false
     default: ''
 
@@ -52,10 +61,19 @@ runs:
           $EXTRA
 
     - if: inputs.toolchain != ''
-      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-      with:
-        toolchain: ${{ inputs.toolchain }}
-        components: ${{ inputs.components }}
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        set -euo pipefail
+        if [ "$TOOLCHAIN" != rust-toolchain.toml ]; then
+          echo "::error::toolchain must be 'rust-toolchain.toml' or empty, not '$TOOLCHAIN'"
+          exit 1
+        fi
+        # With no name, rustup installs the active toolchain, which
+        # rust-toolchain.toml names, with that file's profile and components.
+        rustup toolchain install
+        rustc --version
 
     - if: inputs.cache-prefix != ''
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -64,10 +82,15 @@ runs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', inputs.cache-key-file || 'rust-toolchain.toml') }}
         restore-keys: ${{ inputs.cache-prefix }}-${{ runner.os }}-
 
     # cargo-binstall lets mise fetch prebuilt convco and cargo-deny binaries
     # (no compile, no C build deps).
     - uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # v1.26.0
+    # The mise release every task is run on, so a new mise cannot change a
+    # task's behaviour under CI. mise.toml's `min_version` names the same
+    # release; move both together.
     - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+      with:
+        version: 2026.10.17

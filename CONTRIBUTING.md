@@ -23,17 +23,23 @@ the package lists for Fedora and Ubuntu are in
 
 ### Rust toolchain
 
-Pinned via [`rust-toolchain.toml`](./rust-toolchain.toml). On first invocation `rustup` will
-fetch the channel automatically; if you don't have rustup yet:
+Pinned to an exact stable release in [`rust-toolchain.toml`](./rust-toolchain.toml), which
+local builds, CI, and the container image all use. On first invocation `rustup` will fetch it
+automatically; if you don't have rustup yet:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+The oldest release the workspace supports is `rust-version` in [`Cargo.toml`](./Cargo.toml)
+(clippy.toml's `msrv` must match it); `mise run msrv` checks that it still compiles there,
+and so does CI.
+
 ### Developer tooling (mise + hk)
 
 Formatting, linting, and the git hooks are managed with [`mise`](https://mise.jdx.dev)
-and [`hk`](https://hk.jdx.dev). `mise` provisions the pinned `hk` and `convco`, and every
+(at least the `min_version` in `mise.toml`, the release CI pins) and
+[`hk`](https://hk.jdx.dev). `mise` provisions the pinned `hk` and `convco`, and every
 fmt/lint/test command is defined once in [`mise.toml`](./mise.toml) so local runs and CI
 stay in lock-step.
 
@@ -52,6 +58,7 @@ Everyday tasks:
 | `mise run lint-fix`| Clippy autofix                                           |
 | `mise run test`    | Workspace unit tests (see Test, below)                   |
 | `mise run check`   | fmt + lint                                               |
+| `mise run msrv`    | Check the workspace compiles on the MSRV (`rust-version`) |
 | `mise run size-check` | Fail on a source file over 2689 lines not in `.size-baseline` (see Style) |
 | `mise run test-all`| every automated test layer, including the ignored ones (not `deny` or `bench`) |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
@@ -59,8 +66,10 @@ Everyday tasks:
 | `mise run vpn-check <config> [-- <flags>]` | Verify a real VPN configuration (see below) |
 
 Formatting requires **nightly rustfmt** (`imports_granularity`/`group_imports` are
-unstable); `mise run setup` installs it and the `fmt` tasks invoke `cargo +nightly fmt`.
-Everything else builds/lints/tests on the pinned stable toolchain.
+unstable). The dated nightly it runs on is `RUSTFMT_TOOLCHAIN` in `mise.toml`, its only
+definition: `mise run setup` installs it (rerun `mise run rustfmt-toolchain` after it moves),
+and the `fmt` tasks invoke `cargo +$RUSTFMT_TOOLCHAIN fmt`. Everything else
+builds/lints/tests on the pinned stable toolchain.
 
 `vpn-check` is deliberately outside every `test` task: it needs a real host
 with real tunnels and is meaningless in CI. It takes a config path, forwards
