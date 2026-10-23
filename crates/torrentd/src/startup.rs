@@ -2569,14 +2569,14 @@ fn honour_tombstones(
             }
             continue;
         }
-        let left = torrentd_engine::handlers::add::delete_removed_files(
+        let left = torrentd_engine::removal::delete_removed_files(
             resume,
             torrents,
             metrics,
             profile,
             &ih,
             false,
-            torrentd_engine::handlers::add::Tombstone::Settle,
+            torrentd_engine::removal::Tombstone::Settle,
         );
         info!(profile_id = %profile, infohash = %ih, files_left = left.files_left(),
               "finished the delete of a removed torrent; not loading it");

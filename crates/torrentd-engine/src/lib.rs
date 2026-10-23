@@ -21,6 +21,7 @@ pub mod policy;
 pub mod port_forward;
 pub mod profile;
 pub mod real;
+pub mod removal;
 pub mod resume_store;
 pub mod source;
 pub mod state;
