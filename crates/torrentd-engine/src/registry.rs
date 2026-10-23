@@ -1334,7 +1334,8 @@ mod tests {
     #[test]
     fn a_hundred_thousand_assigns_take_seconds() {
         let dir = tempdir().unwrap();
-        let r = AssignmentRegistry::new_empty(dir.path().join("registry.db"));
+        let db = dir.path().join("registry.db");
+        let r = AssignmentRegistry::new_empty(&db);
         let start = std::time::Instant::now();
         for i in 0..100_000u32 {
             let mut b = [0u8; 20];
@@ -1342,8 +1343,12 @@ mod tests {
             r.assign(InfoHash(b), ProfileId::new("p")).unwrap();
         }
         let took = start.elapsed();
-        eprintln!("100000 assigns took {took:?}");
         assert!(took < Duration::from_secs(120), "took {took:?}");
+        // Fast because each assign writes one row, not because it wrote
+        // nothing: every one of them is on disk.
+        drop(r);
+        let reopened = AssignmentRegistry::open(&db, None).expect("reopen");
+        assert_eq!(reopened.len(), 100_000);
     }
 
     #[test]

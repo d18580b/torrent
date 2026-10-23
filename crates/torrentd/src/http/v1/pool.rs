@@ -44,6 +44,7 @@ use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
 use crate::pool_service::execute_adopt;
+use crate::pool_service::Adopted;
 use crate::pool_service::PoolService;
 
 /// The most infohashes one adoption or verification request may name.
@@ -1020,7 +1021,10 @@ from_profile_problem!(AdoptError);
 /// torrent another profile already holds is refused rather than announced from
 /// a second account. A torrent whose previous client left trustworthy resume
 /// data seeds at once (`fast_path`); any other is hashed by libtorrent before
-/// it seeds (`queued_for_verification`). Torrents that are not `matched` are
+/// it seeds (`queued_for_verification`). Each is listed under the path it
+/// took: one planned for the fast path whose resume data turns out unusable,
+/// or whose add the session rejects, is verified instead and listed under
+/// `queued_for_verification`. Torrents that are not `matched` are
 /// refused, each with the reason. `dry_run` reports all of this and adopts
 /// nothing.
 ///
@@ -1062,6 +1066,9 @@ pub async fn adopt_pool_torrents(
     // lock. Waiting there holds a blocking thread, not a runtime worker.
     blocking(move || adopt_each(&s, &pool, &req, &profile).map(Json)).await
 }
+
+/// The refusal for a target the drift check before an adopt could not see.
+const UNCHECKED_PAYLOAD: &str = "payload could not be checked for changes since the scan: its root or disk is unreadable or unmounted, or a file could not be stated (the log names it); make it readable, then adopt again";
 
 /// [`adopt_pool_torrents`] past its up-front checks: resolve the targets and
 /// adopt, or refuse, each in turn.
@@ -1117,6 +1124,12 @@ fn adopt_each(
         .map_err(|e| AdoptError::Internal {
             detail: internal("the drift check before adopting", e),
         })?;
+    // What the pass could not see — an unreadable or unmounted root or disk,
+    // or a file it could not stat — it leaves `matched`, which the planner
+    // would fast-path on a claim nobody checked. Refused instead, until the
+    // payload is readable again.
+    let unchecked: std::collections::HashSet<&str> =
+        drift.unchecked.iter().map(String::as_str).collect();
 
     let mut resp = AdoptionResult {
         dry_run: req.dry_run,
@@ -1130,6 +1143,10 @@ fn adopt_each(
         let refuse = |resp: &mut AdoptionResult, reason: String| {
             resp.refused.push(RefusedTorrent { infohash, reason });
         };
+        if unchecked.contains(ih.as_str()) {
+            refuse(&mut resp, UNCHECKED_PAYLOAD.to_owned());
+            continue;
+        }
         // Refused, not a 500: by now earlier targets may already be claimed
         // and loaded, and a failure here must leave the response saying
         // exactly which. The cause is logged; the reason says only that the
@@ -1147,21 +1164,20 @@ fn adopt_each(
             }
         };
 
-        // The two adoptable outcomes differ only in which bucket they land in
-        // and whether their bytes are counted, so collapse them: everything
-        // after this point — the registry claim above all — must hold for both,
-        // and holding it in two branches is how it came to hold in neither.
-        let verifies = match plan {
-            torrentd_pool::AdoptPlan::Refuse { reason } => {
-                refuse(&mut resp, reason.to_owned());
-                continue;
-            }
-            torrentd_pool::AdoptPlan::FastPath { .. } => false,
-            torrentd_pool::AdoptPlan::Verify { .. } => true,
-        };
+        // The plan is read here only to refuse before the registry claim: the
+        // two adoptable plans take the same steps below — the claim above all
+        // — and holding them in two branches is how they came to hold in
+        // neither. Which bucket a torrent lands in is not the plan's to say: a
+        // fast-path plan falls back to verification where its resume data
+        // will not do, so it is what `execute_adopt` did.
+        if let torrentd_pool::AdoptPlan::Refuse { reason } = plan {
+            refuse(&mut resp, reason.to_owned());
+            continue;
+        }
 
         // Counted only once it is taken, so a refused torrent's bytes are not.
-        let accept = |resp: &mut AdoptionResult| {
+        let accept = |resp: &mut AdoptionResult, adopted: Adopted| {
+            let verifies = adopted == Adopted::QueuedForVerification;
             if verifies {
                 resp.verify_bytes += pool
                     .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
@@ -1189,7 +1205,7 @@ fn adopt_each(
             // Everything up to the add, the account-isolation guard included,
             // so a dry run refuses what the adoption would.
             match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), true) {
-                Ok(_) => accept(&mut resp),
+                Ok(adopted) => accept(&mut resp, adopted),
                 Err(r) => refuse(&mut resp, r.reason),
             }
             continue;
@@ -1210,7 +1226,7 @@ fn adopt_each(
             continue;
         }
         match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), false) {
-            Ok(_) => accept(&mut resp),
+            Ok(adopted) => accept(&mut resp, adopted),
             Err(r) => {
                 release_claim(s, infohash);
                 if r.isolation {
@@ -1228,6 +1244,7 @@ fn adopt_each(
         queued = resp.queued_for_verification.len(),
         refused = resp.refused.len(),
         drifted = drift.drifted.len(),
+        unchecked = drift.unchecked.len(),
         "adopt",
     );
     Ok(resp)

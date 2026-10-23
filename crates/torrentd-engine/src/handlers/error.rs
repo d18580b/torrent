@@ -137,6 +137,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
     use std::time::Instant;
 
     use libtorrent_safe::alert::AlertHeader;
@@ -145,6 +146,7 @@ mod tests {
     use libtorrent_safe::TorrentHandle;
 
     use super::*;
+    use crate::clock::Clock;
     use crate::clock::MockClock;
     use crate::engine::TorrentEngine;
     use crate::metrics::MetricCall;
@@ -172,16 +174,19 @@ mod tests {
     }
 
     fn dispatch(alert: &Alert, state: &StateMap, metrics: &RecordingSink) {
+        dispatch_at(alert, state, metrics, &MockClock::new());
+    }
+
+    fn dispatch_at(alert: &Alert, state: &StateMap, metrics: &RecordingSink, clock: &MockClock) {
         let resume = MemoryResumeStore::new();
         let torrents = MemoryTorrentStore::new();
-        let clock = MockClock::new();
         let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
         let mut ctx = HandlerCtx {
             state,
             resume: &resume,
             torrents: &torrents,
             metrics,
-            clock: &clock,
+            clock,
             engine: &engine,
             profile_fenced: None,
             fence_hold: None,
@@ -205,7 +210,8 @@ mod tests {
         let state = StateMap::new();
         let metrics = RecordingSink::new();
         seed_state(&state, 0x11);
-        dispatch(
+        let clock = MockClock::new();
+        dispatch_at(
             &Alert::FileError {
                 hdr: hdr(0x11, AlertKind::FileError),
                 error_code: 28,
@@ -215,11 +221,17 @@ mod tests {
             },
             &state,
             &metrics,
+            &clock,
         );
         let st = state.get(&ih(0x11)).unwrap();
         assert_eq!(st.phase, TorrentPhase::DiskError);
         assert!(st.has_error, "file error must record the libtorrent error");
-        assert!(st.retry.is_some(), "retry timer must be armed");
+        let retry = st.retry.expect("retry timer must be armed");
+        assert_eq!(
+            (retry.next_attempt, retry.attempts),
+            (clock.now() + RetryState::INITIAL_DELAY, 1),
+            "the first retry comes due one initial delay after the error",
+        );
         assert!(metrics.calls().iter().any(
             |c| matches!(c, MetricCall::IncCounter { name, .. } if name == "disk_errors_total")
         ));
@@ -246,17 +258,25 @@ mod tests {
             st.phase = TorrentPhase::DiskError;
             st.has_error = false;
         });
-        dispatch(&file_error(), &state, &metrics);
+        let clock = MockClock::new();
+        dispatch_at(&file_error(), &state, &metrics, &clock);
         let st = state.get(&ih(0x44)).unwrap();
         assert_eq!(st.phase, TorrentPhase::DiskError);
         assert!(!st.has_error, "a further peer-read failure set has_error");
-        assert!(st.retry.is_some(), "retry timer must be armed");
+        let due = clock.now() + RetryState::INITIAL_DELAY;
+        let retry = st.retry.expect("retry timer must be armed");
+        assert_eq!((retry.next_attempt, retry.attempts), (due, 1));
 
+        // A later error leaves the armed timer as it was: re-arming it from
+        // the later instant would push the retry out with every failed read.
+        clock.advance(Duration::from_secs(30));
         state.update(&ih(0x44), |st| st.phase = TorrentPhase::Checking);
-        dispatch(&file_error(), &state, &metrics);
+        dispatch_at(&file_error(), &state, &metrics, &clock);
         let st = state.get(&ih(0x44)).unwrap();
         assert_eq!(st.phase, TorrentPhase::DiskError);
         assert!(st.has_error, "a check's file error must record the error");
+        let retry = st.retry.expect("the retry timer stays armed");
+        assert_eq!((retry.next_attempt, retry.attempts), (due, 1));
     }
 
     #[test]

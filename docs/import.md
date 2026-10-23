@@ -51,8 +51,9 @@ and `ProtectHome=yes` ([`deploy/torrentd.service`](../deploy/torrentd.service)).
 
 - **Payload must be readable by `torrentd`.** The scan counts an unreadable
   directory under `errors` (and `torrentd_pool_scan_errors_total{kind="walk"}`
-  or `"stat"`). An unreadable subdirectory of a root is indexed as empty, so
-  the torrents over it read `missing`. An unreadable or missing root keeps the
+  or `"stat"`). An unreadable subdirectory of a root keeps the rows from its
+  last readable scan, so the torrents over it keep their previous state, and
+  the rest of the root is re-indexed. An unreadable or missing root keeps the
   index from its last readable scan, so the torrents over it keep their
   previous state; a root that was never read has no index, and its torrents
   read `missing`. If you will use `allow_mutations` (plans
@@ -251,7 +252,16 @@ selected before it plans any of them. It re-stats each file a `matched` or
 `shared` torrent claims and marks a torrent whose files changed or vanished
 since the scan `drifted`, which the adopt then hashes instead of trusting. A
 qBittorrent torrent rewritten at the same size between the scan and the adopt
-is therefore queued for verification, not fast-pathed. To check the whole pool,
+is therefore queued for verification, not fast-pathed. A file counts as
+vanished only when it is not found under a root that is present, listable and
+not empty; a root that is missing, unreadable, or empty (an unmounted mount
+point) is logged as unreadable and no torrent over it changes state. A file not
+found whose nearest remaining directory is on another filesystem than the scan
+recorded the file on (a disk mounted inside a root, now unmounted) is logged
+the same way and is not drift, and a file that cannot be stated for another
+reason (permission, I/O) is logged and is not drift. The adopt refuses a
+torrent the check could not see for any of these reasons, rather than trust
+payload nobody looked at. To check the whole pool,
 adopted torrents included, run one yourself:
 
 ```bash
@@ -334,9 +344,13 @@ takes.
 A queued torrent is hashed after the request answers, so its hashing adds
 nothing to the wait.
 
-A torrent listed under `fast_path` can still end up hashed: when its resume
-data turns out unreadable or libtorrent rejects it, the adopt falls back to
-the verify queue and logs `falling back to verification`.
+A torrent the index plans for the fast path can still end up hashed: when its
+resume data turns out unreadable, unparseable or keyed by another info-hash,
+or libtorrent rejects its add, the adopt falls back to the verify queue and
+logs `falling back to verification`. The response lists it where it went,
+under `queued_for_verification`, with its bytes in `verify_bytes`; a dry run
+reports the fallbacks it can see before the add, every one but the rejected
+add.
 
 **Batches by account.** Where one root holds several accounts' torrents, a
 subtree does not separate them, but the qBittorrent category often does
@@ -398,6 +412,7 @@ which case it is that error's message:
 | `payload is incomplete` | `partial` | Put the missing files under a root and rescan. torrentd will not download them |
 | `no payload found under any managed root` | `missing` | Add the root it lives under, or move it under one, and rescan |
 | `another torrent claims some of the same files` | `overlap` | Remove one of the two `.torrent` files from the library, rescan |
+| `payload could not be checked for changes since the scan` | The drift check before the adopt (§4) found its root unreadable or unmounted, a disk under the root unmounted, or a file it could not stat; the log names which | Mount the disk or fix the permission, then adopt again |
 | `the previous client renamed these files…`, `…content layout moved these files…`, `…resume data maps a file outside…` | qBittorrent moved or renamed files in a way only its resume data describes, and that resume data cannot be used here | Rename the files back to the `.torrent`'s own paths in the old client, recopy `BT_backup`, rescan |
 | `resume data unreadable: …`, `resume data unparseable: …`, `resume add rejected: …`, each ending `…and the previous client renamed this torrent's files…` | A fast-path torrent whose resume data failed, for a torrent whose files qBittorrent renamed. A torrent without renamed files falls back to the verify queue instead (§5), but this one cannot: verifying from the `.torrent` looks for the files at paths where they are not | Recopy that torrent's `.fastresume` from `BT_backup` and rescan, or rename the files back to the `.torrent`'s own paths in the old client |
 | `cannot read the .torrent to check its trackers: …` | The profile has `allowed_tracker_domains`, and the `.torrent` in `library_dir` could not be read to check them | Fix the file's permissions (§2) or recopy it, rescan |
@@ -475,11 +490,18 @@ as `verify_queue_depth` and `verify_in_flight`.
   admission, or libtorrent rejected the add. Its registry claim is released,
   so it adopts again once the cause is fixed. The log line ends `dropping
   verify`, or reads `verify dropped: …` or `verify add failed`.
-- **A fenced or offline profile** holds the queue: nothing is admitted for it
-  until it is back (`verify held: profile is off the network`, or `re-hash
-  held: …` for a queued re-hash, logged once per profile each second). A
+- **A fenced or offline profile** holds its own items: nothing is admitted
+  for it until it is back, and the items behind them, for other profiles,
+  are admitted meanwhile (`verify held: profile is off the network`, or
+  `re-hash held: …` for a queued re-hash, logged once per profile each
+  second). A
   queued re-hash also waits while the profile's fence is lifted, until the
   lift's paced resume reaches its torrent.
+- **A running scan** holds the pool index until it commits. Meanwhile no
+  waiting adoption is admitted and no adoption's or re-hash's verdict is
+  recorded; each keeps its place and its slot, and goes on once the scan
+  ends. Re-hashes and `.torrent` adds waiting for a slot are started as
+  usual.
 - **A re-hash paused while it checks** keeps its slot until the check ends,
   because libtorrent goes on with it once the torrent is resumed. Resume or
   remove the torrent to free the slot; otherwise it is freed after 24 hours.

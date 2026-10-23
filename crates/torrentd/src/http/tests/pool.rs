@@ -907,6 +907,51 @@ async fn adoption_ignores_allow_mutations() {
     assert_eq!(r["queued_for_verification"], json!([IH_A]));
 }
 
+/// The drift check before an adopt leaves a torrent over an unmounted root
+/// `matched`, since nothing it could see changed; adopting it anyway trusted
+/// payload nobody looked at. Refused, dry run and adoption alike, and
+/// nothing is claimed.
+#[tokio::test]
+async fn adoption_refuses_payload_the_drift_check_could_not_see() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    // Unmounted: an empty mount point where the root was.
+    let root = dir.path().join("pool");
+    std::fs::rename(&root, dir.path().join("away")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.pool = Some(pool);
+    });
+    for dry_run in [true, false] {
+        let resp = h
+            .send(
+                "POST",
+                "/v1/pool/adoptions",
+                Some(&h.tokens.write.clone()),
+                adopt(
+                    "p",
+                    dry_run,
+                    json!({"kind": "infohashes", "infohashes": [IH_A]}),
+                ),
+            )
+            .await;
+        resp.assert_status(StatusCode::OK);
+        let r: Value = resp.json();
+        assert_eq!(r["fast_path"], json!([]), "{r}");
+        assert_eq!(r["queued_for_verification"], json!([]), "{r}");
+        assert_eq!(r["refused"][0]["infohash"], IH_A, "{r}");
+        assert!(
+            r["refused"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("could not be checked"),
+            "{r}"
+        );
+    }
+    assert_eq!(h.state.registry.len(), 0, "nothing was claimed");
+}
+
 /// A one-file `.torrent` announcing to `announce`.
 fn metainfo(announce: &str) -> Vec<u8> {
     let mut t = format!(
@@ -1019,9 +1064,11 @@ async fn resume_data_keyed_otherwise_than_the_index_is_verified_instead() {
             .await;
         resp.assert_status(StatusCode::OK);
         let r = resp.json::<Value>();
-        // Reported under the plan's bucket, as every fallback from the fast
-        // path to verification is.
-        assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+        // Issue #454: reported where it went, not under the plan's fast
+        // path, with its bytes counted as a verification's.
+        assert_eq!(r["fast_path"], json!([]), "{r}");
+        assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
+        assert_eq!(r["verify_bytes"], json!(96), "{r}");
         let queue = index.verify_queue();
         let queued = queue.depth() + queue.in_flight();
         assert_eq!(queued, usize::from(!dry_run), "dry run {dry_run}: {r}");
@@ -2404,6 +2451,13 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let pool = service(dir.path(), true);
     let root_id = pool.roots()[0].0;
+    // A root that is present and not empty, so the drift check trusts its
+    // not-found for `big/x` rather than reading the root as unmounted.
+    write(&dir.path().join("pool"), "present", 1);
+    // On the root's own filesystem, so the not-found reads as the file gone
+    // rather than a disk unmounted under the root.
+    let dev =
+        std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(dir.path().join("pool")).unwrap());
     const BAD: &str = "not-an-infohash";
     let bogus_step_plan = pool.with_store_mut(|st| {
         // Two files whose sizes sum past `i64::MAX`. The materialised tree
@@ -2415,7 +2469,7 @@ async fn internal_failures(cov: &Arc<Coverage>) {
             size: i64::MAX as u64,
             mtime_ns: 0,
             ino,
-            dev: 1,
+            dev,
             v2_root: None,
         };
         st.replace_root_files(root_id, &[huge("big/x", 1), huge("big/y", 2)], 0)
