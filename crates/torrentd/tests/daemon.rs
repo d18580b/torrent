@@ -1170,6 +1170,105 @@ fn a_non_reloadable_change_is_reported_on_the_second_reload_too() {
     assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
+/// A real `SIGHUP`, not `POST /v1/config/reload`, reaches the reload pump,
+/// and a `connections_limit` edit is applied to the profile's live libtorrent
+/// session: `SIGHUP: settings applied` is logged only once that session's
+/// `apply_settings` has returned, and nothing is counted as a failed reload.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_sighup_applies_connections_limit_to_the_live_session() {
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    // `settings applied` is an info line.
+    let body = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        body.replace("log_level = \"warn\"\n", "log_level = \"info\"\n"),
+    )
+    .unwrap();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    let (tx, lines) = std::sync::mpsc::channel::<String>();
+    let stdout = child.0.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    wait_healthy(addr);
+
+    let body = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        body.replace(
+            "enable_lsd = false\n",
+            "enable_lsd = false\nconnections_limit = 321\n",
+        ),
+    )
+    .unwrap();
+    Command::new("kill")
+        .args(["-HUP", &child.0.id().to_string()])
+        .status()
+        .expect("send SIGHUP");
+
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let applied = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = lines.recv_timeout(left) else {
+            panic!("no reload verdict within 10s; output:\n{}", seen.join("\n"));
+        };
+        seen.push(line.clone());
+        if line.contains("SIGHUP: settings applied")
+            || line.contains("SIGHUP: apply_settings failed")
+            || line.contains("SIGHUP: config unchanged")
+            || line.contains("connections_limit refused")
+        {
+            break line;
+        }
+    };
+    assert!(
+        seen.iter().any(|l| l.contains("received SIGHUP")),
+        "the signal, not the HTTP trigger, started this reload: {}",
+        seen.join("\n"),
+    );
+    assert!(
+        applied.contains("SIGHUP: settings applied")
+            && applied.contains(&format!("\"profile_id\":\"{PROFILE}\"")),
+        "the edit reached the profile's session: {applied}",
+    );
+    assert_eq!(
+        metric(
+            addr,
+            "torrentd_config_reload_failures_total{stage=\"apply_settings\"}"
+        ),
+        0.0,
+    );
+
+    sigterm(&child.0);
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
+}
+
 /// A one-file `.torrent` named `name`, announcing to `announce`.
 fn metainfo(name: &str, announce: &str) -> Vec<u8> {
     let mut t = format!(
