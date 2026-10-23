@@ -735,20 +735,44 @@ impl StateMap {
         true
     }
 
-    /// Put every in-flight save back at the front of the queue, to be asked
-    /// for again with `flags`.
+    /// Put every save in flight to `profile`'s session back at the front of
+    /// the queue, to be asked for again with `flags`.
     ///
     /// For an `alerts_dropped_alert` that names the resume alerts: libtorrent
     /// says only *which types* it dropped, never which torrents, so any save in
-    /// flight may be one whose answer is gone and will never settle. Asking
-    /// again is cheap and idempotent; waiting is the shutdown deadline. Returns
-    /// how many were re-queued.
+    /// flight to the session whose queue overflowed may be one whose answer is
+    /// gone and will never settle. Asking again is cheap and idempotent;
+    /// waiting is the shutdown deadline. Returns how many were re-queued.
+    ///
+    /// Only that session's: each profile's session has an alert queue of its
+    /// own, so another profile's answers are still on their way. Taking those
+    /// out of flight too let the dispatcher hand out a fresh
+    /// [`RESUME_SAVES_IN_FLIGHT`](crate::alert_loop::RESUME_SAVES_IN_FLIGHT)
+    /// while the first ones were still owed, doubling what the sessions had
+    /// outstanding. A save whose torrent the map no longer tracks belongs to
+    /// no session anyone can name; it is re-queued too, since the dispatcher
+    /// settles it without asking libtorrent anything.
     ///
     /// One that changed while in flight is asked for unconditionally whatever
     /// `flags` says, and that one request answers its change.
-    pub fn requeue_in_flight_resume_saves(&self, flags: ResumeFlags) -> usize {
+    pub fn requeue_in_flight_resume_saves(&self, profile: &ProfileId, flags: ResumeFlags) -> usize {
+        // The map is read with the saves lock released, so no lock order
+        // between the two is assumed.
+        let in_flight: Vec<InfoHash> = self.saves.lock().in_flight.keys().copied().collect();
+        let ours: Vec<InfoHash> = in_flight
+            .into_iter()
+            .filter(|ih| {
+                self.inner
+                    .get(ih)
+                    .is_none_or(|st| st.profile_id == *profile)
+            })
+            .collect();
         let mut s = self.saves.lock();
-        let lost: Vec<InfoHash> = s.in_flight.drain().map(|(ih, _)| ih).collect();
+        // One that settled in between is no longer owed.
+        let lost: Vec<InfoHash> = ours
+            .into_iter()
+            .filter(|ih| s.in_flight.remove(ih).is_some())
+            .collect();
         for ih in lost.iter().rev() {
             let flags = if s.again.remove(ih) {
                 ResumeFlags::empty()
@@ -890,7 +914,7 @@ mod tests {
         m.dispatch_resume_saves(10);
         m.queue_resume_save_now(ih(1));
         assert_eq!(
-            m.requeue_in_flight_resume_saves(ResumeFlags::ONLY_IF_MODIFIED),
+            m.requeue_in_flight_resume_saves(&ProfileId::new("p"), ResumeFlags::ONLY_IF_MODIFIED),
             1
         );
         assert_eq!(
@@ -935,7 +959,10 @@ mod tests {
             m.queue_resume_save(ih(b), ResumeFlags::ONLY_IF_MODIFIED);
         }
         m.dispatch_resume_saves(2);
-        assert_eq!(m.requeue_in_flight_resume_saves(ResumeFlags::empty()), 2);
+        assert_eq!(
+            m.requeue_in_flight_resume_saves(&ProfileId::new("p"), ResumeFlags::empty()),
+            2
+        );
         assert_eq!(m.resume_saves_in_flight(), 0);
         assert_eq!(m.pending_resume_count(), 3);
         let again = m.dispatch_resume_saves(2);
@@ -943,6 +970,36 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![0, 1], "the lost ones go ahead of the queue");
         assert!(again.iter().all(|(_, f)| f.is_empty()));
+    }
+
+    #[test]
+    fn an_overflow_requeues_only_the_saves_in_flight_to_its_own_profile() {
+        let m = StateMap::new();
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let now = Instant::now();
+        // 1 and 2 are p's, 3 is q's, 4 is no longer tracked by anyone.
+        assert!(m.track_added(handle(1, 1), &p, now));
+        assert!(m.track_added(handle(2, 2), &p, now));
+        assert!(m.track_added(handle(3, 3), &q, now));
+        for b in 1..=4 {
+            m.queue_resume_save(ih(b), ResumeFlags::ONLY_IF_MODIFIED);
+        }
+        assert_eq!(m.dispatch_resume_saves(10).len(), 4);
+        assert_eq!(
+            m.requeue_in_flight_resume_saves(&p, ResumeFlags::empty()),
+            3
+        );
+        assert_eq!(m.resume_saves_in_flight(), 1, "q's answer is still owed");
+        let mut again: Vec<u8> = m
+            .dispatch_resume_saves(10)
+            .into_iter()
+            .map(|(h, _)| h.0[0])
+            .collect();
+        again.sort();
+        assert_eq!(again, vec![1, 2, 4]);
+        // q's own answer settles its save, once.
+        assert!(m.note_resume_settled(&ih(3)));
+        assert!(!m.note_resume_settled(&ih(3)));
     }
 
     #[test]

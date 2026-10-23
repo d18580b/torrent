@@ -47,6 +47,7 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use thiserror::Error;
 use tracing::debug;
 use tracing::info;
@@ -481,24 +482,39 @@ impl AssignmentRegistry {
         Ok(Claim::New)
     }
 
-    /// Remove an assignment. No-op if the infohash isn't present.
+    /// Remove an assignment, returning the profile it named. No-op, returning
+    /// `None`, if neither this process nor the database holds one.
+    ///
+    /// The database's row is deleted whether or not this process had loaded
+    /// it: a row another process wrote after this one loaded the registry is
+    /// still the assignment [`Self::assign`] answers with, so leaving it would
+    /// keep the info-hash claimed after the remove said it was not. Such a
+    /// row's profile is returned only if it is one `read_all` would have
+    /// loaded.
     ///
     /// Like [`Self::assign`], persisted before it is visible: a write that
     /// fails leaves the assignment in place, so retrying the remove retries
     /// the write.
     pub fn remove(&self, ih: &InfoHash) -> Result<Option<ProfileId>, RegistryError> {
         let mut conn = self.writer.lock();
-        let Some(prev) = self.inner.read().get(ih).cloned() else {
+        let tx = conn.transaction().map_err(|e| self.db_err(e))?;
+        let deleted: Option<String> = tx
+            .query_row(
+                "DELETE FROM assignment WHERE infohash = ?1 RETURNING profile_id",
+                params![ih.to_hex()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| self.db_err(e))?;
+        tx.commit().map_err(|e| self.db_err(e))?;
+        let prev = self.inner.write().remove(ih).or_else(|| {
+            deleted
+                .filter(|id| crate::profile::ProfileConfig::is_valid_id(id))
+                .map(ProfileId::new)
+        });
+        let Some(prev) = prev else {
             return Ok(None);
         };
-        let tx = conn.transaction().map_err(|e| self.db_err(e))?;
-        tx.execute(
-            "DELETE FROM assignment WHERE infohash = ?1",
-            params![ih.to_hex()],
-        )
-        .map_err(|e| self.db_err(e))?;
-        tx.commit().map_err(|e| self.db_err(e))?;
-        self.inner.write().remove(ih);
         drop(conn);
         debug!(
             target: "torrentd_engine::registry",
@@ -1026,6 +1042,31 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(r.lookup(&ih), Some(ProfileId::new("other")));
+    }
+
+    #[test]
+    fn remove_deletes_a_row_written_by_another_process() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("registry.db");
+        let r = AssignmentRegistry::open(&db, None).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO assignment VALUES ('0101010101010101010101010101010101010101', 'other')",
+                [],
+            )
+            .unwrap();
+        let ih = InfoHash([1u8; 20]);
+        assert_eq!(r.lookup(&ih), None, "never loaded into this process");
+        assert_eq!(r.remove(&ih).unwrap(), Some(ProfileId::new("other")));
+        // The info-hash is free: this process's assign is a new claim, and a
+        // fresh open finds the one row that assign wrote.
+        assert_eq!(r.assign(ih, ProfileId::new("mine")).unwrap(), Claim::New);
+        drop(r);
+        let reopened = AssignmentRegistry::open(&db, None).unwrap();
+        assert_eq!(reopened.lookup(&ih), Some(ProfileId::new("mine")));
+        // Nothing left to remove is still a no-op.
+        assert_eq!(reopened.remove(&InfoHash([2u8; 20])).unwrap(), None);
     }
 
     /// The same row naming the caller's own profile is not a claim this call

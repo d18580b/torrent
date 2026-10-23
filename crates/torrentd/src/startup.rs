@@ -8327,8 +8327,12 @@ mod profile_construction_tests {
         let cfg = cfg_with(dir.path(), &[host("public", true), vpn("a", "wg-a", 1)]);
         for p in &cfg.profile {
             let engine = MockEngine::new();
+            // Resume data libtorrent reads: the add refuses anything else.
+            let resume = b"d11:file-format22:libtorrent resume file12:file-versioni1e\
+                           9:info-hash20:\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\
+                           \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01e";
             engine
-                .add_torrent(resume_scan_params(p, vec![1; 32], None, None, false))
+                .add_torrent(resume_scan_params(p, resume.to_vec(), None, None, false))
                 .unwrap();
             engine
                 .add_torrent(torrent_dir_scan_params(p, vec![2; 32], "/data".into()))

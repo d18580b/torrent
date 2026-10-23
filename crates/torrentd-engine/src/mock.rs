@@ -528,9 +528,16 @@ impl TorrentEngine for MockEngine {
         // from the params' bytes; tests that need a specific infohash should
         // pre-register via `register_handle` and push their own AddTorrent
         // alert.
-        let named = libtorrent_safe::add_info_hashes(&params)
-            .ok()
-            .and_then(|read| read.hashes.key());
+        //
+        // Resume data libtorrent cannot read — not bencode, or with a
+        // `.torrent` naming another torrent than it does — is refused by the
+        // real session's add, so it is refused here too rather than given a
+        // handle a live daemon would never have had.
+        let named = match libtorrent_safe::add_info_hashes(&params) {
+            Ok(read) => read.hashes.key(),
+            Err(e) if matches!(params, AddParams::Resume { .. }) => return Err(e.into()),
+            Err(_) => None,
+        };
         let ih = named.unwrap_or_else(|| {
             let bytes = match &params {
                 AddParams::Resume { bytes, .. } | AddParams::File { bytes, .. } => bytes.as_slice(),
@@ -874,11 +881,29 @@ mod tests {
             .unwrap();
         assert_eq!(h.infohash, InfoHash([0x22u8; 20]));
 
-        // Not bencode: the first 20 bytes.
+        // A `.torrent` that is not bencode: the first 20 bytes.
         let h = m
-            .add_torrent(AddParams::resume(b"0123456789abcdefghijKLMN".to_vec()))
+            .add_torrent(AddParams::File {
+                bytes: b"0123456789abcdefghijKLMN".to_vec(),
+                save_path: "/tmp".into(),
+                flags: libtorrent_safe::TorrentFlags::empty(),
+                trackers: vec![],
+            })
             .unwrap();
         assert_eq!(h.infohash, InfoHash(*b"0123456789abcdefghij"));
+    }
+
+    /// Real libtorrent refuses resume data it cannot decode, so the mock does
+    /// too, and gives the bytes no handle.
+    #[test]
+    fn add_torrent_refuses_resume_data_that_is_not_bencode() {
+        let m = MockEngine::new();
+        let err = m
+            .add_torrent(AddParams::resume(b"0123456789abcdefghijKLMN".to_vec()))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Safe(_)), "{err:?}");
+        assert_eq!(m.handle_count(), 0);
+        assert!(m.pop_alerts().is_empty(), "no add alert for a refused add");
     }
 
     #[test]
