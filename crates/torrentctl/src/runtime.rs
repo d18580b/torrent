@@ -1,11 +1,14 @@
 //! The loop: draw, wait for a key, a tick, a change notification or an
 //! effect's result, apply it, spawn what it asks for, repeat.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use crossterm::event::Event;
 use crossterm::event::EventStream;
 use crossterm::event::KeyEventKind;
+use futures_util::FutureExt as _;
 use futures_util::StreamExt as _;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
@@ -26,19 +29,37 @@ const TICK: Duration = Duration::from_millis(250);
 /// (the alternate screen left, the cursor shown) rather than leaving it raw.
 pub const PANIC_AFTER_DRAW: &str = "TORRENTCTL_TEST_PANIC";
 
+/// Set in the environment, the loop spawns an effect that panics right after
+/// its first draw: how `tests/e2e.rs` proves that a panic on a background
+/// task stops the loop and exits, rather than leaving it drawing over a
+/// terminal the panic hook already restored.
+pub const PANIC_IN_TASK: &str = "TORRENTCTL_TEST_PANIC_IN_TASK";
+
+/// Why [`run`] ended without the user quitting.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("the terminal failed")]
+    Terminal(#[from] std::io::Error),
+    /// A background task panicked ([`Msg::Fatal`]).
+    #[error("torrentctl stopped: {0}")]
+    Fatal(String),
+}
+
 /// Run until the user quits, returning what to tell them once the terminal
-/// is theirs again ([`Model::exit_notice`]).
+/// is theirs again ([`Model::exit_notice`]), or until a background task
+/// panics ([`Error::Fatal`]).
 pub async fn run(
     mut model: Model,
     terminal: &mut DefaultTerminal,
-) -> std::io::Result<Option<String>> {
+) -> Result<Option<String>, Error> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     // The event stream follows whichever credential is in use: a sign-in or
     // a sign-out changes it.
     let (api_tx, api_rx) = watch::channel(model.api.clone());
-    tokio::spawn(follow_events(api_rx, tx.clone()));
+    spawn_task(&tx, "the event stream", follow_events(api_rx, tx.clone()));
 
     spawn(&tx, vec![app::check_session(&model.api)]);
+    let mut panic_in_task = std::env::var_os(PANIC_IN_TASK).is_some();
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -48,11 +69,17 @@ pub async fn run(
         if std::env::var_os(PANIC_AFTER_DRAW).is_some() {
             panic!("{PANIC_AFTER_DRAW} is set");
         }
+        if std::mem::take(&mut panic_in_task) {
+            spawn(
+                &tx,
+                vec![Effect::new(async { panic!("{PANIC_IN_TASK} is set") })],
+            );
+        }
         let msg = tokio::select! {
             event = keys.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => Msg::Key(key),
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(e),
+                Some(Err(e)) => return Err(e.into()),
                 None => break,
             },
             _ = tick.tick() => Msg::Tick,
@@ -69,18 +96,47 @@ pub async fn run(
         });
         spawn(&tx, effects);
     }
-    Ok(model.exit_notice)
+    match model.fatal {
+        Some(what) => Err(Error::Fatal(what)),
+        None => Ok(model.exit_notice),
+    }
 }
 
-/// Run each effect on its own task, sending its message to `tx`.
+/// Run each effect on its own task, sending its message to `tx`. An effect
+/// that panics sends [`Msg::Fatal`] instead.
 pub fn spawn(tx: &mpsc::UnboundedSender<Msg>, effects: Vec<Effect>) {
     for effect in effects {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let msg = effect.0.await;
-            let _ = tx.send(msg);
+        let reply = tx.clone();
+        spawn_task(tx, "a request", async move {
+            let _ = reply.send(effect.0.await);
         });
     }
+}
+
+/// Run `task` on its own task, sending [`Msg::Fatal`] to `tx` if it panics.
+///
+/// Tokio would otherwise swallow the panic into a join handle nobody awaits,
+/// after the panic hook has already restored the terminal: the loop would
+/// keep drawing over the normal screen with raw mode off, or, for the event
+/// stream, live updates would stop without a word.
+fn spawn_task(
+    tx: &mpsc::UnboundedSender<Msg>,
+    what: &'static str,
+    task: impl Future<Output = ()> + Send + 'static,
+) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        // Nothing the task touched is observed after a panic: the loop
+        // stops on the message this sends.
+        if let Err(payload) = AssertUnwindSafe(task).catch_unwind().await {
+            let said = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("a non-string payload");
+            let _ = tx.send(Msg::Fatal(format!("{what} panicked: {said}")));
+        }
+    });
 }
 
 /// How long the event stream may go without an event before it is taken
@@ -325,6 +381,53 @@ mod tests {
             Live::Reconnecting { reason } => reason,
             other => panic!("expected the stream down, got {other:?}"),
         }
+    }
+
+    fn fatal(msg: Msg) -> String {
+        match msg {
+            Msg::Fatal(what) => what,
+            other => panic!("expected a fatal message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_effect_that_panics_sends_a_fatal_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn(
+            &tx,
+            vec![
+                Effect::new(async { panic!("effect blew up") }),
+                Effect::new(async { panic!("{} blew up", "formatted") }),
+                Effect::now(Msg::Tick),
+            ],
+        );
+        let mut said = Vec::new();
+        for _ in 0..3 {
+            match next(&mut rx).await {
+                Msg::Tick => {}
+                msg => said.push(fatal(msg)),
+            }
+        }
+        said.sort();
+        assert_eq!(
+            said,
+            [
+                "a request panicked: effect blew up",
+                "a request panicked: formatted blew up",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_panics_sends_a_fatal_message_naming_it() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_task(&tx, "the event stream", async {
+            std::panic::panic_any(7_u8);
+        });
+        assert_eq!(
+            fatal(next(&mut rx).await),
+            "the event stream panicked: a non-string payload"
+        );
     }
 
     #[tokio::test]
