@@ -2,9 +2,9 @@
  * libtorrent_shim.h — minimal C ABI over libtorrent-rasterbar for torrentd.
  *
  * Pure C header. No C++ types, no inheritance, no exceptions cross this boundary.
- * The implementation in libtorrent_shim.cpp wraps every public function in
- * try/catch and surfaces errors via err_out string buffers and integer return
- * codes (LT_OK / LT_ERR).
+ * The implementation (the shim_*.cpp files; shim_internal.h maps them) wraps
+ * every public function in try/catch and surfaces errors via err_out string
+ * buffers and integer return codes (LT_OK / LT_ERR).
  *
  * Handle model
  *   `lt_handle` is a small integer keyed into a per-session map of
@@ -124,7 +124,7 @@ typedef uintptr_t lt_handle;
 /* ------------------------------------------------------------------ */
 /* Alert kinds (discriminant for lt_alert_union::kind)                 */
 /* Keep this list in sync with alert_union.h and the dispatch table    */
-/* in libtorrent_shim.cpp::translate_alert.                            */
+/* in shim_alerts.cpp's translate_alert.                               */
 /* ------------------------------------------------------------------ */
 
 typedef enum {

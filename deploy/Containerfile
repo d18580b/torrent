@@ -12,8 +12,9 @@ RUN dnf install -y \
         git curl ca-certificates \
     && dnf clean all
 
-# Rust toolchain — pinned to whatever rust-toolchain.toml in the repo
-# requests (currently 1.90).
+# Rust toolchain — rustup installs no toolchain here; the build below fetches
+# the exact release rust-toolchain.toml pins, so the image builds with the
+# same compiler as CI and a developer.
 #
 # The installer is downloaded to a file and run as a separate command, not
 # piped into `sh`: a pipeline's status is its last command's, so a failed

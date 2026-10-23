@@ -15,7 +15,7 @@ inputs:
     description: >-
       Initialize vendor/libtorrent even on a cache hit. The shim FFI suite
       reads .torrent fixtures out of the pinned libtorrent test corpus
-      (crates/libtorrent-sys/tests/shim.rs), so that job needs the tree on
+      (crates/libtorrent-sys/tests/shim/), so that job needs the tree on
       disk whether or not it needs to build anything. libtorrent alone is
       ~16 MB shallow; Boost, the expensive one, is still skipped.
     required: false
