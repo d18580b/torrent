@@ -1151,7 +1151,10 @@ pub(crate) async fn watch(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(WATCH_INTERVAL) => {}
-            () = stop.stopped() => return,
+            () = stop.stopped() => {
+                tracing::info!(target: "torrentd::vpn::killswitch", table = %table, "kill switch watch stopping");
+                return;
+            }
         }
         // Blocking throughout: the checks and the reinstall shell out to nft,
         // and fencing pauses torrents under each session's lock.
