@@ -284,6 +284,25 @@ mod tests {
             &mut m,
             Msg::SessionChecked(Ok((testing::server(pool, true), principal))),
         );
+        // The dashboard answered, so the shell is drawn around a screen
+        // with content rather than a spinner.
+        let status = testing::from_json(json!({
+            "torrents_total": 12, "seeding": 10, "paused": 1, "checking": 1,
+            "disk_error": 0, "errored": 0, "peers_total": 34,
+            "upload_rate_total": 1_048_576, "download_rate_total": 0,
+            "pending_resume_count": 0, "profile_count": 1,
+        }));
+        let profiles = testing::from_json(json!([
+            {"profile_id": "acct_a", "status": "active", "tunnel_ip": "10.2.0.2",
+             "desired_state": "online", "effective_state": "online",
+             "torrent_count": 12, "listen_port": 51413, "port_forward": "static",
+             "forwarded_port": null, "user_agent": null, "failure_reason": null},
+        ]));
+        app::update(
+            &mut m,
+            Msg::Dashboard(screens::dashboard::Msg::Loaded(Ok((status, profiles)))),
+        );
+        assert!(!m.dashboard.loading);
         m.live = Live::Streaming;
         m
     }
@@ -312,6 +331,8 @@ mod tests {
             assert!(screen.contains("4 Pool"));
             assert!(screen.contains("● live"));
             assert!(screen.contains("token operator"));
+            assert!(screen.contains("acct_a"), "the dashboard inside: {screen}");
+            assert!(!screen.contains("loading"), "{screen}");
             insta::assert_snapshot!(format!("shell_{w}x{h}"), screen);
         }
         let without_pool = draw(&signed_in(false), 160, 48);
@@ -350,7 +371,12 @@ mod tests {
         app::update(&mut m, Msg::Key(testing::key(KeyCode::Char(':'))));
         app::update(&mut m, Msg::Key(testing::key(KeyCode::Char('t'))));
         let screen = draw(&m, 100, 30);
-        assert!(screen.contains(":t"), "{screen}");
+        let palette: Vec<&str> = screen.lines().filter(|l| l.contains(":t")).collect();
+        assert_eq!(
+            palette,
+            [format!("│:t{}│", " ".repeat(96))],
+            "one palette row, holding what was typed: {screen}"
+        );
     }
 
     #[test]

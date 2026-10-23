@@ -276,7 +276,11 @@ mod tests {
 
     #[test]
     fn the_config_file_refuses_unknown_keys() {
-        assert!(toml::from_str::<File>("url = 'http://x'\ntoken = 'no'").is_err());
+        let err = toml::from_str::<File>("url = 'http://x'\ntoken = 'no'").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `token`"),
+            "refused for the unknown key, not anything else: {err}"
+        );
         let file: File = toml::from_str("url = 'http://x'\ntoken_file = '/t'").unwrap();
         assert_eq!(file.token_file.as_deref(), Some(Path::new("/t")));
     }
