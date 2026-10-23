@@ -1132,7 +1132,12 @@ The daemon sets none of these itself.
   listen failure. An API that runs out of descriptors accepting a connection
   keeps listening too: its open requests carry on, and it accepts again after
   10 ms, doubling to 1 s on TCP and to 30 s on a unix socket, logging a
-  warning each time. The daemon does not restart. The
+  warning each time: `retrying failed accept` with `local_addr` on TCP (the
+  server library's own line), `accept on the API socket failed; retrying
+  after a backoff` with `path` on a unix socket. That warning is the only
+  signal: no metric counts it and the systemd status does not change, so
+  search the journal for it when the API stops answering while the daemon
+  still reports healthy. The daemon does not restart. The
   HTTP API draws on the same table and holds at most 256 connections; the
   next waits in the listen backlog. An HTTP/2 connection carries at most 16
   requests at once. It closes a connection that has not sent a whole

@@ -74,6 +74,8 @@ Refusals:
   the one that requires it, and keeps a header `required` only where every
   description of the response requires it. A client generated from the
   document may read the header as optional; the daemon always sends it.
+  The upstream fix is tracked in
+  [issue 508](https://github.com/d18580b/torrent/issues/508).
 - A valid token without the scope is a `403`
   [`insufficient-scope`](problems.md#insufficient-scope).
 - `POST /v1/sessions` is throttled per client (per /64 for IPv6), and against a daemon-wide
