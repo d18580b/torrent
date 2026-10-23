@@ -163,6 +163,16 @@ pub fn busy(state: &State) -> bool {
     state.loading
 }
 
+/// Whether the last load of the list, or of the selected profile's detail,
+/// failed, so what is shown may predate a change.
+pub fn load_failed(state: &State) -> bool {
+    state.error.is_some()
+        || state
+            .detail_error
+            .as_ref()
+            .is_some_and(|(id, _)| state.current().is_some_and(|p| p.profile_id == *id))
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.asking.is_some() {
         return Some(Msg::ConfirmKey(key));

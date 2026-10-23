@@ -261,6 +261,15 @@ pub fn busy(state: &State) -> bool {
         }
 }
 
+/// Whether the last load of what is shown, the list or the open torrent,
+/// failed, so it may predate a change.
+pub fn load_failed(state: &State) -> bool {
+    match &state.detail {
+        Some(d) => d.error.is_some() || d.files.error.is_some() || d.trackers_error.is_some(),
+        None => state.list.error.is_some(),
+    }
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.confirm.is_some() {
         return Some(Msg::ConfirmKey(key));

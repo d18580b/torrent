@@ -66,6 +66,11 @@ pub fn busy(state: &State) -> bool {
     state.loading
 }
 
+/// Whether the last load failed, so what is shown may predate a change.
+pub fn load_failed(state: &State) -> bool {
+    state.error.is_some()
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.confirm_reload.is_some() {
         return Some(Msg::ConfirmKey(key));
