@@ -498,7 +498,8 @@ fn add_magnet_marshals_add_torrent_alert_union() {
                 assert_ne!(u.handle, 0);
                 found = true;
             }
-            // Free any heap payload (ASan checks ownership).
+            // Free any heap payload. Nothing here checks it was freed; the
+            // ASan run does (see the module comment).
             unsafe { lt_alert_payload_free(&mut u) };
         } else {
             std::thread::sleep(std::time::Duration::from_millis(20));
