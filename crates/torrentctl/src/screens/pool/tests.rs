@@ -561,6 +561,16 @@ fn a_drift_check_that_could_not_read_a_root_does_not_say_nothing_drifted() {
         unstatable.text,
         "drift check: nothing drifted, 1 torrents unchecked"
     );
+    // Drift with every root read and every torrent checked asks for a
+    // rescan and claims nothing went unseen.
+    let drifted = drift_toast(drift_report(
+        json!({"drifted": [hash(11)], "files_changed": 1}),
+    ));
+    assert_eq!(drifted.kind, ToastKind::Info);
+    assert_eq!(
+        drifted.text,
+        "drift check: 1 torrents drifted — rescan and verify them"
+    );
     // Drift under a readable root still asks for a rescan when another
     // root could not be read.
     let both = drift_toast(drift_report(json!({
