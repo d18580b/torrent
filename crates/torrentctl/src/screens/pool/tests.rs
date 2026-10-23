@@ -561,6 +561,30 @@ fn a_drift_check_that_could_not_read_a_root_does_not_say_nothing_drifted() {
         unstatable.text,
         "drift check: nothing drifted, 1 torrents unchecked"
     );
+    // Drift under a readable root still asks for a rescan when another
+    // root could not be read.
+    let both = drift_toast(drift_report(json!({
+        "drifted": [hash(11)],
+        "files_changed": 1,
+        "unreadable_roots": ["/srv/pool/a"],
+        "unchecked": [hash(9), hash(10)]
+    })));
+    assert_eq!(both.kind, ToastKind::Info);
+    assert_eq!(
+        both.text,
+        "drift check: 1 torrents drifted — rescan and verify them; \
+         1 roots could not be read — 2 torrents unchecked"
+    );
+    // Drift alongside unstatable files keeps the unchecked count too.
+    let drifted_unstatable = drift_toast(drift_report(json!({
+        "drifted": [hash(11)],
+        "files_unreadable": 1,
+        "unchecked": [hash(9)]
+    })));
+    assert_eq!(
+        drifted_unstatable.text,
+        "drift check: 1 torrents drifted — rescan and verify them; 1 torrents unchecked"
+    );
 }
 
 // The tree.

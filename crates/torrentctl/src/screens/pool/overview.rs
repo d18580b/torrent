@@ -188,26 +188,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         }
         Msg::DriftChecked(Ok(report)) => {
             state.checking_drift = false;
-            let toast = if !report.unreadable_roots.is_empty() {
-                // An unmounted root reads as "nothing drifted" otherwise.
-                Toast::info(format!(
-                    "drift check: {} roots could not be read — {} torrents unchecked",
-                    report.unreadable_roots.len(),
-                    report.unchecked.len()
-                ))
-            } else if report.drifted.is_empty() && report.unchecked.is_empty() {
-                Toast::success("drift check: nothing drifted")
-            } else if report.drifted.is_empty() {
-                Toast::info(format!(
-                    "drift check: nothing drifted, {} torrents unchecked",
-                    report.unchecked.len()
-                ))
-            } else {
-                Toast::info(format!(
-                    "drift check: {} torrents drifted — rescan and verify them",
-                    report.drifted.len()
-                ))
-            };
+            let toast = drift_toast(&report);
             state.drift = Some(report);
             let mut effects = vec![Effect::toast(toast)];
             effects.extend(load(state, ctx));
@@ -217,6 +198,38 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             state.checking_drift = false;
             vec![Effect::now(failed("checking for drift", failure))]
         }
+    }
+}
+
+/// What a drift check found and what it could not see, both at once: an
+/// unmounted root must neither read as "nothing drifted" nor hide the
+/// torrents that did drift under another root.
+fn drift_toast(report: &types::DriftReport) -> Toast {
+    let drifted = (!report.drifted.is_empty()).then(|| {
+        format!(
+            "{} torrents drifted — rescan and verify them",
+            report.drifted.len()
+        )
+    });
+    let unseen = if !report.unreadable_roots.is_empty() {
+        Some(format!(
+            "{} roots could not be read — {} torrents unchecked",
+            report.unreadable_roots.len(),
+            report.unchecked.len()
+        ))
+    } else if !report.unchecked.is_empty() {
+        Some(format!("{} torrents unchecked", report.unchecked.len()))
+    } else {
+        None
+    };
+    match (drifted, unseen) {
+        (None, None) => Toast::success("drift check: nothing drifted"),
+        (None, Some(unseen)) if report.unreadable_roots.is_empty() => {
+            Toast::info(format!("drift check: nothing drifted, {unseen}"))
+        }
+        (None, Some(unseen)) => Toast::info(format!("drift check: {unseen}")),
+        (Some(drifted), None) => Toast::info(format!("drift check: {drifted}")),
+        (Some(drifted), Some(unseen)) => Toast::info(format!("drift check: {drifted}; {unseen}")),
     }
 }
 
