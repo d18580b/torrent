@@ -238,17 +238,22 @@ fn orphans_to(cfg: &Config, limit: usize, out: &mut dyn Write) -> anyhow::Result
             r.files_orphan,
         )?;
         // Walk the top level so the operator sees which subtree to look at,
-        // rather than a flat list of a million paths.
-        for (child, is_dir) in store.children(root_id, "")?.into_iter().take(limit) {
-            let cr = store.rollup(root_id, &child)?;
-            if cr.bytes_orphan == 0 {
-                continue;
-            }
+        // rather than a flat list of a million paths. Only entries holding
+        // unclaimed bytes are selected, so `limit` bounds what is printed.
+        for (child, is_dir) in store.children_page(root_id, "", None, limit, true)? {
+            // A directory's rollup covers what is under it; a file's own path
+            // rolls up to nothing, and an orphan-only child that is a file is
+            // unclaimed whole.
+            let bytes_orphan = if is_dir {
+                store.rollup(root_id, &child)?.bytes_orphan
+            } else {
+                store.file(root_id, &child)?.map_or(0, |f| f.size)
+            };
             writeln!(
                 out,
                 "  {:<50} {:>12} unclaimed{}",
                 child,
-                human_bytes(cr.bytes_orphan),
+                human_bytes(bytes_orphan),
                 if is_dir { "" } else { " (file)" },
             )?;
         }
@@ -548,6 +553,66 @@ listen_interfaces = "0.0.0.0:6881"
                 "{}: 1 B unclaimed in 1 files\n  {:<50} {:>12} unclaimed\n",
                 dir.path().join("pool").display(),
                 "extras",
+                "1 B",
+            )
+        );
+    }
+
+    /// An unclaimed file directly under a root is named, not only counted in
+    /// the root's header, and a claimed directory listed before it does not
+    /// use up `--limit`.
+    #[test]
+    fn orphans_names_a_top_level_file_past_a_claimed_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::minimal_for_tests(dir.path(), false);
+        std::fs::create_dir(dir.path().join("pool/d")).unwrap();
+        std::fs::write(dir.path().join("pool/d/f"), b"x").unwrap();
+        std::fs::write(dir.path().join("pool/stray"), b"z").unwrap();
+        let mut bare = b"d4:infod5:filesld6:lengthi1e4:pathl1:feee4:name1:d\
+            12:piece lengthi16384e6:pieces20:"
+            .to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), &bare).unwrap();
+        scan(&cfg).unwrap();
+        // The directory is claimed: the listing would show it first.
+        let store = PoolStore::open(&cfg.pool_db_path()).unwrap();
+        let (root_id, _) = store.roots().unwrap()[0].clone();
+        assert_eq!(
+            store.children(root_id, "").unwrap(),
+            [("d".to_owned(), true), ("stray".to_owned(), false)]
+        );
+        assert_eq!(store.rollup(root_id, "d").unwrap().bytes_orphan, 0);
+        drop(store);
+        assert_eq!(
+            output(|out| orphans_to(&cfg, 1, out)),
+            format!(
+                "{}: 1 B unclaimed in 1 files\n  {:<50} {:>12} unclaimed (file)\n",
+                dir.path().join("pool").display(),
+                "stray",
+                "1 B",
+            )
+        );
+    }
+
+    /// `--limit` bounds the entries printed per root.
+    #[test]
+    fn orphans_prints_at_most_limit_entries_per_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::minimal_for_tests(dir.path(), false);
+        for name in ["p", "q", "r"] {
+            std::fs::write(dir.path().join("pool").join(name), b"z").unwrap();
+        }
+        scan(&cfg).unwrap();
+        assert_eq!(
+            output(|out| orphans_to(&cfg, 2, out)),
+            format!(
+                "{}: 3 B unclaimed in 3 files\n  {:<50} {:>12} unclaimed (file)\n  \
+                 {:<50} {:>12} unclaimed (file)\n",
+                dir.path().join("pool").display(),
+                "p",
+                "1 B",
+                "q",
                 "1 B",
             )
         );
