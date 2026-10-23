@@ -1121,7 +1121,9 @@ mod tests {
             }
 
             /// `contains` refuses any candidate holding a `..` or a leading
-            /// `.`, whether the root exists or not.
+            /// `.`, whether the root exists or not. The leading-`.` case is
+            /// rooted at `.` itself, where the candidate does resolve under
+            /// the root, so only the component guard can refuse it.
             #[test]
             fn a_traversal_is_never_contained(rel in rel()) {
                 let dir = tempfile::tempdir().unwrap();
@@ -1130,7 +1132,7 @@ mod tests {
                     prop_assert!(!contains(dir.path(), &candidate), "{:?}", candidate);
                     prop_assert!(!contains(&root(), &root().join(rel.trim_start_matches('/'))));
                 }
-                prop_assert!(!contains(dir.path(), &Path::new(".").join(rel.trim_start_matches('/'))));
+                prop_assert!(!contains(Path::new("."), &Path::new(".").join(rel.trim_start_matches('/'))));
             }
 
             /// A path under a symlink that leaves the root resolves outside
