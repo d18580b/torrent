@@ -376,19 +376,10 @@ The requests name internal port `1`, the value Proton documents (`natpmpc -a
 delete-all request. TCP is mapped first and UDP (uTP) is asked for on the
 same port.
 
-Metrics, each labelled `profile_id`:
-
-| Series | Meaning |
-| --- | --- |
-| `torrentd_profile_forwarded_port` | the port the session listens on |
-| `torrentd_profile_port_forward_up` | `1` while the last renewal succeeded and the session is bound to its result |
-| `torrentd_profile_port_forward_udp_mapped` | `0` while the gateway mapped TCP only; uTP peers cannot reach the session then |
-| `torrentd_profile_port_forward_renewals_total` | successful renewals |
-| `torrentd_profile_port_forward_failures_total` | every failed attempt, labelled `stage`: `renew` when the gateway did not answer or refused the lease, `rebind` when it answered with a port the session could not be rebound to, `port_taken` when it answered with a port another live profile holds |
-| `torrentd_profile_port_forward_rebind_failures_total` | the same count as `stage="rebind"` above |
-| `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
-| `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
-| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the renewal that saw it re-created the mapping on the spot |
+The `torrentd_profile_forwarded_port*`, `torrentd_profile_port_forward_*`,
+`torrentd_profile_port_change_reannounce_seconds` and
+`torrentd_profile_vpn_gateway_reboots_total` series, each labelled
+`profile_id`, are described in [`deploy/metrics.md`](../deploy/metrics.md).
 
 Several Proton accounts cannot share one daemon: every Proton WireGuard
 config gives the tunnel `10.2.0.2/32`, and the paragraph above says what
