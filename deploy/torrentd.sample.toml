@@ -27,15 +27,9 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 
 # The daemon refuses to start unless you either configure [auth] (see the
 # bottom of this file) or say here that you do not want authentication. This
-# sample takes the second option because it binds loopback, where access
-# control is the reverse proxy's job. That holds only on a single-user host,
-# or in a network namespace or container no other uid shares: every local
-# user can reach 127.0.0.1, and without [auth] any of them controls the
-# daemon (docs/running.md §6). On a shared host, either move http_listen to
-# a unix socket whose mode and group admit only the operators, or delete
-# this line and configure [auth]. Before exposing the API anywhere, configure
-# [auth]: a non-loopback bind without it is refused outright, and so is a
-# socket whose mode lets every user connect.
+# sample takes the second option because it binds loopback, which is safe only
+# where docs/running.md §6 says it is; a non-loopback bind without [auth] is
+# refused outright, and so is a socket whose mode lets every user connect.
 #
 # Read once, at startup, like every key not listed as reloadable (README.md,
 # "HTTP API"): editing it takes effect on restart, not on SIGHUP. A reload
@@ -377,27 +371,9 @@ dht               = true
 # ---------------------------------------------------------------------------
 # Authentication — required, one way or the other
 # ---------------------------------------------------------------------------
-# The daemon refuses to start unless you have either configured `[auth]` or
-# written `allow_unauthenticated = true`. Without `[auth]` it authenticates
-# nothing: every route, including every mutating one, is open to anyone who can
-# reach the port. That is a legitimate posture behind a reverse proxy that does
-# its own access control — but not one to arrive at by omission, which is what
-# it used to be.
-#
-# The opt-out does not extend to a routable address: `allow_unauthenticated`
-# with a non-loopback `http_listen` is refused, because that is an
-# unauthenticated mutating API on the network. So the two safe shapes are:
-#
-#   loopback + allow_unauthenticated   access control is the proxy's job;
-#                                      single-user host only
-#   any bind + [auth]                  the daemon authenticates itself
-#
-# Every local uid can reach 127.0.0.1, so on a shared host the first shape
-# hands every local user full control of the daemon: use the second there
-# (docs/running.md §6).
-#
-# This sample ships the first, because it binds loopback: see
-# `allow_unauthenticated` in the daemon-wide block at the top. Configure [auth]
+# The daemon refuses to start unless you either configure [auth] here or set
+# `allow_unauthenticated = true`, as the daemon-wide block at the top does;
+# docs/running.md §6 says when going without [auth] is safe. Configure [auth]
 # below and delete that line before exposing the API anywhere.
 # Generate the values — never write a password or token here by hand:
 #   torrentd --config /etc/torrentd/torrentd.toml hash-password

@@ -87,15 +87,10 @@ ambient credential, since a page on another site cannot make a browser
 attach one, so a daemon with `[auth]` needs no defence against cross-site
 request forgery. A daemon without `[auth]` does, and has one (below).
 
-**A daemon without `[auth]`.** With `allow_unauthenticated = true`, which the
-daemon permits only on a loopback `http_listen` or a unix socket that not
-every user may connect to, every operation admits every request, with or
-without a token. Every local user can reach `127.0.0.1`, so on loopback this
-is safe only on a single-user host, or in a network namespace or container no
-other uid shares; anywhere else, serve the API on a unix socket
-(`http_listen = "unix:/run/torrentd/api.sock"`), whose mode and group the
-kernel enforces, or configure `[auth]`
-([running.md §6](../running.md#6-authentication--required-one-way-or-the-other)).
+**A daemon without `[auth]`** (`allow_unauthenticated = true`) admits every
+request to every operation, with or without a token; where that posture is
+safe is
+[running.md §6](../running.md#6-authentication--required-one-way-or-the-other).
 
 **Over a unix socket** the API is the same, spoken as HTTP/1.1 with any
 `Host` a loopback name (`curl --unix-socket /run/torrentd/api.sock

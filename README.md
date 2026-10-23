@@ -335,27 +335,10 @@ content that wants DHT belongs in a `network = "host"` profile.
 ## Authentication
 
 **Required, one way or the other.** The daemon refuses to start unless you
-have either configured `[auth]` or written `allow_unauthenticated = true`.
-Without `[auth]` it authenticates nothing — every route, including every
-mutating one, is open to any client that can reach the port, except a browser
-sent by another site: a request whose `Host` is neither loopback nor in
-`allowed_hosts` (a DNS-rebound page), or a state-changing one that
-`Sec-Fetch-Site`, a foreign `Origin` or a form `Content-Type` marks as
-cross-site, is refused with a `403` ([docs/api/README.md](docs/api/README.md)).
-That is a legitimate
-posture behind a reverse proxy that does its own access control, but only on a
-single-user host, or in a network namespace or container no other uid shares:
-every local user can reach `127.0.0.1`, and without `[auth]` any of them
-controls the daemon ([docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other)).
-It is not one to arrive at by omission. The opt-out does not extend to a
-routable address either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
-and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
-inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. Every key not listed as reloadable under
-[HTTP API](#http-api) — these three, `trusted_proxies` and `allowed_hosts`
-among them — is read once, at startup, and takes a restart, not a `SIGHUP`. A
-`SIGHUP` that changes one says so — "requires daemon restart;
-ignored" — rather than reporting the config unchanged.
+have either configured `[auth]` or written `allow_unauthenticated = true`;
+when running without `[auth]` is safe, and which keys take a restart rather
+than a `SIGHUP`, is
+[docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other).
 
 Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
 there are two kinds, hashed differently on purpose. The **operator password**
