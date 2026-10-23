@@ -612,6 +612,75 @@ mod tests {
         assert_eq!(loaded[0].1.as_bytes(), b"kept");
     }
 
+    /// A delete is durable only once the directory that held the name is
+    /// flushed after the unlink: before that, a power loss can bring the
+    /// file back for the next boot's scan to load.
+    #[test]
+    fn a_delete_unlinks_and_then_syncs_the_directory() {
+        use crate::batch_writer::steps_under;
+        use crate::batch_writer::Step;
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path()).with_batched_writes(None);
+        let p = ProfileId::new("p");
+        let ih = InfoHash([0x08u8; 20]);
+        store.write(&p, &ih, b"x").unwrap();
+        let before = steps_under(dir.path()).len();
+        store.delete(&p, &ih).unwrap();
+        let steps = steps_under(dir.path()).split_off(before);
+        let profile_dir = dir.path().join("p");
+        assert_eq!(
+            steps,
+            vec![
+                Step::Unlink(profile_dir.join(format!("{}.resume", ih.to_hex()))),
+                Step::SyncDir(profile_dir),
+            ],
+        );
+    }
+
+    /// A crash between a write's temp file and its rename leaves
+    /// `<infohash>.resume.tmp` (a batch's) or `<infohash>.resume.now.tmp`
+    /// (`write`'s) beside the resume files. The next boot's scan must neither
+    /// load one as a torrent nor count it unreadable, and the next write for
+    /// that torrent must replace it.
+    #[test]
+    fn a_leftover_tmp_file_is_neither_scanned_nor_fatal() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path()).with_batched_writes(None);
+        let p = ProfileId::new("p");
+        let (batched, now) = (InfoHash([0x09u8; 20]), InfoHash([0x0au8; 20]));
+        let profile_dir = dir.path().join("p");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let batch_tmp = profile_dir.join(format!("{}.resume.tmp", batched.to_hex()));
+        let now_tmp = profile_dir.join(format!("{}.resume.now.tmp", now.to_hex()));
+        std::fs::write(&batch_tmp, b"torn half of a resume file").unwrap();
+        std::fs::write(&now_tmp, b"torn").unwrap();
+
+        let scan = store.scan(&p).unwrap();
+        assert!(scan.entries.is_empty(), "a temp file was loaded");
+        assert_eq!(scan.unreadable, 0, "a temp file was counted unreadable");
+        assert!(store.tombstones(&p).unwrap().is_empty());
+        assert!(!store.exists(&p, &batched).unwrap());
+
+        store.write_batched(&p, &batched, b"whole").unwrap();
+        store.flush();
+        store.write(&p, &now, b"whole too").unwrap();
+        let mut loaded: Vec<(InfoHash, Vec<u8>)> = store
+            .load_all(&p)
+            .unwrap()
+            .into_iter()
+            .map(|(ih, d)| (ih, d.as_bytes().to_vec()))
+            .collect();
+        loaded.sort_by_key(|(ih, _)| ih.0);
+        assert_eq!(
+            loaded,
+            vec![(batched, b"whole".to_vec()), (now, b"whole too".to_vec())],
+        );
+        assert!(
+            !batch_tmp.exists() && !now_tmp.exists(),
+            "the writes reused them"
+        );
+    }
+
     #[test]
     fn exists_sees_a_queued_write_a_landed_one_and_not_a_deleted_one() {
         let dir = tempdir().unwrap();

@@ -65,6 +65,63 @@ use tracing::warn;
 
 use crate::profile::ProfileId;
 
+/// One durable-write step, as the tests see it. Every step that orders a
+/// write against a crash is recorded where it succeeds, so a test can assert
+/// the protocol's order (data, flush, rename, directory flush) rather than
+/// only its end state, which a crash-free run reaches in any order.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The temp file at this path was written, not yet flushed.
+    Write(PathBuf),
+    /// The file at this path was `fsync`ed.
+    SyncFile(PathBuf),
+    /// `syncfs(2)` ran on the filesystem holding this directory.
+    SyncFs(PathBuf),
+    /// A temp file was renamed over this target.
+    Rename(PathBuf),
+    /// This file was unlinked.
+    Unlink(PathBuf),
+    /// This directory was `fsync`ed.
+    SyncDir(PathBuf),
+}
+
+/// Every [`Step`] this process has taken, from any thread: the batch runs on
+/// the writer's thread or the caller's, whichever takes it first. Tests share
+/// the process, so each reads only the steps under its own directory.
+#[cfg(test)]
+static STEPS: std::sync::Mutex<Vec<Step>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a step for the tests. Outside them `step` is never called, so the
+/// seam costs nothing.
+#[inline]
+fn record(step: impl FnOnce() -> Step) {
+    #[cfg(test)]
+    STEPS.lock().unwrap().push(step());
+    #[cfg(not(test))]
+    let _ = step;
+}
+
+/// Every step recorded so far whose path lies under `root`, in order.
+#[cfg(test)]
+pub(crate) fn steps_under(root: &Path) -> Vec<Step> {
+    STEPS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            let (Step::Write(p)
+            | Step::SyncFile(p)
+            | Step::SyncFs(p)
+            | Step::Rename(p)
+            | Step::Unlink(p)
+            | Step::SyncDir(p)) = s;
+            p.starts_with(root)
+        })
+        .cloned()
+        .collect()
+}
+
 /// How long the writer waits after its first queued write before taking the
 /// batch, so a burst — a resume sweep, the shutdown drain — is flushed as a
 /// few batches rather than one flush per file.
@@ -289,7 +346,9 @@ fn run_batch(shared: &Shared) {
                 .create(true)
                 .truncate(true)
                 .open(tmp_for(path))?;
-            f.write_all(&q.data)
+            f.write_all(&q.data)?;
+            record(|| Step::Write(tmp_for(path)));
+            Ok(())
         })();
         match r {
             Ok(()) => written.push((path, q)),
@@ -318,6 +377,9 @@ fn run_batch(shared: &Shared) {
                 return done.map_err(io::Error::from);
             }
             let r = syncfs(&d);
+            if r.is_ok() {
+                record(|| Step::SyncFs(dir.clone()));
+            }
             flushed_devices.insert(dev, r.as_ref().map(|_| ()).map_err(|e| e.kind()));
             r
         });
@@ -342,7 +404,8 @@ fn run_batch(shared: &Shared) {
             }
             match dir_ok.get(dir) {
                 Some(Err(kind)) => Err(io::Error::from(*kind)),
-                _ => fs::rename(tmp_for(path), path),
+                _ => fs::rename(tmp_for(path), path)
+                    .inspect(|()| record(|| Step::Rename(path.clone()))),
             }
         };
         if let Err(e) = r {
@@ -399,9 +462,12 @@ fn write_atomic_via(path: &Path, tmp: &Path, data: &[u8]) -> io::Result<()> {
             .truncate(true)
             .open(tmp)?;
         f.write_all(data)?;
+        record(|| Step::Write(tmp.to_path_buf()));
         f.sync_all()?;
+        record(|| Step::SyncFile(tmp.to_path_buf()));
     }
     fs::rename(tmp, path)?;
+    record(|| Step::Rename(path.to_path_buf()));
     // Best effort: the file itself is already durable. See `sync_dir`.
     sync_dir(dir);
     Ok(())
@@ -437,8 +503,11 @@ pub fn dir_fsync_errors() -> u64 {
 /// Every failure, logged or not, is counted in [`dir_fsync_errors`].
 pub(crate) fn sync_dir(dir: &Path) {
     let r = fs::File::open(dir).and_then(|d| d.sync_all());
-    if r.is_err() {
-        DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);
+    match &r {
+        Ok(()) => record(|| Step::SyncDir(dir.to_path_buf())),
+        Err(_) => {
+            DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
     }
     note_dir_sync(dir_sync_failures(), dir, &r);
 }
@@ -481,7 +550,10 @@ fn note_dir_sync(failed: &Mutex<HashSet<PathBuf>>, dir: &Path, r: &io::Result<()
 /// Remove `path`; a missing file is not an error.
 pub fn remove_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            record(|| Step::Unlink(path.to_path_buf()));
+            Ok(())
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
@@ -513,6 +585,108 @@ mod tests {
         assert_eq!(w.pending_len(), 0);
         assert_eq!(fs::read(&path).unwrap(), b"one");
         assert!(!tmp_for(&path).exists(), "no temp file is left behind");
+    }
+
+    /// Where `want` first happened in `steps`; a step that never happened
+    /// fails the test, naming everything that did.
+    fn at(steps: &[Step], want: &Step) -> usize {
+        steps
+            .iter()
+            .position(|s| s == want)
+            .unwrap_or_else(|| panic!("{want:?} never happened; the steps were {steps:?}"))
+    }
+
+    /// A crash between a rename and the flush of the data it names leaves a
+    /// target that is neither the old file nor the new one. The batch is
+    /// safe only in this order: every temp file written, the filesystem
+    /// flushed, then the renames, then the directory flushed so the renames
+    /// survive a power loss. A crash-free run ends in the same files
+    /// whatever the order, so the order is what this asserts.
+    #[test]
+    fn a_batch_flushes_before_any_rename_exposes_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let w = BatchWriter::spawn("test-writer", None);
+        let paths: Vec<PathBuf> = (1..=3u8)
+            .map(|i| root.join(format!("{i}.resume")))
+            .collect();
+        {
+            // Held while queueing, so whichever of the thread and `flush`
+            // takes the batch takes all three: exactly one batch.
+            let _io = w.shared.io.lock();
+            for (i, p) in (1u8..).zip(&paths) {
+                w.enqueue(p.clone(), &ProfileId::new("p"), &ih(i), b"x");
+            }
+        }
+        w.flush();
+        let steps = steps_under(&root);
+        let flushed = at(&steps, &Step::SyncFs(root.clone()));
+        let dir_synced = at(&steps, &Step::SyncDir(root.clone()));
+        for p in &paths {
+            let renamed = at(&steps, &Step::Rename(p.clone()));
+            assert!(
+                at(&steps, &Step::Write(tmp_for(p))) < flushed,
+                "{} was flushed before it was written: {steps:?}",
+                p.display(),
+            );
+            assert!(
+                flushed < renamed,
+                "{} was renamed before its data was flushed: {steps:?}",
+                p.display(),
+            );
+            assert!(
+                renamed < dir_synced,
+                "the directory was flushed before {} was renamed into it: {steps:?}",
+                p.display(),
+            );
+        }
+        let count = |f: fn(&Step) -> bool| steps.iter().filter(|s| f(s)).count();
+        assert_eq!(
+            count(|s| matches!(s, Step::SyncFs(_))),
+            1,
+            "one flush per batch, not one per file: {steps:?}",
+        );
+        assert_eq!(count(|s| matches!(s, Step::SyncDir(_))), 1, "{steps:?}");
+        assert_eq!(count(|s| matches!(s, Step::SyncFile(_))), 0, "{steps:?}");
+    }
+
+    /// The per-file protocol, [`write_atomic`] and [`BatchWriter::write_now`]:
+    /// the temp file is written and `fsync`ed before the rename exposes it,
+    /// and the directory is `fsync`ed after.
+    #[test]
+    fn a_single_write_syncs_its_file_before_the_rename_and_its_directory_after() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let w = BatchWriter::spawn("test-writer", None);
+        let atomic = root.join("atomic.torrent");
+        let now = root.join("now.torrent");
+        write_atomic(&atomic, b"a").unwrap();
+        w.write_now(&now, b"n").unwrap();
+        let steps = steps_under(&root);
+        for (path, tmp) in [(&atomic, tmp_for(&atomic)), (&now, now_tmp_for(&now))] {
+            let order = [
+                at(&steps, &Step::Write(tmp.clone())),
+                at(&steps, &Step::SyncFile(tmp.clone())),
+                at(&steps, &Step::Rename(path.clone())),
+            ];
+            assert!(
+                order.is_sorted(),
+                "{}: write, fsync, rename out of order: {steps:?}",
+                path.display(),
+            );
+            let synced_after = steps[order[2]..]
+                .iter()
+                .any(|s| *s == Step::SyncDir(root.clone()));
+            assert!(
+                synced_after,
+                "{}: no directory fsync after its rename: {steps:?}",
+                path.display(),
+            );
+        }
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::SyncFs(_))),
+            "a single write flushes its own file, not the filesystem: {steps:?}",
+        );
     }
 
     #[test]
