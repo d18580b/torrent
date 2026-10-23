@@ -43,10 +43,11 @@ pub struct ScanStats {
     pub duplicate_infohashes: u64,
 }
 
-/// Upper bound on a `.torrent` or `.fastresume` the library scan reads: the
-/// daemon's own limit on a `.torrent` (`MAX_TORRENT_FILE_BYTES` in the HTTP
-/// API), which a sidecar of the same torrent has no reason to exceed. A file
-/// past it is not read, and counts a `read` error.
+/// Upper bound on a `.torrent` or `.fastresume` read from the library, by the
+/// scan and by every later read of the same files through [`read_capped`]:
+/// the daemon's own limit on a `.torrent` (`MAX_TORRENT_FILE_BYTES` in the
+/// HTTP API), which a sidecar of the same torrent has no reason to exceed. A
+/// file past it is not read, and the scan counts it a `read` error.
 pub const MAX_LIBRARY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl ScanStats {
@@ -447,7 +448,7 @@ fn rel_of(path: &Path, root: &Path) -> Option<String> {
 ///
 /// The cap is checked against the file's size and again while reading, so a
 /// file that grows between the two is cut off rather than read past it.
-pub(crate) fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let too_large = || {
         std::io::Error::new(

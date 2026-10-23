@@ -265,9 +265,9 @@ pub fn plan(
 }
 
 /// The metadata of the `.torrent` at `path`, or `None` where it cannot be read
-/// or parsed.
+/// or parsed, or is larger than the library's read cap.
 fn torrent_meta(path: &Path) -> Option<TorrentMeta> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::scan::read_capped(path).ok()?;
     libtorrent_safe::torrent_metadata(&bytes).ok()
 }
 
@@ -451,7 +451,47 @@ pub fn torrent_path(store: &PoolStore, infohash: &str) -> Result<Option<PathBuf>
     Ok(store.torrent(infohash)?.map(|t| t.source_path))
 }
 
-/// The `.torrent` bytes, read from the library.
+/// The `.torrent` bytes, read from the library, or an error where the file
+/// is larger than the library's read cap.
 pub fn torrent_bytes(path: &Path) -> Result<Vec<u8>, PoolError> {
-    Ok(std::fs::read(path)?)
+    Ok(crate::scan::read_capped(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::MAX_LIBRARY_FILE_BYTES;
+
+    /// Issue #543: the adoption's reads of a `.torrent` hold to the library
+    /// read cap, as the scan's do. The file past it is still a torrent a
+    /// parser accepts, so only the cap keeps it from being read whole.
+    #[test]
+    fn a_torrent_past_the_library_read_cap_is_not_read() {
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pad_file.torrent"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("t.torrent");
+        std::fs::write(&at, &fixture).unwrap();
+        assert!(torrent_meta(&at).is_some());
+        assert_eq!(torrent_bytes(&at).unwrap(), fixture);
+
+        // An unknown top-level key holding a cap's worth of bytes.
+        let pad = MAX_LIBRARY_FILE_BYTES as usize;
+        let mut big = format!("d1:a{pad}:").into_bytes();
+        big.resize(big.len() + pad, 0);
+        big.extend_from_slice(&fixture[1..]);
+        assert_eq!(
+            libtorrent_safe::info_hash_from_torrent(&big).unwrap(),
+            libtorrent_safe::info_hash_from_torrent(&fixture).unwrap(),
+        );
+        std::fs::write(&at, &big).unwrap();
+
+        assert!(torrent_meta(&at).is_none());
+        match torrent_bytes(&at) {
+            Err(PoolError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::FileTooLarge),
+            other => panic!("{:?}", other.map(|b| b.len())),
+        }
+    }
 }
