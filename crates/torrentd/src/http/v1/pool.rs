@@ -1067,6 +1067,9 @@ pub async fn adopt_pool_torrents(
     blocking(move || adopt_each(&s, &pool, &req, &profile).map(Json)).await
 }
 
+/// The refusal for a target the drift check before an adopt could not see.
+const UNCHECKED_PAYLOAD: &str = "payload could not be checked for changes since the scan: its root or disk is unreadable or unmounted, or a file could not be stated (the log names it); make it readable, then adopt again";
+
 /// [`adopt_pool_torrents`] past its up-front checks: resolve the targets and
 /// adopt, or refuse, each in turn.
 fn adopt_each(
@@ -1121,6 +1124,12 @@ fn adopt_each(
         .map_err(|e| AdoptError::Internal {
             detail: internal("the drift check before adopting", e),
         })?;
+    // What the pass could not see — an unreadable or unmounted root or disk,
+    // or a file it could not stat — it leaves `matched`, which the planner
+    // would fast-path on a claim nobody checked. Refused instead, until the
+    // payload is readable again.
+    let unchecked: std::collections::HashSet<&str> =
+        drift.unchecked.iter().map(String::as_str).collect();
 
     let mut resp = AdoptionResult {
         dry_run: req.dry_run,
@@ -1134,6 +1143,10 @@ fn adopt_each(
         let refuse = |resp: &mut AdoptionResult, reason: String| {
             resp.refused.push(RefusedTorrent { infohash, reason });
         };
+        if unchecked.contains(ih.as_str()) {
+            refuse(&mut resp, UNCHECKED_PAYLOAD.to_owned());
+            continue;
+        }
         // Refused, not a 500: by now earlier targets may already be claimed
         // and loaded, and a failure here must leave the response saying
         // exactly which. The cause is logged; the reason says only that the
@@ -1231,6 +1244,7 @@ fn adopt_each(
         queued = resp.queued_for_verification.len(),
         refused = resp.refused.len(),
         drifted = drift.drifted.len(),
+        unchecked = drift.unchecked.len(),
         "adopt",
     );
     Ok(resp)

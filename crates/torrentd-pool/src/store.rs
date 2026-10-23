@@ -1240,6 +1240,33 @@ impl PoolStore {
         Ok(())
     }
 
+    /// Stage `root_id`'s current index rows at `rel_path` and under it, as
+    /// they stand, for a subtree the walk could not read. Returns how many
+    /// rows were carried.
+    ///
+    /// A walk that could not list a directory saw none of what is in it, so
+    /// the swap would otherwise drop that subtree's rows: the matcher would
+    /// read every torrent over it as `missing`, though nothing on disk is
+    /// known to have changed. A row the walk did stage is left as staged.
+    pub fn stage_previous_subtree(
+        &mut self,
+        root_id: i64,
+        rel_path: &str,
+    ) -> Result<u64, PoolError> {
+        let rel_path = rel_path.trim_matches('/');
+        // `/` sorts immediately before `0`, so the half-open range is exactly
+        // the paths below `rel_path/`, and it reads the primary key's order.
+        let carried = self.conn.execute(
+            "INSERT OR IGNORE INTO temp.file_staging(rel_path, parent, size, mtime_ns, ino, dev, v2_root)
+             SELECT rel_path, parent, size, mtime_ns, ino, dev, v2_root
+             FROM file
+             WHERE root_id = ?1
+               AND (rel_path = ?2 OR (rel_path >= ?2 || '/' AND rel_path < ?2 || '0'))",
+            params![root_id, rel_path],
+        )?;
+        Ok(carried as u64)
+    }
+
     /// Replace `root_id`'s file index with what is staged, and rebuild its
     /// rollups, as one savepoint.
     ///
