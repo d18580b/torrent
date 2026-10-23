@@ -154,19 +154,13 @@ impl Recorder {
                         break text;
                     }
                 };
-                let mut lines = head.lines();
-                let line = lines
+                let line = head
+                    .lines()
                     .next()
                     .unwrap_or_default()
                     .trim_end_matches(" HTTP/1.1")
                     .to_owned();
-                let bearer = lines.find_map(|l| {
-                    let (name, value) = l.split_once(':')?;
-                    let (scheme, token) = value.trim().split_once(' ')?;
-                    (name.eq_ignore_ascii_case("authorization")
-                        && scheme.eq_ignore_ascii_case("bearer"))
-                    .then(|| token.to_owned())
-                });
+                let bearer = bearer(&head);
                 // Recorded before the answer, so an effect that has
                 // finished has been recorded.
                 record
@@ -192,6 +186,117 @@ impl Recorder {
     /// Every request line so far, `METHOD /path?query`, in arrival order.
     pub fn lines(&self) -> Vec<String> {
         self.requests().into_iter().map(|r| r.line).collect()
+    }
+}
+
+/// The bearer token a request head presents, if any.
+fn bearer(head: &str) -> Option<String> {
+    head.lines().skip(1).find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        let (scheme, token) = value.trim().split_once(' ')?;
+        (name.eq_ignore_ascii_case("authorization") && scheme.eq_ignore_ascii_case("bearer"))
+            .then(|| token.to_owned())
+    })
+}
+
+/// A stand-in `GET /v1/events`: hands each connection to the test as it
+/// arrives, for the test to answer as it chooses. Runs on the test's own
+/// runtime, so a paused clock covers both ends.
+pub struct EventServer {
+    pub url: String,
+    connections: tokio::sync::mpsc::UnboundedReceiver<EventConnection>,
+}
+
+/// One connection to an [`EventServer`], its request head already read.
+/// Dropping it closes the connection.
+pub struct EventConnection {
+    /// The bearer token presented, if any.
+    pub bearer: Option<String>,
+    /// When the request arrived.
+    pub at: tokio::time::Instant,
+    socket: tokio::net::TcpStream,
+}
+
+impl EventServer {
+    /// Listen on a free loopback port.
+    pub async fn start() -> Self {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("an address"));
+        let (tx, connections) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut received = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => received.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&received).into_owned();
+                let connection = EventConnection {
+                    bearer: bearer(&head),
+                    at: tokio::time::Instant::now(),
+                    socket,
+                };
+                if tx.send(connection).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { url, connections }
+    }
+
+    /// The next connection, failing the test when none comes within
+    /// `within`.
+    pub async fn next(&mut self, within: std::time::Duration) -> EventConnection {
+        tokio::time::timeout(within, self.connections.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no connection within {within:?}"))
+            .expect("the server is listening")
+    }
+}
+
+impl EventConnection {
+    /// Answer `200` and open the stream.
+    pub async fn open(&mut self) {
+        self.write(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: \
+             no-cache\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+    }
+
+    /// Refuse the stream with `status` (`"503 Service Unavailable"`).
+    pub async fn refuse(mut self, status: &str) {
+        let body = r#"{"type":"about:blank","title":"refused"}"#;
+        self.write(&format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/problem+json\r\ncontent-length: \
+             {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+    }
+
+    /// A `tick` event carrying `fingerprint`, with `extra` SSE field lines
+    /// (`retry: 5000\n`) before its data.
+    pub async fn tick(&mut self, fingerprint: &str, extra: &str) {
+        self.write(&format!(
+            "event: tick\n{extra}data: {{\"kind\":\"tick\",\"fingerprint\":\"{fingerprint}\"}}\n\n"
+        ))
+        .await;
+    }
+
+    async fn write(&mut self, text: &str) {
+        use tokio::io::AsyncWriteExt as _;
+        self.socket
+            .write_all(text.as_bytes())
+            .await
+            .expect("the client is connected");
     }
 }
 

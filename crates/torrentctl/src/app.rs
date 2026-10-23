@@ -91,7 +91,8 @@ impl Tab {
 pub enum Live {
     /// Opening the stream.
     Connecting,
-    /// Ticks are arriving.
+    /// Ticks are arriving: one has on this stream, and none has been missing
+    /// for [`crate::runtime::IDLE_TIMEOUT`].
     Streaming,
     /// The stream dropped; polling until it is back.
     Reconnecting { reason: String },
