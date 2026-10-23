@@ -430,4 +430,59 @@ mod tests {
         assert!(waited < SLACK, "reconnected after {waited:?}, not at once");
         drop(stream);
     }
+
+    /// A daemon that takes the request and never sends a response head is
+    /// down after the idle timeout, not the request timeout.
+    #[tokio::test]
+    async fn a_stream_that_never_opens_is_down_after_the_idle_timeout() {
+        let mut server = EventServer::start().await;
+        let (_api_tx, mut rx) = follow(&server, "tdp_a", FAST);
+        let wedged = server.next(PATIENCE).await;
+        let reason = reason(next_live(&mut rx).await);
+        let waited = wedged.at.elapsed();
+        assert!(reason.contains("did not open the stream"), "{reason}");
+        assert!(
+            waited < FAST.idle + SLACK,
+            "down after {waited:?} without a response"
+        );
+        server.next(PATIENCE).await;
+        drop(wedged);
+    }
+
+    #[tokio::test]
+    async fn a_new_credential_during_a_wait_reconnects_at_once_from_the_first_backoff() {
+        let mut server = EventServer::start().await;
+        // Long enough that the doubled backoff is told apart from the first.
+        let paced = Timing {
+            first_backoff: Duration::from_secs(1),
+            ..FAST
+        };
+        let (api_tx, mut rx) = follow(&server, "tdp_a", paced);
+        // Two refusals in a row: the second wait is the doubled backoff, 2s.
+        for _ in 0..2 {
+            let refused = server.next(PATIENCE).await;
+            refused.refuse("503 Service Unavailable").await;
+            reason(next_live(&mut rx).await);
+        }
+
+        // A new credential arrives during that wait.
+        let next_api = api_tx.borrow().with_token("tds_b").expect("a valid URL");
+        api_tx.send(next_api).expect("follow_events is running");
+        let changed = Instant::now();
+        let reopened = server.next(PATIENCE).await;
+        assert_eq!(reopened.bearer.as_deref(), Some("tds_b"));
+        let waited = reopened.at - changed;
+        assert!(waited < SLACK, "reconnected after {waited:?}, not at once");
+
+        // Refused again, it waits the first backoff, not the doubled one.
+        let at = reopened.at;
+        reopened.refuse("503 Service Unavailable").await;
+        reason(next_live(&mut rx).await);
+        let again = server.next(PATIENCE).await;
+        let waited = again.at - at;
+        assert!(
+            waited >= paced.first_backoff && waited < 2 * paced.first_backoff,
+            "retried after {waited:?}: the backoff was not reset"
+        );
+    }
 }
