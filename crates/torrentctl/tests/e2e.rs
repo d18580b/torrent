@@ -598,7 +598,7 @@ fn a_panic_hands_the_terminal_back() {
     use std::os::fd::OwnedFd;
     use std::os::unix::process::CommandExt as _;
 
-    let (mut master, slave) = {
+    let (master, slave) = {
         let mut master = -1;
         let mut slave = -1;
         let size = libc::winsize {
