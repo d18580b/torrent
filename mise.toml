@@ -7,7 +7,7 @@
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check|msrv|rustfmt-toolchain
-#   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
+#   mise run test-shim|test-shim-asan|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|release-features|deny
 #   mise run lint-tracing|size-check|container|commit-lint <file-or-range>
 #   mise run native|native-fetch|native-clean
@@ -154,6 +154,15 @@ run = "cargo test --workspace"
 description = "Layer 2: FFI shim tests (needs the vendored libtorrent fixtures)"
 run = "cargo test -p libtorrent-sys --features shim-tests"
 
+# The shim's buffer-ownership cases again, in a C++ binary built with
+# AddressSanitizer against an instrumented libtorrent, since test-shim cannot
+# run under it (crates/libtorrent-sys/tests/asan/run.sh says why). Needs
+# clang with its ASan runtime; the first run builds that libtorrent into the
+# native cache root, which native-clean empties.
+[tasks.test-shim-asan]
+description = "Layer 2 under ASan: the shim's buffer ownership, with LeakSanitizer (needs clang)"
+run = "crates/libtorrent-sys/tests/asan/run.sh"
+
 [tasks.test-lifecycle]
 description = "Layer 3: real libtorrent sessions against real disk (no network)"
 run = "cargo test -p torrentd-engine --test lifecycle -- --ignored"
@@ -251,6 +260,7 @@ run = [
   "mise run test",
   "mise run test-fault-injection",
   "mise run test-shim",
+  "mise run test-shim-asan",
   "mise run test-lifecycle",
   "mise run test-daemon",
   "mise run test-torrentctl",

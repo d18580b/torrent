@@ -434,12 +434,11 @@ fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path, ds
     // NOTE on ASan: instrumenting only the shim (`-fsanitize=address`) and
     // letting rustc link it does not work on this toolchain — rustc's lld
     // doesn't expand the `-fsanitize=address` driver flag, so the `__asan_*`
-    // runtime symbols go unresolved, and the prebuilt libtorrent is not
-    // instrumented either. Full ASan would require building libtorrent with
-    // ASan and linking via the C++ driver (a standalone test binary). The
-    // `shim-tests` feature therefore runs the FFI correctness suite (struct
-    // marshalling, exception isolation, null-handle safety, buffer ownership)
-    // without ASan; that remains a follow-up.
+    // runtime symbols go unresolved, and the libtorrent built above is not
+    // instrumented either. So nothing here is: the `shim-tests` suite runs
+    // uninstrumented, and the shim's ownership cases run under ASan in a
+    // standalone C++ binary instead, linked by the C++ driver against a
+    // libtorrent built with ASan (tests/asan/, `mise run test-shim-asan`).
     build.compile("libtorrent_shim");
 }
 

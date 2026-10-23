@@ -194,6 +194,48 @@ jobs:
       # null-handle safety, and buffer ownership across the C ABI boundary.
       - run: mise run test-shim
 
+  shim-asan:
+    name: shim ownership under ASan (Layer 2)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Builds no Rust. clang carries its ASan runtime in compiler-rt
+      # (libclang-rt-18-dev on 24.04) and llvm-18 its symbolizer; GCC's
+      # runtime is the libasan package the native deps do not install.
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-deps: 'true'
+          extra-packages: clang libclang-rt-18-dev llvm-18
+          toolchain: ''
+
+      # The instrumented libtorrent prefix, cached on the key prefix.sh would
+      # build it under: the vendor commits, the compilers, OpenSSL and the
+      # script's flags. Not the shared native cache: that prefix is
+      # uninstrumented, and this one is useful to no other job.
+      - id: asan-key
+        run: |
+          set -euo pipefail
+          key=$(crates/libtorrent-sys/tests/asan/prefix.sh --key)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - id: asan-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
+          key: shim-asan-v1-${{ runner.os }}-${{ steps.asan-key.outputs.key }}
+      # The test generates its own .torrent inputs, so a cached prefix needs
+      # no submodule at all.
+      - if: steps.asan-cache.outputs.cache-hit != 'true'
+        run: mise run native-fetch
+
+      # Every shim heap payload read whole, freed, and freed again where the
+      # contract allows; inputs in exact-size blocks; LeakSanitizer at exit.
+      - run: mise run test-shim-asan
+
   integration:
     name: daemon integration (Layer 3)
     runs-on: ubuntu-24.04

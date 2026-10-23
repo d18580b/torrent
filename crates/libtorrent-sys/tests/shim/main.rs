@@ -6,9 +6,11 @@
 //! safety, and buffer ownership against a real libtorrent session listening
 //! on loopback only. Ownership is checked by what the tests can observe — a
 //! buffer readable for its whole length, released through the shim's own
-//! free — and not by a sanitizer: AddressSanitizer instrumentation is a
-//! follow-up (see build.rs for why instrumenting only the shim doesn't link on
-//! this toolchain), so a double free or a leak goes undetected here.
+//! free — and not by a sanitizer, so a double free or a leak goes undetected
+//! here. Those are caught by `mise run test-shim-asan`, which runs the same
+//! ownership cases in a C++ binary built with AddressSanitizer against an
+//! instrumented libtorrent (tests/asan/; build.rs says why this suite cannot
+//! be instrumented itself).
 //!
 //! One test binary, one module per area of the shim. The fixtures and
 //! helpers more than one module uses are imported here, so each module's

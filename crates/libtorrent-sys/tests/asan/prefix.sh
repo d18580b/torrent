@@ -2,7 +2,9 @@
 # Provision the AddressSanitizer-instrumented libtorrent prefix run.sh links
 # the shim against, and print its path as the last line of stdout.
 #
-#   crates/libtorrent-sys/tests/asan/prefix.sh
+#   crates/libtorrent-sys/tests/asan/prefix.sh [--key]
+#
+# --key prints the prefix's key and builds nothing.
 #
 # The prefix is `<cache>/asan-lt-<key>`, under the cache root build.rs uses,
 # so `mise run native-clean` removes it with the rest. It holds Boost's
@@ -59,6 +61,13 @@ key=$(
   } | sha256sum | cut -c1-24
 )
 prefix=$cache_root/asan-lt-$key
+
+# CI keys its cache on this, so a toolchain the runner image moves misses the
+# cache rather than restoring a prefix the stamp then refuses on every run.
+if [ "${1:-}" = --key ]; then
+  echo "$key"
+  exit 0
+fi
 
 if [ "$(head -1 "$prefix/.stamp" 2>/dev/null)" = "$key" ]; then
   echo "shim-asan: cache hit asan-lt-$key" >&2
