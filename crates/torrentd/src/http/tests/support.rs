@@ -305,6 +305,17 @@ impl Harness {
         let server = tokio::spawn(
             kynos::server::Server::new(service)
                 .listener(listener)
+                // As `startup::serve_once` runs it: the operation's own
+                // deadline answers a stalled body, not the server's.
+                .request_body_idle_timeout(None)
+                // No head deadline: kynos arms its 30 s default before the
+                // head is read, and the paused clock below jumps to that
+                // timer first, so the operation's deadline would be armed
+                // 30 s late. Every head here is sent whole before the pause.
+                .http1(
+                    kynos::server::protocol::http1::Http1Config::default()
+                        .header_read_timeout(None),
+                )
                 .serve(),
         );
 

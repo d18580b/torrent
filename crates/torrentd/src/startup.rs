@@ -3991,6 +3991,12 @@ async fn serve_once(
                 .keep_alive(Some(HTTP2_KEEP_ALIVE))
                 .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS),
         )
+        // Off, rather than kynos's 30 s per-frame default: every operation
+        // that reads a body already bounds its arrival (`http::v1`'s group
+        // deadlines and `TimedBody`), as `docs/api/problems.md`'s `408` row
+        // states them, and the server's own 408 would replace the operation's
+        // response, request id and shared headers included.
+        .request_body_idle_timeout(None)
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
             // Latched first, so an apply still running stops at its next step

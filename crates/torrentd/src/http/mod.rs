@@ -67,10 +67,10 @@ macro_rules! daemon_router {
         let trace = kynos::middleware::trace::Trace::new().correlating(&request_id);
         let router = Router::<AppCtx>::new()
             .info(info())
-            // On the router rather than a group, so every routed response —
-            // the root routes included — carries them, and one id source
-            // serves every request. kynos answers an unknown path or method
-            // before any interceptor runs, so those 404/405s carry neither.
+            // On the router rather than a group, so every response — the
+            // root routes and the 404/405 for an unknown path or method
+            // included — carries them, and one id source serves every
+            // request.
             .intercept(request_id)
             .intercept(crate::http::headers::ApiHeaders)
             .observe(trace)
