@@ -12,6 +12,9 @@
 #   mise run lint-tracing|size-check|container|commit-lint <file-or-range>
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
+#   mise run drill-alerts|drill-udp-transport|drill-listener-replies
+#   mise run drill-ipv6-egress|drill-natpmp-fence
+#   mise run drill-route-fence <iface> [profile_id]
 #   mise run bench -- <subcommand>
 
 # The oldest mise these tasks are run on: the version CI pins in
@@ -338,6 +341,51 @@ run = '''
 # mise's own quoting, which is the only form that round-trips both.
 eval "set -- $usage_flags"
 cargo run --quiet -p torrentd -- --config "$usage_config" vpn check "$@"
+'''
+
+# The drills in deploy/drill, one task per script; each script's header says
+# what it needs, does and exits with. None is part of `test-all`: the alert
+# drill takes minutes and a container engine, and route-fence changes the
+# host's routing. The namespace drills render the kill switch with, or run,
+# target/debug/torrentd, so they build it first; `cargo build` is a no-op when
+# it is current, and the drill then runs this checkout's daemon, not an older
+# build's.
+[tasks.drill-alerts]
+description = "Alert-delivery drill: faults in a real daemon, each alert checked at a webhook (needs podman or docker)"
+run = "deploy/drill/run.sh"
+
+[tasks.drill-udp-transport]
+description = "Namespace drill: nothing but the tunnel's transport leaves through the kill switch's udp sport exemption"
+run = ["cargo build -p torrentd", "deploy/drill/udp-transport.sh"]
+
+[tasks.drill-listener-replies]
+description = "Namespace drill: what the host answers a neighbour's probes with by the physical link under the kill switch"
+run = ["cargo build -p torrentd", "deploy/drill/listener-replies.sh"]
+
+[tasks.drill-ipv6-egress]
+description = "Namespace drill: none of the daemon's IPv6 leaves by the physical link under the kill switch"
+run = ["cargo build -p torrentd", "deploy/drill/ipv6-egress.sh"]
+
+[tasks.drill-natpmp-fence]
+description = "Namespace drill: a fence landing mid NAT-PMP renewal is not followed by a rebind"
+run = ["cargo build -p torrentd", "deploy/drill/natpmp-fence.sh target/debug/torrentd"]
+
+# On a scratch host with a running daemon, as root: it deletes a tunnel's
+# `from <address>` rules and does not put them back (docs/running.md §11).
+# Run through sudo when not root, keeping the variables the script reads.
+[tasks.drill-route-fence]
+description = "Route-fence drill: delete a tunnel's source rules and expect its profile fenced (root; changes the host)"
+usage = '''
+arg "<iface>" help="The tunnel's interface"
+arg "[profile_id]" help="The vpn profile the tunnel belongs to; PROFILE_ID when omitted"
+'''
+run = '''
+set -eu
+set -- deploy/drill/route-fence.sh "$usage_iface" ${usage_profile_id:+"$usage_profile_id"}
+if [ "$(id -u)" = 0 ]; then
+  exec "$@"
+fi
+exec sudo --preserve-env=PROFILE_ID,METRICS_URL,METRICS_TOKEN,POLL_SECS,GRACE_SECS -- "$@"
 '''
 
 # `depends` here, not the sequential `run` list `test-all` uses: mise schedules
