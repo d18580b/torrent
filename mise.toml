@@ -204,13 +204,28 @@ description = "promtool: check deploy/prometheus's alert rules and run their fix
 # Prometheus release, which no registry mise resolves packages as a tool, and
 # the pinned image is the exact binary a deployment's Prometheus evaluates the
 # rules with. `:Z` relabels the mount for SELinux hosts; docker ignores it
-# elsewhere.
+# elsewhere. The image, tag and digest are read from deploy/drill/compose.yaml,
+# the one place they are written, so the release promtool checks the rules
+# with is the release the drill's Prometheus evaluates them with.
 run = '''
 set -eu
 engine=$(command -v podman || command -v docker)
+image=$(sed -n 's|^ *image: *\(docker\.io/prom/prometheus:[^ ]*\) *$|\1|p' deploy/drill/compose.yaml)
+case "$image" in
+  *"
+"*)
+    echo "::error::more than one docker.io/prom/prometheus image in deploy/drill/compose.yaml"
+    exit 1
+    ;;
+  *@sha256:*) ;;
+  *)
+    echo "::error::no digest-pinned docker.io/prom/prometheus image in deploy/drill/compose.yaml"
+    exit 1
+    ;;
+esac
 promtool() {
   "$engine" run --rm -v "$PWD/deploy/prometheus:/w:ro,Z" -w /w \
-    --entrypoint promtool docker.io/prom/prometheus:v3.5.0 "$@"
+    --entrypoint promtool "$image" "$@"
 }
 promtool check rules torrentd.rules.yml
 promtool test rules torrentd.rules.test.yml

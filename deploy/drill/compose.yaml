@@ -11,6 +11,13 @@
 #   deploy/drill/run.sh
 #
 # Every port is published on loopback only, for run.sh to reach.
+#
+# Each image is pinned by the digest of its multi-arch index, not by its tag
+# alone, so the drill runs the same binaries every time. Move a pin with
+#   skopeo inspect --raw docker://IMAGE:TAG | sha256sum
+# The Prometheus line is also the one definition of the Prometheus release
+# `mise run test-alerts` runs promtool from: that task reads it from here, so
+# the rules are unit-tested by the binary that evaluates them in the drill.
 name: torrentd-drill
 
 services:
@@ -41,7 +48,7 @@ services:
       - "127.0.0.1:18180:8080"
 
   prometheus:
-    image: docker.io/prom/prometheus:v3.5.0
+    image: docker.io/prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -56,7 +63,7 @@ services:
       - alertmanager
 
   alertmanager:
-    image: docker.io/prom/alertmanager:v0.28.1
+    image: docker.io/prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
     volumes:
@@ -65,7 +72,7 @@ services:
       - sink
 
   sink:
-    image: docker.io/library/python:3.12-alpine
+    image: docker.io/library/python:3.12-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d
     command: ["python", "-u", "/sink.py"]
     volumes:
       - ./sink.py:/sink.py:ro,z

@@ -158,6 +158,7 @@ Two consequences worth knowing:
 | `LIBTORRENT_SYS_CACHE_DIR` | Relocate the prefix root |
 | `LIBTORRENT_SYS_PREFIX` | Build the shim against an existing libtorrent + Boost install instead of the vendored one |
 | `LIBTORRENT_SYS_FORCE_REBUILD` | Ignore both stamps and rebuild |
+| `LIBTORRENT_SYS_LIBSTDCXX_RPATH=1` | Embed the compiler's libstdc++ directory as an rpath in `libtorrent-sys`'s own test binaries, for a GCC whose runtime the loader does not find (off by default; `torrentd` never gets one) |
 
 Deleting the cache directory by hand is safe even with a warm `target/`: the build script
 registers the stamp file with `rerun-if-changed`, so cargo treats its disappearance as a
