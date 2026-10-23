@@ -84,6 +84,47 @@ paths the daemon cannot (anything under `/home`). Where that matters, scan
 through the daemon instead, with `POST /v1/pool/scan`, which sees exactly what
 the daemon sees.
 
+**Configure it.** Add the section to `/etc/torrentd/torrentd.toml`, with
+your payload's directories as roots and the copy from §1 as the library:
+
+```toml
+[pool]
+roots                 = ["/srv/media/movies", "/srv/media/tv"]   # siblings, never nested
+library_dir           = "/var/lib/torrentd-import/BT_backup"
+max_concurrent_verify = 4          # §5, "Sizing the hashing"
+# allow_mutations     = false      # leave off for an import: adoption needs none
+```
+
+Then let the unit write there, with a drop-in rather than an edit to the
+shipped file. `ReadWritePaths=` in a drop-in adds to the unit's list:
+
+```bash
+sudo systemctl edit torrentd
+```
+
+```ini
+[Service]
+ReadWritePaths=/srv/media/movies /srv/media/tv /var/lib/torrentd-import
+```
+
+Check the file as the daemon's user, then restart: `[pool]` takes a restart,
+and a `SIGHUP` or `POST /v1/config/reload` only warns that it was ignored.
+
+```bash
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config
+sudo systemctl restart torrentd      # skip while the daemon stays stopped for §4's CLI scan
+```
+
+**Map each tracker to its profile first.** A `vpn` profile adopts only a
+torrent whose every tracker is on its `allowed_tracker_domains` (and, where
+two accounts share a tracker, under its `allowed_tracker_urls`): the rest are
+refused, one by one, in §6. List the trackers the old client announces to,
+decide which account each belongs to, and put each domain on that account's
+profile before the first adopt
+([Account isolation](running.md#account-isolation)). Those keys take a
+restart too, so set them with `[pool]`. A torrent whose trackers belong to no
+`vpn` profile goes into a host profile, or stays out.
+
 ## 3. Per client
 
 The scan reads each `.torrent` for its info-hash and file list, and looks for
@@ -169,7 +210,21 @@ started during the scan fails to start, with `the pool index is locked by
 another process`, until the scan ends. With the
 daemon up, `POST /v1/pool/scan` does the same scan through the daemon and
 returns the same counts. Nothing scans on its own: the daemon does not scan
-at boot.
+at boot. So there are two orders, and either works:
+
+```bash
+# The daemon stopped for the scan:
+sudo systemctl stop torrentd
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool scan
+sudo systemctl start torrentd
+
+# Or the daemon running, scanning through it. The request answers when the
+# scan ends, which on a large pool is many minutes:
+curl -sX POST localhost:8080/v1/pool/scan -H "Authorization: Bearer $TOKEN"
+```
+
+The second sees exactly what the sandboxed daemon sees (§2). `$TOKEN` is any
+`write` credential, as §5 says.
 
 | State | Meaning | Adopts |
 | --- | --- | --- |
@@ -216,12 +271,37 @@ Then see what no torrent claims:
 
 ```bash
 sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool orphans
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool orphans --limit 500
 ```
 
-A large unclaimed directory is usually payload whose `.torrent` you did not
+It lists at most 40 entries per root; `--limit` raises that. A large
+unclaimed directory is usually payload whose `.torrent` you did not
 copy, or payload for torrents that read `partial`.
 
 ## 5. Adopt
+
+**Credentials.** Every call below takes a `write` credential as `$TOKEN`.
+With `[auth]` configured, that is a session token from the operator
+password, or a static token with the `write` scope
+([running.md §6](running.md#6-authentication--required-one-way-or-the-other)):
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/v1/sessions \
+             -H 'content-type: application/json' \
+             -d '{"password":"…"}' | jq -r .token)
+```
+
+A session token lasts `[auth] session_ttl_secs`, 12 hours by default, which a
+large import outlives: a `401` from a token that worked earlier means it
+expired, so sign in again. Without
+`[auth]`, drop the header. On a unix-socket daemon, replace `localhost:8080`
+with `--unix-socket /run/torrentd/api.sock http://localhost`.
+
+**From the terminal client.** `torrentctl`'s Pool screen does the same
+adoption with the dry run built in: mark torrents in the library view with
+`space` and press `a`, or press `A` on a directory in the tree view, pick
+the profile, and the dialog shows the dry run's buckets, `verify_bytes`
+included. A second `Enter` sends the same request for real.
 
 Adopt into an explicit profile, always as a dry run first. Find the root's
 `root_id` with `GET /v1/pool`, then name a subtree of it:
@@ -263,6 +343,53 @@ nothing to the wait.
 A torrent listed under `fast_path` can still end up hashed: when its resume
 data turns out unreadable or libtorrent rejects it, the adopt falls back to
 the verify queue and logs `falling back to verification`.
+
+**Batches by account.** Where one root holds several accounts' torrents, a
+subtree does not separate them, but the qBittorrent category often does
+(`GET /v1/pool/torrents` reports it). Collect one account's matched torrents,
+a page of up to 1000 at a time, and adopt them 1000 at most per request:
+
+```bash
+cursor=
+: > acct_a.hashes
+while :; do
+  page=$(curl -sG localhost:8080/v1/pool/torrents -H "Authorization: Bearer $TOKEN" \
+              --data-urlencode state=matched --data-urlencode limit=1000 \
+              ${cursor:+--data-urlencode "cursor=$cursor"})
+  jq -r '.items[] | select(.category == "tracker-a") | .infohash' <<<"$page" >> acct_a.hashes
+  cursor=$(jq -r '.next_cursor // empty' <<<"$page")
+  [ -n "$cursor" ] || break
+done
+rm -f acct_a.batch.*
+if [ -s acct_a.hashes ]; then
+  split -l 1000 acct_a.hashes acct_a.batch.
+  for b in acct_a.batch.*; do
+    jq -Rn --arg p acct_a '{profile_id: $p, dry_run: true,
+          selector: {kind: "infohashes", infohashes: [inputs]}}' < "$b" \
+      | curl -sX POST localhost:8080/v1/pool/adoptions -H "Authorization: Bearer $TOKEN" \
+             -H 'content-type: application/json' -d @- \
+      | jq '{fast_path: (.fast_path | length), queued: (.queued_for_verification | length), verify_bytes, refused}'
+  done
+fi
+```
+
+The `rm -f` clears the previous run's batch files, so a re-run that splits
+into fewer files does not post leftovers; with no matching hashes nothing is
+posted. Run it again with `state=shared` for cross-seeds, and with
+`dry_run: false` once every batch's dry run reads as expected.
+
+**Sizing the hashing.** Every queued torrent is read in full once, so
+`verify_bytes` divided by what the disks holding the payload sustain in
+sequential reads is the least time the batch takes: 20 TB at 400 MB/s is
+about 14 hours, at 150 MB/s about 37. Seeding keeps reading from the same
+disks meanwhile. `max_concurrent_verify` (default `4`) is how many torrents
+hash at once. More helps only where the payload spans independent disks
+that can each serve one: on a single disk, or one parity array, more
+concurrent checks turn sequential reads into seeks and slow the batch and
+the seeding alike. A queue that takes days is still bounded, and survives
+restarts (§7). To seed sooner, adopt the infohashes a dry run lists under
+`fast_path` first, which seed at once, then the hashed ones a batch at a
+time. The value is read at startup (§2).
 
 ## 6. Refusals
 

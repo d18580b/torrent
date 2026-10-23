@@ -1,3 +1,19 @@
+# torrentd behind Caddy. Bringing it up, in order (docs/running.md §8, "On
+# the compose stack", has each step and why):
+#
+#   1. cp deploy/torrentd.sample.toml deploy/torrentd.toml, then in it set
+#      http_listen = "0.0.0.0:8080", uncomment trusted_proxies = ["172.28.0.2"]
+#      and delete allow_unauthenticated. The file must exist before any
+#      `compose run`: a bind mount of a missing file mounts a directory.
+#   2. In deploy/Caddyfile, replace torrentd.example.com with your host name.
+#   3. Create /data/torrents owned by uid 1000 (docs/running.md §4).
+#   4. podman compose -f deploy/compose.yaml build
+#      podman compose -f deploy/compose.yaml run --rm torrentd hash-password
+#      and paste the hash into an [auth] section of deploy/torrentd.toml.
+#   5. podman compose -f deploy/compose.yaml up -d
+#
+# `docker compose` takes the same arguments.
+
 services:
   torrentd:
     build:

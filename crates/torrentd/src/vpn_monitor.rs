@@ -1,7 +1,8 @@
 //! VPN tunnel health monitor (multi-profile mode).
 //!
 //! Every 30s, re-reads each profile's tunnel interface IP, asks the kernel
-//! where a packet from that IP would be routed, and — for WireGuard — reads the
+//! where a packet from that IP, and from each global IPv6 address the
+//! interface holds, would be routed, and — for WireGuard — reads the
 //! age of its latest handshake. If the interface is down, its IP changed, its
 //! traffic no longer routes by the tunnel device, the handshake has gone stale
 //! (a tunnel that keeps its address but has silently died), or a WireGuard
@@ -453,18 +454,58 @@ pub(crate) struct TunnelProbes {
 /// The probes [`run`] makes of `iface` each poll, on the host.
 fn probe_tunnel(iface: &str, is_wg: bool) -> TunnelProbes {
     let ip = vpn::probe_ipv4(iface).map(|v4| v4.map(IpAddr::V4));
-    // Asked from the address the interface holds now: if that is not the
-    // bound one the address check fences first, and with no address (or none
-    // known) there is nothing to ask about.
-    let route = Address::from_probe(&ip)
-        .held()
-        .map(|src| vpn::route::probe(iface, src, IpAddr::V4(vpn::route::PROBE_DEST)));
+    let route = route_probe(iface, &ip, vpn::route::v6_sources, vpn::route::probe);
     let handshake = is_wg.then(|| vpn::wireguard_handshake_age(iface));
     TunnelProbes {
         ip,
         route,
         handshake,
     }
+}
+
+/// Where a packet from each address `iface` sends from would be routed:
+/// the IPv4 address `ip` read, then each global IPv6 address `v6` reads, each
+/// asked of `probe` toward the destination of its own family
+/// ([`vpn::route::probe_dest`]). The first answer that is not
+/// [`RouteProbe::ViaTunnel`](vpn::route::RouteProbe::ViaTunnel) is the
+/// answer.
+///
+/// Asked from the IPv4 address the interface holds now: if that is not the
+/// bound one the address check fences first, and with no address (or none
+/// known) there is nothing to ask about, IPv6 included.
+///
+/// The IPv6 addresses are asked too because a session listens on the device
+/// and so sends from each of them: an `ip -6 rule` lost on its own (an
+/// operator's `ip -6 rule flush`, a firewall reload that restores only the
+/// IPv4 rules) left the IPv4 route by the tunnel and every IPv6 packet the
+/// profile sent leaving by the main table's default route, with nothing
+/// fencing it. A link whose IPv6 addresses cannot be read keeps the IPv4
+/// answer: the address check reads the link again on the next poll.
+fn route_probe(
+    iface: &str,
+    ip: &Result<Option<IpAddr>, vpn::AddrProbeUnavailable>,
+    v6: impl FnOnce(&str) -> std::io::Result<Vec<std::net::Ipv6Addr>>,
+    probe: impl Fn(
+        &str,
+        IpAddr,
+        IpAddr,
+    ) -> Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
+) -> Option<Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>> {
+    let src = Address::from_probe(ip).held()?;
+    let v4 = probe(iface, src, vpn::route::probe_dest(src));
+    if v4 != Ok(vpn::route::RouteProbe::ViaTunnel) {
+        return Some(v4);
+    }
+    let Ok(v6) = v6(iface) else {
+        return Some(v4);
+    };
+    Some(
+        v6.into_iter()
+            .map(IpAddr::V6)
+            .map(|src| probe(iface, src, vpn::route::probe_dest(src)))
+            .find(|r| *r != Ok(vpn::route::RouteProbe::ViaTunnel))
+            .unwrap_or(v4),
+    )
 }
 
 /// How [`run_with`] and [`recovery_check`] probe a tunnel: [`probe_tunnel`]
@@ -2144,6 +2185,111 @@ mod tests {
             Ok(()),
             "a probe that could not run is reported by its own series, not fenced on",
         );
+    }
+
+    /// The tunnel's IPv6 address, `fd00::a`.
+    fn v6(a: u16) -> std::net::Ipv6Addr {
+        std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, a)
+    }
+
+    /// A kernel routing by `wg-a` from every source but `leaking`, which it
+    /// routes by `eth0`, recording each question asked of it.
+    fn kernel(
+        leaking: Option<IpAddr>,
+        asked: &std::cell::RefCell<Vec<(IpAddr, IpAddr)>>,
+    ) -> impl Fn(&str, IpAddr, IpAddr) -> Result<RouteProbe, vpn::route::RouteProbeUnavailable> + '_
+    {
+        move |iface, src, dest| {
+            assert_eq!(iface, "wg-a");
+            asked.borrow_mut().push((src, dest));
+            if Some(src) == leaking {
+                Ok(RouteProbe::Elsewhere(format!(
+                    "leaves by eth0: {dest} from {src} via fe80::1 dev eth0"
+                )))
+            } else {
+                Ok(RouteProbe::ViaTunnel)
+            }
+        }
+    }
+
+    /// #446: the `ip -6 rule` alone lost. The IPv4 route still leaves by the
+    /// tunnel, the address and the handshake are healthy, and every IPv6
+    /// packet the session sends from the tunnel's IPv6 address leaves by
+    /// eth0. Before, only the IPv4 address was asked about and this profile
+    /// stayed `Active`.
+    #[test]
+    fn an_ipv6_route_leaving_by_eth0_fences() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let leaking = IpAddr::V6(v6(2));
+        let route = route_probe(
+            "wg-a",
+            &Ok(ip(2)),
+            |_| Ok(vec![v6(3), v6(2)]),
+            kernel(Some(leaking), &asked),
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                (ip(2).unwrap(), IpAddr::V4(vpn::route::PROBE_DEST)),
+                (IpAddr::V6(v6(3)), IpAddr::V6(vpn::route::PROBE_DEST_V6)),
+                (leaking, IpAddr::V6(vpn::route::PROBE_DEST_V6)),
+            ],
+            "each address is asked toward its own family's destination",
+        );
+        let route = match route {
+            Some(Ok(r)) => r,
+            other => panic!("the probe answered: {other:?}"),
+        };
+        assert!(
+            matches!(route, RouteProbe::Elsewhere(ref why) if why.contains("fd00::2")),
+            "{route:?}"
+        );
+        let obs = Observation {
+            route: Some(route),
+            ..healthy()
+        };
+        assert_eq!(evaluate(&obs, MAX), Err(DownReason::RouteMismatch));
+    }
+
+    /// A tunnel with no IPv6 address, or whose IPv6 addresses cannot be read,
+    /// is judged on its IPv4 route alone; one whose IPv4 route already left
+    /// is not asked about IPv6; one with no address is not asked at all.
+    #[test]
+    fn the_ipv6_route_is_asked_only_beside_a_healthy_ipv4_one() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            route_probe("wg-a", &Ok(ip(2)), |_| Ok(vec![]), kernel(None, &asked)),
+            Some(Ok(RouteProbe::ViaTunnel)),
+        );
+        assert_eq!(
+            route_probe(
+                "wg-a",
+                &Ok(ip(2)),
+                |_| Err(std::io::Error::other("ip -6 exited 1")),
+                kernel(None, &asked),
+            ),
+            Some(Ok(RouteProbe::ViaTunnel)),
+        );
+        asked.borrow_mut().clear();
+        let r = route_probe(
+            "wg-a",
+            &Ok(ip(2)),
+            |_| panic!("the IPv4 route already fences"),
+            kernel(ip(2), &asked),
+        );
+        assert!(matches!(r, Some(Ok(RouteProbe::Elsewhere(_)))), "{r:?}");
+        assert_eq!(asked.borrow().len(), 1);
+        asked.borrow_mut().clear();
+        assert_eq!(
+            route_probe(
+                "wg-a",
+                &Ok(None),
+                |_| panic!("nothing to ask from"),
+                kernel(None, &asked),
+            ),
+            None,
+        );
+        assert!(asked.borrow().is_empty());
     }
 
     /// The acceptance test for the no-handshake rule: a WireGuard link that
