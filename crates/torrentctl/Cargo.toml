@@ -55,6 +55,9 @@ insta = { workspace = true }
 tempfile = { workspace = true }
 # openpty(3), for the e2e test that runs the binary under a pty.
 libc = { workspace = true }
+# `test-util` pauses the clock, so a test can show a request outlasting the
+# 15-second request timeout without waiting for it.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

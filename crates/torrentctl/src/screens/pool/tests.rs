@@ -1071,6 +1071,49 @@ fn adopting_previews_a_dry_run_then_applies_the_same_request() {
     assert!(state.adopt.is_none());
 }
 
+/// The preview of a large adoption can take longer than the 15s request
+/// timeout; it is not given up on, any more than the adoption itself.
+#[test]
+fn the_adoption_preview_outlasts_the_request_timeout() {
+    let mut state = with_library(1, None);
+    press(&mut state, KeyCode::Char('a'), true);
+    let serial = state.adopt.as_ref().unwrap().serial;
+    send(
+        &mut state,
+        Msg::Adopt(adopt::Msg::Profiles {
+            serial,
+            result: Ok(profiles()),
+        }),
+        true,
+    );
+    press(&mut state, KeyCode::Char('j'), true);
+
+    // A daemon that takes the request and is still working on it.
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", busy.local_addr().expect("an address"));
+    let api = crate::api::Api::new(&url, Some("tdp_test")).expect("a valid URL");
+    let msg = on_key(&state, testing::key(KeyCode::Enter)).expect("the dry run");
+    let server = testing::server(true, true);
+    let mut effects = testing::with_api(&api, Some(&server), |ctx| update(&mut state, msg, ctx));
+    assert_eq!(effects.len(), 1, "the dry run");
+
+    // The clock is paused: it moves only to the next deadline, so past the
+    // request timeout the preview is still waiting for its answer.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("a test runtime");
+    let past_the_timeout = crate::api::REQUEST_TIMEOUT * 4;
+    let effect = effects.remove(0).0;
+    let answered = runtime.block_on(async { tokio::time::timeout(past_the_timeout, effect).await });
+    assert!(
+        answered.is_err(),
+        "the preview gave up on a daemon still working: {answered:?}"
+    );
+    drop(busy);
+}
+
 #[test]
 fn a_refused_dry_run_returns_to_the_profile_and_says_why() {
     let mut state = with_library(1, None);

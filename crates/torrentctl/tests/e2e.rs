@@ -544,7 +544,7 @@ async fn follow_events_reconnects_after_daemon_restart() {
     .await;
 
     // The same port again: the stream comes back on its own, within the
-    // backoff (1s, doubling, at most 30s).
+    // backoff (1s, doubling, at most 30s, never under the daemon's 5s retry).
     let _daemon = spawn(&cfg);
     live(&mut rx, Duration::from_secs(60), |l| *l == Live::Streaming).await;
 
