@@ -68,6 +68,14 @@ Refusals:
 
 - A missing, unknown, expired or revoked token is a `401` with
   `WWW-Authenticate: Bearer`. The API never says which of those it was.
+  `openapi.json` declares that header on every operation's `401` but does
+  not mark it `required`, though every `401` carries it: kynos 0.4 merges
+  the guard's own description of the `401`, which omits the header, with
+  the one that requires it, and keeps a header `required` only where every
+  description of the response requires it. A client generated from the
+  document may read the header as optional; the daemon always sends it.
+  The upstream fix is tracked in
+  [issue 508](https://github.com/d18580b/torrent/issues/508).
 - A valid token without the scope is a `403`
   [`insufficient-scope`](problems.md#insufficient-scope).
 - `POST /v1/sessions` is throttled per client (per /64 for IPv6), and against a daemon-wide
