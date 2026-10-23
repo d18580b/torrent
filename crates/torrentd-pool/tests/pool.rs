@@ -2123,6 +2123,42 @@ fn an_unparseable_sidecar_refuses_a_renamed_torrent() {
     );
 }
 
+/// Issue #438: a known torrent moved within the library with a sidecar that
+/// no longer parses keeps what the last good read recorded, while its row
+/// points at the `.torrent` and sidecar where this scan found them. The add
+/// path reads `source_path`, so a stale one would name a file that is gone.
+#[test]
+fn an_unparseable_sidecar_moved_within_the_library_refreshes_its_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let (library, _root, mut store, ih) = renamed_and_indexed(dir.path());
+    let before = store.torrent(&ih).unwrap().unwrap();
+    assert_eq!(before.source_path, library.join("t.torrent"));
+    let files_before = store.torrent_files(&ih).unwrap();
+
+    let moved = library.join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    std::fs::rename(library.join("t.torrent"), moved.join("t.torrent")).unwrap();
+    std::fs::write(moved.join("t.fastresume"), b"d6:pieces").unwrap();
+    std::fs::remove_file(library.join("t.fastresume")).unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+
+    assert_eq!(stats.errors_by_kind.get("parse"), Some(&1));
+    assert_eq!(stats.torrents_indexed, 1);
+    let after = store.torrent(&ih).unwrap().unwrap();
+    assert_eq!(after.source_path, moved.join("t.torrent"));
+    assert_eq!(after.fastresume_path, Some(moved.join("t.fastresume")));
+    // Everything else is what the good read wrote.
+    assert_eq!(
+        PoolTorrent {
+            source_path: before.source_path.clone(),
+            fastresume_path: before.fastresume_path.clone(),
+            ..after
+        },
+        before
+    );
+    assert_eq!(store.torrent_files(&ih).unwrap(), files_before);
+}
+
 /// Issue #438: a `mapped_files` entry spelled with a `.` component or a
 /// doubled slash names the same file as its plain spelling, and is stored as
 /// that, so the file is found where it is.
