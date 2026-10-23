@@ -476,7 +476,7 @@ mise run test-shim       # Layer 2: the C ABI boundary
 mise run test-lifecycle  # Layer 3: real libtorrent against real disk
 mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
 mise run test-torrentctl # Layer 3: torrentctl's generated client against the daemon
-mise run test-netns      # kill switch, WireGuard and the daemon in private network namespaces (needs unprivileged user namespaces)
+mise run test-netns      # kill switch, WireGuard and the daemon in private network namespaces (host tools, kernel modules and /etc/wireguard it needs: CONTRIBUTING.md's test-netns row)
 mise run openapi         # regenerate docs/api/openapi.json after an API change
 mise run openapi-check   # fail if the committed document is stale
 mise run test-alerts     # promtool over deploy/prometheus (needs podman or docker)
