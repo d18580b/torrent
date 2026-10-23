@@ -1124,16 +1124,9 @@ fn profile_checks(
     };
 
     // 4b. The route the health monitor probes every poll: where a packet
-    //     from the tunnel address to the internet would go.
-    let route =
-        tunnel_ip.map(|src| host.route_probe(iface, src, IpAddr::V4(vpn::route::PROBE_DEST)));
-    checks.push(judge_route(
-        "route",
-        iface,
-        tunnel_ip,
-        IpAddr::V4(vpn::route::PROBE_DEST),
-        route.clone(),
-    ));
+    //     from each of the tunnel's addresses to the internet would go.
+    let (route_check, route) = judge_routes(host, iface, tunnel_ip);
+    checks.push(route_check);
 
     // 5. Handshake liveness — the same probe and the same threshold the health
     //    monitor applies every 30 seconds.
@@ -1315,6 +1308,65 @@ fn profile_checks(
         vpn_type: vpn_type_str(vpn_type),
         checks,
     }
+}
+
+/// The health monitor's route probe (`vpn_monitor::route_probe`), asked the
+/// way it asks it, and the `route` line it implies, with the answer the
+/// `health` line judges.
+///
+/// From the IPv4 tunnel address `src` toward `PROBE_DEST`, then — only while
+/// every answer so far is "by the tunnel" — from each global IPv6 address on
+/// `iface` toward `PROBE_DEST_V6`. The first answer that is not "by the
+/// tunnel" is the answer, as it is for the monitor; with none, the IPv4 one.
+/// IPv6 addresses that cannot be read are none, which leaves the IPv4
+/// answer, as the monitor keeps it.
+fn judge_routes(
+    host: &dyn CheckHost,
+    iface: &str,
+    src: Option<IpAddr>,
+) -> (
+    Check,
+    Option<Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>>,
+) {
+    let Some(v4) = src else {
+        let dest = IpAddr::V4(vpn::route::PROBE_DEST);
+        return (judge_route("route", iface, None, dest, None), None);
+    };
+    let via = Ok(vpn::route::RouteProbe::ViaTunnel);
+    let ask = |from: IpAddr| {
+        let dest = vpn::route::probe_dest(from);
+        (from, dest, host.route_probe(iface, from, dest))
+    };
+    let mut answer = ask(v4);
+    let mut by_tunnel = Vec::new();
+    if answer.2 == via {
+        for from in host.tunnel_ipv6(iface) {
+            by_tunnel.push(answer);
+            answer = ask(IpAddr::V6(from));
+            if answer.2 != via {
+                break;
+            }
+        }
+    }
+    let (from, dest, r) = answer;
+    if r != via {
+        return (
+            judge_route("route", iface, Some(from), dest, Some(r.clone())),
+            Some(r),
+        );
+    }
+    by_tunnel.push((from, dest, r));
+    let pairs: Vec<String> = by_tunnel
+        .iter()
+        .map(|(from, dest, _)| format!("from {from} to {dest}"))
+        .collect();
+    (
+        Check::pass(
+            "route",
+            format!("a packet {} leaves by {iface}", pairs.join(" and ")),
+        ),
+        Some(via),
+    )
 }
 
 /// The verdict a route probe implies: a route from the tunnel address to
@@ -1569,6 +1621,12 @@ mod tests {
         /// What `route_probe` answers for every lookup. Defaults to a route by
         /// the tunnel, which is the healthy host.
         route: Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
+        /// What `route_probe` answers for a lookup from one source, ahead of
+        /// `route`.
+        route_from: Vec<(
+            IpAddr,
+            Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
+        )>,
     }
 
     impl FakeHost {
@@ -1590,7 +1648,18 @@ mod tests {
                 handshake: Err("refused"),
                 ports: Vec::new(),
                 route: Ok(vpn::route::RouteProbe::ViaTunnel),
+                route_from: Vec::new(),
             }
+        }
+
+        /// Script what a route lookup from `src` answers.
+        fn with_route_from(
+            mut self,
+            src: IpAddr,
+            route: Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
+        ) -> Self {
+            self.route_from.push((src, route));
+            self
         }
 
         /// Script the listen port `iface`'s link reports; its peer endpoint
@@ -1802,7 +1871,10 @@ mod tests {
             dest: IpAddr,
         ) -> Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable> {
             self.record(format!("route_probe {iface} {src} {dest}"));
-            self.route.clone()
+            self.route_from
+                .iter()
+                .find(|(from, _)| *from == src)
+                .map_or_else(|| self.route.clone(), |(_, r)| r.clone())
         }
     }
 
@@ -3688,6 +3760,94 @@ user_agent           = "Transmission/4.0.5"
         let r = profile_checks(&cfg, &cfg.profile[0], false, None, &healthy);
         let health = find(&r.checks, "health").expect("the monitor's verdict is reported");
         assert_eq!(health.verdict, Verdict::Pass, "detail: {}", health.detail);
+    }
+
+    /// #534: the route line asks what the monitor asks, from each global
+    /// IPv6 address too. With the IPv4 route by the tunnel and the IPv6 one
+    /// leaving by eth0, the monitor fences `route_mismatch`, so the route
+    /// and health lines fail, naming the IPv6 source. Ask from the IPv4
+    /// address alone and both lines pass, which is the first assertion
+    /// failing.
+    #[test]
+    fn an_ipv6_route_leaving_by_another_device_fails_the_route_and_the_health_verdict() {
+        let cfg = cfg_with_profile("");
+        let v6: std::net::Ipv6Addr = "fd00::2".parse().unwrap();
+        let leaking = FakeHost::new()
+            .with_handshake(Ok(Some(Duration::from_secs(5))))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))])
+            .with_v6("wg-acct-a", &[v6])
+            .with_route_from(
+                IpAddr::V6(v6),
+                Ok(vpn::route::RouteProbe::Elsewhere(
+                    "leaves by eth0".to_string(),
+                )),
+            );
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &leaking);
+        let route = find(&r.checks, "route").expect("the route line is reported");
+        assert_eq!(route.verdict, Verdict::Fail, "detail: {}", route.detail);
+        assert!(
+            route
+                .detail
+                .contains("from fd00::2 to 2606:4700:4700::1111 does not leave"),
+            "{}",
+            route.detail
+        );
+        let health = find(&r.checks, "health").expect("the monitor's verdict is reported");
+        assert_eq!(health.verdict, Verdict::Fail, "detail: {}", health.detail);
+        assert!(
+            health.detail.contains("route_mismatch"),
+            "{}",
+            health.detail
+        );
+        let probes: Vec<String> = leaking
+            .events()
+            .into_iter()
+            .filter(|e| e.starts_with("route_probe "))
+            .collect();
+        assert_eq!(
+            probes,
+            [
+                "route_probe wg-acct-a 10.2.0.2 1.1.1.1",
+                "route_probe wg-acct-a fd00::2 2606:4700:4700::1111",
+            ],
+            "the IPv4 address first, each toward its own family's destination",
+        );
+
+        // Both by the tunnel: one passing line naming both questions.
+        let healthy = FakeHost::new()
+            .with_handshake(Ok(Some(Duration::from_secs(5))))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))])
+            .with_v6("wg-acct-a", &[v6]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &healthy);
+        let route = find(&r.checks, "route").expect("the route line is reported");
+        assert_eq!(route.verdict, Verdict::Pass, "detail: {}", route.detail);
+        assert_eq!(
+            route.detail,
+            "a packet from 10.2.0.2 to 1.1.1.1 and from fd00::2 to 2606:4700:4700::1111 \
+             leaves by wg-acct-a"
+        );
+        let health = find(&r.checks, "health").expect("the monitor's verdict is reported");
+        assert_eq!(health.verdict, Verdict::Pass, "detail: {}", health.detail);
+
+        // An IPv4 route that already leaves is the answer; IPv6 is not asked.
+        let v4_leaks = FakeHost::new()
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))])
+            .with_v6("wg-acct-a", &[v6])
+            .with_route(Ok(vpn::route::RouteProbe::Elsewhere(
+                "leaves by eth0".to_string(),
+            )));
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &v4_leaks);
+        let route = find(&r.checks, "route").expect("the route line is reported");
+        assert!(
+            route.detail.contains("from 10.2.0.2 to 1.1.1.1"),
+            "{}",
+            route.detail
+        );
+        assert!(
+            !v4_leaks.events().iter().any(|e| e.contains("fd00::2")),
+            "{:?}",
+            v4_leaks.events()
+        );
     }
 
     /// `--egress` asserts the route before it trusts a reply: a round trip
