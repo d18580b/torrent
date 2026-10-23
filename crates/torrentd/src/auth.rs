@@ -81,16 +81,6 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// The scope a wire name spells, as the security scheme declares it.
-    pub fn parse(name: &str) -> Option<Scope> {
-        match name {
-            "read" => Some(Scope::Read),
-            "write" => Some(Scope::Write),
-            "metrics" => Some(Scope::Metrics),
-            _ => None,
-        }
-    }
-
     /// Whether holding `self` satisfies a requirement for `needed`.
     pub fn allows(self, needed: Scope) -> bool {
         match self {

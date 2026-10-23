@@ -71,7 +71,7 @@ pub struct TimedBody {
 
 /// What [`TimedBody`] answers with.
 pub enum BodyRefused {
-    TooLarge(kynos::middleware::limits::BodySizeExceeded),
+    TooLarge(kynos::middleware::limits::body_size::BodySizeExceeded),
     TooSlow(Duration),
 }
 
@@ -97,8 +97,9 @@ impl kynos::response::ShortCircuit for BodyRefused {
 
 impl kynos::response::Responses for BodyRefused {
     fn responses(registry: &mut kynos::schema::registry::Registry) -> kynos::openapi::Responses {
-        let mut responses = kynos::middleware::limits::BodySizeExceeded::<()>::responses(registry);
-        let timed_out = kynos::middleware::limits::TimedOut::<()>::responses(registry);
+        let mut responses =
+            kynos::middleware::limits::body_size::BodySizeExceeded::<()>::responses(registry);
+        let timed_out = kynos::middleware::limits::timeout::TimedOut::<()>::responses(registry);
         for (status, mut response) in timed_out.responses {
             if let kynos::openapi::RefOr::Item(item) = &mut response {
                 item.description =
@@ -157,8 +158,11 @@ impl<C: Sync + 'static> kynos::middleware::Interceptor<C> for TimedBody {
         _context: &C,
         next: kynos::middleware::Next<'_, C>,
     ) -> Result<kynos::middleware::Continued<()>, BodyRefused> {
-        let too_large =
-            || BodyRefused::TooLarge(kynos::middleware::limits::BodySizeExceeded::new(self.limit));
+        let too_large = || {
+            BodyRefused::TooLarge(kynos::middleware::limits::body_size::BodySizeExceeded::new(
+                self.limit,
+            ))
+        };
         if declared_length(request.headers()).is_some_and(|declared| declared > self.limit) {
             return Err(too_large());
         }
@@ -270,8 +274,10 @@ macro_rules! v1_group {
     };
     (open $max_body:expr, $deadline:expr) => {
         v1_group!()
-            .intercept(kynos::middleware::limits::Timeout::new($deadline))
-            .intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
+            .intercept(kynos::middleware::limits::timeout::Timeout::new($deadline))
+            .intercept(kynos::middleware::limits::body_size::BodySize::new(
+                $max_body as u64,
+            ))
     };
     (untimed $max_body:expr) => {
         v1_group!()
@@ -290,15 +296,19 @@ macro_rules! v1_group {
             .intercept(crate::http::security::Authorized::<
                 crate::http::security::Write,
             >::new())
-            .intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
+            .intercept(kynos::middleware::limits::body_size::BodySize::new(
+                $max_body as u64,
+            ))
     };
     ($max_body:expr, $deadline:expr) => {
         v1_group!()
-            .intercept(kynos::middleware::limits::Timeout::new($deadline))
+            .intercept(kynos::middleware::limits::timeout::Timeout::new($deadline))
             .intercept(crate::http::security::Authorized::<
                 crate::http::security::Write,
             >::new())
-            .intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
+            .intercept(kynos::middleware::limits::body_size::BodySize::new(
+                $max_body as u64,
+            ))
     };
 }
 

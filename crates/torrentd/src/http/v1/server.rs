@@ -215,7 +215,7 @@ const IDLE_TICK: Duration = Duration::from_secs(10);
 
 /// How long a client waits before reconnecting a dropped stream, sent with
 /// the first event.
-const RETRY_MILLIS: u64 = 5_000;
+const RETRY: Duration = Duration::from_secs(5);
 
 /// The most `/v1/events` streams open at once.
 ///
@@ -431,7 +431,7 @@ pub async fn stream_events(
             })
             .event("tick");
             if std::mem::take(&mut first) {
-                event = event.retry(RETRY_MILLIS);
+                event = event.retry(RETRY);
             }
             yield Ok(event);
         }

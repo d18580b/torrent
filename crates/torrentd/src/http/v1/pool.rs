@@ -41,6 +41,7 @@ use crate::http::v1::server::count;
 use crate::http::v1::Pool;
 use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
+use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
 use crate::pool_service::execute_adopt;
 use crate::pool_service::PoolService;
@@ -535,7 +536,6 @@ pub struct TreeQuery {
     /// Resume after the last entry of the previous page.
     pub cursor: Option<String>,
     /// Entries per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -803,7 +803,6 @@ pub struct PoolTorrentQuery {
     /// Resume after the last torrent of the previous page.
     pub cursor: Option<String>,
     /// Torrents per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -1042,7 +1041,7 @@ from_profile_problem!(AdoptError);
 pub async fn adopt_pool_torrents(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
-    Json(req): Json<AdoptRequest>,
+    Json(Unenforced(req)): Json<Unenforced<AdoptRequest>>,
 ) -> Result<Json<AdoptionResult>, AdoptError> {
     // `allow_mutations` is deliberately not consulted. It gates the plan
     // surface — creating a plan as well as applying one — because a plan
@@ -1385,7 +1384,7 @@ from_invalid!(VerifyError);
 pub async fn verify_pool_torrents(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
-    Json(req): Json<VerifyRequest>,
+    Json(Unenforced(req)): Json<Unenforced<VerifyRequest>>,
 ) -> Result<Accepted<Json<VerifyResult>>, VerifyError> {
     let pool = s.pool.clone().ok_or(VerifyError::PoolNotConfigured)?;
     req.validate()?;
@@ -1813,7 +1812,6 @@ pub struct PlanQuery {
     /// Resume after the last plan of the previous page.
     pub cursor: Option<String>,
     /// Plans per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -2090,7 +2088,6 @@ pub struct PlanStepQuery {
     /// inline `steps`, with its `steps_next_cursor`.
     pub cursor: Option<String>,
     /// Steps per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 

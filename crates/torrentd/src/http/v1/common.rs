@@ -41,6 +41,17 @@ impl kynos::schema::Schema for HexString {
     }
 }
 
+/// A string on the wire, so `InfoHashHex`'s string bounds may describe it.
+///
+/// It holds the parsed bytes, not the text, so it offers kynos none to check:
+/// the bounds are held where the text is parsed ([`InfoHashHex`]'s `FromStr`,
+/// which its `Deserialize` calls), the only way a request makes one.
+impl kynos::schema::constraints::Textual for HexString {
+    fn text(&self) -> Option<&str> {
+        None
+    }
+}
+
 impl InfoHashHex {
     pub fn new(ih: InfoHash) -> Self {
         Self(HexString(ih))

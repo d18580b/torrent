@@ -10,11 +10,14 @@
 //! [`Metrics`] — through `Scoped<Bearer, _>`, so the requirement is visible per
 //! operation in the published document and checked by the same declaration.
 //!
-//! The scheme is written by hand rather than derived for one reason: a daemon
-//! run with `allow_unauthenticated` has no credentials at all, and kynos'
-//! derived bearer carrier answers an absent `Authorization` header with a 401
-//! before the authenticator is asked. [`Bearer`]'s carrier instead reports the
-//! absence as a [`Presented`] with no token, and [`Gate`] decides: anonymous
+//! The scheme is derived, but its carrier is written by hand
+//! (`carrier = manual`). A daemon run with `allow_unauthenticated` has no
+//! credentials at all, and kynos' default bearer carrier answers an absent
+//! `Authorization` header with a 401 before the authenticator is asked; its
+//! `carrier = optional` passes the absence through but records nothing else
+//! of the request head, which the unauthenticated posture reads (below).
+//! [`Bearer`]'s carrier reports the absence as a [`Presented`] with no token,
+//! beside the request's [`Site`], and [`Gate`] decides: anonymous
 //! access where no `[auth]` is configured, a 401 everywhere else. The document
 //! still describes the bearer requirement, which is the contract for every
 //! deployment that has credentials; `docs/api/README.md` names the exception.
@@ -67,7 +70,19 @@ macro_rules! problem_base {
 #[cfg(test)]
 pub const PROBLEM_BASE: &str = problem_base!();
 
-/// The bearer scheme.
+/// The bearer scheme. Its carrier is [`Bearer`]'s own `Carries` impl
+/// (`carrier = manual`), for the reason the module header gives.
+#[derive(kynos::SecurityScheme)]
+#[security(bearer)]
+#[security(name = "bearer", credential = Caller, scope = Scope, carrier = manual)]
+#[security(
+    description = "An opaque token in `Authorization: Bearer <token>`. Static tokens (`tdp_…`) \
+                   come from `torrentd new-token` and carry the scopes the config grants them; \
+                   session tokens (`tds_…`) come from `POST /v1/sessions` and carry `read` and \
+                   `write`. Scopes: `read` for every safe operation, `write` for every \
+                   operation that changes state (it implies `read`), `metrics` for \
+                   `GET /metrics` only."
+)]
 pub struct Bearer;
 
 /// What the carrier found in the request head.
@@ -392,28 +407,13 @@ impl Caller {
     }
 }
 
-impl SecurityScheme for Bearer {
-    const NAME: &'static str = "bearer";
-
-    type Credential = Caller;
-
-    fn describe() -> kynos::openapi::SecurityScheme {
-        let mut scheme = kynos::openapi::SecurityScheme::bearer(None);
-        if let kynos::openapi::SecurityScheme::Http { description, .. } = &mut scheme {
-            *description = Some(
-                "An opaque token in `Authorization: Bearer <token>`. Static tokens (`tdp_…`) \
-                 come from `torrentd new-token` and carry the scopes the config grants them; \
-                 session tokens (`tds_…`) come from `POST /v1/sessions` and carry `read` and \
-                 `write`. Scopes: `read` for every safe operation, `write` for every operation \
-                 that changes state (it implies `read`), `metrics` for `GET /metrics` only."
-                    .to_owned(),
-            );
+impl kynos::security::Scope for Scope {
+    fn name(&self) -> &'static str {
+        match self {
+            Scope::Read => "read",
+            Scope::Write => "write",
+            Scope::Metrics => "metrics",
         }
-        scheme
-    }
-
-    fn challenge() -> Option<&'static str> {
-        Some("Bearer")
     }
 }
 
@@ -440,17 +440,20 @@ pub struct Metrics;
 const INSUFFICIENT_SCOPE: &str = concat!(problem_base!(), "insufficient-scope");
 
 impl Scopes for Read {
-    const SCOPES: &'static [&'static str] = &["read"];
+    type Scope = Scope;
+    const REQUIRED: &'static [Scope] = &[Scope::Read];
     const FORBIDDEN_TYPE: Option<&'static str> = Some(INSUFFICIENT_SCOPE);
 }
 
 impl Scopes for Write {
-    const SCOPES: &'static [&'static str] = &["write"];
+    type Scope = Scope;
+    const REQUIRED: &'static [Scope] = &[Scope::Write];
     const FORBIDDEN_TYPE: Option<&'static str> = Some(INSUFFICIENT_SCOPE);
 }
 
 impl Scopes for Metrics {
-    const SCOPES: &'static [&'static str] = &["metrics"];
+    type Scope = Scope;
+    const REQUIRED: &'static [Scope] = &[Scope::Metrics];
     const FORBIDDEN_TYPE: Option<&'static str> = Some(INSUFFICIENT_SCOPE);
 }
 
@@ -522,17 +525,10 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
     async fn authorize(
         &self,
         principal: &Caller,
-        scopes: &'static [&'static str],
+        scopes: &[Scope],
         _context: &C,
     ) -> Result<(), AuthRejection> {
-        let needed = scopes.iter().filter_map(|s| Scope::parse(s));
-        let mut denied = false;
-        for scope in needed {
-            if !principal.allows(scope) {
-                denied = true;
-            }
-        }
-        if !denied {
+        if scopes.iter().all(|&scope| principal.allows(scope)) {
             return Ok(());
         }
         if let Caller::Token { name, .. } = principal {
@@ -601,7 +597,9 @@ impl<R: Scopes> kynos::response::Responses for Refused<R> {
     }
 }
 
-impl<R: Scopes> kynos::middleware::Interceptor<crate::http::ctx::AppCtx> for Authorized<R> {
+impl<R: Scopes<Scope = Scope>> kynos::middleware::Interceptor<crate::http::ctx::AppCtx>
+    for Authorized<R>
+{
     type Reads = ();
     type Adds = ();
     type Short = Refused<R>;
@@ -629,7 +627,9 @@ impl<R: Scopes> kynos::middleware::Interceptor<crate::http::ctx::AppCtx> for Aut
         let caller = Authenticator::<Bearer, _>::authenticate(gate, presented, context)
             .await
             .map_err(refused)?;
-        Authenticator::<Bearer, _>::authorize(gate, &caller, R::SCOPES, context)
+        // `Scoped` demands the scheme's default scopes joined with `R`'s;
+        // `Bearer` declares none, so `R`'s are the whole demand.
+        Authenticator::<Bearer, _>::authorize(gate, &caller, R::REQUIRED, context)
             .await
             .map_err(refused)?;
         Ok(next

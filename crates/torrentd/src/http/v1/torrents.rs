@@ -57,6 +57,7 @@ use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::Torrents;
 use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
+use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
 
 /// Upper bound on a `.torrent`, read from the daemon's own filesystem or
@@ -331,7 +332,6 @@ pub struct ListTorrentsQuery {
     /// Resume after the page this cursor ended.
     pub cursor: Option<String>,
     /// Torrents per page, 1 to 1000; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -718,7 +718,7 @@ enum AddSource {
 pub async fn add_torrent(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
-    Json(body): Json<AddTorrentRequest>,
+    Json(Unenforced(body)): Json<Unenforced<AddTorrentRequest>>,
 ) -> Result<Created<Json<Torrent>>, AddTorrentError> {
     body.validate()?;
     let AddTorrentRequest {
@@ -2304,7 +2304,7 @@ pub async fn set_upload_limit(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
     Path(p): Path<TorrentPath>,
-    Json(body): Json<UploadLimit>,
+    Json(Unenforced(body)): Json<Unenforced<UploadLimit>>,
 ) -> Result<NoContent, SetUploadLimitError> {
     body.validate()?;
     let (st, engine) = loaded(&s, p.infohash.get())?;
@@ -2362,7 +2362,6 @@ pub struct ListFilesQuery {
     /// Resume after the page this cursor ended.
     pub cursor: Option<String>,
     /// Files per page, 1 to 1000; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -2542,7 +2541,7 @@ pub async fn set_file_priority(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
     Path(p): Path<TorrentFilePath>,
-    Json(body): Json<FilePriority>,
+    Json(Unenforced(body)): Json<Unenforced<FilePriority>>,
 ) -> Result<NoContent, SetFilePriorityError> {
     body.validate()?;
     let (st, engine) = loaded(&s, p.infohash.get())?;

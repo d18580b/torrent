@@ -877,6 +877,16 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         .write_json("POST", "/v1/torrents", metainfo("p", b"not bencode"))
         .await;
     assert_problem(&resp, 422, "invalid-metainfo");
+    // Past kynos' 2 MiB default for a buffered body: this operation's own
+    // limit is what it is read under, so the body reaches the handler.
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            metainfo("p", &vec![b'x'; 3 * 1024 * 1024]),
+        )
+        .await;
+    assert_problem(&resp, 422, "invalid-metainfo");
 
     // The profile's tracker allow-list.
     let resp = h

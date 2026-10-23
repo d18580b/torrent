@@ -165,19 +165,16 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   always sends it.
 - **No top-level arrays.** A collection is always an object with `items`, so
   it can grow metadata without breaking anyone.
-- **Every response to a routed request** — the root endpoints included, and
-  every failure but the two below — carries these headers:
+- **Every response** — the root endpoints included, and the `404` for an
+  unknown path and the `405` for a wrong method — carries these headers:
   - `Cache-Control: no-store`
   - `X-Content-Type-Options: nosniff`
   - `X-Request-Id`: 32 random hex digits, chosen by the daemon; one a
     client sends is not adopted. The daemon's trace line for the response
     carries it with the operation, status and latency. Quote it when
     reporting a failure. (The line logged when the request arrives is
-    written before the id is assigned, so it shows only whatever the client
-    sent.)
-
-  The `404` for an unknown path and the `405` for a wrong method are answered
-  by the framework before any of this runs, and carry none of them.
+    written before the id is assigned, and carries an empty `request_id`:
+    an id the client sent is neither adopted nor logged.)
 - **Body limits.** A request body is capped at 64 KiB, except for
   `POST /v1/torrents`, which takes 96 MiB so it can carry a base64-encoded
   64 MiB `.torrent`. An operation that takes no body declares no `413`.

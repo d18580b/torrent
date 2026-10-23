@@ -138,7 +138,7 @@ async fn events(cov: &Arc<Coverage>) {
     resp.assert_status(kynos::http::StatusCode::OK);
     let events = resp.events();
     let first = events.first().expect("at least one tick");
-    assert_eq!(first.name.as_deref(), Some("tick"));
+    assert_eq!(first.event.as_deref(), Some("tick"));
     assert_eq!(first.retry, Some(5_000));
     let data: serde_json::Value = serde_json::from_str(&first.data).unwrap();
     assert_eq!(data["kind"], "tick");
@@ -297,14 +297,6 @@ async fn every_response_carries_the_shared_headers_and_its_own_request_id() {
     ] {
         let resp = h.send(method, path, token.as_deref(), None).await;
         let at = format!("{method} {path} -> {}", resp.status());
-        // kynos answers an unmatched path or method before any interceptor
-        // runs, so its 404/405 carries neither these headers nor an id — a
-        // framework gap `docs/api/README.md` states. This test says so
-        // explicitly, and fails the day that changes.
-        if path == "/v1/nope" || method == "PATCH" {
-            assert_eq!(resp.header("x-request-id"), None, "{at}");
-            continue;
-        }
         assert_eq!(resp.header("cache-control"), Some("no-store"), "{at}");
         assert_eq!(
             resp.header("x-content-type-options"),

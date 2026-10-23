@@ -1,13 +1,45 @@
-//! Request validation the document describes and kynos does not enforce.
+//! Request validation: the one answer to a request that breaks a declared
+//! constraint.
 //!
 //! kynos writes `#[schema(minimum, maximum, pattern, …)]` into the published
-//! schema but decodes a body with plain serde, so a value outside the declared
-//! range reaches the handler. Every request type with a constraint therefore
-//! implements [`Validate`], restating it, and a handler rejects with
-//! `422 validation-failed` before acting. `http::tests::spec` holds the table
-//! that proves each declared constraint is enforced.
+//! schema, and its `Json` extractor also enforces those bounds, answering a
+//! broken one with its own `422` (`about:blank`). This API answers it with
+//! `422 validation-failed` instead (`docs/api/problems.md`), so a body type
+//! with a constraint is extracted as `Json<Unenforced<T>>`, which kynos
+//! describes exactly as `T` and does not check. `T` implements [`Validate`],
+//! restating each constraint, and its handler rejects before acting.
+//!
+//! No test of the published document can tell the wrapper is missing: the
+//! document is the same either way. Instead each operation's own scenario
+//! sends a body that breaks a declared bound and asserts
+//! `422 validation-failed` at its pointer (`adding`, `controls` and `files` in
+//! `http::tests::torrents`, `adoption` and `verification` in
+//! `http::tests::pool`, and, with the `fault-injection` feature,
+//! `fault_injection::scenarios`), so one of these bodies extracted as plain
+//! `Json<T>` fails its scenario. A new bounded body is covered only once its
+//! operation's scenario does the same.
 
+use kynos::schema::registry::Registry;
+use serde::Deserialize;
 use serde::Serialize;
+
+/// A request body kynos decodes and describes as `T`, leaving the bounds
+/// `T`'s schema declares to [`Validate`].
+///
+/// Transparent to serde, and described as a reference to `T` itself, so the
+/// published document is the one `Json<T>` would give. A body that is not
+/// JSON, or JSON of the wrong shape, is still kynos' `400` or `422`.
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+pub struct Unenforced<T>(pub T);
+
+impl<T: kynos::schema::Schema> kynos::schema::Schema for Unenforced<T> {
+    fn schema(registry: &mut Registry) -> kynos::openapi::Schema {
+        registry.resolve::<T>()
+    }
+
+    // `check_constraints` keeps its default, which checks nothing.
+}
 
 /// One violated constraint.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

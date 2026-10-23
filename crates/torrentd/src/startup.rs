@@ -91,11 +91,11 @@ const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 16;
 /// to acknowledge, so a silent peer is dropped within 30 s. It does not bound
 /// a peer that answers pings and sends nothing else, nor a connection that
 /// sends no byte at all (`docs/running.md` §7).
-const HTTP2_KEEP_ALIVE: kynos::server::protocol::Http2KeepAlive =
-    kynos::server::protocol::Http2KeepAlive {
-        interval: std::time::Duration::from_secs(20),
-        timeout: std::time::Duration::from_secs(10),
-    };
+const HTTP2_KEEP_ALIVE: kynos::server::protocol::http2::Http2KeepAlive =
+    kynos::server::protocol::http2::Http2KeepAlive::new(
+        std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(10),
+    );
 
 /// How long the HTTP server's graceful shutdown waits for open requests
 /// before cutting them off. A drain that runs out exits 0 with a warning
@@ -3979,18 +3979,8 @@ async fn serve_once(
     work: &Arc<crate::app_state::WorkGate>,
 ) -> kynos::Result<()> {
     let work = Arc::clone(work);
-    kynos::server::Server::new(app)
+    http_server(app)
         .listener(listener)
-        .max_connections(HTTP_MAX_CONNECTIONS)
-        .http1(
-            kynos::server::protocol::Http1Config::default()
-                .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
-        )
-        .http2(
-            kynos::server::protocol::Http2Config::default()
-                .keep_alive(Some(HTTP2_KEEP_ALIVE))
-                .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS),
-        )
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
             // Latched first, so an apply still running stops at its next step
@@ -4005,6 +3995,32 @@ async fn serve_once(
         .shutdown_timeout(HTTP_DRAIN_TIMEOUT)
         .serve()
         .await
+}
+
+/// The server `serve_once` runs for `app`, with every connection and request
+/// bound it sets but the listener and the drain. Shared with the HTTP tests'
+/// stalled-body harness, so the bounds a stalled request meets there are the
+/// ones production sets.
+pub(crate) fn http_server(
+    app: kynos::router::service::Service<http::ctx::AppCtx>,
+) -> kynos::server::Server<http::ctx::AppCtx> {
+    kynos::server::Server::new(app)
+        .max_connections(HTTP_MAX_CONNECTIONS)
+        .http1(
+            kynos::server::protocol::http1::Http1Config::default()
+                .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
+        )
+        .http2(
+            kynos::server::protocol::http2::Http2Config::default()
+                .keep_alive(Some(HTTP2_KEEP_ALIVE))
+                .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS),
+        )
+        // Off, rather than kynos's 30 s per-frame default: every operation
+        // that reads a body already bounds its arrival (`http::v1`'s group
+        // deadlines and `TimedBody`), as `docs/api/problems.md`'s `408` row
+        // states them, and the server's own 408 would replace the operation's
+        // response, request id and shared headers included.
+        .request_body_idle_timeout(None)
 }
 
 /// The accept failure in `outcome` when it is the process or the system

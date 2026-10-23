@@ -303,8 +303,17 @@ impl Harness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(
-            kynos::server::Server::new(service)
+            // The server `startup::serve_once` runs, so the operation's own
+            // deadline answers a stalled body only where production lets it.
+            crate::startup::http_server(service)
                 .listener(listener)
+                // No head deadline: the paused clock below would jump to it
+                // before the operation's deadline is armed, and arm that one
+                // late. Every head here is sent whole before the pause.
+                .http1(
+                    kynos::server::protocol::http1::Http1Config::default()
+                        .header_read_timeout(None),
+                )
                 .serve(),
         );
 
