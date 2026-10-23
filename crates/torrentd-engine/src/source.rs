@@ -99,6 +99,20 @@ impl ProfileSource {
     /// than handling it, leaves every alert for the loop to dispatch in the
     /// order the session posted it.
     pub fn hold_alerts(&self, profile: &ProfileId) -> usize {
+        self.hold_alerts_inspecting(profile, |_| {})
+    }
+
+    /// [`ProfileSource::hold_alerts`], showing `inspect` each alert it
+    /// takes, in the order the session posted them, before it is held.
+    ///
+    /// For the boot, which checks a vpn session's listen sockets from its
+    /// `listen_succeeded` alerts before the scans add any torrent to it,
+    /// and leaves those alerts for the loop to dispatch as before.
+    pub fn hold_alerts_inspecting(
+        &self,
+        profile: &ProfileId,
+        mut inspect: impl FnMut(&Alert),
+    ) -> usize {
         let Some(idx) = self.entries.iter().position(|(p, _)| p == profile) else {
             return 0;
         };
@@ -110,6 +124,7 @@ impl ProfileSource {
             if popped.is_empty() {
                 break;
             }
+            popped.iter().for_each(&mut inspect);
             held.queue.extend(popped.into_iter().map(|a| (idx, a)));
         }
         let taken = held.queue.len() - before;
@@ -200,6 +215,29 @@ mod tests {
         let drained = src.drain();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].0.as_str(), "public");
+    }
+
+    /// The boot's listen check reads what it holds: each alert is shown
+    /// once, in order, and still held for the loop's drain afterwards.
+    #[test]
+    fn an_inspected_hold_shows_each_alert_and_still_holds_it() {
+        let eng = Arc::new(MockEngine::new());
+        eng.push_alert(finished(1));
+        eng.push_alert(finished(2));
+        let p = ProfileId::new("p");
+        let src = ProfileSource::new(vec![(p.clone(), eng.clone() as Arc<dyn TorrentEngine>)]);
+        let mut seen = Vec::new();
+        let taken = src.hold_alerts_inspecting(&p, |a| seen.push(a.infohash()));
+        assert_eq!(taken, 2);
+        assert_eq!(seen, vec![Some(InfoHash([1; 20])), Some(InfoHash([2; 20]))]);
+        assert_eq!(
+            src.drain()
+                .into_iter()
+                .map(|(_, a)| a.infohash())
+                .collect::<Vec<_>>(),
+            seen,
+            "what was inspected is still dispatched, in order"
+        );
     }
 
     /// Adds that would overflow the queue several times over, popped between

@@ -64,11 +64,63 @@ pub struct Scan<T> {
     pub unreadable: u64,
 }
 
+/// What a store's listing of one profile's directory found, by name alone:
+/// the info-hashes a [`Scan`] would hold, with no file read.
+///
+/// The boot scans list a directory and read each file as they get to it, so
+/// what they hold at once is one file, not every file in the directory, and
+/// a file they skip by its name is never read at all.
+#[derive(Debug, Default)]
+pub struct Listing {
+    /// The info-hash every well-formed name carries, in directory order.
+    pub names: Vec<InfoHash>,
+    /// Directory entries that could not be read. A file that is named well
+    /// and cannot be read is found only when it is read.
+    pub unreadable: u64,
+}
+
+impl<T> From<Scan<T>> for Listing {
+    fn from(scan: Scan<T>) -> Self {
+        Self {
+            names: scan.entries.into_iter().map(|(ih, _)| ih).collect(),
+            unreadable: scan.unreadable,
+        }
+    }
+}
+
 pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     /// Scan every resume file owned by `profile`. Implementations skip
     /// files that don't parse as a 40-char hex info-hash filename, and count
     /// the ones that do but cannot be read.
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError>;
+
+    /// The info-hash of every resume file owned by `profile`, by name, with
+    /// the housekeeping [`ResumeStore::scan`] does first and no file read:
+    /// the boot's resume scan, which reads each with [`ResumeStore::read`]
+    /// as it reaches it.
+    ///
+    /// The default reads every file through `scan`; a store that can list
+    /// without reading overrides it.
+    fn list(&self, profile: &ProfileId) -> Result<Listing, ResumeStoreError> {
+        self.scan(profile).map(Listing::from)
+    }
+
+    /// Read the resume file for `(profile, ih)`, or `None` where there is
+    /// none, a write queued for it included.
+    ///
+    /// The default looks it up in a whole [`ResumeStore::scan`]; a store
+    /// that can read one file overrides it.
+    fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<ResumeData>, ResumeStoreError> {
+        Ok(self
+            .scan(profile)?
+            .entries
+            .into_iter()
+            .find_map(|(found, data)| (found == *ih).then_some(data)))
+    }
 
     /// [`ResumeStore::scan`]'s entries alone.
     fn load_all(
@@ -178,9 +230,43 @@ pub(crate) fn scan_dir(
     profile: &ProfileId,
     what: &str,
 ) -> std::io::Result<Scan<Vec<u8>>> {
-    let mut out = Scan::default();
+    let (named, unreadable) = list_dir(dir, suffix, profile, what)?;
+    let mut out = Scan {
+        entries: Vec::new(),
+        unreadable,
+    };
+    for (ih, path) in named {
+        match fs::read(&path) {
+            Ok(bytes) => out.entries.push((ih, bytes)),
+            Err(e) => {
+                warn!(
+                    target: "torrentd_engine::store",
+                    profile_id = %profile,
+                    infohash = %ih,
+                    file = %path.display(),
+                    error.cause = %e,
+                    "skipping {what} file that could not be read",
+                );
+                out.unreadable += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every `<infohash><suffix>` file in `dir`, by name and path, reading
+/// none, and how many directory entries could not be read. Names that are
+/// not an info-hash are skipped with a warning, as [`scan_dir`] skips them.
+fn list_dir(
+    dir: &Path,
+    suffix: &str,
+    profile: &ProfileId,
+    what: &str,
+) -> std::io::Result<(Vec<(InfoHash, PathBuf)>, u64)> {
+    let mut named = Vec::new();
+    let mut unreadable = 0u64;
     if !dir.exists() {
-        return Ok(out);
+        return Ok((named, unreadable));
     }
     for entry in fs::read_dir(dir)? {
         let entry = match entry {
@@ -193,7 +279,7 @@ pub(crate) fn scan_dir(
                     error.cause = %e,
                     "skipping a {what} directory entry that could not be read",
                 );
-                out.unreadable += 1;
+                unreadable += 1;
                 continue;
             }
         };
@@ -213,22 +299,9 @@ pub(crate) fn scan_dir(
             );
             continue;
         };
-        match fs::read(&path) {
-            Ok(bytes) => out.entries.push((ih, bytes)),
-            Err(e) => {
-                warn!(
-                    target: "torrentd_engine::store",
-                    profile_id = %profile,
-                    infohash = %ih,
-                    file = %path.display(),
-                    error.cause = %e,
-                    "skipping {what} file that could not be read",
-                );
-                out.unreadable += 1;
-            }
-        }
+        named.push((ih, path));
     }
-    Ok(out)
+    Ok((named, unreadable))
 }
 
 #[derive(Debug, Error)]
@@ -295,6 +368,38 @@ impl PartitionedDir {
         self.flush();
         self.remove_stale_temps(profile)?;
         scan_dir(&self.dir_for(profile), self.suffix, profile, self.what)
+    }
+
+    /// [`PartitionedDir::scan`]'s names alone, after the same flush and
+    /// temp-file removal, with no file read: each is read by
+    /// [`PartitionedDir::read`] as the boot reaches it.
+    pub(crate) fn list(&self, profile: &ProfileId) -> std::io::Result<Listing> {
+        self.flush();
+        self.remove_stale_temps(profile)?;
+        let (named, unreadable) =
+            list_dir(&self.dir_for(profile), self.suffix, profile, self.what)?;
+        Ok(Listing {
+            names: named.into_iter().map(|(ih, _)| ih).collect(),
+            unreadable,
+        })
+    }
+
+    /// The file for `(profile, ih)`: the bytes a queued write holds, else
+    /// what is on disk, else `None`.
+    pub(crate) fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let path = self.path_for(profile, ih);
+        if let Some(queued) = self.pending(&path) {
+            return Ok(Some(queued.to_vec()));
+        }
+        match fs::read(&path) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Remove the `<infohash><suffix>.tmp` and `.now.tmp` files a write
@@ -492,6 +597,19 @@ impl ResumeStore for FsResumeStore {
         })
     }
 
+    fn list(&self, profile: &ProfileId) -> Result<Listing, ResumeStoreError> {
+        self.tombstones.remove_stale_temps(profile)?;
+        Ok(self.resume.list(profile)?)
+    }
+
+    fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<ResumeData>, ResumeStoreError> {
+        Ok(self.resume.read(profile, ih)?.map(ResumeData::new))
+    }
+
     fn write(
         &self,
         profile: &ProfileId,
@@ -578,6 +696,29 @@ impl ResumeStore for MemoryResumeStore {
                 .collect(),
             unreadable: 0,
         })
+    }
+
+    fn list(&self, profile: &ProfileId) -> Result<Listing, ResumeStoreError> {
+        Ok(Listing {
+            names: self
+                .inner
+                .iter()
+                .filter(|e| e.key().0 == *profile)
+                .map(|e| e.key().1)
+                .collect(),
+            unreadable: 0,
+        })
+    }
+
+    fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<ResumeData>, ResumeStoreError> {
+        Ok(self
+            .inner
+            .get(&(profile.clone(), *ih))
+            .map(|e| ResumeData::new(e.value().clone())))
     }
 
     fn write(
@@ -668,6 +809,66 @@ mod tests {
         assert_eq!(scan.unreadable, 1);
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].0, good);
+    }
+
+    /// The boot's resume scan lists and then reads one file at a time, so a
+    /// listing holds names, not contents: a file that cannot be read is
+    /// listed and fails only its own read, a queued write lands first, and a
+    /// file gone since the listing reads as `None`.
+    #[test]
+    fn a_listing_reads_no_file_and_each_file_reads_on_its_own() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let good = InfoHash([0x01u8; 20]);
+        let bad = InfoHash([0x02u8; 20]);
+        let queued = InfoHash([0x03u8; 20]);
+        store.write(&profile, &good, b"ok").unwrap();
+        std::fs::create_dir(
+            dir.path()
+                .join("p")
+                .join(format!("{}.resume", bad.to_hex())),
+        )
+        .unwrap();
+        store.write_batched(&profile, &queued, b"later").unwrap();
+        assert_eq!(
+            store.read(&profile, &queued).unwrap().unwrap().as_bytes(),
+            b"later",
+            "a queued write reads before it lands"
+        );
+
+        let listing = store.list(&profile).unwrap();
+        let mut names = listing.names.clone();
+        names.sort_by_key(|ih| ih.0);
+        assert_eq!(names, vec![good, bad, queued]);
+        assert_eq!(listing.unreadable, 0, "no file is read to list it");
+        assert!(
+            dir.path()
+                .join("p")
+                .join(format!("{}.resume", queued.to_hex()))
+                .exists(),
+            "the listing lands what is queued first, as the scan does"
+        );
+
+        assert_eq!(
+            store.read(&profile, &good).unwrap().unwrap().as_bytes(),
+            b"ok"
+        );
+        assert!(store.read(&profile, &bad).is_err());
+        store.delete(&profile, &good).unwrap();
+        assert!(store.read(&profile, &good).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_memory_store_lists_and_reads_one_profile() {
+        let store = MemoryResumeStore::new();
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let ih = InfoHash([0x07u8; 20]);
+        store.write(&p, &ih, b"x").unwrap();
+        assert_eq!(store.list(&p).unwrap().names, vec![ih]);
+        assert!(store.list(&q).unwrap().names.is_empty());
+        assert_eq!(store.read(&p, &ih).unwrap().unwrap().as_bytes(), b"x");
+        assert!(store.read(&q, &ih).unwrap().is_none());
     }
 
     #[test]

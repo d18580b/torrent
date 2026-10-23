@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::batch_writer::WriteErrorHook;
 use crate::profile::ProfileId;
+use crate::resume_store::Listing;
 use crate::resume_store::PartitionedDir;
 use crate::resume_store::Scan;
 
@@ -28,6 +29,17 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     /// [`TorrentStore::scan`]'s entries alone.
     fn load_all(&self, profile: &ProfileId) -> Result<Vec<(InfoHash, Vec<u8>)>, TorrentStoreError> {
         self.scan(profile).map(|s| s.entries)
+    }
+
+    /// The info-hash of every `.torrent` file owned by `profile`, by name,
+    /// with the housekeeping [`TorrentStore::scan`] does first and no file
+    /// read: the boot's torrent-dir scan, which reads with
+    /// [`TorrentStore::read`] only what it has not already loaded.
+    ///
+    /// The default reads every file through `scan`; a store that can list
+    /// without reading overrides it.
+    fn list(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        self.scan(profile).map(Listing::from)
     }
 
     /// Atomically replace the `.torrent` file for `(profile, ih)` with `data`,
@@ -166,6 +178,11 @@ impl TorrentStore for FsTorrentStore {
         Ok(self.torrents.scan(profile)?)
     }
 
+    fn list(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        self.save_paths.remove_stale_temps(profile)?;
+        Ok(self.torrents.list(profile)?)
+    }
+
     fn write(
         &self,
         profile: &ProfileId,
@@ -228,15 +245,7 @@ impl TorrentStore for FsTorrentStore {
         profile: &ProfileId,
         ih: &InfoHash,
     ) -> Result<Option<Vec<u8>>, TorrentStoreError> {
-        let path = self.path_for(profile, ih);
-        if let Some(queued) = self.torrents.pending(&path) {
-            return Ok(Some(queued.to_vec()));
-        }
-        match fs::read(&path) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self.torrents.read(profile, ih)?)
     }
 }
 
@@ -271,6 +280,18 @@ impl TorrentStore for MemoryTorrentStore {
                 .iter()
                 .filter(|e| e.key().0 == *profile)
                 .map(|e| (e.key().1, e.value().clone()))
+                .collect(),
+            unreadable: 0,
+        })
+    }
+
+    fn list(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        Ok(Listing {
+            names: self
+                .inner
+                .iter()
+                .filter(|e| e.key().0 == *profile)
+                .map(|e| e.key().1)
                 .collect(),
             unreadable: 0,
         })
@@ -441,6 +462,42 @@ mod tests {
         let scan = store.scan(&profile).unwrap();
         assert_eq!(scan.unreadable, 1);
         assert_eq!(scan.entries, vec![(good, b"t".to_vec())]);
+    }
+
+    /// The torrent-dir scan lists by name and reads only what no resume file
+    /// loaded, so the listing reads nothing: a file that cannot be read is
+    /// listed, and fails its own read alone. It removes the temp files the
+    /// scan removes, the sidecar's included.
+    #[test]
+    fn a_listing_reads_no_file_and_removes_the_scans_temp_files() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let good = InfoHash([0x01u8; 20]);
+        let bad = InfoHash([0x02u8; 20]);
+        store.write(&profile, &good, b"t").unwrap();
+        std::fs::create_dir(store.path_for(&profile, &bad)).unwrap();
+        let mut tmp = store.save_path_path_for(&profile, &good).into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, b"torn").unwrap();
+
+        let listing = store.list(&profile).unwrap();
+        let mut names = listing.names.clone();
+        names.sort_by_key(|ih| ih.0);
+        assert_eq!(names, vec![good, bad]);
+        assert_eq!(listing.unreadable, 0);
+        assert!(!tmp.exists(), "the listing left {}", tmp.display());
+        assert_eq!(
+            store.read(&profile, &good).unwrap().as_deref(),
+            Some(&b"t"[..])
+        );
+        assert!(store.read(&profile, &bad).is_err());
+
+        let memory = MemoryTorrentStore::new();
+        memory.write(&profile, &good, b"t").unwrap();
+        assert_eq!(memory.list(&profile).unwrap().names, vec![good]);
+        assert!(memory.list(&ProfileId::new("q")).unwrap().names.is_empty());
     }
 
     /// A write killed between its temp file and its rename leaves the temp
