@@ -17,9 +17,6 @@ profile's session. What it takes from the old client's state is what those
 `.torrent` files say, plus, for qBittorrent only, the hints in each
 `<hash>.fastresume` beside them.
 
-Open issues change some of the behaviour below. Each is marked where it
-applies, and describes the daemon as it ships today.
-
 ## 1. Before you start
 
 **Stop the old client, and keep it stopped until §8 is done.** While it runs,
