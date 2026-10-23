@@ -1012,6 +1012,18 @@ fn left_behind(
     )))
 }
 
+/// The managed root `path` is under, its id, and `path` relative to it in
+/// the index's form: as the scan indexes it, `/`-separated with a `\` in a
+/// name kept literally, since a Unix file name may hold one. Turned into a
+/// `/`, a name holding one would look up a path the index has no row for.
+fn index_location(pool: &PoolService, path: &Path) -> Option<(i64, std::path::PathBuf, String)> {
+    pool.roots().iter().find_map(|(id, root)| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|r| (*id, root.clone(), r.to_string_lossy().into_owned()))
+    })
+}
+
 /// Point the torrent's adoption at where its payload now is.
 ///
 /// The adoption base is what `save_path_of`, a later relocate, drift and
@@ -1020,11 +1032,7 @@ fn left_behind(
 /// claims and the file index still describe the old paths; the rescan that
 /// follows a relocate rebuilds both.
 fn record_new_base(pool: &PoolService, infohash: &str, dir: &Path) {
-    let Some((root_id, rel)) = pool.roots().iter().find_map(|(id, root)| {
-        dir.strip_prefix(root)
-            .ok()
-            .map(|r| (*id, r.to_string_lossy().replace('\\', "/")))
-    }) else {
+    let Some((root_id, _, rel)) = index_location(pool, dir) else {
         warn!(
             target: "torrentd::pool::apply",
             infohash,
@@ -1340,11 +1348,7 @@ fn sanctioned_delete(
     path: &Path,
     guards: &mut DeleteGuards,
 ) -> Result<(std::path::PathBuf, String, FileStamp), String> {
-    let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
-        path.strip_prefix(root)
-            .ok()
-            .map(|r| (*id, root.clone(), r.to_string_lossy().replace('\\', "/")))
-    }) else {
+    let Some((root_id, root, rel)) = index_location(pool, path) else {
         return Err(format!("{} is outside every managed root", path.display(),));
     };
     // The planner's containment check, re-run now: the plan is a stored
@@ -1682,11 +1686,7 @@ pub fn torrent_payload(
     let mut located = Vec::with_capacity(files.len());
     for file in files {
         let path = save_path.join(file);
-        let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|r| (*id, root.clone(), r.to_string_lossy().replace('\\', "/")))
-        }) else {
+        let Some((root_id, root, rel)) = index_location(pool, &path) else {
             return Err(outside(&path));
         };
         if !torrentd_pool::plan::contains(&root, &path) {
@@ -5171,6 +5171,12 @@ mod tests {
         record_new_base(&pool, &t.infohash, &root.join(&deep));
         let base = pool.with_store(|s| s.adoption_base(&t.infohash)).unwrap();
         assert_eq!(base, Some((root_id, deep)));
+
+        // Issue #543: a `\` in a directory's name is part of the name, as
+        // the scan indexes it, not a separator to record as `/`.
+        record_new_base(&pool, &t.infohash, &root.join("new\\place"));
+        let base = pool.with_store(|s| s.adoption_base(&t.infohash)).unwrap();
+        assert_eq!(base, Some((root_id, "new\\place".to_owned())));
     }
 
     #[test]
@@ -5194,6 +5200,27 @@ mod tests {
         assert!(
             orphans.is_empty(),
             "the trash is never indexed: {orphans:?}"
+        );
+    }
+
+    /// Issue #543: a file whose name holds a `\` is found under the row the
+    /// scan indexed it by, so its delete is sanctioned and lands it in the
+    /// trash under its own name.
+    #[test]
+    fn deleting_a_file_with_a_backslash_in_its_name_finds_its_index_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let f = write(&root, "misc/a\\b.bin", 32);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        delete_file(&pool, &f, 42, "42-1700000000", &mut Default::default())
+            .unwrap_or_else(|e| panic!("{e:?}"));
+
+        assert!(!f.exists());
+        assert_eq!(
+            std::fs::read(root.join(".torrentd-trash/42-1700000000/misc/a\\b.bin")).unwrap(),
+            vec![7u8; 32]
         );
     }
 
@@ -5372,6 +5399,28 @@ mod tests {
             std::fs::read(root.join(".torrentd-trash/torrent-x-1/T/a.bin")).unwrap(),
             vec![7u8; 16]
         );
+    }
+
+    /// Issue #543: a payload file whose name holds a `\` is proven against
+    /// the claim the index records for that name, and goes to the trash.
+    #[test]
+    fn a_torrents_payload_file_with_a_backslash_in_its_name_is_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let f = write(&root, "T/a\\b.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a\\b.bin");
+
+        let payload = torrent_payload(&pool, &ih, &root, &["T/a\\b.bin".to_owned()])
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(payload.file_count(), 1);
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert!(out.failed.is_none(), "{:?}", out.failed);
+        assert_eq!(out.moved, 1);
+        assert!(!f.exists());
+        assert!(root.join(".torrentd-trash/torrent-x-1/T/a\\b.bin").exists());
     }
 
     /// A file that reached the trash but could not be fsynced there is
