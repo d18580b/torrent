@@ -712,6 +712,52 @@ fn a_tree_refresh_past_1000_entries_keeps_them_and_the_selection() {
 }
 
 #[test]
+fn a_failed_tree_refresh_does_not_snap_a_later_page_back() {
+    let mut state = with_overview();
+    send(&mut state, Msg::OpenRoot, true);
+    let tree_page = |state: &State, first: bool, page: types::TreePage| {
+        Msg::Tree(tree::Msg::Page {
+            generation: state.tree.entries.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    let msg = tree_page(&state, true, wide_tree(0, 100, Some("k100")));
+    send(&mut state, msg, true);
+    state.tree.selected = 10;
+
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    assert_eq!(state.tree.reselect.as_deref(), Some("d00010"));
+    let generation = state.tree.entries.generation;
+    send(
+        &mut state,
+        Msg::Tree(tree::Msg::Page {
+            generation,
+            first: true,
+            result: Err(problem(500, "internal", None)),
+        }),
+        true,
+    );
+    assert!(!state.tree.entries.loading);
+    assert!(
+        state.tree.reselect.is_none(),
+        "the failed refresh will not settle"
+    );
+
+    // The operator scrolls on, to the end: the next page is fetched.
+    state.tree.selected = 98;
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 1);
+    let msg = tree_page(&state, false, wide_tree(100, 50, None));
+    send(&mut state, msg, true);
+    assert_eq!(state.tree.entries.items.len(), 150);
+    assert_eq!(
+        state.tree.selected, 99,
+        "not snapped back to the entry selected when the failed refresh began"
+    );
+}
+
+#[test]
 fn a_list_that_shrank_scrolls_back_to_fill_its_window() {
     let offset = std::cell::Cell::new(50);
     assert_eq!(
@@ -1801,6 +1847,55 @@ fn a_plan_list_refresh_past_1000_plans_keeps_them_and_the_selection() {
     assert_eq!(
         state.plans.list.items[state.plans.selected].id, 1701,
         "the selection follows the plan the operator moved to during the reload"
+    );
+}
+
+#[test]
+fn a_failed_plan_list_refresh_does_not_snap_a_later_page_back() {
+    let mut state = State {
+        view: View::Plans,
+        ..State::default()
+    };
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    let plans_page = |state: &State, first: bool, page: types::PlanPage| {
+        Msg::Plans(plans::Msg::Page {
+            generation: state.plans.list.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    let msg = plans_page(&state, true, wide_plans(0, 100, Some("p100")));
+    send(&mut state, msg, true);
+    state.plans.selected = 10;
+
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    assert_eq!(state.plans.reselect, Some(10));
+    let generation = state.plans.list.generation;
+    send(
+        &mut state,
+        Msg::Plans(plans::Msg::Page {
+            generation,
+            first: true,
+            result: Err(problem(500, "internal", None)),
+        }),
+        true,
+    );
+    assert!(!state.plans.list.loading);
+    assert!(
+        state.plans.reselect.is_none(),
+        "the failed refresh will not settle"
+    );
+
+    // The operator scrolls on, to the end: the next page is fetched.
+    state.plans.selected = 98;
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 1);
+    let msg = plans_page(&state, false, wide_plans(100, 50, None));
+    send(&mut state, msg, true);
+    assert_eq!(state.plans.list.items.len(), 150);
+    assert_eq!(
+        state.plans.list.items[state.plans.selected].id, 99,
+        "not snapped back to the plan selected when the failed refresh began"
     );
 }
 

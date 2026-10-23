@@ -1935,6 +1935,65 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_refresh_does_not_snap_a_later_load_back() {
+        let mut state = loaded(1..31, Some("c31"));
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            state.selected = 2;
+            refresh(&mut state, ctx);
+            assert_eq!(state.restore.as_deref(), Some(hash(3).as_str()));
+            let msg = page_msg(&state, true, Err(failure(500, "internal", "engine gone")));
+            update(&mut state, msg, ctx);
+            assert!(!state.list.loading);
+            assert!(
+                state.restore.is_none(),
+                "the failed refresh will not settle"
+            );
+
+            // The operator scrolls on, to the end: the next page is fetched
+            // and settles without jumping back.
+            update(&mut state, Msg::Move(Move::Bottom), ctx);
+            assert!(state.list.loading, "near the end: the next page");
+            let msg = page_msg(&state, false, Ok(page(31..41, None)));
+            update(&mut state, msg, ctx);
+            assert_eq!(state.list.items.len(), 40);
+            assert_eq!(
+                selected_summary(&state).unwrap().infohash,
+                hash(30),
+                "not snapped back to the torrent selected when the refresh failed"
+            );
+        });
+    }
+
+    #[test]
+    fn a_refresh_after_a_failed_one_keeps_the_torrent_selected_now() {
+        let mut state = loaded(1..8, None);
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            update(&mut state, Msg::Move(Move::Down), ctx);
+            refresh(&mut state, ctx);
+            assert_eq!(state.restore.as_deref(), Some(hash(2).as_str()));
+            let msg = page_msg(&state, true, Err(failure(500, "internal", "engine gone")));
+            update(&mut state, msg, ctx);
+            assert!(
+                state.restore.is_none(),
+                "the failed refresh will not settle"
+            );
+
+            update(&mut state, Msg::Move(Move::Bottom), ctx);
+            refresh(&mut state, ctx);
+            assert_eq!(state.restore.as_deref(), Some(hash(7).as_str()));
+            let msg = page_msg(&state, true, Ok(page(1..8, None)));
+            update(&mut state, msg, ctx);
+            assert_eq!(
+                selected_summary(&state).unwrap().infohash,
+                hash(7),
+                "the torrent selected when this refresh began, not the failed one's"
+            );
+        });
+    }
+
+    #[test]
     fn one_reload_at_a_time() {
         let mut state = loaded(1..4, None);
         testing::with_ctx(None, |ctx| {
