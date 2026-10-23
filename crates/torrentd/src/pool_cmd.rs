@@ -569,6 +569,37 @@ listen_interfaces = "0.0.0.0:6881"
         assert!(!cfg.pool_db_path().exists());
     }
 
+    /// A stdout that refuses writes, as a closed pipe does.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// When stdout cannot be written, each read-only command returns the
+    /// write's error, which the CLI turns into exit 1, instead of panicking.
+    #[test]
+    fn the_read_only_commands_fail_when_stdout_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _) = scanned_pool(dir.path());
+        for e in [
+            status_to(&cfg, &mut ClosedPipe).unwrap_err(),
+            check_to(&cfg, &mut ClosedPipe).unwrap_err(),
+            orphans_to(&cfg, 50, &mut ClosedPipe).unwrap_err(),
+        ] {
+            assert_eq!(
+                e.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+                Some(std::io::ErrorKind::BrokenPipe),
+                "{e:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_check_names_what_it_could_not_see() {
         use torrentd_pool::drift::DriftReport;
