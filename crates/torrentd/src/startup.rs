@@ -1254,37 +1254,9 @@ pub async fn boot(
         }
     }
 
-    // How many torrents each profile actually ended up holding, across both
-    // scans. Compared against the registry's claim once both have run.
-    let mut loaded_by_profile: std::collections::HashMap<ProfileId, usize> =
-        std::collections::HashMap::new();
-    // Which info-hashes a session accepted. Every registry entry outside this
-    // set once both scans have run is held by no session, and is the one kind
-    // of entry `DELETE` may clear without a state-map entry to remove.
-    let mut loaded: std::collections::HashSet<libtorrent_safe::InfoHash> =
-        std::collections::HashSet::new();
-    // What the scans could not load, per profile, by the `source` label of
-    // `boot_torrent_load_failures`. Exported as gauges once both have run:
-    // these happen before any scrape can, so a counter would appear already
-    // incremented and `increase()` would never see it move.
-    let mut load_failures: std::collections::HashMap<ProfileId, BootLoadFailures> =
-        std::collections::HashMap::new();
     // What the scans add, so a profile the VPN monitor or the kill-switch
     // watch fences mid-scan has it paused.
     let mut scan_fence = ScanFence::new(kill_switch.clone());
-    // Each info-hash the resume scan found in a profile the registry does not
-    // assign it to, and counted. The torrent-dir scan finds the same torrent
-    // again by its `.torrent` beside it, and counts it only once per boot.
-    let mut misplaced: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
-    // Each torrent a tombstone says was removed, which neither scan loads
-    // (`honour_tombstones`).
-    let mut removed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
-    // Each info-hash the resume scan refused because its torrent's session key
-    // is another one, or cannot be read before the add
-    // (`pool_service::resume_key_refusal`), and counted. The torrent-dir scan
-    // finds the `.torrent` filed beside it under the same name, and counts it
-    // only once.
-    let mut rekeyed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
 
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call, and
@@ -1343,616 +1315,34 @@ pub async fn boot(
     .await?;
     boot_progress.advance();
 
-    // Resume scan: load every saved resume file per profile. The shim
-    // already deduplicates duplicate adds so a future torrent dir scan
-    // won't double-add.
-    for profile in source.profiles() {
-        let Some(profile_cfg) = profile_registry.config(&profile) else {
-            continue;
+    // The two boot scans, resume files first: a torrent with resume data is
+    // loaded from it, and the torrent-dir scan adds only what no resume file
+    // covered.
+    let mut tally = ScanTally::default();
+    {
+        let inputs = ScanInputs {
+            cfg: &cfg,
+            source: &*source,
+            profile_registry: &profile_registry,
+            resume_store: &*resume_store,
+            torrent_store: &*torrent_store,
+            registry: &registry,
+            metrics: &metrics,
+            state: &state,
+            pool: pool.as_deref(),
+            checks: &checks,
+            checked_hold: &checked_hold,
+            boot_progress: &boot_progress,
         };
-        // Removals first: a torrent `DELETE` removed is not loaded again,
-        // whether its files were left by a failed delete or by a crash.
-        for ih in honour_tombstones(&*resume_store, &*torrent_store, &*metrics, &profile, |ih| {
-            registry.lookup(ih)
-        })
-        .context("read the resume dir's tombstones")?
-        {
-            removed_at_boot.insert((profile.clone(), ih));
-        }
-        // Listed by name and read one file at a time below, so the scan
-        // holds one resume file at once rather than the directory's. A
-        // file that cannot be read is skipped, logged and counted; only the
-        // directory itself failing to open stops the boot.
-        let listing = resume_store.list(&profile).context("scan resume dir")?;
-        boot_progress.advance();
-        load_failures
-            .entry(profile.clone())
-            .or_default()
-            .resume_file += listing.unreadable;
-        let mut count = 0usize;
-        let mut missing_metadata = 0usize;
-        let mut from_library = 0usize;
-        let mut added_from_resume = 0usize;
-        // Paused by a paced set-online the daemon stopped in, not by the
-        // operator: loaded unpaused, as they were before the profile went
-        // offline.
-        let held = profile_registry.holds().held(&profile);
-        let held_for_check = checks.holds().held(&profile);
-        let mut unheld = Vec::new();
-        let engine = source
-            .engine_for(&profile)
-            .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
-        for (i, ih) in listing.names.into_iter().enumerate() {
-            between_scan_batches(i, "resume", &mut boot_shutdown, &boot_progress, || {
-                scan_fence.enforce_all(&profile_registry, &metrics);
-                checked_hold.hold_all();
-                checked_hold.verdict()
-            })
-            .await?;
-            if removed_at_boot.contains(&(profile.clone(), ih)) {
-                continue;
-            }
-            let data = match resume_store.read(&profile, &ih) {
-                Ok(Some(data)) => data,
-                // Removed since the listing: nothing to load.
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        error.cause = %e,
-                        "skipping resume file that could not be read",
-                    );
-                    load_failures
-                        .entry(profile.clone())
-                        .or_default()
-                        .resume_file += 1;
-                    continue;
-                }
-            };
-            count += 1;
-            // Cross-check the registry; the spec aborts the profile on
-            // mismatch. A resume file under one profile's directory that the
-            // registry assigns to another is the operator's to reconcile.
-            let existing = registry.lookup(&ih);
-            if let Some(existing) = &existing {
-                if *existing != profile {
-                    warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        existing_profile = %existing,
-                        "resume file in wrong profile; skipping (operator must reconcile)",
-                    );
-                    metrics.inc_counter(
-                        "profile_assignment_registry_errors_total",
-                        &[("profile_id", profile.as_str())],
-                    );
-                    misplaced.insert((profile.clone(), ih));
-                    continue;
-                }
-            }
-            // Re-attach metadata. libtorrent writes the info dict into resume
-            // data only when save_resume_data was called with SAVE_INFO_DICT
-            // (vendor/libtorrent/src/torrent.cpp: `ret.ti = m_torrent_file` is
-            // gated on that flag), so resume data alone leaves the torrent with
-            // no metadata and it re-enters downloading_metadata on restart —
-            // fatal for a private profile with DHT and PEX disabled. Setting the
-            // flag instead would embed a full piece-hash table in every resume
-            // file, so pass the .torrent already on disk.
-            let torrent = match torrent_store.read(&profile, &ih) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
-                          "could not read .torrent for resume add; continuing without metadata");
-                    load_failures
-                        .entry(profile.clone())
-                        .or_default()
-                        .torrent_read += 1;
-                    None
-                }
-            };
-            // A torrent the pool adopted before adoption wrote its `.torrent`
-            // to the store has none there; the library's copy the pool index
-            // names is the same metadata. Written back to the store, so the
-            // repair happens once and the library may move on.
-            let torrent = match (torrent, pool.as_ref()) {
-                (None, Some(pool)) => {
-                    let found = pool.library_torrent(&ih);
-                    if let Some(bytes) = &found {
-                        from_library += 1;
-                        if let Err(e) = torrent_store.write(&profile, &ih, bytes) {
-                            warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
-                                  "could not copy the pool library's .torrent into the torrent store");
-                            // Counted as the adoption's own write is: this
-                            // completes it, and a store that keeps refusing
-                            // repeats the repair at every boot.
-                            metrics.inc_counter(
-                                "torrent_file_persist_errors_total",
-                                &[("profile_id", profile.as_str()), ("source", "api")],
-                            );
-                        }
-                    }
-                    found
-                }
-                (torrent, _) => torrent,
-            };
-            let without_torrent = torrent.is_none();
-            // The flags re-asserted are `torrentd_engine::policy`'s. PAUSED is
-            // not cleared: resume data does not say why a torrent was paused,
-            // and restarting one an operator paused is not recoverable. The
-            // one exception is a pause the record of paced set-onlines names,
-            // which is the daemon's own and is released by any pause the
-            // operator makes over it.
-            let relocated = relocated_save_path(&*torrent_store, pool.as_deref(), &profile, &ih);
-            let paced = held.contains(&ih);
-            let mut params =
-                resume_scan_params(profile_cfg, data.into_inner(), torrent, relocated, paced);
-            // A `.torrent` the check queue held paused for a slot, or had
-            // resumed and whose check had not ended, when the daemon
-            // stopped: loaded paused whatever its resume data says, and
-            // queued again once the scans are done (`restore_held_adds`), so
-            // its check waits for a slot again rather than starting now.
-            if held_for_check.contains(&ih) {
-                params = with_paused(params);
-            }
-            // A torrent filed under a key its session would not give it: a
-            // hybrid an earlier build keyed by its truncated v2 hash, which
-            // its session now keys by its v1 hash, whether the resume data
-            // or the `.torrent` attached to it says so. Loaded, every alert
-            // would name a key the registry, the save queue and the stores
-            // do not hold, so it is refused, before anything is claimed, for
-            // the operator to reconcile. So is one whose key no add can
-            // know yet: resume data with no v1 hash and no metadata, which
-            // hybrid metadata would rekey once it arrived.
-            if let Some(refusal) = crate::pool_service::resume_key_refusal(&params, &ih) {
-                use crate::pool_service::ResumeKeyRefusal;
-                match refusal {
-                    ResumeKeyRefusal::Rekeyed(key) => warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        session_infohash = %key,
-                        scan = "resume",
-                        "boot scan: torrent filed under an infohash its session does not key it \
-                         by; not loaded (operator must reconcile: re-add it under the session's \
-                         infohash)",
-                    ),
-                    ResumeKeyRefusal::Unkeyable => warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        scan = "resume",
-                        "boot scan: resume data names no v1 infohash and carries no metadata, so \
-                         its session's key could change when the metadata arrives; not loaded \
-                         (operator must reconcile: add its .torrent, or a magnet naming its v1 \
-                         infohash)",
-                    ),
-                }
-                load_failures.entry(profile.clone()).or_default().resume_add += 1;
-                rekeyed_at_boot.insert((profile.clone(), ih));
-                continue;
-            }
-            if without_torrent {
-                missing_metadata += 1;
-            }
-            // The account-isolation guard, on the trackers this resume data
-            // would announce to — its own `trackers` list where it has one.
-            // A file written before the profile's allow-list was set, or
-            // dropped into the directory by hand, is held to it like an API
-            // add. Checked before the registry claim, so a refusal claims
-            // nothing.
-            if let Err(refusal) = boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "resume") {
-                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
-                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
-                }
-                continue;
-            }
-            // Unless it is already this profile's, claim it.
-            let claimed = match existing {
-                Some(_) => Ok(()),
-                None => registry.assign(ih, profile.clone()).map(drop),
-            };
-            if let Err(e) = claimed {
-                // Rule 4 makes the registry the gate every load passes. An
-                // assignment that failed to persist is one that disappears at
-                // the next restart, after which nothing knows this info-hash
-                // belongs to this profile — so refuse the load rather than seed a
-                // torrent the uniqueness rule can no longer see.
-                warn!(
-                    profile_id = %profile,
-                    infohash = %ih,
-                    error.cause = %e,
-                    "could not record the resume assignment; skipping this torrent",
-                );
-                metrics.inc_counter(
-                    "profile_assignment_registry_errors_total",
-                    &[("profile_id", profile.as_str())],
-                );
-                continue;
-            }
-            match engine.add_torrent(params) {
-                // The session keyed it by another infohash than the one it was
-                // filed under, which the check above reads from the params as
-                // the add does, so only a session that reads them otherwise,
-                // or params that check could not read, reach this. Taken
-                // back out where nothing else of this profile's is filed under
-                // the session's key, and refused either way.
-                Ok(h) if h.infohash != ih => {
-                    let Rekeyed {
-                        unloaded,
-                        claimed,
-                        paused,
-                    } = settle_rekeyed(
-                        &registry,
-                        &*resume_store,
-                        &*torrent_store,
-                        &checked_hold,
-                        &state,
-                        &*engine,
-                        &*metrics,
-                        &profile,
-                        h,
-                    );
-                    warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        session_infohash = %h.infohash,
-                        scan = "resume",
-                        unloaded,
-                        paused,
-                        "boot scan: torrent filed under an infohash its session does not key it by; \
-                         refused (operator must reconcile: re-add it under the session's infohash)",
-                    );
-                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
-                    rekeyed_at_boot.insert((profile.clone(), ih));
-                    // The claim this scan made names a torrent no session
-                    // holds under it.
-                    if existing.is_none() {
-                        if let Err(e) = registry.remove(&ih) {
-                            warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
-                                  "could not release the claim of a torrent filed under another \
-                                   infohash");
-                            metrics
-                                .inc_counter("store_write_errors_total", &[("store", "registry")]);
-                        }
-                    }
-                    // Left in the session, it is held to the fence like any
-                    // other, under the key the session gave it, and counted
-                    // loaded where the profile's claim on that key is what
-                    // the unloaded-claims gauge compares it with. One left
-                    // there unclaimed and paused is kept from the fence,
-                    // whose lift resumes what it recorded.
-                    if !unloaded {
-                        loaded.insert(h.infohash);
-                        if claimed {
-                            added_from_resume += 1;
-                        }
-                        if !paused {
-                            scan_fence.added(&profile_registry, &metrics, &profile, h);
-                        }
-                    }
-                }
-                Ok(h) => {
-                    added_from_resume += 1;
-                    loaded.insert(ih);
-                    if paced {
-                        unheld.push(ih);
-                    }
-                    scan_fence.added(&profile_registry, &metrics, &profile, h);
-                }
-                Err(e) => {
-                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
-                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
-                }
-            }
-        }
-        checked_hold.hold_all();
-        checked_hold.verdict()?;
-        if !unheld.is_empty() {
-            // Loaded unpaused, so no longer the record's: saved now, so their
-            // resume data stops saying paused, and released, so a pause the
-            // operator makes from here on is kept by the next boot.
-            for ih in &unheld {
-                state.queue_resume_save_now(*ih);
-            }
-            if let Err(e) = profile_registry
-                .holds()
-                .release(&profile, unheld.iter().copied())
-            {
-                warn!(
-                    profile_id = %profile,
-                    error.cause = %e,
-                    "could not release the paced set-online's holds the boot loaded unpaused; \
-                     the next boot loads them unpaused again",
-                );
-            }
-            info!(
-                profile_id = %profile,
-                torrent_count = unheld.len(),
-                "loaded unpaused the torrents a paced set-online had paused and not resumed \
-                 when the daemon stopped",
-            );
-        }
-        if from_library > 0 {
-            info!(
-                profile_id = %profile,
-                torrent_count = from_library,
-                "resume entries with no .torrent in the torrent store took it from the pool library",
-            );
-        }
-        if missing_metadata > 0 {
-            // Not fatal — libtorrent can still fetch metadata from peers where
-            // discovery is enabled — but on a private profile it usually means the
-            // torrent will sit idle, so make it visible rather than silent.
-            warn!(
-                profile_id = %profile,
-                torrent_count = missing_metadata,
-                "resume entries with no .torrent on disk; these rely on peer metadata exchange",
-            );
-        }
-        info!(profile_id = %profile, torrent_count = count, "resume scan complete");
-        loaded_by_profile.insert(profile.clone(), added_from_resume);
+        resume_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown).await?;
+        torrent_dir_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown).await?;
     }
-
-    // Torrent-dir scan: add any .torrent whose info-hash has no resume file
-    // (resume always wins; startup inventory). After this the torrent
-    // dir is not re-scanned — new torrents arrive only via the API.
-    let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
-    // Adoptions `pool.db` holds as waiting for verification. Their claims
-    // and `.torrent`s are in place, but this scan would hash them with
-    // nothing to record the verdict the pool is waiting for: the verify
-    // queue adds them after the scans instead. `None` where the queue cannot be read,
-    // and then no claimed torrent is re-added here, since none can be told
-    // apart from an adoption.
-    let verify_queued: Option<std::collections::HashSet<libtorrent_safe::InfoHash>> =
-        match pool.as_ref() {
-            None => Some(std::collections::HashSet::new()),
-            Some(pool) => match pool.with_store(|s| s.verify_queue()) {
-                Ok(rows) => Some(
-                    rows.iter()
-                        .filter_map(|row| libtorrent_safe::InfoHash::from_hex(&row.infohash))
-                        .collect(),
-                ),
-                Err(e) => {
-                    warn!(
-                        error.cause = %e,
-                        "torrent-dir scan: could not read the persisted verify queue; torrents \
-                         claimed with no resume file are left unloaded rather than risk adding \
-                         an adoption unverified",
-                    );
-                    None
-                }
-            },
-        };
-    for profile in source.profiles() {
-        let Some(profile_cfg) = profile_registry.config(&profile) else {
-            continue;
-        };
-        // By name: a `.torrent` the resume scan already loaded, or one a
-        // tombstone removed, is skipped before it is read, and the rest are
-        // read one at a time below.
-        let listing = torrent_store.list(&profile).context("scan torrent dir")?;
-        boot_progress.advance();
-        load_failures
-            .entry(profile.clone())
-            .or_default()
-            .torrent_file += listing.unreadable;
-        let entries = listing.names;
-        let engine = source
-            .engine_for(&profile)
-            .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
-        let mut added = 0usize;
-        // Every `.torrent` this scan may add is recorded as held for a check
-        // slot before any is added, in one write rather than one per torrent:
-        // a restart before its check ends then loads it paused and queues it
-        // again, rather than leaving it paused for good. What the scan skips
-        // after all is released once the scans are done
-        // (`restore_held_adds`). A record that cannot be written leaves this
-        // profile's adds running, their checks unbounded, as before the
-        // queue held them.
-        let held_for_check = {
-            let candidates = entries.iter().copied().filter(|ih| {
-                !loaded.contains(ih) && !removed_at_boot.contains(&(profile.clone(), *ih))
-            });
-            match checks.holds().hold(&profile, candidates) {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!(
-                        profile_id = %profile,
-                        error.cause = %e,
-                        "torrent-dir scan: could not record its torrents as held for a check \
-                         slot; adding them running, their checks outside the check limit",
-                    );
-                    false
-                }
-            }
-        };
-        for (i, ih) in entries.into_iter().enumerate() {
-            between_scan_batches(i, "torrent-dir", &mut boot_shutdown, &boot_progress, || {
-                scan_fence.enforce_all(&profile_registry, &metrics);
-                checked_hold.hold_all();
-                checked_hold.verdict()
-            })
-            .await?;
-            // Resume data already loaded this torrent, or it was removed and
-            // its tombstone stands — skip, before reading it.
-            if loaded.contains(&ih) || removed_at_boot.contains(&(profile.clone(), ih)) {
-                continue;
-            }
-            let bytes = match torrent_store.read(&profile, &ih) {
-                Ok(Some(bytes)) => bytes,
-                // Removed since the listing: nothing to load.
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        error.cause = %e,
-                        "skipping torrent file that could not be read",
-                    );
-                    load_failures
-                        .entry(profile.clone())
-                        .or_default()
-                        .torrent_file += 1;
-                    continue;
-                }
-            };
-            // Filed under a key its session would not give it, as in the
-            // resume scan; counted there already where it refused the resume
-            // file beside this one.
-            if let Some(key) = rekeyed(&bytes, &ih) {
-                if rekeyed_at_boot.insert((profile.clone(), ih)) {
-                    warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        session_infohash = %key,
-                        scan = "torrent_dir",
-                        "boot scan: torrent filed under an infohash its session does not key it \
-                         by; not loaded (operator must reconcile: re-add it under the session's \
-                         infohash)",
-                    );
-                    load_failures
-                        .entry(profile.clone())
-                        .or_default()
-                        .torrent_dir_add += 1;
-                }
-                continue;
-            }
-            // A claim does not mean a load: `POST /v1/torrents` claims before
-            // its add, and the claim outlives a resume file that was never
-            // written or cannot be read. One this profile holds is re-added
-            // below without claiming again; one another profile holds is the
-            // operator's to reconcile, as in the resume scan.
-            let claimed_here = match registry.lookup(&ih) {
-                None => false,
-                Some(owner) if owner == profile => true,
-                Some(owner) => {
-                    warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        existing_profile = %owner,
-                        ".torrent in wrong profile; skipping (operator must reconcile)",
-                    );
-                    // Counted once: the resume scan counted it already where
-                    // its resume file sits in this profile too.
-                    if !misplaced.contains(&(profile.clone(), ih)) {
-                        metrics.inc_counter(
-                            "profile_assignment_registry_errors_total",
-                            &[("profile_id", profile.as_str())],
-                        );
-                    }
-                    continue;
-                }
-            };
-            // An adoption waiting for verification is the verify queue's to
-            // add, and one the pool recorded `drifted` stays unloaded; see
-            // `pool_holds_back`.
-            if claimed_here
-                && pool_holds_back(pool.as_deref(), verify_queued.as_ref(), &profile, &ih)
-            {
-                continue;
-            }
-            // The account-isolation guard, before the claim: a `.torrent`
-            // dropped into this profile's directory is held to its
-            // allow-list like one posted to the API.
-            let save_path =
-                torrent_dir_save_path(&*metrics, &*torrent_store, &profile, &ih, &scan_save_path);
-            let mut params = torrent_dir_scan_params(profile_cfg, bytes, save_path);
-            if let Err(refusal) =
-                boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "torrent_dir")
-            {
-                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
-                    load_failures
-                        .entry(profile.clone())
-                        .or_default()
-                        .torrent_dir_add += 1;
-                }
-                continue;
-            }
-            // Rule 4 again: claim first, load second. Claiming afterwards
-            // left a window in which the session held a torrent the registry
-            // had never agreed to, and dropped the claim silently if it could
-            // not be written. A claim this profile already holds stands.
-            let claim = if claimed_here {
-                Ok(())
-            } else {
-                registry.assign(ih, profile.clone()).map(drop)
-            };
-            if let Err(e) = claim {
-                warn!(
-                    profile_id = %profile,
-                    infohash = %ih,
-                    error.cause = %e,
-                    "could not record the torrent-dir assignment; skipping this torrent",
-                );
-                metrics.inc_counter(
-                    "profile_assignment_registry_errors_total",
-                    &[("profile_id", profile.as_str())],
-                );
-                continue;
-            }
-            // With no resume data the add hashes the payload: added paused,
-            // its check waits for a slot in the check queue like every other,
-            // so a directory of N `.torrent`s does not hash N at once. Its
-            // record was written before the loop (`held_for_check`).
-            if held_for_check {
-                params = with_paused(params);
-            }
-            match engine.add_torrent(params) {
-                Ok(h) => {
-                    added += 1;
-                    loaded.insert(ih);
-                    if held_for_check {
-                        checks.enqueue_add(
-                            profile.clone(),
-                            ih,
-                            crate::pool_service::CheckSource::TorrentDir,
-                        );
-                    }
-                    scan_fence.added(&profile_registry, &metrics, &profile, h);
-                }
-                Err(e) => {
-                    warn!(
-                        profile_id = %profile,
-                        infohash = %ih,
-                        error.cause = %e,
-                        "torrent-dir add failed",
-                    );
-                    load_failures
-                        .entry(profile.clone())
-                        .or_default()
-                        .torrent_dir_add += 1;
-                    // Release the claim this scan made, so nothing holds the
-                    // info-hash for a torrent no session has. A claim held
-                    // before the boot is left as it was: the torrent is one
-                    // the boot left unloaded, which `DELETE` clears, and the
-                    // next boot tries the add again either way, as it does
-                    // where a release fails to persist.
-                    let released = if claimed_here {
-                        Ok(())
-                    } else {
-                        registry.remove(&ih).map(drop)
-                    };
-                    if let Err(e) = released {
-                        warn!(
-                            profile_id = %profile,
-                            infohash = %ih,
-                            error.cause = %e,
-                            "could not release the claim of a torrent that failed to load",
-                        );
-                        metrics.inc_counter("store_write_errors_total", &[("store", "registry")]);
-                    }
-                }
-            }
-        }
-        checked_hold.hold_all();
-        checked_hold.verdict()?;
-        if added > 0 {
-            info!(profile_id = %profile, torrent_count = added, "torrent dir scan: added new torrents");
-        }
-        loaded_by_profile
-            .entry(profile.clone())
-            .and_modify(|n| *n += added)
-            .or_insert(added);
-    }
+    let ScanTally {
+        loaded_by_profile,
+        loaded,
+        load_failures,
+        ..
+    } = tally;
 
     // Track what the scans loaded from the handles the sessions returned, not
     // only from their add alerts: an alert libtorrent dropped would leave its
@@ -2987,6 +2377,732 @@ fn with_paused(mut params: AddParams) -> AddParams {
         AddParams::Magnet { .. } => {}
     }
     params
+}
+
+/// What the boot scans read and write besides their tallies: the boot's
+/// sessions, stores, registries and sinks, as `boot` holds them.
+#[derive(Clone, Copy)]
+struct ScanInputs<'a> {
+    cfg: &'a Config,
+    source: &'a dyn AlertSource,
+    profile_registry: &'a ProfileRegistry,
+    resume_store: &'a dyn ResumeStore,
+    torrent_store: &'a dyn TorrentStore,
+    registry: &'a AssignmentRegistry,
+    metrics: &'a PromSink,
+    state: &'a StateMap,
+    pool: Option<&'a crate::pool_service::PoolService>,
+    checks: &'a crate::pool_service::VerifyQueue,
+    checked_hold: &'a CheckedHold<'a>,
+    boot_progress: &'a sd_notify::Progress,
+}
+
+/// What the boot scans found, carried from the resume scan to the
+/// torrent-dir scan and from both to the rest of the boot.
+#[derive(Default)]
+struct ScanTally {
+    /// How many torrents each profile actually ended up holding, across both
+    /// scans. Compared against the registry's claim once both have run.
+    loaded_by_profile: std::collections::HashMap<ProfileId, usize>,
+    /// Which info-hashes a session accepted. Every registry entry outside this
+    /// set once both scans have run is held by no session, and is the one kind
+    /// of entry `DELETE` may clear without a state-map entry to remove.
+    loaded: std::collections::HashSet<libtorrent_safe::InfoHash>,
+    /// What the scans could not load, per profile, by the `source` label of
+    /// `boot_torrent_load_failures`. Exported as gauges once both have run:
+    /// these happen before any scrape can, so a counter would appear already
+    /// incremented and `increase()` would never see it move.
+    load_failures: std::collections::HashMap<ProfileId, BootLoadFailures>,
+    /// Each info-hash the resume scan found in a profile the registry does not
+    /// assign it to, and counted. The torrent-dir scan finds the same torrent
+    /// again by its `.torrent` beside it, and counts it only once per boot.
+    misplaced: HashSet<(ProfileId, libtorrent_safe::InfoHash)>,
+    /// Each torrent a tombstone says was removed, which neither scan loads
+    /// (`honour_tombstones`).
+    removed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)>,
+    /// Each info-hash the resume scan refused because its torrent's session key
+    /// is another one, or cannot be read before the add
+    /// (`pool_service::resume_key_refusal`), and counted. The torrent-dir scan
+    /// finds the `.torrent` filed beside it under the same name, and counts it
+    /// only once.
+    rekeyed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)>,
+}
+
+/// The boot's resume scan: load every profile's saved resume files into its
+/// session, each claimed in the registry first.
+///
+/// `Err` fails the boot: a store directory that cannot be listed, a listen
+/// socket [`CheckedHold`] refused, and a shutdown asked for meanwhile.
+async fn resume_scan(
+    inputs: &ScanInputs<'_>,
+    tally: &mut ScanTally,
+    scan_fence: &mut ScanFence,
+    boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
+) -> anyhow::Result<()> {
+    let ScanInputs {
+        source,
+        profile_registry,
+        resume_store,
+        torrent_store,
+        registry,
+        metrics,
+        state,
+        pool,
+        checks,
+        checked_hold,
+        boot_progress,
+        ..
+    } = *inputs;
+    let ScanTally {
+        loaded_by_profile,
+        loaded,
+        load_failures,
+        misplaced,
+        removed_at_boot,
+        rekeyed_at_boot,
+    } = tally;
+    // Resume scan: load every saved resume file per profile. The shim
+    // already deduplicates duplicate adds so a future torrent dir scan
+    // won't double-add.
+    for profile in source.profiles() {
+        let Some(profile_cfg) = profile_registry.config(&profile) else {
+            continue;
+        };
+        // Removals first: a torrent `DELETE` removed is not loaded again,
+        // whether its files were left by a failed delete or by a crash.
+        for ih in honour_tombstones(resume_store, torrent_store, metrics, &profile, |ih| {
+            registry.lookup(ih)
+        })
+        .context("read the resume dir's tombstones")?
+        {
+            removed_at_boot.insert((profile.clone(), ih));
+        }
+        // Listed by name and read one file at a time below, so the scan
+        // holds one resume file at once rather than the directory's. A
+        // file that cannot be read is skipped, logged and counted; only the
+        // directory itself failing to open stops the boot.
+        let listing = resume_store.list(&profile).context("scan resume dir")?;
+        boot_progress.advance();
+        load_failures
+            .entry(profile.clone())
+            .or_default()
+            .resume_file += listing.unreadable;
+        let mut count = 0usize;
+        let mut missing_metadata = 0usize;
+        let mut from_library = 0usize;
+        let mut added_from_resume = 0usize;
+        // Paused by a paced set-online the daemon stopped in, not by the
+        // operator: loaded unpaused, as they were before the profile went
+        // offline.
+        let held = profile_registry.holds().held(&profile);
+        let held_for_check = checks.holds().held(&profile);
+        let mut unheld = Vec::new();
+        let engine = source
+            .engine_for(&profile)
+            .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
+        for (i, ih) in listing.names.into_iter().enumerate() {
+            between_scan_batches(i, "resume", boot_shutdown, boot_progress, || {
+                scan_fence.enforce_all(profile_registry, metrics);
+                checked_hold.hold_all();
+                checked_hold.verdict()
+            })
+            .await?;
+            if removed_at_boot.contains(&(profile.clone(), ih)) {
+                continue;
+            }
+            let data = match resume_store.read(&profile, &ih) {
+                Ok(Some(data)) => data,
+                // Removed since the listing: nothing to load.
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        error.cause = %e,
+                        "skipping resume file that could not be read",
+                    );
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .resume_file += 1;
+                    continue;
+                }
+            };
+            count += 1;
+            // Cross-check the registry; the spec aborts the profile on
+            // mismatch. A resume file under one profile's directory that the
+            // registry assigns to another is the operator's to reconcile.
+            let existing = registry.lookup(&ih);
+            if let Some(existing) = &existing {
+                if *existing != profile {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        existing_profile = %existing,
+                        "resume file in wrong profile; skipping (operator must reconcile)",
+                    );
+                    metrics.inc_counter(
+                        "profile_assignment_registry_errors_total",
+                        &[("profile_id", profile.as_str())],
+                    );
+                    misplaced.insert((profile.clone(), ih));
+                    continue;
+                }
+            }
+            // Re-attach metadata. libtorrent writes the info dict into resume
+            // data only when save_resume_data was called with SAVE_INFO_DICT
+            // (vendor/libtorrent/src/torrent.cpp: `ret.ti = m_torrent_file` is
+            // gated on that flag), so resume data alone leaves the torrent with
+            // no metadata and it re-enters downloading_metadata on restart —
+            // fatal for a private profile with DHT and PEX disabled. Setting the
+            // flag instead would embed a full piece-hash table in every resume
+            // file, so pass the .torrent already on disk.
+            let torrent = match torrent_store.read(&profile, &ih) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
+                          "could not read .torrent for resume add; continuing without metadata");
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_read += 1;
+                    None
+                }
+            };
+            // A torrent the pool adopted before adoption wrote its `.torrent`
+            // to the store has none there; the library's copy the pool index
+            // names is the same metadata. Written back to the store, so the
+            // repair happens once and the library may move on.
+            let torrent = match (torrent, pool.as_ref()) {
+                (None, Some(pool)) => {
+                    let found = pool.library_torrent(&ih);
+                    if let Some(bytes) = &found {
+                        from_library += 1;
+                        if let Err(e) = torrent_store.write(&profile, &ih, bytes) {
+                            warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
+                                  "could not copy the pool library's .torrent into the torrent store");
+                            // Counted as the adoption's own write is: this
+                            // completes it, and a store that keeps refusing
+                            // repeats the repair at every boot.
+                            metrics.inc_counter(
+                                "torrent_file_persist_errors_total",
+                                &[("profile_id", profile.as_str()), ("source", "api")],
+                            );
+                        }
+                    }
+                    found
+                }
+                (torrent, _) => torrent,
+            };
+            let without_torrent = torrent.is_none();
+            // The flags re-asserted are `torrentd_engine::policy`'s. PAUSED is
+            // not cleared: resume data does not say why a torrent was paused,
+            // and restarting one an operator paused is not recoverable. The
+            // one exception is a pause the record of paced set-onlines names,
+            // which is the daemon's own and is released by any pause the
+            // operator makes over it.
+            let relocated = relocated_save_path(torrent_store, pool, &profile, &ih);
+            let paced = held.contains(&ih);
+            let mut params =
+                resume_scan_params(profile_cfg, data.into_inner(), torrent, relocated, paced);
+            // A `.torrent` the check queue held paused for a slot, or had
+            // resumed and whose check had not ended, when the daemon
+            // stopped: loaded paused whatever its resume data says, and
+            // queued again once the scans are done (`restore_held_adds`), so
+            // its check waits for a slot again rather than starting now.
+            if held_for_check.contains(&ih) {
+                params = with_paused(params);
+            }
+            // A torrent filed under a key its session would not give it: a
+            // hybrid an earlier build keyed by its truncated v2 hash, which
+            // its session now keys by its v1 hash, whether the resume data
+            // or the `.torrent` attached to it says so. Loaded, every alert
+            // would name a key the registry, the save queue and the stores
+            // do not hold, so it is refused, before anything is claimed, for
+            // the operator to reconcile. So is one whose key no add can
+            // know yet: resume data with no v1 hash and no metadata, which
+            // hybrid metadata would rekey once it arrived.
+            if let Some(refusal) = crate::pool_service::resume_key_refusal(&params, &ih) {
+                use crate::pool_service::ResumeKeyRefusal;
+                match refusal {
+                    ResumeKeyRefusal::Rekeyed(key) => warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        session_infohash = %key,
+                        scan = "resume",
+                        "boot scan: torrent filed under an infohash its session does not key it \
+                         by; not loaded (operator must reconcile: re-add it under the session's \
+                         infohash)",
+                    ),
+                    ResumeKeyRefusal::Unkeyable => warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        scan = "resume",
+                        "boot scan: resume data names no v1 infohash and carries no metadata, so \
+                         its session's key could change when the metadata arrives; not loaded \
+                         (operator must reconcile: add its .torrent, or a magnet naming its v1 \
+                         infohash)",
+                    ),
+                }
+                load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                rekeyed_at_boot.insert((profile.clone(), ih));
+                continue;
+            }
+            if without_torrent {
+                missing_metadata += 1;
+            }
+            // The account-isolation guard, on the trackers this resume data
+            // would announce to — its own `trackers` list where it has one.
+            // A file written before the profile's allow-list was set, or
+            // dropped into the directory by hand, is held to it like an API
+            // add. Checked before the registry claim, so a refusal claims
+            // nothing.
+            if let Err(refusal) = boot_scan_guard(metrics, profile_cfg, &ih, &params, "resume") {
+                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                }
+                continue;
+            }
+            // Unless it is already this profile's, claim it.
+            let claimed = match existing {
+                Some(_) => Ok(()),
+                None => registry.assign(ih, profile.clone()).map(drop),
+            };
+            if let Err(e) = claimed {
+                // Rule 4 makes the registry the gate every load passes. An
+                // assignment that failed to persist is one that disappears at
+                // the next restart, after which nothing knows this info-hash
+                // belongs to this profile — so refuse the load rather than seed a
+                // torrent the uniqueness rule can no longer see.
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "could not record the resume assignment; skipping this torrent",
+                );
+                metrics.inc_counter(
+                    "profile_assignment_registry_errors_total",
+                    &[("profile_id", profile.as_str())],
+                );
+                continue;
+            }
+            match engine.add_torrent(params) {
+                // The session keyed it by another infohash than the one it was
+                // filed under, which the check above reads from the params as
+                // the add does, so only a session that reads them otherwise,
+                // or params that check could not read, reach this. Taken
+                // back out where nothing else of this profile's is filed under
+                // the session's key, and refused either way.
+                Ok(h) if h.infohash != ih => {
+                    let Rekeyed {
+                        unloaded,
+                        claimed,
+                        paused,
+                    } = settle_rekeyed(
+                        registry,
+                        resume_store,
+                        torrent_store,
+                        checked_hold,
+                        state,
+                        &*engine,
+                        metrics,
+                        &profile,
+                        h,
+                    );
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        session_infohash = %h.infohash,
+                        scan = "resume",
+                        unloaded,
+                        paused,
+                        "boot scan: torrent filed under an infohash its session does not key it by; \
+                         refused (operator must reconcile: re-add it under the session's infohash)",
+                    );
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                    rekeyed_at_boot.insert((profile.clone(), ih));
+                    // The claim this scan made names a torrent no session
+                    // holds under it.
+                    if existing.is_none() {
+                        if let Err(e) = registry.remove(&ih) {
+                            warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
+                                  "could not release the claim of a torrent filed under another \
+                                   infohash");
+                            metrics
+                                .inc_counter("store_write_errors_total", &[("store", "registry")]);
+                        }
+                    }
+                    // Left in the session, it is held to the fence like any
+                    // other, under the key the session gave it, and counted
+                    // loaded where the profile's claim on that key is what
+                    // the unloaded-claims gauge compares it with. One left
+                    // there unclaimed and paused is kept from the fence,
+                    // whose lift resumes what it recorded.
+                    if !unloaded {
+                        loaded.insert(h.infohash);
+                        if claimed {
+                            added_from_resume += 1;
+                        }
+                        if !paused {
+                            scan_fence.added(profile_registry, metrics, &profile, h);
+                        }
+                    }
+                }
+                Ok(h) => {
+                    added_from_resume += 1;
+                    loaded.insert(ih);
+                    if paced {
+                        unheld.push(ih);
+                    }
+                    scan_fence.added(profile_registry, metrics, &profile, h);
+                }
+                Err(e) => {
+                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                }
+            }
+        }
+        checked_hold.hold_all();
+        checked_hold.verdict()?;
+        if !unheld.is_empty() {
+            // Loaded unpaused, so no longer the record's: saved now, so their
+            // resume data stops saying paused, and released, so a pause the
+            // operator makes from here on is kept by the next boot.
+            for ih in &unheld {
+                state.queue_resume_save_now(*ih);
+            }
+            if let Err(e) = profile_registry
+                .holds()
+                .release(&profile, unheld.iter().copied())
+            {
+                warn!(
+                    profile_id = %profile,
+                    error.cause = %e,
+                    "could not release the paced set-online's holds the boot loaded unpaused; \
+                     the next boot loads them unpaused again",
+                );
+            }
+            info!(
+                profile_id = %profile,
+                torrent_count = unheld.len(),
+                "loaded unpaused the torrents a paced set-online had paused and not resumed \
+                 when the daemon stopped",
+            );
+        }
+        if from_library > 0 {
+            info!(
+                profile_id = %profile,
+                torrent_count = from_library,
+                "resume entries with no .torrent in the torrent store took it from the pool library",
+            );
+        }
+        if missing_metadata > 0 {
+            // Not fatal — libtorrent can still fetch metadata from peers where
+            // discovery is enabled — but on a private profile it usually means the
+            // torrent will sit idle, so make it visible rather than silent.
+            warn!(
+                profile_id = %profile,
+                torrent_count = missing_metadata,
+                "resume entries with no .torrent on disk; these rely on peer metadata exchange",
+            );
+        }
+        info!(profile_id = %profile, torrent_count = count, "resume scan complete");
+        loaded_by_profile.insert(profile.clone(), added_from_resume);
+    }
+    Ok(())
+}
+
+/// The boot's torrent-dir scan: add every `.torrent` no resume file covered,
+/// each claimed in the registry first, and held for a check slot where its
+/// hold can be recorded.
+///
+/// `Err` fails the boot, as [`resume_scan`]'s does.
+async fn torrent_dir_scan(
+    inputs: &ScanInputs<'_>,
+    tally: &mut ScanTally,
+    scan_fence: &mut ScanFence,
+    boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
+) -> anyhow::Result<()> {
+    let ScanInputs {
+        cfg,
+        source,
+        profile_registry,
+        torrent_store,
+        registry,
+        metrics,
+        pool,
+        checks,
+        checked_hold,
+        boot_progress,
+        ..
+    } = *inputs;
+    let ScanTally {
+        loaded_by_profile,
+        loaded,
+        load_failures,
+        misplaced,
+        removed_at_boot,
+        rekeyed_at_boot,
+    } = tally;
+    // Torrent-dir scan: add any .torrent whose info-hash has no resume file
+    // (resume always wins; startup inventory). After this the torrent
+    // dir is not re-scanned — new torrents arrive only via the API.
+    let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
+    // Adoptions `pool.db` holds as waiting for verification. Their claims
+    // and `.torrent`s are in place, but this scan would hash them with
+    // nothing to record the verdict the pool is waiting for: the verify
+    // queue adds them after the scans instead. `None` where the queue cannot be read,
+    // and then no claimed torrent is re-added here, since none can be told
+    // apart from an adoption.
+    let verify_queued: Option<std::collections::HashSet<libtorrent_safe::InfoHash>> =
+        match pool.as_ref() {
+            None => Some(std::collections::HashSet::new()),
+            Some(pool) => match pool.with_store(|s| s.verify_queue()) {
+                Ok(rows) => Some(
+                    rows.iter()
+                        .filter_map(|row| libtorrent_safe::InfoHash::from_hex(&row.infohash))
+                        .collect(),
+                ),
+                Err(e) => {
+                    warn!(
+                        error.cause = %e,
+                        "torrent-dir scan: could not read the persisted verify queue; torrents \
+                         claimed with no resume file are left unloaded rather than risk adding \
+                         an adoption unverified",
+                    );
+                    None
+                }
+            },
+        };
+    for profile in source.profiles() {
+        let Some(profile_cfg) = profile_registry.config(&profile) else {
+            continue;
+        };
+        // By name: a `.torrent` the resume scan already loaded, or one a
+        // tombstone removed, is skipped before it is read, and the rest are
+        // read one at a time below.
+        let listing = torrent_store.list(&profile).context("scan torrent dir")?;
+        boot_progress.advance();
+        load_failures
+            .entry(profile.clone())
+            .or_default()
+            .torrent_file += listing.unreadable;
+        let entries = listing.names;
+        let engine = source
+            .engine_for(&profile)
+            .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
+        let mut added = 0usize;
+        // Every `.torrent` this scan may add is recorded as held for a check
+        // slot before any is added, in one write rather than one per torrent:
+        // a restart before its check ends then loads it paused and queues it
+        // again, rather than leaving it paused for good. What the scan skips
+        // after all is released once the scans are done
+        // (`restore_held_adds`). A record that cannot be written leaves this
+        // profile's adds running, their checks unbounded, as before the
+        // queue held them.
+        let held_for_check = {
+            let candidates = entries.iter().copied().filter(|ih| {
+                !loaded.contains(ih) && !removed_at_boot.contains(&(profile.clone(), *ih))
+            });
+            match checks.holds().hold(&profile, candidates) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        profile_id = %profile,
+                        error.cause = %e,
+                        "torrent-dir scan: could not record its torrents as held for a check \
+                         slot; adding them running, their checks outside the check limit",
+                    );
+                    false
+                }
+            }
+        };
+        for (i, ih) in entries.into_iter().enumerate() {
+            between_scan_batches(i, "torrent-dir", boot_shutdown, boot_progress, || {
+                scan_fence.enforce_all(profile_registry, metrics);
+                checked_hold.hold_all();
+                checked_hold.verdict()
+            })
+            .await?;
+            // Resume data already loaded this torrent, or it was removed and
+            // its tombstone stands — skip, before reading it.
+            if loaded.contains(&ih) || removed_at_boot.contains(&(profile.clone(), ih)) {
+                continue;
+            }
+            let bytes = match torrent_store.read(&profile, &ih) {
+                Ok(Some(bytes)) => bytes,
+                // Removed since the listing: nothing to load.
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        error.cause = %e,
+                        "skipping torrent file that could not be read",
+                    );
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_file += 1;
+                    continue;
+                }
+            };
+            // Filed under a key its session would not give it, as in the
+            // resume scan; counted there already where it refused the resume
+            // file beside this one.
+            if let Some(key) = rekeyed(&bytes, &ih) {
+                if rekeyed_at_boot.insert((profile.clone(), ih)) {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        session_infohash = %key,
+                        scan = "torrent_dir",
+                        "boot scan: torrent filed under an infohash its session does not key it \
+                         by; not loaded (operator must reconcile: re-add it under the session's \
+                         infohash)",
+                    );
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
+                }
+                continue;
+            }
+            // A claim does not mean a load: `POST /v1/torrents` claims before
+            // its add, and the claim outlives a resume file that was never
+            // written or cannot be read. One this profile holds is re-added
+            // below without claiming again; one another profile holds is the
+            // operator's to reconcile, as in the resume scan.
+            let claimed_here = match registry.lookup(&ih) {
+                None => false,
+                Some(owner) if owner == profile => true,
+                Some(owner) => {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        existing_profile = %owner,
+                        ".torrent in wrong profile; skipping (operator must reconcile)",
+                    );
+                    // Counted once: the resume scan counted it already where
+                    // its resume file sits in this profile too.
+                    if !misplaced.contains(&(profile.clone(), ih)) {
+                        metrics.inc_counter(
+                            "profile_assignment_registry_errors_total",
+                            &[("profile_id", profile.as_str())],
+                        );
+                    }
+                    continue;
+                }
+            };
+            // An adoption waiting for verification is the verify queue's to
+            // add, and one the pool recorded `drifted` stays unloaded; see
+            // `pool_holds_back`.
+            if claimed_here && pool_holds_back(pool, verify_queued.as_ref(), &profile, &ih) {
+                continue;
+            }
+            // The account-isolation guard, before the claim: a `.torrent`
+            // dropped into this profile's directory is held to its
+            // allow-list like one posted to the API.
+            let save_path =
+                torrent_dir_save_path(metrics, torrent_store, &profile, &ih, &scan_save_path);
+            let mut params = torrent_dir_scan_params(profile_cfg, bytes, save_path);
+            if let Err(refusal) = boot_scan_guard(metrics, profile_cfg, &ih, &params, "torrent_dir")
+            {
+                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
+                }
+                continue;
+            }
+            // Rule 4 again: claim first, load second. Claiming afterwards
+            // left a window in which the session held a torrent the registry
+            // had never agreed to, and dropped the claim silently if it could
+            // not be written. A claim this profile already holds stands.
+            let claim = if claimed_here {
+                Ok(())
+            } else {
+                registry.assign(ih, profile.clone()).map(drop)
+            };
+            if let Err(e) = claim {
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "could not record the torrent-dir assignment; skipping this torrent",
+                );
+                metrics.inc_counter(
+                    "profile_assignment_registry_errors_total",
+                    &[("profile_id", profile.as_str())],
+                );
+                continue;
+            }
+            // With no resume data the add hashes the payload: added paused,
+            // its check waits for a slot in the check queue like every other,
+            // so a directory of N `.torrent`s does not hash N at once. Its
+            // record was written before the loop (`held_for_check`).
+            if held_for_check {
+                params = with_paused(params);
+            }
+            match engine.add_torrent(params) {
+                Ok(h) => {
+                    added += 1;
+                    loaded.insert(ih);
+                    if held_for_check {
+                        checks.enqueue_add(
+                            profile.clone(),
+                            ih,
+                            crate::pool_service::CheckSource::TorrentDir,
+                        );
+                    }
+                    scan_fence.added(profile_registry, metrics, &profile, h);
+                }
+                Err(e) => {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        error.cause = %e,
+                        "torrent-dir add failed",
+                    );
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
+                    // Release the claim this scan made, so nothing holds the
+                    // info-hash for a torrent no session has. A claim held
+                    // before the boot is left as it was: the torrent is one
+                    // the boot left unloaded, which `DELETE` clears, and the
+                    // next boot tries the add again either way, as it does
+                    // where a release fails to persist.
+                    let released = if claimed_here {
+                        Ok(())
+                    } else {
+                        registry.remove(&ih).map(drop)
+                    };
+                    if let Err(e) = released {
+                        warn!(
+                            profile_id = %profile,
+                            infohash = %ih,
+                            error.cause = %e,
+                            "could not release the claim of a torrent that failed to load",
+                        );
+                        metrics.inc_counter("store_write_errors_total", &[("store", "registry")]);
+                    }
+                }
+            }
+        }
+        checked_hold.hold_all();
+        checked_hold.verdict()?;
+        if added > 0 {
+            info!(profile_id = %profile, torrent_count = added, "torrent dir scan: added new torrents");
+        }
+        loaded_by_profile
+            .entry(profile.clone())
+            .and_modify(|n| *n += added)
+            .or_insert(added);
+    }
+    Ok(())
 }
 
 /// The production engine factory for [`build_profiles`]: a real libtorrent
