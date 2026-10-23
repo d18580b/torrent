@@ -64,8 +64,9 @@ impl ScanStats {
 /// empty walk would read every torrent over it as `missing`, though nothing
 /// on disk is known to have changed. A subdirectory that cannot be listed,
 /// or an entry below the root the walk could not read, counts a `walk` error
-/// the same way and keeps that subtree's previous rows; the rest of the root
-/// is re-indexed as usual.
+/// the same way and keeps that subtree's previous rows, and a file the walk
+/// listed but could not stat counts a `stat` error and keeps its previous
+/// row; the rest of the root is re-indexed as usual.
 pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, PoolError> {
     let root_id = store.upsert_root(root_path)?;
     let mut stats = ScanStats::default();
@@ -109,8 +110,12 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                warn!(target: "torrentd_pool::scan", path = %path.display(), error.cause = %e, "stat failed");
+                warn!(target: "torrentd_pool::scan", path = %path.display(), error.cause = %e, "stat failed; its previous index row is kept");
                 stats.note_error("stat");
+                // Unseen, not gone: dropping its row would read the torrent
+                // over it as `missing` though nothing is known to have
+                // changed.
+                unseen.extend(rel_of(&path, root_path));
                 continue;
             }
         };
@@ -511,6 +516,41 @@ mod tests {
         assert_eq!(stats.errors, 0, "{stats:?}");
         assert!(!indexed(&store, root, "locked/b.bin"));
         assert!(indexed(&store, root, "locked/deep/c.bin"));
+    }
+
+    /// A file the walk lists but cannot stat (EIO, or here a directory
+    /// readable but not searchable) was counted and then dropped by the
+    /// swap, so the torrent over it read `missing`.
+    #[test]
+    fn an_unstatable_file_keeps_its_previous_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.bin");
+        write(root, "half/b.bin");
+        let mut store = PoolStore::open_in_memory().unwrap();
+        scan_root(&mut store, root).unwrap();
+        assert_eq!(store.file_count().unwrap(), 2);
+
+        let half = root.join("half");
+        let original = std::fs::metadata(&half).unwrap().permissions();
+        // Listable, not searchable: the name is seen, its stat fails.
+        std::fs::set_permissions(&half, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let binds = std::fs::metadata(half.join("b.bin")).is_err();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !binds {
+                return;
+            }
+            let stats = scan_root(&mut store, root).unwrap();
+            assert!(stats.errors_by_kind.get("stat") >= Some(&1), "{stats:?}");
+            assert!(indexed(&store, root, "half/b.bin"), "kept");
+            assert!(indexed(&store, root, "a.bin"));
+            assert_eq!(store.file_count().unwrap(), 2);
+        }));
+        std::fs::set_permissions(&half, original).unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
