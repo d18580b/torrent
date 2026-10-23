@@ -515,11 +515,14 @@ daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 
 ## Testing
 
-Every command below lives in [`mise.toml`](mise.toml), and where CI runs one
-it invokes the task rather than a second copy of the command. What
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) still spells out for
-itself, besides each job's setup, is the field-name grep, the container image
-build, and the `convco` check over a pull request's commit range.
+Every command below lives in [`mise.toml`](mise.toml), and
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs each check as
+that task rather than a second copy of the command; besides each job's setup,
+it spells out nothing for itself. So do the field-name grep
+(`mise run lint-tracing`), the container image build (`mise run container`),
+and the `convco` check over a pull request's commit range
+(`mise run commit-lint BASE..HEAD`). `RUSTFLAGS=-D warnings` comes from the
+same file, so a local `mise run` denies warnings exactly as CI does.
 
 ```bash
 mise run check           # fmt + clippy, warnings denied
