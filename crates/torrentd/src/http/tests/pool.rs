@@ -421,6 +421,34 @@ async fn a_drift_check_marks_a_torrent_whose_payload_vanished() {
     assert_eq!(report["files_vanished"], 1);
     let t: Value = h.read("/v1/pool/torrents?state=drifted").await.json();
     assert_eq!(t["items"][0]["infohash"], IH_A);
+    // Nothing it could not see: the root read, and every file stated.
+    assert_eq!(report["files_unreadable"], 0);
+    assert_eq!(report["unreadable_roots"], json!([]));
+    assert_eq!(report["unmounted_dirs"], json!([]));
+    assert_eq!(report["unchecked"], json!([]));
+}
+
+#[tokio::test]
+async fn a_drift_check_over_an_unmounted_root_reports_it_instead_of_no_drift() {
+    // An unmounted mount point is an empty directory. Its files read as
+    // not-found, which must surface as the root being unreadable, not as a
+    // clean check, nor as every file vanished.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let root = pool.roots()[0].1.clone();
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let report: Value = h.write("POST", "/v1/pool/drift-check").await.json();
+    assert_eq!(report["drifted"], json!([]));
+    assert_eq!(report["files_vanished"], 0);
+    assert_eq!(
+        report["unreadable_roots"],
+        json!([root.to_string_lossy()]),
+        "{report}"
+    );
+    assert_eq!(report["unchecked"], json!([IH_A]));
+    assert_eq!(report["unmounted_dirs"], json!([]));
 }
 
 #[tokio::test]

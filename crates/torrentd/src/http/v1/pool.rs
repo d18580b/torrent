@@ -207,6 +207,14 @@ fn hexes(infohashes: impl IntoIterator<Item = String>) -> Result<Vec<InfoHashHex
     infohashes.into_iter().map(|ih| hex(&ih)).collect()
 }
 
+/// Host paths as the API spells them, as [`RootSummary::path`] does.
+fn lossy(paths: Vec<std::path::PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Validate `infohashes` as a list of 1..=1000 into `invalid`.
 fn check_infohashes(invalid: &mut Invalid, pointer: &str, infohashes: &[InfoHashHex]) {
     invalid.check(
@@ -447,8 +455,26 @@ pub struct DriftReport {
     pub drifted: Vec<InfoHashHex>,
     /// Claimed files whose size or modification time changed.
     pub files_changed: u64,
-    /// Claimed files that are gone.
+    /// Claimed files that are gone from a root that is present and readable.
     pub files_vanished: u64,
+    /// Claimed files whose stat failed for a reason other than not-found (a
+    /// permission or I/O error). Not evidence of change, so not drift.
+    pub files_unreadable: u64,
+    /// Roots, as absolute paths on the daemon's host, that were missing, not
+    /// listable, or empty though the index holds files under them: what an
+    /// unmounted root looks like. A file not found under one is not counted
+    /// as vanished, so `drifted` says nothing about the payload there.
+    pub unreadable_roots: Vec<String>,
+    /// Directories inside a readable root that a claimed file was not found
+    /// under and that are on another filesystem than the index recorded: the
+    /// mount point of a disk unmounted inside the root. A file not found
+    /// under one is not counted as vanished.
+    pub unmounted_dirs: Vec<String>,
+    /// Torrents this check could not vouch for and found no change in: over
+    /// an unreadable root, under an unmounted directory, or with a file that
+    /// could not be stated. Their state is left alone, so they are neither
+    /// `drifted` nor known unchanged.
+    pub unchecked: Vec<InfoHashHex>,
 }
 
 /// Check adopted and matched payload for drift.
@@ -483,6 +509,10 @@ pub async fn check_pool_drift(
         drifted: hexes(report.drifted).map_err(|detail| PoolFailure::Internal { detail })?,
         files_changed: report.files_changed,
         files_vanished: report.files_vanished,
+        files_unreadable: report.files_unreadable,
+        unreadable_roots: lossy(report.unreadable_roots),
+        unmounted_dirs: lossy(report.unmounted_dirs),
+        unchecked: hexes(report.unchecked).map_err(|detail| PoolFailure::Internal { detail })?,
     }))
 }
 

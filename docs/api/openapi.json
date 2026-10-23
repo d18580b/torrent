@@ -11274,14 +11274,45 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Claimed files that are gone."
+            "description": "Claimed files that are gone from a root that is present and readable."
+          },
+          "files_unreadable": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Claimed files whose stat failed for a reason other than not-found (a\npermission or I/O error). Not evidence of change, so not drift."
+          },
+          "unreadable_roots": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "description": "Roots, as absolute paths on the daemon's host, that were missing, not\nlistable, or empty though the index holds files under them: what an\nunmounted root looks like. A file not found under one is not counted\nas vanished, so `drifted` says nothing about the payload there."
+          },
+          "unmounted_dirs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "description": "Directories inside a readable root that a claimed file was not found\nunder and that are on another filesystem than the index recorded: the\nmount point of a disk unmounted inside the root. A file not found\nunder one is not counted as vanished."
+          },
+          "unchecked": {
+            "items": {
+              "$ref": "#/components/schemas/InfoHashHex"
+            },
+            "type": "array",
+            "description": "Torrents this check could not vouch for and found no change in: over\nan unreadable root, under an unmounted directory, or with a file that\ncould not be stated. Their state is left alone, so they are neither\n`drifted` nor known unchanged."
           }
         },
         "type": "object",
         "required": [
           "drifted",
           "files_changed",
-          "files_vanished"
+          "files_vanished",
+          "files_unreadable",
+          "unreadable_roots",
+          "unmounted_dirs",
+          "unchecked"
         ],
         "description": "What a drift check found."
       },
