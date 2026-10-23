@@ -58,6 +58,7 @@ libc = { workspace = true }
 # `test-util` pauses the clock, so a test can show a request outlasting the
 # 15-second request timeout without waiting for it.
 tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

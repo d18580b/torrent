@@ -881,6 +881,33 @@ pub(crate) mod tests {
         assert!(!FORBIDDEN_TORRENT_FLAGS.contains(TorrentFlags::UPLOAD_MODE));
     }
 
+    /// The shim's `forbidden_torrent_flags`, which it clears on every add
+    /// whatever the caller passes, is the set this crate states: the two
+    /// copies of the list name the same flags. The engine's add policy
+    /// states it from [`FORBIDDEN_TORRENT_FLAGS`] itself.
+    #[test]
+    fn the_shims_forbidden_flags_are_this_crates() {
+        let shim = include_str!("../../libtorrent-sys/shim/shim_session_add.cpp");
+        let (_, rest) = shim
+            .split_once("forbidden_torrent_flags =")
+            .expect("the shim defines forbidden_torrent_flags");
+        let (expr, _) = rest.split_once(';').expect("a terminated definition");
+        let names: Vec<&str> = expr
+            .split('|')
+            .map(|term| {
+                term.trim()
+                    .strip_prefix("lt::torrent_flags::")
+                    .unwrap_or_else(|| panic!("a term that is not a torrent flag: {term:?}"))
+            })
+            .collect();
+        let shim_set = names.iter().fold(TorrentFlags::empty(), |set, name| {
+            set | TorrentFlags::from_name(&name.to_ascii_uppercase())
+                .unwrap_or_else(|| panic!("the shim forbids {name}, which TorrentFlags lacks"))
+        });
+        assert_eq!(shim_set, FORBIDDEN_TORRENT_FLAGS, "shim: {names:?}");
+        assert_eq!(names.len(), FORBIDDEN_TORRENT_FLAGS.iter().count());
+    }
+
     /// Two real sessions on loopback, with nothing to discover peers but the
     /// magnet's own `x.pe`.
     fn loopback_settings() -> Settings {

@@ -913,6 +913,82 @@ mod tests {
         assert_eq!(redacted(&once), once);
     }
 
+    mod props {
+        use proptest::prelude::*;
+
+        use super::redacted;
+
+        /// Text built from the pieces URLs and their credentials are made
+        /// of, separators and escapes included, mixed with anything at all:
+        /// the inputs where the redactor's scanning has edges.
+        fn url_soup() -> impl Strategy<Value = String> {
+            let piece = prop_oneof![
+                Just("https://".to_owned()),
+                Just("udp://".to_owned()),
+                Just("%3A%2F%2F".to_owned()),
+                Just("%253a%252f%252f".to_owned()),
+                Just("t.example".to_owned()),
+                Just("/announce".to_owned()),
+                Just("?passkey=".to_owned()),
+                Just("&".to_owned()),
+                Just("@".to_owned()),
+                Just("#".to_owned()),
+                Just("%".to_owned()),
+                Just(":".to_owned()),
+                Just("/".to_owned()),
+                Just(" ".to_owned()),
+                Just(super::PASSKEY.to_owned()),
+                "[0-9a-zA-Z]{1,40}",
+                ".{0,6}",
+            ];
+            prop::collection::vec(piece, 0..24).prop_map(|p| p.concat())
+        }
+
+        /// A URL carrying `key` in each shape the log redactor recognises.
+        fn credential_url(key: String) -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just(format!("https://t.example/announce?passkey={key}")),
+                Just(format!("udp://t.example:6969/{key}/announce")),
+                Just(format!("https://user:{key}@t.example/announce")),
+                Just(format!(
+                    "https://r.example/go?u=https%3A%2F%2Ft.example%2Fa%3Fpasskey%3D{key}"
+                )),
+                Just(format!(
+                    "http://r.example/go?u=https://t.example/a?apikey={key}"
+                )),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Whatever a log line holds, redacting it answers.
+            #[test]
+            fn redacting_never_panics(text in url_soup()) {
+                let _ = redacted(&text);
+            }
+
+            /// Redacting what was redacted changes nothing.
+            #[test]
+            fn redaction_is_idempotent(text in url_soup()) {
+                let once = redacted(&text);
+                prop_assert_eq!(redacted(&once), once);
+            }
+
+            /// A credential in a recognised shape never survives into the
+            /// line, whatever text stands around its URL.
+            #[test]
+            fn no_passkey_survives(
+                (url, key) in "[0-9a-f]{32}".prop_flat_map(|k| (credential_url(k.clone()), Just(k))),
+                before in ".*",
+                after in ".*",
+            ) {
+                let line = redacted(&format!("{before} {url} {after}"));
+                prop_assert!(!line.contains(&key), "{}", line);
+            }
+        }
+    }
+
     #[test]
     fn the_daemon_layer_redacts_message_event_fields_and_span_fields() {
         let buf = Buf::default();

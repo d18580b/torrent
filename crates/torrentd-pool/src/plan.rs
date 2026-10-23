@@ -1074,4 +1074,99 @@ mod tests {
             Path::new("/data/pool/..hidden/foo..bar"),
         );
     }
+
+    mod props {
+        use std::path::Component;
+
+        use proptest::prelude::*;
+
+        use super::super::contains;
+        use super::super::prefixes_overlap;
+        use super::*;
+
+        /// A root-relative path as the API may send one: plain names,
+        /// names that merely contain dots, traversals, empties and roots.
+        fn rel() -> impl Strategy<Value = String> {
+            (
+                any::<bool>(),
+                prop::collection::vec(
+                    prop::sample::select(vec!["a", "shows", "..hidden", "x..y", "..", ".", ""]),
+                    0..6,
+                ),
+            )
+                .prop_map(|(lead, parts)| {
+                    format!("{}{}", if lead { "/" } else { "" }, parts.join("/"))
+                })
+        }
+
+        fn has_parent(p: &str) -> bool {
+            Path::new(p).components().any(|c| c == Component::ParentDir)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// What comes back is inside the root and never walks back out;
+            /// a path with a `..` in it never comes back at all.
+            #[test]
+            fn a_resolved_path_is_inside_the_root(rel in rel()) {
+                match resolve_under(&root(), &rel) {
+                    Ok(p) => {
+                        prop_assert!(!has_parent(&rel), "{:?} was accepted as {:?}", rel, p);
+                        prop_assert!(p.starts_with(root()), "{:?} resolved to {:?}", rel, p);
+                        prop_assert!(!p.components().any(|c| c == Component::ParentDir));
+                    }
+                    Err(_) => prop_assert!(has_parent(&rel), "{:?} was refused", rel),
+                }
+            }
+
+            /// `contains` refuses any candidate holding a `..` or a leading
+            /// `.`, whether the root exists or not. The leading-`.` case is
+            /// rooted at `.` itself, where the candidate does resolve under
+            /// the root, so only the component guard can refuse it.
+            #[test]
+            fn a_traversal_is_never_contained(rel in rel()) {
+                let dir = tempfile::tempdir().unwrap();
+                let candidate = PathBuf::from(format!("{}/{rel}", dir.path().display()));
+                if has_parent(&rel) {
+                    prop_assert!(!contains(dir.path(), &candidate), "{:?}", candidate);
+                    prop_assert!(!contains(&root(), &root().join(rel.trim_start_matches('/'))));
+                }
+                prop_assert!(!contains(Path::new("."), &Path::new(".").join(rel.trim_start_matches('/'))));
+            }
+
+            /// A path under a symlink that leaves the root resolves outside
+            /// it, and is refused; the same path under a real directory is
+            /// not.
+            #[test]
+            fn a_symlink_out_of_the_root_is_refused(
+                via_link in any::<bool>(),
+                rest in prop::collection::vec("[a-z]{1,6}", 0..4),
+            ) {
+                let dir = tempfile::tempdir().unwrap();
+                let (root, outside) = (dir.path().join("root"), dir.path().join("outside"));
+                std::fs::create_dir_all(root.join("in")).unwrap();
+                std::fs::create_dir(&outside).unwrap();
+                std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+                let top = if via_link { "out" } else { "in" };
+                let rel = [vec![top.to_owned()], rest].concat().join("/");
+                prop_assert_eq!(resolve_under(&root, &rel).is_ok(), !via_link, "{}", rel);
+            }
+
+            /// Whether two delete areas overlap does not depend on which is
+            /// asked about first, and an area always overlaps itself and
+            /// anything under it.
+            #[test]
+            fn overlap_is_symmetric_and_covers_descendants(
+                a in "(/?[a-z]{1,3}){0,3}/?",
+                b in "(/?[a-z]{1,3}){0,3}/?",
+                below in "[a-z]{1,3}",
+            ) {
+                prop_assert_eq!(prefixes_overlap(&a, &b), prefixes_overlap(&b, &a));
+                prop_assert!(prefixes_overlap(&a, &a));
+                let under = format!("{}/{below}", a.trim_end_matches('/'));
+                prop_assert!(prefixes_overlap(&a, &under), "{:?} under {:?}", under, a);
+            }
+        }
+    }
 }

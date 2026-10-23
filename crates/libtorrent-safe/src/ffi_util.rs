@@ -132,4 +132,21 @@ mod tests {
     fn a_fixed_buffer_decodes_lossily() {
         assert_eq!(fixed_c_str(&buf::<4>(b"a\xffb")), "a\u{fffd}b");
     }
+
+    proptest::proptest! {
+        /// A fixed-size buffer is read up to its first NUL, or whole where
+        /// it holds none, and never past its end: the bytes after it in
+        /// memory, none of them NUL, are never part of the string.
+        #[test]
+        fn a_fixed_buffer_is_read_within_its_bounds(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            tail in 1usize..16,
+        ) {
+            let mut memory: Vec<c_char> = bytes.iter().map(|&b| b as c_char).collect();
+            memory.extend(std::iter::repeat_n(b'Z' as c_char, tail));
+            let text = fixed_c_str(&memory[..bytes.len()]);
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            proptest::prop_assert_eq!(text, String::from_utf8_lossy(&bytes[..end]).into_owned());
+        }
+    }
 }

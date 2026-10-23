@@ -99,4 +99,24 @@ mod tests {
         assert_eq!(duration(2 * 86_400 + 3600), "2d 1h");
         assert_eq!(short_hash("0123456789abcdef0123"), "0123456789ab");
     }
+
+    proptest::proptest! {
+        /// Any finite fraction, in range or not, reads as a percentage
+        /// between 0 and 100 with one decimal.
+        #[test]
+        fn a_percent_of_any_finite_fraction_is_within_0_to_100(
+            fraction in proptest::num::f64::NORMAL
+                | proptest::num::f64::SUBNORMAL
+                | proptest::num::f64::ZERO
+        ) {
+            let shown = percent(fraction);
+            let number = shown
+                .strip_suffix('%')
+                .and_then(|n| n.parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("{fraction} read as {shown:?}"));
+            proptest::prop_assert!((0.0..=100.0).contains(&number), "{fraction} read as {shown}");
+            let decimals = shown.trim_end_matches('%').split_once('.').map(|(_, d)| d.len());
+            proptest::prop_assert_eq!(decimals, Some(1), "{}", shown);
+        }
+    }
 }
