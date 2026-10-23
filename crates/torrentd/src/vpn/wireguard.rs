@@ -106,7 +106,53 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
     if !out.status.success() {
         return Err(ProbeUnavailable::Refused);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
+    match parse_latest_handshake(&String::from_utf8_lossy(&out.stdout), now)? {
+        Handshake::Never => Ok(None),
+        Handshake::Age(age) => Ok(Some(age)),
+        Handshake::Ahead { skew_secs } => {
+            // The handshake is stamped in our future, so one of the two clocks
+            // has moved. Treating that as an enormous age is the dangerous
+            // reading: it would fence a healthy profile permanently, and
+            // fencing requires an operator to undo. Report it as fresh and say
+            // why.
+            warn!(
+                target: "torrentd::vpn::wireguard",
+                vpn_iface = %iface,
+                skew_secs,
+                "latest handshake is in the future; treating the tunnel as fresh \
+                 (check clock sync on this host)",
+            );
+            Ok(Some(Duration::ZERO))
+        }
+    }
+}
+
+/// The freshest handshake `wg show <iface> latest-handshakes` reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Handshake {
+    /// No peer has handshaked, or the link has no peers.
+    Never,
+    /// The freshest peer handshaked this long ago.
+    Age(Duration),
+    /// The freshest handshake is stamped `skew_secs` past `now`.
+    Ahead { skew_secs: u64 },
+}
+
+/// [`latest_handshake_age`]'s reading of `wg show <iface> latest-handshakes`,
+/// which prints `<pubkey>\t<unix_secs>` per peer, `0` for a peer that never
+/// handshaked. The freshest across peers is taken, and a line whose time does
+/// not read is passed over; output in which no line reads at all is
+/// [`ProbeUnavailable::Unparseable`], which an empty output, a link with no
+/// peers, is not.
+///
+/// `now` is the host's clock in seconds since the epoch, `None` where it
+/// cannot be read: a handshake then has no age to give, and is
+/// `Unparseable` too.
+fn parse_latest_handshake(text: &str, now: Option<u64>) -> Result<Handshake, ProbeUnavailable> {
     let Some(latest) = text
         .lines()
         .filter_map(|l| l.split_whitespace().nth(1))
@@ -116,33 +162,22 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
         // Output we could not read at all is not the same as a tunnel with no
         // peers, which prints a line per peer with a 0.
         return if text.trim().is_empty() {
-            Ok(None)
+            Ok(Handshake::Never)
         } else {
             Err(ProbeUnavailable::Unparseable)
         };
     };
     if latest == 0 {
-        return Ok(None); // never handshaked → no liveness signal yet
+        return Ok(Handshake::Never); // never handshaked → no liveness signal yet
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ProbeUnavailable::Unparseable)?
-        .as_secs();
-    if latest > now {
-        // The handshake is stamped in our future, so one of the two clocks has
-        // moved. Treating that as an enormous age is the dangerous reading: it
-        // would fence a healthy profile permanently, and fencing requires an
-        // operator to undo. Report it as fresh and say why.
-        warn!(
-            target: "torrentd::vpn::wireguard",
-            vpn_iface = %iface,
-            skew_secs = latest - now,
-            "latest handshake is in the future; treating the tunnel as fresh \
-             (check clock sync on this host)",
-        );
-        return Ok(Some(Duration::ZERO));
-    }
-    Ok(Some(Duration::from_secs(now - latest)))
+    let now = now.ok_or(ProbeUnavailable::Unparseable)?;
+    Ok(if latest > now {
+        Handshake::Ahead {
+            skew_secs: latest - now,
+        }
+    } else {
+        Handshake::Age(Duration::from_secs(now - latest))
+    })
 }
 
 /// A WireGuard link's byte counters, summed across its peers.
@@ -1612,6 +1647,174 @@ mod tests {
                 Err(ProbeUnavailable::Unparseable),
                 "{bad:?}"
             );
+        }
+    }
+
+    /// The freshest peer's handshake is the link's; a line whose time does
+    /// not read is passed over while another line reads; a handshake stamped
+    /// in the future is reported as such, with its skew, not as an age.
+    #[test]
+    fn the_latest_handshake_is_the_freshest_peers() {
+        const NOW: u64 = 1_700_000_000;
+        let read = |text: &str| parse_latest_handshake(text, Some(NOW));
+        assert_eq!(
+            read("pkA=\t1699999000\npkB=\t1699999900\npkC=\t0\n"),
+            Ok(Handshake::Age(Duration::from_secs(100))),
+            "the max across peers, a never-handshaked peer among them",
+        );
+        assert_eq!(
+            read("pkA=\tsoon\npkB=\t1699999990\npkC=\n"),
+            Ok(Handshake::Age(Duration::from_secs(10))),
+            "unreadable lines beside a readable one",
+        );
+        assert_eq!(
+            read("pkA=\tsoon\npkC=\n"),
+            Err(ProbeUnavailable::Unparseable)
+        );
+        assert_eq!(
+            read("pkA=\t1700000042\npkB=\t1699999990\n"),
+            Ok(Handshake::Ahead { skew_secs: 42 }),
+        );
+        assert_eq!(read(""), Ok(Handshake::Never));
+        assert_eq!(read(" \n\t\n"), Ok(Handshake::Never));
+        assert_eq!(read("pkA=\t0\npkB=\t0\n"), Ok(Handshake::Never));
+        assert_eq!(
+            read(&format!("pkA=\t{NOW}\n")),
+            Ok(Handshake::Age(Duration::ZERO))
+        );
+        assert_eq!(
+            parse_latest_handshake("pkA=\t1699999000\n", None),
+            Err(ProbeUnavailable::Unparseable),
+            "an age with no clock to measure it by",
+        );
+        assert_eq!(
+            parse_latest_handshake("pkA=\t0\n", None),
+            Ok(Handshake::Never)
+        );
+    }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// `wg show <iface> transfer` output for peers with these counters.
+        fn transfer_text(peers: &[(u64, u64)]) -> String {
+            peers
+                .iter()
+                .enumerate()
+                .map(|(i, (rx, tx))| format!("pk{i}=\t{rx}\t{tx}\n"))
+                .collect()
+        }
+
+        fn sum(peers: &[(u64, u64)]) -> Transfer {
+            peers
+                .iter()
+                .fold(Transfer::default(), |s, (rx, tx)| Transfer {
+                    rx: s.rx.saturating_add(*rx),
+                    tx: s.tx.saturating_add(*tx),
+                })
+        }
+
+        proptest! {
+            /// Whatever `wg` prints, each reader answers.
+            #[test]
+            fn the_wg_readers_never_panic(text in ".*", now in any::<Option<u64>>()) {
+                let _ = parse_transfer(&text);
+                let _ = parse_latest_handshake(&text, now);
+                let _ = endpoint_hosts(&text);
+                let _ = native::parse(&text);
+            }
+
+            /// The config reader answers on text shaped like a config too,
+            /// where it reads deeper than on noise.
+            #[test]
+            fn the_config_reader_never_panics_on_config_shaped_text(
+                lines in prop::collection::vec(
+                    prop_oneof![
+                        Just("[Interface]".to_owned()),
+                        Just("[Peer]".to_owned()),
+                        "[A-Za-z ]{0,12} ?= ?[ -~]{0,48}",
+                        "#.{0,12}",
+                        ".{0,24}",
+                    ],
+                    0..16,
+                )
+            ) {
+                let text = lines.join("\n");
+                let _ = native::parse(&text);
+                let _ = endpoint_hosts(&text);
+            }
+
+            /// The link's counters are the sum of its peers', split however
+            /// the output is: reading two halves and adding them is reading
+            /// the whole.
+            #[test]
+            fn transfer_is_additive(
+                a in prop::collection::vec((any::<u64>(), any::<u64>()), 0..6),
+                b in prop::collection::vec((any::<u64>(), any::<u64>()), 0..6),
+            ) {
+                let whole = [a.clone(), b.clone()].concat();
+                prop_assert_eq!(parse_transfer(&transfer_text(&whole)), Ok(sum(&whole)));
+                let (ta, tb) = (
+                    parse_transfer(&transfer_text(&a)).unwrap(),
+                    parse_transfer(&transfer_text(&b)).unwrap(),
+                );
+                prop_assert_eq!(
+                    parse_transfer(&format!("{}{}", transfer_text(&a), transfer_text(&b))),
+                    Ok(Transfer {
+                        rx: ta.rx.saturating_add(tb.rx),
+                        tx: ta.tx.saturating_add(tb.tx),
+                    }),
+                );
+            }
+
+            /// One unreadable line fails the whole reading, wherever it is.
+            #[test]
+            fn one_unreadable_transfer_line_fails_the_reading(
+                peers in prop::collection::vec((any::<u64>(), any::<u64>()), 0..6),
+                at in any::<prop::sample::Index>(),
+                bad in prop_oneof![Just("pkX=\t1\n"), Just("pkX=\tlots\t7\n"), Just("pkX=\n")],
+            ) {
+                let mut lines: Vec<String> =
+                    transfer_text(&peers).lines().map(|l| format!("{l}\n")).collect();
+                lines.insert(at.index(lines.len() + 1), bad.to_owned());
+                prop_assert_eq!(parse_transfer(&lines.concat()), Err(ProbeUnavailable::Unparseable));
+            }
+
+            /// The age is measured from the freshest peer, and no peer's
+            /// order, nor a never-handshaked peer, moves it.
+            #[test]
+            fn the_handshake_age_is_the_freshest_peers(
+                times in prop::collection::vec(0u64..=1_000_000, 1..8),
+                now in 1_000_000u64..2_000_000,
+                never in 0usize..3,
+            ) {
+                let mut lines: Vec<String> =
+                    times.iter().enumerate().map(|(i, t)| format!("pk{i}=\t{t}\n")).collect();
+                lines.extend((0..never).map(|i| format!("pkN{i}=\t0\n")));
+                lines.reverse();
+                let latest = *times.iter().max().unwrap();
+                let want = if latest == 0 {
+                    Handshake::Never
+                } else {
+                    Handshake::Age(Duration::from_secs(now - latest))
+                };
+                prop_assert_eq!(parse_latest_handshake(&lines.concat(), Some(now)), Ok(want));
+            }
+
+            /// A handshake past the clock is never read as an age, however
+            /// far past.
+            #[test]
+            fn a_future_handshake_is_never_an_age(
+                now in 1u64..u64::MAX / 2,
+                ahead in 1u64..u64::MAX / 2,
+            ) {
+                prop_assert_eq!(
+                    parse_latest_handshake(&format!("pk=\t{}\n", now + ahead), Some(now)),
+                    Ok(Handshake::Ahead { skew_secs: ahead }),
+                );
+            }
         }
     }
 
