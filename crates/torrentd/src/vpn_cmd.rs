@@ -3850,6 +3850,50 @@ user_agent           = "Transmission/4.0.5"
         );
     }
 
+    /// #534: an IPv4 route by the tunnel followed by an IPv6 probe that
+    /// could not run is the probe's answer, as it is for the monitor
+    /// (`vpn_monitor::route_probe` stops at the first answer not by the
+    /// tunnel). The route line is `unknown`, not a pass naming the IPv4 pair,
+    /// and the health observation carries no route, so the monitor's verdict
+    /// does not fence on it. Skip the unavailable answer and the route line
+    /// passes, which is the first assertion failing.
+    #[test]
+    fn an_ipv6_route_probe_that_cannot_run_leaves_the_route_unknown_and_the_health_unfenced() {
+        let cfg = cfg_with_profile("");
+        let v6: std::net::Ipv6Addr = "fd00::2".parse().unwrap();
+        let host = FakeHost::new()
+            .with_handshake(Ok(Some(Duration::from_secs(5))))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))])
+            .with_v6("wg-acct-a", &[v6])
+            .with_route_from(
+                IpAddr::V6(v6),
+                Err(vpn::route::RouteProbeUnavailable::NoTool),
+            );
+
+        let (route, answer) = judge_routes(
+            &host,
+            "wg-acct-a",
+            Some(IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2))),
+        );
+        assert_eq!(route.verdict, Verdict::Unknown, "detail: {}", route.detail);
+        assert_eq!(
+            answer,
+            Some(Err(vpn::route::RouteProbeUnavailable::NoTool)),
+            "the unavailable IPv6 answer is the answer, not the IPv4 pass before it",
+        );
+        assert_eq!(
+            answer.and_then(Result::ok),
+            None,
+            "the health observation gets no route, as the monitor's does",
+        );
+
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
+        let route = find(&r.checks, "route").expect("the route line is reported");
+        assert_eq!(route.verdict, Verdict::Unknown, "detail: {}", route.detail);
+        let health = find(&r.checks, "health").expect("the monitor's verdict is reported");
+        assert_eq!(health.verdict, Verdict::Pass, "detail: {}", health.detail);
+    }
+
     /// `--egress` asserts the route before it trusts a reply: a round trip
     /// that went out of the physical interface is not evidence the tunnel
     /// carries traffic, so it is not attempted.
