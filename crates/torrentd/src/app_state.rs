@@ -9,7 +9,6 @@ use std::sync::Arc;
 use libtorrent_safe::InfoHash;
 use parking_lot::Mutex;
 use torrentd_engine::AlertSource;
-use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
@@ -19,6 +18,7 @@ use torrentd_engine::TorrentStore;
 
 use crate::metrics_sink::PromSink;
 use crate::profile_registry::ProfileRegistry;
+use crate::registry::AssignmentRegistry;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -270,11 +270,12 @@ pub(crate) fn build_test_state_with_sessions(
     profiles: Option<Arc<ProfileRegistry>>,
     session_ids: &[&str],
 ) -> AppState {
-    use torrentd_engine::AssignmentRegistry;
     use torrentd_engine::MemoryTorrentStore;
     use torrentd_engine::MockEngine;
     use torrentd_engine::ProfileSource;
     use torrentd_engine::TorrentEngine;
+
+    use crate::registry::AssignmentRegistry;
 
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
     // Tests that do not care about profiles get one named `p`, which is what

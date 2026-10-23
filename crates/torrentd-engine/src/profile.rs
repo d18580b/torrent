@@ -187,7 +187,7 @@ impl<'de> Deserialize<'de> for ProfileId {
 
 /// Why an id outside `[A-Za-z0-9_-]{1,64}` cannot be used: the one wording
 /// every refusal of an id shares.
-pub(crate) const ID_CHARSET_RULE: &str =
+pub const ID_CHARSET_RULE: &str =
     "an id may be 1-64 characters of [A-Za-z0-9_-] only. The id is a path component in three \
      places (<resume_dir>/<id>, <torrent_dir>/<id>, session_state-<id>.dat) and a URL path \
      segment, so anything else either escapes those directories or cannot be addressed.";
@@ -948,7 +948,7 @@ impl ProfileConfig {
     /// is also URL-safe unescaped, which is what `/v1/profiles/<id>` needs.
     /// The 64-character bound keeps `session_state-<id>.dat` inside a
     /// filename-length limit on every platform the daemon targets.
-    pub(crate) fn is_valid_id(id: &str) -> bool {
+    pub fn is_valid_id(id: &str) -> bool {
         !id.is_empty()
             && id.len() <= 64
             && id

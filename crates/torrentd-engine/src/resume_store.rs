@@ -217,7 +217,7 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
 /// spelling. A name that decoded under any other — `ABCD…` for `abcd…` —
 /// would be loaded at boot, yet every delete removes only the lower-case
 /// name, so the torrent would come back after each removal.
-pub(crate) fn canonical_infohash(name: &str) -> Option<InfoHash> {
+pub fn canonical_infohash(name: &str) -> Option<InfoHash> {
     InfoHash::from_hex(name).filter(|ih| ih.to_hex() == name)
 }
 

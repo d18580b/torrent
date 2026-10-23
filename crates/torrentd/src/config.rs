@@ -14,10 +14,11 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::JsonImport;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileConfigError;
 use torrentd_engine::ProfileId;
+
+use crate::registry::JsonImport;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -3244,7 +3245,7 @@ upload_rate_limit = 0"#,
             pre_profiles: false,
         };
         assert!(
-            torrentd_engine::AssignmentRegistry::open(dir.path().join("registry.db"), Some(import))
+            crate::registry::AssignmentRegistry::open(dir.path().join("registry.db"), Some(import))
                 .is_err(),
             "a registry naming an id that escapes its directory must not load",
         );

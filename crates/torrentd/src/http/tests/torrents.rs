@@ -12,7 +12,6 @@ use kynos::http::StatusCode;
 use kynos::test::TestResponse;
 use serde_json::json;
 use serde_json::Value;
-use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::EngineError;
 use torrentd_engine::HeldCall;
 use torrentd_engine::InfoHash;
@@ -39,6 +38,7 @@ use crate::profile_registry::test_failed_profile;
 use crate::profile_registry::test_host_entry;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::registry::AssignmentRegistry;
 
 const MAGNET: &str = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101";
 const MAGNET_HEX: &str = "0101010101010101010101010101010101010101";

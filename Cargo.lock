@@ -3607,7 +3607,6 @@ dependencies = [
  "libtorrent-safe",
  "once_cell",
  "parking_lot",
- "rusqlite",
  "serde",
  "serde_json",
  "sha1",

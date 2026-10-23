@@ -1785,13 +1785,13 @@ async fn a_same_profile_adoption_that_loses_the_claim_race_is_refused_and_keeps_
                 q.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
             ),
         ]));
-        s.registry = Arc::new(torrentd_engine::AssignmentRegistry::new_empty(&reg_path));
+        s.registry = Arc::new(crate::registry::AssignmentRegistry::new_empty(&reg_path));
         s.pool = Some(pool);
     });
     let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
     // The concurrent add's claim, and the duplicate the session would answer
     // the adoption with if it got that far.
-    torrentd_engine::AssignmentRegistry::new_empty(&reg_path)
+    crate::registry::AssignmentRegistry::new_empty(&reg_path)
         .assign(hash, torrentd_engine::ProfileId::new("p"))
         .unwrap();
     p.inject_error(
