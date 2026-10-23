@@ -167,7 +167,12 @@ fn a_missing_file_yields_partial_not_matched() {
     assert_eq!(stats.partial, 1);
     assert_eq!(stats.matched, 0);
     assert_eq!(state_of(&store, "dd"), AdoptionState::Partial);
-    assert!(!AdoptionState::Partial.is_adoptable());
+    assert_eq!(
+        torrentd_pool::adopt::plan(&store, "dd", |_| Some(root.to_path_buf())).unwrap(),
+        AdoptPlan::Refuse {
+            reason: refusal::PARTIAL
+        },
+    );
 }
 
 #[test]
@@ -226,7 +231,17 @@ fn two_torrents_over_the_same_files_are_both_shared() {
     let stats = torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "1a"), AdoptionState::Shared);
     assert_eq!(state_of(&store, "2b"), AdoptionState::Shared);
-    assert!(AdoptionState::Shared.is_adoptable());
+    // Each adopts on its own, through verification: neither has resume data.
+    for ih in ["1a", "2b"] {
+        assert_eq!(
+            torrentd_pool::adopt::plan(&store, ih, |_| Some(root.to_path_buf())).unwrap(),
+            AdoptPlan::Verify {
+                torrent_path: PathBuf::from(format!("/library/{ih}.torrent")),
+                save_path: root.to_path_buf(),
+                resume_path: None,
+            },
+        );
+    }
     assert_eq!((stats.shared, stats.matched, stats.overlap), (2, 0, 0));
     assert!(store.shares_claims("1a").unwrap());
 }
@@ -260,7 +275,14 @@ fn two_torrents_over_different_sets_of_the_same_bytes_are_both_flagged_overlap()
     let stats = torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "1a"), AdoptionState::Overlap);
     assert_eq!(state_of(&store, "2b"), AdoptionState::Overlap);
-    assert!(!AdoptionState::Overlap.is_adoptable());
+    for ih in ["1a", "2b"] {
+        assert_eq!(
+            torrentd_pool::adopt::plan(&store, ih, |_| Some(root.to_path_buf())).unwrap(),
+            AdoptPlan::Refuse {
+                reason: refusal::OVERLAP
+            },
+        );
+    }
     assert_eq!((stats.overlap, stats.matched), (2, 0));
 }
 
@@ -990,7 +1012,12 @@ fn qbittorrents_mapped_files_are_honoured() {
                 "{plan:?}"
             );
         } else {
-            assert!(plan.is_refusal(), "{plan:?}");
+            assert_eq!(
+                plan,
+                AdoptPlan::Refuse {
+                    reason: refusal::RENAMED_INCOMPLETE
+                }
+            );
         }
     }
 }
@@ -1031,7 +1058,12 @@ fn a_refused_mapped_file_blocks_adoption() {
         let r = root.clone();
         let plan = torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone()))
             .unwrap();
-        assert!(plan.is_refusal(), "{plan:?}");
+        assert_eq!(
+            plan,
+            AdoptPlan::Refuse {
+                reason: refusal::MAPPED_OUTSIDE
+            }
+        );
     }
 }
 
@@ -1061,7 +1093,12 @@ fn qbittorrents_no_subfolder_layout_is_honoured() {
     let r = root.clone();
     let plan =
         torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone())).unwrap();
-    assert!(plan.is_refusal(), "{plan:?}");
+    assert_eq!(
+        plan,
+        AdoptPlan::Refuse {
+            reason: refusal::LAYOUT_NOT_IN_RESUME
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1581,6 +1618,7 @@ fn a_rescan_never_clears_a_profile_assignment() {
 // adoption planning
 // ---------------------------------------------------------------------------
 
+use torrentd_pool::adopt::refusal;
 use torrentd_pool::adopt::AdoptPlan;
 
 /// Write a `.fastresume` next to a `.torrent`, as another client would.
@@ -1792,12 +1830,13 @@ fn partial_overlap_and_missing_are_all_refused() {
     let at = |ih: &str| {
         torrentd_pool::adopt::plan(&store, ih, |id| (id == root_id).then(|| r.clone())).unwrap()
     };
-    for ih in ["p1", "o1", "o2", "m1"] {
-        assert!(
-            at(ih).is_refusal(),
-            "{ih} must be refused, got {:?}",
-            at(ih)
-        );
+    for (ih, reason) in [
+        ("p1", refusal::PARTIAL),
+        ("o1", refusal::OVERLAP),
+        ("o2", refusal::OVERLAP),
+        ("m1", refusal::MISSING),
+    ] {
+        assert_eq!(at(ih), AdoptPlan::Refuse { reason }, "{ih}");
     }
 }
 
@@ -1833,7 +1872,203 @@ fn a_stale_fastresume_does_not_vouch_for_changed_payload() {
     let r = root.clone();
     let plan =
         torrentd_pool::adopt::plan(&store, "fd", |id| (id == root_id).then(|| r.clone())).unwrap();
-    assert!(plan.is_refusal(), "got {plan:?}");
+    assert_eq!(
+        plan,
+        AdoptPlan::Refuse {
+            reason: refusal::MISSING
+        }
+    );
+}
+
+/// The sidecar says complete and the torrent is still `matched`, but one of
+/// its two files has since changed size in the index: a rescan saw it, and no
+/// match has run since. The file count agrees, so only the per-file size
+/// comparison stands between the stale sidecar and the fast path; it must
+/// send the torrent to verification instead.
+#[test]
+fn a_complete_fastresume_with_one_file_resized_since_the_match_is_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "T/a.bin", 4096);
+    write_file(&root, "T/b.bin", 512);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "fe",
+        "T",
+        &[("T/a.bin", 4096), ("T/b.bin", 512)],
+        Some(true),
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    let r = root.clone();
+    let plan = || {
+        torrentd_pool::adopt::plan(&store, "fe", |id| (id == root_id).then(|| r.clone())).unwrap()
+    };
+    assert_eq!(plan().kind(), "fast_path", "{:?}", plan());
+
+    // Same two files, one of them a different size, indexed without a match.
+    write_file(&root, "T/b.bin", 511);
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert_eq!(state_of(&store, "fe"), AdoptionState::Matched);
+    assert_eq!(store.torrent_files("fe").unwrap().len(), 2);
+
+    let r = root.clone();
+    assert_eq!(
+        torrentd_pool::adopt::plan(&store, "fe", |id| (id == root_id).then(|| r.clone())).unwrap(),
+        AdoptPlan::Verify {
+            torrent_path: lib.join("fe.torrent"),
+            save_path: root.clone(),
+            resume_path: Some(lib.join("fe.fastresume")),
+        },
+    );
+}
+
+#[path = "fixtures/bt_backup.rs"]
+mod bt_backup;
+
+/// Issue #430: a qBittorrent `BT_backup` of 500 generated pairs, every case
+/// the generator knows cycled through it, is indexed, matched and planned
+/// with no error and no panic, and each torrent lands where its case says:
+/// its base, its hints, its state and its plan.
+#[test]
+fn a_generated_bt_backup_of_500_pairs_plans_each_torrent_by_its_case() {
+    use bt_backup::Case;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("BT_backup");
+    let root = dir.path().join("root");
+    // The pool never hashes payload, so the piece hash is not read here.
+    let generated = bt_backup::generate(&backup, &root, 500, |_| [0; 20]);
+    let indexed: Vec<_> = generated
+        .iter()
+        .filter(|g| g.case != Case::OrphanSidecar)
+        .collect();
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let lib = torrentd_pool::scan_library(&mut store, &backup, &Default::default()).unwrap();
+    assert_eq!(lib.torrents_indexed, indexed.len() as u64);
+    assert_eq!(lib.errors, 0, "{:?}", lib.errors_by_kind);
+    let scan = torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert_eq!(scan.errors, 0, "{:?}", scan.errors_by_kind);
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        (
+            stats.matched,
+            stats.partial,
+            stats.missing,
+            stats.overlap,
+            stats.shared,
+            stats.drifted
+        ),
+        (indexed.len() as u64, 0, 0, 0, 0, 0),
+    );
+    let root_id = store.root_id(&root).unwrap();
+    let root_path_of = |id| (id == root_id).then(|| root.clone());
+
+    for g in &generated {
+        let ih = g.infohash.as_str();
+        let Some(t) = store.torrent(ih).unwrap() else {
+            assert_eq!(g.case, Case::OrphanSidecar, "{g:?} was not indexed");
+            continue;
+        };
+        assert_ne!(g.case, Case::OrphanSidecar, "an orphan sidecar was indexed");
+        assert_eq!(t.name, g.name);
+        assert_eq!(state_of(&store, ih), AdoptionState::Matched, "{g:?}");
+        assert_eq!(
+            store.adoption_base(ih).unwrap(),
+            Some((root_id, g.base_rel.clone())),
+            "{g:?}"
+        );
+        let fastresume = backup.join(format!("{ih}.fastresume"));
+        assert_eq!(t.fastresume_path.as_ref(), Some(&fastresume), "{g:?}");
+        // The hints survive where the sidecar parses and its save path is
+        // UTF-8; otherwise they are absent, never wrong.
+        let (save_hint, category) = match g.case {
+            Case::TruncatedSidecar => (None, None),
+            Case::NonUtf8SavePath => (None, Some("imported".to_owned())),
+            _ => (
+                Some(root.join(&g.base_rel).to_string_lossy().into_owned()),
+                Some("imported".to_owned()),
+            ),
+        };
+        assert_eq!(t.declared_save_path, save_hint, "{g:?}");
+        assert_eq!(t.category, category, "{g:?}");
+        let on_disk: Vec<String> = store
+            .torrent_files(ih)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.rel_path)
+            .collect();
+        assert_eq!(on_disk, g.file_paths, "{g:?}");
+
+        let save_path = root.join(&g.base_rel);
+        let torrent_path = backup.join(format!("{ih}.torrent"));
+        let expected = match g.case {
+            Case::Complete | Case::NonUtf8SavePath | Case::Renamed => AdoptPlan::FastPath {
+                resume_path: fastresume,
+                torrent_path,
+                save_path,
+                files_renamed: g.case == Case::Renamed,
+            },
+            Case::Incomplete | Case::TruncatedSidecar => AdoptPlan::Verify {
+                torrent_path,
+                save_path,
+                resume_path: Some(fastresume),
+            },
+            Case::NoSubfolder => AdoptPlan::Refuse {
+                reason: refusal::LAYOUT_NOT_IN_RESUME,
+            },
+            Case::OrphanSidecar => unreachable!(),
+        };
+        assert_eq!(
+            torrentd_pool::adopt::plan(&store, ih, root_path_of).unwrap(),
+            expected,
+            "{g:?}"
+        );
+    }
+
+    // The bulk view an operator previews before adopting the whole root
+    // agrees, case for case.
+    let of = |cases: &[Case]| -> std::collections::BTreeSet<String> {
+        indexed
+            .iter()
+            .filter(|g| cases.contains(&g.case))
+            .map(|g| g.infohash.clone())
+            .collect()
+    };
+    let preview = torrentd_pool::adopt::preview(&store, root_id, "", root_path_of).unwrap();
+    assert_eq!(
+        preview
+            .fast_path
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        of(&[Case::Complete, Case::Renamed, Case::NonUtf8SavePath]),
+    );
+    assert_eq!(
+        preview
+            .verify
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        of(&[Case::Incomplete, Case::TruncatedSidecar]),
+    );
+    assert_eq!(
+        preview
+            .refused
+            .iter()
+            .map(|(ih, _)| ih.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        of(&[Case::NoSubfolder]),
+    );
+    assert!(preview
+        .refused
+        .iter()
+        .all(|(_, reason)| *reason == refusal::LAYOUT_NOT_IN_RESUME));
 }
 
 #[test]
