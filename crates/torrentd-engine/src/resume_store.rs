@@ -22,6 +22,7 @@ use libtorrent_safe::InfoHash;
 use libtorrent_safe::ResumeData;
 use thiserror::Error;
 use tracing::debug;
+use tracing::info;
 use tracing::warn;
 
 use crate::batch_writer::remove_if_present;
@@ -261,10 +262,44 @@ impl PartitionedDir {
             .join(format!("{}{}", ih.to_hex(), self.suffix))
     }
 
+    /// Every file in `profile`'s directory, after removing the temp files an
+    /// interrupted write left there (see [`PartitionedDir::remove_stale_temps`]).
+    /// The boot's scan, run before anything writes.
     pub(crate) fn scan(&self, profile: &ProfileId) -> std::io::Result<Scan<Vec<u8>>> {
         // Whatever is still queued lands first, so the scan reads the newest.
         self.flush();
+        self.remove_stale_temps(profile)?;
         scan_dir(&self.dir_for(profile), self.suffix, profile, self.what)
+    }
+
+    /// Remove the `<infohash><suffix>.tmp` and `.now.tmp` files a write
+    /// killed between its temp file and its rename leaves in `profile`'s
+    /// directory. Nothing reads them, but nothing else removes them either
+    /// until that torrent is written again, which a removed or never-saved
+    /// torrent never is. Held between this store's batches, so none of its
+    /// own temp files is removed mid-batch.
+    pub(crate) fn remove_stale_temps(&self, profile: &ProfileId) -> std::io::Result<()> {
+        let dir = self.dir_for(profile);
+        let remove = || {
+            crate::batch_writer::remove_stale_temps(&dir, self.suffix, |stem| {
+                canonical_infohash(stem).is_some()
+            })
+        };
+        let removed = match &self.writer {
+            Some(w) => w.between_batches(remove),
+            None => remove(),
+        }?;
+        if removed > 0 {
+            info!(
+                target: "torrentd_engine::store",
+                profile_id = %profile,
+                dir = %dir.display(),
+                removed,
+                "removed {what} temp files left by interrupted writes",
+                what = self.what,
+            );
+        }
+        Ok(())
     }
 
     /// The info-hash of every file in `profile`'s directory, by name alone:
@@ -417,6 +452,8 @@ impl FsResumeStore {
 
 impl ResumeStore for FsResumeStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
+        // A tombstone is written through a temp file too.
+        self.tombstones.remove_stale_temps(profile)?;
         let raw = self.resume.scan(profile)?;
         Ok(Scan {
             entries: raw
@@ -650,9 +687,10 @@ mod tests {
 
     /// A crash between a write's temp file and its rename leaves
     /// `<infohash>.resume.tmp` (a batch's) or `<infohash>.resume.now.tmp`
-    /// (`write`'s) beside the resume files. The next boot's scan must neither
-    /// load one as a torrent nor count it unreadable, and the next write for
-    /// that torrent must replace it.
+    /// (`write`'s) beside the resume files, and `<infohash>.removed.tmp` for
+    /// a tombstone. The next boot's scan must neither load one as a torrent
+    /// nor count it unreadable, and removes them: a torrent never written
+    /// again would otherwise keep its temp file forever.
     #[test]
     fn a_leftover_tmp_file_is_neither_scanned_nor_fatal() {
         let dir = tempdir().unwrap();
@@ -666,9 +704,19 @@ mod tests {
         std::fs::write(&batch_tmp, b"torn half of a resume file").unwrap();
         std::fs::write(&now_tmp, b"torn").unwrap();
 
+        let tomb_tmp = profile_dir.join(format!("{}.removed.tmp", batched.to_hex()));
+        std::fs::write(&tomb_tmp, b"").unwrap();
+        // Not a name the store writes: left alone.
+        let foreign = profile_dir.join("notes.resume.tmp");
+        std::fs::write(&foreign, b"mine").unwrap();
+
         let scan = store.scan(&p).unwrap();
         assert!(scan.entries.is_empty(), "a temp file was loaded");
         assert_eq!(scan.unreadable, 0, "a temp file was counted unreadable");
+        for tmp in [&batch_tmp, &now_tmp, &tomb_tmp] {
+            assert!(!tmp.exists(), "the boot scan left {}", tmp.display());
+        }
+        assert!(foreign.exists(), "the scan removed a file it did not write");
         assert!(store.tombstones(&p).unwrap().is_empty());
         assert!(!store.exists(&p, &batched).unwrap());
 

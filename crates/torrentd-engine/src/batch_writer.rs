@@ -263,6 +263,63 @@ impl BatchWriter {
     pub fn pending_len(&self) -> usize {
         self.shared.pending.lock().by_path.len()
     }
+
+    /// Run `f` with no batch in progress and none starting until it returns.
+    pub(crate) fn between_batches<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _io = self.shared.io.lock();
+        f()
+    }
+}
+
+/// Remove every temp file a write to `<infohash><suffix>` in `dir` leaves
+/// behind when the process dies between writing it and renaming it:
+/// `<infohash><suffix>.tmp` (a batch's or [`write_atomic`]'s) and
+/// `<infohash><suffix>.now.tmp` ([`BatchWriter::write_now`]'s). Returns how
+/// many it removed. A missing directory holds none.
+///
+/// Only names whose info-hash `is_name` accepts are touched, so nothing the
+/// stores did not write is removed. Meant for boot, before anything writes:
+/// a temp file a write is still filling would be removed from under it, and
+/// that write would then fail. A file that cannot be removed is logged and
+/// skipped; it is never read, and the next write for its torrent replaces
+/// it.
+pub(crate) fn remove_stale_temps(
+    dir: &Path,
+    suffix: &str,
+    is_name: impl Fn(&str) -> bool,
+) -> io::Result<usize> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(target) = name
+            .strip_suffix(".now.tmp")
+            .or_else(|| name.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if !target.strip_suffix(suffix).is_some_and(&is_name) {
+            continue;
+        }
+        let path = dir.join(name);
+        match remove_if_present(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(
+                target: "torrentd_engine::batch_writer",
+                file = %path.display(),
+                error.cause = %e,
+                "could not remove a temp file left by an interrupted write",
+            ),
+        }
+    }
+    Ok(removed)
 }
 
 impl Drop for BatchWriter {

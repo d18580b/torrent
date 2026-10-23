@@ -156,6 +156,8 @@ const SAVE_PATH_SUFFIX: &str = ".save_path";
 
 impl TorrentStore for FsTorrentStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
+        // A save-path sidecar is written through a temp file too.
+        self.save_paths.remove_stale_temps(profile)?;
         Ok(self.torrents.scan(profile)?)
     }
 
@@ -434,6 +436,39 @@ mod tests {
         let scan = store.scan(&profile).unwrap();
         assert_eq!(scan.unreadable, 1);
         assert_eq!(scan.entries, vec![(good, b"t".to_vec())]);
+    }
+
+    /// A write killed between its temp file and its rename leaves the temp
+    /// file behind, and a torrent never written again keeps it forever. The
+    /// boot scan removes the `.torrent`'s and the sidecar's.
+    #[test]
+    fn the_scan_removes_temp_files_left_by_interrupted_writes() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0x5bu8; 20]);
+        let torrent = store.path_for(&profile, &ih);
+        std::fs::create_dir_all(torrent.parent().unwrap()).unwrap();
+        let sidecar = store.save_path_path_for(&profile, &ih);
+        let leftovers: Vec<PathBuf> = [".tmp", ".now.tmp"]
+            .iter()
+            .flat_map(|ext| {
+                [&torrent, &sidecar].map(|p| {
+                    let mut s = p.as_os_str().to_owned();
+                    s.push(ext);
+                    PathBuf::from(s)
+                })
+            })
+            .collect();
+        for tmp in &leftovers {
+            std::fs::write(tmp, b"torn").unwrap();
+        }
+        let scan = store.scan(&profile).unwrap();
+        assert!(scan.entries.is_empty());
+        assert_eq!(scan.unreadable, 0);
+        for tmp in &leftovers {
+            assert!(!tmp.exists(), "the boot scan left {}", tmp.display());
+        }
     }
 
     /// `delete` removes the lower-case name only, so an upper-case `.torrent`
