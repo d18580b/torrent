@@ -2240,6 +2240,10 @@ impl PoolStore {
     /// under there — another torrent's files, or unclaimed bytes — would be
     /// dragged along by the rename without appearing anywhere in the plan.
     ///
+    /// An empty file at the path of one of this torrent's declared empty
+    /// files is its own: the matcher claims no file without bytes, so it has
+    /// no claim row, yet it is part of the payload the rename carries.
+    ///
     /// Returns at most `limit` paths; the caller only needs enough to name one
     /// in the refusal.
     pub fn foreign_files_under(
@@ -2263,6 +2267,11 @@ impl PoolStore {
                  WHERE c.root_id = f.root_id AND c.rel_path = f.rel_path
                    AND c.infohash = ?4
                )
+               AND NOT (f.size = 0 AND EXISTS (
+                 SELECT 1 FROM torrent_file t
+                 WHERE t.infohash = ?4 AND t.size = 0 AND t.pad_file = 0
+                   AND ?2 || t.rel_path = f.rel_path
+               ))
              ORDER BY f.rel_path
              LIMIT ?5",
         )?;

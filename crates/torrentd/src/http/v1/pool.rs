@@ -1984,9 +1984,12 @@ fn create_plan_blocking(
         detail: internal("creating a plan", e),
     };
 
+    // The index checks under the store; the disk checks, a relocate's walk of
+    // its whole source directory among them, once it is released.
     let built = pool
-        .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
-        .map_err(|e| fail(&e))?;
+        .with_store(|st| torrentd_pool::plan::prepare(st, &spec, |id| pool.root_path_of(id)))
+        .map_err(|e| fail(&e))?
+        .and_then(torrentd_pool::plan::Prepared::finish);
     let steps = match built {
         Ok(steps) => steps,
         // A refusal is the expected outcome for overlap, drift, or an occupied

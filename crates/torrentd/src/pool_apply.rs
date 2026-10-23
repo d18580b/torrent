@@ -2095,16 +2095,16 @@ fn recheck_relocatable(pool: &PoolService, infohash: &str, src: &Path) -> Result
                 foreign.join(", "),
             ));
         }
-        let claimed = torrentd_pool::plan::claimed_under(store, infohash, root_id)
+        let listed = torrentd_pool::plan::listed_under(store, infohash, root_id, &base)
             .map_err(|e| e.to_string())?;
-        Ok((base, claimed))
+        Ok((base, listed))
     })
-    .and_then(|(base, claimed)| {
+    .and_then(|(base, listed)| {
         // The disk, asked again: anything that landed under the source since
         // the plan was built would travel with the rename unseen. `src` is
         // this base under its root, as `torrent_at` resolved it. Walked
         // outside the store, which a large directory would otherwise hold.
-        match torrentd_pool::plan::unlisted_entry(src, &base, &claimed) {
+        match torrentd_pool::plan::unlisted_entry(src, &base, &listed) {
             Some(entry) => Err(format!(
                 "{} now holds {entry}; moving it would take that too",
                 src.display(),

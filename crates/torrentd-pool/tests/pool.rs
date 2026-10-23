@@ -2706,6 +2706,42 @@ fn relocating_a_base_holding_unclaimed_files_is_refused() {
 }
 
 #[test]
+fn relocating_a_torrent_with_its_own_empty_file_on_disk_is_planned() {
+    // The matcher claims no file without bytes, so the torrent's own empty
+    // file has no claim row; it is still the torrent's, in the index check
+    // and in the walk of the disk alike.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "src/T/a.bin", 128);
+    write_file(root, "src/T/empty.txt", 0);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "e1",
+        "T",
+        None,
+        &[("T/a.bin", 128), ("T/empty.txt", 0)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    let spec = PlanSpec::Relocate {
+        infohash: "e1".into(),
+        dest_root_id: root_id,
+        dest_rel: "dest".into(),
+    };
+
+    let steps = build_plan(&store, &spec, root_id, root).unwrap();
+    assert_eq!(steps.len(), 1);
+
+    // Bytes at that path are not the empty file the torrent declares.
+    write_file(root, "src/T/empty.txt", 5);
+    let e = build_plan(&store, &spec, root_id, root).unwrap_err();
+    assert!(e.contains("empty.txt"), "got {e}");
+}
+
+#[test]
 fn delete_orphans_targets_only_unclaimed_files() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

@@ -67,12 +67,33 @@ pub struct Refused(pub String);
 
 pub type BuildResult = Result<Vec<PlanStep>, Refused>;
 
-/// Compute the steps for `spec` without touching anything.
+/// Compute the steps for `spec` without touching anything: [`prepare`] and
+/// then [`Prepared::finish`], both against `store`.
+///
+/// This runs the disk walk with `store` borrowed. A caller that borrows it
+/// under the pool's writer lock calls the two halves itself, finishing once
+/// the lock is released.
 pub fn build(
     store: &PoolStore,
     spec: &PlanSpec,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
 ) -> Result<BuildResult, PoolError> {
+    Ok(prepare(store, spec, root_path_of)?.and_then(Prepared::finish))
+}
+
+/// Every check [`build`] makes of the index, with the steps they admit and
+/// the disk checks still to run.
+///
+/// The index is read here; [`Prepared::finish`] reads only the disk, so it
+/// runs without the store. A relocate's walk of its source directory is the
+/// one disk check whose cost grows with the directory, and holding the
+/// writer lock across it would stall every scan and every other plan for as
+/// long as it takes.
+pub fn prepare(
+    store: &PoolStore,
+    spec: &PlanSpec,
+    root_path_of: impl Fn(i64) -> Option<PathBuf>,
+) -> Result<Result<Prepared, Refused>, PoolError> {
     Ok(match spec {
         PlanSpec::Relocate {
             infohash,
@@ -81,8 +102,36 @@ pub fn build(
         } => build_relocate(store, infohash, *dest_root_id, dest_rel, root_path_of)?,
         PlanSpec::DeleteOrphans { root_id, prefix } => {
             build_delete_orphans(store, *root_id, prefix, root_path_of)?
+                .map(|steps| Prepared { steps, walk: None })
         }
     })
+}
+
+/// A plan whose index checks passed, from [`prepare`].
+#[derive(Debug)]
+pub struct Prepared {
+    steps: Vec<PlanStep>,
+    /// A relocate's source directory, its root-relative path, and what the
+    /// index lists there as this torrent's, as of [`prepare`].
+    walk: Option<(PathBuf, String, Listed)>,
+}
+
+impl Prepared {
+    /// Run the disk checks [`prepare`] left, needing no store, and return
+    /// the plan's steps or the refusal.
+    pub fn finish(self) -> BuildResult {
+        // The index is a snapshot and the move is of the directory itself,
+        // so the index checks see only what the last scan listed. The disk
+        // is asked too.
+        if let Some((src_dir, src_base, listed)) = &self.walk {
+            if let Some(entry) = unlisted_entry(src_dir, src_base, listed) {
+                return Err(Refused(format!(
+                    "{src_base} holds {entry}; moving the directory would take it too"
+                )));
+            }
+        }
+        Ok(self.steps)
+    }
 }
 
 fn build_relocate(
@@ -91,7 +140,7 @@ fn build_relocate(
     dest_root_id: i64,
     dest_rel: &str,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
-) -> Result<BuildResult, PoolError> {
+) -> Result<Result<Prepared, Refused>, PoolError> {
     let Some(torrent) = store.torrent(infohash)? else {
         return Ok(Err(Refused("torrent is not in the library".into())));
     };
@@ -187,18 +236,6 @@ fn build_relocate(
         return Ok(Err(Refused("destination is the current location".into())));
     }
 
-    // The index is a snapshot and the move is of the directory itself, so the
-    // check above sees only what the last scan listed. The disk is asked too.
-    if let Some(entry) = unlisted_entry(
-        &src_dir,
-        &src_base,
-        &claimed_under(store, infohash, src_root_id)?,
-    ) {
-        return Ok(Err(Refused(format!(
-            "{src_base} holds {entry}; moving the directory would take it too"
-        ))));
-    }
-
     if let Some(rel) = existing_destination_file(store, infohash, &dest_dir)? {
         return Ok(Err(Refused(format!("destination already contains {rel}"))));
     }
@@ -208,11 +245,15 @@ fn build_relocate(
     // back is how a seeding torrent starts serving from a path that no longer
     // exists.
     let _ = torrent;
-    Ok(Ok(vec![PlanStep {
-        op: ops::MOVE_TORRENT.to_string(),
-        src: src_dir.to_string_lossy().into_owned(),
-        dst: Some(dest_dir.to_string_lossy().into_owned()),
-    }]))
+    let listed = listed_under(store, infohash, src_root_id, &src_base)?;
+    Ok(Ok(Prepared {
+        steps: vec![PlanStep {
+            op: ops::MOVE_TORRENT.to_string(),
+            src: src_dir.to_string_lossy().into_owned(),
+            dst: Some(dest_dir.to_string_lossy().into_owned()),
+        }],
+        walk: Some((src_dir, src_base, listed)),
+    }))
 }
 
 /// The first of `infohash`'s files that already has an entry under
@@ -549,32 +590,54 @@ fn prefixes_overlap(prefix: &str, area: &str) -> bool {
         || p.starts_with(&format!("{a}/"))
 }
 
-/// The root-relative paths `infohash` claims under root `root_id`.
-pub fn claimed_under(
+/// The root-relative paths a torrent's payload occupies under one root, as
+/// [`listed_under`] reads them from the index.
+#[derive(Clone, Debug, Default)]
+pub struct Listed {
+    /// The paths the torrent claims.
+    pub claimed: HashSet<String>,
+    /// The paths of the torrent's declared empty files under its base. The
+    /// matcher claims no file without bytes, so these are the torrent's own
+    /// as long as they are still empty.
+    pub empty: HashSet<String>,
+}
+
+/// What `infohash` occupies under root `root_id`, whose payload is based at
+/// the root-relative `base`.
+pub fn listed_under(
     store: &PoolStore,
     infohash: &str,
     root_id: i64,
-) -> Result<HashSet<String>, PoolError> {
-    Ok(store
+    base: &str,
+) -> Result<Listed, PoolError> {
+    let claimed = store
         .claims_of(infohash)?
         .into_iter()
         .filter(|(r, _)| *r == root_id)
         .map(|(_, rel)| rel)
-        .collect())
+        .collect();
+    let empty = store
+        .torrent_files(infohash)?
+        .into_iter()
+        .filter(|f| f.size == 0 && !f.pad_file)
+        .map(|f| join_rel(base, &f.rel_path))
+        .collect();
+    Ok(Listed { claimed, empty })
 }
 
 /// The first entry under `dir` (whose root-relative path is `base`) that a
 /// relocate would carry without the plan showing it, described for a refusal;
-/// `None` when every entry is a directory or one of `claimed`.
+/// `None` when every entry is a directory or one of `listed`'s.
 ///
 /// A relocate renames the whole directory, and the index lists only what the
 /// last scan saw. So the directory is walked with `symlink_metadata` and
-/// every entry has to be accounted for: a regular file in `claimed`, or a
-/// directory whose own entries are. A symlink, a name that is not UTF-8, a
-/// FIFO, socket or device, a file the scan never saw or this torrent does
-/// not claim, and a directory that cannot be listed all refuse, since none
-/// of them can be shown to belong to the payload being moved.
-pub fn unlisted_entry(dir: &Path, base: &str, claimed: &HashSet<String>) -> Option<String> {
+/// every entry has to be accounted for: a regular file in `listed.claimed`,
+/// an empty regular file in `listed.empty`, or a directory whose own entries
+/// are. A symlink, a name that is not UTF-8, a FIFO, socket or device, a file
+/// the scan never saw or this torrent does not claim, and a directory that
+/// cannot be listed all refuse, since none of them can be shown to belong to
+/// the payload being moved.
+pub fn unlisted_entry(dir: &Path, base: &str, listed: &Listed) -> Option<String> {
     match std::fs::symlink_metadata(dir) {
         Ok(md) if md.file_type().is_dir() => {}
         Ok(_) => {
@@ -603,17 +666,20 @@ pub fn unlisted_entry(dir: &Path, base: &str, claimed: &HashSet<String>) -> Opti
                 return Some(format!("{}, whose name is not UTF-8", child.display()));
             };
             let child_rel = join_rel(&rel, &name);
-            let kind = match std::fs::symlink_metadata(&child) {
-                Ok(md) => md.file_type(),
+            let md = match std::fs::symlink_metadata(&child) {
+                Ok(md) => md,
                 Err(e) => return Some(format!("{child_rel}, which cannot be examined ({e})")),
             };
+            let kind = md.file_type();
             if kind.is_dir() {
                 pending.push((child, child_rel));
             } else if kind.is_symlink() {
                 return Some(format!("{child_rel}, a symlink"));
             } else if !kind.is_file() {
                 return Some(format!("{child_rel}, which is not a regular file"));
-            } else if !claimed.contains(&child_rel) {
+            } else if !listed.claimed.contains(&child_rel)
+                && !(md.len() == 0 && listed.empty.contains(&child_rel))
+            {
                 return Some(format!(
                     "{child_rel}, which the index does not list as this torrent's"
                 ));
