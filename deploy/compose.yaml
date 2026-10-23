@@ -99,19 +99,8 @@ services:
       # files inside it and delete_files moves them to <root>/.torrentd-trash.
       # Mounted :ro, each of those fails with EROFS. deploy/torrentd.service grants the same path
       # in ReadWritePaths.
-      #
-      # The bind mount hides the image's own /data/torrents, which the
-      # Containerfile chowns to 1000:1000, so the host directory has to be
-      # writable by uid 1000 — the image's USER — or every add and plan step
-      # fails with EACCES. Docker creates a missing source as root:root
-      # 0755, and docs/running.md §4c creates it for the `torrentd` system
-      # user, a different uid. Before the first `up`, on the host:
-      #   sudo install -d -o 1000 -g 1000 -m0755 /data/torrents
-      # Rootless podman instead: create it owned by your own uid, since
-      # `podman unshare chown` fails with EPERM on a directory you do not
-      # own, then hand it to the container's uid 1000:
-      #   sudo install -d -o "$USER" -g "$USER" -m0755 /data/torrents
-      #   podman unshare chown 1000:1000 /data/torrents
+      # The host directory must be writable by uid 1000 before the first `up`;
+      # docs/running.md §4 gives the commands, rootless podman included.
       - /data/torrents:/data/torrents
 
   # torrentd does not terminate TLS, by design: an HTTP server's TLS
@@ -125,12 +114,8 @@ services:
   # names, so the address is pinned here instead: 172.28.0.2, which is what
   # the sample config lists as a single /32. Widening it to the whole subnet
   # would make every sibling container on the host a trusted proxy, and a
-  # trusted proxy can claim to be any client.
-  #
-  # Get it wrong and the daemon ignores the headers, which is the safe
-  # direction rather than a broken one: it falls back to the socket peer,
-  # which on this network is this proxy, so the login throttle behaves as one
-  # shared bucket and the login log lines name the proxy, not the client.
+  # trusted proxy can claim to be any client. What getting it wrong costs is in
+  # docs/running.md §6a.
   proxy:
     image: caddy:2-alpine
     restart: unless-stopped

@@ -372,14 +372,10 @@ declaration is what the daemon checks.
 ## Reverse proxy
 
 torrentd does not terminate TLS and will not; `deploy/Caddyfile` and
-`deploy/compose.yaml` are a working pair that does. `X-Forwarded-For`,
-`X-Forwarded-Proto` and RFC 7239 `Forwarded` — all three, which is what your
-proxy has to strip or overwrite — are read **only** from peers listed in
-`trusted_proxies`, empty by default, meaning no forwarding header is read at
-all and the socket's peer address is the client. They feed two things: a
-per-client throttle on `POST /v1/sessions` instead of one shared bucket, and
-the `client_ip` field on the login log lines — the record of who tried, which
-is the consumer this support exists to create.
+`deploy/compose.yaml` are a working pair that does. Forwarding headers are
+read only from peers listed in `trusted_proxies`, empty by default; which
+headers, what they feed, and what your proxy must strip are
+[docs/running.md §6a](docs/running.md#6a-reverse-proxy).
 
 ## Metrics
 
