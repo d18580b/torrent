@@ -104,10 +104,9 @@ mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
 
 ### Submodules
 
-Vendored C/C++ dependencies live under `vendor/` as git submodules:
-
-- `vendor/libtorrent` — pinned to `v2.0.14` (arvidn/libtorrent)
-- `vendor/boost` — pinned to `boost-1.83.0` (boostorg/boost super-repo)
+Vendored C/C++ dependencies live under `vendor/` as git submodules, `vendor/libtorrent`
+(arvidn/libtorrent) and `vendor/boost` (the boostorg/boost super-repo), declared in
+[`.gitmodules`](./.gitmodules); `git submodule status` prints the commit each is pinned to.
 
 After cloning the repo:
 

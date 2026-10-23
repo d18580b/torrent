@@ -58,10 +58,13 @@ detail lives there, so this file does not have to be kept in step with a
 behaviour it only points at.
 
 - **Authentication** — described in
-  [`README.md` § *Authentication*](README.md#authentication) and in
-  [`docs/running.md`](docs/running.md), § *6*, on authentication.
-  Anything that bypasses authentication once it *is* configured — session
-  handling, scope enforcement, token or password verification — is in scope.
+  [`README.md` § *Authentication*](README.md#authentication),
+  [`docs/running.md`](docs/running.md), § *6*, and
+  [`docs/api/README.md`](docs/api/README.md). Anything that bypasses
+  authentication once it *is* configured, or lets a request reach an
+  operation without the scope it declares — session and token handling, the
+  password exchange and its throttle, a static token reaching beyond its
+  scopes, a tracker passkey leaking through a response — is in scope.
 
 - **The network kill switch** — described in
   [`README.md`](README.md), § *Security posture*, and in
@@ -94,37 +97,15 @@ behaviour it only points at.
   `.torrent`, alert or metadata payload into a crash, an out-of-bounds access,
   a use-after-free or a type confusion across that boundary is in scope.
 
-- **The HTTP API's authentication** — described in
-  [`README.md` § *Authentication*](README.md#authentication) and
-  [`docs/api/README.md`](docs/api/README.md). Anything that lets a request
-  reach an operation without the scope it declares — token or session-token
-  handling, the password exchange and its throttle, a static token reaching
-  beyond its scopes, a tracker passkey leaking through a response — is in
-  scope.
-
 ## Out of scope
 
-- **Vulnerabilities in vendored dependencies.** `vendor/libtorrent`
-  (`v2.0.14`) and `vendor/boost` (`boost-1.83.0`) are pinned here, not
+- **Vulnerabilities in vendored dependencies.** `vendor/libtorrent` and
+  `vendor/boost` are pinned here (see [`.gitmodules`](.gitmodules)), not
   maintained here. Report a libtorrent vulnerability to
   [arvidn/libtorrent](https://github.com/arvidn/libtorrent/security), which
   publishes a security policy and takes private reports. A Boost
-  vulnerability belongs with the Boost project, against the pinned
-  `boost-1.83.0` — **no link is given for it, deliberately.** No Boost
-  destination could be shown to carry a reporting route: `boostorg/boost`
-  publishes no security policy, there is no organisation-level fallback, and
-  private vulnerability reporting is switched off, so every candidate page
-  either answers with a statement that the project has no security policy or
-  is a generic page served for an unrecognised path. A link to one of those
-  is worse than no link, because it looks like a destination.
+  vulnerability belongs with the Boost project, against the pinned version;
+  no link is given because `boostorg/boost` publishes no reporting route.
   A report that *this* repository pins a version with a known upstream
   advisory is welcome — that is a pin to move, and it belongs in a normal
   issue.
-
-**What a link in this file has to do.** An outbound link is held to the thing
-the sentence sends you for, not to whether it answers. A link offered as a
-route to report something has to be shown to carry a route; a link offered as
-documentation has to be shown to carry the documentation. The test is the
-target's content, not its status code — a page can answer `200` and say
-nothing but that there is no policy there. That is the standard for editing
-this file, and it is why the Boost pointer above is prose.
