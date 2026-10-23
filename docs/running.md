@@ -1816,6 +1816,13 @@ On a scratch pool, not your real one.
    An `ip` killed by a signal, such as the OOM killer, counts as one that
    could not run. Setting a fenced profile online on such a poll keeps
    the fence: lifting it needs the bound address seen on the interface.
+   One such poll fences nothing, but three in a row on which the address,
+   route or handshake probe could not run — or whose probes did not return
+   within 20 s — fence the profile with reason `probe_unavailable`, since it
+   is then seeding with no check in force. Three kill-switch checks in a row
+   that `nft` cannot answer fence every vpn profile the same way, until a
+   check finds the table in force again. Each profile is probed at once with
+   the others, so one hung `ip` delays no other profile's verdict.
 
    **Then take its route away and leave the tunnel up.** Each poll also asks
    the kernel where a packet from the tunnel address would go

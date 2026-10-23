@@ -10,7 +10,11 @@
 //! immediately pauses every torrent in that profile, marks the profile
 //! `VpnDown`, and emits metrics — but does **not** restart the session (the
 //! spec Safety Rule: automatic restart risks a window where traffic routes over
-//! the bare interface; the operator must intervene).
+//! the bare interface; the operator must intervene). A probe that cannot run
+//! is no verdict on the tunnel, but [`PROBE_FAILURES_TO_FENCE`] polls in a row
+//! on which one could not fence the profile the same way
+//! ([`DownReason::ProbeUnavailable`]). Every profile is probed at once, each
+//! bounded by [`PROBE_TIMEOUT`].
 //!
 //! [`evaluate`] is the whole judgement and it is shared: `torrentd vpn check`
 //! reports the verdict this monitor would reach on the same observations.
