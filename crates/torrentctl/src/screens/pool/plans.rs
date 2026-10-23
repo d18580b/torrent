@@ -423,6 +423,12 @@ fn show(detail: &mut Detail, mut plan: types::Plan, ctx: &Ctx<'_>) -> Vec<Effect
     let next = plan.steps_next_cursor.clone();
     detail.plan = Some(plan);
     let loaded = detail.steps.items.len();
+    if loaded > inline.len() && detail.steps.loading {
+        // Steps are already being read: restarting would bump the
+        // generation and drop them, and a plan refreshed faster than its
+        // steps re-read would never finish.
+        return Vec::new();
+    }
     let request = detail.steps.reload();
     if loaded > inline.len() {
         return vec![fetch_steps(detail, ctx, request)];

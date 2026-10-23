@@ -1632,6 +1632,32 @@ fn the_step_table_pages_past_the_plans_inline_steps() {
 }
 
 #[test]
+fn a_plan_refreshed_while_its_steps_re_read_lets_the_re_read_finish() {
+    let mut state = with_detail(big_plan());
+    assert_eq!(press(&mut state, KeyCode::Char('G'), true), 1);
+    steps_answer(&mut state, false, steps_page(101, 250, None));
+    assert_eq!(state.plans.detail.as_ref().unwrap().steps.items.len(), 250);
+    let loaded = || {
+        Msg::Plans(plans::Msg::DetailLoaded {
+            id: 8,
+            result: Ok(big_plan()),
+        })
+    };
+    assert_eq!(send(&mut state, loaded(), true), 1, "the steps, re-read");
+    let (_, generation) = steps_tag(&state);
+    assert_eq!(
+        send(&mut state, loaded(), true),
+        0,
+        "the next refresh leaves the re-read in flight alone"
+    );
+    assert_eq!(steps_tag(&state).1, generation, "its answer is still taken");
+    assert_eq!(steps_answer(&mut state, true, steps_page(1, 250, None)), 0);
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 250);
+    assert!(!detail.steps.loading);
+}
+
+#[test]
 fn a_drafted_plan_is_counted_from_step_counts() {
     let mut state = with_plans();
     let server = testing::server(true, true);
