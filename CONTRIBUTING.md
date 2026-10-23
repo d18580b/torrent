@@ -163,12 +163,13 @@ Every test command is a mise task, and CI runs the same tasks:
 | `mise run test` | unit + in-memory; no libtorrent, no network |
 | `mise run test-fault-injection` | torrentd's unit tests again in the alert drill's `fault-injection` build, where `POST /v1/faults` and `FaultEngine` exist |
 | `mise run deny` | not a test: `cargo deny check` against `deny.toml` (advisories, licenses, bans, sources) |
+| `mise run release-features` | not a test: fails if the release build resolves `fault-injection` or `test-support` on for `torrentd` or `torrentd-engine`. Reads `cargo metadata`; builds nothing. |
 | `mise run test-shim` | Layer 2, the C ABI boundary. Needs the `vendor/libtorrent` submodule for its `.torrent` fixtures. |
 | `mise run test-lifecycle` | Layer 3, real libtorrent against real disk. No network. |
 | `mise run test-daemon` | Layer 3, spawns the built binary and drives it over HTTP |
 | `mise run test-torrentctl` | Layer 3, torrentctl's generated client against a spawned daemon (builds `torrentd` first) |
 | `mise run test-alerts` | `promtool` checks `deploy/prometheus`'s alert rules and runs their fixtures. Needs podman or docker. |
-| `mise run test-all` | every row above except `deny`, in order |
+| `mise run test-all` | every row above except `deny` and `release-features`, in order |
 | `mise run bench -- <subcommand>` | Layer 4, manual: minutes and GBs of RAM |
 
 Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
