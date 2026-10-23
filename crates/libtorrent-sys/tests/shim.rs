@@ -2518,6 +2518,12 @@ fn settings_with_trailing_bytes_are_refused() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// A JSON `\u` escape followed by `hex`, assembled at run time so the source
+/// holds no escape a tool or reader could decode in place.
+fn u_esc(hex: &str) -> String {
+    format!("{}u{hex}", '\\')
+}
+
 /// A settings string may spell characters as `\uXXXX`, including a surrogate
 /// pair, and they decode to their UTF-8 bytes. A lone surrogate, `\u0000`, a
 /// short escape and a non-hex digit are refused.
@@ -2525,7 +2531,24 @@ fn settings_with_trailing_bytes_are_refused() {
 fn a_settings_string_decodes_unicode_escapes() {
     // `127.0.0.1:0` with escapes: the session listens only if they decode to
     // exactly those bytes.
-    let json = r#"{"enable_dht":false,"enable_lsd":false,"enable_upnp":false,"enable_natpmp":false,"listen_interfaces":"127.0.0.1:0","user_agent":"café € 😀"}"#;
+    let listen = format!(
+        "{}{}{}.0.0.1{}0",
+        u_esc("0031"),
+        u_esc("0032"),
+        u_esc("0037"),
+        u_esc("003A")
+    );
+    // U+00E9, U+20AC, and U+1F600 as a surrogate pair.
+    let agent = format!(
+        "caf{} {} {}{}",
+        u_esc("00e9"),
+        u_esc("20ac"),
+        u_esc("d83d"),
+        u_esc("de00")
+    );
+    let json = format!(
+        r#"{{"enable_dht":false,"enable_lsd":false,"enable_upnp":false,"enable_natpmp":false,"listen_interfaces":"{listen}","user_agent":"{agent}"}}"#
+    );
     let settings = CString::new(json).unwrap();
     let mut err = [0 as c_char; 512];
     let s = unsafe { lt_session_create(settings.as_ptr(), err.as_mut_ptr(), 512) };
@@ -2542,16 +2565,17 @@ fn a_settings_string_decodes_unicode_escapes() {
     );
     unsafe { lt_session_destroy(s) };
 
-    for bad in [
-        r#"{"user_agent":"\ud83d"}"#,
-        r#"{"user_agent":"\ud83dx"}"#,
-        r#"{"user_agent":"\ud83dA"}"#,
-        r#"{"user_agent":"\ude00"}"#,
-        r#"{"user_agent":"a\u0000b"}"#,
-        r#"{"user_agent":"\u12"}"#,
-        r#"{"user_agent":"\u12g4"}"#,
+    for value in [
+        u_esc("d83d"),
+        format!("{}x", u_esc("d83d")),
+        format!("{}{}", u_esc("d83d"), u_esc("0041")),
+        u_esc("de00"),
+        format!("a{}b", u_esc("0000")),
+        u_esc("12"),
+        u_esc("12g4"),
     ] {
-        let settings = CString::new(bad).unwrap();
+        let bad = format!(r#"{{"user_agent":"{value}"}}"#);
+        let settings = CString::new(bad.as_str()).unwrap();
         let mut err = [0 as c_char; 512];
         let s = unsafe { lt_session_create(settings.as_ptr(), err.as_mut_ptr(), 512) };
         assert!(s.is_null(), "{bad} was accepted");
