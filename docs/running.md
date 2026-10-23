@@ -1506,10 +1506,11 @@ command changes nothing and needs no privilege at all, which is the form worth
 automating.
 
 **It reports the health monitor's own verdict.** The `route` line is the
-monitor's route probe (`ip route get 1.1.1.1 from <tunnel address>` must
-leave by the tunnel device; the monitor also asks
+monitor's route probe, asked the way the monitor asks it:
+`ip route get 1.1.1.1 from <tunnel address>`, then
 `ip route get 2606:4700:4700::1111 from <address>` from each global IPv6
-address on the device, which this command does not), and the `health` line is what the monitor's
+address on the device, must each leave by the tunnel device, and the line
+names the first that does not. The `health` line is what the monitor's
 judgement — the same function, on the address, route and handshake just
 observed — would decide about the profile. The `kill_switch_ruleset` line
 dry-runs the exact script boot hands to `nft -f`, rendered by the same
@@ -2040,10 +2041,12 @@ On a scratch pool, not your real one.
       is refused. `DNS` and `SaveConfig` are ignored with a warning. With
       `Table = off` the routing is yours: traffic *from* the tunnel address
       must still route by the tunnel, because the health monitor checks
-      exactly that every poll (`ip route get 1.1.1.1 from <address>`) and
-      fences the profile (`route_mismatch`) when it does not.
+      exactly that every poll (`ip route get 1.1.1.1 from <address>`, and
+      `ip route get 2606:4700:4700::1111 from <address>` from each global
+      IPv6 address) and fences the profile (`route_mismatch`) when it does
+      not.
 
-      The bring-up asks the same question once the link is up, and **refuses
+      The bring-up asks the same questions once the link is up, and **refuses
       a config whose answer would be fenced** rather than letting it come up
       and be fenced on the first poll: a `Table = off` link that nothing
       routes through the tunnel is taken down again — which is every link the
@@ -2051,15 +2054,14 @@ On a scratch pool, not your real one.
       can only be added once it exists, so raise a `Table = off` link with
       your own routing before the daemon starts and let the daemon adopt it —
       and a split `AllowedIPs`
-      that does not cover `1.1.1.1` (with an IPv4 `Address`) is refused before
-      anything is created, because only `AllowedIPs` are routed through the
-      tunnel and the probe's packet would leave by the main table. The
-      profile is reported failed with the reason. Use `AllowedIPs =
-      0.0.0.0/0` (plus `::/0` for IPv6). The monitor asks the same of each
-      global IPv6 address (toward `2606:4700:4700::1111`), so a config with
-      an IPv6 `Address` and no `::/0` comes up and is fenced as
-      `route_mismatch` on its first poll; drop the IPv6 `Address` or route
-      `::/0`. The `Table = off` case, a link
+      that does not cover `1.1.1.1` (with an IPv4 `Address`), or
+      `2606:4700:4700::1111` (with an IPv6 `Address` that is not
+      link-local, beside an IPv4 one), is refused before anything is
+      created, because only `AllowedIPs` are routed through the tunnel and
+      the probe's packet would leave by the main table. The profile is
+      reported failed with the reason. Use `AllowedIPs = 0.0.0.0/0, ::/0`,
+      or drop the IPv6 `Address` and use `AllowedIPs = 0.0.0.0/0`. The
+      `Table = off` case, a link
       whose installed routing is outranked by another rule, and one whose
       routing could not be installed at all are reported as a routing
       failure; `vpn check --bring-up` reports each as a tunnel that came up
