@@ -758,27 +758,34 @@ mod tests {
     /// `starts_with` alone cannot express that — it is lexical, so
     /// `/data/pool/../escape` satisfies it. The absence of a `ParentDir`
     /// component is what makes the prefix meaningful, so both are asserted.
+    /// Each input states whether it is accepted, so a resolver that refused
+    /// everything, or accepted a traversal, fails here rather than passing
+    /// vacuously.
     #[test]
     fn anything_accepted_is_inside_the_root() {
-        for input in [
-            "",
-            "shows/S01",
-            "/etc/cron.d",
-            "./here",
-            "..hidden",
-            "../escape",
-            "a/../../../b",
-            "/../../etc",
+        for (input, accepted) in [
+            ("", true),
+            ("shows/S01", true),
+            ("/etc/cron.d", true),
+            ("./here", true),
+            ("..hidden", true),
+            ("../escape", false),
+            ("a/../../../b", false),
+            ("/../../etc", false),
         ] {
-            if let Ok(p) = resolve_under(&root(), input) {
-                assert!(
-                    p.starts_with(root()),
-                    "{input:?} resolved to {p:?}, outside the root",
-                );
-                assert!(
-                    !p.components().any(|c| c == std::path::Component::ParentDir),
-                    "{input:?} resolved to {p:?}, which walks back out",
-                );
+            match resolve_under(&root(), input) {
+                Ok(p) => {
+                    assert!(accepted, "{input:?} was accepted as {p:?}");
+                    assert!(
+                        p.starts_with(root()),
+                        "{input:?} resolved to {p:?}, outside the root",
+                    );
+                    assert!(
+                        !p.components().any(|c| c == std::path::Component::ParentDir),
+                        "{input:?} resolved to {p:?}, which walks back out",
+                    );
+                }
+                Err(e) => assert!(!accepted, "{input:?} was refused: {e:?}"),
             }
         }
     }

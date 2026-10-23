@@ -4474,36 +4474,47 @@ fn a_failed_rematch_leaves_the_previous_claims_in_place() {
     // partway rolls back to the previous claims rather than leaving the pool
     // looking unprotected.
     //
-    // Driven through `match_all` itself rather than a hand-rolled
-    // transaction, so reverting `matcher.rs` to call `match_all_inner`
-    // directly fails this test.
+    // The failure is injected inside `match_all_inner`, after the clear and
+    // one torrent's rebuilt claims, with no transaction of the test's own
+    // around the call: only `match_all`'s transaction can put the claims
+    // back. A trigger on a second connection to the same file makes the
+    // second torrent's claim insert fail.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(root, "T/a.bin", 128);
+    write_file(root, "U/b.bin", 128);
+    let db_dir = tempfile::tempdir().unwrap();
+    let db = db_dir.path().join("pool.db");
 
-    let mut store = PoolStore::open_in_memory().unwrap();
+    let mut store = PoolStore::open(&db).unwrap();
     let root_id = store.upsert_root(root).unwrap();
     torrentd_pool::scan_root(&mut store, root).unwrap();
     add_torrent(&mut store, "x1", "T", None, &[("T/a.bin", 128)]);
+    add_torrent(&mut store, "x2", "U", None, &[("U/b.bin", 128)]);
     torrentd_pool::match_all(&mut store).unwrap();
     assert!(store.orphan_files(root_id, "").unwrap().is_empty());
 
-    // A rematch that panics partway is the realistic mid-rebuild failure.
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = store.in_transaction(|st| {
-            torrentd_pool::match_all(st)?;
-            // Past the clear and the rebuild, before the outer commit.
-            panic!("scan interrupted");
-            #[allow(unreachable_code)]
-            Ok::<(), torrentd_pool::model::PoolError>(())
-        });
-    }));
-    assert!(panicked.is_err());
+    // Whichever torrent the rebuild reaches first, the other's insert fails
+    // after a claim of the first has been written.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_second_claim BEFORE INSERT ON claim
+             WHEN EXISTS (SELECT 1 FROM claim WHERE infohash <> NEW.infohash)
+             BEGIN SELECT RAISE(ABORT, 'injected mid-rebuild failure'); END;",
+        )
+        .unwrap();
+
+    let e = torrentd_pool::match_all(&mut store).unwrap_err();
+    assert!(
+        e.to_string().contains("injected mid-rebuild failure"),
+        "the rebuild failed for another reason: {e}",
+    );
 
     assert!(
         store.orphan_files(root_id, "").unwrap().is_empty(),
-        "an interrupted rematch published an empty claim table; every file in \
-         the root now reads as deletable",
+        "a failed rematch published a partial claim table; a file in the \
+         root now reads as deletable",
     );
 }
 
@@ -4542,8 +4553,9 @@ fn a_destination_behind_a_symlink_is_refused() {
     assert!(e.contains("outside the managed root"), "got {e}");
 
     // A destination that stays inside is still accepted, so the check is not
-    // simply refusing everything.
-    assert!(build_plan(
+    // simply refusing everything, and the plan moves to the destination
+    // asked for.
+    let steps = build_plan(
         &store,
         &PlanSpec::Relocate {
             infohash: "x1".into(),
@@ -4553,7 +4565,13 @@ fn a_destination_behind_a_symlink_is_refused() {
         root_id,
         &root,
     )
-    .is_ok());
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].op, torrentd_pool::model::ops::MOVE_TORRENT);
+    assert_eq!(
+        steps[0].dst.as_deref().map(Path::new),
+        Some(root.join("archive/T").as_path()),
+    );
 }
 
 #[test]

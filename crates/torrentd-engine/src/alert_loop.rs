@@ -2475,11 +2475,37 @@ mod tests {
         // Multi-profile mode: the profile is marked failed by the handler, but the
         // daemon keeps seeding the other profiles.
         let engine = Arc::new(MockEngine::new());
+        let metrics = Arc::new(RecordingSink::new());
+        let state = Arc::new(StateMap::new());
         engine.push_alert(listen_failed_alert());
-        let handle = builder_with(engine).fatal_listen_failure(false).spawn();
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine.clone())),
+            state.clone(),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .fatal_listen_failure(false)
+        .spawn();
 
-        // Give the loop a chance to process the alert and keep going.
-        std::thread::sleep(Duration::from_millis(200));
+        // The failure was dispatched: its handler published the gauge.
+        assert!(
+            wait_for(|| metrics.calls().into_iter().any(|c| matches!(
+                c,
+                MetricCall::SetGauge { name, value, .. }
+                    if name == "listen_failure_active" && value == 1.0
+            ))),
+            "the listen failure was never dispatched",
+        );
+        // An alert in a later drain is dispatched too, so the loop finished
+        // the failure's batch, where a fatal failure would have stopped it,
+        // and kept going.
+        engine.push_alert(add_torrent_alert(1, 1));
+        assert!(
+            wait_for(|| state.len() == 1),
+            "the loop stopped dispatching after a non-fatal listen failure",
+        );
         assert!(!handle.listen_failed());
 
         assert!(handle.signal_shutdown(ShutdownReason::Test));

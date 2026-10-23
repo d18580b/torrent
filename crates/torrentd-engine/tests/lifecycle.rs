@@ -21,8 +21,8 @@
 //!     match the piece hashes and never seeds when they don't.
 //!   - bounded drains: a bounded drain leaves the rest queued, and
 //!     `RealEngine::pop_alerts` returns at most `MAX_ALERTS_PER_POP`.
-//!   - alert-queue overflow: a tiny `alert_queue_size` flooded without draining
-//!     surfaces `alerts_dropped` and keeps draining cleanly (no hang/panic).
+//!   - alert-queue overflow is covered in `src/real.rs` by
+//!     `torrents_whose_add_alerts_overflowed_the_queue_are_all_tracked`.
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
 //!     for a magnet (which `SEED_MODE` cannot cover at all), and holds through
 //!     the verification failure that drops `SEED_MODE`; and, the one scenario
@@ -437,47 +437,6 @@ fn the_engine_pops_at_most_its_cap_per_call() {
     assert_eq!(added, count, "every add_torrent_alert arrives across pops");
 }
 
-#[test]
-#[ignore = "real libtorrent; run with --ignored"]
-fn alert_queue_overflow_surfaces_drop_and_keeps_draining() {
-    // Tiny alert queue: flooding adds without draining forces libtorrent to drop
-    // alerts and post an alerts_dropped_alert.
-    let mut settings = support::local_seed_settings();
-    settings.alert_queue_size = Some(4);
-    let dir = tempfile::tempdir().unwrap();
-    let save = dir.path().to_str().unwrap().to_string();
-
-    let session = Session::new(&settings).unwrap();
-
-    // Add many distinct SEED_MODE torrents WITHOUT draining alerts in between.
-    // SEED_MODE + no peers means no disk access, so missing payload is fine.
-    let payload = support::payload(7, 64);
-    for i in 0..3000 {
-        let torrent = support::single_file_torrent(&format!("ov-{i}"), &payload, 64);
-        let _ = session.add_torrent(AddParams::File {
-            bytes: torrent,
-            save_path: save.clone(),
-            flags: TorrentFlags::SEED_MODE,
-            trackers: Vec::new(),
-        });
-    }
-
-    // Now drain: we must observe an AlertsDropped, and draining must terminate
-    // cleanly without panicking.
-    let saw_dropped = support::pump_until(&session, Duration::from_secs(10), |a| match a {
-        Alert::AlertsDropped { .. } => Some(()),
-        _ => None,
-    })
-    .is_some();
-    assert!(
-        saw_dropped,
-        "flooding a size-4 alert queue should surface an alerts_dropped alert"
-    );
-
-    // Drain whatever remains; the session stays responsive (no hang/panic).
-    let _ = session.drain_alerts();
-}
-
 // ---------------------------------------------------------------------------
 // The no-download invariant
 // ---------------------------------------------------------------------------
@@ -604,39 +563,6 @@ fn resume_data_carrying_auto_managed_cannot_lift_upload_mode() {
         last.download_rate, 0,
         "a torrent in upload_mode never requests a piece"
     );
-}
-
-/// The case `SEED_MODE` cannot cover: libtorrent documents it as a no-op for a
-/// torrent added without metadata, so a magnet add was previously unguarded and
-/// would fetch the whole payload once metadata arrived. `UPLOAD_MODE` is not
-/// conditioned on metadata.
-#[test]
-#[ignore = "real libtorrent + disk; run with --ignored"]
-fn a_magnet_add_carries_upload_mode_without_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = Session::new(&support::local_seed_settings()).unwrap();
-    let h = s
-        .add_torrent(AddParams::Magnet {
-            uri: "magnet:?xt=urn:btih:0101010101010101010101010101010101010101".into(),
-            save_path: dir.path().to_str().unwrap().to_string(),
-            flags: TorrentFlags::SEED_MODE | TorrentFlags::UPLOAD_MODE,
-        })
-        .unwrap();
-
-    let last = support::settle_status(&s, h, Duration::from_secs(5))
-        .expect("the torrent should report status");
-    let flags = TorrentFlags::from_bits_truncate(last.flags);
-
-    assert!(
-        !flags.contains(TorrentFlags::SEED_MODE),
-        "libtorrent ignores seed_mode without metadata — if this ever fails, \
-         the reasoning in torrentd_engine::policy needs revisiting; flags={flags:?}",
-    );
-    assert!(
-        flags.contains(TorrentFlags::UPLOAD_MODE),
-        "upload_mode is what actually holds for a magnet; flags={flags:?}",
-    );
-    assert_eq!(last.download_rate, 0);
 }
 
 /// The no-download invariant against a peer that has every piece and would
