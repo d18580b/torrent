@@ -415,13 +415,19 @@ fn openapi_cmd(out: Option<&std::path::Path>) -> anyhow::Result<()> {
 /// tunnel is raised; left to `killswitch::enable`, it came after every
 /// profile's tunnel and session were up, as a boot failure the unit restarts.
 fn check_config(cfg: &config::Config) -> anyhow::Result<()> {
-    check_config_as(cfg, vpn::killswitch::current_uid)
+    check_config_as(
+        cfg,
+        vpn::killswitch::current_uid,
+        vpn::killswitch::nft_available,
+    )
 }
 
-/// [`check_config`], with the effective uid handed in so a test can be root.
+/// [`check_config`], with the effective uid and the `nft` probe handed in, so
+/// a test can be root, or judge a host with or without nftables.
 fn check_config_as(
     cfg: &config::Config,
     uid: impl FnOnce() -> std::io::Result<u32>,
+    nft_available: impl FnOnce() -> bool,
 ) -> anyhow::Result<()> {
     if cfg.network_kill_switch {
         let uid = uid().context("read this process's uid for the kill switch")?;
@@ -431,7 +437,7 @@ fn check_config_as(
     }
     // The kill switch shells out to `nft`; fail the pre-flight check now
     // rather than aborting startup later.
-    if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
+    if cfg.network_kill_switch && !nft_available() {
         anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
     }
     // An OpenVPN profile's file is executable configuration: one naming a
@@ -913,23 +919,59 @@ http_listen = "127.0.0.1:8080"
         );
     }
 
+    /// A kill switch over a WireGuard profile, loaded the way the daemon and
+    /// `--check-config` load it.
+    fn kill_switch_over_wireguard(dir: &std::path::Path) -> config::Config {
+        let p = dir.join("torrentd.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "{TOP}allow_unauthenticated = true\nnetwork_kill_switch = true\n\n\
+                 [[profile]]\nid = \"acct_a\"\n\
+                 network = \"vpn\"\nvpn_type = \"wireguard\"\n\
+                 vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
+                 listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
+                 user_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n"
+            ),
+        )
+        .unwrap();
+        config::Config::load(&p).expect("the file is valid on any host")
+    }
+
     #[test]
-    fn the_pre_flight_probes_nft_and_config_loading_does_not() {
-        // The property: whether `nft` exists is a fact about the host, so it
-        // is `--check-config`'s to establish and not `Config::load`'s.
-        // `Config::load` is what the SIGHUP pump and every operator
-        // subcommand run; probing the host there refuses a reload, and
-        // refuses `hash-password`, on a machine without nftables.
-        //
-        // The probe's outcome depends on the host, so what is pinned is the
-        // seam: `check_config` is the only caller, and a config with the kill
-        // switch off never reaches it.
-        let cfg = cfg_from(&format!(
-            "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
-             listen_interfaces = \"0.0.0.0:6881\"\n"
-        ));
-        assert!(!cfg.network_kill_switch);
-        check_config(&cfg).expect("no kill switch, so no probe and nothing to refuse");
+    fn check_config_passes_a_vpn_kill_switch_config_as_non_root_with_nft() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = kill_switch_over_wireguard(dir.path());
+        let mut probed = false;
+        check_config_as(
+            &cfg,
+            || Ok(998),
+            || {
+                probed = true;
+                true
+            },
+        )
+        .expect("a non-root daemon on a host with nft passes");
+        assert!(probed, "the kill switch asks whether nft is there");
+    }
+
+    #[test]
+    fn check_config_refuses_when_nft_is_absent() {
+        // Whether `nft` exists is a fact about the host, so it is the
+        // pre-flight's to establish and not `Config::load`'s: the SIGHUP pump
+        // and every operator subcommand load the config too, and probing the
+        // host there refuses a reload, and `hash-password`, on a machine
+        // without nftables. The file above loaded; only the probe refuses.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = kill_switch_over_wireguard(dir.path());
+        let msg = format!(
+            "{:#}",
+            check_config_as(&cfg, || Ok(998), || false).expect_err("no nft is refused")
+        );
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("`nft`"),
+            "got: {msg}",
+        );
     }
 
     #[test]
@@ -942,7 +984,12 @@ http_listen = "127.0.0.1:8080"
             "{TOP}network_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
              network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n"
         ));
-        let e = check_config_as(&cfg, || Ok(0)).expect_err("uid 0 is refused");
+        let e = check_config_as(
+            &cfg,
+            || Ok(0),
+            || unreachable!("refused before the nft probe"),
+        )
+        .expect_err("uid 0 is refused");
         assert!(startup::is_config_refusal(&e), "got: {e:#}");
         assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
         // The daemon's pre-flight is judged as the daemon itself, so its
@@ -967,7 +1014,12 @@ http_listen = "127.0.0.1:8080"
             "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
              listen_interfaces = \"0.0.0.0:6881\"\n"
         ));
-        check_config_as(&off, || unreachable!("no kill switch, no uid")).unwrap();
+        check_config_as(
+            &off,
+            || unreachable!("no kill switch, no uid"),
+            || unreachable!("no kill switch, no nft probe"),
+        )
+        .unwrap();
     }
 
     /// #229: an OpenVPN profile whose `.ovpn` names a hook or a plugin is
@@ -995,8 +1047,12 @@ http_listen = "127.0.0.1:8080"
             std::fs::write(&ovpn, format!("client\ndev tun\n{line}\n")).unwrap();
             let msg = format!(
                 "{:#}",
-                check_config_as(&profile(&ovpn), || unreachable!("no kill switch"))
-                    .expect_err(line)
+                check_config_as(
+                    &profile(&ovpn),
+                    || unreachable!("no kill switch"),
+                    || unreachable!("no kill switch"),
+                )
+                .expect_err(line)
             );
             assert!(msg.contains(&format!("`{name}`")), "{line:?}: {msg}");
             assert!(msg.contains("acct_b.ovpn"), "{line:?}: {msg}");
