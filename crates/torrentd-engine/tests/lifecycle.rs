@@ -10,8 +10,9 @@
 //!   cargo test -p torrentd-engine --test lifecycle -- --ignored
 //!
 //! Coverage:
-//!   - resume round-trip: SEED_MODE seed → save_resume_data → reload skips
-//!     re-verification (no `hash_failed`, seeds immediately).
+//!   - resume round-trip: SEED_MODE seed → save_resume_data → corrupt a piece
+//!     on disk → reload skips re-verification (still seeds at 1.0, no
+//!     `hash_failed`), while a forced check does find the corruption.
 //!   - resume WITHOUT the info dict (the daemon's actual save flags): proves
 //!     metadata is lost and re-attaching the stored `.torrent` restores it.
 //!   - a resume add that clears flags still reports status (update_subscribe
@@ -84,6 +85,26 @@ fn resume_round_trip_skips_reverify() {
     };
     assert!(!blob.is_empty(), "resume blob should be non-empty");
 
+    // --- between sessions: corrupt the first piece in place ---
+    // The same length and modification time, so nothing but a hash check can
+    // tell. A reload that re-verified would find the piece bad and never
+    // reach 1.0; one that trusts its resume data seeds as before. The absence
+    // of `hash_failed` alone cannot tell the two apart: a check that passes
+    // posts none either.
+    let file = dir.path().join("seed-A");
+    let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let mut corrupt = data.clone();
+    for b in &mut corrupt[..PIECE_LEN] {
+        *b ^= 0xff;
+    }
+    std::fs::write(&file, &corrupt).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+
     // --- session 2: reload purely from resume; it must NOT re-verify ---
     let s2 = Session::new(&support::local_seed_settings()).unwrap();
     let h2 = s2.add_torrent(AddParams::resume(blob)).unwrap();
@@ -96,16 +117,42 @@ fn resume_round_trip_skips_reverify() {
         Alert::StateUpdate { statuses, .. } => statuses
             .iter()
             .find(|s| s.handle.infohash == h2.infohash && s.is_seeding)
-            .map(|_| ()),
+            .map(|s| s.progress),
         _ => None,
-    })
-    .is_some();
+    });
 
     assert!(
         !saw_hash_failed,
         "resume must skip re-verification: no hash_failed expected"
     );
-    assert!(seeded, "the resumed torrent should be seeding");
+    assert_eq!(
+        seeded,
+        Some(1.0),
+        "the resumed torrent should seed whole over a piece it never re-read",
+    );
+
+    // The corruption is real: a forced check finds it. Without this, a
+    // corruption the check could not see would make the assertions above
+    // hold whether or not the reload re-verified.
+    s2.force_recheck(h2).unwrap();
+    let (mut checked, mut last) = (false, None);
+    let found = support::pump_until(&s2, Duration::from_secs(15), |a| {
+        match a {
+            Alert::TorrentChecked { .. } => checked = true,
+            Alert::StateUpdate { statuses, .. } => {
+                if let Some(s) = statuses.iter().find(|s| s.handle.infohash == h2.infohash) {
+                    last = Some((s.progress, s.is_seeding));
+                }
+            }
+            _ => {}
+        }
+        (checked && last.is_some_and(|(p, seeding)| p < 1.0 && !seeding)).then_some(())
+    });
+    assert!(
+        found.is_some(),
+        "a full check of the corrupted payload should drop it below 1.0 \
+         (checked: {checked}, last progress and seeding: {last:?})",
+    );
 }
 
 /// The production resume path, which the round-trip test above does not cover
