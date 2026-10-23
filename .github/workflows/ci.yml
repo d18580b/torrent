@@ -105,6 +105,21 @@ jobs:
           toolchain: ''
       - run: mise run lint-tracing
 
+  size-check:
+    name: file-length gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # Source files over the limit must be in .size-baseline, which may only
+      # shrink. Needs git and bash, not a toolchain.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - run: mise run size-check
+
   shim-tests:
     name: shim FFI tests (Layer 2)
     runs-on: ubuntu-24.04

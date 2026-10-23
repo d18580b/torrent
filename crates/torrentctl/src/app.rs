@@ -198,6 +198,12 @@ pub struct Model {
     pub pool: screens::pool::State,
     /// When the visible screen last refreshed, for the polling fallback.
     pub last_refresh: Option<Instant>,
+    /// The fingerprint of the stream tick that last refreshed the visible
+    /// screen. A tick carrying the same one says nothing changed, so it
+    /// fetches nothing. Not recorded when the screen had a load in flight
+    /// and skipped it, so a re-send retries. Forgotten whenever the stream's
+    /// state changes, so the first tick after a reconnect always refreshes.
+    pub fingerprint: Option<String>,
 }
 
 /// Everything that can happen.
@@ -206,8 +212,9 @@ pub enum Msg {
     Key(KeyEvent),
     /// A render tick (250 ms): spinners, toast expiry, the polling fallback.
     Tick,
-    /// `GET /v1/events` delivered a tick: something visible may have changed.
-    Changed,
+    /// `GET /v1/events` delivered a tick carrying this fingerprint of the
+    /// daemon's state: something visible changed if it differs from the last.
+    Changed(String),
     LiveChanged(Live),
     /// The answer to "who am I": the server's description and the principal.
     SessionChecked(Result<(types::ServerInfo, types::Principal), Failure>),
@@ -256,6 +263,7 @@ impl Model {
             profiles: Default::default(),
             pool: Default::default(),
             last_refresh: None,
+            fingerprint: None,
         }
     }
 
@@ -337,15 +345,26 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             Vec::new()
         }
-        Msg::Changed => {
-            if matches!(model.session, Session::SignedIn { .. }) {
-                refresh_visible(model)
-            } else {
-                Vec::new()
+        Msg::Changed(fingerprint) => {
+            // The daemon re-sends an unchanged fingerprint at least every ten
+            // seconds; refetching each time would re-read every loaded row
+            // of a list that did not change.
+            if !matches!(model.session, Session::SignedIn { .. })
+                || model.fingerprint.as_ref() == Some(&fingerprint)
+            {
+                return Vec::new();
             }
+            // A screen with a load in flight skips it rather than restart
+            // it, and that load may have been answered before this change.
+            // Remember the fingerprint only when nothing was skipped, so the
+            // daemon's next re-send of it retries until the screen reloads.
+            let skipped = busy(model);
+            model.fingerprint = (!skipped).then_some(fingerprint);
+            refresh_visible(model)
         }
         Msg::LiveChanged(live) => {
             model.live = live;
+            model.fingerprint = None;
             Vec::new()
         }
         Msg::SessionChecked(Ok((server, principal))) => {
@@ -518,6 +537,16 @@ pub fn refresh_visible(model: &mut Model) -> Vec<Effect> {
             screens::profiles::refresh(&mut m.profiles, ctx)
         }),
         Tab::Pool => route(model, |m, ctx| screens::pool::refresh(&mut m.pool, ctx)),
+    }
+}
+
+/// Whether the visible screen has a load in flight, which a refresh skips.
+fn busy(model: &Model) -> bool {
+    match model.tab {
+        Tab::Dashboard => screens::dashboard::busy(&model.dashboard),
+        Tab::Torrents => screens::torrents::busy(&model.torrents),
+        Tab::Profiles => screens::profiles::busy(&model.profiles),
+        Tab::Pool => screens::pool::busy(&model.pool),
     }
 }
 
@@ -945,9 +974,88 @@ mod tests {
         );
         m.dashboard.loading = false;
         assert_eq!(
-            update(&mut m, Msg::Changed).len(),
+            update(&mut m, Msg::Changed("00000000000000aa".into())).len(),
             1,
             "a change notification refreshes"
+        );
+    }
+
+    #[test]
+    fn a_tick_with_an_unchanged_fingerprint_fetches_nothing() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = signed_in_as(model_at(&daemon), false);
+        m.tab = Tab::Torrents;
+        update(&mut m, Msg::LiveChanged(Live::Streaming));
+        let tick = |fp: &str| Msg::Changed(fp.to_owned());
+
+        testing::run(update(&mut m, tick("00000000000000aa")));
+        assert_eq!(
+            daemon.lines(),
+            ["GET /v1/profiles", "GET /v1/torrents?limit=100"],
+            "the first tick refreshes what is on screen"
+        );
+        // Let the list's answer land so a refresh is not skipped as one
+        // already in flight.
+        m.torrents.list.loading = false;
+        m.torrents.profiles_loading = false;
+
+        assert!(
+            update(&mut m, tick("00000000000000aa")).is_empty(),
+            "the daemon re-sent the same state: nothing to fetch"
+        );
+        testing::run(update(&mut m, tick("00000000000000bb")));
+        assert_eq!(daemon.lines().len(), 4, "a new fingerprint refreshes");
+        m.torrents.list.loading = false;
+        m.torrents.profiles_loading = false;
+
+        // A reconnect forgets it: what changed while the stream was down is
+        // unknown, so the first tick after refreshes even if it matches.
+        update(
+            &mut m,
+            Msg::LiveChanged(Live::Reconnecting {
+                reason: "down".into(),
+            }),
+        );
+        update(&mut m, Msg::LiveChanged(Live::Streaming));
+        assert_eq!(update(&mut m, tick("00000000000000bb")).len(), 2);
+    }
+
+    #[test]
+    fn a_change_that_lands_while_the_list_is_loading_is_retried_on_its_re_send() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = signed_in_as(model_at(&daemon), false);
+        m.tab = Tab::Torrents;
+        update(&mut m, Msg::LiveChanged(Live::Streaming));
+        let tick = |fp: &str| Msg::Changed(fp.to_owned());
+
+        testing::run(update(&mut m, tick("00000000000000aa")));
+        assert_eq!(daemon.lines().len(), 2, "the first tick refreshes");
+        // The list's re-read is still in flight (a multi-page reload, say)
+        // when the state changes: the screen skips the list, whose answer
+        // may predate the change.
+        m.torrents.profiles_loading = false;
+        testing::run(update(&mut m, tick("00000000000000bb")));
+        assert_eq!(
+            daemon.lines()[2..],
+            ["GET /v1/profiles"],
+            "the list is not restarted mid-load"
+        );
+        m.torrents.list.loading = false;
+        m.torrents.profiles_loading = false;
+
+        // The daemon re-sends the same fingerprint: the skipped list is
+        // re-read now that it can be.
+        testing::run(update(&mut m, tick("00000000000000bb")));
+        assert_eq!(
+            daemon.lines()[3..],
+            ["GET /v1/profiles", "GET /v1/torrents?limit=100"],
+            "the change skipped mid-load is fetched on its re-send"
+        );
+        m.torrents.list.loading = false;
+        m.torrents.profiles_loading = false;
+        assert!(
+            update(&mut m, tick("00000000000000bb")).is_empty(),
+            "once seen, a re-send fetches nothing"
         );
     }
 

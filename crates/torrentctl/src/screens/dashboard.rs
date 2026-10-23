@@ -61,6 +61,11 @@ pub fn capturing(state: &State) -> bool {
     state.confirm_reload.is_some()
 }
 
+/// Whether a load is in flight, so a refresh now would skip it.
+pub fn busy(state: &State) -> bool {
+    state.loading
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.confirm_reload.is_some() {
         return Some(Msg::ConfirmKey(key));
