@@ -642,6 +642,47 @@ impl<R: Scopes<Scope = Scope>> kynos::middleware::Interceptor<crate::http::ctx::
 mod tests {
     use super::*;
 
+    /// The scope names the published document requires are the names an
+    /// operator writes in `[[auth.token]] scopes`: each one parses back to
+    /// the scope that declared it, and every scope is required somewhere.
+    /// A rename on either side alone fails here, rather than as a token the
+    /// config refuses or one the document cannot describe.
+    #[test]
+    fn every_declared_scope_parses() {
+        #[derive(serde::Deserialize)]
+        struct Granted {
+            scopes: Vec<Scope>,
+        }
+        let parse = |name: &str| -> Scope {
+            let granted: Granted = toml::from_str(&format!("scopes = [\"{name}\"]"))
+                .unwrap_or_else(|e| panic!("scope {name:?} does not parse: {e}"));
+            assert_eq!(granted.scopes.len(), 1);
+            granted.scopes[0]
+        };
+        for scope in [Scope::Read, Scope::Write, Scope::Metrics] {
+            let name = kynos::security::Scope::name(&scope);
+            assert_eq!(parse(name), scope, "{name}");
+        }
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&crate::http::document_json().unwrap()).unwrap();
+        let mut declared = std::collections::BTreeSet::new();
+        for item in doc["paths"].as_object().unwrap().values() {
+            for op in item.as_object().unwrap().values() {
+                for requirement in op["security"].as_array().into_iter().flatten() {
+                    for name in requirement["bearer"].as_array().into_iter().flatten() {
+                        declared.insert(name.as_str().unwrap().to_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            declared.iter().map(|n| parse(n)).collect::<Vec<_>>(),
+            vec![Scope::Metrics, Scope::Read, Scope::Write],
+            "the document requires every scope, by the name the config takes: {declared:?}",
+        );
+    }
+
     #[test]
     fn the_refusal_log_writes_one_line_a_minute_and_counts_the_rest() {
         let log = RefusalLog::default();
