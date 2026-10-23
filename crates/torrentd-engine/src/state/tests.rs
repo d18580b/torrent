@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn ih(byte: u8) -> InfoHash {

@@ -1,4 +1,3 @@
-
 use std::net::Ipv4Addr;
 
 use libtorrent_safe::TorrentHandle;
