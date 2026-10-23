@@ -140,10 +140,15 @@ pub(crate) fn apply(s: &TorrentStatusView, ctx: &HandlerCtx<'_>) {
 /// Every add applies the invariant, but nothing held it afterwards: a torrent
 /// found out of upload mode went on requesting pieces until the next restart
 /// re-added it. Called outside the state-map update so no map lock is held
-/// across the engine call. Each status that shows the lapse re-asserts again,
-/// so one that does not take is retried at the next update and counted again;
-/// no resume save is queued, because every add path re-applies the invariant
-/// whatever the resume data says.
+/// across the engine call. Each status that shows the lapse re-asserts again
+/// and is counted again, so a re-assert that does not take is retried only
+/// when a status for that torrent next arrives: libtorrent posts one only once
+/// the torrent's status changes, and the overflow handler reads one back only
+/// after a dropped update. An idle torrent whose re-assert failed is neither
+/// retried nor counted again until something changes its status, which a
+/// torrent that starts requesting pieces does. No resume save is
+/// queued, because every add path re-applies the invariant whatever the resume
+/// data says.
 fn reassert_no_download(s: &TorrentStatusView, ctx: &HandlerCtx<'_>) {
     let flags = TorrentFlags::from_bits_truncate(s.flags);
     let forbidden = crate::policy::forbidden();
@@ -171,7 +176,8 @@ fn reassert_no_download(s: &TorrentStatusView, ctx: &HandlerCtx<'_>) {
             error.kind = "enforce_no_download",
             error.cause = %e,
             "a torrent's status showed upload mode lifted or a forbidden flag set, and \
-             re-asserting upload mode failed; retried at the next status update",
+             re-asserting upload mode failed; retried only when this torrent's status next \
+             changes",
         ),
     }
 }
@@ -666,7 +672,8 @@ mod tests {
     }
 
     /// A re-assert the engine refuses is still counted, and the status is
-    /// still folded into the state map; the next update tries again.
+    /// still folded into the state map; the next status that arrives for the
+    /// torrent tries again.
     #[test]
     fn a_failed_reassert_is_counted_and_retried_at_the_next_update() {
         let h = TorrentHandle {
