@@ -772,10 +772,11 @@ http_socket_mode  = 0o660
 http_socket_group = "torrentd"
 ```
 
-The socket's directory must exist and be writable by the daemon's user;
-`deploy/torrentd.service` creates none, so add `RuntimeDirectory=torrentd`
-(and `RuntimeDirectoryMode=0750` with `Group=` the socket's group, so its
-members can reach it) in a drop-in (`systemctl edit torrentd`). The socket is
+The socket's directory must exist and be writable by the daemon's user.
+`deploy/torrentd.service` provides `/run/torrentd` (`RuntimeDirectory=torrentd`,
+`RuntimeDirectoryMode=0750`), owned by its `User=` and `Group=`, so members of
+`Group=` can reach a socket whose `http_socket_group` is that group; a socket
+for another group's members, or elsewhere, needs its own directory. The socket is
 bound in a private (`0700`) staging directory beside it, given its mode and
 group, and only then renamed into place, so nobody but the daemon's user can
 connect before its permissions are set. That staging path is up to 14 bytes

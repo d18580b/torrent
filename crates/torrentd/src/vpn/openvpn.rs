@@ -76,12 +76,11 @@
 //! the packaged unit — as `openvpn-<iface>.pid`.
 //!
 //! `/run/torrentd` would be the conventional home for a pid file, and it is
-//! tmpfs so nothing survives a reboot. It is not used because the packaged
-//! `deploy/torrentd.service` declares `StateDirectory=torrentd` and names
-//! `/var/lib/torrentd` in `ReadWritePaths=`, and declares no
-//! `RuntimeDirectory=`: `/run/torrentd` does not exist on a host running the
-//! shipped unit, and the daemon could not create it under that unit's
-//! sandboxing. Putting the pid file there means changing the packaged unit.
+//! tmpfs so nothing survives a reboot. It is not used because only the
+//! packaged `deploy/torrentd.service` provides it (`RuntimeDirectory=`): a
+//! daemon run any other way, a container or a unit of the operator's own, has
+//! no `/run/torrentd` unless something creates it, while the state dir is one
+//! the daemon already needs and writes.
 //!
 //! What that alternative would buy — a file that cannot outlive the process
 //! it names — `live_pid` already provides by other means: it verifies the pid

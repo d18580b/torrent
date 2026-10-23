@@ -93,6 +93,13 @@ SystemCallErrorNumber=EPERM
 ReadWritePaths=/var/lib/torrentd /data/torrents
 StateDirectory=torrentd
 StateDirectoryMode=0750
+# /run/torrentd, for `http_listen = "unix:/run/torrentd/api.sock"`, the path
+# torrentctl tries first. systemd creates it owned by User=/Group= before the
+# start, makes it writable under `ProtectSystem=strict`, and removes it after
+# the stop. 0750 lets members of Group= reach a socket whose
+# `http_socket_group` is that group, and nobody else.
+RuntimeDirectory=torrentd
+RuntimeDirectoryMode=0750
 
 # WireGuard / tunnel control. A `network = "vpn"` profile brings up its own
 # tunnel (and, with `network_kill_switch = true`, installs an nftables table),

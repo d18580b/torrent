@@ -18,7 +18,7 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # write permission on the socket, so its mode and group decide who may call
 # the API, and nobody else can take its path over while the daemon is down.
 # torrentctl uses /run/torrentd/api.sock whenever it exists. The directory
-# must exist (RuntimeDirectory=torrentd in a drop-in for the unit), and a
+# must exist (deploy/torrentd.service creates it: RuntimeDirectory=), and a
 # socket serves no Prometheus scrape (docs/running.md §6). The two socket keys
 # are refused beside a TCP http_listen. Read once, at startup.
 # http_listen       = "unix:/run/torrentd/api.sock"
