@@ -343,13 +343,23 @@ async fn a_client_that_logged_in_before_gets_past_a_spent_verification_budget() 
     // Spend the shared budget the way an unidentified poller would.
     let throttle = &h.state.auth.as_ref().unwrap().throttle;
     while throttle.admit_verification(None).is_ok() {}
+    assert_eq!(h.metric(&login_failures("verification_budget")).await, 0.0);
 
     let resp = login("203.0.113.8").await;
     assert_problem(&resp, 429, "login-throttled");
     assert!(resp.header("retry-after").is_some());
+    // The series `TorrentdLoginThrottled` alerts on counts this refusal under
+    // its own reason, not as a per-client throttle.
+    assert_eq!(h.metric(&login_failures("verification_budget")).await, 1.0);
+    assert_eq!(h.metric(&login_failures("throttled")).await, 0.0);
     login("203.0.113.7")
         .await
         .assert_status(kynos::http::StatusCode::CREATED);
+    assert_eq!(
+        h.metric(&login_failures("verification_budget")).await,
+        1.0,
+        "a login admitted from the reserve is not a refusal",
+    );
 }
 
 #[tokio::test]
