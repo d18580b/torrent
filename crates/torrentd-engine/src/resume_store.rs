@@ -37,6 +37,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(any(test, feature = "test-support"))]
 use dashmap::DashMap;
 use libtorrent_safe::InfoHash;
 use libtorrent_safe::ResumeData;
@@ -657,12 +658,14 @@ impl ResumeStore for FsResumeStore {
 // MemoryResumeStore (test fixture)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct MemoryResumeStore {
     inner: DashMap<(ProfileId, InfoHash), Vec<u8>>,
     tombstones: DashMap<(ProfileId, InfoHash), ()>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MemoryResumeStore {
     pub fn new() -> Self {
         Self::default()
@@ -685,6 +688,7 @@ impl MemoryResumeStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ResumeStore for MemoryResumeStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
         Ok(Scan {

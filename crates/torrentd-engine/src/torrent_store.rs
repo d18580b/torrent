@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(any(test, feature = "test-support"))]
 use dashmap::DashMap;
 use libtorrent_safe::InfoHash;
 use thiserror::Error;
@@ -253,12 +254,14 @@ impl TorrentStore for FsTorrentStore {
 // MemoryTorrentStore (test fixture)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct MemoryTorrentStore {
     inner: DashMap<(ProfileId, InfoHash), Vec<u8>>,
     save_paths: DashMap<(ProfileId, InfoHash), String>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MemoryTorrentStore {
     pub fn new() -> Self {
         Self::default()
@@ -272,6 +275,7 @@ impl MemoryTorrentStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl TorrentStore for MemoryTorrentStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
         Ok(Scan {

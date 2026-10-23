@@ -35,7 +35,9 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 
 [features]
-# The test doubles: `MockEngine`, `MockVpn` and `MockForwarder`. Compiled into
+# The test doubles: `MockEngine`, `MockVpn`, `MockForwarder` and `MockClock`,
+# and the fixtures `MemoryResumeStore`, `MemoryTorrentStore` and
+# `RecordingSink`. Compiled into
 # this crate's own tests regardless; a dependent crate enables this for its
 # tests (a dev-dependency) or for the alert drill's `fault-injection` build.
 # That build is optimised too (`cargo build --release` in deploy/Containerfile
@@ -47,6 +49,9 @@ libc = { workspace = true }
 test-support = []
 
 [dev-dependencies]
+# The test doubles and fixtures above, for tests/lifecycle.rs: an integration
+# test links the library as built for dependents, without `cfg(test)`.
+torrentd-engine = { path = ".", features = ["test-support"] }
 # The willing-seeder test in tests/lifecycle.rs dials a peer and reads a
 # torrent's payload download counter, which only `test-api` exposes.
 libtorrent-safe = { workspace = true, features = ["test-api"] }

@@ -45,6 +45,7 @@ pub use alert_loop::DEFAULT_SHUTDOWN_DEADLINE;
 pub use alert_loop::POST_UPDATES_INTERVAL;
 pub use batch_writer::WriteErrorHook;
 pub use clock::Clock;
+#[cfg(any(test, feature = "test-support"))]
 pub use clock::MockClock;
 pub use clock::SystemClock;
 pub use engine::EngineError;
@@ -66,6 +67,7 @@ pub use libtorrent_safe::TorrentHandle;
 pub use libtorrent_safe::TrackerEntry;
 pub use metrics::MetricsSink;
 pub use metrics::NoopSink;
+#[cfg(any(test, feature = "test-support"))]
 pub use metrics::RecordingSink;
 #[cfg(any(test, feature = "test-support"))]
 pub use mock::HeldCall;
@@ -98,6 +100,7 @@ pub use profile::ProfileId;
 pub use profile::ProfileNetwork;
 pub use real::RealEngine;
 pub use resume_store::FsResumeStore;
+#[cfg(any(test, feature = "test-support"))]
 pub use resume_store::MemoryResumeStore;
 pub use resume_store::ResumeStore;
 pub use resume_store::Scan;
@@ -109,6 +112,7 @@ pub use state::StorageMove;
 pub use state::TorrentPhase;
 pub use state::TorrentState;
 pub use torrent_store::FsTorrentStore;
+#[cfg(any(test, feature = "test-support"))]
 pub use torrent_store::MemoryTorrentStore;
 pub use torrent_store::TorrentStore;
 #[cfg(any(test, feature = "test-support"))]
