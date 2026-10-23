@@ -32,20 +32,17 @@ use crate::app::Toast;
 use crate::app::ToastKind;
 use crate::fmt;
 use crate::theme::Tone;
+use crate::ui::widgets::caps;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
 use crate::ui::widgets::spinner;
 use crate::ui::widgets::state_span;
 use crate::ui::widgets::Confirm;
 use crate::ui::widgets::Confirmed;
+use crate::ui::widgets::PageRequest;
 use crate::ui::widgets::Paged;
+use crate::ui::widgets::Received;
 
-/// Torrents or files per page when paging on.
-const PAGE: usize = 100;
-/// The most one page may hold (the daemon's cap). A reload asks for as many
-/// as are loaded, up to this, so a refresh neither shrinks the list nor
-/// loses the selection.
-const MAX_PAGE: usize = 1000;
 /// Rows `PgUp`/`PgDn` move.
 const PAGE_STEP: usize = 10;
 
@@ -71,7 +68,7 @@ pub struct State {
     /// Only torrents in this phase (server-side).
     pub phase: Option<types::Phase>,
     /// The `/` filter over what is loaded: an infohash prefix or part of a
-    /// profile id.
+    /// profile id, as typed. It matches in any case.
     pub filter: String,
     /// The `/` field, while it has the keyboard.
     pub filter_input: Option<Input>,
@@ -360,10 +357,19 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             }
             match result {
                 Ok(page) => {
-                    state
+                    match state
                         .list
-                        .receive(generation, first, page.items, page.next_cursor);
-                    settle(state, ctx)
+                        .receive(generation, first, page.items, page.next_cursor)
+                    {
+                        Received::Stale => Vec::new(),
+                        Received::Continue(request) => vec![fetch_page(
+                            ctx.api,
+                            state.profile.clone(),
+                            state.phase.clone(),
+                            request,
+                        )],
+                        Received::Settled => settle(state, ctx),
+                    }
                 }
                 Err(failure) => {
                     state.list.fail(generation, failure.message());
@@ -470,7 +476,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 }
                 _ => {
                     input.handle_event(&crossterm::event::Event::Key(key));
-                    state.filter = input.value().trim().to_lowercase();
+                    state.filter = input.value().trim().to_owned();
                 }
             }
             reselect(state, keep);
@@ -591,13 +597,21 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             match result {
                 Ok(page) => {
                     detail.metadata_pending = false;
-                    detail
+                    match detail
                         .files
-                        .receive(generation, first, page.items, page.next_cursor);
-                    detail.files_selected = detail
-                        .files_selected
-                        .min(detail.files.items.len().saturating_sub(1));
-                    more_files(detail, ctx)
+                        .receive(generation, first, page.items, page.next_cursor)
+                    {
+                        Received::Stale => Vec::new(),
+                        Received::Continue(request) => {
+                            vec![fetch_files(ctx.api, detail.hash.clone(), request)]
+                        }
+                        Received::Settled => {
+                            detail.files_selected = detail
+                                .files_selected
+                                .min(detail.files.items.len().saturating_sub(1));
+                            more_files(detail, ctx)
+                        }
+                    }
                 }
                 Err(failure) => {
                     detail.metadata_pending = failure.is("metadata-pending");
@@ -910,15 +924,18 @@ fn unauthenticated(attempt: &str, failure: Failure) -> Vec<Effect> {
 
 /// Indices into the loaded list of the rows the `/` filter shows.
 fn visible(state: &State) -> Vec<usize> {
+    // The daemon emits infohashes lowercase, so a lowercased needle matches
+    // them in any case it was typed; profile ids are lowercased to compare.
+    let needle = state.filter.to_lowercase();
     state
         .list
         .items
         .iter()
         .enumerate()
         .filter(|(_, t)| {
-            state.filter.is_empty()
-                || t.infohash.starts_with(&state.filter)
-                || t.profile_id.to_lowercase().contains(&state.filter)
+            needle.is_empty()
+                || t.infohash.starts_with(&needle)
+                || t.profile_id.to_lowercase().contains(&needle)
         })
         .map(|(i, _)| i)
         .collect()
@@ -965,9 +982,7 @@ fn set_server_filter(
     state.phase = phase;
     // What was loaded belongs to another filter: drop it rather than show it
     // under this one.
-    state.list.items.clear();
-    state.list.next_cursor = None;
-    state.list.complete = false;
+    state.list.reset();
     state.selected = 0;
     state.list_offset.set(0);
     state.restore = None;
@@ -976,20 +991,18 @@ fn set_server_filter(
     effects
 }
 
-/// Reload the list from its first page, keeping the selection.
+/// Reload the list from its first page, as many rows as are loaded (see
+/// [`Paged`]), keeping the selection.
 fn load_list(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     if state.restore.is_none() {
         state.restore = selected_summary(state).map(|s| s.infohash.clone());
     }
-    let limit = state.list.items.len().clamp(PAGE, MAX_PAGE);
-    let generation = state.list.reload();
+    let request = state.list.reload();
     vec![fetch_page(
         ctx.api,
         state.profile.clone(),
         state.phase.clone(),
-        None,
-        limit,
-        generation,
+        request,
     )]
 }
 
@@ -997,11 +1010,14 @@ fn fetch_page(
     api: &Api,
     profile: Option<String>,
     phase: Option<types::Phase>,
-    cursor: Option<String>,
-    limit: usize,
-    generation: u64,
+    request: PageRequest,
 ) -> Effect {
     let api = api.clone();
+    let PageRequest {
+        cursor,
+        limit,
+        generation,
+    } = request;
     Effect::new(async move {
         let first = cursor.is_none();
         let params = crate::api::generated::ListTorrentsParams {
@@ -1037,13 +1053,11 @@ fn load_more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
 
 fn next_page(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     match state.list.begin_more() {
-        Some((cursor, generation)) => vec![fetch_page(
+        Some(request) => vec![fetch_page(
             ctx.api,
             state.profile.clone(),
             state.phase.clone(),
-            Some(cursor),
-            PAGE,
-            generation,
+            request,
         )],
         None => Vec::new(),
     }
@@ -1109,11 +1123,14 @@ fn load_detail(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
         }));
     }
     match detail.tab {
-        // A list longer than one request can re-read would come back cut
-        // short, and the selection with it. Files do not change while a
-        // torrent seeds (a priority edit updates its row in place), so such a
-        // list is left as it is; reopening the tab reloads it.
-        detail::Tab::Files if !detail.files.loading && detail.files.items.len() <= MAX_PAGE => {
+        // A list longer than one request is not re-read on every change: it
+        // would take a request per thousand files each time, and files do
+        // not change while a torrent seeds (a priority edit updates its row
+        // in place). Such a list is left as it is; reopening the torrent
+        // reloads it, in as many requests as it needs.
+        detail::Tab::Files
+            if !detail.files.loading && detail.files.items.len() <= caps::PAGE_MAX =>
+        {
             effects.extend(load_files(detail, ctx))
         }
         detail::Tab::Trackers if !detail.trackers_loading => {
@@ -1125,15 +1142,8 @@ fn load_detail(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
 }
 
 fn load_files(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
-    let limit = detail.files.items.len().clamp(PAGE, MAX_PAGE);
-    let generation = detail.files.reload();
-    vec![fetch_files(
-        ctx.api,
-        detail.hash.clone(),
-        None,
-        limit,
-        generation,
-    )]
+    let request = detail.files.reload();
+    vec![fetch_files(ctx.api, detail.hash.clone(), request)]
 }
 
 fn more_files(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -1141,25 +1151,18 @@ fn more_files(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     match detail.files.begin_more() {
-        Some((cursor, generation)) => vec![fetch_files(
-            ctx.api,
-            detail.hash.clone(),
-            Some(cursor),
-            PAGE,
-            generation,
-        )],
+        Some(request) => vec![fetch_files(ctx.api, detail.hash.clone(), request)],
         None => Vec::new(),
     }
 }
 
-fn fetch_files(
-    api: &Api,
-    hash: String,
-    cursor: Option<String>,
-    limit: usize,
-    generation: u64,
-) -> Effect {
+fn fetch_files(api: &Api, hash: String, request: PageRequest) -> Effect {
     let api = api.clone();
+    let PageRequest {
+        cursor,
+        limit,
+        generation,
+    } = request;
     Effect::new(async move {
         let first = cursor.is_none();
         let params = crate::api::generated::ListTorrentFilesParams {
@@ -1804,6 +1807,74 @@ mod tests {
         });
     }
 
+    /// `n` torrents from the `from`th, in infohash order, continuing at
+    /// `next`: lists longer than `page`'s `u8` range reaches.
+    fn wide_page(from: usize, n: usize, next: Option<&str>) -> types::TorrentPage {
+        let items: Vec<_> = (from..from + n)
+            .map(|i| {
+                let mut row = summary(1, "acct_a", "seeding");
+                row["infohash"] = json!(format!("{i:040x}"));
+                row
+            })
+            .collect();
+        testing::from_json(json!({"items": items, "next_cursor": next}))
+    }
+
+    #[test]
+    fn a_refresh_past_1000_rows_keeps_them_and_the_selection_while_it_re_pages() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut state = State::default();
+        testing::with_api(&daemon.api(), None, |ctx| {
+            state.profiles_loading = true;
+            let _ = refresh(&mut state, ctx);
+            let msg = page_msg(&state, true, Ok(wide_page(0, 1000, Some("k1000"))));
+            update(&mut state, msg, ctx);
+            let msg = page_msg(&state, false, Ok(wide_page(1000, 500, Some("k1500"))));
+            update(&mut state, msg, ctx);
+            assert_eq!(state.list.items.len(), 1500);
+            update(&mut state, Msg::Move(Move::Top), ctx);
+            for _ in 0..140 {
+                update(&mut state, Msg::Move(Move::PageDown), ctx);
+            }
+            assert_eq!(state.selected, 1400);
+            let chosen = format!("{:040x}", 1400);
+
+            let effects = refresh(&mut state, ctx);
+            testing::run(effects);
+            assert_eq!(
+                daemon.lines(),
+                ["GET /v1/torrents?limit=1000"],
+                "one request's reach"
+            );
+            let msg = page_msg(&state, true, Ok(wide_page(0, 1000, Some("k1000"))));
+            let effects = update(&mut state, msg, ctx);
+            assert_eq!(state.list.items.len(), 1500, "not cut to the first page");
+            assert_eq!(state.selected, 1400, "nor the selection to row 999");
+            testing::run(effects);
+            assert_eq!(
+                daemon.lines()[1],
+                "GET /v1/torrents?cursor=k1000&limit=500",
+                "pages on towards the 1500 loaded"
+            );
+
+            // A key while it re-pages moves among the rows still shown.
+            update(&mut state, Msg::Move(Move::Down), ctx);
+            assert_eq!(state.selected, 1401);
+            let chosen_now = format!("{:040x}", 1401);
+            assert_ne!(chosen, chosen_now);
+
+            let msg = page_msg(&state, false, Ok(wide_page(1000, 500, Some("k1500"))));
+            update(&mut state, msg, ctx);
+            assert!(!state.list.loading);
+            assert_eq!(state.list.items.len(), 1500);
+            assert_eq!(
+                selected_summary(&state).unwrap().infohash,
+                chosen_now,
+                "the torrent the operator moved to, after the reload"
+            );
+        });
+    }
+
     #[test]
     fn a_page_answering_an_older_reload_is_dropped() {
         let mut state = loaded(1..4, None);
@@ -1982,13 +2053,24 @@ mod tests {
             update(&mut state, msg, ctx);
             assert!(capturing(&state), "q and digits are typed into the field");
             keys(&mut state, ctx, "ACCT_B");
-            assert_eq!(state.filter, "acct_b");
-            assert_eq!(visible(&state).len(), 2, "3 and 6");
+            assert_eq!(state.filter, "ACCT_B", "as typed");
+            assert_eq!(visible(&state).len(), 2, "3 and 6, matched in any case");
             assert_eq!(selected_summary(&state).unwrap().infohash, hash(3));
             let msg = on_key(&state, testing::key(KeyCode::Enter)).unwrap();
             update(&mut state, msg, ctx);
             assert!(!capturing(&state));
-            assert_eq!(state.filter, "acct_b", "Enter keeps the filter");
+            assert_eq!(state.filter, "ACCT_B", "Enter keeps the filter");
+            update(&mut state, Msg::StartFilter, ctx);
+            assert_eq!(
+                state.filter_input.as_ref().unwrap().value(),
+                "ACCT_B",
+                "reopening the field shows what was typed, not a lowercased copy"
+            );
+            update(
+                &mut state,
+                Msg::FilterKey(testing::key(KeyCode::Enter)),
+                ctx,
+            );
 
             update(&mut state, Msg::StartFilter, ctx);
             update(&mut state, Msg::FilterKey(testing::key(KeyCode::Esc)), ctx);
@@ -2653,7 +2735,7 @@ mod tests {
         let path = dir.path().join("big.torrent");
         std::fs::File::create(&path)
             .unwrap()
-            .set_len(add::MAX_METAINFO + 1)
+            .set_len(caps::MAX_METAINFO + 1)
             .unwrap();
         let request = add::Request {
             profile: "acct_a".into(),

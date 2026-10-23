@@ -202,8 +202,9 @@ fn problem(status: u16, slug: &str, detail: Option<&str>) -> Failure {
 
 // Driving.
 
-/// What reloading the plan list and plan 8 sends.
-const PLAN_RELOAD: [&str; 2] = ["GET /v1/pool/plans", "GET /v1/pool/plans/8"];
+/// What reloading the plan list and plan 8 sends: every page request names
+/// its size.
+const PLAN_RELOAD: [&str; 2] = ["GET /v1/pool/plans?limit=100", "GET /v1/pool/plans/8"];
 
 /// Apply `msg` under a daemon with the pool configured and `mutations` as
 /// given, returning how many effects it asked for.
@@ -653,6 +654,78 @@ fn a_tree_refresh_keeps_the_selected_entry() {
     );
 }
 
+/// `n` directory entries from the `from`th, in name order, continuing at
+/// `next`.
+fn wide_tree(from: usize, n: usize, next: Option<&str>) -> types::TreePage {
+    let items: Vec<_> = (from..from + n)
+        .map(|i| {
+            let name = format!("d{i:05}");
+            entry(&name, &name, true, &["adopted"])
+        })
+        .collect();
+    testing::from_json(json!({"items": items, "next_cursor": next}))
+}
+
+#[test]
+fn a_tree_refresh_past_1000_entries_keeps_them_and_the_selection() {
+    let mut state = with_overview();
+    send(&mut state, Msg::OpenRoot, true);
+    let tree_page = |state: &State, first: bool, page: types::TreePage| {
+        Msg::Tree(tree::Msg::Page {
+            generation: state.tree.entries.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    let msg = tree_page(&state, true, wide_tree(0, 1000, Some("k1000")));
+    send(&mut state, msg, true);
+    let msg = tree_page(&state, false, wide_tree(1000, 300, None));
+    send(&mut state, msg, true);
+    state.tree.selected = 1200;
+
+    let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+    let server = testing::server(true, true);
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| refresh(&mut state, ctx));
+    testing::run(effects);
+    assert_eq!(daemon.lines(), ["GET /v1/pool/roots/1/tree?limit=1000"]);
+
+    let msg = tree_page(&state, true, wide_tree(0, 1000, Some("k1000")));
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| {
+        update(&mut state, msg, ctx)
+    });
+    assert_eq!(
+        state.tree.entries.items.len(),
+        1300,
+        "kept while it re-pages"
+    );
+    assert_eq!(state.tree.selected, 1200, "not clamped to row 999");
+    testing::run(effects);
+    assert_eq!(
+        daemon.lines()[1],
+        "GET /v1/pool/roots/1/tree?cursor=k1000&limit=300"
+    );
+    let msg = tree_page(&state, false, wide_tree(1000, 300, None));
+    send(&mut state, msg, true);
+    assert!(!state.tree.entries.loading);
+    assert_eq!(state.tree.entries.items.len(), 1300);
+    assert_eq!(state.tree.entries.items[state.tree.selected].name, "d01200");
+}
+
+#[test]
+fn a_list_that_shrank_scrolls_back_to_fill_its_window() {
+    let offset = std::cell::Cell::new(50);
+    assert_eq!(
+        scroll(&offset, 9, 20, 10),
+        0,
+        "ten rows fit a twenty-row window from the top"
+    );
+    assert_eq!(offset.get(), 0);
+    let offset = std::cell::Cell::new(50);
+    assert_eq!(scroll(&offset, 39, 20, 40), 20, "the last twenty rows");
+    let offset = std::cell::Cell::new(5);
+    assert_eq!(scroll(&offset, 10, 20, 100), 5, "steady, not re-centred");
+}
+
 // The library.
 
 #[test]
@@ -742,6 +815,75 @@ fn the_library_pages_and_a_refresh_keeps_the_selected_torrent() {
         true,
     );
     assert_eq!(state.library.selected_infohash(), selected);
+}
+
+/// `n` library torrents from the `from`th, in infohash order, continuing at
+/// `next`.
+fn wide_library(from: usize, n: usize, next: Option<&str>) -> types::PoolTorrentPage {
+    let mut page = torrents(1, next);
+    let row = page.items.remove(0);
+    page.items = (from..from + n)
+        .map(|i| types::PoolTorrent {
+            infohash: format!("{i:040x}"),
+            ..row.clone()
+        })
+        .collect();
+    page
+}
+
+#[test]
+fn a_library_refresh_past_1000_rows_keeps_them_and_the_selection() {
+    let mut state = with_library(0, None);
+    let library_page = |state: &State, first: bool, page: types::PoolTorrentPage| {
+        Msg::Library(library::Msg::Page {
+            generation: state.library.items.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    // Loaded as the operator scrolled: two pages, 1800 rows.
+    let msg = library_page(&state, true, wide_library(0, 1000, Some("k1000")));
+    send(&mut state, msg, true);
+    let msg = library_page(&state, false, wide_library(1000, 800, Some("k1800")));
+    send(&mut state, msg, true);
+    assert_eq!(state.library.items.items.len(), 1800);
+    state.library.selected = 1700;
+
+    let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+    let server = testing::server(true, true);
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| refresh(&mut state, ctx));
+    testing::run(effects);
+    assert_eq!(daemon.lines(), ["GET /v1/pool/torrents?limit=1000"]);
+
+    let msg = library_page(&state, true, wide_library(0, 1000, Some("k1000")));
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| {
+        update(&mut state, msg, ctx)
+    });
+    assert_eq!(
+        state.library.items.items.len(),
+        1800,
+        "kept while it re-pages"
+    );
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 0);
+    assert_eq!(
+        state.library.selected, 1701,
+        "a key moves, not clamped to 999"
+    );
+    let chosen = state.library.selected_infohash();
+    testing::run(effects);
+    assert_eq!(
+        daemon.lines()[1],
+        "GET /v1/pool/torrents?cursor=k1000&limit=800"
+    );
+    let msg = library_page(&state, false, wide_library(1000, 800, Some("k1800")));
+    send(&mut state, msg, true);
+    assert!(!state.library.items.loading);
+    assert_eq!(state.library.items.items.len(), 1800);
+    assert_eq!(
+        state.library.selected_infohash(),
+        chosen,
+        "the selection follows the torrent the operator moved to during the reload"
+    );
 }
 
 #[test]

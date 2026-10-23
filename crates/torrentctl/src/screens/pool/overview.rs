@@ -445,7 +445,7 @@ fn draw_roots(
         ],
     ));
     let visible = block.inner(area).height.saturating_sub(1) as usize;
-    let offset = scroll(&state.offset, state.selected, visible);
+    let offset = scroll(&state.offset, state.selected, visible, pool.roots.len());
     let mut table_state = TableState::default()
         .with_offset(offset)
         .with_selected(Some(state.selected));

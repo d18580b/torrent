@@ -79,19 +79,86 @@ pub fn placeholder(frame: &mut Frame, area: Rect, theme: &Theme, text: &str, ton
     );
 }
 
-/// One page-at-a-time collection, loaded by following `next_cursor`.
+/// What the daemon allows one request, in one place. Each is the daemon's own
+/// limit restated: asking past one is refused, so the client holds itself to
+/// it before sending.
+pub mod caps {
+    /// Rows a list asks for per page when paging on, and the least a reload
+    /// asks for. The daemon's `DEFAULT_LIMIT`.
+    pub const PAGE: usize = 100;
+    /// The most rows one list request may ask for: the daemon's `MAX_LIMIT`
+    /// on every paged listing (`limit` is `1..=1000`). A reload holding more
+    /// than this re-reads them in several requests; see [`super::Paged`].
+    pub const PAGE_MAX: usize = 1000;
+    /// The most infohashes one adopt or verify request may name: the
+    /// daemon's `MAX_INFOHASHES`.
+    pub const MAX_BATCH: usize = 1000;
+    /// The largest `.torrent` the daemon takes, decoded: its
+    /// `MAX_TORRENT_FILE_BYTES`.
+    pub const MAX_METAINFO: u64 = 64 * 1024 * 1024;
+}
+
+/// One request for a page: from `cursor` (the first page when `None`), at
+/// most `limit` rows, tagged with the `generation` it answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRequest {
+    pub cursor: Option<String>,
+    pub limit: usize,
+    pub generation: u64,
+}
+
+/// What [`Paged::receive`] made of a page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum Received {
+    /// The page answered an older reload, and was dropped.
+    Stale,
+    /// A reload has not yet re-read as many rows as were loaded: fetch this
+    /// next. What is shown is unchanged until it has.
+    Continue(PageRequest),
+    /// [`Paged::items`] changed: settle the selection against it.
+    Settled,
+}
+
+/// A list loaded a page at a time by following `next_cursor`, and reloaded
+/// without losing the operator's place.
+///
+/// The policy every list screen shares:
+///
+/// - **Paging on.** [`Paged::wants_more`] asks for the next page of
+///   [`caps::PAGE`] rows once the selection nears the end of what is loaded.
+/// - **Reloading.** [`Paged::reload`] re-reads from the first page as many
+///   rows as are loaded — rounded up to a whole page, at most
+///   [`caps::PAGE_MAX`] a request — following the cursor until it has them
+///   all or the list ends. What is shown stays as it was until then, so a
+///   refresh neither shrinks the list nor moves the selection, at any size;
+///   a failed reload leaves it as it was.
+/// - **Staleness.** Each reload bumps [`Paged::generation`]; a page tagged
+///   with an older one is dropped.
 #[derive(Debug, Clone)]
 pub struct Paged<T> {
+    /// What is shown.
     pub items: Vec<T>,
-    /// Where the next page starts; `None` once everything is loaded.
+    /// Where the page after [`Paged::items`] starts; `None` once the last
+    /// page is loaded.
     pub next_cursor: Option<String>,
-    /// Whether everything has been loaded at least once.
+    /// Whether the last page is loaded: `next_cursor` is `None`.
     pub complete: bool,
+    /// A request is in flight.
     pub loading: bool,
+    /// Why the last request failed, until one succeeds.
     pub error: Option<String>,
     /// Bumped on every reload, so a page answering an older reload is
     /// dropped rather than appended to a list it no longer belongs to.
     pub generation: u64,
+    /// The reload in flight: the rows it has re-read, and how many it wants.
+    refill: Option<Refill<T>>,
+}
+
+#[derive(Debug, Clone)]
+struct Refill<T> {
+    items: Vec<T>,
+    want: usize,
 }
 
 impl<T> Default for Paged<T> {
@@ -103,18 +170,43 @@ impl<T> Default for Paged<T> {
             loading: false,
             error: None,
             generation: 0,
+            refill: None,
         }
     }
 }
 
+/// How many rows to ask for when `want` are wanted: a whole number of
+/// pages, within one request's reach.
+fn limit_for(want: usize) -> usize {
+    (want.div_ceil(caps::PAGE) * caps::PAGE).clamp(caps::PAGE, caps::PAGE_MAX)
+}
+
 impl<T> Paged<T> {
-    /// Start over from the first page; returns the generation to tag the
-    /// request with.
-    pub fn reload(&mut self) -> u64 {
+    /// Forget what is loaded: the list now means something else (another
+    /// filter, another directory). Follow with [`Paged::reload`].
+    pub fn reset(&mut self) {
+        self.items.clear();
+        self.next_cursor = None;
+        self.complete = false;
+        self.refill = None;
+    }
+
+    /// Start over from the first page, re-reading as many rows as are
+    /// loaded; returns the first request.
+    pub fn reload(&mut self) -> PageRequest {
         self.generation += 1;
         self.loading = true;
         self.error = None;
-        self.generation
+        let want = self.items.len();
+        self.refill = Some(Refill {
+            items: Vec::new(),
+            want,
+        });
+        PageRequest {
+            cursor: None,
+            limit: limit_for(want),
+            generation: self.generation,
+        }
     }
 
     /// Whether another page should be fetched for a view whose selection is
@@ -123,34 +215,69 @@ impl<T> Paged<T> {
         !self.loading && self.next_cursor.is_some() && selected + 20 >= self.items.len()
     }
 
-    /// Start fetching the next page; returns the cursor and generation.
-    pub fn begin_more(&mut self) -> Option<(String, u64)> {
+    /// Start fetching the page after what is loaded; `None` while a request
+    /// is in flight or when there is none.
+    pub fn begin_more(&mut self) -> Option<PageRequest> {
+        if self.loading {
+            return None;
+        }
         let cursor = self.next_cursor.clone()?;
         self.loading = true;
-        Some((cursor, self.generation))
+        Some(PageRequest {
+            cursor: Some(cursor),
+            limit: caps::PAGE,
+            generation: self.generation,
+        })
     }
 
-    /// Take in a page answering `generation`. `first` replaces what is
-    /// loaded; any later page appends.
-    pub fn receive(&mut self, generation: u64, first: bool, items: Vec<T>, next: Option<String>) {
+    /// Take in a page answering `generation`; `first` when it is a first
+    /// page. A reload's pages are gathered aside and replace what is shown
+    /// only once they hold as many rows as it did, or the list ends; any
+    /// other page appends.
+    pub fn receive(
+        &mut self,
+        generation: u64,
+        first: bool,
+        items: Vec<T>,
+        next: Option<String>,
+    ) -> Received {
         if generation != self.generation {
-            return;
+            return Received::Stale;
         }
-        if first {
-            self.items = items;
-        } else {
-            self.items.extend(items);
+        match self.refill.as_mut() {
+            Some(refill) => {
+                if first {
+                    refill.items = items;
+                } else {
+                    refill.items.extend(items);
+                }
+                let short = refill.want.saturating_sub(refill.items.len());
+                if let (Some(cursor), true) = (&next, short > 0) {
+                    return Received::Continue(PageRequest {
+                        cursor: Some(cursor.clone()),
+                        limit: limit_for(short),
+                        generation,
+                    });
+                }
+                self.items = std::mem::take(&mut refill.items);
+                self.refill = None;
+            }
+            None if first => self.items = items,
+            None => self.items.extend(items),
         }
         self.next_cursor = next;
         self.complete = self.next_cursor.is_none();
         self.loading = false;
         self.error = None;
+        Received::Settled
     }
 
-    /// A page for `generation` failed.
+    /// A page for `generation` failed. A reload in flight is abandoned and
+    /// what is shown kept.
     pub fn fail(&mut self, generation: u64, error: String) {
         if generation == self.generation {
             self.loading = false;
+            self.refill = None;
             self.error = Some(error);
         }
     }
@@ -283,18 +410,135 @@ mod tests {
     #[test]
     fn a_page_from_an_old_reload_is_dropped() {
         let mut p: Paged<u32> = Paged::default();
-        let old = p.reload();
-        let new = p.reload();
-        p.receive(old, true, vec![1], None);
+        let old = p.reload().generation;
+        let new = p.reload().generation;
+        assert_eq!(p.receive(old, true, vec![1], None), Received::Stale);
         assert!(p.items.is_empty() && p.loading, "stale page ignored");
-        p.receive(new, true, vec![1, 2], Some("c".into()));
+        assert_eq!(
+            p.receive(new, true, vec![1, 2], Some("c".into())),
+            Received::Settled
+        );
         assert_eq!(p.items, [1, 2]);
         assert!(!p.complete && p.wants_more(1));
-        let (cursor, generation) = p.begin_more().unwrap();
-        assert_eq!(cursor, "c");
+        let more = p.begin_more().unwrap();
+        assert_eq!(more.cursor.as_deref(), Some("c"));
+        assert_eq!(more.limit, caps::PAGE);
         assert!(!p.wants_more(1), "one page at a time");
-        p.receive(generation, false, vec![3], None);
+        assert!(p.begin_more().is_none(), "nor a second request in flight");
+        assert_eq!(
+            p.receive(more.generation, false, vec![3], None),
+            Received::Settled
+        );
         assert_eq!(p.items, [1, 2, 3]);
         assert!(p.complete && !p.wants_more(2));
+    }
+
+    /// `n` rows, numbered from `from`.
+    fn rows(from: usize, n: usize) -> Vec<usize> {
+        (from..from + n).collect()
+    }
+
+    /// A list of `n` rows, loaded.
+    fn loaded(n: usize) -> Paged<usize> {
+        let mut p = Paged::default();
+        let first = p.reload();
+        assert_eq!(
+            p.receive(first.generation, true, rows(0, n), Some("more".into())),
+            Received::Settled
+        );
+        p
+    }
+
+    #[test]
+    fn a_reload_past_one_request_pages_up_to_what_was_loaded_and_keeps_it_meanwhile() {
+        let mut p = loaded(2500);
+        let first = p.reload();
+        assert_eq!(first.cursor, None);
+        assert_eq!(first.limit, caps::PAGE_MAX, "one request's reach");
+
+        let next = p.receive(first.generation, true, rows(0, 1000), Some("k1000".into()));
+        let Received::Continue(next) = next else {
+            panic!("pages on towards the 2500 loaded: {next:?}");
+        };
+        assert_eq!(next.cursor.as_deref(), Some("k1000"));
+        assert_eq!(next.limit, caps::PAGE_MAX);
+        assert_eq!(
+            p.items.len(),
+            2500,
+            "what is shown stays until it is all re-read"
+        );
+        assert!(p.loading && !p.wants_more(2499));
+
+        let last = p.receive(
+            next.generation,
+            false,
+            rows(1000, 1000),
+            Some("k2000".into()),
+        );
+        let Received::Continue(last) = last else {
+            panic!("500 short still: {last:?}");
+        };
+        assert_eq!(last.limit, 500, "the shortfall, as whole pages");
+        assert_eq!(
+            p.receive(
+                last.generation,
+                false,
+                rows(2000, 500),
+                Some("k2500".into())
+            ),
+            Received::Settled
+        );
+        assert_eq!(p.items, rows(0, 2500));
+        assert_eq!(
+            p.next_cursor.as_deref(),
+            Some("k2500"),
+            "paging on continues"
+        );
+        assert!(!p.loading && !p.complete);
+    }
+
+    #[test]
+    fn a_reload_of_a_list_that_shrank_settles_at_its_end() {
+        let mut p = loaded(1500);
+        let first = p.reload();
+        assert_eq!(
+            p.receive(first.generation, true, rows(0, 600), None),
+            Received::Settled
+        );
+        assert_eq!(p.items.len(), 600);
+        assert!(p.complete);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_what_is_shown() {
+        let mut p = loaded(1500);
+        let first = p.reload();
+        assert!(matches!(
+            p.receive(first.generation, true, rows(0, 1000), Some("k".into())),
+            Received::Continue(_)
+        ));
+        p.fail(first.generation, "boom".into());
+        assert_eq!(p.items, rows(0, 1500));
+        assert_eq!(p.error.as_deref(), Some("boom"));
+        assert!(!p.loading);
+        let again = p.reload();
+        assert_eq!(again.limit, caps::PAGE_MAX);
+        assert_eq!(
+            p.receive(again.generation, true, rows(7, 1000), None),
+            Received::Settled,
+            "a fresh reload starts its own gathering, not the abandoned one's"
+        );
+        assert_eq!(p.items, rows(7, 1000));
+    }
+
+    #[test]
+    fn a_reload_asks_for_whole_pages() {
+        let mut p: Paged<usize> = Paged::default();
+        assert_eq!(p.reload().limit, caps::PAGE, "nothing loaded: one page");
+        let mut p = loaded(250);
+        assert_eq!(p.reload().limit, 300);
+        p.reset();
+        assert!(p.items.is_empty() && p.next_cursor.is_none());
+        assert_eq!(p.reload().limit, caps::PAGE);
     }
 }
