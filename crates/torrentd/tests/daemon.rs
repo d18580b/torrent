@@ -590,7 +590,16 @@ fn a_second_daemon_of_the_same_uid_on_another_state_dir_exits_ex_config() {
     let first = Running(spawn_daemon(first_dir.path(), free_port(), addr));
     wait_healthy(addr);
 
+    // At info, so the second's output shows how far its boot got: a boot
+    // that reaches the HTTP bind logs `HTTP server listening`, which the
+    // successful boot at the end of this test proves.
     let cfg = write_config(second_dir.path(), free_port(), &second_addr);
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        text.replace("log_level = \"warn\"\n", "log_level = \"info\"\n"),
+    )
+    .unwrap();
     let (code, out) = run_to_exit(&cfg, false, None);
     assert_eq!(code, 78, "a same-uid second daemon exits EX_CONFIG: {out}");
     let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(second_dir.path()).unwrap());
@@ -600,24 +609,102 @@ fn a_second_daemon_of_the_same_uid_on_another_state_dir_exits_ex_config() {
         "the refusal names the socket and the running daemon's pid: {out}"
     );
     assert!(
-        TcpStream::connect(&second_addr).is_err(),
-        "the second daemon got as far as binding its HTTP port"
+        out.contains("starting torrentd"),
+        "the second's info lines reach its output: {out}"
+    );
+    assert!(
+        !out.contains("HTTP server listening"),
+        "the second daemon got as far as binding its HTTP port: {out}"
     );
 
     // The first is untouched and still serving.
     assert_eq!(http(addr, "GET", "/healthz", None).0, 200);
     first.stop();
 
-    // With the first gone the name is free, and the same config boots.
-    let second = Running(
+    // With the first gone the name is free, and the same config boots, as
+    // far as the HTTP bind the refused one never logged.
+    let mut second = Running(
         Command::new(env!("CARGO_BIN_EXE_torrentd"))
             .arg("--config")
             .arg(&cfg)
+            .env_remove("RUST_LOG")
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn second daemon"),
     );
+    // Read on its own thread, so a full pipe cannot stall the daemon.
+    let mut stdout = second.0.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).unwrap();
+        out
+    });
     wait_healthy(&second_addr);
     second.stop();
+    let out = reader.join().unwrap();
+    assert!(
+        out.contains("HTTP server listening"),
+        "a boot that binds its HTTP port logs it: {out}"
+    );
+}
+
+/// The table lock is held until the teardown has removed the table, not only
+/// while the daemon serves: a second start under the same uid while the
+/// first is still draining after a SIGTERM is refused the same way. A request
+/// whose body never arrives holds the first's HTTP drain to its 10 s bound,
+/// which is the window the second start lands in. A lock released when the
+/// shutdown begins, rather than with the daemon's last act, lets the second
+/// boot replace or remove the table the first's teardown is about to remove.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_same_uid_start_during_the_first_daemon_s_shutdown_drain_exits_ex_config() {
+    let addr = free_http();
+    let addr = addr.as_str();
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    // Killed on a panic: left running, it would hold the lock against every
+    // test after this one.
+    let mut first = Running(spawn_daemon(first_dir.path(), free_port(), addr));
+    wait_healthy(addr);
+
+    // In flight until the drain gives up on it.
+    let mut stuck = TcpStream::connect(addr).expect("connect");
+    stuck
+        .write_all(
+            b"POST /v1/torrents HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+              Content-Length: 4096\r\n\r\n{\"profile_id\":",
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    sigterm(&first.0);
+    // The listener closes when the graceful shutdown begins: from then on
+    // the first is draining.
+    poll(
+        "the first daemon's listener to close",
+        Duration::from_secs(5),
+        || TcpStream::connect(addr).is_err().then_some(()),
+    );
+
+    let cfg = write_config(second_dir.path(), free_port(), &free_http());
+    let (code, out) = run_to_exit(&cfg, false, None);
+    assert!(
+        matches!(first.0.try_wait(), Ok(None)),
+        "the first daemon exited before the second start, {:?} after its SIGTERM",
+        started.elapsed()
+    );
+    assert_eq!(
+        code, 78,
+        "a same-uid start during the first's drain exits EX_CONFIG: {out}"
+    );
+    assert!(
+        out.contains(&format!("pid {}", first.0.id())),
+        "the refusal names the draining daemon's pid: {out}"
+    );
+
+    assert_exits_zero(&mut first.0, Duration::from_secs(45));
+    drop(stuck);
 }
 
 /// Graceful shutdown must stay graceful under load: with many torrents added,
