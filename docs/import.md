@@ -307,7 +307,10 @@ and `.torrent` adds in turn:
   `torrent_dir` at boot with no resume file beside it, is added `paused`, and
   the queue resumes it, which starts its first check, once a slot is free.
   Dropping thousands of `.torrent` files into `torrent_dir` before a restart
-  therefore checks them a slot at a time.
+  therefore checks them a slot at a time. Name each one
+  `<infohash>.torrent`, with the info-hash in 40 lower-case hex
+  digits: a boot skips any other name with a warning and loads nothing from
+  it ([operations.md](operations.md#what-is-in-the-state-directory)).
 - The disk-error retry takes a slot before it resumes or re-checks a torrent,
   and where none is free looks again a minute later.
 
