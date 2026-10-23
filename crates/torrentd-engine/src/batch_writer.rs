@@ -947,16 +947,40 @@ mod tests {
         assert!(dir_fsync_errors() >= before + 2, "the repeat counts too");
     }
 
+    /// Waits for the write itself to appear rather than for the queue to
+    /// empty: a batch's `syncfs` can outlast any short bound on a loaded host,
+    /// and a bound that expires silently would read a file not yet renamed.
+    /// A failed write reaches the hook, so it fails the test with its cause
+    /// instead of running out the clock.
     #[test]
     fn the_thread_lands_writes_without_being_asked() {
         let dir = tempdir().unwrap();
-        let w = BatchWriter::spawn("test-writer", None);
+        let failed: Arc<Mutex<Option<String>>> = Arc::default();
+        let hook: WriteErrorHook = {
+            let failed = Arc::clone(&failed);
+            Arc::new(move |_, _, e| *failed.lock() = Some(e.to_string()))
+        };
+        let w = BatchWriter::spawn("test-writer", Some(hook));
         let path = dir.path().join("a.resume");
         w.enqueue(path.clone(), &ProfileId::new("p"), &ih(1), b"bg");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while w.pending_len() > 0 && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            // A rename is atomic: the file is absent or holds every byte.
+            if let Ok(got) = fs::read(&path) {
+                assert_eq!(got, b"bg");
+                break;
+            }
+            if let Some(e) = failed.lock().take() {
+                panic!("the queued write failed: {e}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} not written within 60s; {} still queued, steps: {:?}",
+                path.display(),
+                w.pending_len(),
+                steps_under(dir.path()),
+            );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(fs::read(&path).unwrap(), b"bg");
     }
 }
