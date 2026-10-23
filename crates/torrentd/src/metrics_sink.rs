@@ -408,7 +408,7 @@ pub const CATALOGUE: &[Series] = catalogue! {
          for the loaded torrents to reach the state map and left interrupted plans applying.";
     "pool_scan_errors_total" Counter Daemon ("kind": &["walk", "stat", "path", "read", "parse"]) Zero =>
         "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or \
-         unparseable .torrent files.";
+         unparseable .torrent files and .fastresume sidecars.";
     "pool_verify_completed_total" Counter Daemon Zero => "Adopted torrents that verified and are seeding.";
     "pool_verify_failed_total" Counter Daemon Zero => "Adopted torrents whose verification failed or was dropped.";
     "pool_recheck_dropped_total" Counter Daemon

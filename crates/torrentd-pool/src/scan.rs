@@ -174,6 +174,9 @@ pub fn scan_library(
 ) -> Result<ScanStats, PoolError> {
     let mut stats = ScanStats::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // `read` and `parse` errors that were a sidecar's, whose torrent was
+    // still seen.
+    let mut sidecar_errors = 0u64;
     if !library_dir.exists() {
         warn!(
             target: "torrentd_pool::scan",
@@ -231,14 +234,37 @@ pub fn scan_library(
             continue;
         };
 
+        let infohash = best.to_hex();
         let fr_path = path.with_extension("fastresume");
         let (fastresume_path, hints) = if fr_path.is_file() {
-            (Some(fr_path.clone()), fastresume::read_hints(&fr_path))
+            match fastresume::read_hints(&fr_path) {
+                Ok(hints) => (Some(fr_path), hints),
+                Err(e) => {
+                    warn!(target: "torrentd_pool::scan", path = %fr_path.display(), error.cause = %e, "unusable .fastresume");
+                    stats.note_error(e.kind());
+                    sidecar_errors += 1;
+                    // The torrent itself was read, so it stays in the index,
+                    // and what an earlier read of its sidecar recorded stands:
+                    // its save path, category and tags, and the file paths
+                    // `mapped_files` gave. Indexed without them, renamed
+                    // payload would read as missing, and as orphans.
+                    if let Some(mut known) = store.torrent(&infohash)? {
+                        known.source_path = path.clone();
+                        known.fastresume_path = Some(fr_path);
+                        store.upsert_torrent(&known, now_secs())?;
+                        stats.torrents_indexed += 1;
+                        seen.insert(infohash);
+                        continue;
+                    }
+                    // A torrent the index has never held has nothing to keep,
+                    // and is indexed from its `.torrent` alone.
+                    (Some(fr_path), fastresume::ResumeHints::default())
+                }
+            }
         } else {
             (None, fastresume::ResumeHints::default())
         };
 
-        let infohash = best.to_hex();
         let torrent = PoolTorrent {
             infohash: infohash.clone(),
             infohash_v1: meta.infohash_v1.map(|h| h.to_hex()),
@@ -293,11 +319,13 @@ pub fn scan_library(
     // subdirectory would otherwise drop every torrent under it, and a
     // `.torrent` that is present but does not parse — truncated by a copy,
     // or corrupted — names no info-hash, so its torrent would be dropped
-    // with its claims and its payload offered up as orphans.
+    // with its claims and its payload offered up as orphans. A sidecar that
+    // fails hides no torrent, so its error does not count here.
     let unseen = ["walk", "read", "parse"]
         .iter()
         .map(|k| stats.errors_by_kind.get(k).copied().unwrap_or(0))
-        .sum::<u64>();
+        .sum::<u64>()
+        - sidecar_errors;
     if unseen == 0 {
         let dropped = store.retain_torrents(&seen, loaded)?;
         if dropped > 0 {

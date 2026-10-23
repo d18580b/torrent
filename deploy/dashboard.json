@@ -456,7 +456,7 @@
       "id": 32,
       "type": "timeseries",
       "title": "Pool scan errors by kind",
-      "description": "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or unparseable .torrent files (TorrentdPoolScanErrors).",
+      "description": "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or unparseable .torrent files and .fastresume sidecars (TorrentdPoolScanErrors).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 85 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },

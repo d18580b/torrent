@@ -103,7 +103,9 @@ identified by the info-hash parsed from its contents.
 - the save path (`qBt-savePath`, else `save_path`), tried first when matching;
 - the category (`qBt-category`) and tags (`qBt-tags`), shown on
   `GET /v1/pool/torrents` and nothing else;
-- completion, from the `pieces` bitfield: every piece had, or not;
+- completion, from the `pieces` bitfield: one entry for each of the
+  `.torrent`'s pieces, every one had, or not. A bitfield of any other length
+  claims nothing, and its torrent is hashed;
 - renamed files (`mapped_files`) and the content layout
   (`qBt-contentLayout`), so payload qBittorrent renamed or laid out without
   its top folder is matched where it actually is;
@@ -111,6 +113,14 @@ identified by the info-hash parsed from its contents.
   `.torrent` without trackers and keep them only here. Both adoption paths
   announce to this list in place of the `.torrent`'s, so a tracker-less
   `.torrent` still adopts.
+
+A `.fastresume` that cannot be read, or is not bencode (a copy cut short, for
+example), is logged and counted as a scan error of kind `read` or `parse`.
+Its torrent stays in the index: a torrent indexed before keeps what an
+earlier scan read from the sidecar, renamed file paths included, and a new
+one is indexed from its `.torrent` alone. Adopting it hashes it, or, where
+the index holds its files anywhere but the `.torrent`'s own paths, is
+refused until the sidecar is recopied and the library rescanned.
 
 Check that `BT_backup` actually holds `.fastresume` files before you count on
 the fast path (`GET /v1/pool/torrents` shows `has_fastresume` per torrent).

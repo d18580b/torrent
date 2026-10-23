@@ -2676,10 +2676,25 @@ fn verify_add_params(
 /// data, which applies the list itself; the verify path adds from the
 /// `.torrent`, and without this the torrent announced to nothing — or, on a
 /// profile with `allowed_tracker_domains`, was refused.
+///
+/// A sidecar that cannot be read or parsed has no list to give, and the
+/// torrent announces to the `.torrent`'s own.
 fn previous_trackers(resume_path: Option<&std::path::Path>) -> Vec<Vec<String>> {
-    resume_path
-        .map(|p| torrentd_pool::fastresume::read_hints(p).trackers)
-        .unwrap_or_default()
+    let Some(p) = resume_path else {
+        return Vec::new();
+    };
+    match torrentd_pool::fastresume::read_hints(p) {
+        Ok(hints) => hints.trackers,
+        Err(e) => {
+            warn!(
+                target: "torrentd::pool",
+                path = %p.display(),
+                error.cause = %e,
+                "the previous client's resume data is unusable; adopting with the .torrent's trackers",
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// What pool adoption hands a session to seed a payload straight from resume
@@ -4815,6 +4830,9 @@ mod tests {
 
         // No `.fastresume`, or one with no trackers: none to announce to.
         assert!(super::previous_trackers(None).is_empty());
+        // Nor does a sidecar that cannot be parsed, or read.
+        assert!(resume("ll39:http://tracker.allowed.example/announce").is_empty());
+        assert!(super::previous_trackers(Some(&dir.path().join("gone.fastresume"))).is_empty());
         let none = resume("le");
         assert!(none.is_empty());
         let refusal = super::verify_guard(
