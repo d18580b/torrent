@@ -359,6 +359,11 @@ as `verify_queue_depth` and `verify_in_flight`.
   second). A
   queued re-hash also waits while the profile's fence is lifted, until the
   lift's paced resume reaches its torrent.
+- **A running scan** holds the pool index until it commits. Meanwhile no
+  waiting adoption is admitted and no adoption's or re-hash's verdict is
+  recorded; each keeps its place and its slot, and goes on once the scan
+  ends. Re-hashes and `.torrent` adds waiting for a slot are started as
+  usual.
 - **A re-hash paused while it checks** keeps its slot until the check ends,
   because libtorrent goes on with it once the torrent is resumed. Resume or
   remove the torrent to free the slot; otherwise it is freed after 24 hours.
