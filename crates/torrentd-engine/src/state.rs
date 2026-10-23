@@ -10,6 +10,8 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -302,6 +304,9 @@ pub struct RemovalSettled {
 #[derive(Debug)]
 pub struct StateMap {
     inner: DashMap<InfoHash, TorrentState>,
+    /// Bumped after every change to which torrents `inner` holds: each
+    /// insert, each replaced entry, each remove. See [`Self::generation`].
+    generation: AtomicU64,
     saves: Mutex<ResumeSaves>,
     /// `(next_attempt, infohash)` for every retry ever armed, earliest first.
     /// Entries go stale when a retry is re-armed or retired; `retries_due`
@@ -323,6 +328,7 @@ impl Default for StateMap {
     fn default() -> Self {
         Self {
             inner: DashMap::new(),
+            generation: AtomicU64::new(0),
             saves: Mutex::new(ResumeSaves::default()),
             retry_heap: Mutex::new(BinaryHeap::new()),
             removals: Mutex::new(HashMap::new()),
@@ -343,6 +349,22 @@ impl StateMap {
         self.inner.is_empty()
     }
 
+    /// A counter that moves on every insert, replacement, and removal of an
+    /// entry, and never moves back. O(1).
+    ///
+    /// Two equal readings mean no torrent was added, replaced, or removed in
+    /// between, which [`Self::len`] cannot say: one removal and one add leave
+    /// the length as it was. The bump follows the change, so a caller that
+    /// reads the counter and then reads the map sees at least every change
+    /// that counter reading counts.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Every info-hash currently loaded into a session.
     ///
     /// This is the authoritative answer to "what is this daemon serving right
@@ -356,6 +378,7 @@ impl StateMap {
     pub fn insert(&self, ih: InfoHash, state: TorrentState) {
         let armed = state.retry.as_ref().map(|r| r.next_attempt);
         self.inner.insert(ih, state);
+        self.changed();
         if let Some(at) = armed {
             self.retry_heap.lock().push(Reverse((at, ih.0)));
         }
@@ -374,7 +397,7 @@ impl StateMap {
     /// outlived, and is replaced, as an add has always replaced it.
     pub fn track_added(&self, handle: TorrentHandle, profile: &ProfileId, now: Instant) -> bool {
         use dashmap::mapref::entry::Entry;
-        match self.inner.entry(handle.infohash) {
+        let inserted = match self.inner.entry(handle.infohash) {
             Entry::Occupied(e) if e.get().handle == handle && e.get().profile_id == *profile => {
                 false
             }
@@ -386,7 +409,11 @@ impl StateMap {
                 e.insert(TorrentState::newly_added(handle, profile.clone(), now));
                 true
             }
+        };
+        if inserted {
+            self.changed();
         }
+        inserted
     }
 
     /// Remove `ih`'s entry if it is `profile`'s and, where `handle` is given,
@@ -402,11 +429,16 @@ impl StateMap {
         profile: &ProfileId,
         handle: Option<TorrentHandle>,
     ) -> Option<TorrentState> {
-        self.inner
+        let removed = self
+            .inner
             .remove_if(ih, |_, st| {
                 st.profile_id == *profile && handle.is_none_or(|h| h == st.handle)
             })
-            .map(|(_, v)| v)
+            .map(|(_, v)| v);
+        if removed.is_some() {
+            self.changed();
+        }
+        removed
     }
 
     /// Record that the session is being asked to remove `profile`'s torrent
@@ -1000,6 +1032,33 @@ mod tests {
         // q's own answer settles its save, once.
         assert!(m.note_resume_settled(&ih(3)));
         assert!(!m.note_resume_settled(&ih(3)));
+    }
+
+    /// One removal and one add leave the length as it was; the generation
+    /// moves on each, and not on a call that changes nothing.
+    #[test]
+    fn the_generation_moves_on_every_entry_change_and_only_then() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let p = ProfileId::new("p");
+        let (a, b) = (handle(1, 1), handle(2, 2));
+        let g0 = m.generation();
+        m.insert(a.infohash, TorrentState::newly_added(a, p.clone(), now));
+        let g1 = m.generation();
+        assert!(g1 > g0);
+        assert!(!m.track_added(a, &p, now), "already tracked");
+        assert!(m.remove(&a.infohash, &ProfileId::new("q"), None).is_none());
+        assert!(m.remove(&b.infohash, &p, None).is_none());
+        m.update(&a.infohash, |s| s.retry = None);
+        assert_eq!(m.generation(), g1, "a no-op moved the generation");
+
+        assert!(m.remove(&a.infohash, &p, Some(a)).is_some());
+        assert!(m.track_added(b, &p, now));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.generation(), g1 + 2, "a swap left the generation");
+        // The same info-hash under another handle is another torrent.
+        assert!(m.track_added(handle(3, 2), &p, now));
+        assert_eq!(m.generation(), g1 + 3);
     }
 
     #[test]

@@ -85,6 +85,9 @@ const REASON: &str = "wg-acct_c: no handshake";
 fn three(cov: &Arc<Coverage>) -> (Harness, Arc<MockEngine>, Arc<MockEngine>) {
     let (a, eng_a) = live("acct_a", ProfileStatus::Active);
     let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+    b.update_health(|hl| hl.fence_reason = Some("probe_unavailable"));
+    // A fence that has since lifted leaves its reason behind, unreported.
+    a.update_health(|hl| hl.fence_reason = Some("kill_switch"));
     let h = Harness::authed(cov, |s| {
         install(s, vec![a, b], vec![test_failed_profile("acct_c", REASON)]);
     });
@@ -132,8 +135,11 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         Value::Null,
         "present and null, never omitted"
     );
+    assert_eq!(items[0]["fence_reason"], Value::Null, "not fenced now");
     assert_eq!(items[1]["status"], "vpn_down");
+    assert_eq!(items[1]["fence_reason"], "probe_unavailable");
     assert_eq!(items[2]["status"], "failed");
+    assert_eq!(items[2]["fence_reason"], Value::Null);
     assert_eq!(items[2]["failure_reason"], REASON);
     assert_eq!(items[2]["tunnel_ip"], Value::Null);
     assert_eq!(items[2]["forwarded_port"], Value::Null);

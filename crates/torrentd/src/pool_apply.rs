@@ -335,9 +335,12 @@ impl DeleteScope {
 }
 
 /// What the between-steps re-check of [`check_index_accounts_for_live_state`]
-/// watches: the loaded set and the registry each changing size.
-fn ownership_size(pool: &PoolService, state: &StateMap) -> (usize, usize) {
-    (state.len(), pool.registry_len())
+/// watches: the change counters of the loaded set and of the registry.
+///
+/// Not their sizes: one torrent removed and another added leaves both sizes
+/// as they were, and the added torrent's files would then read as orphans.
+fn ownership_generation(pool: &PoolService, state: &StateMap) -> (u64, u64) {
+    (state.generation(), pool.registry_generation())
 }
 
 /// What `apply_inner` answers when a shutdown stops it before the claim. The
@@ -437,6 +440,13 @@ fn apply_inner(
     // load path and across a restart.
     let deletes = steps.iter().any(|s| s.op == ops::DELETE_FILE);
     let scope = DeleteScope::of(pool, &steps);
+    // A delete plan over a large subtree runs for minutes. A `POST /torrents`
+    // landing in that window makes the index incomplete again, so the
+    // precondition is re-established whenever the loaded set or the registry
+    // changes. Read before the check, so a change landing while it runs is
+    // one the first step's comparison sees. Both counters are O(1); the full
+    // check only runs when one has actually moved.
+    let mut owned_generation = ownership_generation(pool, state);
     if deletes {
         if let Err(msg) = check_index_accounts_for_live_state(pool, source, state, &scope) {
             // The boot re-drive refusing leaves a plan in `applying`, which
@@ -478,12 +488,6 @@ fn apply_inner(
         status: plan_status::APPLIED.to_string(),
     };
 
-    // A delete plan over a large subtree runs for minutes. A `POST /torrents`
-    // landing in that window makes the index incomplete again, so the
-    // precondition is re-established whenever the loaded set or the registry
-    // changes. Both sizes are O(1); the full check only runs when one has
-    // actually moved.
-    let mut owned_size = ownership_size(pool, state);
     let mut guards = DeleteGuards::default();
     let bucket = plan_trash_bucket(plan.id, plan.created_at);
 
@@ -577,10 +581,13 @@ fn apply_inner(
                 stopping = true;
             } else if deletes
                 && step.op == ops::DELETE_FILE
-                && ownership_size(pool, state) != owned_size
+                && ownership_generation(pool, state) != owned_generation
             {
+                // Read before the check, not after it: a change landing while
+                // the check runs is then one the next step's comparison sees.
+                let seen = ownership_generation(pool, state);
                 match check_index_accounts_for_live_state(pool, source, state, &scope) {
-                    Ok(()) => owned_size = ownership_size(pool, state),
+                    Ok(()) => owned_generation = seen,
                     Err(e) => {
                         // Stop, but as a *failed* plan rather than an early
                         // return: the plan is claimed at this point, and
@@ -2607,6 +2614,250 @@ mod tests {
             orphans.iter().filter(|o| o.exists()).count(),
             1,
             "the step after the torrent loaded still ran"
+        );
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        let failed = steps
+            .iter()
+            .find(|s| s.status == step_status::FAILED)
+            .expect("a failed step");
+        assert!(
+            failed.error.as_deref().is_some_and(
+                |e| e.contains("no claims in the index") && e.contains("lists T/a.bin")
+            ),
+            "{failed:?}"
+        );
+    }
+
+    /// The between-steps re-check watches change, not size: one torrent
+    /// removed and another loaded under the root in the same window leaves
+    /// the loaded set the size it was, and the new torrent's file must still
+    /// stop the plan rather than be trashed as an orphan.
+    #[test]
+    fn a_torrent_swapped_in_mid_plan_aborts_the_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [
+            write(&root, "junk/a.bin", 64),
+            write(&root, "junk/b.bin", 64),
+        ];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        assert_eq!(scope_of(&pool, plan_id).targets.len(), 2);
+
+        // `late` lists a file under the root; `leaving` lists one elsewhere,
+        // so it never blocks the plan. Both are in the same session.
+        let mock = Arc::new(torrentd_engine::MockEngine::new());
+        let (source, held) = unclaimed_loaded_on(mock.clone(), &root, Some(&["T/a.bin"]));
+        let late_hash = libtorrent_safe::InfoHash([0xee; 20]);
+        let late = held.get(&late_hash).unwrap();
+        let leaving_hash = libtorrent_safe::InfoHash([0xdd; 20]);
+        let leaving = mock.register_handle(leaving_hash);
+        mock.set_torrent_details(
+            leaving,
+            libtorrent_safe::TorrentDetails {
+                save_path: dir.path().join("other").to_string_lossy().into_owned(),
+                ..torrentd_engine::MockEngine::default_details()
+            },
+        );
+        mock.set_torrent_files(
+            leaving,
+            Some(vec![libtorrent_safe::TorrentFile {
+                index: 0,
+                path: "T/b.bin".to_owned(),
+                size: 64,
+                downloaded: 64,
+                priority: 4,
+            }]),
+        );
+        let profile = torrentd_engine::ProfileId::new("p");
+        let state = StateMap::new();
+        state.insert(
+            leaving_hash,
+            torrentd_engine::TorrentState::newly_added(
+                leaving,
+                profile.clone(),
+                std::time::Instant::now(),
+            ),
+        );
+        // Polled between steps: once the first step ran, swaps `leaving` out
+        // and `late` in, so the loaded set is one torrent before and after.
+        let stop = || {
+            if state.contains(&leaving_hash) && orphans.iter().any(|o| !o.exists()) {
+                state
+                    .remove(&leaving_hash, &profile, Some(leaving))
+                    .unwrap();
+                state.insert(late_hash, late.clone());
+                assert_eq!(state.len(), 1);
+            }
+            false
+        };
+        let out = apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (1, 1, "failed"),
+            "{out:?}"
+        );
+        assert_eq!(
+            orphans.iter().filter(|o| o.exists()).count(),
+            1,
+            "the step after the swap still ran"
+        );
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        let failed = steps
+            .iter()
+            .find(|s| s.status == step_status::FAILED)
+            .expect("a failed step");
+        assert!(
+            failed.error.as_deref().is_some_and(
+                |e| e.contains("no claims in the index") && e.contains("lists T/a.bin")
+            ),
+            "{failed:?}"
+        );
+    }
+
+    /// One session holding two unclaimed torrents: `late`, `0xee`, listing
+    /// `T/a.bin` under `root`, and `leaving`, `0xdd`, listing a file outside
+    /// it, so `leaving` alone never blocks a plan over `root`. Returns the
+    /// session, `late`'s state, and `leaving`'s hash and state.
+    fn late_and_leaving(
+        mock: Arc<torrentd_engine::MockEngine>,
+        dir: &Path,
+        root: &Path,
+    ) -> (
+        Arc<dyn AlertSource>,
+        torrentd_engine::TorrentState,
+        libtorrent_safe::InfoHash,
+        torrentd_engine::TorrentState,
+    ) {
+        let (source, held) = unclaimed_loaded_on(mock.clone(), root, Some(&["T/a.bin"]));
+        let late = held.get(&libtorrent_safe::InfoHash([0xee; 20])).unwrap();
+        let leaving_hash = libtorrent_safe::InfoHash([0xdd; 20]);
+        let leaving = mock.register_handle(leaving_hash);
+        mock.set_torrent_details(
+            leaving,
+            libtorrent_safe::TorrentDetails {
+                save_path: dir.join("other").to_string_lossy().into_owned(),
+                ..torrentd_engine::MockEngine::default_details()
+            },
+        );
+        mock.set_torrent_files(
+            leaving,
+            Some(vec![libtorrent_safe::TorrentFile {
+                index: 0,
+                path: "T/b.bin".to_owned(),
+                size: 64,
+                downloaded: 64,
+                priority: 4,
+            }]),
+        );
+        let leaving_state = torrentd_engine::TorrentState::newly_added(
+            leaving,
+            torrentd_engine::ProfileId::new("p"),
+            std::time::Instant::now(),
+        );
+        (source, late, leaving_hash, leaving_state)
+    }
+
+    /// Swaps `leaving` out and `late` in once `held`, a session read the
+    /// ownership check makes, is reached, then lets the read go on.
+    fn swap_during(
+        held: torrentd_engine::HeldCall,
+        state: &StateMap,
+        leaving: (libtorrent_safe::InfoHash, &torrentd_engine::TorrentState),
+        late: &torrentd_engine::TorrentState,
+    ) {
+        held.wait_entered();
+        state
+            .remove(&leaving.0, &leaving.1.profile_id, Some(leaving.1.handle))
+            .unwrap();
+        state.insert(libtorrent_safe::InfoHash([0xee; 20]), late.clone());
+        held.release();
+    }
+
+    /// The change counter is read before the initial ownership check, not
+    /// after it: a torrent swapped in while that check reads a session is
+    /// one it never saw, so the first delete step must re-check and fail
+    /// rather than trash anything.
+    #[test]
+    fn a_torrent_swapped_in_during_the_initial_check_fails_the_first_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [
+            write(&root, "junk/a.bin", 64),
+            write(&root, "junk/b.bin", 64),
+        ];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+
+        let mock = Arc::new(torrentd_engine::MockEngine::new());
+        let (source, late, leaving_hash, leaving) =
+            late_and_leaving(mock.clone(), dir.path(), &root);
+        let state = StateMap::new();
+        state.insert(leaving_hash, leaving.clone());
+        // The initial check's read of `leaving`'s session is the first.
+        let held = mock.hold_next("torrent_details");
+        let out = std::thread::scope(|s| {
+            let (st, lv, lt) = (&state, &leaving, &late);
+            s.spawn(move || swap_during(held, st, (leaving_hash, lv), lt));
+            apply(&pool, &source, &state, plan_id, &|| false).unwrap()
+        });
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (0, 1, "failed"),
+            "{out:?}"
+        );
+        assert!(
+            orphans.iter().all(|o| o.exists()),
+            "a delete ran against an ownership check the swap overtook"
+        );
+    }
+
+    /// The change counter is read before each between-steps re-check, not
+    /// after it: a torrent swapped in while that re-check reads a session is
+    /// one it never saw, so the next delete step must re-check and fail.
+    #[test]
+    fn a_torrent_swapped_in_during_a_re_check_fails_the_next_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [
+            write(&root, "junk/a.bin", 64),
+            write(&root, "junk/b.bin", 64),
+            write(&root, "junk/c.bin", 64),
+        ];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        assert_eq!(scope_of(&pool, plan_id).targets.len(), 3);
+
+        let mock = Arc::new(torrentd_engine::MockEngine::new());
+        let (source, late, leaving_hash, leaving) =
+            late_and_leaving(mock.clone(), dir.path(), &root);
+        let state = StateMap::new();
+        // Polled between steps: loads `leaving` once the first step ran, so
+        // the second step re-checks and reads its session, the first read.
+        let stop = || {
+            if state.is_empty() && orphans.iter().any(|o| !o.exists()) {
+                state.insert(leaving_hash, leaving.clone());
+            }
+            false
+        };
+        let held = mock.hold_next("torrent_details");
+        let out = std::thread::scope(|s| {
+            let (st, lv, lt) = (&state, &leaving, &late);
+            s.spawn(move || swap_during(held, st, (leaving_hash, lv), lt));
+            apply(&pool, &source, &state, plan_id, &stop).unwrap()
+        });
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (2, 1, "failed"),
+            "{out:?}"
+        );
+        assert_eq!(
+            orphans.iter().filter(|o| o.exists()).count(),
+            1,
+            "the step after the swap still ran"
         );
         let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
         let failed = steps

@@ -10670,6 +10670,13 @@
               "null"
             ],
             "description": "Why the profile has no session. Set only when `status` is `failed`."
+          },
+          "fence_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the profile is fenced, as the `reason` label of\n`torrentd_profile_vpn_fenced_total` names it: `ip_lost_or_changed`,\n`route_mismatch`, `handshake_stale`, `no_handshake`,\n`probe_unavailable` (its tunnel's checks, or the kill switch's, could\nnot run several times in a row), or `kill_switch` (the nftables kill\nswitch was not in force). Set only when `status` is `vpn_down`."
           }
         },
         "type": "object",

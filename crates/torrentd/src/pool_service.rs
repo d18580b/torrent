@@ -186,9 +186,10 @@ impl PoolService {
         let _ = self.registry.set(registry);
     }
 
-    /// How many torrents the registry assigns; 0 where none is set. O(1).
-    pub fn registry_len(&self) -> usize {
-        self.registry.get().map_or(0, |r| r.len())
+    /// The registry's change counter ([`AssignmentRegistry::generation`]);
+    /// 0 where none is set. O(1).
+    pub fn registry_generation(&self) -> u64 {
+        self.registry.get().map_or(0, |r| r.generation())
     }
 
     /// Every info-hash the daemon owns: loaded in `state`, assigned in the

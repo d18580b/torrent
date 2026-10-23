@@ -55,6 +55,12 @@ pub struct ProfileHealth {
     /// `ScanFence` reads a value it has not seen as a new fence, under which
     /// the torrents it paused before are paused again.
     pub fence_generation: u64,
+    /// Why the latest fence went on: the `reason` its
+    /// `profile_vpn_fenced_total` increment carries (`vpn_monitor`'s
+    /// `DownReason::as_str`, or `kill_switch`). Set in the update that marks
+    /// the profile `vpn_down`, and left by a lift, so it describes the
+    /// profile only while `status` is `VpnDown`; `None` before any fence.
+    pub fence_reason: Option<&'static str>,
     /// Current NAT-PMP-negotiated listening port (natpmp profiles only; `None`
     /// for static profiles).
     pub forwarded_port: Option<u16>,
@@ -225,6 +231,7 @@ impl ProfileEntry {
                 paused_for_vpn: 0,
                 counted_for_vpn: Arc::default(),
                 fence_generation: 0,
+                fence_reason: None,
                 forwarded_port,
                 forwarded_epoch,
                 port_forward_ok: true,
