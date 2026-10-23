@@ -26,13 +26,11 @@ use crate::api::Failure;
 use crate::fmt;
 use crate::theme::Theme;
 use crate::theme::Tone;
+use crate::ui::widgets::caps::MAX_METAINFO;
 use crate::ui::widgets::centered;
 use crate::ui::widgets::key_hints;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::spinner;
-
-/// The largest `.torrent` the daemon takes, decoded.
-pub const MAX_METAINFO: u64 = 64 * 1024 * 1024;
 
 /// Where the torrent's metadata comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -44,6 +44,7 @@ use crate::app::Effect;
 use crate::app::Toast;
 use crate::theme::Theme;
 use crate::theme::Tone;
+use crate::ui::widgets::caps;
 use crate::ui::widgets::placeholder;
 use crate::ui::widgets::spinner;
 
@@ -134,19 +135,30 @@ pub const KEYS: &[(&str, &str)] = &[
 const MUTATIONS_OFF: &str = "pool mutations are disabled: creating and applying plans needs \
                              `allow_mutations = true` under [pool] in the daemon's config";
 
-/// Where each listing's page size starts; a refresh asks for as many rows as
-/// are loaded, up to [`MAX_REFRESH`], so the selection keeps its place.
-const PAGE: i64 = 100;
-const MAX_REFRESH: i64 = 1000;
-
-/// Most infohashes one adopt or verify request may carry.
-const MAX_BATCH: usize = 1000;
-
 pub fn capturing(state: &State) -> bool {
     state.adopt.is_some()
         || state.overview.confirm_scan.is_some()
         || state.library.confirm_verify.is_some()
         || state.plans.capturing()
+}
+
+/// Whether the view shown has a load in flight, so a refresh now would
+/// skip it.
+pub fn busy(state: &State) -> bool {
+    match state.view {
+        View::Overview => state.overview.loading,
+        View::Tree if state.tree.root.is_some() => state.tree.entries.loading,
+        View::Tree => state.overview.loading,
+        View::Library => state.library.items.loading,
+        View::Plans => {
+            state.plans.list.loading
+                || state
+                    .plans
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.loading || d.steps.loading)
+        }
+    }
 }
 
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
@@ -262,10 +274,11 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             let targets = state.library.targets();
             if targets.is_empty() {
                 Vec::new()
-            } else if targets.len() > MAX_BATCH {
+            } else if targets.len() > caps::MAX_BATCH {
                 vec![Effect::toast(Toast::info(format!(
-                    "{} marked: adopt at most {MAX_BATCH} at a time",
-                    targets.len()
+                    "{} marked: adopt at most {} at a time",
+                    targets.len(),
+                    caps::MAX_BATCH
                 )))]
             } else {
                 open_adopt(state, adopt::Selector::Infohashes(targets), ctx)
@@ -427,13 +440,6 @@ fn signed_out(failure: &Failure) -> Vec<Effect> {
     }
 }
 
-/// How many rows a refresh asks for: as many as are loaded, so the
-/// selection keeps its place, within one request's reach.
-fn refresh_limit(loaded: usize) -> Option<i64> {
-    let loaded = loaded as i64;
-    (loaded > PAGE).then(|| ((loaded + PAGE - 1) / PAGE * PAGE).min(MAX_REFRESH))
-}
-
 /// A move of a list's selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Motion {
@@ -475,10 +481,12 @@ impl Motion {
     }
 }
 
-/// The first row to draw so `selected` stays in view, moving the window
-/// only as far as it must: scrolling is steady rather than re-centred.
-fn scroll(offset: &Cell<usize>, selected: usize, rows: usize) -> usize {
-    let mut at = offset.get();
+/// The first row to draw, of `len`, so `selected` stays in view in a window
+/// of `rows`, moving the window only as far as it must: scrolling is steady
+/// rather than re-centred. A list that shrank pulls the window back so it
+/// stays full rather than showing its last row alone at the top.
+fn scroll(offset: &Cell<usize>, selected: usize, rows: usize, len: usize) -> usize {
+    let mut at = offset.get().min(len.saturating_sub(rows));
     if selected < at {
         at = selected;
     } else if rows > 0 && selected >= at + rows {
