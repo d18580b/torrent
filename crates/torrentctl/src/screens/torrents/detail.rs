@@ -1,6 +1,7 @@
 //! One torrent: its overview, files, trackers and actions.
 
 use std::cell::Cell;
+use std::time::Instant;
 
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
@@ -124,6 +125,8 @@ pub struct Detail {
     pub files_offset: Cell<usize>,
     pub trackers: Option<Vec<types::Tracker>>,
     pub trackers_loading: bool,
+    /// When the trackers were last asked for, for the Trackers tab's poll.
+    pub trackers_asked: Option<Instant>,
     pub trackers_error: Option<String>,
     pub trackers_selected: usize,
     pub trackers_offset: Cell<usize>,
