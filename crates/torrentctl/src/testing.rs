@@ -162,11 +162,10 @@ impl Recorder {
                     .to_owned();
                 let bearer = lines.find_map(|l| {
                     let (name, value) = l.split_once(':')?;
-                    let value = value.trim();
+                    let (scheme, token) = value.trim().split_once(' ')?;
                     (name.eq_ignore_ascii_case("authorization")
-                        && value.len() > 7
-                        && value[..7].eq_ignore_ascii_case("bearer "))
-                    .then(|| value[7..].to_owned())
+                        && scheme.eq_ignore_ascii_case("bearer"))
+                    .then(|| token.to_owned())
                 });
                 // Recorded before the answer, so an effect that has
                 // finished has been recorded.
