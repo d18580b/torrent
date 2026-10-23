@@ -174,6 +174,15 @@ pub struct Settings {
     pub send_buffer_low_watermark: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alert_queue_size: Option<u32>,
+    /// libtorrent's `close_redundant_connections` (default true): drop a
+    /// connection on which neither side can want a piece from the other.
+    ///
+    /// The daemon leaves it unset. A torrent in upload mode advertises itself
+    /// upload-only, so with the default a seed hangs up on it at once; a test
+    /// that holds a willing seeder connected to one, to show it still takes
+    /// nothing, sets it false on both sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_redundant_connections: Option<bool>,
 }
 
 impl Settings {

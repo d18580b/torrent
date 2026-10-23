@@ -1,5 +1,6 @@
-//! Layer 3 integration scenarios — deterministic,
-//! single-session, real libtorrent + real disk, no network.
+//! Layer 3 integration scenarios — deterministic, real libtorrent + real
+//! disk, no network beyond loopback. Every scenario but the willing-seeder one
+//! runs a single session.
 //!
 //! Each test drives a real `libtorrent_safe::Session` and asserts on the raw
 //! alert stream the daemon's handlers consume (the handler→`StateMap` phase
@@ -23,7 +24,10 @@
 //!     surfaces `alerts_dropped` and keeps draining cleanly (no hang/panic).
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
 //!     for a magnet (which `SEED_MODE` cannot cover at all), and holds through
-//!     the verification failure that drops `SEED_MODE`.
+//!     the verification failure that drops `SEED_MODE`; and, the one scenario
+//!     here with a second session, a half-written torrent added on each of the
+//!     six add paths takes zero payload bytes from a loopback seeder it stays
+//!     connected to.
 //!   - a magnet on a DHT-enabled host profile reaches the session with DHT,
 //!     PEX and LSD disabled while it has no metadata, sheds them once its
 //!     metadata shows it public, and keeps them when it shows it private.
@@ -586,6 +590,414 @@ fn a_magnet_add_carries_upload_mode_without_metadata() {
         "upload_mode is what actually holds for a magnet; flags={flags:?}",
     );
     assert_eq!(last.download_rate, 0);
+}
+
+/// The no-download invariant against a peer that has every piece and would
+/// serve it, on every path the daemon adds a torrent by.
+///
+/// The tests above read `download_rate` off a torrent that has no peer, so
+/// nothing could have been downloaded whatever the flags said. Here session A
+/// seeds six complete payloads on loopback. Six daemon-side sessions each hold
+/// one of them half-written — the first half correct, the rest zeroes — added
+/// the way one add path adds it, with the flags that path composes, and each
+/// is connected to A. For ten seconds after every connection is up (and after
+/// the recheck, on the recheck path), each must take zero payload bytes and
+/// leave its file exactly as it was, while A still lists it as a peer and it
+/// still sees A as a seed.
+///
+/// Both sides set `close_redundant_connections` false. With libtorrent's
+/// default, a torrent in upload mode tells its peers it is upload-only and a
+/// seed hangs up on it at once; the torrent would then take nothing because it
+/// had no peer, which is the vacuous pass this test exists to replace.
+#[test]
+#[ignore = "real libtorrent + disk + loopback peers; run with --ignored"]
+fn an_upload_mode_torrent_never_takes_a_piece_from_a_willing_seeder() {
+    use std::net::Ipv4Addr;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use libtorrent_safe::alert::TorrentStatusView;
+    use libtorrent_safe::TorrentHandle;
+    use torrentd_engine::policy::magnet_flags;
+    use torrentd_engine::resume_flags_clear;
+    use torrentd_engine::resume_flags_set;
+    use torrentd_engine::resume_flags_set_without_metadata;
+    use torrentd_engine::seed_flags;
+    use torrentd_engine::verify_flags;
+    use torrentd_engine::ProfileConfig;
+    use torrentd_engine::ProfileId;
+    use torrentd_engine::ProfileNetwork;
+
+    /// libtorrent's `torrent_status::state_t` values for a torrent hashing
+    /// its payload: it turns peers away until it is done.
+    const CHECKING_FILES: u32 = 1;
+    const CHECKING_RESUME_DATA: u32 = 7;
+    const PATHS: [&str; 6] = [
+        ".torrent",
+        "magnet",
+        "resume",
+        "resume + .torrent",
+        "adoption fast path",
+        "force recheck",
+    ];
+    const RECHECK: usize = 5;
+    const ADOPTION: usize = 4;
+
+    let mut settings = support::local_seed_settings();
+    settings.close_redundant_connections = Some(false);
+    let profile = ProfileConfig {
+        id: ProfileId::new("public"),
+        network: ProfileNetwork::Host {
+            listen_interfaces: "127.0.0.1:0".into(),
+            dht: false,
+        },
+        peer_fingerprint: None,
+        user_agent: None,
+        resume_dir: None,
+        torrent_dir: None,
+        allowed_tracker_domains: vec![],
+        allowed_tracker_urls: vec![],
+        upload_rate_limit: None,
+    };
+
+    // One payload per path, so each of A's torrents has exactly one peer and
+    // A's peer count names the path it belongs to.
+    let names: Vec<String> = (0..PATHS.len()).map(|i| format!("willing-{i}")).collect();
+    let payloads: Vec<Vec<u8>> = (0..PATHS.len())
+        .map(|i| support::payload(0x50 + i as u8, FILE_LEN))
+        .collect();
+    let torrents: Vec<Vec<u8>> = (0..PATHS.len())
+        .map(|i| support::single_file_torrent(&names[i], &payloads[i], PIECE_LEN))
+        .collect();
+    let half_written = |i: usize| {
+        let mut b = payloads[i][..FILE_LEN / 2].to_vec();
+        b.resize(FILE_LEN, 0);
+        b
+    };
+
+    // --- A: the willing seeder, every payload complete and verified ---
+    let seed_dir = tempfile::tempdir().unwrap();
+    let a = Session::new(&settings).unwrap();
+    let mut a_torrents = Vec::new();
+    for i in 0..PATHS.len() {
+        std::fs::write(seed_dir.path().join(&names[i]), &payloads[i]).unwrap();
+        a_torrents.push(
+            a.add_torrent(AddParams::File {
+                bytes: torrents[i].clone(),
+                save_path: seed_dir.path().to_str().unwrap().to_string(),
+                flags: verify_flags(&profile),
+                trackers: Vec::new(),
+            })
+            .unwrap(),
+        );
+    }
+    let mut port = None;
+    let mut a_seeding = vec![false; PATHS.len()];
+    support::pump_until(&a, Duration::from_secs(20), |alert| {
+        match alert {
+            Alert::ListenSucceeded { endpoint, .. } => {
+                port = port.or_else(|| {
+                    endpoint
+                        .rsplit_once(':')
+                        .and_then(|(_, p)| p.parse::<u16>().ok())
+                        .filter(|p| *p != 0)
+                });
+            }
+            Alert::StateUpdate { statuses, .. } => {
+                for st in statuses {
+                    if let Some(i) = a_torrents.iter().position(|h| h.id == st.handle.id) {
+                        a_seeding[i] |= st.is_seeding;
+                    }
+                }
+            }
+            _ => {}
+        }
+        (port.is_some() && a_seeding.iter().all(|s| *s)).then_some(())
+    })
+    .unwrap_or_else(|| panic!("A seeds every payload and listens: {a_seeding:?} {port:?}"));
+    let seeder = SocketAddr::from((Ipv4Addr::LOCALHOST, port.unwrap()));
+
+    // Resume data for a half-written payload, as this daemon saves it (no
+    // info dict) or with it. The directory it was saved from, which the
+    // resume data names, keeps the half-written file for the add.
+    let saved_resume = |i: usize, flags: ResumeFlags| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(&names[i]), half_written(i)).unwrap();
+        let s = Session::new(&settings).unwrap();
+        let h = s
+            .add_torrent(AddParams::File {
+                bytes: torrents[i].clone(),
+                save_path: dir.path().to_str().unwrap().to_string(),
+                flags: verify_flags(&profile),
+                trackers: Vec::new(),
+            })
+            .unwrap();
+        support::pump_until(&s, Duration::from_secs(15), |alert| match alert {
+            Alert::TorrentChecked { hdr } if hdr.infohash == Some(h.infohash) => Some(()),
+            _ => None,
+        })
+        .expect("the half-written payload is checked");
+        s.save_resume_data(h, flags).unwrap();
+        let blob = support::pump_until(&s, Duration::from_secs(15), |alert| match alert {
+            Alert::SaveResumeData { data, .. } => Some(data.as_bytes().to_vec()),
+            Alert::SaveResumeDataFailed { message, .. } => {
+                panic!("save_resume_data failed: {message}")
+            }
+            _ => None,
+        })
+        .expect("a save_resume_data alert should arrive");
+        (dir, blob)
+    };
+
+    // --- the daemon side: one session per add path ---
+    struct Leecher {
+        path: &'static str,
+        session: Session,
+        h: TorrentHandle,
+        file: std::path::PathBuf,
+        written: Vec<u8>,
+        last: Option<TorrentStatusView>,
+        dialled: Option<Instant>,
+        _dir: tempfile::TempDir,
+    }
+    let mut leechers = Vec::new();
+    for (i, path) in PATHS.iter().enumerate() {
+        let (dir, params) = match i {
+            0 | RECHECK => {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join(&names[i]), half_written(i)).unwrap();
+                let params = AddParams::File {
+                    bytes: torrents[i].clone(),
+                    save_path: dir.path().to_str().unwrap().to_string(),
+                    flags: verify_flags(&profile),
+                    trackers: Vec::new(),
+                };
+                (dir, params)
+            }
+            1 => {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join(&names[i]), half_written(i)).unwrap();
+                let ih = libtorrent_safe::info_hash_from_torrent(&torrents[i]).unwrap();
+                let params = AddParams::Magnet {
+                    uri: format!("magnet:?xt=urn:btih:{}", ih.to_hex()),
+                    save_path: dir.path().to_str().unwrap().to_string(),
+                    flags: magnet_flags(&profile),
+                };
+                (dir, params)
+            }
+            // The startup resume reload, from resume data that carries its
+            // metadata and has no `.torrent` beside it.
+            2 => {
+                let (dir, blob) = saved_resume(i, ResumeFlags::SAVE_INFO_DICT);
+                let params = AddParams::Resume {
+                    bytes: blob,
+                    torrent: None,
+                    save_path: None,
+                    flags_set: resume_flags_set_without_metadata(&profile),
+                    flags_clear: resume_flags_clear(),
+                };
+                (dir, params)
+            }
+            // The startup resume reload as the daemon's own saves need it.
+            3 => {
+                let (dir, blob) = saved_resume(i, ResumeFlags::empty());
+                let params = AddParams::Resume {
+                    bytes: blob,
+                    torrent: Some(torrents[i].clone()),
+                    save_path: None,
+                    flags_set: resume_flags_set(&profile),
+                    flags_clear: resume_flags_clear(),
+                };
+                (dir, params)
+            }
+            // Pool adoption's fast path: another client's resume data, which
+            // carries `auto_managed=1`, seeded straight away.
+            ADOPTION => {
+                let (dir, mut blob) = saved_resume(i, ResumeFlags::empty());
+                let (off, on) = (b"12:auto_managedi0e", b"12:auto_managedi1e");
+                let at = blob
+                    .windows(off.len())
+                    .position(|w| w == off)
+                    .expect("resume data records auto_managed");
+                blob[at..at + on.len()].copy_from_slice(on);
+                let params = AddParams::Resume {
+                    bytes: blob,
+                    torrent: Some(torrents[i].clone()),
+                    save_path: Some(dir.path().to_str().unwrap().to_string()),
+                    flags_set: seed_flags(&profile),
+                    flags_clear: TorrentFlags::PAUSED | resume_flags_clear(),
+                };
+                (dir, params)
+            }
+            _ => unreachable!(),
+        };
+        let session = Session::new(&settings).unwrap();
+        let h = session.add_torrent(params).unwrap();
+        let file = dir.path().join(&names[i]);
+        let written = std::fs::read(&file).unwrap();
+        assert_eq!(written, half_written(i), "{path}");
+        leechers.push(Leecher {
+            path,
+            session,
+            h,
+            file,
+            written,
+            last: None,
+            dialled: None,
+            _dir: dir,
+        });
+    }
+
+    // One round: read every status, and dial A again from any torrent that
+    // is not checking and has lost it. Returns whether the recheck path
+    // reported a finished check this round.
+    //
+    // Liveness is read fresh from each session with `torrent_statuses`, not
+    // from `post_torrent_updates`: libtorrent posts a state update only for
+    // a torrent it marked changed, and a peer hanging up does not mark one,
+    // so a seeder lost mid-dwell would go unnoticed and never be redialled.
+    let mut a_peers = vec![0i32; PATHS.len()];
+    let round = |leechers: &mut Vec<Leecher>, a_peers: &mut Vec<i32>| {
+        let mut checked = false;
+        a.drain_alerts();
+        for st in a.torrent_statuses().unwrap() {
+            if let Some(i) = a_torrents.iter().position(|h| h.id == st.handle.id) {
+                a_peers[i] = st.num_peers;
+            }
+        }
+        for (i, l) in leechers.iter_mut().enumerate() {
+            for alert in l.session.drain_alerts() {
+                if i == RECHECK && matches!(alert, Alert::TorrentChecked { .. }) {
+                    checked = true;
+                }
+            }
+            l.last = l
+                .session
+                .torrent_statuses()
+                .unwrap()
+                .into_iter()
+                .find(|st| st.handle.id == l.h.id);
+            let checking = l
+                .last
+                .as_ref()
+                .is_none_or(|st| matches!(st.state, CHECKING_FILES | CHECKING_RESUME_DATA));
+            let lost = l.last.as_ref().is_none_or(|st| st.num_seeds == 0);
+            if !checking
+                && lost
+                && l.dialled
+                    .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+            {
+                l.session.connect_peer(l.h, seeder).unwrap();
+                l.dialled = Some(Instant::now());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        checked
+    };
+    let connected = |leechers: &Vec<Leecher>, a_peers: &Vec<i32>| {
+        leechers
+            .iter()
+            .zip(a_peers)
+            .all(|(l, peers)| *peers >= 1 && l.last.as_ref().is_some_and(|st| st.num_seeds >= 1))
+    };
+    let describe = |leechers: &Vec<Leecher>, a_peers: &Vec<i32>| {
+        leechers
+            .iter()
+            .zip(a_peers)
+            .map(|(l, peers)| {
+                let st = l.last.as_ref();
+                format!(
+                    "{}: A lists {peers} peer(s), it sees {:?} seed(s), state {:?}",
+                    l.path,
+                    st.map(|s| s.num_seeds),
+                    st.map(|s| s.state),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !connected(&leechers, &a_peers) {
+        assert!(
+            Instant::now() < deadline,
+            "every path connects to A: {}",
+            describe(&leechers, &a_peers),
+        );
+        round(&mut leechers, &mut a_peers);
+    }
+
+    // The recheck runs with the seeder connected. It drops every peer, so
+    // the round above dials A again once the check is done; the dwell starts
+    // once it has, so the recheck path gets its ten seconds connected too.
+    leechers[RECHECK]
+        .session
+        .force_recheck(leechers[RECHECK].h)
+        .unwrap();
+    let mut rechecked = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !(rechecked && connected(&leechers, &a_peers)) {
+        assert!(
+            Instant::now() < deadline,
+            "the recheck finishes (finished: {rechecked}) and every path is connected to A: {}",
+            describe(&leechers, &a_peers),
+        );
+        rechecked |= round(&mut leechers, &mut a_peers);
+    }
+    let dwell = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < dwell {
+        round(&mut leechers, &mut a_peers);
+    }
+    let untouched = |leechers: &Vec<Leecher>| {
+        for l in leechers {
+            assert_eq!(
+                l.session.total_payload_download(l.h).unwrap(),
+                0,
+                "{}: took payload from the seeder",
+                l.path,
+            );
+            assert!(
+                std::fs::read(&l.file).unwrap() == l.written,
+                "{}: the payload on disk changed",
+                l.path,
+            );
+        }
+    };
+    untouched(&leechers);
+    // Ten seconds on, every path is connected to A again, or still, and has
+    // still taken nothing.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !connected(&leechers, &a_peers) {
+        assert!(
+            Instant::now() < deadline,
+            "every path is still connected to A: {}",
+            describe(&leechers, &a_peers),
+        );
+        round(&mut leechers, &mut a_peers);
+    }
+    untouched(&leechers);
+
+    for (i, l) in leechers.iter().enumerate() {
+        let st = l.last.as_ref().unwrap();
+        let flags = TorrentFlags::from_bits_truncate(st.flags);
+        assert!(
+            flags.contains(TorrentFlags::UPLOAD_MODE),
+            "{}: flags={flags:?}",
+            l.path
+        );
+        // Every path but adoption's `SEED_MODE` add knows it lacks half the
+        // payload, and A has it: a torrent that would download, would here.
+        if i != ADOPTION {
+            assert!(
+                st.has_metadata && !st.is_seeding && st.progress < 1.0,
+                "{}: has_metadata={} is_seeding={} progress={}",
+                l.path,
+                st.has_metadata,
+                st.is_seeding,
+                st.progress,
+            );
+        }
+    }
 }
 
 /// A magnet on a DHT-enabled host profile, before its metadata arrives.

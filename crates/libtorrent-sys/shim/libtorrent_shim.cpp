@@ -712,6 +712,20 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         }
         return true;
     }
+    // torrentd-engine's dropped-alert handler (handlers/dropped.rs) reads
+    // these bits by libtorrent's alert type numbers, which it hard-codes. A
+    // libtorrent that renumbers any of them fails the build here rather than
+    // leaving that handler testing the wrong bits.
+    static_assert(lt::torrent_removed_alert::alert_type == 4,
+                  "dropped.rs TORRENT_REMOVED_TYPE");
+    static_assert(lt::save_resume_data_alert::alert_type == 37,
+                  "dropped.rs SAVE_RESUME_DATA_TYPE");
+    static_assert(lt::save_resume_data_failed_alert::alert_type == 38,
+                  "dropped.rs SAVE_RESUME_DATA_FAILED_TYPE");
+    static_assert(lt::add_torrent_alert::alert_type == 67,
+                  "dropped.rs ADD_TORRENT_TYPE");
+    static_assert(lt::state_update_alert::alert_type == 68,
+                  "dropped.rs STATE_UPDATE_TYPE");
     if (auto* x = lt::alert_cast<lt::alerts_dropped_alert>(a)) {
         out.kind = LT_ALERT_ALERTS_DROPPED;
         // dropped_alerts is a fixed-size bitset; copy bit values into our
@@ -2057,6 +2071,36 @@ extern "C" int lt_pop_alert(lt_session* s, lt_alert_union* out) {
 extern "C" uint64_t lt_alert_translate_errors(lt_session* s) {
     if (!s) return 0;
     return s->alert_translate_errors.load(std::memory_order_relaxed);
+}
+
+// -------------------------------------------------------------------------
+// Test-only (see the header): nothing in the daemon calls these.
+// -------------------------------------------------------------------------
+
+extern "C" int lt_test_connect_peer(lt_session* s, lt_handle h,
+                                    const char* ip, uint16_t port) {
+    if (!s || !ip) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    lt::error_code ec;
+    auto const addr = lt::make_address(ip, ec);
+    if (ec) return LT_ERR;
+    th.connect_peer(lt::tcp::endpoint(addr, port));
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
+extern "C" int lt_test_total_payload_download(lt_session* s, lt_handle h,
+                                              uint64_t* out) {
+    if (!s || !out) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    auto const st = th.status(lt::status_flags_t{});
+    *out = static_cast<std::uint64_t>(st.total_payload_download);
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
 }
 
 extern "C" void lt_alert_payload_free(lt_alert_union* u) {

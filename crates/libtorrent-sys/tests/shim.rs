@@ -3,9 +3,12 @@
 //! Run with: `cargo test -p libtorrent-sys --features shim-tests`
 //!
 //! The assertions cover struct marshalling, exception isolation, null-handle
-//! safety, and buffer ownership against a real (but non-listening) libtorrent
-//! session. AddressSanitizer instrumentation is a follow-up (see build.rs for
-//! why instrumenting only the shim doesn't link on this toolchain).
+//! safety, and buffer ownership against a real libtorrent session listening
+//! on loopback only. Ownership is checked by what the tests can observe — a
+//! buffer readable for its whole length, released through the shim's own
+//! free — and not by a sanitizer: AddressSanitizer instrumentation is a
+//! follow-up (see build.rs for why instrumenting only the shim doesn't link on
+//! this toolchain), so a double free or a leak goes undetected here.
 
 #![cfg(all(feature = "shim-tests", feature = "bundled"))]
 #![allow(non_upper_case_globals)]
@@ -82,6 +85,82 @@ fn null_and_unknown_handle_ops_are_safe() {
         unsafe { lt_torrent_unset_flags(ptr::null_mut(), 1, LT_TF_DISABLE_DHT) },
         LT_ERR
     );
+    assert_eq!(unsafe { lt_torrent_force_recheck(s, 0) }, LT_ERR);
+    assert_eq!(unsafe { lt_torrent_force_recheck(s, 999_999) }, LT_ERR);
+    assert_eq!(
+        unsafe { lt_torrent_force_recheck(ptr::null_mut(), 1) },
+        LT_ERR
+    );
+    let ip = CString::new("127.0.0.1").unwrap();
+    assert_eq!(
+        unsafe { lt_test_connect_peer(s, 999_999, ip.as_ptr(), 1) },
+        LT_ERR
+    );
+    assert_eq!(
+        unsafe { lt_test_connect_peer(ptr::null_mut(), 1, ip.as_ptr(), 1) },
+        LT_ERR
+    );
+    let mut downloaded = 7u64;
+    assert_eq!(
+        unsafe { lt_test_total_payload_download(s, 999_999, &mut downloaded) },
+        LT_ERR
+    );
+    assert_eq!(
+        unsafe { lt_test_total_payload_download(ptr::null_mut(), 1, &mut downloaded) },
+        LT_ERR
+    );
+    assert_eq!(downloaded, 7, "a refused read leaves *out alone");
+    unsafe { lt_session_destroy(s) };
+}
+
+/// The test-only peer API on a live torrent: a fresh torrent has taken no
+/// payload, a numeric address is accepted, and anything else is refused.
+#[test]
+fn the_test_peer_api_reads_zero_and_refuses_a_bad_address() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    let mut downloaded = u64::MAX;
+    assert_eq!(
+        unsafe { lt_test_total_payload_download(s, h, &mut downloaded) },
+        LT_OK as i32
+    );
+    assert_eq!(downloaded, 0);
+    for ok in ["127.0.0.1", "::1"] {
+        let ip = CString::new(ok).unwrap();
+        assert_eq!(
+            unsafe { lt_test_connect_peer(s, h, ip.as_ptr(), 1) },
+            LT_OK as i32,
+            "{ok}"
+        );
+    }
+    for bad in ["localhost", "", "127.0.0.1:1"] {
+        let ip = CString::new(bad).unwrap();
+        assert_eq!(
+            unsafe { lt_test_connect_peer(s, h, ip.as_ptr(), 1) },
+            LT_ERR,
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        unsafe { lt_test_connect_peer(s, h, ptr::null(), 1) },
+        LT_ERR
+    );
+    unsafe { lt_session_destroy(s) };
+}
+
+/// A fresh session has dropped no alert in translation, a null one reads 0,
+/// and an ordinary drain leaves the count where it was.
+#[test]
+fn translate_errors_starts_at_zero() {
+    assert_eq!(unsafe { lt_alert_translate_errors(ptr::null_mut()) }, 0);
+    let s = make_session();
+    assert_eq!(unsafe { lt_alert_translate_errors(s) }, 0);
+    let _h = add_file(s, &multi_file_tracker_torrent());
+    let added = wait_for(s, |u| {
+        (u.kind == lt_alert_kind_LT_ALERT_ADD_TORRENT).then_some(())
+    });
+    assert!(added.is_some(), "no add_torrent_alert");
+    assert_eq!(unsafe { lt_alert_translate_errors(s) }, 0);
     unsafe { lt_session_destroy(s) };
 }
 
@@ -124,10 +203,78 @@ fn save_state_buffer_ownership_roundtrip() {
         !buf.is_null() && len > 0,
         "expected a non-empty state buffer"
     );
-    // ASan verifies this frees exactly what the shim malloc'd (no double-free
-    // / no leak).
+    // The buffer is the caller's: readable for its whole length, and what it
+    // holds is the bencoded dict lt_session_create_with_state reads back.
+    let state = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
+    assert_eq!(
+        (state[0], state[len - 1]),
+        (b'd', b'e'),
+        "state is a bencoded dict: {}",
+        String::from_utf8_lossy(&state)
+    );
+    let restored = create_with_state(Some(&state)).expect("the saved state is accepted");
+    unsafe { lt_session_destroy(restored) };
+    // Released through the shim's own free, never Rust's allocator. Nothing
+    // here detects a double free or a leak: the shim is not built under a
+    // sanitizer (see the module comment).
     unsafe { lt_buf_free(buf) };
     unsafe { lt_session_destroy(s) };
+}
+
+/// `lt_session_create_with_state` on `state` (None: a null buffer), with the
+/// no-network settings. `Err` carries err_out.
+fn create_with_state(state: Option<&[u8]>) -> Result<*mut lt_session, String> {
+    let settings = CString::new(NO_NET).unwrap();
+    let (ptr, len) = state.map_or((ptr::null(), 0), |b| (b.as_ptr(), b.len()));
+    let mut err = [0 as c_char; 512];
+    let s =
+        unsafe { lt_session_create_with_state(settings.as_ptr(), ptr, len, err.as_mut_ptr(), 512) };
+    if s.is_null() {
+        Err(c_buf(&err))
+    } else {
+        Ok(s)
+    }
+}
+
+/// The state a session saves, copied out and freed.
+fn saved_state(s: *mut lt_session) -> Vec<u8> {
+    let mut buf: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe { lt_session_save_state(s, &mut buf, &mut len, err.as_mut_ptr(), 512) };
+    assert_eq!(rc, LT_OK as i32, "{}", c_buf(&err));
+    let state = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
+    unsafe { lt_buf_free(buf) };
+    state
+}
+
+/// A session restored from saved state saves state of its own again, and a
+/// blob that is not bencode is refused with a reason, not unwound across the
+/// boundary or turned into a session with whatever the parse left.
+#[test]
+fn create_with_state_round_trips_and_refuses_garbage() {
+    let first = make_session();
+    let state = saved_state(first);
+    unsafe { lt_session_destroy(first) };
+
+    let restored = create_with_state(Some(&state)).expect("saved state is accepted");
+    let again = saved_state(restored);
+    assert!(
+        again.starts_with(b"d") && again.ends_with(b"e"),
+        "{}",
+        String::from_utf8_lossy(&again)
+    );
+    unsafe { lt_session_destroy(restored) };
+
+    // A null buffer is lt_session_create.
+    let plain = create_with_state(None).expect("no state is a fresh session");
+    unsafe { lt_session_destroy(plain) };
+
+    let truncated = &state[..state.len() / 2];
+    for garbage in [&b"this is not bencode"[..], truncated] {
+        let err = create_with_state(Some(garbage)).expect_err("garbage state must be refused");
+        assert!(!err.is_empty(), "err_out names the parse failure");
+    }
 }
 
 #[test]
@@ -1676,20 +1823,17 @@ fn a_removal_drained_after_the_re_add_leaves_the_new_id_live() {
     unsafe { lt_session_destroy(s) };
 }
 
-/// `lt_add_torrent_resume_ex` with no overrides forces upload mode: resume data
-/// that says `auto_managed`, `share_mode`, `super_seeding`,
-/// `sequential_download` and `stop_when_ready`, and not `upload_mode`, is
-/// added in upload mode with none of them.
-#[test]
-fn a_plain_resume_add_forces_upload_mode_over_the_resume_data() {
-    let s = make_session();
-    let ih = [0x0Au8; 20];
+/// Resume data for `ih` that says `auto_managed`, `share_mode`,
+/// `super_seeding`, `sequential_download` and `stop_when_ready`, and not
+/// `upload_mode`: everything another client's resume data could carry to take
+/// a torrent out of upload mode.
+fn resume_lifting_upload_mode(ih: &[u8; 20]) -> Vec<u8> {
     let mut resume = Vec::new();
     resume.extend_from_slice(b"d12:auto_managedi1e");
     resume.extend_from_slice(b"11:file-format22:libtorrent resume file");
     resume.extend_from_slice(b"12:file-versioni1e");
     resume.extend_from_slice(b"9:info-hash20:");
-    resume.extend_from_slice(&ih);
+    resume.extend_from_slice(ih);
     resume.extend_from_slice(b"6:pausedi1e");
     resume.extend_from_slice(b"9:save_path4:/tmp");
     resume.extend_from_slice(b"19:sequential_downloadi1e");
@@ -1698,36 +1842,132 @@ fn a_plain_resume_add_forces_upload_mode_over_the_resume_data() {
     resume.extend_from_slice(b"13:super_seedingi1e");
     resume.extend_from_slice(b"11:upload_modei0e");
     resume.extend_from_slice(b"e");
+    resume
+}
 
-    let mut ih_out = [0u8; 20];
+/// `lt_add_torrent_resume_ex` with no overrides forces upload mode over
+/// [`resume_lifting_upload_mode`]: alone, and with the `.torrent` the daemon
+/// keeps beside resume data saved without its info dict.
+#[test]
+fn a_plain_resume_add_forces_upload_mode_over_the_resume_data() {
+    let s = make_session();
+    let torrent = multi_file_tracker_torrent();
+    let mut hashes: lt_info_hashes = unsafe { std::mem::zeroed() };
     let mut err = [0 as c_char; 512];
-    let h = unsafe {
-        lt_add_torrent_resume_ex(
-            s,
-            resume.as_ptr(),
-            resume.len(),
-            ptr::null(),
-            0,
-            ptr::null(),
-            0,
-            0,
-            ih_out.as_mut_ptr(),
-            err.as_mut_ptr(),
-            512,
-        )
-    };
-    assert_ne!(h, 0, "resume add failed: {}", c_buf(&err));
-    assert_eq!(ih_out, ih);
-
+    assert_eq!(
+        unsafe {
+            lt_torrent_info_hashes(
+                torrent.as_ptr(),
+                torrent.len(),
+                &mut hashes,
+                err.as_mut_ptr(),
+                512,
+            )
+        },
+        LT_OK as i32,
+        "{}",
+        c_buf(&err)
+    );
     let forbidden = LT_TF_AUTO_MANAGED
         | LT_TF_SHARE_MODE
         | LT_TF_SUPER_SEEDING
         | LT_TF_SEQUENTIAL_DOWNLOAD
         | LT_TF_STOP_WHEN_READY;
-    let flags = status_flags(s, h);
-    assert_ne!(flags & LT_TF_UPLOAD_MODE, 0, "flags={flags:#x}");
-    assert_eq!(flags & forbidden, 0, "flags={flags:#x}");
+
+    for (ih, torrent) in [([0x0Au8; 20], None), (hashes.v1, Some(&torrent[..]))] {
+        let resume = resume_lifting_upload_mode(&ih);
+        let (t_ptr, t_len) = torrent.map_or((ptr::null(), 0), |t| (t.as_ptr(), t.len()));
+        let mut ih_out = [0u8; 20];
+        let h = unsafe {
+            lt_add_torrent_resume_ex(
+                s,
+                resume.as_ptr(),
+                resume.len(),
+                t_ptr,
+                t_len,
+                ptr::null(),
+                0,
+                0,
+                ih_out.as_mut_ptr(),
+                err.as_mut_ptr(),
+                512,
+            )
+        };
+        assert_ne!(h, 0, "resume add failed: {}", c_buf(&err));
+        assert_eq!(ih_out, ih);
+        if torrent.is_some() {
+            assert_eq!(details(s, h).has_metadata, 1, "the .torrent was attached");
+        }
+
+        let flags = status_flags(s, h);
+        assert_ne!(flags & LT_TF_UPLOAD_MODE, 0, "flags={flags:#x}");
+        assert_eq!(flags & forbidden, 0, "flags={flags:#x}");
+    }
     unsafe { lt_session_destroy(s) };
+}
+
+/// `force_recheck` drops seed mode — libtorrent re-learns which pieces it
+/// has — and leaves upload mode where every add put it.
+#[test]
+fn recheck_keeps_upload_mode() {
+    // libtorrent holds seed mode only for a running torrent whose payload is
+    // on disk, so the single file exists at its full length and the add is
+    // not paused (the torrent names no tracker, and the session dials no
+    // peer). Its piece hash is filler: the recheck fails it, which is beside
+    // the point.
+    const LEN: usize = 1000;
+    let dir = std::env::temp_dir().join(format!("shim-recheck-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload"), [0x5A_u8; LEN]).unwrap();
+    let mut bytes =
+        format!("d4:infod6:lengthi{LEN}e4:name7:payload12:piece lengthi16384e6:pieces20:")
+            .into_bytes();
+    bytes.extend_from_slice(&[0xAB; 20]);
+    bytes.extend_from_slice(b"ee");
+
+    let s = make_session();
+    let save = CString::new(dir.to_str().unwrap()).unwrap();
+    let mut ih = [0u8; 20];
+    let mut err = [0 as c_char; 512];
+    let h = unsafe {
+        lt_add_torrent_file(
+            s,
+            bytes.as_ptr(),
+            bytes.len(),
+            save.as_ptr(),
+            LT_TF_SEED_MODE,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            ih.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "add failed: {}", c_buf(&err));
+    let before = status_flags(s, h);
+    assert_eq!(
+        before & (LT_TF_SEED_MODE | LT_TF_UPLOAD_MODE),
+        LT_TF_SEED_MODE | LT_TF_UPLOAD_MODE,
+        "flags={before:#x}"
+    );
+
+    assert_eq!(unsafe { lt_torrent_force_recheck(s, h) }, LT_OK as i32);
+    let mut after = before;
+    for _ in 0..50 {
+        after = status_flags(s, h);
+        if after & LT_TF_SEED_MODE == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        after & LT_TF_SEED_MODE,
+        0,
+        "the recheck ran; flags={after:#x}"
+    );
+    assert_ne!(after & LT_TF_UPLOAD_MODE, 0, "flags={after:#x}");
+    unsafe { lt_session_destroy(s) };
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An integer setting outside `int` is refused, not narrowed into some other

@@ -17,6 +17,12 @@ hex = { workspace = true }
 tracing = { workspace = true }
 bitflags = { workspace = true }
 
+[features]
+# `Session::connect_peer` and `Session::total_payload_download`, which only a
+# test has a use for: torrentd-engine's lifecycle tests enable it as a
+# dev-dependency, so no build of the daemon carries either.
+test-api = []
+
 [dev-dependencies]
 
 [lints]

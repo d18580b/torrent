@@ -305,6 +305,76 @@ mod tests {
         }
     }
 
+    /// Every profile shape the policy can be handed: both networks, DHT on
+    /// and off, the ids the guards once keyed on, with and without tracker
+    /// lists, identity overrides and a rate limit. The policy reads only the
+    /// network, so the rest is there to show it stays that way.
+    fn every_profile() -> Vec<ProfileConfig> {
+        let mut out = Vec::new();
+        for id in ["default", "public", "acct_a"] {
+            for network in 0..3 {
+                for lists in [false, true] {
+                    for identity in [false, true] {
+                        let mut p = if network == 2 { vpn() } else { host() };
+                        if let ProfileNetwork::Host { dht, .. } = &mut p.network {
+                            *dht = network == 1;
+                        }
+                        p.id = ProfileId::new(id);
+                        if lists {
+                            p.allowed_tracker_domains = vec!["tracker.example".into()];
+                            p.allowed_tracker_urls = vec!["https://tracker.example/PASS/".into()];
+                        }
+                        p.peer_fingerprint = identity.then(|| "-AA1000-".into());
+                        p.user_agent = identity.then(|| "qB/5.0".into());
+                        p.upload_rate_limit = identity.then_some(1024);
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Each flag builder an add path composes from, by name.
+    type Builder = fn(&ProfileConfig) -> TorrentFlags;
+    const BUILDERS: [(&str, Builder); 5] = [
+        ("seed_flags", seed_flags),
+        ("magnet_flags", magnet_flags),
+        ("verify_flags", verify_flags),
+        ("resume_flags_set", resume_flags_set),
+        (
+            "resume_flags_set_without_metadata",
+            resume_flags_set_without_metadata,
+        ),
+    ];
+
+    /// The no-download invariant as a property of the policy: for every
+    /// profile and every builder, the flags carry `UPLOAD_MODE` and nothing
+    /// [`forbidden`]. What a resume add clears after setting them (the shim
+    /// applies the set, then the clear) is [`resume_flags_clear`], plus
+    /// `PAUSED` for pool adoption; neither may take `UPLOAD_MODE` away.
+    #[test]
+    fn every_builder_on_every_profile_keeps_upload_mode_and_nothing_forbidden() {
+        let profiles = every_profile();
+        assert_eq!(profiles.len(), 36);
+        assert!(!resume_flags_clear().contains(TorrentFlags::UPLOAD_MODE));
+        for p in &profiles {
+            for (name, build) in BUILDERS {
+                let flags = build(p);
+                assert!(
+                    flags.contains(TorrentFlags::UPLOAD_MODE),
+                    "{name}({}) = {flags:?} lacks UPLOAD_MODE",
+                    p.id,
+                );
+                assert!(
+                    !flags.intersects(forbidden()),
+                    "{name}({}) = {flags:?} sets a forbidden flag",
+                    p.id,
+                );
+            }
+        }
+    }
+
     #[test]
     fn no_path_sets_a_forbidden_flag_and_resume_clears_them_all() {
         for p in [host(), vpn()] {
