@@ -63,6 +63,28 @@ pub enum AdoptPlan {
     },
 }
 
+/// Every `reason` [`plan`] refuses with, named so a caller or a test can tell
+/// one refusal from another without restating its text.
+pub mod refusal {
+    pub const NOT_IN_LIBRARY: &str = "torrent is not in the library";
+    pub const ALREADY_ADOPTED: &str = "already adopted";
+    pub const PARTIAL: &str = "payload is incomplete; seeding it would advertise pieces \
+                               the daemon cannot serve";
+    pub const OVERLAP: &str = "another torrent claims some of the same files but not the same set";
+    pub const MISSING: &str = "no payload found under any managed root";
+    pub const NO_BASE: &str = "matched but no base directory was recorded";
+    pub const ROOT_GONE: &str = "matched against a root that is no longer configured";
+    pub const MAPPED_OUTSIDE: &str =
+        "the previous client's resume data maps a file outside the torrent's directory, or to a \
+         name that is not UTF-8; where libtorrent would look for it is not where the pool found it";
+    pub const LAYOUT_NOT_IN_RESUME: &str =
+        "the previous client's content layout moved these files, and its resume data does not \
+         tell libtorrent so; adopting would look for them in the wrong places";
+    pub const RENAMED_INCOMPLETE: &str =
+        "the previous client renamed these files, which only its resume data maps for \
+         libtorrent, and that resume data does not mark every piece had";
+}
+
 impl AdoptPlan {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -88,7 +110,7 @@ pub fn plan(
 ) -> Result<AdoptPlan, PoolError> {
     let Some(torrent) = store.torrent(infohash)? else {
         return Ok(AdoptPlan::Refuse {
-            reason: "torrent is not in the library",
+            reason: refusal::NOT_IN_LIBRARY,
         });
     };
     let state = store.adoption_state(infohash)?;
@@ -106,35 +128,34 @@ pub fn plan(
         Some(AdoptionState::Drifted) => may_fast_path = false,
         Some(AdoptionState::Adopted) => {
             return Ok(AdoptPlan::Refuse {
-                reason: "already adopted",
+                reason: refusal::ALREADY_ADOPTED,
             })
         }
         Some(AdoptionState::Partial) => {
             return Ok(AdoptPlan::Refuse {
-                reason: "payload is incomplete; seeding it would advertise pieces \
-                         the daemon cannot serve",
+                reason: refusal::PARTIAL,
             })
         }
         Some(AdoptionState::Overlap) => {
             return Ok(AdoptPlan::Refuse {
-                reason: "another torrent claims some of the same files but not the same set",
+                reason: refusal::OVERLAP,
             })
         }
         Some(AdoptionState::Missing) | None => {
             return Ok(AdoptPlan::Refuse {
-                reason: "no payload found under any managed root",
+                reason: refusal::MISSING,
             })
         }
     }
 
     let Some((root_id, base_rel)) = store.adoption_base(infohash)? else {
         return Ok(AdoptPlan::Refuse {
-            reason: "matched but no base directory was recorded",
+            reason: refusal::NO_BASE,
         });
     };
     let Some(root) = root_path_of(root_id) else {
         return Ok(AdoptPlan::Refuse {
-            reason: "matched against a root that is no longer configured",
+            reason: refusal::ROOT_GONE,
         });
     };
 
@@ -161,22 +182,17 @@ pub fn plan(
         // agrees with the other, so nothing here can be adopted.
         (Some(r), _) if r.rejected > 0 => {
             return Ok(AdoptPlan::Refuse {
-                reason: "the previous client's resume data maps a file outside the torrent's \
-                         directory, or to a name that is not UTF-8; where libtorrent would look \
-                         for it is not where the pool found it",
+                reason: refusal::MAPPED_OUTSIDE,
             })
         }
         (Some(r), true) if !r.in_resume_data => {
             return Ok(AdoptPlan::Refuse {
-                reason: "the previous client's content layout moved these files, and its resume \
-                         data does not tell libtorrent so; adopting would look for them in the \
-                         wrong places",
+                reason: refusal::LAYOUT_NOT_IN_RESUME,
             })
         }
         (Some(_), false) => {
             return Ok(AdoptPlan::Refuse {
-                reason: "the previous client renamed these files, which only its resume data maps \
-                         for libtorrent, and that resume data does not mark every piece had",
+                reason: refusal::RENAMED_INCOMPLETE,
             })
         }
         _ => {}
