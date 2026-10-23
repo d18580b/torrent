@@ -2805,6 +2805,133 @@ mod tests {
         assert_eq!(plan.status, plan_status::FAILED);
     }
 
+    /// The child half of
+    /// [`a_kill_9_inside_a_delete_batch_leaves_its_steps_in_progress`]: applies
+    /// the plan, and once the batch's first step has moved its file, says so
+    /// and waits there, between two steps of one batch, to be killed.
+    #[test]
+    #[ignore = "run only as the crash test's child process"]
+    fn delete_batch_crash_child() {
+        use std::io::Write as _;
+        let Some(dir) = std::env::var_os("TORRENTD_POOL_CRASH_DIR") else {
+            return;
+        };
+        let plan_id: i64 = std::env::var("TORRENTD_POOL_CRASH_PLAN")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let first = PathBuf::from(std::env::var_os("TORRENTD_POOL_CRASH_FIRST").unwrap());
+        let pool = service(Path::new(&dir), true);
+        let (source, state) = engine_and_state();
+        let stop = || {
+            if !first.exists() {
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "inside the batch").unwrap();
+                out.flush().unwrap();
+                // The parent never writes; this returns only if it is gone.
+                let _ = std::io::stdin().read_line(&mut String::new());
+                std::process::exit(3);
+            }
+            false
+        };
+        let _ = apply(&pool, &source, &state, plan_id, &stop);
+        panic!("the batch ran to its end without being killed");
+    }
+
+    /// `kill -9` between two steps of one journal batch, then a fresh open of
+    /// the same index: every step of the batch is `in_progress`, the one that
+    /// ran and the ones that had not alike, the plan is still `applying`, and
+    /// the re-drive refuses it rather than re-running or skipping any of
+    /// them. [`a_crash_inside_a_batch_refuses_the_plan_counting_every_unknown_step`]
+    /// writes that journal by hand; this one has a real process die into it.
+    #[test]
+    fn a_kill_9_inside_a_delete_batch_leaves_its_steps_in_progress() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [
+            write(&root, "junk/a.bin", 8),
+            write(&root, "junk/b.bin", 8),
+            write(&root, "junk/c.bin", 8),
+        ];
+        let (plan_id, first) = {
+            let pool = service(dir.path(), true);
+            pool.scan().unwrap();
+            let plan_id = delete_plan(&pool);
+            let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+            assert_eq!(steps.len(), 3, "{steps:?}");
+            (plan_id, PathBuf::from(&steps[0].src))
+        };
+        assert_eq!(first, orphans[0]);
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pool_apply::tests::delete_batch_crash_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TORRENTD_POOL_CRASH_DIR", dir.path())
+            .env("TORRENTD_POOL_CRASH_PLAN", plan_id.to_string())
+            .env("TORRENTD_POOL_CRASH_FIRST", &first)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Read on a thread of its own, so a child that never gets there fails
+        // the test within a bound rather than hanging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                // libtest's `test NAME ... ` precedes it on the same line.
+                if line.is_ok_and(|l| l.ends_with("inside the batch")) {
+                    let _ = tx.send(());
+                    return;
+                }
+            }
+        });
+        let reached = rx.recv_timeout(std::time::Duration::from_secs(60));
+        if reached.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child never reached the inside of the batch: {reached:?}");
+        }
+        child.kill().unwrap(); // SIGKILL
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+
+        let pool = service(dir.path(), true);
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::APPLYING);
+        assert_eq!(
+            statuses(&pool, plan_id),
+            ["in_progress", "in_progress", "in_progress"],
+            "the batch's start was journalled in one commit before its first step",
+        );
+        assert!(!orphans[0].exists(), "the first step ran before the kill");
+        assert!(orphans[1].exists() && orphans[2].exists());
+
+        let (source, state) = engine_and_state();
+        let e = apply_inner(&pool, &source, &state, plan_id, true, &|| false).unwrap_err();
+        assert!(
+            e.contains("step 0 (delete_file) was interrupted") && e.contains("2 more of its steps"),
+            "{e}"
+        );
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::FAILED);
+        assert!(
+            orphans[1].exists() && orphans[2].exists(),
+            "the refused re-drive ran nothing"
+        );
+    }
+
     /// A registry over `dir` assigning `ih` to profile `p`, handed to `pool`
     /// as the daemon hands it the boot's.
     fn assign(pool: &PoolService, dir: &Path, ih: &str) {
