@@ -34,4 +34,82 @@ mod link_smoke {
     fn lt_alert_payload_free_null_is_safe() {
         unsafe { lt_alert_payload_free(std::ptr::null_mut()) };
     }
+
+    // The shim releases payloads with `std::free`, so the test allocates
+    // them with the C allocator too.
+    extern "C" {
+        fn malloc(size: usize) -> *mut std::ffi::c_void;
+    }
+
+    /// `alert_union.h` documents `lt_alert_payload_free` as idempotent. For
+    /// every kind that owns a heap payload, the first call releases it and
+    /// nulls the pointer and its length, so a second call frees nothing:
+    /// without the nulling it would hand glibc the same block twice, which
+    /// aborts the process.
+    #[test]
+    fn payload_free_is_idempotent_per_kind() {
+        type Read = fn(&lt_alert_payload_u) -> (*const std::ffi::c_void, usize);
+        type Write = fn(&mut lt_alert_payload_u, *mut std::ffi::c_void);
+        let kinds: [(u32, Read, Write); 5] = [
+            (
+                lt_alert_kind_LT_ALERT_STATE_UPDATE,
+                |p| unsafe { (p.state_update.statuses.cast(), p.state_update.count) },
+                |p, b| {
+                    p.state_update.statuses = b.cast();
+                    p.state_update.count = 1;
+                },
+            ),
+            (
+                lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA,
+                |p| unsafe { (p.save_resume.buf.cast(), p.save_resume.len) },
+                |p, b| {
+                    p.save_resume.buf = b.cast();
+                    p.save_resume.len = 1;
+                },
+            ),
+            (
+                lt_alert_kind_LT_ALERT_METADATA_RECEIVED,
+                |p| unsafe { (p.metadata_received.buf.cast(), p.metadata_received.len) },
+                |p, b| {
+                    p.metadata_received.buf = b.cast();
+                    p.metadata_received.len = 1;
+                },
+            ),
+            (
+                lt_alert_kind_LT_ALERT_SESSION_STATS,
+                |p| unsafe { (p.session_stats.counters.cast(), p.session_stats.count) },
+                |p, b| {
+                    p.session_stats.counters = b.cast();
+                    p.session_stats.count = 1;
+                },
+            ),
+            (
+                lt_alert_kind_LT_ALERT_STORAGE_MOVED,
+                |p| unsafe { (p.storage_moved.path.cast(), p.storage_moved.path_len) },
+                |p, b| {
+                    p.storage_moved.path = b.cast();
+                    p.storage_moved.path_len = 1;
+                },
+            ),
+        ];
+        for (kind, read, write) in kinds {
+            let mut u: lt_alert_union = unsafe { std::mem::zeroed() };
+            u.kind = kind;
+            // Large enough for one element of any of the payload arrays.
+            let block = unsafe { malloc(std::mem::size_of::<lt_torrent_status_view>()) };
+            assert!(!block.is_null(), "malloc failed");
+            write(&mut u.payload, block);
+            assert_eq!(read(&u.payload), (block.cast_const(), 1));
+
+            unsafe { lt_alert_payload_free(&mut u) };
+            assert_eq!(
+                read(&u.payload),
+                (std::ptr::null(), 0),
+                "kind {kind}: the first free must clear the payload",
+            );
+            unsafe { lt_alert_payload_free(&mut u) };
+            assert_eq!(read(&u.payload), (std::ptr::null(), 0), "kind {kind}");
+            assert_eq!(u.kind, kind, "freeing does not change the kind");
+        }
+    }
 }
