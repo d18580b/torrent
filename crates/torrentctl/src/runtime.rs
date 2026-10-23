@@ -333,10 +333,12 @@ mod tests {
         let (_api_tx, mut rx) = follow(&server, "tdp_a", FAST);
         let mut stream = server.next(PATIENCE).await;
         stream.open().await;
+        // Taken before the tick is sent, so the follower's wait for the next
+        // one cannot have started earlier.
+        let last_tick = Instant::now();
         stream.tick("00000000000000aa", "").await;
         assert_eq!(next_live(&mut rx).await, Live::Streaming);
         assert_eq!(next_changed(&mut rx).await, "00000000000000aa");
-        let last_tick = Instant::now();
 
         // The connection stays open and says nothing: a wedged daemon.
         let reason = reason(next_live(&mut rx).await);
