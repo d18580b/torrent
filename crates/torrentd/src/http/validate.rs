@@ -8,8 +8,16 @@
 //! with a constraint is extracted as `Json<Unenforced<T>>`, which kynos
 //! describes exactly as `T` and does not check. `T` implements [`Validate`],
 //! restating each constraint, and its handler rejects before acting.
-//! `http::tests::spec` holds the table that proves each declared constraint
-//! is enforced, and with which problem type.
+//!
+//! No test of the published document can tell the wrapper is missing: the
+//! document is the same either way. Instead each operation's own scenario
+//! sends a body that breaks a declared bound and asserts
+//! `422 validation-failed` at its pointer (`adding`, `controls` and `files` in
+//! `http::tests::torrents`, `adoption` and `verification` in
+//! `http::tests::pool`, and, with the `fault-injection` feature,
+//! `fault_injection::scenarios`), so one of these bodies extracted as plain
+//! `Json<T>` fails its scenario. A new bounded body is covered only once its
+//! operation's scenario does the same.
 
 use kynos::schema::registry::Registry;
 use serde::Deserialize;
