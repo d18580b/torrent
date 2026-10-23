@@ -1985,16 +1985,19 @@ On a scratch pool, not your real one.
    a WireGuard tunnel routed the way the daemon routes the links it raises.
    Inside the namespace the drill is uid 0, so the kill switch it installs,
    the ruleset `killswitch::render_ruleset_with_transport` renders, matches
-   every socket there. Each drill exits 0 when it finds no gap, 1 when it
+   every socket there. The drill does not carry a copy of that ruleset: it
+   asks the daemon for it, through `torrentd vpn check`, so the first three
+   need a built `torrentd`, `$TORRENTD` or by default `target/debug/torrentd`. Each drill exits 0 when it finds no gap, 1 when it
    finds one, and 2 when its topology could not be set up (`natpmp-fence.sh`
    also exits 3, below). It prints a line per check: `gap` fails the drill,
    while `ok` and `info` do not.
 
    ```bash
+   cargo build -p torrentd
    deploy/drill/udp-transport.sh
    deploy/drill/listener-replies.sh
    deploy/drill/ipv6-egress.sh
-   cargo build -p torrentd && deploy/drill/natpmp-fence.sh target/debug/torrentd
+   deploy/drill/natpmp-fence.sh target/debug/torrentd
    ```
 
    `natpmp-fence.sh` runs the real daemon, which raises the tunnel itself
