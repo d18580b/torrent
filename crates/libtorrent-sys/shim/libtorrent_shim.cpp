@@ -712,6 +712,20 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         }
         return true;
     }
+    // torrentd-engine's dropped-alert handler (handlers/dropped.rs) reads
+    // these bits by libtorrent's alert type numbers, which it hard-codes. A
+    // libtorrent that renumbers any of them fails the build here rather than
+    // leaving that handler testing the wrong bits.
+    static_assert(lt::torrent_removed_alert::alert_type == 4,
+                  "dropped.rs TORRENT_REMOVED_TYPE");
+    static_assert(lt::save_resume_data_alert::alert_type == 37,
+                  "dropped.rs SAVE_RESUME_DATA_TYPE");
+    static_assert(lt::save_resume_data_failed_alert::alert_type == 38,
+                  "dropped.rs SAVE_RESUME_DATA_FAILED_TYPE");
+    static_assert(lt::add_torrent_alert::alert_type == 67,
+                  "dropped.rs ADD_TORRENT_TYPE");
+    static_assert(lt::state_update_alert::alert_type == 68,
+                  "dropped.rs STATE_UPDATE_TYPE");
     if (auto* x = lt::alert_cast<lt::alerts_dropped_alert>(a)) {
         out.kind = LT_ALERT_ALERTS_DROPPED;
         // dropped_alerts is a fixed-size bitset; copy bit values into our

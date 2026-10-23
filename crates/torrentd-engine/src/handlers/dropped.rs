@@ -38,6 +38,10 @@ use crate::handlers::HandlerCtx;
 /// (`include/libtorrent/alert_types.hpp`). The shim copies libtorrent's
 /// `dropped_alerts` bitset bit for bit, so bit *n* of the pair is alert type
 /// *n*.
+///
+/// The shim `static_assert`s each of these five numbers against libtorrent's
+/// own `alert_type` (`libtorrent_shim.cpp`, beside the `alerts_dropped`
+/// translation), so a libtorrent that renumbers one fails the build.
 const SAVE_RESUME_DATA_TYPE: u32 = 37;
 const SAVE_RESUME_DATA_FAILED_TYPE: u32 = 38;
 /// `add_torrent_alert::alert_type` in libtorrent 2.0.
