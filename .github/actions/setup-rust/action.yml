@@ -1,0 +1,73 @@
+name: setup-rust
+description: >-
+  Everything a CI job needs before its `mise run` steps: the native build's
+  system packages, a Rust toolchain, the cargo registry and target cache, and
+  mise with the tools mise.toml pins. Each part is optional, so a job that
+  builds nothing still provisions mise the same way as one that builds.
+
+inputs:
+  system-deps:
+    description: >-
+      Install the apt packages libtorrent-sys's native build needs (a C++
+      toolchain, CMake, Ninja, OpenSSL and libclang for bindgen).
+    required: false
+    default: 'false'
+  extra-packages:
+    description: >-
+      Further apt packages, space separated, installed with the system deps.
+    required: false
+    default: ''
+  toolchain:
+    description: >-
+      The Rust toolchain to install, or empty to install none and use the
+      runner's own.
+    required: false
+    default: '1.90'
+  components:
+    description: Comma-separated rustup components for the toolchain.
+    required: false
+    default: ''
+  cache-prefix:
+    description: >-
+      Key prefix for the cargo registry and target cache, one per job so jobs
+      that build different feature sets do not evict each other's target/.
+      Empty disables the cache.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - if: inputs.system-deps == 'true'
+      shell: bash
+      env:
+        EXTRA: ${{ inputs.extra-packages }}
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        # shellcheck disable=SC2086 # EXTRA is a space-separated package list.
+        sudo apt-get install -y \
+          build-essential cmake ninja-build pkg-config \
+          libssl-dev libclang-dev \
+          $EXTRA
+
+    - if: inputs.toolchain != ''
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+
+    - if: inputs.cache-prefix != ''
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: ${{ inputs.cache-prefix }}-${{ runner.os }}-
+
+    # cargo-binstall lets mise fetch prebuilt convco and cargo-deny binaries
+    # (no compile, no C build deps).
+    - uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # v1.26.0
+    - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4

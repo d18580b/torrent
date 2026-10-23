@@ -9,7 +9,8 @@
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check
 #   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|deny
-#   mise run native|native-clean
+#   mise run lint-tracing|container|commit-lint <file-or-range>
+#   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
 #   mise run bench -- <subcommand>
 
@@ -37,6 +38,12 @@ jobs = 1
 # (imports_granularity / group_imports in rustfmt.toml) is an unstable feature.
 # Everything else builds/lints/tests on the pinned stable toolchain.
 RUSTFMT_TOOLCHAIN = "nightly"
+# Warnings are errors everywhere a mise task builds, locally exactly as in CI,
+# so a warning fails a hook or a local `mise run test` instead of first
+# surfacing as a red CI run. It replaces, rather than extends, a RUSTFLAGS the
+# shell exports: one value means one build cache shared by every task, and a
+# developer's own codegen flags belong in a cargo config, not in RUSTFLAGS.
+RUSTFLAGS = "-D warnings"
 
 [tasks.fmt]
 description = "Check formatting (nightly rustfmt)"
@@ -46,13 +53,75 @@ run = "cargo +$RUSTFMT_TOOLCHAIN fmt --all --check"
 description = "Apply formatting (nightly rustfmt)"
 run = "cargo +$RUSTFMT_TOOLCHAIN fmt --all"
 
+# Clippy runs once per feature set that compiles code the default features do
+# not: `fault-injection` mounts `POST /v1/faults` and wraps every engine in
+# `FaultEngine`, and `shim-tests` compiles libtorrent-sys's FFI suite. Both
+# builds are tested in CI; without these passes neither was ever linted.
 [tasks.lint]
-description = "Clippy across the workspace, warnings denied"
-run = "cargo clippy --workspace --all-targets -- -D warnings"
+description = "Clippy across the workspace and its fault-injection and shim-tests builds, warnings denied"
+run = [
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy -p torrentd --all-targets --features fault-injection -- -D warnings",
+  "cargo clippy -p libtorrent-sys --all-targets --features shim-tests -- -D warnings",
+]
 
 [tasks.lint-fix]
-description = "Clippy autofix — safe under the hk pre-commit hook (allows staged/dirty index)"
-run = "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged -- -D warnings"
+description = "Clippy autofix over lint's feature sets — safe under the hk pre-commit hook (allows staged/dirty index)"
+run = [
+  "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged -- -D warnings",
+  "cargo clippy --fix -p torrentd --all-targets --features fault-injection --allow-dirty --allow-staged -- -D warnings",
+  "cargo clippy --fix -p libtorrent-sys --all-targets --features shim-tests --allow-dirty --allow-staged -- -D warnings",
+]
+
+# Log field names. CONTRIBUTING.md fixes the `infohash` and `profile_id`
+# spellings; the other spelling of either silently splits every log query in
+# two. Scoped to *.rs so the C++ shim's include of libtorrent's real header
+# (<libtorrent/info_hash.hpp>) is not flagged. The `::error::` and
+# `::warning::` prefixes are GitHub annotations in CI, and plain text locally.
+[tasks.lint-tracing]
+description = "Reject info_hash and slot_id log field names in crates/"
+run = '''
+set -eu
+if grep -RnE --include='*.rs' '\binfo_hash\b' crates/; then
+  echo "::error::Field name must be 'infohash' (no underscore)."
+  exit 1
+fi
+# `slot_id` was the field's name before profiles replaced slots.
+if grep -RnE --include='*.rs' '\bslot_id\b' crates/; then
+  echo "::error::use profile_id, not slot_id"
+  exit 1
+fi
+# A free-standing log line emitting `infohash =` outside an
+# instrument-decorated function is not forbidden, but the parent span should
+# carry the field. Soft warning only.
+if grep -RnE --include='*.rs' 'tracing::(info|warn|error|debug)!\([^)]*infohash *=' crates/ | grep -v 'fields(' >/dev/null; then
+  echo "::warning::Free-standing infohash field in a log macro; prefer #[instrument] on the parent function."
+fi
+'''
+
+# Conventional Commits, checked by the convco [tools] pins. The commit-msg hook
+# passes the message file git wrote; CI passes a pull request's BASE..HEAD
+# range, which backstops the hook against `--no-verify`.
+[tasks.commit-lint]
+description = "convco: check a commit-message file, or every commit in a BASE..HEAD range"
+usage = '''
+arg "<target>" help="A commit-message file, or a commit range such as BASE..HEAD"
+'''
+run = '''
+set -eu
+if [ -f "$usage_target" ]; then
+  # --strip drops the comment and scissors lines git writes into the file.
+  convco check --from-stdin --strip < "$usage_target"
+else
+  convco check "$usage_target"
+fi
+'''
+
+# deploy/Containerfile's stages. The build context needs the vendor submodules,
+# so run this from a recursive checkout.
+[tasks.container]
+description = "Build the container image from deploy/Containerfile (needs podman and the vendor submodules)"
+run = "podman build -f deploy/Containerfile -t torrentd:dev ."
 
 [tasks.test]
 description = "Workspace tests (default features; parity with CI)"
@@ -228,16 +297,23 @@ depends = ["fmt", "lint"]
 # The native prefix deliberately does NOT get its path from a [env] entry here:
 # a bare `cargo build` outside mise has to resolve the same directory, so both
 # sides independently expand ${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native.
+# The vendor submodules a native build needs, shallow. CI's native-cache action
+# runs this only when the prefix cache missed: consuming a prefix needs neither.
+#
+# Skipping libsimulator is not an optimisation: it builds libtorrent's
+# simulation tests, which nothing here consumes, and libtorrent pins a
+# commit that is not the tip of libsimulator's default branch -- which is
+# all a --depth 1 fetch can reach. Without this the nested checkout lands
+# on whatever that tip was, and vendor/libtorrent reads as
+# "(modified content)" in every `git status` from then on.
+[tasks.native-fetch]
+description = "Fetch the vendor/libtorrent and vendor/boost submodules (shallow)"
+run = "git -c 'submodule.simulation/libsimulator.update=none' submodule update --init --recursive --depth 1 vendor/libtorrent vendor/boost"
+
 [tasks.native]
 description = "Provision the shared libtorrent/Boost prefix (first run: 5-15 min)"
 run = [
-  # Skipping libsimulator is not an optimisation: it builds libtorrent's
-  # simulation tests, which nothing here consumes, and libtorrent pins a
-  # commit that is not the tip of libsimulator's default branch -- which is
-  # all a --depth 1 fetch can reach. Without this the nested checkout lands
-  # on whatever that tip was, and vendor/libtorrent reads as
-  # "(modified content)" in every `git status` from then on.
-  "git -c 'submodule.simulation/libsimulator.update=none' submodule update --init --recursive --depth 1",
+  "mise run native-fetch",
   "cargo build -p libtorrent-sys",
   # Honours LIBTORRENT_SYS_CACHE_DIR, which build.rs checks before XDG, and
   # tolerates the glob not matching rather than failing a 15-minute task.

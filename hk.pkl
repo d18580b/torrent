@@ -39,12 +39,12 @@ hooks {
   }
 
   // Enforce Conventional Commits AT COMMIT TIME (not pre-push, which is easy to
-  // force through). convco reads the message from stdin; --strip removes the
-  // comment / scissor lines git writes into the message file.
+  // force through). The mise `commit-lint` task is the one convco invocation,
+  // shared with CI's check over a pull request's commit range.
   ["commit-msg"] {
     steps {
       ["convco"] {
-        check = "mise exec -- convco check --from-stdin --strip < {{commit_msg_file}}"
+        check = "mise run commit-lint {{commit_msg_file}}"
       }
     }
   }
