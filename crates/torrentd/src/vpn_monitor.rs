@@ -1575,38 +1575,107 @@ pub(crate) fn resume_unless_fenced(
 /// Dropping it stops them too, so a boot that fails, or a handle that is
 /// never run, leaves nothing fencing sessions that are being closed.
 #[derive(Debug)]
-pub(crate) struct FencingStop(tokio::sync::watch::Sender<bool>);
+pub(crate) struct FencingStop {
+    stop: tokio::sync::watch::Sender<bool>,
+    gate: FencingGate,
+}
 
 impl FencingStop {
     pub(crate) fn new() -> Self {
-        Self(tokio::sync::watch::Sender::new(false))
+        Self {
+            stop: tokio::sync::watch::Sender::new(false),
+            gate: FencingGate::default(),
+        }
     }
 
     /// The receiving end one fencing task holds for as long as it runs.
     pub(crate) fn subscribe(&self) -> FencingStopped {
-        FencingStopped(self.0.subscribe())
+        FencingStopped {
+            stop: self.stop.subscribe(),
+            gate: self.gate.clone(),
+        }
     }
 
-    /// Tell every subscriber to stop, then wait up to `bound` for each to
-    /// have returned (dropped its [`FencingStopped`]). Returns whether they
-    /// all did: a poll or check already running on the blocking pool
-    /// finishes first, and one that outlasts `bound` is still running.
+    /// Tell every subscriber to stop, close their [`FencingGate`], and wait
+    /// for each to have returned (dropped its [`FencingStopped`]), all within
+    /// `bound`. Returns whether the gate closed and they all returned.
+    ///
+    /// Closing the gate waits out an act already inside it, then refuses
+    /// every later one: a check already running on the blocking pool cannot
+    /// be cancelled, and without the gate one that outlasted `bound` could
+    /// still reinstall the table the teardown removes. An act that outlasts
+    /// `bound` leaves the gate to close as soon as that act ends.
     pub(crate) async fn stop(self, bound: Duration) -> bool {
-        self.0.send_replace(true);
-        tokio::time::timeout(bound, self.0.closed()).await.is_ok()
+        let deadline = tokio::time::Instant::now() + bound;
+        self.stop.send_replace(true);
+        let closed = self.gate.try_close() || {
+            let gate = self.gate.clone();
+            tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(move || gate.close()))
+                .await
+                .is_ok_and(|joined| joined.is_ok())
+        };
+        let returned = tokio::time::timeout_at(deadline, self.stop.closed())
+            .await
+            .is_ok();
+        closed && returned
+    }
+}
+
+/// What a fencing task's blocking work passes each act through that would
+/// change the profiles or the ruleset — a fence, a lift, a reinstall — so
+/// that none runs once [`FencingStop::stop`] has closed it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FencingGate(Arc<std::sync::Mutex<bool>>);
+
+impl FencingGate {
+    /// Run `act` unless the stop has closed the gate, which waits for it to
+    /// end. `None`, without running it, once closed.
+    pub(crate) fn run<T>(&self, act: impl FnOnce() -> T) -> Option<T> {
+        let closed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!*closed).then(act)
+    }
+
+    /// Close the gate, once any act inside it has ended. Blocking.
+    fn close(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
+    /// Close the gate if no act is inside it, returning whether it closed.
+    fn try_close(&self) -> bool {
+        let mut closed = match self.0.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        *closed = true;
+        true
     }
 }
 
 /// A fencing task's half of [`FencingStop`].
 #[derive(Debug)]
-pub(crate) struct FencingStopped(tokio::sync::watch::Receiver<bool>);
+pub(crate) struct FencingStopped {
+    stop: tokio::sync::watch::Receiver<bool>,
+    gate: FencingGate,
+}
 
 impl FencingStopped {
     /// Resolves once the stop is asked for, or its [`FencingStop`] is
     /// dropped. Cancel safe: the stop is a level, read afresh each call.
     pub(crate) async fn stopped(&mut self) {
         // `Err` is the sender gone, which is a stop as well.
-        let _ = self.0.wait_for(|stop| *stop).await;
+        let _ = self.stop.wait_for(|stop| *stop).await;
+    }
+
+    /// The gate the task's blocking work runs its acts through.
+    pub(crate) fn gate(&self) -> FencingGate {
+        self.gate.clone()
     }
 }
 
@@ -2720,6 +2789,83 @@ mod tests {
             .await
             .expect("the monitor returns")
             .unwrap();
+    }
+
+    /// Work on the blocking pool outlives an abort of the task that spawned
+    /// it, so the stop closes the gate its acts run through: the stop waits
+    /// out an act already inside, and every act after it is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_waits_out_an_act_in_its_gate_and_refuses_every_later_one() {
+        let stop = FencingStop::new();
+        let subscriber = stop.subscribe();
+        let gate = subscriber.gate();
+        drop(subscriber);
+        assert_eq!(gate.run(|| 1), Some(1), "an open gate runs its act");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let in_flight = std::thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.run(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            }
+        });
+        entered_rx.recv().unwrap();
+        let stopping = tokio::spawn(stop.stop(Duration::from_secs(30)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !stopping.is_finished(),
+            "the stop waits for the act inside its gate"
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            stopping.await.unwrap(),
+            "the gate closed and nothing was left running"
+        );
+        assert_eq!(
+            in_flight.join().unwrap(),
+            Some(()),
+            "the act inside ran to its end"
+        );
+        assert_eq!(gate.run(|| 1), None, "the stop refuses every later act");
+    }
+
+    /// An act that outlasts the bound does not hold the stop past it; the
+    /// gate closes as soon as that act ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_returns_at_its_bound_and_the_gate_closes_after_the_act() {
+        let stop = FencingStop::new();
+        let gate = stop.subscribe().gate();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let in_flight = std::thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.run(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            }
+        });
+        entered_rx.recv().unwrap();
+        assert!(
+            !stop.stop(Duration::from_millis(100)).await,
+            "an act past the bound is reported"
+        );
+        release_tx.send(()).unwrap();
+        in_flight.join().unwrap();
+        // The close the stop handed to the blocking pool takes the lock once
+        // the act lets go of it.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.run(|| ()).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the gate closes once the act ends");
     }
 
     /// The route probe as `run` calls it: its answer reaches the verdict,

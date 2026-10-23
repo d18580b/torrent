@@ -453,8 +453,9 @@ const BOOT_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(15 
 const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long the teardown waits for the VPN monitor and the kill-switch
-/// watch to return once told to stop: a poll or check of theirs already
-/// running shells out to `ip`, `wg` or `nft`, and finishes first.
+/// watch to return once told to stop, and for the stop's gate to close: a
+/// poll or check of theirs already running shells out to `ip`, `wg` or
+/// `nft`, and finishes first.
 const FENCING_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Every descriptor the daemon may hold at once, against `RLIMIT_NOFILE`.
@@ -3763,8 +3764,16 @@ impl DaemonHandle {
 
 /// Stop the VPN monitor and the kill-switch watch, waiting up to
 /// [`FENCING_STOP_BOUND`] for each to return, then abort the watch in case it
-/// did not: a check already on the blocking pool finishes, and every one
-/// after it would read the teardown's removal of the table as a flush.
+/// did not, so that no later check starts.
+///
+/// The abort cannot cancel a check already on the blocking pool, and that
+/// check would read the teardown's removal of the table as a flush. What
+/// keeps it from installing the table again, or fencing the closing
+/// sessions, is the stop's gate (`vpn_monitor::FencingGate`): the stop
+/// closes it within the bound, after any fence or install inside it ends,
+/// and the check's later ones are refused. Only a fence or install that
+/// itself outlasts the bound can still land after the teardown, which the
+/// warning below reports.
 async fn stop_fencing(
     fencing: crate::vpn_monitor::FencingStop,
     kill_switch_watch: Option<&tokio::task::AbortHandle>,
