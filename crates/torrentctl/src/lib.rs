@@ -8,7 +8,7 @@ pub mod app;
 pub mod config;
 mod fmt;
 pub mod runtime;
-mod screens;
+pub mod screens;
 #[cfg(test)]
 mod testing;
 pub mod theme;

@@ -53,6 +53,8 @@ spargen = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 tempfile = { workspace = true }
+# openpty(3), for the e2e test that runs the binary under a pty.
+libc = { workspace = true }
 
 [lints]
 workspace = true
