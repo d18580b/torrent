@@ -261,6 +261,21 @@ pub fn busy(state: &State) -> bool {
         }
 }
 
+/// Whether the last load of what is shown, the list or the open torrent,
+/// failed, so it may predate a change. A files or trackers error counts only
+/// where [`load_detail`] re-reads it: one it will not re-read would never
+/// clear, and the change would be refetched on every re-send.
+pub fn load_failed(state: &State) -> bool {
+    match &state.detail {
+        Some(d) => {
+            d.error.is_some()
+                || (rereads_files(d) && d.files.error.is_some())
+                || (rereads_trackers(d) && d.trackers_error.is_some())
+        }
+        None => state.list.error.is_some(),
+    }
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.confirm.is_some() {
         return Some(Msg::ConfirmKey(key));
@@ -1135,23 +1150,28 @@ fn load_detail(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
             crate::app::Msg::Torrents(Msg::Torrent { hash, result })
         }));
     }
-    match detail.tab {
-        // A list longer than one request is not re-read on every change: it
-        // would take a request per thousand files each time, and files do
-        // not change while a torrent seeds (a priority edit updates its row
-        // in place). Such a list is left as it is; reopening the torrent
-        // reloads it, in as many requests as it needs.
-        detail::Tab::Files
-            if !detail.files.loading && detail.files.items.len() <= caps::PAGE_MAX =>
-        {
-            effects.extend(load_files(detail, ctx))
-        }
-        detail::Tab::Trackers if !detail.trackers_loading => {
-            effects.extend(load_trackers(detail, ctx))
-        }
-        _ => {}
+    if rereads_files(detail) && !detail.files.loading {
+        effects.extend(load_files(detail, ctx));
+    } else if rereads_trackers(detail) && !detail.trackers_loading {
+        effects.extend(load_trackers(detail, ctx));
     }
     effects
+}
+
+/// Whether [`load_detail`] re-reads the open torrent's files: only on the
+/// Files tab, and only a list that fits one request. A longer list would take
+/// a request per thousand files on every change, and files do not change
+/// while a torrent seeds (a priority edit updates its row in place). Such a
+/// list is left as it is; reopening the torrent reloads it, in as many
+/// requests as it needs.
+fn rereads_files(detail: &detail::Detail) -> bool {
+    detail.tab == detail::Tab::Files && detail.files.items.len() <= caps::PAGE_MAX
+}
+
+/// Whether [`load_detail`] re-reads the open torrent's trackers: only on the
+/// Trackers tab.
+fn rereads_trackers(detail: &detail::Detail) -> bool {
+    detail.tab == detail::Tab::Trackers
 }
 
 fn load_files(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -2453,6 +2473,38 @@ mod tests {
             view(&state, ctx, frame, area)
         });
         assert!(screen.contains("metadata not yet received"), "{screen}");
+    }
+
+    #[test]
+    fn only_an_error_a_refresh_re_reads_counts_as_failed() {
+        let mut state = opened(false);
+        with_files(&mut state);
+        with_trackers(&mut state);
+        testing::with_ctx(None, |ctx| {
+            update(
+                &mut state,
+                Msg::Trackers {
+                    hash: hash(1),
+                    result: Err(failure(500, "internal", "boom")),
+                },
+                ctx,
+            );
+            assert!(load_failed(&state), "trackers, on the Trackers tab");
+            update(&mut state, Msg::Tab(false), ctx);
+            let detail = state.detail.as_mut().unwrap();
+            let generation = detail.files.generation;
+            detail.files.fail(generation, "no metadata yet".to_owned());
+            assert!(load_failed(&state), "files, on the Files tab");
+            // A refresh re-reads neither from the Overview tab.
+            update(&mut state, Msg::Tab(false), ctx);
+            assert!(!load_failed(&state), "neither, on the Overview tab");
+            // Nor a files list longer than one request.
+            update(&mut state, Msg::Tab(true), ctx);
+            let detail = state.detail.as_mut().unwrap();
+            let row = detail.files.items[0].clone();
+            detail.files.items.resize(caps::PAGE_MAX + 1, row);
+            assert!(!load_failed(&state), "a long files list");
+        });
     }
 
     #[test]

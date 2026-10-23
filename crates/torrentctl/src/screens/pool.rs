@@ -161,6 +161,25 @@ pub fn busy(state: &State) -> bool {
     }
 }
 
+/// Whether the last load of the view shown failed, so what it shows may
+/// predate a change.
+pub fn load_failed(state: &State) -> bool {
+    match state.view {
+        View::Overview => state.overview.error.is_some(),
+        View::Tree if state.tree.root.is_some() => state.tree.entries.error.is_some(),
+        View::Tree => state.overview.error.is_some(),
+        View::Library => state.library.items.error.is_some(),
+        View::Plans => {
+            state.plans.list.error.is_some()
+                || state
+                    .plans
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.error.is_some() || d.steps.error.is_some())
+        }
+    }
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.adopt.is_some() {
         return Some(Msg::Adopt(adopt::Msg::Key(key)));

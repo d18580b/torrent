@@ -205,7 +205,8 @@ pub struct Model {
     /// The fingerprint of the stream tick that last refreshed the visible
     /// screen. A tick carrying the same one says nothing changed, so it
     /// fetches nothing. Not recorded when the screen had a load in flight
-    /// and skipped it, so a re-send retries. Forgotten whenever the stream's
+    /// and skipped it, so a re-send retries; forgotten when the screen's load
+    /// fails, so a re-send retries that too. Forgotten whenever the stream's
     /// state changes, so the first tick after a reconnect always refreshes.
     pub fingerprint: Option<String>,
 }
@@ -505,16 +506,16 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             };
             screens::login::update(&mut model.login, msg, &ctx)
         }
-        Msg::Dashboard(msg) => route(model, |m, ctx| {
+        Msg::Dashboard(msg) => answered(model, |m, ctx| {
             screens::dashboard::update(&mut m.dashboard, msg, ctx)
         }),
-        Msg::Torrents(msg) => route(model, |m, ctx| {
+        Msg::Torrents(msg) => answered(model, |m, ctx| {
             screens::torrents::update(&mut m.torrents, msg, ctx)
         }),
-        Msg::Profiles(msg) => route(model, |m, ctx| {
+        Msg::Profiles(msg) => answered(model, |m, ctx| {
             screens::profiles::update(&mut m.profiles, msg, ctx)
         }),
-        Msg::Pool(msg) => route(model, |m, ctx| screens::pool::update(&mut m.pool, msg, ctx)),
+        Msg::Pool(msg) => answered(model, |m, ctx| screens::pool::update(&mut m.pool, msg, ctx)),
     }
 }
 
@@ -529,6 +530,19 @@ fn route(model: &mut Model, f: impl FnOnce(&mut Model, &Ctx<'_>) -> Vec<Effect>)
         tick,
     };
     f(model, &ctx)
+}
+
+/// Route a screen's message, most often a load's answer. Where the visible
+/// screen's load has failed, the fingerprint that triggered it is forgotten,
+/// so the daemon's next re-send of it retries rather than leaving the error
+/// and the rows from before the change on screen until something else
+/// changes.
+fn answered(model: &mut Model, f: impl FnOnce(&mut Model, &Ctx<'_>) -> Vec<Effect>) -> Vec<Effect> {
+    let effects = route(model, f);
+    if load_failed(model) {
+        model.fingerprint = None;
+    }
+    effects
 }
 
 /// Refresh whatever is on screen.
@@ -555,6 +569,17 @@ fn busy(model: &Model) -> bool {
         Tab::Torrents => screens::torrents::busy(&model.torrents),
         Tab::Profiles => screens::profiles::busy(&model.profiles),
         Tab::Pool => screens::pool::busy(&model.pool),
+    }
+}
+
+/// Whether the visible screen's last load failed, so what it shows may
+/// predate the change that triggered it.
+fn load_failed(model: &Model) -> bool {
+    match model.tab {
+        Tab::Dashboard => screens::dashboard::load_failed(&model.dashboard),
+        Tab::Torrents => screens::torrents::load_failed(&model.torrents),
+        Tab::Profiles => screens::profiles::load_failed(&model.profiles),
+        Tab::Pool => screens::pool::load_failed(&model.pool),
     }
 }
 
@@ -1158,6 +1183,48 @@ mod tests {
         assert!(
             update(&mut m, tick("00000000000000bb")).is_empty(),
             "once seen, a re-send fetches nothing"
+        );
+    }
+
+    #[test]
+    fn a_change_whose_refresh_fails_is_retried_on_its_re_send() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = signed_in_as(model_at(&daemon), false);
+        m.tab = Tab::Profiles;
+        update(&mut m, Msg::LiveChanged(Live::Streaming));
+        let tick = |fp: &str| Msg::Changed(fp.to_owned());
+        let answer = |m: &mut Model, effects: Vec<Effect>| {
+            for msg in testing::run(effects) {
+                update(m, msg);
+            }
+        };
+
+        // The refresh the change triggers fails: a transient 500, say.
+        let effects = update(&mut m, tick("00000000000000aa"));
+        answer(&mut m, effects);
+        assert_eq!(daemon.lines(), ["GET /v1/profiles"]);
+        assert!(m.profiles.error.is_some(), "the failure is shown");
+
+        // The daemon re-sends the same fingerprint: the failed load is
+        // retried, not left on screen until some other change arrives.
+        let effects = update(&mut m, tick("00000000000000aa"));
+        answer(&mut m, effects);
+        assert_eq!(
+            daemon.lines(),
+            ["GET /v1/profiles", "GET /v1/profiles"],
+            "a change whose refresh failed is fetched again on its re-send"
+        );
+
+        // Once a refresh it triggered succeeds, a re-send fetches nothing.
+        assert_eq!(update(&mut m, tick("00000000000000aa")).len(), 1);
+        update(
+            &mut m,
+            Msg::Profiles(screens::profiles::Msg::Loaded(Ok(Vec::new()))),
+        );
+        assert!(m.profiles.error.is_none());
+        assert!(
+            update(&mut m, tick("00000000000000aa")).is_empty(),
+            "once loaded, a re-send fetches nothing"
         );
     }
 
