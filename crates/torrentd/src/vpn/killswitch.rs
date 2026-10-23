@@ -158,8 +158,8 @@ const TABLE_PREFIX: &str = "torrentd_ks";
 /// WireGuard one, the layout docs/running.md prescribes — deleted the other
 /// daemon's table each time it booted or stopped, and left that daemon's
 /// egress unconfined until its watch noticed. Two daemons sharing a uid in one
-/// network namespace still share a table; docs/running.md requires separate
-/// uids.
+/// network namespace would still share a table; [`TableLock`] refuses the
+/// second of them, and docs/running.md requires separate uids.
 pub fn table_name(uid: u32) -> String {
     format!("{TABLE_PREFIX}_{uid}")
 }
@@ -168,6 +168,110 @@ pub fn table_name(uid: u32) -> String {
 /// cannot be read: for messages that tell an operator what to delete.
 pub fn own_table_name() -> String {
     current_uid().map_or_else(|_| format!("{TABLE_PREFIX}_<uid>"), table_name)
+}
+
+/// The abstract unix socket `@torrentd_ks_<uid>`, bound for as long as this
+/// is held: one holder per uid per network namespace, which is exactly the
+/// scope of the uid's [`table_name`] table. A daemon holds it for its life
+/// and `torrentd net-cleanup` for its run, so neither a second daemon of the
+/// same uid on another state directory nor a cleanup acting for that uid can
+/// replace or remove the table a running daemon's kill switch is.
+///
+/// The state directory's single-instance lock cannot do this: it is per
+/// state directory, and the table is per uid. An abstract socket needs no
+/// file, so nothing is left behind however the process ends, and it is
+/// close-on-exec, so no child process (`openvpn`, `nft`) inherits it.
+#[derive(Debug)]
+pub struct TableLock {
+    /// Never read. Holding the bound socket is the lock.
+    _socket: std::os::unix::net::UnixDatagram,
+}
+
+impl TableLock {
+    /// Take the lock on `uid`'s table, or refuse naming the process that
+    /// holds it. The refusal's kind is [`io::ErrorKind::AddrInUse`], and no
+    /// other failure's is.
+    pub fn acquire(uid: u32) -> io::Result<Self> {
+        Self::acquire_named(&table_name(uid))
+    }
+
+    /// [`TableLock::acquire`] on the abstract socket `@name`.
+    pub(crate) fn acquire_named(name: &str) -> io::Result<Self> {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+        use std::os::unix::net::UnixDatagram;
+
+        let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
+        match UnixDatagram::bind_addr(&addr) {
+            Ok(socket) => Ok(Self { _socket: socket }),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                let who = match socket_holder(name) {
+                    Some((pid, comm)) => format!("{comm} (pid {pid})"),
+                    None => "another process".to_string(),
+                };
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "{who} holds the abstract unix socket @{name}, which a torrentd holds for \
+                         its life: the nftables table `inet {name}` is that daemon's kill switch \
+                         and would be this one's too, since the table is per uid, not per state \
+                         directory. Refusing before touching it. Stop that daemon first, or run \
+                         this one under a user of its own (docs/running.md §11, \"Two daemons in \
+                         one network namespace need separate uids\").",
+                    ),
+                ))
+            }
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("bind the abstract unix socket @{name}: {e}"),
+            )),
+        }
+    }
+}
+
+/// The pid and command name of a process holding the abstract unix socket
+/// `@name`, as this process can see it: the socket's inode from
+/// `/proc/net/unix` (this network namespace's), then the `/proc/<pid>/fd`
+/// entry linking to it. Best effort, for the refusal's message only: a holder
+/// in another pid namespace, or owned by another uid, is not found.
+fn socket_holder(name: &str) -> Option<(u32, String)> {
+    let table = std::fs::read_to_string("/proc/net/unix").ok()?;
+    let inode = unix_socket_inode(&table, name)?;
+    let target = std::ffi::OsString::from(format!("socket:[{inode}]"));
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let holds = fds
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == target));
+        if holds {
+            let comm = std::fs::read_to_string(entry.path().join("comm"))
+                .map_or_else(|_| "a process".to_string(), |c| c.trim().to_string());
+            return Some((pid, comm));
+        }
+    }
+    None
+}
+
+/// The inode `/proc/net/unix`'s `table` lists for the abstract socket
+/// `@name`. Its columns are `Num RefCount Protocol Flags Type St Inode Path`.
+fn unix_socket_inode(table: &str, name: &str) -> Option<u64> {
+    let path = format!("@{name}");
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            [_, _, _, _, _, _, inode, p] if *p == path => inode.parse().ok(),
+            _ => None,
+        }
+    })
 }
 
 /// One profile's tunnel as the ruleset pairs it: the interface, and the
@@ -1560,6 +1664,58 @@ mod tests {
 
     /// The table every test install, for uid 998, owns.
     const TABLE: &str = "torrentd_ks_998";
+
+    /// An abstract socket name no other test, and no daemon, binds.
+    fn lock_name(test: &str) -> String {
+        format!("torrentd_ks_test_{}_{test}", std::process::id())
+    }
+
+    /// A second holder is refused while the first lives, with the
+    /// `AddrInUse` kind boot reads as the configuration's refusal and a
+    /// message naming this process as the holder; once the first is
+    /// dropped the name is free again.
+    #[test]
+    fn a_second_table_lock_refuses_and_names_the_holder() {
+        let name = lock_name("second");
+        let first = TableLock::acquire_named(&name).expect("first lock");
+        let err = TableLock::acquire_named(&name).expect_err("second lock must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("(pid {})", std::process::id())),
+            "the refusal names the holder's pid: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("@{name}")) && msg.contains(&format!("inet {name}")),
+            "the refusal names the socket and the table: {msg}"
+        );
+        drop(first);
+        TableLock::acquire_named(&name).expect("the lock is free once the holder is gone");
+    }
+
+    /// The lock is on the table's own name, so a lock on another uid's
+    /// table does not stand in the way: separate uids are the supported
+    /// layout.
+    #[test]
+    fn another_uids_table_lock_does_not_refuse() {
+        let a = lock_name("uid_a");
+        let b = lock_name("uid_b");
+        let _a = TableLock::acquire_named(&a).expect("one uid's lock");
+        TableLock::acquire_named(&b).expect("another uid's lock is not refused");
+        assert_eq!(table_name(1000), "torrentd_ks_1000");
+    }
+
+    /// `/proc/net/unix`'s abstract entries are found by their exact name and
+    /// no other: a longer name sharing the prefix is not the socket.
+    #[test]
+    fn the_holders_inode_is_read_from_proc_net_unix() {
+        let table = "Num       RefCount Protocol Flags    Type St Inode Path\n\
+                     0000000000000000: 00000002 00000000 00000000 0002 01 4242 @torrentd_ks_10000\n\
+                     0000000000000000: 00000002 00000000 00000000 0002 01 777 @torrentd_ks_1000\n\
+                     0000000000000000: 00000002 00000000 00010000 0001 01 99\n";
+        assert_eq!(unix_socket_inode(table, "torrentd_ks_1000"), Some(777));
+        assert_eq!(unix_socket_inode(table, "torrentd_ks_100"), None);
+    }
 
     const ADDR_A: Ipv4Addr = Ipv4Addr::new(10, 2, 0, 2);
     const ADDR_B: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 7);

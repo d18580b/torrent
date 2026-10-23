@@ -124,11 +124,16 @@ const POOL_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// An exclusive `flock` on [`Config::instance_lock_path`], held for the life
 /// of the daemon and taken first in `boot`, so a second `torrentd` against
-/// the same state refuses before it can replace the running daemon's kill
-/// switch or tear down its tunnels. The kernel releases it however the
+/// the same state directory refuses before it can touch the running daemon's
+/// state files or tear down its tunnels. The kernel releases it however the
 /// process ends, so a crash leaves no stale lock.
 ///
-/// `torrentd net-cleanup` takes it too, so it refuses to tear down a running
+/// It is per state directory, and the kill switch's nftables table is per
+/// uid, so it does not keep a second daemon of the same uid on another state
+/// directory off the running one's table: the
+/// [`crate::vpn::killswitch::TableLock`] `boot` takes next does.
+///
+/// `torrentd net-cleanup` takes both, so it refuses to tear down a running
 /// daemon's tunnels and kill switch.
 #[derive(Debug)]
 pub(crate) struct InstanceLock {
@@ -877,6 +882,29 @@ pub struct DaemonHandle {
     /// down the kill switch and the tunnels: released any earlier, a new start
     /// could install its own and have this daemon's teardown remove them.
     instance_lock: InstanceLock,
+    /// Held as long as `instance_lock`, for the same reason: a daemon of this
+    /// uid started any earlier would install, or remove, the table this
+    /// daemon's teardown is still to remove.
+    table_lock: crate::vpn::killswitch::TableLock,
+}
+
+/// Take this uid's [`crate::vpn::killswitch::TableLock`]. Its refusal is a
+/// [`ConfigRefused`]: two daemons under one uid is a deployment no restart
+/// fixes, and exiting 78 keeps the unit from restarting into it every five
+/// seconds. Any other failure, an unreadable uid included, is not.
+fn acquire_table_lock() -> anyhow::Result<crate::vpn::killswitch::TableLock> {
+    let uid = crate::vpn::killswitch::current_uid()
+        .context("read this process's uid for the kill-switch table lock")?;
+    crate::vpn::killswitch::TableLock::acquire(uid).map_err(table_lock_failure)
+}
+
+/// The error a failed [`crate::vpn::killswitch::TableLock::acquire`] fails
+/// the boot with: see [`acquire_table_lock`].
+fn table_lock_failure(e: std::io::Error) -> anyhow::Error {
+    let held = e.kind() == std::io::ErrorKind::AddrInUse;
+    let e = anyhow::Error::new(e);
+    let e = if held { refused(e) } else { e };
+    e.context("take the kill-switch table lock")
 }
 
 pub async fn boot(
@@ -900,6 +928,14 @@ pub async fn boot(
             .await
             .context("single-instance lock")??
     };
+    // One daemon per uid in this network namespace, which is the kill
+    // switch's table's scope: every boot touches that table, replacing it
+    // with the switch on and removing it as stale with the switch off. Taken
+    // after the state directory's lock, so a second start on the same state
+    // directory is told that first.
+    let table_lock = tokio::task::spawn_blocking(acquire_table_lock)
+        .await
+        .context("kill-switch table lock")??;
 
     // Signals, installed before anything that can block or fail, so a
     // SIGTERM during a tunnel bring-up is handled rather than fatal.
@@ -2363,6 +2399,7 @@ pub async fn boot(
         unloaded_at_boot,
         requeued_at_boot,
         instance_lock,
+        table_lock,
     })
 }
 
@@ -3688,8 +3725,9 @@ impl DaemonHandle {
             unloaded_at_boot,
             requeued_at_boot,
             // Bound, not `_`: it has to live to the end of this function,
-            // past the teardown. See the field.
+            // past the teardown. See the fields.
             instance_lock: _instance_lock,
+            table_lock: _table_lock,
         } = self;
 
         // The VPN health and port-forward monitors and the kill-switch watch
@@ -4725,6 +4763,30 @@ mod shutdown_report_tests {
 
         let e = kill_switch_enable_failure(failed().unwrap_err());
         assert!(!is_config_refusal(&e), "got: {e:#}");
+    }
+
+    /// A table lock another daemon of this uid holds exits 78, which the
+    /// unit does not restart, naming the holder; a socket that could not be
+    /// bound for any other reason keeps exiting 70.
+    #[test]
+    fn a_held_table_lock_is_the_configuration_s_refusal_and_another_failure_is_not() {
+        let name = format!("torrentd_ks_test_{}_boot", std::process::id());
+        let _held = crate::vpn::killswitch::TableLock::acquire_named(&name).unwrap();
+        let refusal = crate::vpn::killswitch::TableLock::acquire_named(&name).unwrap_err();
+        let e = table_lock_failure(refusal);
+        assert!(is_config_refusal(&e), "got: {e:#}");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("take the kill-switch table lock"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("(pid {})", std::process::id())),
+            "got: {msg}"
+        );
+
+        let other = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no");
+        assert!(!is_config_refusal(&table_lock_failure(other)));
     }
 
     #[test]

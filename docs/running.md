@@ -169,7 +169,10 @@ while it is running:
   running daemon's pid, having touched nothing (§12). The file holds that pid.
   The lock is the kernel's and goes with the process, however it ends, so
   there is never a stale one to clear after a crash. Delete the file while the
-  daemon runs and the next start no longer sees it.
+  daemon runs and the next start no longer sees it. The lock is per state
+  directory; the kill switch's table is per uid, and a second daemon of the
+  same uid on another state directory is refused by the table lock instead
+  (§11, "Two daemons in one network namespace need separate uids").
 
 A deployment with no `vpn` profile has none of the next three:
 
@@ -1969,10 +1972,19 @@ On a scratch pool, not your real one.
    and in `net-cleanup` (run by root, `net-cleanup` acts for the owner of the
    state directory). So the daemon without the switch leaves the other's
    table standing however often it boots, restarts or stops. Two daemons
-   under one uid share one table, and the ruleset could not tell their
-   traffic apart anyway: one's boot or stop removes the other's switch, and
-   two with the switch on replace each other's install every 30 s. Give each
-   daemon its own user. A table an earlier release left under the shared
+   under one uid would share one table, and the ruleset could not tell their
+   traffic apart anyway: one's boot or stop would remove the other's switch.
+   So the second is refused. Every daemon holds the abstract unix socket
+   `@torrentd_ks_<uid>` for its life, taken at startup right after
+   `torrentd.lock` and before anything touches the table, whatever its state
+   directory and whether or not its switch is on; a second daemon of the same
+   uid in the same network namespace finds it bound and exits `78` with
+   `… holds the abstract unix socket @torrentd_ks_<uid>` and the holder's pid,
+   which `RestartPreventExitStatus=78` does not restart. `net-cleanup` takes
+   the same socket, so it refuses while a daemon of that uid runs (`ss -xap |
+   grep torrentd_ks` shows the holder). The socket goes with the process,
+   however it ends. Give each daemon its own user. A table an earlier
+   release left under the shared
    name `torrentd_ks` is removed by the daemon whose uid its rules confine,
    and by no other.
 
@@ -2333,9 +2345,10 @@ reproduction itself.
 kill switch, a tunnel or a state file — so it shows nothing of the running
 daemon's behaviour; the journal above is where that is. The lock is per state
 directory: a copy pointed at a different `resume_dir` is not stopped by it,
-and with `network_kill_switch` it would still replace the running daemon's
-`inet torrentd_ks_<uid>` table, which is the same table for the same user
-(§11, drill 6). If you stop the service to
+but run as the same user it is stopped by the kill-switch table lock, and
+exits `78` naming the running daemon's pid, because its boot would replace or
+remove the running daemon's `inet torrentd_ks_<uid>` table, which is the same
+table for the same user (§11, drill 6). If you stop the service to
 run it by hand instead, start the service again afterwards:
 `Restart=on-failure` does not bring back a unit that was stopped.
 
