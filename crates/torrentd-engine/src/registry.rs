@@ -40,6 +40,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use libtorrent_safe::InfoHash;
@@ -213,6 +215,9 @@ pub struct AssignmentRegistry {
     /// The read path. Holds exactly what the database holds: every change
     /// lands here only after its transaction commits.
     inner: RwLock<HashMap<InfoHash, ProfileId>>,
+    /// Bumped, under `inner`'s write lock, after every entry `inner` gains
+    /// or loses. See [`Self::generation`].
+    generation: AtomicU64,
     /// The one writer. Holding it across check-and-write is what makes an
     /// `assign` atomic against every other `assign` and `remove`; the lock
     /// order is always this, then `inner`.
@@ -278,6 +283,7 @@ impl AssignmentRegistry {
             path,
             source,
             inner: RwLock::new(map),
+            generation: AtomicU64::new(0),
             writer: Mutex::new(conn),
         })
     }
@@ -373,6 +379,36 @@ impl AssignmentRegistry {
         self.inner.read().is_empty()
     }
 
+    /// A counter that moves on every assignment added to or removed from the
+    /// map, and never moves back. O(1).
+    ///
+    /// Two equal readings mean no assignment came or went in between, which
+    /// [`Self::len`] cannot say: one remove and one assign leave the length
+    /// as it was. The bump lands under the same write lock as the change, so
+    /// a caller that reads the counter and then reads the map sees at least
+    /// every change that counter reading counts.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Insert into the map and bump [`Self::generation`] under one lock.
+    fn insert_entry(&self, ih: InfoHash, profile: ProfileId) {
+        let mut map = self.inner.write();
+        map.insert(ih, profile);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Remove from the map, bumping [`Self::generation`] under the same lock
+    /// where there was an entry to remove.
+    fn remove_entry(&self, ih: &InfoHash) -> Option<ProfileId> {
+        let mut map = self.inner.write();
+        let prev = map.remove(ih);
+        if prev.is_some() {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        prev
+    }
+
     /// Where the entries in memory were read from.
     ///
     /// The database except on the boot that imports a JSON file, where it is
@@ -461,7 +497,7 @@ impl AssignmentRegistry {
                 });
             }
             let existing = ProfileId::new(existing);
-            self.inner.write().insert(ih, existing.clone());
+            self.insert_entry(ih, existing.clone());
             if existing == profile {
                 return Ok(Claim::AlreadyOurs);
             }
@@ -471,7 +507,7 @@ impl AssignmentRegistry {
             });
         }
         tx.commit().map_err(|e| self.db_err(e))?;
-        self.inner.write().insert(ih, profile.clone());
+        self.insert_entry(ih, profile.clone());
         drop(conn);
         info!(
             target: "torrentd_engine::registry",
@@ -507,7 +543,7 @@ impl AssignmentRegistry {
             .optional()
             .map_err(|e| self.db_err(e))?;
         tx.commit().map_err(|e| self.db_err(e))?;
-        let prev = self.inner.write().remove(ih).or_else(|| {
+        let prev = self.remove_entry(ih).or_else(|| {
             deleted
                 .filter(|id| crate::profile::ProfileConfig::is_valid_id(id))
                 .map(ProfileId::new)
@@ -1044,6 +1080,30 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(r.lookup(&ih), Some(ProfileId::new("other")));
+    }
+
+    /// One remove and one assign leave the length as it was; the generation
+    /// moves on each, and not on a call that changes nothing.
+    #[test]
+    fn the_generation_moves_on_every_assignment_change_and_only_then() {
+        let dir = tempdir().unwrap();
+        let r = AssignmentRegistry::new_empty(dir.path().join("registry.db"));
+        let (a, b) = (InfoHash([1u8; 20]), InfoHash([2u8; 20]));
+        let p = ProfileId::new("p");
+        let g0 = r.generation();
+        assert_eq!(r.assign(a, p.clone()).unwrap(), Claim::New);
+        let g1 = r.generation();
+        assert!(g1 > g0);
+        assert_eq!(r.assign(a, p.clone()).unwrap(), Claim::AlreadyOurs);
+        assert!(r.assign(a, ProfileId::new("q")).is_err());
+        assert_eq!(r.remove(&b).unwrap(), None);
+        assert_eq!(r.generation(), g1, "a no-op moved the generation");
+
+        let len = r.len();
+        assert_eq!(r.remove(&a).unwrap(), Some(p.clone()));
+        assert_eq!(r.assign(b, p).unwrap(), Claim::New);
+        assert_eq!(r.len(), len);
+        assert_eq!(r.generation(), g1 + 2, "a swap left the generation");
     }
 
     #[test]
