@@ -2055,96 +2055,10 @@ pub async fn boot(
         .filter(|ih| !loaded.contains(ih) && !requeued_at_boot.contains(ih))
         .collect();
 
-    // Two artefacts persist a torrent→profile mapping, and nothing reconciled
-    // them: the assignment registry, which the resume scan above writes and
-    // every load is gated on, and the pool index's `torrent.profile` column,
-    // which adoption and release write and a scan only fills where empty. The
-    // registry is the authority and the column is a cache of it — said so in
-    // both module docs — so where the two disagree the column is rewritten to
-    // the registry's profile, naming both values. Nothing else corrects it,
-    // and a wrong one made a `DELETE` by the registry's owner release nothing
-    // and every later adoption of the torrent refuse it as already adopted.
-    // The gauge counts what still disagrees after that: a rewrite that failed.
-    //
-    // A record the registry does not back at all is another matter: nothing
-    // owns the torrent, and the record is a release that never landed - a
-    // `DELETE` queued it behind a scan holding the writer and the daemon
-    // stopped first, or its write failed. Left alone it refused the torrent
-    // every adoption into another profile and every relocation, and `DELETE`
-    // cannot clear it any more. With the sessions loaded and the verify queue
-    // restored, whatever still owns the torrent has said so, so each such
-    // record is cleared here, before the disagreements are counted.
+    // The pool index's owner records follow the registry, now that the
+    // sessions are loaded and the verify queue restored.
     if let Some(pool) = pool.as_ref() {
-        match pool.clear_unbacked_owners(&state) {
-            Ok(cleared) => {
-                for (infohash, index_profile) in &cleared {
-                    warn!(
-                        infohash = %infohash,
-                        index_profile = %index_profile,
-                        "the pool index named an owner for this torrent that no registry \
-                         assignment, session or verify-queue item backs, most likely a \
-                         `DELETE`'s release lost to a restart; cleared it, so the torrent can \
-                         be adopted into any profile again",
-                    );
-                }
-                if !cleared.is_empty() {
-                    info!(
-                        cleared = cleared.len(),
-                        "cleared pool index owner records nothing backs",
-                    );
-                }
-            }
-            Err(e) => pool.note_store_error("clear_unbacked_owners", &e),
-        }
-        match pool.follow_registry_owners() {
-            Ok(rewritten) => {
-                for (infohash, registry_profile, index_profile) in &rewritten {
-                    warn!(
-                        infohash = %infohash,
-                        registry_profile = %registry_profile,
-                        index_profile = %index_profile,
-                        "the pool index and the assignment registry disagreed about who owns \
-                         this torrent; the registry is authoritative and the index is a cache \
-                         of it, so the index now names the registry's profile",
-                    );
-                }
-            }
-            Err(e) => pool.note_store_error("follow_registry_owners", &e),
-        }
-    }
-    if let Some(pool) = pool.as_ref() {
-        let stale = pool.with_store(|st| {
-            let mut out: Vec<(String, String, String)> = Vec::new();
-            for t in st.torrents().unwrap_or_default() {
-                let Some(indexed) = t.profile.as_deref() else {
-                    continue;
-                };
-                let Some(ih) = libtorrent_safe::InfoHash::from_hex(&t.infohash) else {
-                    continue;
-                };
-                if let Some(owner) = registry.lookup(&ih) {
-                    if owner.as_str() != indexed {
-                        out.push((
-                            t.infohash.clone(),
-                            owner.as_str().to_string(),
-                            indexed.to_string(),
-                        ));
-                    }
-                }
-            }
-            out
-        });
-        for (infohash, registry_profile, index_profile) in &stale {
-            warn!(
-                infohash = %infohash,
-                registry_profile = %registry_profile,
-                index_profile = %index_profile,
-                "the pool index and the assignment registry still disagree about who owns \
-                 this torrent: rewriting the index to the registry's profile failed (see the \
-                 pool index write warning above); the next start tries again",
-            );
-        }
-        metrics.set_gauge("pool_index_profile_disagreements", stale.len() as f64, &[]);
+        pool.reconcile_owners_at_boot(&state, &registry, &*metrics);
     }
 
     // Alert loop.
