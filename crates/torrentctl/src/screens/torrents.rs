@@ -252,6 +252,15 @@ pub fn capturing(state: &State) -> bool {
             .is_some_and(|d| d.prompt || d.limit.is_some())
 }
 
+/// Whether a load is in flight, so a refresh now would skip it.
+pub fn busy(state: &State) -> bool {
+    state.profiles_loading
+        || match &state.detail {
+            Some(d) => d.loading || d.files.loading || d.trackers_loading,
+            None => state.list.loading,
+        }
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.confirm.is_some() {
         return Some(Msg::ConfirmKey(key));

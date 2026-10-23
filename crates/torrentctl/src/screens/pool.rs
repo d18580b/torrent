@@ -142,6 +142,25 @@ pub fn capturing(state: &State) -> bool {
         || state.plans.capturing()
 }
 
+/// Whether the view shown has a load in flight, so a refresh now would
+/// skip it.
+pub fn busy(state: &State) -> bool {
+    match state.view {
+        View::Overview => state.overview.loading,
+        View::Tree if state.tree.root.is_some() => state.tree.entries.loading,
+        View::Tree => state.overview.loading,
+        View::Library => state.library.items.loading,
+        View::Plans => {
+            state.plans.list.loading
+                || state
+                    .plans
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.loading || d.steps.loading)
+        }
+    }
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.adopt.is_some() {
         return Some(Msg::Adopt(adopt::Msg::Key(key)));
