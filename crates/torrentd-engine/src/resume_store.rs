@@ -11,6 +11,26 @@
 //! `MemoryResumeStore` keeps everything in a `DashMap` keyed by
 //! `(profile, infohash)`. Used by Layer 1 unit tests so we don't hit the
 //! filesystem.
+//!
+//! # Durability
+//!
+//! Where this store and [`crate::torrent_store`] say a write or delete is
+//! durable before it returns, they mean exactly this:
+//!
+//! - A write's data reaches the disk before its new name can: its temp file
+//!   is `fsync`ed, or a batch's filesystem flushed, before the rename, and a
+//!   flush that reports an error abandons the rename. Any crash leaves the
+//!   previous file or the new one, never a torn mix.
+//! - The rename or unlink itself is made durable by `fsync`ing the
+//!   directory, and that step is best effort: a failure is logged, counted in
+//!   `dir_fsync_errors_total`, and does not fail the call (`sync_dir` in
+//!   [`crate::batch_writer`] says why). Until the filesystem commits
+//!   that directory on its own, a power loss can revert the name: a write to
+//!   the previous file, or to none, and a delete to the deleted file.
+//!
+//! A process crash that the machine survives loses nothing either way. Only
+//! a power loss after a failed directory `fsync` can, and the counter says
+//! when one has failed.
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,6 +42,7 @@ use libtorrent_safe::InfoHash;
 use libtorrent_safe::ResumeData;
 use thiserror::Error;
 use tracing::debug;
+use tracing::info;
 use tracing::warn;
 
 use crate::batch_writer::remove_if_present;
@@ -58,7 +79,9 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Atomically replace the resume file for `(profile, ih)` with `data`,
-    /// durably, before returning.
+    /// durably before returning in the sense the module's Durability section
+    /// gives: the data always, the new name as far as a directory `fsync`
+    /// can make it.
     fn write(
         &self,
         profile: &ProfileId,
@@ -83,7 +106,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     fn flush(&self) {}
 
     /// Delete the resume file for `(profile, ih)`, and any write queued for
-    /// it, durably before returning. Missing files are not an error.
+    /// it, before returning, then `fsync` the directory, best effort (see the
+    /// module's Durability section). Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
 
     /// Whether `(profile, ih)` has a resume file, on disk or queued for one.
@@ -95,7 +119,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
         Ok(false)
     }
 
-    /// Record, durably before returning, that `(profile, ih)` was removed.
+    /// Record, durably before returning (as the module's Durability section
+    /// defines it), that `(profile, ih)` was removed.
     ///
     /// `DELETE` writes one before it removes the torrent from its session,
     /// and it stands until every file that would bring the torrent back is
@@ -116,7 +141,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Remove `(profile, ih)`'s tombstone, durably before returning. Missing
+    /// Remove `(profile, ih)`'s tombstone before returning, then `fsync` the
+    /// directory, best effort (see the module's Durability section). Missing
     /// is not an error.
     fn clear_tombstone(
         &self,
@@ -130,6 +156,17 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     fn tombstones(&self, _profile: &ProfileId) -> Result<Vec<InfoHash>, ResumeStoreError> {
         Ok(Vec::new())
     }
+}
+
+/// The info-hash `name` spells, only where it is spelled exactly as this
+/// daemon writes it: 40 lower-case hex digits, [`InfoHash::to_hex`]'s form.
+///
+/// Every file and registry row is written and deleted under that one
+/// spelling. A name that decoded under any other — `ABCD…` for `abcd…` —
+/// would be loaded at boot, yet every delete removes only the lower-case
+/// name, so the torrent would come back after each removal.
+pub(crate) fn canonical_infohash(name: &str) -> Option<InfoHash> {
+    InfoHash::from_hex(name).filter(|ih| ih.to_hex() == name)
 }
 
 /// Read every `<infohash><suffix>` file in `dir`, skipping — with a warning
@@ -167,12 +204,12 @@ pub(crate) fn scan_dir(
         let Some(stem) = name.strip_suffix(suffix) else {
             continue;
         };
-        let Some(ih) = InfoHash::from_hex(stem) else {
+        let Some(ih) = canonical_infohash(stem) else {
             warn!(
                 target: "torrentd_engine::store",
                 profile_id = %profile,
                 file = %path.display(),
-                "skipping {what} file with invalid name",
+                "skipping {what} file whose name is not a lower-case hex info-hash",
             );
             continue;
         };
@@ -250,10 +287,44 @@ impl PartitionedDir {
             .join(format!("{}{}", ih.to_hex(), self.suffix))
     }
 
+    /// Every file in `profile`'s directory, after removing the temp files an
+    /// interrupted write left there (see [`PartitionedDir::remove_stale_temps`]).
+    /// The boot's scan, run before anything writes.
     pub(crate) fn scan(&self, profile: &ProfileId) -> std::io::Result<Scan<Vec<u8>>> {
         // Whatever is still queued lands first, so the scan reads the newest.
         self.flush();
+        self.remove_stale_temps(profile)?;
         scan_dir(&self.dir_for(profile), self.suffix, profile, self.what)
+    }
+
+    /// Remove the `<infohash><suffix>.tmp` and `.now.tmp` files a write
+    /// killed between its temp file and its rename leaves in `profile`'s
+    /// directory. Nothing reads them, but nothing else removes them either
+    /// until that torrent is written again, which a removed or never-saved
+    /// torrent never is. Held between this store's batches, so none of its
+    /// own temp files is removed mid-batch.
+    pub(crate) fn remove_stale_temps(&self, profile: &ProfileId) -> std::io::Result<()> {
+        let dir = self.dir_for(profile);
+        let remove = || {
+            crate::batch_writer::remove_stale_temps(&dir, self.suffix, |stem| {
+                canonical_infohash(stem).is_some()
+            })
+        };
+        let removed = match &self.writer {
+            Some(w) => w.between_batches(remove),
+            None => remove(),
+        }?;
+        if removed > 0 {
+            info!(
+                target: "torrentd_engine::store",
+                profile_id = %profile,
+                dir = %dir.display(),
+                removed,
+                "removed {what} temp files left by interrupted writes",
+                what = self.what,
+            );
+        }
+        Ok(())
     }
 
     /// The info-hash of every file in `profile`'s directory, by name alone:
@@ -270,15 +341,16 @@ impl PartitionedDir {
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(self.suffix)) else {
                 continue;
             };
-            if let Some(ih) = InfoHash::from_hex(stem) {
+            if let Some(ih) = canonical_infohash(stem) {
                 out.push(ih);
             }
         }
         Ok(out)
     }
 
-    /// Replace the file durably before returning: temp file, `fsync`,
-    /// `rename`, `fsync` of the directory.
+    /// Replace the file before returning: temp file, `fsync`, `rename`, then
+    /// a best-effort `fsync` of the directory (the module's Durability
+    /// section).
     pub(crate) fn write(
         &self,
         profile: &ProfileId,
@@ -323,8 +395,9 @@ impl PartitionedDir {
     }
 
     /// Remove the file and any write queued for it, then `fsync` the
-    /// directory, so a crash or power loss after this returns cannot bring
-    /// the file back for the next boot's scan to load.
+    /// directory, so a crash after this returns cannot bring the file back
+    /// for the next boot's scan to load. A power loss can, where that `fsync`
+    /// failed (the module's Durability section).
     pub(crate) fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> std::io::Result<()> {
         let path = self.path_for(profile, ih);
         match &self.writer {
@@ -406,6 +479,8 @@ impl FsResumeStore {
 
 impl ResumeStore for FsResumeStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
+        // A tombstone is written through a temp file too.
+        self.tombstones.remove_stale_temps(profile)?;
         let raw = self.resume.scan(profile)?;
         Ok(Scan {
             entries: raw
@@ -639,9 +714,10 @@ mod tests {
 
     /// A crash between a write's temp file and its rename leaves
     /// `<infohash>.resume.tmp` (a batch's) or `<infohash>.resume.now.tmp`
-    /// (`write`'s) beside the resume files. The next boot's scan must neither
-    /// load one as a torrent nor count it unreadable, and the next write for
-    /// that torrent must replace it.
+    /// (`write`'s) beside the resume files, and `<infohash>.removed.tmp` for
+    /// a tombstone. The next boot's scan must neither load one as a torrent
+    /// nor count it unreadable, and removes them: a torrent never written
+    /// again would otherwise keep its temp file forever.
     #[test]
     fn a_leftover_tmp_file_is_neither_scanned_nor_fatal() {
         let dir = tempdir().unwrap();
@@ -655,9 +731,19 @@ mod tests {
         std::fs::write(&batch_tmp, b"torn half of a resume file").unwrap();
         std::fs::write(&now_tmp, b"torn").unwrap();
 
+        let tomb_tmp = profile_dir.join(format!("{}.removed.tmp", batched.to_hex()));
+        std::fs::write(&tomb_tmp, b"").unwrap();
+        // Not a name the store writes: left alone.
+        let foreign = profile_dir.join("notes.resume.tmp");
+        std::fs::write(&foreign, b"mine").unwrap();
+
         let scan = store.scan(&p).unwrap();
         assert!(scan.entries.is_empty(), "a temp file was loaded");
         assert_eq!(scan.unreadable, 0, "a temp file was counted unreadable");
+        for tmp in [&batch_tmp, &now_tmp, &tomb_tmp] {
+            assert!(!tmp.exists(), "the boot scan left {}", tmp.display());
+        }
+        assert!(foreign.exists(), "the scan removed a file it did not write");
         assert!(store.tombstones(&p).unwrap().is_empty());
         assert!(!store.exists(&p, &batched).unwrap());
 
@@ -679,6 +765,52 @@ mod tests {
             !batch_tmp.exists() && !now_tmp.exists(),
             "the writes reused them"
         );
+    }
+
+    /// Every delete removes the lower-case name. A file named in upper case
+    /// that a scan still loaded would survive each `DELETE` and come back at
+    /// every boot, as would an upper-case tombstone that boot honours but
+    /// `clear_tombstone` never removes.
+    #[test]
+    fn only_a_lower_case_hex_name_is_scanned_or_listed() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let p = ProfileId::new("p");
+        let ih = InfoHash([0xabu8; 20]);
+        let profile_dir = dir.path().join("p");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let upper = ih.to_hex().to_uppercase();
+        let mixed = format!("Ab{}", &ih.to_hex()[2..]);
+        for stem in [&upper, &mixed] {
+            std::fs::write(profile_dir.join(format!("{stem}.resume")), b"x").unwrap();
+            std::fs::write(profile_dir.join(format!("{stem}.removed")), b"").unwrap();
+        }
+
+        let scan = store.scan(&p).unwrap();
+        assert!(scan.entries.is_empty(), "{:?}", scan.entries);
+        assert_eq!(scan.unreadable, 0);
+        assert!(store.tombstones(&p).unwrap().is_empty());
+
+        store.write(&p, &ih, b"canonical").unwrap();
+        store.write_tombstone(&p, &ih).unwrap();
+        assert_eq!(store.load_all(&p).unwrap().len(), 1);
+        assert_eq!(store.tombstones(&p).unwrap(), vec![ih]);
+        store.delete(&p, &ih).unwrap();
+        store.clear_tombstone(&p, &ih).unwrap();
+        assert!(
+            store.load_all(&p).unwrap().is_empty(),
+            "the delete is final"
+        );
+        assert!(store.tombstones(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_infohash_accepts_only_to_hex_spelling() {
+        let ih = InfoHash([0x0fu8; 20]);
+        assert_eq!(canonical_infohash(&ih.to_hex()), Some(ih));
+        assert_eq!(canonical_infohash(&ih.to_hex().to_uppercase()), None);
+        assert_eq!(canonical_infohash("0f"), None);
+        assert_eq!(canonical_infohash(&"g".repeat(40)), None);
     }
 
     #[test]

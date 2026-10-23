@@ -31,7 +31,9 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Atomically replace the `.torrent` file for `(profile, ih)` with `data`,
-    /// durably, before returning.
+    /// durably before returning in the sense
+    /// [`crate::resume_store`]'s Durability section gives: the data always,
+    /// the new name as far as a directory `fsync` can make it.
     fn write(
         &self,
         profile: &ProfileId,
@@ -56,11 +58,14 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     fn flush(&self) {}
 
     /// Delete the `.torrent` file for `(profile, ih)`, and the save path
-    /// recorded beside it, durably before returning: a crash after this
-    /// returns does not bring them back. Missing files are not an error.
+    /// recorded beside it, before returning, then `fsync` the directory: a
+    /// crash after this returns does not bring them back, and a power loss
+    /// can only where that `fsync` failed ([`crate::resume_store`]'s
+    /// Durability section). Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError>;
 
-    /// Atomically record, durably before returning, the save path
+    /// Atomically record, durably before returning (as
+    /// [`crate::resume_store`]'s Durability section defines it), the save path
     /// `(profile, ih)` was added at, beside its `.torrent`.
     ///
     /// The torrent-dir scan re-adds a `.torrent` whose resume file is gone;
@@ -156,6 +161,8 @@ const SAVE_PATH_SUFFIX: &str = ".save_path";
 
 impl TorrentStore for FsTorrentStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
+        // A save-path sidecar is written through a temp file too.
+        self.save_paths.remove_stale_temps(profile)?;
         Ok(self.torrents.scan(profile)?)
     }
 
@@ -434,6 +441,56 @@ mod tests {
         let scan = store.scan(&profile).unwrap();
         assert_eq!(scan.unreadable, 1);
         assert_eq!(scan.entries, vec![(good, b"t".to_vec())]);
+    }
+
+    /// A write killed between its temp file and its rename leaves the temp
+    /// file behind, and a torrent never written again keeps it forever. The
+    /// boot scan removes the `.torrent`'s and the sidecar's.
+    #[test]
+    fn the_scan_removes_temp_files_left_by_interrupted_writes() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0x5bu8; 20]);
+        let torrent = store.path_for(&profile, &ih);
+        std::fs::create_dir_all(torrent.parent().unwrap()).unwrap();
+        let sidecar = store.save_path_path_for(&profile, &ih);
+        let leftovers: Vec<PathBuf> = [".tmp", ".now.tmp"]
+            .iter()
+            .flat_map(|ext| {
+                [&torrent, &sidecar].map(|p| {
+                    let mut s = p.as_os_str().to_owned();
+                    s.push(ext);
+                    PathBuf::from(s)
+                })
+            })
+            .collect();
+        for tmp in &leftovers {
+            std::fs::write(tmp, b"torn").unwrap();
+        }
+        let scan = store.scan(&profile).unwrap();
+        assert!(scan.entries.is_empty());
+        assert_eq!(scan.unreadable, 0);
+        for tmp in &leftovers {
+            assert!(!tmp.exists(), "the boot scan left {}", tmp.display());
+        }
+    }
+
+    /// `delete` removes the lower-case name only, so an upper-case `.torrent`
+    /// the scan loaded would bring the torrent back at every boot.
+    #[test]
+    fn an_upper_case_torrent_file_is_not_loaded() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path());
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0xcdu8; 20]);
+        let path = store.path_for(&profile, &ih);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let upper = path.with_file_name(format!("{}.torrent", ih.to_hex().to_uppercase()));
+        std::fs::write(&upper, b"t").unwrap();
+        let scan = store.scan(&profile).unwrap();
+        assert!(scan.entries.is_empty(), "{:?}", scan.entries);
+        assert_eq!(scan.unreadable, 0);
     }
 
     #[test]

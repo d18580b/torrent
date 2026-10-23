@@ -31,6 +31,15 @@ The small state files are described in full in
 | `openvpn-<iface>.pid` | The pid of that profile's `openvpn` process. It is the teardown's only handle on it. | The `openvpn` process keeps running past the next shutdown, and you must stop it by hand. | Every OpenVPN bring-up. |
 | `openvpn-<iface>.table` | The routing table that profile's source-address `ip rule` entries point at. | If that `openvpn` process dies on its own, its `ip rule` entries stay behind, and you must delete them by hand. | Every OpenVPN bring-up. |
 
+The `<infohash>` in a `.resume`, `.torrent` or `.save_path` name is the
+info-hash in exactly 40 lower-case hex digits, the spelling the daemon writes.
+A boot skips a `.resume` or `.torrent` named any other way, `ABCD….torrent`
+for `abcd….torrent` included, logging `skipping torrent file whose name is not
+a lower-case hex info-hash` (`resume file` for a `.resume`), and loads nothing
+from it. A `.save_path` is only ever read under the lower-case name, so one
+spelled otherwise is never found. Rename such a file to the lower-case spelling
+before you restart.
+
 The plan journal is the one record here that a rescan cannot reconstruct.
 Losing it loses the trail of what each delete plan moved where, and with it the
 mapping from `<root>/.torrentd-trash/<plan id>-<created_at>/` back to the plan

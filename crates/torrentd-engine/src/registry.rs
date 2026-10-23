@@ -647,11 +647,13 @@ fn read_all(conn: &Connection, path: &Path) -> Result<HashMap<InfoHash, ProfileI
     let mut out = HashMap::new();
     for row in rows {
         let (hex, id) = row.map_err(db)?;
-        let Some(ih) = InfoHash::from_hex(&hex) else {
+        // Lower-case only: `remove` deletes the row by `to_hex()`, so a row
+        // spelled any other way would load at every boot and never go.
+        let Some(ih) = crate::resume_store::canonical_infohash(&hex) else {
             warn!(
                 target: "torrentd_engine::registry",
                 key = %hex,
-                "skipping registry row with invalid infohash hex",
+                "skipping registry row whose infohash is not lower-case hex",
             );
             continue;
         };
@@ -1110,6 +1112,33 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(r.lookup(&ih), None);
+    }
+
+    /// `remove` deletes the row by its lower-case hex. A row spelled in upper
+    /// case that a load still accepted would stay assigned after every
+    /// remove, and the torrent would come back at the next boot.
+    #[test]
+    fn a_row_whose_infohash_is_not_lower_case_hex_is_not_loaded() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("registry.db");
+        drop(AssignmentRegistry::new_empty(&db));
+        let ih = InfoHash([0xabu8; 20]);
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO assignment VALUES (?1, 'mine')",
+                params![ih.to_hex().to_uppercase()],
+            )
+            .unwrap();
+        let r = AssignmentRegistry::open(&db, None).unwrap();
+        assert_eq!(r.lookup(&ih), None, "an upper-case row was loaded");
+        assert_eq!(r.len(), 0);
+        // The canonical row is the one `remove` can delete, and it does.
+        assert_eq!(r.assign(ih, ProfileId::new("mine")).unwrap(), Claim::New);
+        assert_eq!(r.remove(&ih).unwrap(), Some(ProfileId::new("mine")));
+        drop(r);
+        let reopened = AssignmentRegistry::open(&db, None).unwrap();
+        assert_eq!(reopened.lookup(&ih), None, "the remove is final");
     }
 
     #[test]

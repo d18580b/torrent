@@ -58,6 +58,7 @@ use std::time::UNIX_EPOCH;
 use crossbeam_channel::bounded;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
+use crossbeam_channel::TryRecvError;
 use libtorrent_safe::Alert;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::TorrentFlags;
@@ -116,6 +117,8 @@ pub enum ShutdownReason {
     /// and the only writer to the state map, so its death stops seeding,
     /// resume saves and status updates — with nothing else noticing.
     LoopPanicked,
+    /// Every [`AlertLoopHandle`] was dropped, so no signal can arrive.
+    HandleDropped,
     Test,
 }
 
@@ -571,8 +574,16 @@ fn run(
         //    wedged inside a handler stops refreshing it and /healthz fails.
         hooks.heartbeat.store(now_millis(), Ordering::Relaxed);
 
-        // 1) Shutdown probe.
-        if let Ok(reason) = shutdown_rx.try_recv() {
+        // 1) Shutdown probe. A dropped handle is a shutdown too: nothing can
+        //    signal one any more, and treating the closed channel as empty
+        //    left the loop running with no way to stop it and no shutdown
+        //    save when the process ended.
+        let signalled = match shutdown_rx.try_recv() {
+            Ok(reason) => Some(reason),
+            Err(TryRecvError::Disconnected) => Some(ShutdownReason::HandleDropped),
+            Err(TryRecvError::Empty) => None,
+        };
+        if let Some(reason) = signalled {
             info!(target: "torrentd_engine::alert_loop", reason = ?reason, "shutdown signaled");
             let unsaved = run_shutdown(
                 reason,
@@ -4103,6 +4114,39 @@ mod tests {
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread");
         assert_eq!(unsaved.load(Ordering::Relaxed), 1);
+    }
+
+    /// The handle owns the only sender of the shutdown channel. Dropping it
+    /// without a signal used to read as "no signal yet" forever: the loop ran
+    /// on with nothing able to stop it, and its shutdown save never ran.
+    #[test]
+    fn dropping_the_handle_stops_the_loop() {
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let h = engine.register_handle(InfoHash([0xC3; 20]));
+        let state = Arc::new(StateMap::new());
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        state.insert(
+            h.infohash,
+            crate::state::TorrentState::newly_added(h, ProfileId::new("p"), clock.now()),
+        );
+        let resume = Arc::new(MemoryResumeStore::new());
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine)),
+            Arc::clone(&state),
+            Arc::clone(&resume) as Arc<dyn ResumeStore>,
+            Arc::new(MemoryTorrentStore::new()),
+            Arc::new(NoopSink),
+            clock,
+        )
+        .spawn();
+        drop(handle);
+        // The loop thread holds the only other reference to the state map,
+        // and releases it when it returns.
+        assert!(
+            wait_for(|| Arc::strong_count(&state) == 1),
+            "the loop is still running after its handle was dropped",
+        );
+        assert_eq!(resume.len(), 1, "the shutdown save did not run");
     }
 
     #[test]
