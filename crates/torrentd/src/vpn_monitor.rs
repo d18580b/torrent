@@ -26,11 +26,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use futures_util::StreamExt as _;
-use torrentd_engine::port_forward::Pacer;
-use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -41,9 +38,12 @@ use tracing::info;
 use tracing::warn;
 
 use crate::metrics_sink::PromSink;
+use crate::pacing::Pacer;
+use crate::pacing::REANNOUNCE_PACE;
 use crate::profile_registry::Gated;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 use crate::profile_registry::ResumeGate;
 use crate::vpn;
 
@@ -2153,9 +2153,9 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use torrentd_engine::metrics::MetricCall;
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
 
     use super::*;
+    use crate::pacing::REANNOUNCE_BATCH;
     use crate::vpn::route::RouteProbe;
 
     const MAX: Duration = Duration::from_secs(180);
@@ -2939,7 +2939,7 @@ mod tests {
                     |r| {
                         r.set(
                             &torrentd_engine::ProfileId::new("acct_a"),
-                            torrentd_engine::DesiredState::Offline,
+                            crate::profile_state::DesiredState::Offline,
                         )
                     },
                     &*metrics.0,

@@ -189,12 +189,11 @@ mod tests {
         // the total that check compares against.
         use std::sync::Arc;
 
-        use torrentd_engine::ProfileStatus;
-
         use crate::app_state::build_test_state_with_sessions;
         use crate::profile_registry::test_entry;
         use crate::profile_registry::test_failed_profile;
         use crate::profile_registry::ProfileRegistry;
+        use crate::profile_registry::ProfileStatus;
 
         let reg = Arc::new(
             ProfileRegistry::new(vec![test_entry("a", ProfileStatus::Active)]).with_failed(vec![
@@ -240,10 +239,9 @@ mod tests {
     fn a_daemon_with_every_profile_fenced_is_unready() {
         use std::sync::Arc;
 
-        use torrentd_engine::ProfileStatus;
-
         use crate::profile_registry::test_entry;
         use crate::profile_registry::ProfileRegistry;
+        use crate::profile_registry::ProfileStatus;
 
         let reg = Arc::new(ProfileRegistry::new(vec![
             test_entry("a", ProfileStatus::VpnDown),
@@ -284,12 +282,11 @@ mod tests {
     fn one_healthy_profile_keeps_the_daemon_in_rotation() {
         use std::sync::Arc;
 
-        use torrentd_engine::ProfileStatus;
-
         use crate::app_state::build_test_state_with_sessions;
         use crate::profile_registry::test_entry;
         use crate::profile_registry::test_failed_profile;
         use crate::profile_registry::ProfileRegistry;
+        use crate::profile_registry::ProfileStatus;
 
         // Three profiles configured, and `c`'s tunnel failed at boot, so it
         // never got a session at all. The fixture has a failed profile so the
@@ -320,12 +317,11 @@ mod tests {
     fn a_fenced_profile_beside_a_profile_that_never_came_up_is_unready() {
         use std::sync::Arc;
 
-        use torrentd_engine::ProfileStatus;
-
         use crate::app_state::build_test_state_with_sessions;
         use crate::profile_registry::test_entry;
         use crate::profile_registry::test_failed_profile;
         use crate::profile_registry::ProfileRegistry;
+        use crate::profile_registry::ProfileStatus;
 
         let reg = Arc::new(
             ProfileRegistry::new(vec![test_entry("a", ProfileStatus::VpnDown)])

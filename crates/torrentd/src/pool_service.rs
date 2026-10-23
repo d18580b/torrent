@@ -16,10 +16,8 @@ use anyhow::Context;
 use parking_lot::Mutex;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertSource;
-use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentPhase;
@@ -34,6 +32,8 @@ use tracing::info;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::profile_registry::ProfileStatus;
+use crate::registry::AssignmentRegistry;
 
 /// How often the verify queue re-checks what finished hashing.
 const ADMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -3459,13 +3459,13 @@ mod tests {
 
     use torrentd_engine::InfoHash;
     use torrentd_engine::ProfileId;
-    use torrentd_engine::ProfileStatus;
     use torrentd_engine::TorrentHandle;
     use torrentd_engine::TorrentPhase;
     use torrentd_engine::TorrentState;
 
     use super::verify_outcome;
     use super::VerifyOutcome;
+    use crate::profile_registry::ProfileStatus;
 
     const SETTLE: Duration = Duration::from_secs(5);
 
@@ -4151,7 +4151,7 @@ mod tests {
         let ih = InfoHash([0x55; 20]);
         let pool = pool_with(dir.path(), ih, None);
         let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
-        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let reg = crate::registry::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         reg.assign(ih, ProfileId::new("p")).unwrap();
 
         super::enqueue_verify(
@@ -4194,7 +4194,7 @@ mod tests {
         let admitted = InfoHash([0x65; 20]);
         let pool = pool_with(dir.path(), reassigned, None);
         let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
-        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let reg = crate::registry::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let trackers = vec![vec!["http://tracker.example/announce".to_owned()]];
         let resume = dir.path().join("t.fastresume");
         std::fs::write(
@@ -4389,7 +4389,7 @@ mod tests {
         let removed = InfoHash([0x72; 20]);
         let pool = pool_with(dir.path(), checked, None);
         let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
-        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let reg = crate::registry::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         for ih in [checked, removed] {
             reg.assign(ih, ProfileId::new("p")).unwrap();
             super::enqueue_verify(
@@ -4985,7 +4985,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let ih = InfoHash([0x66; 20]);
-        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let reg = crate::registry::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
 
         // Already this profile's before the adopt: the enqueue records nothing.
         let pool = pool_with(dir.path(), ih, Some("p"));
@@ -5219,7 +5219,7 @@ mod tests {
     #[test]
     fn a_dropped_verify_releases_its_registry_claim() {
         let dir = tempfile::tempdir().unwrap();
-        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let reg = crate::registry::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([0x22; 20]);
         reg.assign(ih, ProfileId::new("p")).unwrap();
         let pool = pool_with(dir.path(), ih, None);
@@ -5232,7 +5232,7 @@ mod tests {
     #[test]
     fn a_dropped_verify_leaves_another_profiles_claim() {
         let dir = tempfile::tempdir().unwrap();
-        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let reg = crate::registry::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([0x33; 20]);
         reg.assign(ih, ProfileId::new("other")).unwrap();
         let pool = pool_with(dir.path(), ih, None);
@@ -5352,7 +5352,6 @@ mod tests {
         use std::collections::HashSet;
         use std::sync::Arc;
 
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
         use torrentd_engine::StateMap;
@@ -5361,6 +5360,7 @@ mod tests {
         use crate::profile_registry::Gated;
         use crate::profile_registry::NoTorrents;
         use crate::profile_registry::ProfileRegistry;
+        use crate::profile_state::DesiredState;
 
         let failed = TorrentHandle {
             id: 1,
@@ -5559,7 +5559,7 @@ mod tests {
         state: torrentd_engine::StateMap,
         metrics: std::sync::Arc<crate::metrics_sink::PromSink>,
         profiles: std::sync::Arc<crate::profile_registry::ProfileRegistry>,
-        registry: std::sync::Arc<torrentd_engine::AssignmentRegistry>,
+        registry: std::sync::Arc<crate::registry::AssignmentRegistry>,
     }
 
     impl Worker {
@@ -5581,7 +5581,7 @@ mod tests {
                     test_entry("p", ProfileStatus::Active),
                     test_entry("down", ProfileStatus::VpnDown),
                 ])),
-                registry: Arc::new(torrentd_engine::AssignmentRegistry::new_empty(
+                registry: Arc::new(crate::registry::AssignmentRegistry::new_empty(
                     dir.join("reg.json"),
                 )),
             }

@@ -21,9 +21,32 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::batch_writer::write_atomic;
-use torrentd_engine::DesiredState;
 use torrentd_engine::InfoHash;
 use torrentd_engine::ProfileId;
+
+/// Whether the operator wants a profile on the network.
+///
+/// Set by the operator and persisted across restarts, unlike
+/// [`ProfileStatus`](crate::profile_registry::ProfileStatus), which is what
+/// the daemon observed. The two compose: an
+/// `Online` profile the VPN monitor fenced is still off the network, and an
+/// `Offline` profile is held off it however healthy its tunnel is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DesiredState {
+    #[default]
+    Online,
+    Offline,
+}
+
+impl DesiredState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DesiredState::Online => "online",
+            DesiredState::Offline => "offline",
+        }
+    }
+}
 
 /// The file's name in the state directory.
 pub const PROFILE_STATE_FILE: &str = "profile_state.json";

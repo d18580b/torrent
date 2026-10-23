@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::Context;
-use torrentd_engine::AssignmentRegistry;
 use torrentd_pool::model::AdoptionState;
 use torrentd_pool::PoolStore;
 
 use crate::config::Config;
+use crate::registry::AssignmentRegistry;
 
 /// Run a full index: walk every managed root, read the torrent library, then
 /// match one against the other.

@@ -18,7 +18,6 @@ use kynos::schema::ParamValue;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::Claim;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use tracing::info;
@@ -46,6 +45,7 @@ use crate::http::validate::Validate;
 use crate::pool_service::execute_adopt;
 use crate::pool_service::Adopted;
 use crate::pool_service::PoolService;
+use crate::registry::Claim;
 
 /// The most infohashes one adoption or verification request may name.
 pub const MAX_INFOHASHES: usize = 1000;

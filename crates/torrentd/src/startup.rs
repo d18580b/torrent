@@ -17,7 +17,6 @@ use torrentd_engine::batch_writer::write_atomic;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertLoopBuilder;
 use torrentd_engine::AlertSource;
-use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::FsResumeStore;
 use torrentd_engine::FsTorrentStore;
 use torrentd_engine::MetricsSink;
@@ -28,7 +27,6 @@ use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileNetwork;
 use torrentd_engine::ProfileSource;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RealEngine;
 use torrentd_engine::ResumeStore;
 use torrentd_engine::ShutdownReason;
@@ -47,6 +45,8 @@ use crate::metrics_sink::PromSink;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
+use crate::registry::AssignmentRegistry;
 use crate::reload;
 use crate::sd_notify;
 use crate::signals::SignalChannels;
@@ -2569,14 +2569,14 @@ fn honour_tombstones(
             }
             continue;
         }
-        let left = torrentd_engine::handlers::add::delete_removed_files(
+        let left = torrentd_engine::removal::delete_removed_files(
             resume,
             torrents,
             metrics,
             profile,
             &ih,
             false,
-            torrentd_engine::handlers::add::Tombstone::Settle,
+            torrentd_engine::removal::Tombstone::Settle,
         );
         info!(profile_id = %profile, infohash = %ih, files_left = left.files_left(),
               "finished the delete of a removed torrent; not loading it");
@@ -8841,7 +8841,7 @@ mod profile_construction_tests {
                 |r| {
                     r.set(
                         &ProfileId::new("acct_b"),
-                        torrentd_engine::DesiredState::Offline,
+                        crate::profile_state::DesiredState::Offline,
                     )
                 },
                 |_| (),

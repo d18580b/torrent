@@ -6,7 +6,6 @@ use std::sync::Arc;
 use kynos::http::StatusCode;
 use serde_json::json;
 use serde_json::Value;
-use torrentd_engine::ProfileStatus;
 use torrentd_pool::model::TorrentFileRow;
 use torrentd_pool::AdoptionState;
 use torrentd_pool::PoolFile;
@@ -21,6 +20,7 @@ use crate::profile_registry::test_entry;
 use crate::profile_registry::test_failed_profile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 
 /// Matched under `movies/`, claiming both files there.
 ///
@@ -844,7 +844,7 @@ async fn adoption(cov: &Arc<Coverage>) {
             )
             .unwrap()
     };
-    set_p(torrentd_engine::DesiredState::Offline);
+    set_p(crate::profile_state::DesiredState::Offline);
     let claims = h.state.registry.len();
     let resp = post(adopt(
         "p",
@@ -855,7 +855,7 @@ async fn adoption(cov: &Arc<Coverage>) {
     assert_problem(&resp, 409, "profile-unavailable");
     assert_eq!(resp.json::<Value>()["profile_status"], "offline");
     assert_eq!(h.state.registry.len(), claims, "nothing was claimed");
-    set_p(torrentd_engine::DesiredState::Online);
+    set_p(crate::profile_state::DesiredState::Online);
 
     // An unknown root in the selector.
     let resp = post(adopt(
@@ -1785,13 +1785,13 @@ async fn a_same_profile_adoption_that_loses_the_claim_race_is_refused_and_keeps_
                 q.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
             ),
         ]));
-        s.registry = Arc::new(torrentd_engine::AssignmentRegistry::new_empty(&reg_path));
+        s.registry = Arc::new(crate::registry::AssignmentRegistry::new_empty(&reg_path));
         s.pool = Some(pool);
     });
     let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
     // The concurrent add's claim, and the duplicate the session would answer
     // the adoption with if it got that far.
-    torrentd_engine::AssignmentRegistry::new_empty(&reg_path)
+    crate::registry::AssignmentRegistry::new_empty(&reg_path)
         .assign(hash, torrentd_engine::ProfileId::new("p"))
         .unwrap();
     p.inject_error(

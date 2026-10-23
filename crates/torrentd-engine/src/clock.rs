@@ -3,12 +3,15 @@
 //! Used by the alert loop's tick scheduler, the retry timer, and the
 //! resume save scheduler. Every place that would otherwise call
 //! `Instant::now()` or `thread::sleep()` goes through this trait so unit
-//! tests advance time deterministically via `MockClock`.
+//! tests advance time deterministically via `MockClock`, which exists only
+//! in this crate's tests and under the `test-support` feature.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(any(test, feature = "test-support"))]
 use parking_lot::Mutex;
 
 pub trait Clock: Send + Sync + std::fmt::Debug {
@@ -34,17 +37,20 @@ impl Clock for SystemClock {
 /// Deterministic clock for unit tests. `now()` returns the current
 /// simulated time. `sleep(d)` advances the simulated clock by `d` and
 /// returns immediately.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct MockClock {
     inner: Arc<Mutex<MockClockInner>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct MockClockInner {
     now: Instant,
     sleeps: Vec<Duration>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MockClock {
     pub fn new() -> Self {
         Self {
@@ -67,12 +73,14 @@ impl MockClock {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for MockClock {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Clock for MockClock {
     fn now(&self) -> Instant {
         self.inner.lock().now

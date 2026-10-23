@@ -299,7 +299,7 @@ fn reconcile_removals(ctx: &HandlerCtx<'_>, entries: Vec<TorrentHandle>, held: &
     let (mut settled, mut unrecorded) = (0u64, 0u64);
     for h in entries.into_iter().filter(|h| !held.contains(h)) {
         let outcome = ctx.state.reconcile_removal(&ctx.profile_id, h, |readded| {
-            add::settle_removed_files(ctx, &h.infohash, readded, add::Tombstone::Keep);
+            add::settle_removed_files(ctx, &h.infohash, readded, crate::removal::Tombstone::Keep);
         });
         match outcome {
             Some(s) => {

@@ -3455,7 +3455,7 @@ mod tests {
     /// A registry over `dir` assigning `ih` to profile `p`, handed to `pool`
     /// as the daemon hands it the boot's.
     fn assign(pool: &PoolService, dir: &Path, ih: &str) {
-        let registry = Arc::new(torrentd_engine::AssignmentRegistry::new_empty(
+        let registry = Arc::new(crate::registry::AssignmentRegistry::new_empty(
             dir.join("registry.db"),
         ));
         registry

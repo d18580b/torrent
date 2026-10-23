@@ -12,7 +12,6 @@ use torrentd_engine::InfoHash;
 use torrentd_engine::MockEngine;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileSource;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RecordedCall;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -28,6 +27,7 @@ use crate::profile_registry::test_vpn_entry;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 
 /// A live profile whose engine the test keeps a handle on.
 fn live(id: &str, status: ProfileStatus) -> (ProfileEntry, Arc<MockEngine>) {
@@ -634,8 +634,8 @@ async fn bulk_operations_count_what_the_engine_refused() {
 /// pause.
 #[tokio::test(start_paused = true)]
 async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(REANNOUNCE_BATCH + 50).unwrap();
     for pause in [
@@ -715,8 +715,8 @@ async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
 /// only what was resumed and lists nothing in `skipped_profiles`.
 #[tokio::test(start_paused = true)]
 async fn a_pause_during_a_resume_all_is_not_undone_by_its_later_batches() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     // Both profiles' torrents fit in `load`'s one-byte infohashes.
     let (batch, per) = (REANNOUNCE_BATCH, REANNOUNCE_BATCH + 20);
@@ -1099,8 +1099,8 @@ fn paced_profile(n: u8) -> (Harness, Arc<MockEngine>, Vec<TorrentHandle>) {
 /// held in the record a restart loads unpaused.
 #[tokio::test(start_paused = true)]
 async fn setting_a_profile_online_starts_its_torrents_a_batch_per_pace() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
     let running = usize::from(n) - 1;
@@ -1164,7 +1164,7 @@ async fn setting_a_profile_online_starts_its_torrents_a_batch_per_pace() {
 /// they run.
 #[tokio::test(start_paused = true)]
 async fn a_torrent_the_session_refuses_to_resume_stays_held() {
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let id = ProfileId::new("acct_a");
     let (h, eng, _) = paced_profile(5);
@@ -1332,7 +1332,7 @@ async fn a_hand_resume_racing_a_set_online_leaves_its_pause_held() {
 /// again, each leave the torrent held, as a set-online's pace left it.
 #[tokio::test(start_paused = true)]
 async fn a_hand_resume_that_does_not_leave_it_running_keeps_it_held() {
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let id = ProfileId::new("acct_a");
     for case in ["refused", "fenced"] {
@@ -1405,8 +1405,8 @@ async fn a_hand_resume_that_does_not_leave_it_running_keeps_it_held() {
 /// a restart before the new run reaches them would load them paused.
 #[tokio::test(start_paused = true)]
 async fn a_stopped_run_does_not_release_what_a_newer_set_online_holds() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
     let running = usize::from(n) - 1;
@@ -1447,8 +1447,8 @@ async fn a_stopped_run_does_not_release_what_a_newer_set_online_holds() {
 /// start with the rest, still a batch per pace.
 #[tokio::test(start_paused = true)]
 async fn setting_a_profile_offline_mid_pace_stops_it_and_holds_the_rest() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
     let running = usize::from(n) - 1;
