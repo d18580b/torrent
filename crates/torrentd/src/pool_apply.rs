@@ -1765,8 +1765,10 @@ pub fn torrent_payload(
 
 /// Move `payload` into `<root>/.torrentd-trash/<bucket>/`, each file
 /// re-stat'd against the index at the moment it moves. Stops at the first
-/// file that cannot be moved, and leaves it and the rest in place: nothing
-/// is ever unlinked.
+/// file whose move fails, and reports it as [`TrashOutcome::failed`]: a file
+/// that could not be moved is left in place, a file that was moved but whose
+/// move could not be fsynced is already in the trash and counted in `moved`,
+/// and every file after it is left in place. Nothing is ever unlinked.
 pub fn trash_torrent_payload(payload: &TorrentPayload, bucket: &str) -> TrashOutcome {
     let mut out = TrashOutcome {
         trash: Vec::new(),
