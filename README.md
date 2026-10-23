@@ -462,7 +462,8 @@ that task rather than a second copy of the command; besides each job's setup,
 it spells out nothing for itself. So do the field-name grep
 (`mise run lint-tracing`), the source file-length gate
 (`mise run size-check`), the container image build (`mise run container`),
-and the `convco` check over a pull request's commit range
+the release-build feature check that `fault-injection` and `test-support`
+resolve off (`mise run release-features`), and the `convco` check over a pull request's commit range
 (`mise run commit-lint BASE..HEAD`). `RUSTFLAGS=-D warnings` comes from the
 same file, so a local `mise run` denies warnings exactly as CI does.
 

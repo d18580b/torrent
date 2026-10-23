@@ -439,6 +439,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "metrics_dropped_samples_total" Counter Daemon ("reason": &["registration", "labels"]) Zero =>
         "Samples the exporter dropped: a series that could not be registered, or an emission \
          whose labels differ from the series' first use.";
+    // the build
+    "build_fault_injection" Gauge Daemon Owner("always") =>
+        "1 if this binary was built with the fault-injection feature, which mounts \
+         POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a \
+         deployment.";
 };
 
 /// The `kind` values of `session_alerts_total` that `TorrentdSessionErrors`
@@ -678,6 +683,7 @@ pub struct PromSink {
 
 const DROPPED: &str = "metrics_dropped_samples_total";
 const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
+const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
 
 impl PromSink {
     pub fn new() -> Self {
@@ -693,7 +699,7 @@ impl PromSink {
                 dropped.with_label_values(&[reason]);
             }
         }
-        Self {
+        let sink = Self {
             registry,
             counters: Mutex::new(HashMap::from([(DROPPED.to_string(), dropped.clone())])),
             gauges: Mutex::new(HashMap::new()),
@@ -701,7 +707,18 @@ impl PromSink {
             dropped,
             dir_fsync_exported: Mutex::new(0),
             boot_counts: Once::new(),
-        }
+        };
+        // A property of the binary, so it is known before anything else is.
+        sink.set_gauge(
+            BUILD_FAULT_INJECTION,
+            if cfg!(feature = "fault-injection") {
+                1.0
+            } else {
+                0.0
+            },
+            &[],
+        );
+        sink
     }
 
     /// Write every [`Seed::Zero`] series at zero, for each profile in
@@ -1525,6 +1542,23 @@ mod tests {
             sample(&later, "profile_assignment_registry_errors_total", a).as_deref(),
             Some("7"),
             "{later}"
+        );
+    }
+
+    #[test]
+    fn the_sink_exports_whether_this_is_a_fault_injection_build() {
+        // Run in both builds: `mise run test` sees 0, `mise run
+        // test-fault-injection` sees 1.
+        let text = String::from_utf8(PromSink::new().render()).unwrap();
+        let expected = if cfg!(feature = "fault-injection") {
+            "1"
+        } else {
+            "0"
+        };
+        assert_eq!(
+            sample(&text, "build_fault_injection", "").as_deref(),
+            Some(expected),
+            "{text}"
         );
     }
 

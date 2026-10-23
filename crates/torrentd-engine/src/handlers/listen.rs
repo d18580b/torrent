@@ -960,6 +960,12 @@ mod tests {
         let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
         let mut failures = ListenFailures::default();
         let warns = Arc::new(WarnCounter::default());
+        // While only one dispatcher is registered, tracing-core caches a new
+        // callsite's interest from the registering thread's default alone: a
+        // parallel test that first reaches the `warn!` under no subscriber
+        // would cache it as never for this thread too. A second live one
+        // makes every registration ask each, this test's counter included.
+        let _pin = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         tracing::subscriber::with_default(Arc::clone(&warns), || {
             let mut ctx = HandlerCtx {
                 state: &state,
