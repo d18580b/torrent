@@ -119,6 +119,45 @@ fn uses_the_declared_save_path_as_a_candidate_base() {
     assert_eq!(base, "movies");
 }
 
+/// Issue #440: candidates were built root by root, so a complete copy the
+/// size anchor found on a root sorting first beat the save path the previous
+/// client declared, complete on a later root — though the declared path is
+/// the cheapest candidate, and right almost every time.
+#[test]
+fn the_declared_save_path_wins_across_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("a");
+    let declared = dir.path().join("b");
+    // Only the size anchor finds this copy: neither its base nor the
+    // torrent's name is a candidate on its own.
+    write_file(&first, "elsewhere/copy/Foo/Foo.mkv", 4096);
+    write_file(&declared, "movies/Foo/Foo.mkv", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, &first).unwrap();
+    torrentd_pool::scan_root(&mut store, &declared).unwrap();
+    assert_eq!(
+        store.roots().unwrap()[0].1,
+        first,
+        "the anchor's root first"
+    );
+    let save = declared.join("movies").to_string_lossy().into_owned();
+    add_torrent(
+        &mut store,
+        "bc",
+        "Foo",
+        Some(&save),
+        &[("Foo/Foo.mkv", 4096)],
+    );
+
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "bc"), AdoptionState::Matched);
+    assert_eq!(
+        store.adoption_base("bc").unwrap(),
+        Some((store.root_id(&declared).unwrap(), "movies".to_string()))
+    );
+}
+
 #[test]
 fn finds_payload_that_moved_via_the_size_anchor() {
     // Neither the torrent name nor any recorded save path points at the data:
@@ -4607,4 +4646,164 @@ fn a_panic_inside_a_transaction_does_not_wedge_the_connection() {
     // And the store still works — depth was restored and the lock released.
     torrentd_pool::match_all(&mut store).unwrap();
     assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// what the scan reads
+// ---------------------------------------------------------------------------
+
+/// Issue #440: a backslash is an ordinary character in a Linux file name,
+/// but the scan rewrote it to `/`, so `a\b` was indexed as `a/b`: drift
+/// stat'ed the wrong file, a delete step targeted it, and a real `a/b`
+/// collided with it. Only a torrent's own declared paths are normalised.
+#[test]
+fn a_literal_backslash_in_a_file_name_is_indexed_as_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "a\\b", 3);
+    write_file(root, "a/b", 5);
+    write_file(root, "d\\e/f.bin", 7);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let stats = torrentd_pool::scan_root(&mut store, root).unwrap();
+    assert_eq!((stats.files_indexed, stats.errors), (3, 0), "{stats:?}");
+    let root_id = store.root_id(root).unwrap();
+    let size = |rel: &str| store.file(root_id, rel).unwrap().map(|f| f.size);
+    assert_eq!(size("a\\b"), Some(3));
+    assert_eq!(size("a/b"), Some(5));
+    assert_eq!(size("d\\e/f.bin"), Some(7));
+    assert_eq!(size("d/e/f.bin"), None);
+    assert_eq!(store.file_count().unwrap(), 3);
+
+    // And it is matched under that name: the size anchor derives the base
+    // `d\e` from the indexed path, where `d/e` resolves nothing.
+    add_torrent(&mut store, "bs", "f", None, &[("f.bin", 7)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "bs"), AdoptionState::Matched);
+    assert_eq!(
+        store.adoption_base("bs").unwrap(),
+        Some((root_id, "d\\e".to_string()))
+    );
+}
+
+/// A library holding a copy of `fixture` at each of `paths`, and an empty
+/// store to scan it into.
+fn library_of(dir: &Path, fixture: &str, paths: &[&str]) -> (PathBuf, PoolStore) {
+    let library = dir.join("library");
+    for p in paths {
+        let dst = library.join(p);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture),
+            dst,
+        )
+        .unwrap();
+    }
+    (library, PoolStore::open_in_memory().unwrap())
+}
+
+/// Issue #440: two `.torrent` files with one info-hash were each upserted
+/// in the order an unsorted parallel walk met them, so which one the index
+/// kept — its source path, and its sidecar's save path and category —
+/// changed from scan to scan. The first in path order wins every time, and
+/// the other is counted.
+#[test]
+fn a_duplicate_infohash_resolves_to_the_same_winner_on_every_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    // Created loser first, so a walk in creation order meets it first.
+    let (library, mut store) = library_of(
+        dir.path(),
+        "pad_file.torrent",
+        &["z/copy.torrent", "a.torrent", "m.torrent"],
+    );
+    let sidecar = |name: &str, category: &str| {
+        let mut fr = b"d".to_vec();
+        fr.extend_from_slice(format!("12:qBt-category{}:{category}", category.len()).as_bytes());
+        fr.push(b'e');
+        std::fs::write(library.join(name), fr).unwrap();
+    };
+    sidecar("z/copy.fastresume", "loser");
+    sidecar("a.fastresume", "winner");
+    sidecar("m.fastresume", "loser");
+
+    for _ in 0..3 {
+        let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+        assert_eq!(stats.torrents_indexed, 1, "{stats:?}");
+        assert_eq!(stats.duplicate_infohashes, 2, "{stats:?}");
+        assert_eq!(stats.errors, 0, "{stats:?}");
+        let torrents = store.torrents().unwrap();
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].source_path, library.join("a.torrent"));
+        assert_eq!(torrents[0].category.as_deref(), Some("winner"));
+    }
+
+    // The winner gone, the next in path order takes over.
+    std::fs::remove_file(library.join("a.torrent")).unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(stats.duplicate_infohashes, 1, "{stats:?}");
+    assert_eq!(
+        store.torrents().unwrap()[0].source_path,
+        library.join("m.torrent")
+    );
+}
+
+/// Issue #440: a `.torrent` was read whole whatever its size, so one file
+/// in the library could exhaust the daemon's memory. Past the cap it is not
+/// read: it counts a `read` error, as an unreadable one does, so the scan
+/// keeps the torrents it may hide.
+#[test]
+fn an_oversized_torrent_file_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (library, mut store) = library_of(dir.path(), "pad_file.torrent", &["t.torrent"]);
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let before = store.torrents().unwrap();
+    assert_eq!(before.len(), 1);
+
+    // Sparse: a cap's worth of zeroes costs no disk. Read and parsed, it
+    // would count a `parse` error instead.
+    std::fs::File::create(library.join("huge.torrent"))
+        .unwrap()
+        .set_len(torrentd_pool::scan::MAX_LIBRARY_FILE_BYTES + 1)
+        .unwrap();
+    // Exactly at the cap is still read.
+    std::fs::File::create(library.join("at_cap.torrent"))
+        .unwrap()
+        .set_len(torrentd_pool::scan::MAX_LIBRARY_FILE_BYTES)
+        .unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(
+        stats.errors_by_kind,
+        std::collections::BTreeMap::from([("parse", 1), ("read", 1)]),
+        "{stats:?}"
+    );
+    assert_eq!(store.torrents().unwrap(), before);
+}
+
+/// Issue #440: the same cap holds for a `.fastresume`, which counts a
+/// `read` error and keeps the hints an earlier read recorded.
+#[test]
+fn an_oversized_sidecar_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (library, mut store, ih) = library_with_sidecar(
+        dir.path(),
+        "pad_file.torrent",
+        &[("qBt-category", bstr_of("kept"))],
+    );
+    let before = store.torrent(&ih).unwrap().unwrap();
+    assert_eq!(before.category.as_deref(), Some("kept"));
+
+    std::fs::File::create(library.join("t.fastresume"))
+        .unwrap()
+        .set_len(torrentd_pool::scan::MAX_LIBRARY_FILE_BYTES + 1)
+        .unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(
+        stats.errors_by_kind,
+        std::collections::BTreeMap::from([("read", 1)]),
+        "{stats:?}"
+    );
+    assert_eq!(stats.torrents_indexed, 1);
+    assert_eq!(store.torrent(&ih).unwrap().unwrap(), before);
 }
