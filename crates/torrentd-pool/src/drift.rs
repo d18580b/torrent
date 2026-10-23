@@ -42,6 +42,18 @@ pub struct DriftReport {
     /// stats has nothing over it stated or marked; one that becomes so during
     /// them keeps only its changed files as evidence.
     pub unreadable_roots: Vec<std::path::PathBuf>,
+    /// Directories a claimed file was not found under that are on another
+    /// filesystem than the index recorded the file on: what the mount point
+    /// of a disk mounted inside a readable root looks like once the disk is
+    /// unmounted. A file not found under one is not counted as vanished.
+    pub unmounted_dirs: Vec<std::path::PathBuf>,
+    /// Torrents this pass could not vouch for and found no change in: over a
+    /// root unreadable before or during the pass, with a file under one of
+    /// [`Self::unmounted_dirs`], or with a file that could not be stated.
+    /// Their state is left alone, so they are neither `drifted` nor known
+    /// unchanged; an adopt refuses them rather than trust payload it could
+    /// not see.
+    pub unchecked: Vec<String>,
 }
 
 /// Whether `root` can vouch for a not-found: present, listable, and not
@@ -57,6 +69,37 @@ fn probe_root(root: &std::path::Path) -> Result<(), String> {
         Some(Err(e)) => Err(e.to_string()),
         None => Err("the root is empty though the index holds files under it".to_string()),
     }
+}
+
+/// The directory a not-found `file` under `root` cannot be trusted over, if
+/// any: the nearest directory above it that still exists, up to and
+/// including `root`, when that directory is on another filesystem than the
+/// one the index recorded the file on (`indexed_dev`).
+///
+/// A disk mounted inside a readable root leaves its mount point behind when
+/// it is unmounted, and every file on it then reads not-found exactly as a
+/// deleted one does. A deleted file's nearest surviving directory is on the
+/// file's own filesystem; an unmounted one's is the mount point, on the
+/// filesystem below it. Only files already not found are walked up, so a
+/// pass over a healthy pool pays nothing for it.
+fn untrusted_parent(
+    root: &std::path::Path,
+    file: &std::path::Path,
+    indexed_dev: u64,
+) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let mut dir = file.parent()?;
+    while dir.starts_with(root) {
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) if m.is_dir() => {
+                return (m.dev() != indexed_dev).then(|| dir.to_path_buf());
+            }
+            // A file where a directory was is the path gone, not unmounted.
+            Ok(_) => return None,
+            Err(_) => dir = dir.parent()?,
+        }
+    }
+    None
 }
 
 /// [`probe_root`] once per root before the stats and once after, warning
@@ -166,10 +209,11 @@ fn detect_among(
 ) -> Result<DriftReport, PoolError> {
     let mut report = DriftReport::default();
     let mut probes = RootProbes::default();
-    // Each torrent with evidence: (infohash, root, its root path, files
-    // changed, files vanished). Vanished files count only once their root is
+    // Each torrent with evidence, or with a file it could not check:
+    // (infohash, root, its root path, files changed, files vanished, a file
+    // left unchecked). Vanished files count only once their root is
     // confirmed readable after the stats, below.
-    let mut candidates: Vec<(String, i64, std::path::PathBuf, u64, u64)> = Vec::new();
+    let mut candidates: Vec<(String, i64, std::path::PathBuf, u64, u64, bool)> = Vec::new();
 
     for infohash in infohashes {
         let Some(state) = store.adoption_state(infohash)? else {
@@ -190,10 +234,11 @@ fn detect_among(
             continue;
         };
         if !probes.readable(root_id, &root_path, &mut report) {
+            report.unchecked.push(infohash.clone());
             continue;
         }
 
-        let (mut changed, mut vanished) = (0u64, 0u64);
+        let (mut changed, mut vanished, mut unsure) = (0u64, 0u64, false);
         for f in store.torrent_files(infohash)? {
             if !f.is_on_disk() {
                 continue;
@@ -206,7 +251,8 @@ fn detect_among(
             let Some(indexed) = store.file(root_id, &rel)? else {
                 continue;
             };
-            match std::fs::metadata(root_path.join(&rel)) {
+            let path = root_path.join(&rel);
+            match std::fs::metadata(&path) {
                 Ok(m) => {
                     if !same_file(&indexed, &m) {
                         changed += 1;
@@ -219,37 +265,62 @@ fn detect_among(
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                     ) =>
                 {
-                    vanished += 1;
+                    match untrusted_parent(&root_path, &path, indexed.dev) {
+                        None => vanished += 1,
+                        Some(dir) => {
+                            unsure = true;
+                            if !report.unmounted_dirs.contains(&dir) {
+                                warn!(
+                                    target: "torrentd_pool::drift",
+                                    root_id,
+                                    dir = %dir.display(),
+                                    "a claimed file is gone and its nearest directory is on another filesystem than the file was (an unmounted disk?); no file gone from it is counted as drift",
+                                );
+                                report.unmounted_dirs.push(dir);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
                         target: "torrentd_pool::drift",
                         infohash = %infohash,
-                        path = %root_path.join(&rel).display(),
+                        path = %path.display(),
                         error.cause = %e,
                         "claimed file could not be stated; not counted as drift",
                     );
                     report.files_unreadable += 1;
+                    unsure = true;
                 }
             }
         }
 
-        if changed > 0 || vanished > 0 {
-            candidates.push((infohash.clone(), root_id, root_path, changed, vanished));
+        if changed > 0 || vanished > 0 || unsure {
+            candidates.push((
+                infohash.clone(),
+                root_id,
+                root_path,
+                changed,
+                vanished,
+                unsure,
+            ));
         }
     }
 
     let mut drifted: Vec<String> = Vec::new();
-    for (infohash, root_id, root_path, changed, vanished) in candidates {
-        let vanished = if vanished > 0 && !probes.still_readable(root_id, &root_path, &mut report) {
-            0
-        } else {
-            vanished
-        };
+    for (infohash, root_id, root_path, changed, vanished, unsure) in candidates {
+        let (vanished, unsure) =
+            if vanished > 0 && !probes.still_readable(root_id, &root_path, &mut report) {
+                (0, true)
+            } else {
+                (vanished, unsure)
+            };
         report.files_changed += changed;
         report.files_vanished += vanished;
         if changed > 0 || vanished > 0 {
             drifted.push(infohash);
+        } else if unsure {
+            report.unchecked.push(infohash);
         }
     }
 
@@ -376,6 +447,7 @@ mod tests {
             assert!(report.drifted.is_empty(), "{report:?}");
             assert_eq!(report.files_vanished, 0);
             assert_eq!(report.unreadable_roots, vec![root.clone()]);
+            assert_eq!(report.unchecked, vec!["aa".to_string(), "bb".to_string()]);
             assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
             assert_eq!(state_of(&store, "bb"), AdoptionState::Matched);
         });
@@ -401,6 +473,7 @@ mod tests {
         assert!(report.drifted.is_empty(), "{report:?}");
         assert_eq!(report.files_vanished, 0);
         assert_eq!(report.unreadable_roots, vec![root.clone()]);
+        assert_eq!(report.unchecked, vec!["aa".to_string(), "bb".to_string()]);
 
         assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
         assert_eq!(state_of(&store, "bb"), AdoptionState::Matched);
@@ -432,6 +505,38 @@ mod tests {
         assert_eq!(report.files_changed, 1);
         assert_eq!(report.files_vanished, 0);
         assert_eq!(report.unreadable_roots, vec![root.clone()]);
+        assert_eq!(report.unchecked, vec!["bb".to_string()]);
+        assert_eq!(state_of(&store, "bb"), AdoptionState::Matched);
+    }
+
+    /// A disk mounted inside a readable root, once unmounted, leaves its
+    /// mount point: a directory on the filesystem below, where the index
+    /// recorded the files on the disk's. Every file on it is not-found, and
+    /// none of that is drift. A file deleted from the root's own filesystem
+    /// still is.
+    #[test]
+    fn a_disk_unmounted_inside_a_readable_root_changes_no_state() {
+        let (_dir, root, mut store) = pool(&["aa", "bb"]);
+        // No mount without privileges: record `bb`'s file as on another
+        // device, which is what the index holds for a file on a submount.
+        let (root_id, _) = store.adoption_base("bb").unwrap().unwrap();
+        let a = store.file(root_id, "aa/a.bin").unwrap().unwrap();
+        let mut b = store.file(root_id, "bb/a.bin").unwrap().unwrap();
+        b.dev = b.dev.wrapping_add(1);
+        store.begin_staging().unwrap();
+        store.stage_files(&[a, b]).unwrap();
+        store.swap_staged_root(root_id, 0).unwrap();
+        // Unmounted: the mount point `bb/` stays, empty.
+        std::fs::remove_file(root.join("bb/a.bin")).unwrap();
+        std::fs::remove_file(root.join("aa/a.bin")).unwrap();
+
+        let r = root.clone();
+        let report = detect(&mut store, |_| Some(r.clone())).unwrap();
+        assert_eq!(report.drifted, vec!["aa".to_string()]);
+        assert_eq!(report.files_vanished, 1);
+        assert_eq!(report.unmounted_dirs, vec![root.join("bb")]);
+        assert_eq!(report.unchecked, vec!["bb".to_string()]);
+        assert!(report.unreadable_roots.is_empty());
         assert_eq!(state_of(&store, "bb"), AdoptionState::Matched);
     }
 
@@ -467,6 +572,7 @@ mod tests {
             assert_eq!(report.files_unreadable, 1);
             assert_eq!(report.files_vanished, 0);
             assert!(report.unreadable_roots.is_empty());
+            assert_eq!(report.unchecked, vec!["aa".to_string()]);
             assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
         });
     }
