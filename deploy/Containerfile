@@ -144,9 +144,8 @@ RUN mkdir -p /var/lib/torrentd/resume /var/lib/torrentd/torrents /data/torrents 
 
 EXPOSE 6881/tcp 6881/udp 8080/tcp
 
-# Drop privileges. The container needs CAP_NET_ADMIN at runtime if
-# multi-slot mode brings up VPN tunnels itself; in that case run as
-# root with `cap_add: NET_ADMIN`.
+# Drop privileges. A `network = "vpn"` profile needs CAP_NET_ADMIN at runtime
+# to bring up its tunnel; in that case run as root with `cap_add: NET_ADMIN`.
 USER 1000:1000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
