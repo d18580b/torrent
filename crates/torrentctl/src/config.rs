@@ -6,7 +6,12 @@
 //! [`DEFAULT_URL`] is the fallback. A URL may name a socket as `unix:/path`.
 //! A token is read from a file only
 //! when that file is private to its owner: a readable token file is a leaked
-//! token, and refusing to use one is how the operator finds out.
+//! token, and refusing to use one is how the operator finds out. Private
+//! means no group or other permission bit is set (`mode & 0o077 == 0`, so
+//! `0600` and `0400` both pass); who owns the file is not checked. A relative
+//! `token_file`, from the flag or the config file, is resolved against the
+//! current directory, not the config file's. A token from any source must be
+//! visible ASCII, and one that is not is refused at startup.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -29,7 +34,9 @@ pub const DEFAULT_SOCKET: &str = "unix:/run/torrentd/api.sock";
 pub struct File {
     /// The daemon's base URL, or `unix:/path` for its socket.
     pub url: Option<String>,
-    /// A file holding a bearer token (`tdp_…`), mode `0600`.
+    /// A file holding a bearer token (`tdp_…`), with no group or other
+    /// permission bits (`0600` or `0400`). A relative path is resolved
+    /// against the current directory, not this file's.
     pub token_file: Option<PathBuf>,
 }
 
@@ -70,6 +77,28 @@ pub enum ConfigError {
     TokenFileNotPrivate { path: PathBuf, mode: u32 },
     #[error("{path} holds no token")]
     EmptyTokenFile { path: PathBuf },
+    /// A token no `Authorization` header could carry as given. The token
+    /// itself is never printed, only where it came from and where in it the
+    /// first offending character is.
+    #[error(
+        "the token from {origin} is not valid: character {position} is not visible ASCII \
+         (a token has no spaces, control or non-ASCII characters)"
+    )]
+    MalformedToken { origin: String, position: usize },
+}
+
+/// `token`, when every character is visible ASCII (`!` to `~`): the only
+/// characters a bearer token is made of. Anything else would fail every
+/// request before it is sent, which the UI could only show as a failed
+/// request, over and over; refusing it here names the cause once.
+fn checked_token(token: String, origin: impl FnOnce() -> String) -> Result<String, ConfigError> {
+    match token.chars().position(|c| !c.is_ascii_graphic()) {
+        Some(index) => Err(ConfigError::MalformedToken {
+            origin: origin(),
+            position: index + 1,
+        }),
+        None => Ok(token),
+    }
 }
 
 /// The default config file path.
@@ -85,9 +114,7 @@ pub fn resolve(overrides: Overrides) -> Result<Config, ConfigError> {
     let env_url = std::env::var("TORRENTCTL_URL")
         .ok()
         .filter(|v| !v.is_empty());
-    let env_token = std::env::var("TORRENTCTL_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty());
+    let env_token = std::env::var("TORRENTCTL_TOKEN").ok();
     let file = read_file(overrides.config.as_deref(), default_path().as_deref())?;
     let default_socket = DEFAULT_SOCKET
         .strip_prefix(crate::api::UNIX_PREFIX)
@@ -132,15 +159,20 @@ fn resolve_from(
         }
         .to_owned()
     });
+    // Trimmed like a token file, so `TORRENTCTL_TOKEN=$(cat token)` and a
+    // value pasted with a newline both work; blank is unset.
+    let env_token = env_token
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty());
     let token = match (
         overrides.token,
         overrides.token_file,
         env_token,
         file.token_file,
     ) {
-        (Some(t), _, _, _) => Some(t),
+        (Some(t), _, _, _) => Some(checked_token(t, || "--token".to_owned())?),
         (None, Some(path), _, _) => Some(read_token_file(&path)?),
-        (None, None, Some(t), _) => Some(t),
+        (None, None, Some(t), _) => Some(checked_token(t, || "TORRENTCTL_TOKEN".to_owned())?),
         (None, None, None, Some(path)) => Some(read_token_file(&path)?),
         (None, None, None, None) => None,
     };
@@ -150,9 +182,10 @@ fn resolve_from(
     })
 }
 
-/// A token from `path`, which must be private to its owner. The file is
-/// opened once and its mode read from that handle, so what is checked is
-/// what is read.
+/// A token from `path`, which must be private to its owner: `mode & 0o077`
+/// is zero. Its owner is not checked. The file is opened once and its mode
+/// read from that handle, so what is checked is what is read. The trimmed
+/// contents must be a visible-ASCII token.
 pub fn read_token_file(path: &Path) -> Result<String, ConfigError> {
     use std::io::Read as _;
     let read_error = |source| ConfigError::Read {
@@ -179,7 +212,7 @@ pub fn read_token_file(path: &Path) -> Result<String, ConfigError> {
             path: path.to_owned(),
         });
     }
-    Ok(token.to_owned())
+    checked_token(token.to_owned(), || path.display().to_string())
 }
 
 #[cfg(test)]
@@ -279,6 +312,86 @@ mod tests {
             read_token_file(&empty).unwrap_err(),
             ConfigError::EmptyTokenFile { .. }
         ));
+    }
+
+    #[test]
+    fn a_token_that_is_not_visible_ascii_is_refused_naming_where_it_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["tdp_a b", "tdp_a\u{1}b", "tdp_\u{e9}t\u{e9}", "tdp_a\u{7f}"] {
+            let path = token_file(dir.path(), 0o600, &format!("{bad}\n"));
+            let err = read_token_file(&path).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::MalformedToken { origin, .. }
+                    if *origin == path.display().to_string()),
+                "{bad:?}: {err}"
+            );
+            assert!(!err.to_string().contains(bad), "the token never prints");
+
+            let err = resolve_from(
+                Overrides::default(),
+                None,
+                Some(bad.into()),
+                File::default(),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::MalformedToken { origin, .. }
+                    if origin == "TORRENTCTL_TOKEN"),
+                "{bad:?}: {err}"
+            );
+
+            let err = resolve_from(
+                Overrides {
+                    token: Some(bad.into()),
+                    ..Default::default()
+                },
+                None,
+                None,
+                File::default(),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::MalformedToken { origin, .. } if origin == "--token"),
+                "{bad:?}: {err}"
+            );
+        }
+        let err = resolve_from(
+            Overrides::default(),
+            None,
+            Some("tdp_a\u{1}b".into()),
+            File::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("character 6"),
+            "the offending position is named: {err}"
+        );
+    }
+
+    #[test]
+    fn the_environment_token_is_trimmed_and_blank_is_unset() {
+        let cfg = resolve_from(
+            Overrides::default(),
+            None,
+            Some(" tdp_env\n".into()),
+            File::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.token.as_deref(), Some("tdp_env"));
+
+        let cfg = resolve_from(
+            Overrides::default(),
+            None,
+            Some(" \n".into()),
+            File::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.token, None, "a blank variable is no token");
     }
 
     #[test]
