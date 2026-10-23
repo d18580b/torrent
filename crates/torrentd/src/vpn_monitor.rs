@@ -578,6 +578,22 @@ pub(crate) fn mark_fenced(
     current: Option<IpAddr>,
     metrics: &dyn MetricsSink,
 ) {
+    mark_fenced_reading(entry, current, metrics, || ());
+}
+
+/// [`mark_fenced`], running `read` once the mark is in and before what a
+/// pause or resume noted is forgotten, and returning what it read.
+///
+/// For the kill-switch fence's re-read of what is running
+/// ([`KillSwitchFence`]): a resume that read the profile as not fenced
+/// ([`resume_unless_fenced`]) noted itself before the `SeqCst` fence below,
+/// so a read here sees its note, which the forget after it would lose.
+fn mark_fenced_reading<R>(
+    entry: &ProfileEntry,
+    current: Option<IpAddr>,
+    metrics: &dyn MetricsSink,
+    read: impl FnOnce() -> R,
+) -> R {
     let labels = [("profile_id", entry.id().as_str())];
     // `profile_vpn_tunnel_up` goes to 0 with the mark, under the same lock,
     // whoever fences: the kill-switch watch's fence left it at the monitor's
@@ -596,10 +612,12 @@ pub(crate) fn mark_fenced(
         metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
     });
     atomic::fence(atomic::Ordering::SeqCst);
+    let read = read();
     // Every torrent is paused by the walk that follows, so what a pause or resume before this
-    // noted no longer holds: the kill-switch fence read it before this, and
+    // noted no longer holds: the kill-switch fence read it in `read`, and
     // a resume noted after the mark sees it and pauses again.
     entry.forget_noted();
+    read
 }
 
 /// The second half of [`fence`]: pause every torrent the state map holds in
@@ -708,7 +726,16 @@ pub(crate) struct KillSwitchFence {
     /// The profiles this fence marked `vpn_down`, each with the torrents it
     /// found running and paused.
     fenced: parking_lot::Mutex<Fenced>,
+    /// Run by [`vpn::killswitch::Fence::fence_all`] for each profile it
+    /// fences, after its first read of what is running and before its mark,
+    /// so a test can land a resume in that window.
+    #[cfg(test)]
+    before_mark: std::sync::OnceLock<BeforeMark>,
 }
+
+/// [`KillSwitchFence`]'s test hook between its read and its mark.
+#[cfg(test)]
+type BeforeMark = Box<dyn Fn(&KillSwitchFence) + Send + Sync>;
 
 /// [`KillSwitchFence`]'s record, under its lock.
 #[derive(Default)]
@@ -747,6 +774,8 @@ impl KillSwitchFence {
             metrics,
             probe,
             fenced: Default::default(),
+            #[cfg(test)]
+            before_mark: std::sync::OnceLock::new(),
         }
     }
 
@@ -828,12 +857,27 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             // here, and every torrent it was asked to resume is this fence's
             // to resume too: those it has not reached yet read as paused
             // above, and would otherwise stay paused after the next lift.
-            if let Some(unfinished) = e.take_resume() {
-                let mut seen: std::collections::HashSet<TorrentHandle> =
-                    running.iter().copied().collect();
-                running.extend(unfinished.into_iter().filter(|h| seen.insert(*h)));
+            let unfinished = e.take_resume().unwrap_or_default();
+            #[cfg(test)]
+            if let Some(hook) = self.before_mark.get() {
+                hook(self);
             }
-            let paused = fence(e, &self.state, health.tunnel_ip, self.metrics.as_ref());
+            // Read again once the mark is in: a resume that landed after the
+            // read above read the profile as not fenced, answered that it
+            // resumed, and noted it; the walk below pauses it, and only this
+            // read keeps it in the record for the lift. The mark forgets
+            // that note, so this read runs inside it.
+            let marked_running =
+                mark_fenced_reading(e, health.tunnel_ip, self.metrics.as_ref(), || {
+                    running_now(e, &self.state)
+                });
+            let mut seen: std::collections::HashSet<TorrentHandle> =
+                running.iter().copied().collect();
+            let newly_running = marked_running
+                .into_iter()
+                .filter_map(|(h, running)| running.then_some(h));
+            running.extend(newly_running.chain(unfinished).filter(|h| seen.insert(*h)));
+            let paused = walk_fenced(e, &self.state, self.metrics.as_ref());
             // Not fenced now, so any earlier record is one the operator's lift
             // already undid: what is running now replaces it.
             fenced.marks += 1;
@@ -3709,6 +3753,37 @@ mod tests {
         let before = resumes(&engine).len();
 
         fence.fence_all();
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(
+            sorted_ids(&resumes(&engine)[before..]),
+            [1, 2],
+            "the resume stands"
+        );
+    }
+
+    /// A torrent the operator resumes after the kill-switch fence read what
+    /// was running but before it marked the profile is resumed by its lift:
+    /// the resume reads the profile as not fenced and answers that it
+    /// resumed, so the fence's walk is the only pause it gets.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_between_a_kill_switch_fences_read_and_its_mark_is_resumed_by_its_lift() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
+        let landed = Arc::new(atomic::AtomicBool::new(false));
+        let hook = {
+            let landed = landed.clone();
+            move |fence: &KillSwitchFence| {
+                resume_by_hand(fence, handle(2));
+                landed.store(true, atomic::Ordering::SeqCst);
+            }
+        };
+        assert!(fence.before_mark.set(Box::new(hook)).is_ok());
+
+        fence.fence_all();
+        assert!(landed.load(atomic::Ordering::SeqCst), "the resume landed");
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        let before = resumes(&engine).len();
         fence.lift();
         settle(&fence).await;
         assert_eq!(
