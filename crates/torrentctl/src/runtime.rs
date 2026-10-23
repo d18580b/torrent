@@ -21,6 +21,11 @@ use crate::app::Msg;
 /// How often the UI redraws without input: spinners and toast expiry.
 const TICK: Duration = Duration::from_millis(250);
 
+/// Set in the environment, the loop panics right after its first draw: how
+/// `tests/e2e.rs` proves, under a pty, that a panic hands the terminal back
+/// (the alternate screen left, the cursor shown) rather than leaving it raw.
+pub const PANIC_AFTER_DRAW: &str = "TORRENTCTL_TEST_PANIC";
+
 /// Run until the user quits.
 pub async fn run(mut model: Model, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
@@ -36,6 +41,9 @@ pub async fn run(mut model: Model, terminal: &mut DefaultTerminal) -> std::io::R
 
     while !model.quit {
         terminal.draw(|frame| crate::ui::view(&model, frame))?;
+        if std::env::var_os(PANIC_AFTER_DRAW).is_some() {
+            panic!("{PANIC_AFTER_DRAW} is set");
+        }
         let msg = tokio::select! {
             event = keys.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => Msg::Key(key),
@@ -60,7 +68,8 @@ pub async fn run(mut model: Model, terminal: &mut DefaultTerminal) -> std::io::R
     Ok(())
 }
 
-fn spawn(tx: &mpsc::UnboundedSender<Msg>, effects: Vec<Effect>) {
+/// Run each effect on its own task, sending its message to `tx`.
+pub fn spawn(tx: &mpsc::UnboundedSender<Msg>, effects: Vec<Effect>) {
     for effect in effects {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -73,7 +82,7 @@ fn spawn(tx: &mpsc::UnboundedSender<Msg>, effects: Vec<Effect>) {
 /// Keep `GET /v1/events` open, turning each event into [`Msg::Changed`] and
 /// reporting whether the stream is up. Reconnects with backoff, and at once
 /// when the credential changes.
-async fn follow_events(mut api_rx: watch::Receiver<Api>, tx: mpsc::UnboundedSender<Msg>) {
+pub async fn follow_events(mut api_rx: watch::Receiver<Api>, tx: mpsc::UnboundedSender<Msg>) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let api = api_rx.borrow_and_update().clone();

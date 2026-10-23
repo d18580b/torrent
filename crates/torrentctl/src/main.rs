@@ -2,23 +2,18 @@
 //!
 //! It talks to the daemon only through a client spargen generates from the
 //! committed OpenAPI document, so it exercises the same contract any other
-//! client would.
-
-mod api;
-mod app;
-mod config;
-mod fmt;
-mod runtime;
-mod screens;
-#[cfg(test)]
-mod testing;
-mod theme;
-mod ui;
+//! client would. Everything but the command line and the terminal lives in
+//! the library (`lib.rs`).
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::WrapErr as _;
+use torrentctl::api;
+use torrentctl::app;
+use torrentctl::config;
+use torrentctl::runtime;
+use torrentctl::theme;
 
 /// A terminal client for torrentd.
 #[derive(Debug, Parser)]

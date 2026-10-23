@@ -8,6 +8,13 @@ authors.workspace = true
 description = "Terminal operator client for torrentd's /v1 API."
 publish = false
 
+# A library as well as the binary, so `tests/e2e.rs` can drive the `App`
+# itself — its model, effects and rendering — against a spawned daemon.
+# No doc tests: none of its docs are examples.
+[lib]
+path = "src/lib.rs"
+doctest = false
+
 [[bin]]
 name = "torrentctl"
 path = "src/main.rs"
