@@ -645,6 +645,31 @@ int         lt_save_resume_data(lt_session* s, lt_handle h, uint32_t flags);
  * delivered. Monotonic for the session's lifetime; 0 for a null session. */
 uint64_t    lt_alert_translate_errors(lt_session* s);
 
+/* ------------------------------------------------------------------ */
+/* Test-only                                                           */
+/* ------------------------------------------------------------------ */
+
+/* These exist so a test can prove the no-download invariant against a real
+ * peer, and nothing in the daemon calls them: the daemon never dials a peer
+ * by address, and the status view carries no download counter because a
+ * torrent this daemon adds never downloads. libtorrent-safe exposes them only
+ * under its `test-api` feature. */
+
+/* Hand torrent `h` the peer at `ip`:`port` (a numeric IPv4 or IPv6 address)
+ * to connect to, as torrent_handle::connect_peer does. Asynchronous: the
+ * peer joins the torrent's peer list and the session dials it when the
+ * torrent wants peers. LT_OK, or LT_ERR for a null session, an unknown
+ * handle, or an address that does not parse. */
+int         lt_test_connect_peer(lt_session* s, lt_handle h,
+                                 const char* ip, uint16_t port);
+
+/* Write torrent `h`'s `total_payload_download` to *out: the payload bytes it
+ * has received from peers since it was added to this session, protocol
+ * overhead and metadata excluded. Blocks on the session's thread. LT_OK, or
+ * LT_ERR for a null argument or an unknown handle (*out untouched). */
+int         lt_test_total_payload_download(lt_session* s, lt_handle h,
+                                           uint64_t* out);
+
 #ifdef __cplusplus
 }
 #endif

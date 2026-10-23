@@ -602,6 +602,43 @@ impl Session {
         unsafe { ffi::lt_alert_translate_errors(self.ptr) }
     }
 
+    /// Test-only: hand torrent `h` the peer at `peer` to connect to.
+    /// Asynchronous; the session dials it once the torrent wants peers, and
+    /// calling again for a peer it already knows is harmless.
+    ///
+    /// The daemon never dials a peer by address. This exists so a test can put
+    /// a seeder next to a torrent and show the torrent takes nothing from it.
+    #[cfg(feature = "test-api")]
+    pub fn connect_peer(&self, h: TorrentHandle, peer: std::net::SocketAddr) -> Result<()> {
+        let ip = c_string(peer.ip().to_string(), "peer ip")?;
+        let rc = unsafe {
+            ffi::lt_test_connect_peer(self.ptr, h.id as ffi::lt_handle, ip.as_ptr(), peer.port())
+        };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
+    /// Test-only: the payload bytes torrent `h` has received from peers since
+    /// it was added to this session (libtorrent's `total_payload_download`).
+    ///
+    /// Not in [`TorrentStatusView`]: no torrent the daemon adds downloads, and
+    /// this is how a test shows that.
+    #[cfg(feature = "test-api")]
+    pub fn total_payload_download(&self, h: TorrentHandle) -> Result<u64> {
+        let mut out = 0u64;
+        let rc = unsafe {
+            ffi::lt_test_total_payload_download(self.ptr, h.id as ffi::lt_handle, &mut out)
+        };
+        if rc == ffi::LT_OK as i32 {
+            Ok(out)
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
     /// Drain *all* alerts currently queued (after a single shim drain).
     ///
     /// Convenience for the engine's poll thread; equivalent to calling
