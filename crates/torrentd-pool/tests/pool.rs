@@ -3424,7 +3424,7 @@ fn nothing_is_pruned_from_a_library_that_was_not_read_in_full() {
     assert_eq!(stats.errors_by_kind.get("parse"), Some(&1));
     assert!(store.torrent(&ihs[0]).unwrap().is_some(), "kept");
 
-    // Unreadable: the same. Skipped where permissions do not bind (root).
+    // Unreadable: the same, where permissions bind.
     {
         use std::os::unix::fs::PermissionsExt;
         let p = library.join("pad_file.torrent");
@@ -3434,6 +3434,8 @@ fn nothing_is_pruned_from_a_library_that_was_not_read_in_full() {
                 torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
             assert_eq!(stats.errors_by_kind.get("read"), Some(&1));
             assert!(store.torrent(&ihs[0]).unwrap().is_some(), "kept");
+        } else {
+            permissions_do_not_bind("an unreadable .torrent");
         }
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
@@ -3444,9 +3446,9 @@ fn nothing_is_pruned_from_a_library_that_was_not_read_in_full() {
     assert!(store.torrent(&ihs[0]).unwrap().is_none());
 }
 
-/// Run `f` with `dir` at mode 0o000, restoring its mode afterwards, or skip
-/// `f` where permissions do not bind (running as root) and the directory
-/// still lists.
+/// Run `f` with `dir` at mode 0o000, restoring its mode afterwards. Where
+/// permissions do not bind (running as root) and the directory still lists,
+/// `f` is not run, through [`permissions_do_not_bind`].
 fn with_unlistable(dir: &Path, f: impl FnOnce()) {
     use std::os::unix::fs::PermissionsExt;
     let original = std::fs::metadata(dir).unwrap().permissions();
@@ -3455,12 +3457,29 @@ fn with_unlistable(dir: &Path, f: impl FnOnce()) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if binds {
             f();
+        } else {
+            permissions_do_not_bind("an unlistable directory");
         }
     }));
     std::fs::set_permissions(dir, original).unwrap();
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// A test of what a permission refusal does cannot build its case where
+/// permissions do not bind (root, or `CAP_DAC_OVERRIDE`). Locally that skips
+/// the test with a note on stderr. Where `CI` is set, as every CI runner sets
+/// it, it fails the test instead: CI runs the suite as a non-root user, and a
+/// runner that stopped doing so would otherwise pass every such test without
+/// running it.
+fn permissions_do_not_bind(case: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "permissions do not bind for this user, so {case} cannot be built: \
+         CI must run the tests as a user they bind for"
+    );
+    eprintln!("skipped: permissions do not bind for this user, so {case} cannot be built");
 }
 
 /// jwalk reports a directory it cannot list on the directory's own `Ok`

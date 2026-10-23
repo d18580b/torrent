@@ -1,10 +1,12 @@
 //! Layer 3 daemon integration test.
 //!
 //! Spawns the real `torrentd` binary against a real libtorrent session and
-//! drives the HTTP control plane end-to-end: add, list, duplicate-409,
-//! metrics, then a SIGTERM graceful shutdown that must persist DHT/session
-//! state. Marked `#[ignore]` (binds ports, starts libtorrent) so it stays
-//! out of the default `cargo test`; run with:
+//! drives it over HTTP and signals: what only the whole process shows, such as
+//! the boot, a SIGTERM's drain and exit status, reloads, and state that must
+//! survive a restart. What one handler answers is the unit tests'
+//! (`src/http/tests`), and the generated client's reading of the API is
+//! torrentctl's e2e. Marked `#[ignore]` (binds ports, starts libtorrent) so it
+//! stays out of the default `cargo test`; run with:
 //!
 //!   cargo test -p torrentd --test daemon -- --ignored --test-threads=1
 //!
@@ -149,8 +151,8 @@ impl Drop for DaemonLog {
 /// The profile every torrent in these tests belongs to.
 pub const PROFILE: &str = "test";
 
-/// A loopback port free for both TCP and UDP right now, from the kernel's
-/// ephemeral range.
+/// A loopback port free for both TCP and UDP right now, from below the
+/// kernel's ephemeral range.
 ///
 /// Every test here used to hard-code its ports, and two pairs collided:
 /// `the_first_scrape_holds_every_series_present_from_boot` served HTTP on
@@ -164,18 +166,37 @@ pub const PROFILE: &str = "test";
 /// port to the next probe: a test that took its `http_listen` port and then
 /// its session's listen port got one port for both, and the daemon refused
 /// the config. No port is returned twice in one test process.
+///
+/// The probe is released before the daemon binds the port, so something may
+/// take it in between. Taken from the ephemeral range, as it was, the likely
+/// taker was the kernel itself: every outgoing connection, this test's own
+/// HTTP client's included, and every `bind(0)` draws its port from there.
+/// Below the range only a process that names the port can take it. Each test
+/// process starts its walk at its own offset, so two suites side by side do
+/// not probe the same ports in the same order.
 fn free_port() -> u16 {
     static ISSUED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
-    loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
-            && ISSUED.lock().unwrap().insert(port)
-        {
-            return port;
-        }
-    }
+    const FLOOR: u32 = 10_000;
+    let ephemeral_low: u32 = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32_768);
+    let span = ephemeral_low
+        .checked_sub(FLOOR)
+        .filter(|span| *span >= 1_000)
+        .unwrap_or_else(|| panic!("the ephemeral range starts at {ephemeral_low}, too low"));
+    let start = std::process::id().wrapping_mul(7_919) % span;
+    let mut issued = ISSUED.lock().unwrap();
+    (0..span)
+        .map(|i| u16::try_from(FLOOR + (start + i) % span).unwrap())
+        .find(|&port| {
+            !issued.contains(&port)
+                && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+                && issued.insert(port)
+        })
+        .unwrap_or_else(|| panic!("no port below {ephemeral_low} is free for TCP and UDP"))
 }
 
 /// `127.0.0.1:<free port>`, for `http_listen`.
@@ -258,60 +279,6 @@ fn assert_exits_zero(child: &mut Child, timeout: Duration) {
         status.code(),
         Some(0),
         "a SIGTERM must end in a clean exit, not {status:?}"
-    );
-}
-
-#[test]
-#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
-fn daemon_end_to_end() {
-    let addr = free_http();
-    let addr = addr.as_str();
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path();
-    let mut child = spawn_daemon(p, free_port(), addr);
-
-    wait_healthy(addr);
-
-    let magnet = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101&dn=itest";
-    let payload = add_magnet(magnet);
-    let ih = "0101010101010101010101010101010101010101";
-
-    let (code, body) = http(addr, "POST", "/v1/torrents", Some(&payload));
-    assert_eq!(code, 201, "add should be 201: {body}");
-    assert!(body.contains(ih), "add response: {body}");
-
-    let (code, body) = http(addr, "GET", "/v1/torrents", None);
-    assert_eq!(code, 200);
-    assert!(body.contains(ih), "list should contain the torrent: {body}");
-
-    let (code, body) = http(addr, "POST", "/v1/torrents", Some(&payload));
-    assert_eq!(code, 409, "duplicate add must be 409");
-    assert!(
-        body.contains("problems.md#torrent-exists"),
-        "a duplicate is a torrent-exists problem: {body}"
-    );
-
-    // The document the daemon serves is the one committed beside the code.
-    let (code, doc) = http(addr, "GET", "/v1/openapi.json", None);
-    assert_eq!(code, 200);
-    let committed = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api/openapi.json"),
-    )
-    .expect("read docs/api/openapi.json");
-    assert_eq!(doc, committed, "the served document is the committed one");
-
-    let (code, metrics) = http(addr, "GET", "/metrics", None);
-    assert_eq!(code, 200);
-    assert!(metrics.contains("torrentd_"), "metrics output: {metrics}");
-
-    // Graceful shutdown via SIGTERM (shell out to `kill`, no extra dep).
-    sigterm(&child);
-    assert_exits_zero(&mut child, Duration::from_secs(30));
-
-    // DHT/session state must be persisted on a graceful shutdown (Commit C).
-    assert!(
-        p.join(format!("session_state-{PROFILE}.dat")).exists(),
-        "a dht profile's session state should be written on SIGTERM"
     );
 }
 
@@ -754,16 +721,15 @@ fn daemon_graceful_shutdown_under_load() {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound() {
-    // Ports of its own: the reconciliation test's daemon holds 18094, and a
-    // client that reached it instead held nothing across this one's stop.
-    const HTTP: &str = "127.0.0.1:18101";
+    let addr = free_http();
+    let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let mut child = spawn_daemon(p, 16901, HTTP);
-    wait_healthy(HTTP);
+    let mut child = spawn_daemon(p, free_port(), addr);
+    wait_healthy(addr);
 
     // The events stream, read until its first tick so it is established.
-    let mut events = TcpStream::connect(HTTP).expect("connect");
+    let mut events = TcpStream::connect(addr).expect("connect");
     events
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -784,7 +750,7 @@ fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound(
 
     // A request whose declared body never arrives: in flight until the drain
     // gives up on it.
-    let mut stuck = TcpStream::connect(HTTP).expect("connect");
+    let mut stuck = TcpStream::connect(addr).expect("connect");
     stuck
         .write_all(
             b"POST /v1/torrents HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
@@ -819,10 +785,11 @@ fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound(
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn the_configured_drain_deadline_reaches_the_alert_loop() {
-    const HTTP: &str = "127.0.0.1:18097";
+    let addr = free_http();
+    let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let cfg = write_config(p, 16897, HTTP);
+    let cfg = write_config(p, free_port(), addr);
     let text = std::fs::read_to_string(&cfg).unwrap();
     // Neither the config default (60) nor the engine's (30).
     let text = text.replace(
@@ -844,7 +811,7 @@ fn the_configured_drain_deadline_reaches_the_alert_loop() {
         stdout.read_to_string(&mut out).unwrap();
         out
     });
-    wait_healthy(HTTP);
+    wait_healthy(addr);
 
     sigterm(&child);
     assert_exits_zero(&mut child, Duration::from_secs(30));
@@ -958,10 +925,11 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn unreadable_scan_files_are_exported_by_source_at_boot() {
-    const HTTP: &str = "127.0.0.1:18100";
+    let addr = free_http();
+    let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let cfg = write_config(p, 16900, HTTP);
+    let cfg = write_config(p, free_port(), addr);
     let ih = "ab".repeat(20);
     std::fs::create_dir_all(p.join("resume").join(PROFILE).join(format!("{ih}.resume"))).unwrap();
     std::fs::create_dir_all(
@@ -975,9 +943,9 @@ fn unreadable_scan_files_are_exported_by_source_at_boot() {
         .arg(&cfg)
         .spawn()
         .expect("spawn daemon");
-    wait_healthy(HTTP);
+    wait_healthy(addr);
 
-    let (code, metrics) = http(HTTP, "GET", "/metrics", None);
+    let (code, metrics) = http(addr, "GET", "/metrics", None);
     assert_eq!(code, 200);
     for source in ["resume_file", "torrent_file"] {
         assert!(
@@ -1043,7 +1011,7 @@ fn run_to_exit(
 fn a_config_that_fails_to_load_exits_ex_config() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let cfg = write_config(p, 16898, "127.0.0.1:18098");
+    let cfg = write_config(p, free_port(), &free_http());
     let text = std::fs::read_to_string(&cfg).unwrap();
     // Out of `shutdown_drain_secs`'s `1..=3600`: parses, then fails validation.
     std::fs::write(&cfg, format!("shutdown_drain_secs = 0\n{text}")).unwrap();
@@ -1096,7 +1064,7 @@ fn a_kill_switch_with_no_nft_exits_ex_config() {
             "default_save_path = \"{d}/data\"\n\
              resume_dir = \"{d}/resume\"\n\
              torrent_dir = \"{d}/torrents\"\n\
-             http_listen = \"127.0.0.1:18099\"\n\
+             http_listen = \"{http}\"\n\
              log_level = \"warn\"\n\
              allow_unauthenticated = true\n\
              network_kill_switch = true\n\
@@ -1107,11 +1075,13 @@ fn a_kill_switch_with_no_nft_exits_ex_config() {
              vpn_type = \"wireguard\"\n\
              vpn_config = \"{d}/wg0.conf\"\n\
              vpn_interface = \"wg-nonft\"\n\
-             listen_port = 16899\n\
+             listen_port = {listen_port}\n\
              peer_fingerprint = \"-AA1000-\"\n\
              user_agent = \"ua-a\"\n\
              allowed_tracker_domains = [\"t.example\"]\n",
-            d = p.display()
+            d = p.display(),
+            http = free_http(),
+            listen_port = free_port(),
         ),
     )
     .unwrap();
@@ -1592,13 +1562,11 @@ fn a_claimed_torrent_the_pool_records_drifted_is_not_re_added_with_no_resume_fil
     boot_a_claimed_torrent_with_no_resume_file(true);
 }
 
-/// Add a torrent through the API, stop the daemon, remove its resume file,
-/// and boot again; with `drifted`, also record it `drifted` in `pool.db`
-/// first. Asserts it is re-added at its recorded save path, or with
-/// `drifted` that it is left unloaded.
+/// Boot over what an API add leaves once its resume file is gone; with
+/// `drifted`, also record the torrent `drifted` in `pool.db` first. Asserts
+/// it is re-added at its recorded save path, or with `drifted` that it is
+/// left unloaded.
 fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
-    use base64::Engine as _;
-
     let addr = free_http();
     let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
@@ -1653,36 +1621,23 @@ fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
         v["session"]["save_path"].as_str().map(str::to_owned)
     };
 
-    let mut child = spawn();
-    let (code, body) = http(
-        addr,
-        "POST",
-        "/v1/torrents",
-        Some(&format!(
-            "{{\"profile_id\":\"{PROFILE}\",\"save_path\":\"{}\",\"source\":{{\"kind\":\
-             \"metainfo\",\"data\":\"{}\"}}}}",
-            recorded.display(),
-            base64::engine::general_purpose::STANDARD.encode(&torrent),
-        )),
-    );
-    assert_eq!(code, 201, "{body}");
-    assert_eq!(
-        session_name(addr, &ih, Duration::from_secs(30)).as_deref(),
-        Some("lost_resume"),
-        "the added torrent never loaded",
-    );
-    sigterm(&child.0);
-    assert_exits_zero(&mut child.0, Duration::from_secs(30));
-
-    // What a crash before the first save, or an unreadable resume file,
-    // leaves: the claim, the `.torrent` and its recorded save path.
+    // What an API add leaves after a crash before the first save, or with
+    // its resume file unreadable: the claim, the `.torrent` and its recorded
+    // save path, and no resume file. The claim is written as the
+    // pre-registry file, which the boot imports.
     let torrents = p.join("torrents").join(PROFILE);
-    assert!(torrents.join(format!("{ih}.torrent")).exists());
-    assert!(torrents.join(format!("{ih}.save_path")).exists());
-    let resume = p.join("resume").join(PROFILE).join(format!("{ih}.resume"));
-    if resume.exists() {
-        std::fs::remove_file(&resume).unwrap();
-    }
+    std::fs::create_dir_all(&torrents).unwrap();
+    std::fs::write(torrents.join(format!("{ih}.torrent")), &torrent).unwrap();
+    std::fs::write(
+        torrents.join(format!("{ih}.save_path")),
+        recorded.to_str().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("profile_assignments.json"),
+        format!("{{\"{ih}\":\"{PROFILE}\"}}"),
+    )
+    .unwrap();
     if drifted {
         // What a failed verification records (`record_verify_outcome`).
         let store = torrentd_pool::PoolStore::open(&pool_db).unwrap();
@@ -3502,18 +3457,23 @@ fn boot_a_hybrid_filed_under_its_truncated_v2_hash(case: HybridFiling) {
         metrics.lines().any(|l| l == unloaded),
         "the registry should claim {n} unloaded ({unloaded}):\n{metrics}"
     );
+    // Every claim, loaded or not, is listed, ordered by infohash.
+    let (code, list) = http(addr, "GET", "/v1/torrents", None);
+    assert_eq!(code, 200, "{list}");
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(list["next_cursor"], serde_json::Value::Null, "{list}");
+    let claims: Vec<(String, String)> = list["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no items: {list}"))
+        .iter()
+        .map(|t| {
+            (
+                t["infohash"].as_str().unwrap().to_owned(),
+                t["profile_id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
     daemon.stop();
-
-    let claims: Vec<(String, String)> = {
-        let db = rusqlite::Connection::open(p.join("registry.db")).unwrap();
-        let mut stmt = db
-            .prepare("SELECT infohash, profile_id FROM assignment ORDER BY infohash")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
     let mut expected = Vec::new();
     if v2_claimed {
         expected.push((filed.clone(), PROFILE.to_owned()));

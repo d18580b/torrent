@@ -3798,6 +3798,13 @@ mod tests {
     fn relocating_refuses_a_subdirectory_that_cannot_be_listed() {
         use std::os::unix::fs::PermissionsExt as _;
         if unsafe { libc::geteuid() } == 0 {
+            // CI runs as a non-root user, so there the skip is a failure.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "root lists any directory, so this case cannot be built: \
+                 CI must run the tests as a non-root user"
+            );
+            eprintln!("skipped: root lists any directory");
             return;
         }
         let dir = tempfile::tempdir().unwrap();

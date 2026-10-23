@@ -234,7 +234,7 @@ pub(crate) fn evaluate(obs: &Observation, max_age: Duration) -> Result<(), DownR
 ///
 /// Split out of [`run`] because the failed-profile half below is the whole of
 /// a finding and `run`'s own poll loop is not reachable by a test.
-fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
+fn seed_baselines(profiles: &ProfileRegistry, metrics: &dyn MetricsSink) {
     // Live tunnelled profiles start healthy (their session was constructed on
     // a confirmed IP).
     //
@@ -1806,17 +1806,17 @@ pub async fn run(
 
 /// [`run`] with the host probes behind `probe` and `counters`, so a test can
 /// drive the poll loop — the gauges it sets, the clock it keeps, the fence —
-/// without a tunnel.
+/// without a tunnel, and read what it recorded from any sink.
 async fn run_with(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
-    metrics: Arc<PromSink>,
+    metrics: Arc<dyn MetricsSink>,
     handshake_max_age: Duration,
     mut stop: FencingStopped,
     probe: Prober,
     counters: CounterProber,
 ) {
-    seed_baselines(&profiles, &metrics);
+    seed_baselines(&profiles, &*metrics);
     // Per profile: when its current run of polls with torrents to carry
     // began, and when a poll in it first saw its WireGuard tunnel never
     // handshaked. See `Observation::unanswered_for`.
@@ -2152,6 +2152,7 @@ async fn run_with(
 mod tests {
     use std::net::Ipv4Addr;
 
+    use torrentd_engine::metrics::MetricCall;
     use torrentd_engine::port_forward::REANNOUNCE_BATCH;
 
     use super::*;
@@ -2862,13 +2863,13 @@ mod tests {
 
     /// Run the poll loop over one WireGuard profile, `acct_a` on 10.2.0.2,
     /// for `polls` polls, then shut it down. Returns the profile's status and
-    /// the exported metrics.
+    /// the metrics it recorded.
     async fn poll_acct_a(
         state: StateMap,
         max_age: Duration,
         probe: Prober,
         polls: u32,
-    ) -> (ProfileStatus, String) {
+    ) -> (ProfileStatus, Recorded) {
         poll_acct_a_held(state, max_age, probe, polls, false).await
     }
 
@@ -2880,7 +2881,7 @@ mod tests {
         probe: Prober,
         polls: u32,
         offline: bool,
-    ) -> (ProfileStatus, String) {
+    ) -> (ProfileStatus, Recorded) {
         let (health, exported) = poll_acct_a_health(state, max_age, probe, polls, offline).await;
         (health.status, exported)
     }
@@ -2911,7 +2912,7 @@ mod tests {
         probe: Prober,
         polls: u32,
         offline: bool,
-    ) -> (crate::profile_registry::ProfileHealth, String) {
+    ) -> (crate::profile_registry::ProfileHealth, Recorded) {
         poll_acct_a_counted(state, max_age, probe, no_counters(), polls, offline).await
     }
 
@@ -2924,14 +2925,14 @@ mod tests {
         counters: CounterProber,
         polls: u32,
         offline: bool,
-    ) -> (crate::profile_registry::ProfileHealth, String) {
+    ) -> (crate::profile_registry::ProfileHealth, Recorded) {
         use crate::profile_registry::test_entry;
 
         let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
             "acct_a",
             ProfileStatus::Active,
         )]));
-        let metrics = Arc::new(PromSink::new());
+        let metrics = Recorded::default();
         if offline {
             profiles
                 .change_states(
@@ -2941,7 +2942,7 @@ mod tests {
                             torrentd_engine::DesiredState::Offline,
                         )
                     },
-                    &*metrics,
+                    &*metrics.0,
                     &crate::profile_registry::NoTorrents,
                 )
                 .unwrap();
@@ -2950,7 +2951,7 @@ mod tests {
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(state),
-            metrics.clone(),
+            metrics.0.clone(),
             max_age,
             stop.subscribe(),
             probe,
@@ -2960,16 +2961,69 @@ mod tests {
         assert!(stop.stop(Duration::from_secs(5)).await);
         task.await.unwrap();
         let health = profiles.iter().next().unwrap().health();
-        let exported = String::from_utf8(metrics.render()).expect("utf-8");
-        (health, exported)
+        (health, metrics)
     }
 
-    fn fenced_once_for(exported: &str, reason: &str) -> bool {
-        exported.lines().any(|l| {
-            l.starts_with("torrentd_profile_vpn_fenced_total")
-                && l.contains(&format!("reason=\"{reason}\""))
-                && l.ends_with(" 1")
-        })
+    /// What the poll loop recorded through its sink, read series by series:
+    /// a gauge's last value and a counter's total, for `acct_a`.
+    #[derive(Debug, Default)]
+    struct Recorded(Arc<torrentd_engine::RecordingSink>);
+
+    /// Every recorded call, for an assertion's message.
+    impl std::fmt::Display for Recorded {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:#?}", self.0.calls())
+        }
+    }
+
+    impl Recorded {
+        /// The value `name` was last set to for `acct_a`, `None` if never.
+        fn gauge(&self, name: &str) -> Option<f64> {
+            let acct_a = [("profile_id".to_string(), "acct_a".to_string())];
+            self.0.calls().into_iter().rev().find_map(|c| match c {
+                MetricCall::SetGauge {
+                    name: n,
+                    value,
+                    labels,
+                } if n == name && labels == acct_a => Some(value),
+                _ => None,
+            })
+        }
+
+        /// What was counted on `name` with exactly `labels`.
+        fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+            let want: Vec<(String, String)> = labels
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            self.0
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    MetricCall::IncCounter { name: n, labels } if n == name && labels == want => {
+                        Some(1)
+                    }
+                    MetricCall::AddCounter {
+                        name: n,
+                        value,
+                        labels,
+                    } if n == name && labels == want => Some(value),
+                    _ => None,
+                })
+                .sum()
+        }
+
+        /// How many times `acct_a` was fenced for `reason`.
+        fn fenced_for(&self, reason: &str) -> u64 {
+            self.counter(
+                "profile_vpn_fenced_total",
+                &[("profile_id", "acct_a"), ("reason", reason)],
+            )
+        }
+    }
+
+    fn fenced_once_for(recorded: &Recorded, reason: &str) -> bool {
+        recorded.fenced_for(reason) == 1
     }
 
     /// The shutdown's drain — HTTP, pool work, resume data — runs with the
@@ -3003,12 +3057,12 @@ mod tests {
             "acct_a",
             ProfileStatus::Active,
         )]));
-        let metrics = Arc::new(PromSink::new());
+        let exported = Recorded::default();
         let stop = FencingStop::new();
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(StateMap::new()),
-            metrics.clone(),
+            exported.0.clone(),
             MAX,
             stop.subscribe(),
             probe,
@@ -3021,7 +3075,6 @@ mod tests {
         // The shutdown has begun and is draining: the tunnel goes.
         lost.store(true, atomic::Ordering::SeqCst);
         tokio::time::sleep(POLL_INTERVAL).await;
-        let exported = String::from_utf8(metrics.render()).expect("utf-8");
         assert_eq!(
             entry.health().status,
             ProfileStatus::VpnDown,
@@ -3156,7 +3209,7 @@ mod tests {
             poll_acct_a(StateMap::new(), MAX, scripted(elsewhere, fresh), 1).await;
         assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
         assert!(
-            exported.contains("torrentd_profile_vpn_route_probe_ok{profile_id=\"acct_a\"} 1"),
+            exported.gauge("profile_vpn_route_probe_ok") == Some(1.0),
             "{exported}"
         );
         assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
@@ -3170,11 +3223,11 @@ mod tests {
             "a probe that could not run is reported, not fenced on: {exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_route_probe_ok{profile_id=\"acct_a\"} 0"),
+            exported.gauge("profile_vpn_route_probe_ok") == Some(0.0),
             "{exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            exported.gauge("profile_vpn_tunnel_up") == Some(1.0),
             "{exported}"
         );
     }
@@ -3199,20 +3252,22 @@ mod tests {
             "a probe that could not run is reported, not fenced on: {exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"acct_a\"} 0"),
+            exported.gauge("profile_vpn_addr_probe_ok") == Some(0.0),
             "{exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_route_probe_ok{profile_id=\"acct_a\"} 0"),
+            exported.gauge("profile_vpn_route_probe_ok") == Some(0.0),
             "with no address known the route probe is not running either: {exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            exported.gauge("profile_vpn_tunnel_up") == Some(1.0),
             "{exported}"
         );
         assert!(
-            exported
-                .contains("torrentd_profile_vpn_tunnel_ip_changes_total{profile_id=\"acct_a\"} 0"),
+            exported.counter(
+                "profile_vpn_tunnel_ip_changes_total",
+                &[("profile_id", "acct_a")]
+            ) == 0,
             "no address changed: {exported}"
         );
         let log = log.text();
@@ -3248,12 +3303,7 @@ mod tests {
         .await;
         assert_eq!(health.status, ProfileStatus::VpnDown, "{exported}");
         assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
-        assert!(
-            exported.contains(
-                "torrentd_profile_vpn_fenced_total{profile_id=\"acct_a\",reason=\"probe_unavailable\"} 0"
-            ),
-            "{exported}"
-        );
+        assert!(exported.fenced_for("probe_unavailable") == 0, "{exported}");
         assert_eq!(
             health.tunnel_ip,
             ip(2),
@@ -3273,7 +3323,7 @@ mod tests {
             "{exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"acct_a\"} 1"),
+            exported.gauge("profile_vpn_addr_probe_ok") == Some(1.0),
             "{exported}"
         );
     }
@@ -3318,7 +3368,7 @@ mod tests {
                 "{label}: {exported}"
             );
             assert!(
-                exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 0"),
+                exported.gauge("profile_vpn_tunnel_up") == Some(0.0),
                 "{label}: {exported}"
             );
             assert_eq!(health.tunnel_ip, ip(2), "{label}");
@@ -3400,12 +3450,12 @@ mod tests {
             test_entry("acct_a", ProfileStatus::Active),
             test_entry("acct_b", ProfileStatus::Active),
         ]));
-        let metrics = Arc::new(PromSink::new());
+        let metrics = Recorded::default();
         let stop = FencingStop::new();
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(StateMap::new()),
-            metrics.clone(),
+            metrics.0.clone(),
             MAX,
             stop.subscribe(),
             probe,
@@ -3414,11 +3464,7 @@ mod tests {
         let mut entries = profiles.iter();
         let (a, b) = (entries.next().unwrap(), entries.next().unwrap());
         assert_eq!((a.id().as_str(), b.id().as_str()), ("acct_a", "acct_b"));
-        let a_unavailable = || {
-            String::from_utf8(metrics.render())
-                .unwrap()
-                .contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"acct_a\"} 0")
-        };
+        let a_unavailable = || metrics.gauge("profile_vpn_addr_probe_ok") == Some(0.0);
 
         // To just past the first poll. The clock is moved by hand from here:
         // while acct_a's probe is blocked it does not move on its own.
@@ -3517,14 +3563,12 @@ mod tests {
             "an empty profile sends nothing to be answered: {exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            exported.gauge("profile_vpn_tunnel_up") == Some(1.0),
             "{exported}"
         );
         assert!(
-            !exported
-                .lines()
-                .any(|l| l.starts_with("torrentd_profile_vpn_fenced_total") && l.ends_with(" 1")),
-            "{exported}"
+            exported.0.count_for("profile_vpn_fenced_total") == 0,
+            "fenced for no reason: {exported}"
         );
 
         let paused = StateMap::new();
@@ -3579,11 +3623,11 @@ mod tests {
             "a quiet seed sent nothing to be answered: {exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            exported.gauge("profile_vpn_tunnel_up") == Some(1.0),
             "{exported}"
         );
         assert!(
-            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"acct_a\"} 1"),
+            exported.gauge("profile_vpn_transfer_probe_ok") == Some(1.0),
             "the counters were read: {exported}"
         );
 
@@ -3592,7 +3636,7 @@ mod tests {
         let (_, exported) =
             poll_acct_a_counted(seeding(), max_age, stale(), no_counters(), 1, false).await;
         assert!(
-            exported.contains("torrentd_profile_vpn_transfer_probe_ok{profile_id=\"acct_a\"} 0"),
+            exported.gauge("profile_vpn_transfer_probe_ok") == Some(0.0),
             "{exported}"
         );
 
@@ -3671,12 +3715,12 @@ mod tests {
             "acct_a",
             ProfileStatus::Active,
         )]));
-        let metrics = Arc::new(PromSink::new());
+        let exported = Recorded::default();
         let stop = FencingStop::new();
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(state),
-            metrics.clone(),
+            exported.0.clone(),
             max_age,
             stop.subscribe(),
             scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
@@ -3694,7 +3738,6 @@ mod tests {
         tokio::time::sleep(POLL_INTERVAL * 2).await;
         assert!(stop.stop(Duration::from_secs(5)).await);
         task.await.unwrap();
-        let exported = String::from_utf8(metrics.render()).expect("utf-8");
         assert_eq!(entry.health().status, ProfileStatus::Active, "{exported}");
         assert!(fenced_once_for(&exported, "no_handshake"), "{exported}");
     }

@@ -252,6 +252,10 @@ mod tests {
         let t = Instant::now();
         let e = run("sleep", &["30"], None, Duration::from_millis(200)).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            e.to_string().contains("`sleep 30`"),
+            "names the command: {e}"
+        );
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
@@ -272,9 +276,19 @@ mod tests {
         assert_eq!(out.stdout.len(), 200_000);
     }
 
+    /// A missing tool keeps the spawn's `NotFound`, so a caller can tell it
+    /// from a tool that ran and failed or one that timed out, and the error
+    /// names the command.
     #[test]
     fn a_tool_that_is_not_there_is_an_error_not_a_status() {
-        assert!(run("torrentd-no-such-tool", &[], None, QUICK).is_err());
+        let e = run("torrentd-no-such-tool", &["x"], None, QUICK).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "got {e}");
+        assert!(
+            e.to_string().contains("`torrentd-no-such-tool x`"),
+            "names the command: {e}"
+        );
+        let e = run_ok("torrentd-no-such-tool", &[], None, QUICK).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "got {e}");
         assert!(!available("torrentd-no-such-tool", "--version"));
     }
 }

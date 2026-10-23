@@ -1218,6 +1218,13 @@ fn resume_clears_the_error_a_disk_failure_left_and_keeps_upload_mode() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
     if std::fs::File::open(&file).is_ok() {
         // Root reads through mode 000; there is no read failure to observe.
+        // CI runs this as a non-root user, so there the skip is a failure:
+        // a runner that ran it as root would otherwise pass it unrun.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "this user can read a mode-000 file, so the disk failure cannot be built: \
+             CI must run the tests as a user permissions bind for"
+        );
         eprintln!("skipped: this user can read a mode-000 file");
         return;
     }
