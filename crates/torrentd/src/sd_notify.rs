@@ -122,10 +122,17 @@ impl TimeoutExtender {
     }
 
     /// Start extending, on the current tokio runtime, until `stall` has
-    /// passed with `progress` not advancing. Each advance the extender sees
-    /// gives the phase `stall` more from then, so a phase that keeps getting
-    /// further is never cut off, and one that stops is extended for at most
-    /// `stall` plus one re-send interval past its last advance.
+    /// passed with `progress` not advancing. The extender reads `progress`
+    /// once every re-send interval ([`EXTEND_EVERY`]), and an advance it
+    /// sees gives the phase `stall` more from that read, so a phase that
+    /// keeps getting further is never cut off. One that stops is extended
+    /// for at most `stall` plus one re-send interval past its last advance,
+    /// and systemd's timeout fires at most [`EXTEND_BY`] after that last
+    /// extension.
+    ///
+    /// It is a task on the runtime like any other: a phase that holds the
+    /// only thread the runtime has without awaiting is not extended while it
+    /// does, so a long phase awaits between batches of its work.
     pub fn start_while_progressing(stall: Duration, progress: &Progress) -> Self {
         Self::spawn(stall, Some(progress.clone()))
     }
