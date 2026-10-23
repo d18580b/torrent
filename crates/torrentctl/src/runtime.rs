@@ -79,9 +79,10 @@ pub fn spawn(tx: &mpsc::UnboundedSender<Msg>, effects: Vec<Effect>) {
     }
 }
 
-/// Keep `GET /v1/events` open, turning each event into [`Msg::Changed`] and
-/// reporting whether the stream is up. Reconnects with backoff, and at once
-/// when the credential changes.
+/// Keep `GET /v1/events` open, turning each event into [`Msg::Changed`] with
+/// its fingerprint (the model decides whether it is news) and reporting
+/// whether the stream is up. Reconnects with backoff, and at once when the
+/// credential changes.
 pub async fn follow_events(mut api_rx: watch::Receiver<Api>, tx: mpsc::UnboundedSender<Msg>) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -96,8 +97,8 @@ pub async fn follow_events(mut api_rx: watch::Receiver<Api>, tx: mpsc::Unbounded
                 loop {
                     tokio::select! {
                         item = stream.next() => match item {
-                            Some(Ok(_event)) => {
-                                let _ = tx.send(Msg::Changed);
+                            Some(Ok(event)) => {
+                                let _ = tx.send(Msg::Changed(event.fingerprint));
                             }
                             Some(Err(e)) => break format!("stream error: {e}"),
                             None => break "the daemon closed the stream".to_owned(),

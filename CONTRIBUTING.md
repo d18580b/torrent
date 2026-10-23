@@ -70,6 +70,7 @@ Everyday tasks:
 | `mise run lint-fix`| Clippy autofix                                           |
 | `mise run test`    | Workspace unit tests (see Test, below)                   |
 | `mise run check`   | fmt + lint                                               |
+| `mise run size-check` | Fail on a source file over 2689 lines not in `.size-baseline` (see Style) |
 | `mise run test-all`| every automated test layer, including the ignored ones (not `deny` or `bench`) |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
 | `mise run native-clean` | Delete every cached native prefix                   |
@@ -102,7 +103,7 @@ pass does and does not establish.
 - **commit-msg** — enforces [Conventional Commits](https://www.conventionalcommits.org)
   via `convco` **at commit time**. `feat:`, `fix:`, `chore:`, `build:`, `ci:`, `docs:`,
   `refactor:`, `style:`, `perf:`, `test:` (optionally scoped, e.g. `feat(engine):`).
-- **pre-push** — runs the full `fmt` + `lint` + `test` suite before a push.
+- **pre-push** — runs the full `fmt` + `lint` + `test` suite and `size-check` before a push.
 
 ### Submodules
 
@@ -214,6 +215,15 @@ trust it — is in [`docs/running.md`](docs/running.md).
 
 The pre-commit hook applies both automatically to staged changes. Do not commit code with
 `unwrap()` outside tests — return a `Result` or expect-with-context.
+
+- `mise run size-check` — file length
+
+No tracked source file (`.rs`, `.c`, `.cc`, `.cpp`, `.h`, `.hpp`, `.py`, `.sh`) may exceed
+2689 lines. The files that already did when the gate landed are listed in
+[`.size-baseline`](./.size-baseline), and that list may only shrink: the check also fails on
+an entry whose file is now within the limit or no longer exists, so the change that brings a
+file under the limit deletes its line. Never add a line; split the file instead. CI and the
+pre-push hook both run it.
 
 ## Logging conventions
 

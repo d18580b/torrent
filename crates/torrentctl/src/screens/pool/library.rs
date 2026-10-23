@@ -21,14 +21,12 @@ use ratatui::widgets::Wrap;
 use ratatui::Frame;
 
 use super::hints;
-use super::refresh_limit;
 use super::scroll;
 use super::signed_out;
 use super::strong;
 use super::title;
 use super::wrap;
 use super::Motion;
-use super::MAX_BATCH;
 use crate::api::generated::ListPoolTorrentsParams;
 use crate::api::types;
 use crate::api::Failure;
@@ -38,12 +36,15 @@ use crate::app::Effect;
 use crate::app::Toast;
 use crate::fmt;
 use crate::theme::Tone;
+use crate::ui::widgets::caps::MAX_BATCH;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
 use crate::ui::widgets::state_span;
 use crate::ui::widgets::Confirm;
 use crate::ui::widgets::Confirmed;
+use crate::ui::widgets::PageRequest;
 use crate::ui::widgets::Paged;
+use crate::ui::widgets::Received;
 
 /// The filters `F` cycles through, after "all".
 const FILTERS: [types::State; 6] = [
@@ -69,7 +70,7 @@ pub struct State {
     pub verifying: bool,
     /// What the last verification request started and skipped.
     pub verify: Option<types::VerifyResult>,
-    /// The infohash to select once the first page arrives.
+    /// The infohash to select once a reload settles.
     pub reselect: Option<String>,
 }
 
@@ -118,20 +119,13 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     state.reselect = state.selected_infohash();
-    let limit = refresh_limit(state.items.items.len());
-    reload(state, ctx, limit)
+    reload(state, ctx)
 }
 
-fn reload(state: &mut State, ctx: &Ctx<'_>, limit: Option<i64>) -> Vec<Effect> {
-    let generation = state.items.reload();
-    vec![fetch(
-        ctx,
-        state.filter.clone(),
-        None,
-        limit,
-        generation,
-        true,
-    )]
+/// Re-read as many rows as are loaded (see [`Paged`]).
+fn reload(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
+    let request = state.items.reload();
+    vec![fetch(ctx, state.filter.clone(), request)]
 }
 
 fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -139,34 +133,24 @@ fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     match state.items.begin_more() {
-        Some((cursor, generation)) => {
-            vec![fetch(
-                ctx,
-                state.filter.clone(),
-                Some(cursor),
-                None,
-                generation,
-                false,
-            )]
-        }
+        Some(request) => vec![fetch(ctx, state.filter.clone(), request)],
         None => Vec::new(),
     }
 }
 
-fn fetch(
-    ctx: &Ctx<'_>,
-    filter: Option<types::State>,
-    cursor: Option<String>,
-    limit: Option<i64>,
-    generation: u64,
-    first: bool,
-) -> Effect {
+fn fetch(ctx: &Ctx<'_>, filter: Option<types::State>, request: PageRequest) -> Effect {
     let api = ctx.api.clone();
+    let PageRequest {
+        cursor,
+        limit,
+        generation,
+    } = request;
     Effect::new(async move {
+        let first = cursor.is_none();
         let params = ListPoolTorrentsParams {
             state: filter,
             cursor,
-            limit,
+            limit: Some(limit as i64),
         };
         let result = crate::api::call(api.client.list_pool_torrents(params)).await;
         wrap(super::Msg::Library(Msg::Page {
@@ -184,17 +168,19 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             first,
             result: Ok(page),
         } => {
-            if generation != state.items.generation {
-                return Vec::new();
-            }
-            state
+            match state
                 .items
-                .receive(generation, first, page.items, page.next_cursor);
-            if first {
-                if let Some(hash) = state.reselect.take() {
-                    if let Some(at) = state.items.items.iter().position(|t| t.infohash == hash) {
-                        state.selected = at;
-                    }
+                .receive(generation, first, page.items, page.next_cursor)
+            {
+                Received::Stale => return Vec::new(),
+                Received::Continue(request) => {
+                    return vec![fetch(ctx, state.filter.clone(), request)]
+                }
+                Received::Settled => {}
+            }
+            if let Some(hash) = state.reselect.take() {
+                if let Some(at) = state.items.items.iter().position(|t| t.infohash == hash) {
+                    state.selected = at;
                 }
             }
             state.selected = state
@@ -207,11 +193,21 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             result: Err(failure),
             ..
         } => {
-            state.items.fail(generation, failure.message());
+            if state.items.fail(generation, failure.message()) {
+                // The reload will not settle: a later page must not snap
+                // the selection back to where it began.
+                state.reselect = None;
+            }
             signed_out(&failure)
         }
         Msg::Move(motion) => {
             state.selected = motion.apply(state.selected, state.items.items.len());
+            if state.items.loading {
+                // A reload is in flight: keep what the operator chose.
+                if let Some(hash) = state.selected_infohash() {
+                    state.reselect = Some(hash);
+                }
+            }
             more(state, ctx)
         }
         Msg::ToggleMark => {
@@ -232,12 +228,11 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                     .and_then(|at| FILTERS.get(at + 1))
                     .cloned(),
             };
-            state.items.items.clear();
-            state.items.next_cursor = None;
+            state.items.reset();
             state.selected = 0;
             state.offset.set(0);
             state.reselect = None;
-            reload(state, ctx, None)
+            reload(state, ctx)
         }
         Msg::Back => {
             if state.verify.is_some() {
@@ -439,7 +434,12 @@ fn draw_table(
     header.extend([Line::from(" state"), Line::from("profile")]);
 
     let visible = block.inner(area).height.saturating_sub(1) as usize;
-    let offset = scroll(&state.offset, state.selected, visible);
+    let offset = scroll(
+        &state.offset,
+        state.selected,
+        visible,
+        state.items.items.len(),
+    );
     let mut table_state = TableState::default()
         .with_offset(offset)
         .with_selected(Some(state.selected));

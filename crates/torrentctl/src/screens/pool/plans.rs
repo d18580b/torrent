@@ -28,7 +28,6 @@ use tui_input::Input;
 
 use super::hints;
 use super::mutations_allowed;
-use super::refresh_limit;
 use super::scroll;
 use super::signed_out;
 use super::strong;
@@ -56,7 +55,9 @@ use crate::ui::widgets::spinner;
 use crate::ui::widgets::state_span;
 use crate::ui::widgets::Confirm;
 use crate::ui::widgets::Confirmed;
+use crate::ui::widgets::PageRequest;
 use crate::ui::widgets::Paged;
+use crate::ui::widgets::Received;
 
 /// The filters `F` cycles through, after "all".
 const FILTERS: [types::Status4ee43c98; 5] = [
@@ -74,7 +75,7 @@ pub struct State {
     pub list: Paged<types::PlanSummary>,
     pub selected: usize,
     pub offset: Cell<usize>,
-    /// The plan to select once the first page arrives.
+    /// The plan to select once a reload settles.
     pub reselect: Option<i64>,
     /// The plan open with its steps.
     pub detail: Option<Detail>,
@@ -317,8 +318,7 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     let mut effects = Vec::new();
     if !state.list.loading {
         state.reselect = state.selected_id();
-        let limit = refresh_limit(state.list.items.len());
-        effects.extend(reload(state, ctx, limit));
+        effects.extend(reload(state, ctx));
     }
     if let Some(detail) = state.detail.as_mut() {
         if !detail.loading {
@@ -328,16 +328,10 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     effects
 }
 
-fn reload(state: &mut State, ctx: &Ctx<'_>, limit: Option<i64>) -> Vec<Effect> {
-    let generation = state.list.reload();
-    vec![fetch(
-        ctx,
-        state.filter.clone(),
-        None,
-        limit,
-        generation,
-        true,
-    )]
+/// Re-read as many plans as are loaded (see [`Paged`]).
+fn reload(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
+    let request = state.list.reload();
+    vec![fetch(ctx, state.filter.clone(), request)]
 }
 
 fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -345,34 +339,24 @@ fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     match state.list.begin_more() {
-        Some((cursor, generation)) => {
-            vec![fetch(
-                ctx,
-                state.filter.clone(),
-                Some(cursor),
-                None,
-                generation,
-                false,
-            )]
-        }
+        Some(request) => vec![fetch(ctx, state.filter.clone(), request)],
         None => Vec::new(),
     }
 }
 
-fn fetch(
-    ctx: &Ctx<'_>,
-    filter: Option<types::Status4ee43c98>,
-    cursor: Option<String>,
-    limit: Option<i64>,
-    generation: u64,
-    first: bool,
-) -> Effect {
+fn fetch(ctx: &Ctx<'_>, filter: Option<types::Status4ee43c98>, request: PageRequest) -> Effect {
     let api = ctx.api.clone();
+    let PageRequest {
+        cursor,
+        limit,
+        generation,
+    } = request;
     Effect::new(async move {
+        let first = cursor.is_none();
         let params = ListPlansParams {
             status: filter,
             cursor,
-            limit,
+            limit: Some(limit as i64),
         };
         let result = crate::api::call(api.client.list_plans(params)).await;
         wrap(super::Msg::Plans(Msg::Page {
@@ -393,20 +377,21 @@ fn load_detail(detail: &mut Detail, ctx: &Ctx<'_>) -> Effect {
     })
 }
 
-/// Fetch the open plan's steps from `cursor`, or from its first step with
-/// `limit` of them when `first`.
-fn fetch_steps(
-    detail: &Detail,
-    ctx: &Ctx<'_>,
-    cursor: Option<String>,
-    limit: Option<i64>,
-    generation: u64,
-    first: bool,
-) -> Effect {
+/// Fetch `request`'s page of the open plan's steps.
+fn fetch_steps(detail: &Detail, ctx: &Ctx<'_>, request: PageRequest) -> Effect {
     let (id, opening) = (detail.id, detail.opening);
     let api = ctx.api.clone();
+    let PageRequest {
+        cursor,
+        limit,
+        generation,
+    } = request;
     Effect::new(async move {
-        let params = ListPlanStepsParams { cursor, limit };
+        let first = cursor.is_none();
+        let params = ListPlanStepsParams {
+            cursor,
+            limit: Some(limit as i64),
+        };
         let result = crate::api::call(api.client.list_plan_steps(id, params)).await;
         wrap(super::Msg::Plans(Msg::StepsPage {
             opening,
@@ -424,42 +409,40 @@ fn more_steps(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     match detail.steps.begin_more() {
-        Some((cursor, generation)) => {
-            vec![fetch_steps(
-                detail,
-                ctx,
-                Some(cursor),
-                None,
-                generation,
-                false,
-            )]
-        }
+        Some(request) => vec![fetch_steps(detail, ctx, request)],
         None => Vec::new(),
     }
 }
 
 /// Show `plan` in `detail`. Its inline steps replace those loaded, unless
-/// more than them were loaded: then the steps are fetched again, as many as
-/// were loaded, so a refresh keeps the selection where it was.
+/// more than them were loaded: then the steps are re-read from the first, as
+/// many as were loaded (see [`Paged`]), so a refresh keeps the selection
+/// where it was.
 fn show(detail: &mut Detail, mut plan: types::Plan, ctx: &Ctx<'_>) -> Vec<Effect> {
     let inline = std::mem::take(&mut plan.steps);
     let next = plan.steps_next_cursor.clone();
     detail.plan = Some(plan);
-    let generation = detail.steps.reload();
     let loaded = detail.steps.items.len();
-    if loaded > inline.len() {
-        if let Some(limit) = refresh_limit(loaded) {
-            return vec![fetch_steps(
-                detail,
-                ctx,
-                None,
-                Some(limit),
-                generation,
-                true,
-            )];
-        }
+    if loaded > inline.len() && detail.steps.loading {
+        // Steps are already being read: restarting would bump the
+        // generation and drop them, and a plan refreshed faster than its
+        // steps re-read would never finish.
+        return Vec::new();
     }
-    detail.steps.receive(generation, true, inline, next);
+    let request = detail.steps.reload();
+    if loaded > inline.len() {
+        return vec![fetch_steps(detail, ctx, request)];
+    }
+    match detail.steps.receive(request.generation, true, inline, next) {
+        Received::Stale => Vec::new(),
+        Received::Continue(request) => vec![fetch_steps(detail, ctx, request)],
+        Received::Settled => settle_steps(detail, ctx),
+    }
+}
+
+/// After the open plan's steps changed: keep the selection in range, and
+/// page on when it nears the end.
+fn settle_steps(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
     detail.selected = detail
         .selected
         .min(detail.steps.items.len().saturating_sub(1));
@@ -486,17 +469,19 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             first,
             result: Ok(page),
         } => {
-            if generation != state.list.generation {
-                return Vec::new();
-            }
-            state
+            match state
                 .list
-                .receive(generation, first, page.items, page.next_cursor);
-            if first {
-                if let Some(id) = state.reselect.take() {
-                    if let Some(at) = state.list.items.iter().position(|p| p.id == id) {
-                        state.selected = at;
-                    }
+                .receive(generation, first, page.items, page.next_cursor)
+            {
+                Received::Stale => return Vec::new(),
+                Received::Continue(request) => {
+                    return vec![fetch(ctx, state.filter.clone(), request)]
+                }
+                Received::Settled => {}
+            }
+            if let Some(id) = state.reselect.take() {
+                if let Some(at) = state.list.items.iter().position(|p| p.id == id) {
+                    state.selected = at;
                 }
             }
             state.selected = state.selected.min(state.list.items.len().saturating_sub(1));
@@ -507,7 +492,11 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             result: Err(failure),
             ..
         } => {
-            state.list.fail(generation, failure.message());
+            if state.list.fail(generation, failure.message()) {
+                // The reload will not settle: a later page must not snap
+                // the selection back to where it began.
+                state.reselect = None;
+            }
             signed_out(&failure)
         }
         Msg::Move(motion) => match state.detail.as_mut() {
@@ -517,6 +506,12 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             }
             None => {
                 state.selected = motion.apply(state.selected, state.list.items.len());
+                if state.list.loading {
+                    // A reload is in flight: keep what the operator chose.
+                    if let Some(id) = state.selected_id() {
+                        state.reselect = Some(id);
+                    }
+                }
                 more(state, ctx)
             }
         },
@@ -529,12 +524,11 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                     .and_then(|at| FILTERS.get(at + 1))
                     .cloned(),
             };
-            state.list.items.clear();
-            state.list.next_cursor = None;
+            state.list.reset();
             state.selected = 0;
             state.offset.set(0);
             state.reselect = None;
-            reload(state, ctx, None)
+            reload(state, ctx)
         }
         Msg::Open => match state.selected_id() {
             Some(id) => open(state, id, false, ctx),
@@ -576,16 +570,14 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             };
             match result {
                 Ok(page) => {
-                    if generation != detail.steps.generation {
-                        return Vec::new();
-                    }
-                    detail
+                    match detail
                         .steps
-                        .receive(generation, first, page.items, page.next_cursor);
-                    detail.selected = detail
-                        .selected
-                        .min(detail.steps.items.len().saturating_sub(1));
-                    more_steps(detail, ctx)
+                        .receive(generation, first, page.items, page.next_cursor)
+                    {
+                        Received::Stale => Vec::new(),
+                        Received::Continue(request) => vec![fetch_steps(detail, ctx, request)],
+                        Received::Settled => settle_steps(detail, ctx),
+                    }
                 }
                 Err(failure) => {
                     detail.steps.fail(generation, failure.message());
@@ -623,7 +615,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             let mut effects = vec![Effect::toast(toast)];
             effects.extend(show(&mut detail, plan, ctx));
             state.detail = Some(detail);
-            effects.extend(reload(state, ctx, refresh_limit(state.list.items.len())));
+            effects.extend(reload(state, ctx));
             effects
         }
         Msg::Created(Err(failure)) => {
@@ -708,7 +700,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 let mut effects = vec![Effect::toast(Toast::success(format!(
                     "plan #{id} discarded"
                 )))];
-                effects.extend(reload(state, ctx, refresh_limit(state.list.items.len())));
+                effects.extend(reload(state, ctx));
                 effects
             }
             Err(failure) => vec![Effect::now(failed(
@@ -980,7 +972,12 @@ fn draw_list(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
         Constraint::Fill(1),
     ];
     let visible = block.inner(area).height.saturating_sub(1) as usize;
-    let offset = scroll(&state.offset, state.selected, visible);
+    let offset = scroll(
+        &state.offset,
+        state.selected,
+        visible,
+        state.list.items.len(),
+    );
     let mut table_state = TableState::default()
         .with_offset(offset)
         .with_selected(Some(state.selected));
@@ -1146,7 +1143,12 @@ fn draw_detail(state: &State, detail: &Detail, ctx: &Ctx<'_>, frame: &mut Frame,
     )
     .title_bottom(plan_hints(theme, ctx, true));
     let visible = block.inner(steps_area).height.saturating_sub(1) as usize;
-    let offset = scroll(&detail.offset, detail.selected, visible);
+    let offset = scroll(
+        &detail.offset,
+        detail.selected,
+        visible,
+        detail.steps.items.len(),
+    );
     let mut table_state = TableState::default()
         .with_offset(offset)
         .with_selected(Some(detail.selected));

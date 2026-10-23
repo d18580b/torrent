@@ -17,7 +17,6 @@ use ratatui::Frame;
 
 use super::hints;
 use super::overview::Root;
-use super::refresh_limit;
 use super::scroll;
 use super::signed_out;
 use super::title;
@@ -34,7 +33,9 @@ use crate::theme::Tone;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
 use crate::ui::widgets::state_span;
+use crate::ui::widgets::PageRequest;
 use crate::ui::widgets::Paged;
+use crate::ui::widgets::Received;
 
 #[derive(Debug, Default)]
 pub struct State {
@@ -47,8 +48,8 @@ pub struct State {
     pub entries: Paged<types::TreeEntry>,
     pub selected: usize,
     pub offset: Cell<usize>,
-    /// The entry to select once the first page arrives: the directory just
-    /// left, or what the selection was on before a refresh.
+    /// The entry to select once a load settles: the directory just left, or
+    /// what the selection was on before a refresh.
     pub reselect: Option<String>,
 }
 
@@ -79,8 +80,8 @@ impl State {
 
 #[derive(Debug)]
 pub enum Msg {
-    /// A page of the listing loaded for `generation`; `first` replaces what
-    /// is shown.
+    /// A page of the listing loaded for `generation`; `first` when it is a
+    /// first page (see [`Paged::receive`]).
     Page {
         generation: u64,
         first: bool,
@@ -105,11 +106,10 @@ pub fn open(state: &mut State, root: Root, ctx: &Ctx<'_>) -> Vec<Effect> {
 
 /// Show a new place: forget the old listing and load the first page.
 fn navigate(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
-    state.entries.items.clear();
-    state.entries.next_cursor = None;
+    state.entries.reset();
     state.selected = 0;
     state.offset.set(0);
-    reload(state, ctx, None)
+    reload(state, ctx)
 }
 
 /// Reload what is shown, keeping the selection on the same entry.
@@ -118,67 +118,44 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     state.reselect = state.selected_entry().map(|e| e.name.clone());
-    let limit = refresh_limit(state.entries.items.len());
-    reload(state, ctx, limit)
+    reload(state, ctx)
 }
 
-fn reload(state: &mut State, ctx: &Ctx<'_>, limit: Option<i64>) -> Vec<Effect> {
-    let Some(root) = &state.root else {
+/// Re-read as many entries as are loaded (see [`Paged`]).
+fn reload(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
+    if state.root.is_none() {
         return Vec::new();
-    };
-    let root_id = root.id;
-    let generation = state.entries.reload();
-    vec![fetch(
-        ctx,
-        root_id,
-        state.dir(),
-        state.orphans,
-        None,
-        limit,
-        generation,
-        true,
-    )]
+    }
+    let request = state.entries.reload();
+    fetch(state, ctx, request)
 }
 
 /// Fetch the next page when the selection nears the end of what is loaded.
 fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
-    let Some(root_id) = state.root.as_ref().map(|r| r.id) else {
-        return Vec::new();
-    };
-    if !state.entries.wants_more(state.selected) {
+    if state.root.is_none() || !state.entries.wants_more(state.selected) {
         return Vec::new();
     }
     match state.entries.begin_more() {
-        Some((cursor, generation)) => vec![fetch(
-            ctx,
-            root_id,
-            state.dir(),
-            state.orphans,
-            Some(cursor),
-            None,
-            generation,
-            false,
-        )],
+        Some(request) => fetch(state, ctx, request),
         None => Vec::new(),
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one request's parameters, named at the call"
-)]
-fn fetch(
-    ctx: &Ctx<'_>,
-    root_id: i64,
-    dir: String,
-    orphans: bool,
-    cursor: Option<String>,
-    limit: Option<i64>,
-    generation: u64,
-    first: bool,
-) -> Effect {
+/// Ask for `request`'s page of the directory shown.
+fn fetch(state: &State, ctx: &Ctx<'_>, request: PageRequest) -> Vec<Effect> {
+    let Some(root_id) = state.root.as_ref().map(|r| r.id) else {
+        return Vec::new();
+    };
+    let (dir, orphans) = (state.dir(), state.orphans);
     let api = ctx.api.clone();
-    Effect::new(async move {
+    let PageRequest {
+        cursor,
+        limit,
+        generation,
+    } = request;
+    let limit = Some(limit as i64);
+    vec![Effect::new(async move {
+        let first = cursor.is_none();
         let path = (!dir.is_empty()).then_some(dir);
         let result = if orphans {
             let params = ListPoolOrphansParams {
@@ -200,7 +177,7 @@ fn fetch(
             first,
             result,
         }))
-    })
+    })]
 }
 
 pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -210,17 +187,17 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             first,
             result: Ok(page),
         } => {
-            if generation != state.entries.generation {
-                return Vec::new();
-            }
-            state
+            match state
                 .entries
-                .receive(generation, first, page.items, page.next_cursor);
-            if first {
-                if let Some(name) = state.reselect.take() {
-                    if let Some(at) = state.entries.items.iter().position(|e| e.name == name) {
-                        state.selected = at;
-                    }
+                .receive(generation, first, page.items, page.next_cursor)
+            {
+                Received::Stale => return Vec::new(),
+                Received::Continue(request) => return fetch(state, ctx, request),
+                Received::Settled => {}
+            }
+            if let Some(name) = state.reselect.take() {
+                if let Some(at) = state.entries.items.iter().position(|e| e.name == name) {
+                    state.selected = at;
                 }
             }
             state.selected = state
@@ -233,11 +210,21 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             result: Err(failure),
             ..
         } => {
-            state.entries.fail(generation, failure.message());
+            if state.entries.fail(generation, failure.message()) {
+                // The reload will not settle: a later page must not snap
+                // the selection back to where it began.
+                state.reselect = None;
+            }
             signed_out(&failure)
         }
         Msg::Move(motion) => {
             state.selected = motion.apply(state.selected, state.entries.items.len());
+            if state.entries.loading {
+                // A reload is in flight: keep what the operator chose.
+                if let Some(name) = state.selected_entry().map(|e| e.name.clone()) {
+                    state.reselect = Some(name);
+                }
+            }
             more(state, ctx)
         }
         Msg::Enter => match state.selected_entry() {
@@ -383,7 +370,12 @@ pub fn view(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
     header.push(Line::from(" claimed by"));
 
     let visible = block.inner(area).height.saturating_sub(1) as usize;
-    let offset = scroll(&state.offset, state.selected, visible);
+    let offset = scroll(
+        &state.offset,
+        state.selected,
+        visible,
+        state.entries.items.len(),
+    );
     let mut table_state = TableState::default()
         .with_offset(offset)
         .with_selected(Some(state.selected));
