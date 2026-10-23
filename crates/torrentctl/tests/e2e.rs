@@ -1,12 +1,16 @@
-//! The generated client against a real daemon.
+//! The generated client, and the `App` built on it, against a real daemon.
 //!
-//! `#[ignore]`d: it spawns `torrentd` with a live libtorrent session. Run it
-//! with `mise run test-torrentctl`, which builds the daemon first; set
-//! `TORRENTD_BIN` to use another binary.
+//! `#[ignore]`d where it spawns `torrentd` with a live libtorrent session.
+//! Run those with `mise run test-torrentctl`, which builds the daemon first;
+//! set `TORRENTD_BIN` to use another binary.
 //!
-//! This is the other half of the contract test `torrentd`'s own router tests
-//! are: those hold the handlers to the document, this holds a client
-//! generated from the document — by a different tool — to the handlers.
+//! The generated-client tests are the other half of the contract test
+//! `torrentd`'s own router tests are: those hold the handlers to the
+//! document, this holds a client generated from the document — by a
+//! different tool — to the handlers. The `App` tests drive what the
+//! operator runs: the model, its effects spawned by the runtime, and the
+//! rendered screen. Every test daemon gets its own HTTP and peer ports,
+//! since the tests run in parallel.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -16,6 +20,24 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
+
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+use torrentctl::api::Api;
+use torrentctl::app;
+use torrentctl::app::Live;
+use torrentctl::app::Model;
+use torrentctl::app::Msg;
+use torrentctl::app::Session;
+use torrentctl::app::Tab;
+use torrentctl::runtime;
+use torrentctl::theme::Depth;
+use torrentctl::theme::Theme;
 
 #[allow(clippy::all, clippy::pedantic, dead_code, unused, unreachable_patterns)]
 mod api {
@@ -31,7 +53,18 @@ const LISTEN_PORT: u16 = 16991;
 /// The socket test's peer port. The tests run in parallel, and a daemon
 /// whose only session cannot bind its listen socket exits.
 const SOCKET_TEST_LISTEN_PORT: u16 = 16992;
+/// The `App` test's daemon.
+const APP_HTTP: &str = "127.0.0.1:18192";
+const APP_LISTEN_PORT: u16 = 16993;
+/// The event-stream reconnect test's daemon.
+const STREAM_HTTP: &str = "127.0.0.1:18193";
+const STREAM_LISTEN_PORT: u16 = 16994;
+/// The session-loss test's daemon.
+const RESTART_HTTP: &str = "127.0.0.1:18194";
+const RESTART_LISTEN_PORT: u16 = 16995;
 const MAGNET_HEX: &str = "0505050505050505050505050505050505050505";
+/// How long the `App` is given to reach each state it is driven to.
+const STEP: Duration = Duration::from_secs(30);
 
 fn torrentd() -> PathBuf {
     std::env::var_os("TORRENTD_BIN").map_or_else(
@@ -114,12 +147,24 @@ impl Drop for Daemon {
 }
 
 async fn start(dir: &Path) -> (Daemon, String) {
-    let hash = password_hash(dir);
-    let cfg = config(dir, Some(&hash));
-    let daemon = spawn(&cfg);
-    let base = format!("http://{HTTP}");
-    wait_ready(&api::Client::new(&base).unwrap()).await;
+    let (daemon, base, _) = start_on(dir, Some(&password_hash(dir)), HTTP, LISTEN_PORT).await;
     (daemon, base)
+}
+
+/// A ready daemon on `http`, with the password whose hash is `auth` or
+/// authentication disabled, and its peer socket on `port`; with its base
+/// URL and its config file, to start it again from.
+async fn start_on(
+    dir: &Path,
+    auth: Option<&str>,
+    http: &str,
+    port: u16,
+) -> (Daemon, String, PathBuf) {
+    let cfg = config_listening(dir, auth, &format!("\"{http}\""), port);
+    let daemon = spawn(&cfg);
+    let base = format!("http://{http}");
+    wait_ready(&api::Client::new(&base).unwrap()).await;
+    (daemon, base, cfg)
 }
 
 fn spawn(cfg: &Path) -> Daemon {
@@ -314,4 +359,373 @@ async fn the_generated_client_drives_a_real_daemon() {
         api::Error::Api(response) => assert_eq!(response.status().as_u16(), 401),
         other => panic!("a revoked token is a 401, got {other:?}"),
     }
+}
+
+/// The `App` as `runtime::run` drives it, with keys typed by the test
+/// instead of read from a terminal: each message goes through
+/// `app::update`, and the effects it returns are spawned by
+/// `runtime::spawn`, whose messages come back on `rx`.
+struct Driver {
+    model: Model,
+    tx: mpsc::UnboundedSender<Msg>,
+    rx: mpsc::UnboundedReceiver<Msg>,
+}
+
+impl Driver {
+    /// A model on `api`, asking the daemon who it is, as the loop's start
+    /// does.
+    fn start(api: Api) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        runtime::spawn(&tx, vec![app::check_session(&api)]);
+        Self {
+            model: Model::new(api, Theme::new(Depth::Mono)),
+            tx,
+            rx,
+        }
+    }
+
+    fn send(&mut self, msg: Msg) {
+        let effects = app::update(&mut self.model, msg);
+        runtime::spawn(&self.tx, effects);
+    }
+
+    fn key(&mut self, code: KeyCode) {
+        self.send(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn type_text(&mut self, text: &str) {
+        for c in text.chars() {
+            self.key(KeyCode::Char(c));
+        }
+    }
+
+    /// Apply the effects' messages until `done` holds, failing after
+    /// [`STEP`] with what was on screen.
+    async fn until(&mut self, what: &str, done: impl Fn(&Model) -> bool) {
+        let deadline = tokio::time::Instant::now() + STEP;
+        while !done(&self.model) {
+            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+                Ok(Some(msg)) => self.send(msg),
+                Ok(None) => unreachable!("the driver holds a sender"),
+                Err(_) => panic!("{what}: not within {STEP:?}\n{}", self.screen()),
+            }
+        }
+    }
+
+    /// The screen at 160x48, one line per row, trailing spaces trimmed.
+    fn screen(&self) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        terminal
+            .draw(|frame| torrentctl::ui::view(&self.model, frame))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Wait for `follow_events` to report `wanted`, skipping change
+/// notifications and other states on the way.
+async fn live(rx: &mut mpsc::UnboundedReceiver<Msg>, within: Duration, wanted: fn(&Live) -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Msg::LiveChanged(state))) if wanted(&state) => return,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("follow_events stopped"),
+            Err(_) => panic!("the event stream did not reach the state within {within:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "spawns torrentd; run with `mise run test-torrentctl`"]
+async fn app_against_daemon_logs_in_lists_and_quits() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = password_hash(dir.path());
+    let (_daemon, base, _) = start_on(dir.path(), Some(&hash), APP_HTTP, APP_LISTEN_PORT).await;
+
+    // No token: the placeholder `main` presents, which the daemon refuses,
+    // so the password prompt is what comes up.
+    let mut app = Driver::start(Api::new(&base, Some(torrentctl::api::ANONYMOUS)).unwrap());
+    app.until("the sign-in prompt", |m| {
+        matches!(m.session, Session::SignedOut)
+    })
+    .await;
+    assert!(app.screen().contains("password"), "{}", app.screen());
+
+    app.type_text(PASSWORD);
+    app.key(KeyCode::Enter);
+    app.until("signed in", |m| {
+        matches!(m.session, Session::SignedIn { .. })
+    })
+    .await;
+    assert!(app.model.minted, "the token came from the password");
+    let minted = app.model.api.clone();
+
+    // Add a magnet through the palette's `add`, into the one profile.
+    app.key(KeyCode::Char(':'));
+    app.type_text("add");
+    app.key(KeyCode::Enter);
+    assert_eq!(app.model.tab, Tab::Torrents);
+    app.until("the profiles in the add dialog", |m| {
+        !m.torrents.profiles_loading && !m.torrents.profiles.is_empty()
+    })
+    .await;
+    app.type_text(&format!("magnet:?xt=urn:btih:{MAGNET_HEX}&dn=e2e"));
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Right);
+    assert_eq!(
+        app.model
+            .torrents
+            .add
+            .as_ref()
+            .and_then(|d| d.profile.as_deref()),
+        Some(PROFILE)
+    );
+    app.key(KeyCode::Enter);
+    app.until("the added magnet listed", |m| {
+        m.torrents.add.is_none()
+            && !m.torrents.list.loading
+            && m.torrents
+                .list
+                .items
+                .iter()
+                .any(|t| t.infohash == MAGNET_HEX)
+    })
+    .await;
+    let screen = app.screen();
+    let short = &MAGNET_HEX[..12];
+    let row = screen
+        .lines()
+        .find(|line| line.contains(short) && line.contains(PROFILE) && !line.contains("added"))
+        .unwrap_or_else(|| panic!("a list row for {short} in {PROFILE}:\n{screen}"));
+    assert!(row.contains(short), "{row}");
+    assert!(
+        screen.contains(&format!("· {short} to {PROFILE}")),
+        "the success toast:\n{screen}"
+    );
+
+    // `q` revokes the minted token before leaving.
+    app.key(KeyCode::Char('q'));
+    assert!(
+        app.model.quitting && !app.model.quit,
+        "waits for the revocation"
+    );
+    app.until("quit", |m| m.quit).await;
+    let refused = torrentctl::api::call(minted.client.get_current_session())
+        .await
+        .expect_err("a revoked token is refused");
+    assert_eq!(refused.status, Some(401), "{refused:?}");
+}
+
+#[tokio::test]
+#[ignore = "spawns torrentd; run with `mise run test-torrentctl`"]
+async fn follow_events_reconnects_after_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, base, cfg) = start_on(dir.path(), None, STREAM_HTTP, STREAM_LISTEN_PORT).await;
+    let api = Api::new(&base, Some(torrentctl::api::ANONYMOUS)).unwrap();
+    let (api_tx, api_rx) = watch::channel(api);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let follower = tokio::spawn(runtime::follow_events(api_rx, tx));
+
+    live(&mut rx, Duration::from_secs(15), |l| *l == Live::Streaming).await;
+    drop(daemon);
+    live(&mut rx, Duration::from_secs(15), |l| {
+        matches!(l, Live::Reconnecting { .. })
+    })
+    .await;
+
+    // The same port again: the stream comes back on its own, within the
+    // backoff (1s, doubling, at most 30s).
+    let _daemon = spawn(&cfg);
+    live(&mut rx, Duration::from_secs(60), |l| *l == Live::Streaming).await;
+
+    drop(api_tx);
+    follower.abort();
+}
+
+#[tokio::test]
+#[ignore = "spawns torrentd; run with `mise run test-torrentctl`"]
+async fn a_session_does_not_survive_a_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = password_hash(dir.path());
+    let (daemon, base, cfg) =
+        start_on(dir.path(), Some(&hash), RESTART_HTTP, RESTART_LISTEN_PORT).await;
+    let grant = api::Client::new(&base)
+        .unwrap()
+        .create_session(&types::CreateSession {
+            password: PASSWORD.to_owned(),
+        })
+        .await
+        .expect("sign in")
+        .into_inner();
+    let client = api::Client::new(&base).unwrap().with_credential(
+        "bearer",
+        api::Credential::Bearer(api::SecretString::from(grant.token)),
+    );
+    client
+        .get_current_session()
+        .await
+        .expect("the session works before the restart");
+
+    // Sessions live in the daemon's memory only.
+    drop(daemon);
+    let _daemon = spawn(&cfg);
+    wait_ready(&api::Client::new(&base).unwrap()).await;
+    match client.get_current_session().await.unwrap_err() {
+        api::Error::Api(response) => assert_eq!(response.status().as_u16(), 401),
+        other => panic!("a session from before the restart is a 401, got {other:?}"),
+    }
+}
+
+/// A panic inside the loop hands the terminal back: run under a pty, the
+/// binary enters the alternate screen, leaves it ahead of the panic report,
+/// shows the cursor again, and leaves the pty out of raw mode. Needs no
+/// daemon, so it is not ignored.
+#[test]
+fn a_panic_hands_the_terminal_back() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::fd::FromRawFd as _;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::process::CommandExt as _;
+
+    let (master, slave) = {
+        let mut master = -1;
+        let mut slave = -1;
+        let size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty writes two descriptors it opened into the
+        // pointers it is given; the name and termios are optional.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: both descriptors were just opened and are owned here.
+        unsafe {
+            (
+                std::fs::File::from(OwnedFd::from_raw_fd(master)),
+                OwnedFd::from_raw_fd(slave),
+            )
+        }
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_torrentctl"));
+    command
+        .args(["--url", "http://127.0.0.1:9"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("TERM", "xterm-256color")
+        .env("RUST_BACKTRACE", "0")
+        .env(torrentctl::runtime::PANIC_AFTER_DRAW, "1")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    // SAFETY: only async-signal-safe calls between fork and exec: a new
+    // session, with the pty on stdin as its controlling terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("run torrentctl");
+    // The child holds the only copies of the pty's other end now.
+    drop(command);
+
+    // Read on a thread until the child closes its end (Linux reports that as
+    // EIO), so a binary that neither panics nor exits fails the test at a
+    // deadline instead of hanging it.
+    let mut reader = master.try_clone().unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buf = [0u8; 4096];
+        let result = loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break Ok(output),
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break Ok(output),
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = done.send(result);
+    });
+    let output = match finished.recv_timeout(STEP) {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => panic!("read the pty ({}): {e}", master.as_raw_fd()),
+        Err(_) => {
+            // Killing the child closes its end, which ends the reader too.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("torrentctl neither panicked nor exited within {STEP:?}");
+        }
+    };
+    let status = child.wait().unwrap();
+    let output = String::from_utf8_lossy(&output);
+    assert!(!status.success(), "a panic is a failure exit: {output:?}");
+
+    const ENTER_ALTERNATE: &str = "\x1b[?1049h";
+    const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
+    const SHOW_CURSOR: &str = "\x1b[?25h";
+    let entered = output
+        .find(ENTER_ALTERNATE)
+        .unwrap_or_else(|| panic!("never entered the alternate screen: {output:?}"));
+    let left = output[entered..]
+        .find(LEAVE_ALTERNATE)
+        .map(|at| entered + at)
+        .unwrap_or_else(|| panic!("never left the alternate screen: {output:?}"));
+    let report = output
+        .find("TORRENTCTL_TEST_PANIC is set")
+        .unwrap_or_else(|| panic!("no panic report: {output:?}"));
+    assert!(
+        left < report,
+        "the alternate screen is left before the report prints, so it stays \
+         on the operator's screen: {output:?}"
+    );
+    // The cursor comes back as the unwinding drops the terminal, after the
+    // report.
+    assert!(
+        output[entered..].contains(SHOW_CURSOR),
+        "the cursor is shown again: {output:?}"
+    );
+    // And the pty is out of raw mode: line editing and echo are back.
+    // SAFETY: `termios` is plain data, filled in by tcgetattr on a
+    // descriptor this test owns.
+    let lflag = unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        assert_eq!(
+            libc::tcgetattr(master.as_raw_fd(), &mut termios),
+            0,
+            "tcgetattr: {}",
+            std::io::Error::last_os_error()
+        );
+        termios.c_lflag
+    };
+    assert_ne!(lflag & libc::ICANON, 0, "canonical mode restored");
+    assert_ne!(lflag & libc::ECHO, 0, "echo restored");
 }

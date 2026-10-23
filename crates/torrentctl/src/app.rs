@@ -740,14 +740,27 @@ mod tests {
         Model::new(testing::api(), testing::theme())
     }
 
+    /// What `GET /v1/server` then `GET /v1/sessions/current` — asking who
+    /// we are — sends.
+    const CHECK: [&str; 2] = ["GET /v1/server", "GET /v1/sessions/current"];
+    const REVOKE: &str = "DELETE /v1/sessions/current";
+
     fn principal(kind: &str) -> types::Principal {
         testing::from_json(json!({
             "kind": kind, "name": null, "scopes": ["read", "write"], "expires_at": null,
         }))
     }
 
+    /// A model whose effects reach `recorder`.
+    fn model_at(recorder: &testing::Recorder) -> Model {
+        Model::new(recorder.api(), testing::theme())
+    }
+
     fn signed_in(pool: bool) -> Model {
-        let mut m = model();
+        signed_in_as(model(), pool)
+    }
+
+    fn signed_in_as(mut m: Model, pool: bool) -> Model {
         update(
             &mut m,
             Msg::SessionChecked(Ok((testing::server(pool, false), principal("token")))),
@@ -774,15 +787,21 @@ mod tests {
 
     #[test]
     fn a_checked_session_signs_in_and_refreshes_the_visible_screen() {
-        let mut m = model();
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = model_at(&daemon);
         assert!(matches!(m.session, Session::Checking));
         let effects = update(
             &mut m,
             Msg::SessionChecked(Ok((testing::server(false, false), principal("token")))),
         );
         assert!(matches!(m.session, Session::SignedIn { .. }));
-        assert_eq!(effects.len(), 1, "the dashboard loads");
         assert!(m.dashboard.loading);
+        testing::run(effects);
+        assert_eq!(
+            daemon.lines(),
+            ["GET /v1/status", "GET /v1/profiles"],
+            "the dashboard loads"
+        );
     }
 
     #[test]
@@ -791,10 +810,12 @@ mod tests {
         update(&mut m, Msg::SessionChecked(Err(unauthorized())));
         assert!(matches!(m.session, Session::SignedOut));
 
-        let mut m = signed_in(false);
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = signed_in_as(model_at(&daemon), false);
         let effects = update(&mut m, Msg::SignedOut(unauthorized()));
-        assert_eq!(effects.len(), 1, "a 401 is re-checked first");
         assert!(matches!(m.session, Session::Checking));
+        testing::run(effects);
+        assert_eq!(daemon.lines(), CHECK, "a 401 is re-checked first");
         update(&mut m, Msg::SessionChecked(Err(unauthorized())));
         assert!(matches!(m.session, Session::SignedOut));
         assert!(m
@@ -812,16 +833,29 @@ mod tests {
         assert!(update(&mut m, Msg::Quit).is_empty());
         assert!(m.quit, "a static token needs no revoking");
 
+        let daemon = testing::Recorder::start("204 No Content", "");
         let mut m = model();
-        update(&mut m, Msg::SignedIn(testing::api()));
+        update(
+            &mut m,
+            Msg::SignedIn(daemon.api().with_token("tds_minted").unwrap()),
+        );
         assert!(m.minted);
         update(
             &mut m,
             Msg::SessionChecked(Ok((testing::server(false, false), principal("session")))),
         );
         let effects = update(&mut m, Msg::Quit);
-        assert_eq!(effects.len(), 1, "one revocation");
         assert!(!m.quit, "waits for it");
+        let msgs = testing::run(effects);
+        assert_eq!(
+            daemon.requests(),
+            [testing::Request {
+                line: REVOKE.to_owned(),
+                bearer: Some("tds_minted".to_owned()),
+            }],
+            "one revocation, of the minted token"
+        );
+        assert!(matches!(msgs[..], [Msg::Exit]), "{msgs:?}");
         update(&mut m, Msg::Exit);
         assert!(m.quit);
     }
@@ -919,7 +953,8 @@ mod tests {
 
     #[test]
     fn an_unreachable_daemon_is_retried_not_treated_as_a_sign_out() {
-        let mut m = model();
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = model_at(&daemon);
         let down = Failure::local("Cannot reach the daemon", Some("refused".to_owned()));
         assert!(update(&mut m, Msg::SessionChecked(Err(down))).is_empty());
         assert!(matches!(m.session, Session::Unreachable { .. }));
@@ -930,7 +965,8 @@ mod tests {
         if let Session::Unreachable { since, .. } = &mut m.session {
             *since -= RETRY_INTERVAL;
         }
-        assert_eq!(update(&mut m, Msg::Tick).len(), 1, "asks again");
+        testing::run(update(&mut m, Msg::Tick));
+        assert_eq!(daemon.lines(), CHECK, "asks again");
         assert!(matches!(m.session, Session::Checking));
 
         // `r` asks at once; typing is not a password.
@@ -939,10 +975,8 @@ mod tests {
             Msg::SessionChecked(Err(Failure::local("down", None))),
         );
         assert!(update(&mut m, Msg::Key(testing::key(KeyCode::Char('x')))).is_empty());
-        assert_eq!(
-            update(&mut m, Msg::Key(testing::key(KeyCode::Char('r')))).len(),
-            1
-        );
+        testing::run(update(&mut m, Msg::Key(testing::key(KeyCode::Char('r')))));
+        assert_eq!(daemon.lines(), [CHECK, CHECK].concat(), "`r` asks again");
     }
 
     #[test]
@@ -967,21 +1001,42 @@ mod tests {
     #[test]
     fn a_minted_token_is_revoked_whatever_state_the_session_is_in() {
         // Quit while the new session is still being described.
+        let daemon = testing::Recorder::start("204 No Content", "");
         let mut m = model();
-        update(&mut m, Msg::SignedIn(testing::api()));
+        update(
+            &mut m,
+            Msg::SignedIn(daemon.api().with_token("tds_1").unwrap()),
+        );
         assert!(matches!(m.session, Session::Checking));
-        assert_eq!(update(&mut m, Msg::Quit).len(), 1, "revoked, not orphaned");
+        testing::run(update(&mut m, Msg::Quit));
         assert!(!m.quit);
+        assert_eq!(
+            daemon.requests(),
+            [testing::Request {
+                line: REVOKE.to_owned(),
+                bearer: Some("tds_1".to_owned()),
+            }],
+            "revoked, not orphaned"
+        );
 
         // Signing in again revokes the first token before replacing it.
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut m = model();
-        update(&mut m, Msg::SignedIn(testing::api()));
-        let effects = update(
-            &mut m,
-            Msg::SignedIn(testing::api().with_token("tds_2").unwrap()),
-        );
-        assert_eq!(effects.len(), 2, "revoke the old, describe the new");
-        assert_eq!(m.api.epoch, 1);
+        let first = daemon.api().with_token("tds_1").unwrap();
+        update(&mut m, Msg::SignedIn(first.clone()));
+        let effects = update(&mut m, Msg::SignedIn(first.with_token("tds_2").unwrap()));
+        testing::run(effects);
+        let sent: Vec<_> = daemon
+            .requests()
+            .into_iter()
+            .map(|r| (r.line, r.bearer.unwrap_or_default()))
+            .collect();
+        let expected: Vec<_> = [(REVOKE, "tds_1"), (CHECK[0], "tds_2"), (CHECK[1], "tds_2")]
+            .into_iter()
+            .map(|(line, bearer)| (line.to_owned(), bearer.to_owned()))
+            .collect();
+        assert_eq!(sent, expected, "revoke the old, describe the new");
+        assert_eq!(m.api.epoch, 2);
     }
 
     #[test]
@@ -1025,18 +1080,32 @@ mod tests {
 
     #[test]
     fn quitting_during_a_sign_in_revokes_the_token_it_mints() {
-        let mut m = model();
+        let daemon = testing::Recorder::start("204 No Content", "");
+        let mut m = model_at(&daemon);
         update(&mut m, Msg::SessionChecked(Err(unauthorized())));
         m.login.busy = true;
         let effects = update(&mut m, Msg::Quit);
         assert!(!m.quit, "waits for the sign-in");
-        assert_eq!(effects.len(), 1, "says so");
+        let msgs = testing::run(effects);
+        assert!(
+            matches!(&msgs[..], [Msg::Toast(t)] if t.text.starts_with("finishing sign-in")),
+            "says so: {msgs:?}"
+        );
         let effects = update(
             &mut m,
             Msg::Login(screens::login::Msg::Answered(Ok("tds_late".into()))),
         );
-        assert_eq!(effects.len(), 1, "revokes what it minted");
         assert!(!m.quit);
+        let msgs = testing::run(effects);
+        assert_eq!(
+            daemon.requests(),
+            [testing::Request {
+                line: REVOKE.to_owned(),
+                bearer: Some("tds_late".to_owned()),
+            }],
+            "revokes what it minted"
+        );
+        assert!(matches!(msgs[..], [Msg::Exit]), "then leaves: {msgs:?}");
 
         // A second quit leaves at once.
         let mut m = model();
@@ -1064,8 +1133,9 @@ mod tests {
         }
         assert!(!m.quit && !m.quitting);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        update(&mut m, Msg::Key(ctrl_c));
-        assert!(m.quitting || m.quit, "Ctrl-C still quits");
+        // A static token: nothing to revoke, so it leaves at once.
+        assert!(update(&mut m, Msg::Key(ctrl_c)).is_empty());
+        assert!(m.quit, "Ctrl-C still quits");
     }
 
     #[test]

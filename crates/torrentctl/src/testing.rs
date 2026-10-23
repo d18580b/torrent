@@ -76,15 +76,137 @@ pub fn render(
 
 /// Run `f` with a context over `server`, for driving `update`.
 pub fn with_ctx<R>(server: Option<&types::ServerInfo>, f: impl FnOnce(&Ctx<'_>) -> R) -> R {
-    let api = api();
+    with_api(&api(), server, f)
+}
+
+/// [`with_ctx`], with the effects `f` gets back aimed at `api` — a
+/// [`Recorder`]'s, to see what they send.
+pub fn with_api<R>(
+    api: &Api,
+    server: Option<&types::ServerInfo>,
+    f: impl FnOnce(&Ctx<'_>) -> R,
+) -> R {
     let theme = theme();
     let ctx = Ctx {
-        api: &api,
+        api,
         server,
         theme: &theme,
         tick: 0,
     };
     f(&ctx)
+}
+
+/// One request a [`Recorder`] received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Request {
+    /// `METHOD /path?query`.
+    pub line: String,
+    /// The bearer token presented, if any.
+    pub bearer: Option<String>,
+}
+
+/// A stand-in daemon: answers every request with one status and body, and
+/// records what each asked for. It lives until the test process exits.
+pub struct Recorder {
+    pub url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+}
+
+impl Recorder {
+    /// Listen on a free loopback port, answering `status` (`"204 No
+    /// Content"`) with `body`.
+    pub fn start(status: &'static str, body: &str) -> Self {
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("an address"));
+        let requests = std::sync::Arc::<std::sync::Mutex<Vec<Request>>>::default();
+        let record = requests.clone();
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nx-request-id: \
+             feedface\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { continue };
+                let mut received = Vec::new();
+                let mut buf = [0u8; 65536];
+                let head = loop {
+                    let n = socket.read(&mut buf).unwrap_or(0);
+                    received.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&received).into_owned();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if received.len() >= end + 4 + length {
+                            break text[..end].to_owned();
+                        }
+                    }
+                    if n == 0 {
+                        break text;
+                    }
+                };
+                let mut lines = head.lines();
+                let line = lines
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(" HTTP/1.1")
+                    .to_owned();
+                let bearer = lines.find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    let (scheme, token) = value.trim().split_once(' ')?;
+                    (name.eq_ignore_ascii_case("authorization")
+                        && scheme.eq_ignore_ascii_case("bearer"))
+                    .then(|| token.to_owned())
+                });
+                // Recorded before the answer, so an effect that has
+                // finished has been recorded.
+                record
+                    .lock()
+                    .expect("not poisoned")
+                    .push(Request { line, bearer });
+                let _ = socket.write_all(response.as_bytes());
+            }
+        });
+        Self { url, requests }
+    }
+
+    /// An API handle aimed here, presenting `tdp_test`.
+    pub fn api(&self) -> Api {
+        Api::new(&self.url, Some("tdp_test")).expect("a valid URL")
+    }
+
+    /// Every request so far, in arrival order.
+    pub fn requests(&self) -> Vec<Request> {
+        self.requests.lock().expect("not poisoned").clone()
+    }
+
+    /// Every request line so far, `METHOD /path?query`, in arrival order.
+    pub fn lines(&self) -> Vec<String> {
+        self.requests().into_iter().map(|r| r.line).collect()
+    }
+}
+
+/// Run `effects` to completion, one after another, returning their
+/// messages: what they send arrives at the [`Recorder`] they are aimed at in
+/// the order given.
+pub fn run(effects: Vec<crate::app::Effect>) -> Vec<crate::app::Msg> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a test runtime");
+    effects
+        .into_iter()
+        .map(|effect| runtime.block_on(effect.0))
+        .collect()
 }
 
 /// The message an effect that needs no daemon — an `Effect::now`, such as a
