@@ -17,18 +17,21 @@
 //!
 //! Hashing a petabyte is days of I/O, so it cannot be the routine check:
 //!
-//! 1. **Cheap sweep** — `(size, mtime, inode)` against the recorded snapshot.
-//!    Catches essentially every real change and runs over a large pool
-//!    routinely. See [`drift`].
+//! 1. **Cheap sweep** — `(size, mtime, inode, device)` against the recorded
+//!    snapshot. Catches essentially every real change and runs over a large
+//!    pool routinely. See [`drift`].
 //! 2. **Authoritative verify** — libtorrent re-hashes the payload (v1 SHA-1,
-//!    v2 SHA-256 merkle). Triggered on adopt and on drift. torrentd never
-//!    reimplements piece hashing.
+//!    v2 SHA-256 merkle). Triggered on drift, and on adopt for every torrent
+//!    but the fast path's. torrentd never reimplements piece hashing.
 //!
 //! Matching itself is `(path, size)` for every torrent, v1, v2 and hybrid
 //! alike: see [`matcher`]. A v2 torrent's per-file merkle root is recorded in
 //! the index but no file's root is ever computed from disk — that would mean
 //! reading the whole pool — so it plays no part in placing a file, and a
-//! match is only ever confirmed by step 2.
+//! match is confirmed by step 2, with one exception: the [`adopt`] fast path
+//! seeds a complete, unchanged torrent whose previous client's `.fastresume`
+//! says so in seed mode, on the strength of that client's own check. The
+//! README's "Managed pool" section states the same split.
 
 pub mod adopt;
 pub mod drift;

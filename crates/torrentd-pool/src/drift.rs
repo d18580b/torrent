@@ -1,15 +1,19 @@
 //! Cheap change detection over the managed roots.
 //!
 //! Re-hashing a petabyte is days of I/O, so the routine check compares
-//! `(size, mtime, inode)` against the snapshot the last scan recorded. That
-//! catches truncation, replacement, in-place edits and re-creation — every way
-//! payload realistically changes under a seeder — for the cost of a stat.
+//! `(size, mtime, inode, device)` against the snapshot the last scan recorded.
+//! That catches truncation, replacement, in-place edits and re-creation — every
+//! way payload realistically changes under a seeder — for the cost of a stat.
 //!
-//! It cannot catch a change that preserves all three, which in practice means a
+//! It cannot catch a change that preserves all four, which in practice means a
 //! deliberate write through the same inode with a restored mtime. Anything
 //! relying on byte-level certainty (adoption, and any destructive operation)
 //! must go through libtorrent's verification instead; this pass only decides
-//! *when* that is worth paying for.
+//! *when* that is worth paying for. The one adoption that skips it is the
+//! [`crate::adopt`] fast path: a complete torrent whose previous client's
+//! `.fastresume` vouches for its pieces is seeded on that client's check, and
+//! this pass, run over the adopt's selection first, is what sends a torrent
+//! whose files changed since down the verify path instead.
 
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;

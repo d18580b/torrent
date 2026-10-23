@@ -37,9 +37,10 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # [auth]: a non-loopback bind without it is refused outright, and so is a
 # socket whose mode lets every user connect.
 #
-# Read once, at startup, like [auth], http_listen and trusted_proxies: editing
-# any of the four takes effect on restart, not on SIGHUP. A reload after such an
-# edit warns "requires daemon restart; ignored" and changes nothing.
+# Read once, at startup, like every key not listed as reloadable (README.md,
+# "HTTP API"): editing it takes effect on restart, not on SIGHUP. A reload
+# after such an edit warns "requires daemon restart; ignored" and changes
+# nothing.
 allow_unauthenticated = true
 
 # Without [auth], a request whose Host is not loopback (localhost, 127.0.0.0/8,
@@ -74,8 +75,8 @@ allow_unauthenticated = true
 # a range such as 172.16.0.0/12 would trust every container on every Docker
 # network on the host.
 #
-# Read once, at startup, like [auth], http_listen and allow_unauthenticated:
-# the trust set is parsed before anything is served and does not follow a
+# Read once, at startup, like every key not listed as reloadable (README.md,
+# "HTTP API"): the trust set is parsed before anything is served and does not follow a
 # running daemon. Editing this key and sending SIGHUP warns "requires daemon
 # restart; ignored" and changes nothing — decommission a proxy here and the
 # daemon keeps believing its headers until you restart.
@@ -294,7 +295,7 @@ dht               = true
 # same Endpoint host. See "Account isolation" in docs/running.md.
 #
 # [[profile]]
-# id                       = "account_a"
+# id                       = "acct_a"
 # network                  = "vpn"
 # vpn_type                 = "wireguard"
 # vpn_config               = "/etc/wireguard/wg-acct-a.conf"
@@ -302,10 +303,10 @@ dht               = true
 # listen_port              = 6891
 # peer_fingerprint         = "-qB5030-"
 # user_agent               = "qBittorrent/5.0.3"
-# resume_dir               = "/var/lib/torrentd/resume/account_a"
-# torrent_dir              = "/var/lib/torrentd/torrents/account_a"
+# resume_dir               = "/var/lib/torrentd/resume/acct_a"
+# torrent_dir              = "/var/lib/torrentd/torrents/acct_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
-# allowed_tracker_urls     = ["https://tracker.example.com/<account_a's passkey>/"]
+# allowed_tracker_urls     = ["https://tracker.example.com/<acct_a's passkey>/"]
 # `0` means unlimited for this profile, overriding the daemon-wide cap; omit
 # the key to inherit it.
 # upload_rate_limit        = 0

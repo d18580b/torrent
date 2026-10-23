@@ -1,7 +1,11 @@
 # Importing a library from another client
 
 How to move torrents another client is seeding into torrentd's pool, without
-re-downloading anything and without seeding bytes nobody checked. This expands
+re-downloading anything and without seeding bytes nobody checked: torrentd
+hashes every adopted torrent itself, except a complete, unchanged torrent whose
+previous client's `.fastresume` marks it complete, which seeds at once on the
+strength of that client's own check (the fast path, §3 and §5; see the README's
+[Managed pool](../README.md#managed-pool) section). This expands
 [`running.md` §10](running.md#10-migrating-a-pool-from-another-client), and
 assumes the daemon already runs as §4–§9 describe. Each step names the
 failure that skipping it causes.

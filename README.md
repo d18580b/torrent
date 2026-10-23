@@ -77,7 +77,7 @@ them, and reports per path:
 | `matched` | Every file resolved on disk; not yet loaded. |
 | `partial` | Only some files present. Adoption is refused — seeding it would advertise pieces the daemon cannot serve. |
 | `missing` | No payload found under any root. |
-| `drifted` | A claimed file's size, mtime or inode changed since the last scan. Stays so across rescans until a verification clears it. |
+| `drifted` | A claimed file's size, mtime, inode or device changed since the last scan. Stays so across rescans until a verification clears it. |
 | `overlap` | Two torrents claim some of the same files, but not the same set. Blocks adoption and any mutation touching those bytes. |
 | `shared` | Another torrent claims exactly the same files — a cross-seed. Adoptable, each into its own profile; never moved or deleted for one of them. |
 
@@ -85,11 +85,13 @@ Plus byte rollups per directory, so an unprotected subtree is visible without
 reading a file listing.
 
 Change detection is tiered because hashing a petabyte is days of I/O: a
-`(size, mtime, inode)` sweep catches essentially every real change cheaply,
-and libtorrent's own piece hashing is the authoritative check, run on adopt
-and on drift. Every torrent, v1, v2 or hybrid, matches on `(path, size)`
-against a small set of candidate directories, and a match is confirmed only
-by that verification.
+`(size, mtime, inode, device)` sweep catches essentially every real change
+cheaply, and libtorrent's own piece hashing is the authoritative check, run on
+drift and on adopt. Every torrent, v1, v2 or hybrid, matches on `(path, size)`
+against a small set of candidate directories, and a match is confirmed by that
+verification, with one exception: a complete, unchanged torrent whose previous
+client's `.fastresume` says so is adopted in seed mode on the strength of that
+client's own check, without hashing (see the tiered adoption paragraph below).
 
 **Migrating from qBittorrent, or another libtorrent-based client, is just the
 first scan** — point `library_dir` at its state directory (qBittorrent's
@@ -246,7 +248,7 @@ listen_interfaces = "eth0:6881"     # not 0.0.0.0 beside a vpn profile
 dht               = true            # off unless written
 
 [[profile]]
-id                      = "account_a"
+id                      = "acct_a"
 network                 = "vpn"     # binds a tunnel; dht/pex/lsd forced off
 vpn_type                = "wireguard"
 vpn_config              = "/etc/wireguard/wg-acct-a.conf"
@@ -272,8 +274,8 @@ gateway (ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the
 live socket rebinding when it changes).
 
 Verify a tunnel before trusting it, with no torrents involved. `vpn check`
-inspects `vpn` profiles and reaches every profile you do not name, so name a
-`vpn` one unless the configuration is all `vpn`:
+checks every profile unless `--profile` names one; a `host` profile has no
+tunnel to check and reports `skip`, which does not change the exit status:
 
 ```bash
 torrentd --config … vpn check --profile acct_a   # --bring-up also raises it
@@ -320,7 +322,7 @@ pre-flight the daemon depends on and reports each part separately, with no
 libtorrent session, no torrents and no tracker contact.
 
 ```bash
-torrentd --config … vpn check                 # only if every profile is vpn
+torrentd --config … vpn check                 # every profile; host ones report skip
 torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
 torrentd --config … vpn check --egress 1.1.1.1:53      # route it via the tunnel, then a reply through it
 ```
@@ -389,9 +391,10 @@ It is not one to arrive at by omission. The opt-out does not extend to a
 routable address either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
 and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
 inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` and
-`allowed_hosts` alongside them, are read once, at startup: changing any of the
-five takes a restart, not a `SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
+defaults to `127.0.0.1:8080`. Every key not listed as reloadable under
+[HTTP API](#http-api) — these three, `trusted_proxies` and `allowed_hosts`
+among them — is read once, at startup, and takes a restart, not a `SIGHUP`. A
+`SIGHUP` that changes one says so — "requires daemon restart;
 ignored" — rather than reporting the config unchanged.
 
 Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
@@ -505,8 +508,8 @@ daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 
 ## Deployment
 
-`deploy/` has a hardened systemd unit (`Type=notify`, `--check-config`
-pre-flight, resource limits), a multi-stage `Containerfile`, and a
+`deploy/` has a hardened systemd unit (`Type=notify`,
+`RestartPreventExitStatus=78`, resource limits), a multi-stage `Containerfile`, and a
 `compose.yaml`. Run torrentd as its own user. Setup is
 [`docs/running.md`](docs/running.md).
 
@@ -535,12 +538,11 @@ mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```
 
 `mise run vpn-check` verifies a real VPN configuration against a real tunnel,
-with no torrents and no tracker involved. `vpn check` inspects `vpn` profiles,
-so give it a configuration that has one, and name it with `--profile` when the
-configuration also carries `host` profiles:
+with no torrents and no tracker involved. It checks every profile unless
+`--profile` names one; a `host` profile has no tunnel and reports `skip`:
 
 ```bash
-mise run vpn-check /etc/torrentd/torrentd.toml --profile account_a
+mise run vpn-check /etc/torrentd/torrentd.toml --profile acct_a
 ```
 
 ## Contributing & license

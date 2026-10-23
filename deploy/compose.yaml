@@ -94,7 +94,8 @@ services:
       # Only needed by a `network = "vpn"` profile.
       # - /etc/wireguard:/etc/wireguard:ro
       # The payload directory. Read-write: it is the sample config's
-      # default_save_path, so every download lands here, and with
+      # default_save_path, so every add without its own save_path lands
+      # here, and with
       # [pool] allow_mutations on and it listed in roots, plan applies move
       # files inside it and delete_files moves them to <root>/.torrentd-trash.
       # Mounted :ro, each of those fails with EROFS. deploy/torrentd.service grants the same path
@@ -102,8 +103,8 @@ services:
       #
       # The bind mount hides the image's own /data/torrents, which the
       # Containerfile chowns to 1000:1000, so the host directory has to be
-      # writable by uid 1000 — the image's USER — or every download and plan
-      # step fails with EACCES. Docker creates a missing source as root:root
+      # writable by uid 1000 — the image's USER — or every add and plan step
+      # fails with EACCES. Docker creates a missing source as root:root
       # 0755, and docs/running.md §4c creates it for the `torrentd` system
       # user, a different uid. Before the first `up`, on the host:
       #   sudo install -d -o 1000 -g 1000 -m0755 /data/torrents
@@ -116,11 +117,7 @@ services:
 
   # torrentd does not terminate TLS, by design: an HTTP server's TLS
   # configuration is a thing to get wrong, and there is a mature one right
-  # here. Caddy terminates it, forwards the API, and passes conditional
-  # responses through, so a client that already holds an asset revalidates it
-  # and gets a 304. The stock caddy:2-alpine image has no HTTP cache module —
-  # that needs the third-party cache-handler plugin, which this stack does not
-  # build in — so every request still reaches torrentd.
+  # here. Caddy terminates it and forwards the API.
   #
   # The forwarding headers below are the contract, and `trusted_proxies` in
   # torrentd.toml has to name the address this service connects from. Compose
