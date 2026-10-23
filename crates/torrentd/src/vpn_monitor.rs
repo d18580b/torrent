@@ -3427,51 +3427,64 @@ mod tests {
     /// run, and the fence's lift through `PATCH /v1/profiles/{id}` replaces
     /// it; a batch that slipped between the two resumed the torrent a
     /// second time (issue 423).
+    ///
+    /// The lift is played in two places: right after the run's check before
+    /// its batch, and right after any check the batch itself makes on the
+    /// blocking pool while the profile still reads fenced. The predicate
+    /// reports the run cancelled only once the profile already reads active,
+    /// so the batch stops only if its check comes after its status read: a
+    /// check above that read sees the profile fenced, lets the lift land
+    /// after it, and the batch resumes the torrent.
     #[tokio::test]
     async fn a_run_a_lift_replaced_before_its_batch_resumes_nothing() {
-        let (entry, engine) = mock_entry(ProfileStatus::VpnDown);
-        let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
-        let replaced = Arc::new(atomic::AtomicBool::new(false));
-        // The lift lands right after the run's check before its batch: it
-        // cancels the run, then marks the profile active, as `lift_fence`
-        // does, and only then does the batch reach the session.
-        let cancelled = {
-            let (profiles, replaced) = (profiles.clone(), replaced.clone());
-            move || {
-                if replaced.swap(true, atomic::Ordering::SeqCst) {
-                    return true;
+        // The runtime is current-thread, so only the batch's checks run off
+        // this thread.
+        let runtime_thread = std::thread::current().id();
+        for lift_on_pool in [false, true] {
+            let (entry, engine) = mock_entry(ProfileStatus::VpnDown);
+            let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+            let replaced = Arc::new(atomic::AtomicBool::new(false));
+            // The lift cancels the run, then marks the profile active, as
+            // `lift_fence` does, right after the check it follows.
+            let cancelled = {
+                let (profiles, replaced) = (profiles.clone(), replaced.clone());
+                move || {
+                    let profile = profiles.iter().next().unwrap();
+                    if profile.health().status == ProfileStatus::Active {
+                        return replaced.load(atomic::Ordering::SeqCst);
+                    }
+                    let on_pool = std::thread::current().id() != runtime_thread;
+                    if on_pool == lift_on_pool && !replaced.swap(true, atomic::Ordering::SeqCst) {
+                        profile.update_health(|h| h.status = ProfileStatus::Active);
+                    }
+                    false
                 }
-                profiles
-                    .iter()
-                    .next()
-                    .unwrap()
-                    .update_health(|h| h.status = ProfileStatus::Active);
-                false
-            }
-        };
-        let resumed = resume_paced(
-            profiles,
-            ProfileId::new("acct_a"),
-            &[handle(1)],
-            REANNOUNCE_PACE,
-            cancelled,
-            Arc::new(ResumeGate::default()),
-            Arc::new(PromSink::new()),
-            |_, _| {},
-        )
-        .await;
-        assert_eq!(
-            resumes(&engine),
-            [],
-            "the replaced run leaves the torrent to the lift's run",
-        );
-        assert_eq!(
-            resumed,
-            Resumed {
-                not_reached: 1,
-                ..Resumed::default()
-            },
-        );
+            };
+            let resumed = resume_paced(
+                profiles,
+                ProfileId::new("acct_a"),
+                &[handle(1)],
+                REANNOUNCE_PACE,
+                cancelled,
+                Arc::new(ResumeGate::default()),
+                Arc::new(PromSink::new()),
+                |_, _| {},
+            )
+            .await;
+            assert_eq!(
+                resumes(&engine),
+                [],
+                "lift_on_pool: {lift_on_pool}: the replaced run leaves the torrent to the lift's run",
+            );
+            assert_eq!(
+                resumed,
+                Resumed {
+                    not_reached: 1,
+                    ..Resumed::default()
+                },
+                "lift_on_pool: {lift_on_pool}",
+            );
+        }
     }
 
     /// A lift that starts while an earlier one is still resuming replaces
