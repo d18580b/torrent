@@ -173,8 +173,8 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
     client sends is not adopted. The daemon's trace line for the response
     carries it with the operation, status and latency. Quote it when
     reporting a failure. (The line logged when the request arrives is
-    written before the id is assigned, so it shows only whatever the client
-    sent.)
+    written before the id is assigned, and carries an empty `request_id`:
+    an id the client sent is neither adopted nor logged.)
 - **Body limits.** A request body is capped at 64 KiB, except for
   `POST /v1/torrents`, which takes 96 MiB so it can carry a base64-encoded
   64 MiB `.torrent`. An operation that takes no body declares no `413`.
