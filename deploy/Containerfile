@@ -3,8 +3,17 @@
 # Stage 1 (builder): Fedora with gcc/cmake/openssl-dev + Rust via rustup.
 # Compiles vendored Boost + libtorrent + the shim + the daemon.
 # Stage 2 (runtime): Fedora minimal plus the runtime tools listed below.
+#
+# Both base images are pinned by the digest of their multi-arch index, not by
+# tag alone: `fedora:43` is re-pushed with every update, so a tag names a
+# different image from one build to the next and nothing records which one a
+# given torrentd image was built on. The tag stays for the reader; the digest
+# is what is pulled. To move a pin, read the index digest a tag currently
+# names and replace it:
+#
+#   skopeo inspect --raw docker://registry.fedoraproject.org/fedora:43 | sha256sum
 
-FROM registry.fedoraproject.org/fedora:43 AS builder
+FROM registry.fedoraproject.org/fedora:43@sha256:4f128be2ec20ffa551ec33add60f8bfd0cf60f7c6d3f1026206f0cf731b3a1f2 AS builder
 
 RUN dnf install -y \
         gcc-c++ make cmake ninja-build pkgconf-pkg-config \
@@ -16,15 +25,35 @@ RUN dnf install -y \
 # the exact release rust-toolchain.toml pins, so the image builds with the
 # same compiler as CI and a developer.
 #
-# The installer is downloaded to a file and run as a separate command, not
-# piped into `sh`: a pipeline's status is its last command's, so a failed
-# download fed `sh` empty input, `sh` exited 0, and the build broke later with
-# `cargo: command not found`. Joined by `&&`, a failed `curl` now fails this
-# step with its own error. `SHELL ["/bin/bash", "-o", "pipefail", "-c"]` is
-# not used because podman's default OCI image format ignores `SHELL`.
-RUN curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init.sh https://sh.rustup.rs \
-    && sh /tmp/rustup-init.sh -y --default-toolchain none --profile minimal \
-    && rm /tmp/rustup-init.sh
+# rustup-init itself is a pinned release, fetched from rustup's versioned
+# archive and checked against the SHA-256 recorded here before it runs: the
+# unversioned `sh.rustup.rs` script runs whatever the server returns that day.
+# Each checksum is the `rustup-init.sha256` rustup publishes next to the
+# binary, at
+#   https://static.rust-lang.org/rustup/archive/<version>/<triple>/rustup-init.sha256
+# and the three values move together. An architecture with no checksum here
+# fails this step rather than running an unverified installer.
+#
+# Every command is joined by `&&`, so a failed download or a checksum mismatch
+# fails this step with its own error. `echo ... | sha256sum -c -` is the one
+# pipeline, and its status is `sha256sum`'s, which is the one that matters.
+# `SHELL ["/bin/bash", "-o", "pipefail", "-c"]` is not used because podman's
+# default OCI image format ignores `SHELL`.
+ARG RUSTUP_VERSION=1.29.2
+ARG RUSTUP_INIT_SHA256_X86_64=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4
+ARG RUSTUP_INIT_SHA256_AARCH64=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697
+RUN arch=$(uname -m) \
+    && case "$arch" in \
+         x86_64) sha=$RUSTUP_INIT_SHA256_X86_64 ;; \
+         aarch64) sha=$RUSTUP_INIT_SHA256_AARCH64 ;; \
+         *) echo "no pinned rustup-init checksum for $arch" >&2; exit 1 ;; \
+       esac \
+    && curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init \
+         "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${arch}-unknown-linux-gnu/rustup-init" \
+    && echo "$sha  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --default-toolchain none --profile minimal \
+    && rm /tmp/rustup-init
 ENV PATH=/root/.cargo/bin:${PATH}
 
 WORKDIR /src
@@ -59,8 +88,9 @@ RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \
 # ---- runtime --------------------------------------------------------------
 
 # `fedora-minimal:43`, not `fedora:43-minimal` — the latter is not a tag that
-# exists in any registry, so the runtime stage could never be pulled.
-FROM registry.fedoraproject.org/fedora-minimal:43
+# exists in any registry, so the runtime stage could never be pulled. Pinned by
+# index digest for the reason given at the top of this file.
+FROM registry.fedoraproject.org/fedora-minimal:43@sha256:faf83ebf1612b5c8da396dce424f2d4ac7ec1b9ac0e0b7c6cdb863259ee74f05
 
 # **This runtime layer is WireGuard-only.** No `openvpn` binary is installed
 # and none ever has been, so a profile configured `vpn_type = "openvpn"` cannot
