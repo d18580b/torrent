@@ -10,18 +10,11 @@
 #   info      worth knowing; routine on some trackers
 #
 # `increase(x[15m]) > 0` fires on the first evaluation after an event and
-# resolves 15 minutes after the last one. It needs a scraped sample from
-# before the event. The daemon writes every series these read at zero at
-# boot, but nothing can scrape it until /metrics is served, after the boot
-# scans and the alert loop's first stretch: whatever those count is already in
-# the first sample, and a zero nobody scraped is no sample. So for each counter
-# a boot moves, the daemon also exports what it had counted at the first
-# scrape as a gauge named for it (`boot_registry_errors` for
-# `profile_assignment_registry_errors_total`, and so on), and the rule fires
-# on that being above zero too (`or boot_gauge > 0`). Such an alert holds for the life of the
-# process, as TorrentdBootLoadFailures does; a restart clears it. A series
-# that appears only with its first event is matched on its appearance as well
-# (`or (x unless x offset 15m)`).
+# resolves 15 minutes after the last one. Why a counter a boot moves is also
+# read through its `torrentd_boot_*` gauge (`or boot_gauge > 0`, holding for
+# the life of the process), and a first-event series matched on its
+# appearance (`or (x unless x offset 15m)`), is the Present column of
+# ../metrics.md.
 
 groups:
   - name: torrentd_runtime

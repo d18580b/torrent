@@ -391,63 +391,11 @@ Per-session series carry a `profile_id` label. Per-*torrent* series are
 deliberately absent — they are unusable at 10K+ torrents, and the HTTP API
 serves per-torrent status on demand.
 
-What follows is the series worth building a panel or an alert on, named so you
-can find them; a scrape of a running daemon is the authoritative list.
-Alongside the libtorrent gauges (`torrentd_libtorrent_*`) there are daemon
-counters for torrent lifecycle, resume writes, disk and hash errors, dropped
-alerts, storage moves and pool verification. Tunnel health and fencing are
-carried by the `profile_id`-labelled `profile_vpn_tunnel_up`,
-`profile_torrents_paused_vpn_down`, `profile_vpn_tunnel_ip_changes_total` and
-`profile_vpn_fenced_total`, and they are meaningful only on a tunnelled
-profile: a sample carrying the `profile_id` of a profile with no tunnel says
-nothing about any tunnel, so scope a panel or an alert to the profiles you
-actually tunnel rather than aggregating over every profile. Handshake age is
-reported per WireGuard profile. Port-forward state is reported per profile that
-negotiates its port over NAT-PMP, and `profile_vpn_gateway_reboots_total`
-counts the gateway restarts a renewal detects on such a profile. A
-`profile_id` label marks a series as one session's rather than the daemon's,
-which is why most of those daemon counters carry one too — pool verification is
-daemon-wide and carries none. Outside both VPN groups, these are the labelled
-series worth an alert of their own: `listen_failure_active`, 1 while any of a
-profile's listen sockets is failed (a dual-stack `0.0.0.0:6881,[::]:6881`
-profile holds two) and 0 once every one of them is up; `listen_failures_total`, which counts
-those failures — and a listen failure on a daemon left with a single live
-session is fatal, so on that shape the alert that fires is the daemon going
-away; and `profile_assignment_registry_errors_total`, which counts the torrents
-a profile's registry refused to take, whether for a duplicate info-hash, a
-resume file found under another profile, or a tracker outside
-`allowed_tracker_domains` or `allowed_tracker_urls` — the cross-account contamination profiles exist to
-prevent. `kill_switch_active` is none of these: it is a single unlabelled
-daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
-`vpn` profile is configured.
-
-> Every series, and when it first exists, is listed in
-> [`deploy/metrics.md`](deploy/metrics.md). The alert rules in
-> [`deploy/prometheus/`](deploy/prometheus) and the Grafana dashboard in
-> [`deploy/dashboard.json`](deploy/dashboard.json) read only series that table
-> holds, and `cargo test -p torrentd` fails if either reads one it does not.
-> Most daemon counters are written at zero from boot, so `increase()` sees an
-> event that follows the first scrape. What a boot counts comes before any
-> scrape, so it is already in the counter's first sample, where `increase()`
-> cannot see it; the `torrentd_boot_*` gauges carry what the boot counted, and
-> the alerts that read those counters also fire on them. A series the table
-> marks "on first event" reads as "no data" rather than zero until something
-> happens. The per-profile families do
-> not wait for one: every family a per-profile monitor owns is pre-registered at
-> its baseline when that monitor starts, so `rate()` and alerting queries over
-> it resolve on a healthy daemon rather than on the first event ever to occur.
-> That is tunnel health and fencing on every profile, and port-forward state —
-> `profile_vpn_gateway_reboots_total` included — on every profile that
-> negotiates over NAT-PMP. `profile_vpn_handshake_probe_ok` and
-> `profile_vpn_transfer_probe_ok` are seeded at 1 on
-> every live WireGuard profile, so an alert on either reads "no" from a cold
-> start; neither is ever seeded on a profile that is not WireGuard, nor on one whose tunnel
-> never came up, where a 0 would wrongly blame the host's `wg` tooling.
-> `profile_vpn_handshake_age_seconds` is the exception, because it registers on
-> the first probe rather than when the monitor starts: an alert on it reads "no
-> data" until the first poll completes, and permanently on a `vpn` profile that
-> is not WireGuard. A `vpn` profile whose tunnel never came up at boot carries
-> `profile_vpn_tunnel_up` at 0 and none of the other per-profile series.
+Every series, its labels, which instances carry it, when it first exists, and
+what it means are in [`deploy/metrics.md`](deploy/metrics.md), the one
+authoritative list; the alert rules in [`deploy/prometheus/`](deploy/prometheus)
+and the Grafana dashboard in [`deploy/dashboard.json`](deploy/dashboard.json)
+read only series it holds.
 
 ## Deployment
 
