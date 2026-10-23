@@ -11,8 +11,7 @@ publish = false
 [dependencies]
 libtorrent-safe = { workspace = true }
 
-# Async / concurrency
-tokio = { workspace = true }
+# Concurrency
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -52,7 +51,6 @@ test-support = []
 # torrent's payload download counter, which only `test-api` exposes.
 libtorrent-safe = { workspace = true, features = ["test-api"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # Layer 3 integration fixtures: real SHA-1 piece hashes for generated .torrents.
 sha1 = { workspace = true }
 

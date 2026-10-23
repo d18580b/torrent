@@ -27,6 +27,7 @@ mod config;
 mod http;
 mod metrics_sink;
 mod net_cmd;
+mod pacing;
 mod pool_apply;
 mod pool_cmd;
 mod pool_service;

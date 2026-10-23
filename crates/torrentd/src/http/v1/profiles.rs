@@ -10,7 +10,6 @@ use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::DesiredState;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode as EnginePortForwardMode;
@@ -36,6 +35,7 @@ use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::server::count;
 use crate::http::v1::Profiles;
 use crate::http::v1::Torrents;
+use crate::pacing::REANNOUNCE_PACE;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::Resolution;
@@ -1189,12 +1189,12 @@ mod tests {
     /// profile until the run ends.
     #[tokio::test(start_paused = true)]
     async fn a_lifted_fence_names_what_its_run_has_yet_to_resume() {
-        use torrentd_engine::port_forward::REANNOUNCE_BATCH;
         use torrentd_engine::InfoHash;
         use torrentd_engine::TorrentHandle;
         use torrentd_engine::TorrentState;
 
         use crate::app_state::build_test_state;
+        use crate::pacing::REANNOUNCE_BATCH;
         use crate::profile_registry::test_entry;
         use crate::profile_registry::ProfileRegistry;
 
