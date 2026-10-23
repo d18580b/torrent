@@ -1835,13 +1835,14 @@ On a scratch pool, not your real one.
    the handshake still look healthy. On a scratch host, with the daemon up:
 
    ```bash
-   sudo deploy/drill/route-fence.sh <iface>
+   sudo deploy/drill/route-fence.sh <iface> <profile_id>
    ```
 
-   The script deletes only that tunnel's `from <address> lookup <table>`
+   `<profile_id>` is the id of the vpn profile `<iface>` belongs to (or set
+   `PROFILE_ID`); the script reads only that profile's series. The script deletes only that tunnel's `from <address> lookup <table>`
    rules — not the whole rule list, which would take the host's own routing
    with it — waits up to one poll plus a grace, and exits 0 once
-   `torrentd_profile_vpn_fenced_total{reason="route_mismatch"}` has risen (the
+   that profile's `torrentd_profile_vpn_fenced_total{reason="route_mismatch"}` has risen (the
    log says `VPN tunnel unhealthy` with `reason=route_mismatch`). Set
    `METRICS_URL` and `METRICS_TOKEN` if `/metrics` is not on
    `127.0.0.1:8080` or needs the scrape token. Afterwards, restore the
