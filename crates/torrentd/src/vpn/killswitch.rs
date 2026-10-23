@@ -1128,12 +1128,20 @@ enum Watch {
 /// leaves the live table differing from the one now rendered, which the
 /// check reads as drift.
 ///
-/// Only spawned when the kill switch is active.
+/// Only spawned when the kill switch is active. Runs until `stop`, which
+/// the shutdown fires just before it closes the sessions and removes the
+/// table, so the check holds through the shutdown's drain, while the
+/// sessions still seed; past that point it would read the removal as a
+/// flush and install the table again. A check already on the blocking pool
+/// when the stop comes runs on, but its fences, lifts and installs pass the
+/// stop's [`FencingGate`](crate::vpn_monitor::FencingGate), which the stop
+/// closes before the teardown once any of them inside it has ended, so none
+/// lands after the teardown unless that one outlasts the stop's bound.
 pub(crate) async fn watch(
     installed: Installed,
     fence: std::sync::Arc<dyn Fence>,
     metrics: std::sync::Arc<crate::metrics_sink::PromSink>,
-    mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
+    mut stop: crate::vpn_monitor::FencingStopped,
 ) {
     use torrentd_engine::MetricsSink;
     // Installed moments ago by `enable`, and verified by the boot.
@@ -1143,27 +1151,38 @@ pub(crate) async fn watch(
     // filter that lets one of those events through disables the span.
     let table = installed.table_name();
     let installed = std::sync::Arc::new(std::sync::Mutex::new(installed));
+    let gate = stop.gate();
     let mut state = Watch::default();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(WATCH_INTERVAL) => {}
-            _ = shutdown.recv() => return,
+            () = stop.stopped() => {
+                tracing::info!(target: "torrentd::vpn::killswitch", table = %table, "kill switch watch stopping");
+                return;
+            }
         }
         // Blocking throughout: the checks and the reinstall shell out to nft,
-        // and fencing pauses torrents under each session's lock.
+        // and fencing pauses torrents under each session's lock. Aborting
+        // the watch cannot cancel this closure, so its fences and installs
+        // pass the stop's gate.
         let ticked = tokio::task::spawn_blocking({
             let (installed, fence, metrics) = (installed.clone(), fence.clone(), metrics.clone());
+            let gate = gate.clone();
             let span = tracing::error_span!("kill_switch_watch", table = %table);
             move || {
                 let _span = span.entered();
+                let apply = gated_apply(&gate, apply);
                 let mut installed = installed.lock().unwrap_or_else(|p| p.into_inner());
-                refresh(&mut installed, transport, apply);
+                refresh(&mut installed, transport, &apply);
                 let installed = &*installed;
                 tick(
                     state,
                     || verify(installed),
                     || apply(&installed.script()),
-                    &*fence,
+                    &Gated {
+                        fence: &*fence,
+                        gate: &gate,
+                    },
                     &*metrics,
                 )
             }
@@ -1181,6 +1200,38 @@ pub(crate) async fn watch(
                 );
             }
         }
+    }
+}
+
+/// `apply`, refused once the shutdown's stop has closed `gate`: the teardown
+/// is about to remove the table, or already has, and installing it then
+/// would outlive the daemon.
+fn gated_apply<'a>(
+    gate: &'a crate::vpn_monitor::FencingGate,
+    apply: impl Fn(&str) -> io::Result<()> + 'a,
+) -> impl Fn(&str) -> io::Result<()> + 'a {
+    move |script| {
+        gate.run(|| apply(script)).unwrap_or_else(|| {
+            Err(io::Error::other(
+                "the shutdown stopped the kill switch watch; not installing the table again",
+            ))
+        })
+    }
+}
+
+/// A [`Fence`] whose fences and lifts are dropped once the shutdown's stop
+/// has closed `gate`: past it the sessions are closing.
+struct Gated<'a> {
+    fence: &'a dyn Fence,
+    gate: &'a crate::vpn_monitor::FencingGate,
+}
+
+impl Fence for Gated<'_> {
+    fn fence_all(&self) {
+        self.gate.run(|| self.fence.fence_all());
+    }
+    fn lift(&self) {
+        self.gate.run(|| self.fence.lift());
     }
 }
 
@@ -2711,6 +2762,84 @@ table inet torrentd_ks_998 {
         fn take(&self) -> Vec<&'static str> {
             std::mem::take(&mut *self.0.lock().unwrap())
         }
+    }
+
+    /// The watch runs until its own stop, which the shutdown fires only once
+    /// its drain is over, and returns at it without a further check: it
+    /// does not end with the shutdown broadcast that starts the drain.
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_runs_until_its_stop_and_returns_at_it() {
+        let stop = crate::vpn_monitor::FencingStop::new();
+        let fence = std::sync::Arc::new(Recorded::default());
+        let task = tokio::spawn(watch(
+            installed(),
+            fence.clone(),
+            std::sync::Arc::new(crate::metrics_sink::PromSink::new()),
+            stop.subscribe(),
+        ));
+        tokio::time::sleep(WATCH_INTERVAL / 2).await;
+        assert!(!task.is_finished(), "nothing has stopped the watch");
+        assert!(
+            stop.stop(std::time::Duration::from_secs(5)).await,
+            "the watch returned"
+        );
+        task.await.unwrap();
+        assert_eq!(fence.take(), Vec::<&str>::new(), "no check ran");
+    }
+
+    /// A check still on the blocking pool when the shutdown's stop closes
+    /// the gate reads the teardown's removal of the table as a loss, and
+    /// neither installs the table again nor fences the closing sessions;
+    /// before the stop the same check does both.
+    #[tokio::test]
+    async fn a_check_past_the_stop_neither_reinstalls_nor_fences() {
+        let stop = crate::vpn_monitor::FencingStop::new();
+        let gate = stop.subscribe().gate();
+        let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+        let applied = std::sync::Mutex::new(0);
+        let apply = gated_apply(&gate, |_| {
+            *applied.lock().unwrap() += 1;
+            Ok(())
+        });
+        let gated = Gated {
+            fence: &fence,
+            gate: &gate,
+        };
+
+        let next = tick(
+            Watch::Intact,
+            verdicts(vec![Ok(Verdict::Absent), Ok(Verdict::Intact)]),
+            || apply("script"),
+            &gated,
+            &metrics,
+        );
+        assert_eq!(next, Watch::Intact);
+        assert_eq!(
+            fence.take(),
+            ["fence", "lift"],
+            "the open gate lets both through"
+        );
+        assert_eq!(*applied.lock().unwrap(), 1);
+
+        assert!(stop.stop(std::time::Duration::from_secs(5)).await);
+        let next = tick(
+            Watch::Intact,
+            verdicts(vec![Ok(Verdict::Absent)]),
+            || apply("script"),
+            &gated,
+            &metrics,
+        );
+        assert_eq!(
+            next,
+            Watch::Lost,
+            "the refused reinstall is not taken for a repair"
+        );
+        assert_eq!(
+            fence.take(),
+            Vec::<&str>::new(),
+            "nothing fenced past the stop"
+        );
+        assert_eq!(*applied.lock().unwrap(), 1, "the table not installed again");
     }
 
     /// Verdicts handed out in order, one per call.

@@ -20,13 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::sync::broadcast;
 use torrentd_engine::port_forward::Pacer;
 use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
-use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -1565,19 +1563,137 @@ pub(crate) fn resume_unless_fenced(
     Ok(SingleResume::Fenced)
 }
 
+/// Stops the tasks that fence vpn profiles — [`run`] and
+/// `vpn::killswitch::watch` — at the point the shutdown chooses, which is
+/// just before it closes the sessions and takes the network down.
+///
+/// Not the shutdown broadcast: that fires as the stop begins, and the
+/// sessions keep seeding through the HTTP drain, the pool-work wait and the
+/// resume drain after it (up to `shutdown_drain_secs`). A tunnel lost or a
+/// ruleset flushed in that window has to be fenced as at any other time.
+///
+/// Dropping it stops them too, so a boot that fails, or a handle that is
+/// never run, leaves nothing fencing sessions that are being closed.
+#[derive(Debug)]
+pub(crate) struct FencingStop {
+    stop: tokio::sync::watch::Sender<bool>,
+    gate: FencingGate,
+}
+
+impl FencingStop {
+    pub(crate) fn new() -> Self {
+        Self {
+            stop: tokio::sync::watch::Sender::new(false),
+            gate: FencingGate::default(),
+        }
+    }
+
+    /// The receiving end one fencing task holds for as long as it runs.
+    pub(crate) fn subscribe(&self) -> FencingStopped {
+        FencingStopped {
+            stop: self.stop.subscribe(),
+            gate: self.gate.clone(),
+        }
+    }
+
+    /// Tell every subscriber to stop, close their [`FencingGate`], and wait
+    /// for each to have returned (dropped its [`FencingStopped`]), all within
+    /// `bound`. Returns whether the gate closed and they all returned.
+    ///
+    /// Closing the gate waits out an act already inside it, then refuses
+    /// every later one: a check already running on the blocking pool cannot
+    /// be cancelled, and without the gate one that outlasted `bound` could
+    /// still reinstall the table the teardown removes. An act that outlasts
+    /// `bound` leaves the gate to close as soon as that act ends.
+    pub(crate) async fn stop(self, bound: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        self.stop.send_replace(true);
+        let closed = self.gate.try_close() || {
+            let gate = self.gate.clone();
+            tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(move || gate.close()))
+                .await
+                .is_ok_and(|joined| joined.is_ok())
+        };
+        let returned = tokio::time::timeout_at(deadline, self.stop.closed())
+            .await
+            .is_ok();
+        closed && returned
+    }
+}
+
+/// What a fencing task's blocking work passes each act through that would
+/// change the profiles or the ruleset — a fence, a lift, a reinstall — so
+/// that none runs once [`FencingStop::stop`] has closed it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FencingGate(Arc<std::sync::Mutex<bool>>);
+
+impl FencingGate {
+    /// Run `act` unless the stop has closed the gate, which waits for it to
+    /// end. `None`, without running it, once closed.
+    pub(crate) fn run<T>(&self, act: impl FnOnce() -> T) -> Option<T> {
+        let closed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!*closed).then(act)
+    }
+
+    /// Close the gate, once any act inside it has ended. Blocking.
+    fn close(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
+    /// Close the gate if no act is inside it, returning whether it closed.
+    fn try_close(&self) -> bool {
+        let mut closed = match self.0.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        *closed = true;
+        true
+    }
+}
+
+/// A fencing task's half of [`FencingStop`].
+#[derive(Debug)]
+pub(crate) struct FencingStopped {
+    stop: tokio::sync::watch::Receiver<bool>,
+    gate: FencingGate,
+}
+
+impl FencingStopped {
+    /// Resolves once the stop is asked for, or its [`FencingStop`] is
+    /// dropped. Cancel safe: the stop is a level, read afresh each call.
+    pub(crate) async fn stopped(&mut self) {
+        // `Err` is the sender gone, which is a stop as well.
+        let _ = self.stop.wait_for(|stop| *stop).await;
+    }
+
+    /// The gate the task's blocking work runs its acts through.
+    pub(crate) fn gate(&self) -> FencingGate {
+        self.gate.clone()
+    }
+}
+
+/// Watch every vpn profile's tunnel and fence the profile whose tunnel is
+/// lost, until `stop` says the shutdown is about to take the network down.
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
     handshake_max_age: Duration,
-    shutdown: broadcast::Receiver<ShutdownReason>,
+    stop: FencingStopped,
 ) {
     run_with(
         profiles,
         state,
         metrics,
         handshake_max_age,
-        shutdown,
+        stop,
         host_prober(),
         Arc::new(vpn::wireguard_transfer),
     )
@@ -1592,7 +1708,7 @@ async fn run_with(
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
     handshake_max_age: Duration,
-    mut shutdown: broadcast::Receiver<ShutdownReason>,
+    mut stop: FencingStopped,
     probe: Prober,
     counters: CounterProber,
 ) {
@@ -1606,7 +1722,7 @@ async fn run_with(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
-            _ = shutdown.recv() => {
+            () = stop.stopped() => {
                 info!(target: "torrentd::vpn_monitor", "vpn monitor shutting down");
                 return;
             }
@@ -2554,18 +2670,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (tx, rx) = broadcast::channel(1);
+        let stop = FencingStop::new();
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(state),
             metrics.clone(),
             max_age,
-            rx,
+            stop.subscribe(),
             probe,
             counters,
         ));
         tokio::time::sleep(POLL_INTERVAL * polls + Duration::from_secs(1)).await;
-        tx.send(ShutdownReason::Test).unwrap();
+        assert!(stop.stop(Duration::from_secs(5)).await);
         task.await.unwrap();
         let health = profiles.iter().next().unwrap().health();
         let exported = String::from_utf8(metrics.render()).expect("utf-8");
@@ -2578,6 +2694,178 @@ mod tests {
                 && l.contains(&format!("reason=\"{reason}\""))
                 && l.ends_with(" 1")
         })
+    }
+
+    /// The shutdown's drain — HTTP, pool work, resume data — runs with the
+    /// sessions still up, so a tunnel lost in it is fenced as at any other
+    /// time: the monitor stops only at [`FencingStop::stop`], which the
+    /// shutdown fires just before it closes the sessions, not at the
+    /// shutdown broadcast that starts the drain. After the stop it probes
+    /// nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_lost_during_drain_still_fences() {
+        use crate::profile_registry::test_entry;
+
+        let lost = Arc::new(atomic::AtomicBool::new(false));
+        let probes = Arc::new(atomic::AtomicU32::new(0));
+        let probe: Prober = {
+            let (lost, probes) = (lost.clone(), probes.clone());
+            Arc::new(move |_iface: &str, is_wg: bool| {
+                probes.fetch_add(1, atomic::Ordering::SeqCst);
+                TunnelProbes {
+                    ip: Ok(ip(2)),
+                    route: Some(Ok(if lost.load(atomic::Ordering::SeqCst) {
+                        RouteProbe::Elsewhere("leaves by eth0".into())
+                    } else {
+                        RouteProbe::ViaTunnel
+                    })),
+                    handshake: is_wg.then_some(Ok(Some(Duration::from_secs(5)))),
+                }
+            })
+        };
+        let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "acct_a",
+            ProfileStatus::Active,
+        )]));
+        let metrics = Arc::new(PromSink::new());
+        let stop = FencingStop::new();
+        let task = tokio::spawn(run_with(
+            profiles.clone(),
+            Arc::new(StateMap::new()),
+            metrics.clone(),
+            MAX,
+            stop.subscribe(),
+            probe,
+            no_counters(),
+        ));
+        let entry = profiles.iter().next().unwrap();
+        tokio::time::sleep(POLL_INTERVAL + Duration::from_secs(1)).await;
+        assert_eq!(entry.health().status, ProfileStatus::Active);
+
+        // The shutdown has begun and is draining: the tunnel goes.
+        lost.store(true, atomic::Ordering::SeqCst);
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert_eq!(
+            entry.health().status,
+            ProfileStatus::VpnDown,
+            "fenced during the drain: {exported}"
+        );
+        assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
+
+        // The teardown's stop: the monitor returns, and polls no more.
+        assert!(
+            stop.stop(Duration::from_secs(5)).await,
+            "the monitor returned"
+        );
+        assert!(task.is_finished());
+        let seen = probes.load(atomic::Ordering::SeqCst);
+        tokio::time::sleep(POLL_INTERVAL * 3).await;
+        assert_eq!(probes.load(atomic::Ordering::SeqCst), seen);
+    }
+
+    /// A dropped [`FencingStop`] stops its tasks as a fired one does: a boot
+    /// that fails leaves nothing fencing the sessions it closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_fencing_stop_stops_the_monitor() {
+        use crate::profile_registry::test_entry;
+
+        let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "acct_a",
+            ProfileStatus::Active,
+        )]));
+        let stop = FencingStop::new();
+        let task = tokio::spawn(run_with(
+            profiles,
+            Arc::new(StateMap::new()),
+            Arc::new(PromSink::new()),
+            MAX,
+            stop.subscribe(),
+            scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
+            no_counters(),
+        ));
+        drop(stop);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the monitor returns")
+            .unwrap();
+    }
+
+    /// Work on the blocking pool outlives an abort of the task that spawned
+    /// it, so the stop closes the gate its acts run through: the stop waits
+    /// out an act already inside, and every act after it is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_waits_out_an_act_in_its_gate_and_refuses_every_later_one() {
+        let stop = FencingStop::new();
+        let subscriber = stop.subscribe();
+        let gate = subscriber.gate();
+        drop(subscriber);
+        assert_eq!(gate.run(|| 1), Some(1), "an open gate runs its act");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let in_flight = std::thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.run(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            }
+        });
+        entered_rx.recv().unwrap();
+        let stopping = tokio::spawn(stop.stop(Duration::from_secs(30)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !stopping.is_finished(),
+            "the stop waits for the act inside its gate"
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            stopping.await.unwrap(),
+            "the gate closed and nothing was left running"
+        );
+        assert_eq!(
+            in_flight.join().unwrap(),
+            Some(()),
+            "the act inside ran to its end"
+        );
+        assert_eq!(gate.run(|| 1), None, "the stop refuses every later act");
+    }
+
+    /// An act that outlasts the bound does not hold the stop past it; the
+    /// gate closes as soon as that act ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_returns_at_its_bound_and_the_gate_closes_after_the_act() {
+        let stop = FencingStop::new();
+        let gate = stop.subscribe().gate();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let in_flight = std::thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.run(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            }
+        });
+        entered_rx.recv().unwrap();
+        assert!(
+            !stop.stop(Duration::from_millis(100)).await,
+            "an act past the bound is reported"
+        );
+        release_tx.send(()).unwrap();
+        in_flight.join().unwrap();
+        // The close the stop handed to the blocking pool takes the lock once
+        // the act lets go of it.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.run(|| ()).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the gate closes once the act ends");
     }
 
     /// The route probe as `run` calls it: its answer reaches the verdict,
@@ -2908,13 +3196,13 @@ mod tests {
             ProfileStatus::Active,
         )]));
         let metrics = Arc::new(PromSink::new());
-        let (tx, rx) = broadcast::channel(1);
+        let stop = FencingStop::new();
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(state),
             metrics.clone(),
             max_age,
-            rx,
+            stop.subscribe(),
             scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
             no_counters(),
         ));
@@ -2928,7 +3216,7 @@ mod tests {
         // fifth and sixth polls (0s, 30s unanswered) leave it up.
         entry.update_health(|h| h.status = ProfileStatus::Active);
         tokio::time::sleep(POLL_INTERVAL * 2).await;
-        tx.send(ShutdownReason::Test).unwrap();
+        assert!(stop.stop(Duration::from_secs(5)).await);
         task.await.unwrap();
         let exported = String::from_utf8(metrics.render()).expect("utf-8");
         assert_eq!(entry.health().status, ProfileStatus::Active, "{exported}");

@@ -447,9 +447,16 @@ pub fn is_config_refusal(e: &anyhow::Error) -> bool {
 /// which at 100K files on a cold disk takes minutes.
 const BOOT_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// What the teardown after the resume drain is given: closing the sessions,
-/// the tunnels (up to 7 s an OpenVPN profile, in parallel), the kill switch.
+/// What the teardown after the resume drain is given: stopping the fencing
+/// tasks (up to [`FENCING_STOP_BOUND`]), closing the sessions, the tunnels
+/// (up to 7 s an OpenVPN profile, in parallel), the kill switch.
 const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the teardown waits for the VPN monitor and the kill-switch
+/// watch to return once told to stop, and for the stop's gate to close: a
+/// poll or check of theirs already running shells out to `ip`, `wg` or
+/// `nft`, and finishes first.
+const FENCING_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Every descriptor the daemon may hold at once, against `RLIMIT_NOFILE`.
 ///
@@ -665,6 +672,14 @@ pub struct DaemonHandle {
     /// installed: graceful shutdown tears the table down, and the API's adds
     /// record what they pause with the fence. `boot` started its watch.
     kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
+    /// Stops the VPN monitor and the kill-switch watch, which `boot`
+    /// started: fired just before the teardown closes the sessions, so both
+    /// fence through the drain before it.
+    fencing: crate::vpn_monitor::FencingStop,
+    /// The kill-switch watch, aborted after `fencing` in case it outran the
+    /// stop's bound: left running, it would install the table again once
+    /// the teardown removes it.
+    kill_switch_watch: Option<tokio::task::AbortHandle>,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: torrentd_engine::AlertLoopHandle,
     /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
@@ -1058,6 +1073,11 @@ pub async fn boot(
     // pauses what the state map holds, which the scans fill only once both
     // have run, so the scans pause what they add to a fenced profile
     // themselves (`ScanFence`).
+    //
+    // It and the kill-switch watch stop on `fencing`, not on the shutdown
+    // broadcast: the shutdown fires it just before it closes the sessions,
+    // so both keep fencing through the drain while the sessions still seed.
+    let fencing = crate::vpn_monitor::FencingStop::new();
     spawn_supervised(
         "vpn_monitor",
         metrics.clone(),
@@ -1066,7 +1086,7 @@ pub async fn boot(
             state.clone(),
             metrics.clone(),
             std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
-            shutdown_tx.subscribe(),
+            fencing.subscribe(),
         ),
     );
 
@@ -1083,6 +1103,7 @@ pub async fn boot(
     // that window. Installing it before the sessions would need every
     // tunnel's transport port, which is known only once its link is up.
     let mut kill_switch = None;
+    let mut kill_switch_watch = None;
     // Seed the gauge at zero so `kill_switch_active == 0` is a series that
     // exists and can be alerted on. Registered lazily on first emission, it
     // was previously only ever set to 1 — so on a daemon running without the
@@ -1148,10 +1169,11 @@ pub async fn boot(
                 installed,
                 fence.clone(),
                 metrics.clone(),
-                shutdown_tx.subscribe(),
+                fencing.subscribe(),
             ),
         );
-        cleanup.note_kill_switch_watch(watch);
+        cleanup.note_kill_switch_watch(watch.clone());
+        kill_switch_watch = Some(watch);
         kill_switch = Some(fence);
     }
 
@@ -2097,6 +2119,8 @@ pub async fn boot(
         registry,
         profile_registry,
         kill_switch,
+        fencing,
+        kill_switch_watch,
         log_handle,
         alert_loop,
         unloaded_at_boot,
@@ -3419,6 +3443,8 @@ impl DaemonHandle {
             registry,
             profile_registry,
             kill_switch,
+            fencing,
+            kill_switch_watch,
             log_handle,
             alert_loop,
             unloaded_at_boot,
@@ -3429,7 +3455,8 @@ impl DaemonHandle {
         } = self;
 
         // The VPN health and port-forward monitors and the kill-switch watch
-        // are not here: `boot` starts each before the scans.
+        // are not here: `boot` starts each before the scans. The VPN monitor
+        // and the watch run until `stop_fencing`, before the teardown.
 
         // Long-running pool work and the shutdown latch it checks; the
         // teardown below waits for it before stopping the alert loop.
@@ -3713,6 +3740,11 @@ impl DaemonHandle {
                 ))
             })
             .collect();
+        // The fencing stops here and no earlier: through the drains above
+        // the sessions still seed, and a tunnel lost or a ruleset flushed
+        // then is fenced as at any other time. Past here the sessions close,
+        // and the watch would read the switch's removal as a flush.
+        stop_fencing(fencing, kill_switch_watch.as_ref()).await;
         teardown_network(engines, tunnels, || {
             if kill_switch.is_some() {
                 finish_kill_switch_removal(
@@ -3728,6 +3760,35 @@ impl DaemonHandle {
         info!("torrentd: clean exit");
         exit_code
     }
+}
+
+/// Stop the VPN monitor and the kill-switch watch, waiting up to
+/// [`FENCING_STOP_BOUND`] for each to return, then abort the watch in case it
+/// did not, so that no later check starts.
+///
+/// The abort cannot cancel a check already on the blocking pool, and that
+/// check would read the teardown's removal of the table as a flush. What
+/// keeps it from installing the table again, or fencing the closing
+/// sessions, is the stop's gate (`vpn_monitor::FencingGate`): the stop
+/// closes it within the bound, after any fence or install inside it ends,
+/// and the check's later ones are refused. Only a fence or install that
+/// itself outlasts the bound can still land after the teardown, which the
+/// warning below reports.
+async fn stop_fencing(
+    fencing: crate::vpn_monitor::FencingStop,
+    kill_switch_watch: Option<&tokio::task::AbortHandle>,
+) {
+    if !fencing.stop(FENCING_STOP_BOUND).await {
+        warn!(
+            bound_secs = FENCING_STOP_BOUND.as_secs(),
+            "the vpn monitor or the kill-switch watch was still running at its bound; \
+             tearing down the network around it",
+        );
+    }
+    if let Some(watch) = kill_switch_watch {
+        watch.abort();
+    }
+    info!("vpn fencing stopped; tearing down the network");
 }
 
 /// Wait up to `bound` for pool work still in flight, returning whether none
@@ -3761,9 +3822,10 @@ async fn wait_for_pool_work(work: &crate::app_state::WorkGate, bound: std::time:
 /// graceful-shutdown future has received a reason on this channel, which
 /// every subscriber received too. A server that never ran, or stopped on a
 /// failure of its own (`http_exit_code` 70), had no such send, and without
-/// one the VPN and port-forward monitors, the kill-switch watch and the
-/// verify queue ran on through the teardown: fencing profiles while the
-/// kill switch came down, admitting adoptions into sessions being closed.
+/// one the port-forward monitor and the verify queue ran on through the
+/// teardown, admitting adoptions into sessions being closed. The VPN monitor
+/// and the kill-switch watch do not listen here: they fence through the
+/// drain, and `stop_fencing` stops them just before the teardown.
 async fn run_http_stage<L, A, S, F>(
     listener: Option<L>,
     app: Option<A>,
@@ -4888,6 +4950,38 @@ mod shutdown_report_tests {
         let code = run_http_stage(Some(()), Some(()), |(), ()| async { 70 }, &tx).await;
         assert_eq!(code, 70);
         assert_eq!(monitor.await.unwrap(), ShutdownReason::ListenFailed);
+    }
+
+    /// The fencing tasks do not hear the shutdown broadcast that starts the
+    /// drain; `stop_fencing` stops them, and aborts a watch that outran its
+    /// bound, so nothing reinstalls the table the teardown removes.
+    #[tokio::test(start_paused = true)]
+    async fn the_fencing_stops_at_stop_fencing_and_a_stuck_watch_is_aborted() {
+        let (tx, _keep) = broadcast::channel(8);
+        let fencing = crate::vpn_monitor::FencingStop::new();
+        let mut stopped = fencing.subscribe();
+        let monitor = tokio::spawn(async move { stopped.stopped().await });
+        // A watch stuck in a check: it holds its stop and never reads it.
+        let held = fencing.subscribe();
+        let watch = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+
+        let code = run_http_stage(None::<()>, Some(()), |(), ()| async { 0 }, &tx).await;
+        assert_eq!(code, 70);
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(
+            !monitor.is_finished(),
+            "the shutdown broadcast does not stop the fencing"
+        );
+
+        stop_fencing(fencing, Some(&watch.abort_handle())).await;
+        monitor.await.unwrap();
+        assert!(
+            watch.await.unwrap_err().is_cancelled(),
+            "the stuck watch is aborted"
+        );
     }
 
     #[tokio::test]

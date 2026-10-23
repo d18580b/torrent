@@ -681,7 +681,9 @@ fn restore_base_rules(flush: &str) {
 /// still sending through it when they land. After each, the daemon is
 /// prompted to send, and nothing may arrive on the physical link outside
 /// the tunnel's own transport. A SIGTERM then removes the kill switch, and
-/// the shutdown report says so.
+/// the shutdown report says so; the VPN monitor and the kill-switch watch
+/// fenced until the drain before it was over
+/// ([`assert_fencing_held_through_the_drain`]).
 #[test]
 #[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
 fn vpn_netns_e2e_no_leak() {
@@ -837,6 +839,38 @@ fn vpn_netns_e2e_no_leak() {
         "{report}"
     );
     assert!(!table_listed(), "the kill switch table is removed on stop");
+    assert_fencing_held_through_the_drain(&daemon.log);
+}
+
+/// The stop as `daemon.log` records it: the VPN monitor and the kill-switch
+/// watch keep fencing through the shutdown's drain, which ends when the
+/// alert loop exits, and stop only after it, before the sessions close.
+///
+/// Stopped on the shutdown broadcast instead, both would return as the
+/// SIGTERM landed, and a tunnel lost or a ruleset flushed while the sessions
+/// still seeded through the drain would go unfenced.
+fn assert_fencing_held_through_the_drain(log: &std::path::Path) {
+    let text = std::fs::read_to_string(log).expect("the daemon's log");
+    let at = |what: &str, matches: &dyn Fn(&str) -> bool| -> usize {
+        text.lines()
+            .position(matches)
+            .unwrap_or_else(|| panic!("no line for {what} in the daemon's log:\n{text}"))
+    };
+    let drained = at("the alert loop's exit", &|l| {
+        l.contains("alert loop exited")
+    });
+    let closed = at("the sessions closing", &|l| l.contains("sessions closed"));
+    for (task, line) in [
+        ("the VPN monitor", "vpn monitor shutting down"),
+        ("the kill-switch watch", "kill switch watch stopping"),
+    ] {
+        let stopped = at(&format!("{task}'s stop"), &|l| l.contains(line));
+        assert!(
+            drained < stopped && stopped < closed,
+            "{task} stopped at line {stopped}, not between the drain's end (line {drained}) \
+             and the sessions closing (line {closed}):\n{text}"
+        );
+    }
 }
 
 /// A NAT-PMP gateway behind the tunnel, as a provider runs one.
