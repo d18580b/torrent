@@ -215,7 +215,8 @@ pub struct Model {
 #[derive(Debug)]
 pub enum Msg {
     Key(KeyEvent),
-    /// A render tick (250 ms): spinners, toast expiry, the polling fallback.
+    /// A render tick (250 ms): spinners, toast expiry, the polling fallback,
+    /// and the poll of an open torrent's trackers.
     Tick,
     /// `GET /v1/events` delivered a tick carrying this fingerprint of the
     /// daemon's state: something visible changed if it differs from the last.
@@ -345,11 +346,18 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             let due = model
                 .last_refresh
                 .is_none_or(|at| now.duration_since(at) >= POLL_INTERVAL);
-            if model.live != Live::Streaming
-                && due
-                && matches!(model.session, Session::SignedIn { .. })
-            {
+            if !matches!(model.session, Session::SignedIn { .. }) {
+                return Vec::new();
+            }
+            if model.live != Live::Streaming && due {
                 return refresh_visible(model);
+            }
+            // What the stream does not cover and the screen shows: an open
+            // torrent's trackers, polled on their own timer.
+            if model.tab == Tab::Torrents {
+                return route(model, |m, ctx| {
+                    screens::torrents::poll(&mut m.torrents, now, ctx)
+                });
             }
             Vec::new()
         }
@@ -1104,6 +1112,62 @@ mod tests {
             update(&mut m, Msg::Changed("00000000000000aa".into())).len(),
             1,
             "a change notification refreshes"
+        );
+    }
+
+    #[test]
+    fn an_open_trackers_tab_is_polled_while_the_stream_is_up() {
+        use screens::torrents::Msg as T;
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = signed_in_as(model_at(&daemon), false);
+        m.tab = Tab::Torrents;
+        update(&mut m, Msg::LiveChanged(Live::Streaming));
+        let infohash = "ab".repeat(20);
+        let page: types::TorrentPage = testing::from_json(serde_json::json!({
+            "items": [{
+                "infohash": infohash, "profile_id": "acct_a", "phase": "seeding",
+                "progress": 1.0, "upload_rate": 0, "download_rate": 0,
+                "total_uploaded": 0, "total_payload_uploaded": 0, "num_peers": 0,
+                "is_finished": true, "is_seeding": true,
+            }],
+            "next_cursor": null,
+        }));
+        let generation = m.torrents.list.generation;
+        update(
+            &mut m,
+            Msg::Torrents(T::Page {
+                generation,
+                first: true,
+                result: Ok(page),
+            }),
+        );
+        update(&mut m, Msg::Torrents(T::Open));
+        update(&mut m, Msg::Torrents(T::Tab(true)));
+        update(&mut m, Msg::Torrents(T::Tab(true)));
+        let trackers: types::TrackerList = testing::from_json(serde_json::json!({"items": []}));
+        update(
+            &mut m,
+            Msg::Torrents(T::Trackers {
+                hash: infohash.clone(),
+                result: Ok(trackers),
+            }),
+        );
+        // Nothing the stream reports has changed, and the screen refreshed
+        // just now; only the trackers' own timer is due.
+        m.last_refresh = Some(Instant::now());
+        let detail = m.torrents.detail.as_mut().unwrap();
+        detail.trackers_asked = detail
+            .trackers_asked
+            .map(|at| at - screens::torrents::TRACKERS_POLL_INTERVAL);
+
+        testing::run(update(&mut m, Msg::Tick));
+        assert_eq!(
+            daemon.lines(),
+            [format!("GET /v1/torrents/{infohash}/trackers")]
+        );
+        assert!(
+            update(&mut m, Msg::Tick).is_empty(),
+            "and not again until the interval"
         );
     }
 

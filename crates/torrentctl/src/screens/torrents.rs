@@ -6,6 +6,8 @@ mod add;
 mod detail;
 
 use std::cell::Cell;
+use std::time::Duration;
+use std::time::Instant;
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -358,6 +360,30 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         None => effects.extend(load_list(state, ctx)),
     }
     effects
+}
+
+/// How often an open torrent's trackers are re-read while its Trackers tab is
+/// shown, whatever the event stream says.
+pub const TRACKERS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Re-read the open torrent's trackers when its Trackers tab is shown and
+/// they were last asked for at least [`TRACKERS_POLL_INTERVAL`] before `now`.
+/// `GET /v1/events`' fingerprint does not cover a tracker's status or
+/// message, which the daemon reads from the session on request, so on an
+/// idle seeding torrent a tracker that starts failing changes nothing the
+/// stream reports: only this poll shows it.
+pub fn poll(state: &mut State, now: Instant, ctx: &Ctx<'_>) -> Vec<Effect> {
+    let Some(detail) = state.detail.as_mut() else {
+        return Vec::new();
+    };
+    let due = detail
+        .trackers_asked
+        .is_none_or(|at| now.saturating_duration_since(at) >= TRACKERS_POLL_INTERVAL);
+    if rereads_trackers(detail) && !detail.trackers_loading && due {
+        load_trackers(detail, ctx)
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -1214,6 +1240,7 @@ fn fetch_files(api: &Api, hash: String, request: PageRequest) -> Effect {
 
 fn load_trackers(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
     detail.trackers_loading = true;
+    detail.trackers_asked = Some(Instant::now());
     let api = ctx.api.clone();
     let hash = detail.hash.clone();
     vec![Effect::new(async move {
@@ -2473,6 +2500,62 @@ mod tests {
             view(&state, ctx, frame, area)
         });
         assert!(screen.contains("metadata not yet received"), "{screen}");
+    }
+
+    #[test]
+    fn the_trackers_tab_polls_its_trackers_on_its_own_timer() {
+        let mut state = opened(true);
+        with_trackers(&mut state);
+        let asked = state.detail.as_ref().unwrap().trackers_asked.unwrap();
+        let due = asked + TRACKERS_POLL_INTERVAL;
+        testing::with_ctx(None, |ctx| {
+            assert!(
+                poll(&mut state, due - Duration::from_millis(1), ctx).is_empty(),
+                "not before the interval"
+            );
+            state.detail.as_mut().unwrap().trackers_selected = 1;
+            assert_eq!(poll(&mut state, due, ctx).len(), 1, "due: re-read");
+            assert!(state.detail.as_ref().unwrap().trackers_loading);
+            assert!(
+                poll(&mut state, due + TRACKERS_POLL_INTERVAL, ctx).is_empty(),
+                "not while a read is in flight"
+            );
+
+            // The tracker that worked now fails: the poll's answer shows it,
+            // and the operator's place in the list holds.
+            let failing: types::TrackerList = testing::from_json(json!({"items": [
+                {"tier": 0, "host": "tracker.example.org:443",
+                 "url": "https://tracker.example.org/announce", "status": "error",
+                 "message": "connection refused", "next_announce_at": null,
+                 "seeds": null, "peers": null},
+                {"tier": 1, "host": "backup.example.net",
+                 "url": "https://backup.example.net/[redacted:9f2c]", "status": "error",
+                 "message": "unregistered torrent", "next_announce_at": null,
+                 "seeds": null, "peers": null},
+            ]}));
+            update(
+                &mut state,
+                Msg::Trackers {
+                    hash: hash(1),
+                    result: Ok(failing),
+                },
+                ctx,
+            );
+            let detail = state.detail.as_ref().unwrap();
+            let trackers = detail.trackers.as_ref().unwrap();
+            assert_eq!(trackers[0].message.as_deref(), Some("connection refused"));
+            assert_eq!(detail.trackers_selected, 1);
+
+            // Only the Trackers tab polls.
+            let later = Instant::now() + TRACKERS_POLL_INTERVAL;
+            update(&mut state, Msg::Tab(true), ctx);
+            assert!(poll(&mut state, later, ctx).is_empty(), "Actions tab");
+            update(&mut state, Msg::Tab(true), ctx);
+            assert!(poll(&mut state, later, ctx).is_empty(), "Overview tab");
+            update(&mut state, Msg::Back, ctx);
+            assert!(state.detail.is_none());
+            assert!(poll(&mut state, later, ctx).is_empty(), "the list");
+        });
     }
 
     #[test]
