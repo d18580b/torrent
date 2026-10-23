@@ -177,6 +177,13 @@ pub struct Profile {
     pub user_agent: Option<String>,
     /// Why the profile has no session. Set only when `status` is `failed`.
     pub failure_reason: Option<String>,
+    /// Why the profile is fenced, as the `reason` label of
+    /// `torrentd_profile_vpn_fenced_total` names it: `ip_lost_or_changed`,
+    /// `route_mismatch`, `handshake_stale`, `no_handshake`,
+    /// `probe_unavailable` (its tunnel's checks, or the kill switch's, could
+    /// not run several times in a row), or `kill_switch` (the nftables kill
+    /// switch was not in force). Set only when `status` is `vpn_down`.
+    pub fence_reason: Option<String>,
 }
 
 /// Every configured profile.
@@ -294,6 +301,10 @@ fn profile_of(s: &AppState, e: &ProfileEntry) -> Profile {
         forwarded_port: h.forwarded_port.or(listen_port),
         user_agent: e.config.user_agent.clone(),
         failure_reason: None,
+        fence_reason: (h.status == EngineProfileStatus::VpnDown)
+            .then_some(h.fence_reason)
+            .flatten()
+            .map(str::to_owned),
     }
 }
 
@@ -321,6 +332,7 @@ fn profile_of_failed(s: &AppState, f: &FailedProfile) -> Profile {
         forwarded_port: None,
         user_agent: f.config.user_agent.clone(),
         failure_reason: Some(f.reason.clone()),
+        fence_reason: None,
     }
 }
 

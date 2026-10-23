@@ -10,7 +10,11 @@
 //! immediately pauses every torrent in that profile, marks the profile
 //! `VpnDown`, and emits metrics — but does **not** restart the session (the
 //! spec Safety Rule: automatic restart risks a window where traffic routes over
-//! the bare interface; the operator must intervene).
+//! the bare interface; the operator must intervene). A probe that cannot run
+//! is no verdict on the tunnel, but [`PROBE_FAILURES_TO_FENCE`] polls in a row
+//! on which one could not fence the profile the same way
+//! ([`DownReason::ProbeUnavailable`]). Every profile is probed at once, each
+//! bounded by [`PROBE_TIMEOUT`].
 //!
 //! [`evaluate`] is the whole judgement and it is shared: `torrentd vpn check`
 //! reports the verdict this monitor would reach on the same observations.
@@ -21,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures_util::StreamExt as _;
 use torrentd_engine::port_forward::Pacer;
 use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::MetricsSink;
@@ -69,14 +74,24 @@ pub(crate) enum DownReason {
     /// look healthy, and the stale-handshake rule cannot fire because there is
     /// no handshake to age.
     NoHandshake,
+    /// [`PROBE_FAILURES_TO_FENCE`] polls in a row on which a check the
+    /// profile's tunnel needs could not run: `ip` could not read its address
+    /// or its route, or `wg` its handshake while the profile had traffic to
+    /// carry (its handshake is judged only then), or its probes did not return
+    /// within [`PROBE_TIMEOUT`]. Or, written by [`KillSwitchFence`], that
+    /// many kill-switch checks in a row could not run `nft`. One such poll
+    /// says nothing about the tunnel; a run of them leaves it seeding with no
+    /// check in force.
+    ProbeUnavailable,
 }
 
 impl DownReason {
-    pub(crate) const ALL: [DownReason; 4] = [
+    pub(crate) const ALL: [DownReason; 5] = [
         DownReason::IpLostOrChanged,
         DownReason::RouteMismatch,
         DownReason::HandshakeStale,
         DownReason::NoHandshake,
+        DownReason::ProbeUnavailable,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -85,9 +100,23 @@ impl DownReason {
             DownReason::RouteMismatch => "route_mismatch",
             DownReason::HandshakeStale => "handshake_stale",
             DownReason::NoHandshake => "no_handshake",
+            DownReason::ProbeUnavailable => "probe_unavailable",
         }
     }
 }
+
+/// How many polls in a row (and kill-switch checks in a row) may fail to run
+/// a check before the profiles it covers are fenced
+/// [`DownReason::ProbeUnavailable`]. One failure, with answers either side,
+/// is a transient host fault (`EMFILE`, a stalled `ip`) and changes nothing.
+pub(crate) const PROBE_FAILURES_TO_FENCE: u32 = 3;
+
+/// How long one poll waits for a profile's probes, all of them together,
+/// before it reads every one of them as unavailable. The profiles are probed
+/// at once, each on the blocking pool, so one hung `ip` or `wg` delays only
+/// its own profile's verdict. Each command already has its own timeout
+/// (`exec::QUICK`), so a probe left running past this one ends on its own.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// What the WireGuard handshake probe said, as far as the verdict cares.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -463,6 +492,27 @@ fn probe_tunnel(iface: &str, is_wg: bool) -> TunnelProbes {
     }
 }
 
+/// What [`run_with`] reads for a profile whose probe task failed or did not
+/// return within [`PROBE_TIMEOUT`]: every probe it would have made, the byte
+/// counters included, as unavailable, for `cause`. The WireGuard probes carry
+/// `why` (`TimedOut` or `TaskFailed`), so their warns name what happened
+/// rather than a `wg` that could not be run.
+fn unavailable_probes(
+    is_wg: bool,
+    cause: String,
+    why: vpn::HandshakeProbeUnavailable,
+) -> (
+    TunnelProbes,
+    Option<Result<vpn::WireguardTransfer, vpn::HandshakeProbeUnavailable>>,
+) {
+    let probes = TunnelProbes {
+        ip: Err(vpn::AddrProbeUnavailable { cause }),
+        route: None,
+        handshake: is_wg.then_some(Err(why)),
+    };
+    (probes, is_wg.then_some(Err(why)))
+}
+
 /// Where a packet from each address `iface` sends from would be routed:
 /// the IPv4 address `ip` read, then each global IPv6 address `v6` reads, each
 /// asked of `probe` toward the destination of its own family
@@ -604,20 +654,22 @@ pub(crate) fn fence(
     entry: &ProfileEntry,
     state: &StateMap,
     current: Option<IpAddr>,
+    reason: DownReason,
     metrics: &dyn MetricsSink,
 ) -> u64 {
-    mark_fenced(entry, current, metrics);
+    mark_fenced(entry, current, reason.as_str(), metrics);
     walk_fenced(entry, state, metrics)
 }
 
 /// The first half of [`fence`]: mark `entry` `vpn_down` under a new fence
-/// generation, starting its `paused_for_vpn` count over.
+/// generation, for `reason`, starting its `paused_for_vpn` count over.
 pub(crate) fn mark_fenced(
     entry: &ProfileEntry,
     current: Option<IpAddr>,
+    reason: &'static str,
     metrics: &dyn MetricsSink,
 ) {
-    mark_fenced_reading(entry, current, metrics, || ());
+    mark_fenced_reading(entry, current, reason, metrics, || ());
 }
 
 /// [`mark_fenced`], running `read` once the mark is in and before what a
@@ -630,6 +682,7 @@ pub(crate) fn mark_fenced(
 fn mark_fenced_reading<R>(
     entry: &ProfileEntry,
     current: Option<IpAddr>,
+    reason: &'static str,
     metrics: &dyn MetricsSink,
     read: impl FnOnce() -> R,
 ) -> R {
@@ -645,6 +698,7 @@ fn mark_fenced_reading<R>(
     // `KillSwitchFence::fenced`, held from its mark check through that update.
     entry.update_health(|h| {
         h.status = ProfileStatus::VpnDown;
+        h.fence_reason = Some(reason);
         h.tunnel_ip = current;
         h.start_paused_for_vpn_over();
         h.fence_generation += 1;
@@ -873,7 +927,18 @@ impl KillSwitchFence {
 }
 
 impl vpn::killswitch::Fence for KillSwitchFence {
-    fn fence_all(&self) {
+    fn fence_all_for(&self, cause: vpn::killswitch::FenceCause) {
+        let (reason, message) = match cause {
+            vpn::killswitch::FenceCause::NotInForce => (
+                KILL_SWITCH_FENCE_REASON,
+                "network kill switch not in force; paused all profile torrents until it is",
+            ),
+            vpn::killswitch::FenceCause::Unverifiable => (
+                DownReason::ProbeUnavailable.as_str(),
+                "network kill switch could not be checked; paused all profile torrents until a \
+                 check finds it in force",
+            ),
+        };
         let mut fenced = self.fenced.lock();
         for e in self
             .profiles
@@ -907,7 +972,7 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             // read keeps it in the record for the lift. The mark forgets
             // that note, so this read runs inside it.
             let marked_running =
-                mark_fenced_reading(e, health.tunnel_ip, self.metrics.as_ref(), || {
+                mark_fenced_reading(e, health.tunnel_ip, reason, self.metrics.as_ref(), || {
                     running_now(e, &self.state)
                 });
             let mut seen: std::collections::HashSet<TorrentHandle> =
@@ -931,16 +996,14 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             );
             self.metrics.inc_counter(
                 "profile_vpn_fenced_total",
-                &[
-                    ("profile_id", e.id().as_str()),
-                    ("reason", KILL_SWITCH_FENCE_REASON),
-                ],
+                &[("profile_id", e.id().as_str()), ("reason", reason)],
             );
             error!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %e.id(),
                 torrent_count = paused,
-                "network kill switch not in force; paused all profile torrents until it is",
+                reason,
+                "{message}",
             );
         }
     }
@@ -1759,6 +1822,10 @@ async fn run_with(
     // handshaked. See `Observation::unanswered_for`.
     let mut unanswered: std::collections::HashMap<torrentd_engine::ProfileId, Unanswered> =
         std::collections::HashMap::new();
+    // Per profile: how many polls in a row, ending with the latest, a check
+    // its tunnel needs could not run. See `DownReason::ProbeUnavailable`.
+    let mut unavailable: std::collections::HashMap<torrentd_engine::ProfileId, u32> =
+        std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -1769,47 +1836,116 @@ async fn run_with(
             }
         }
 
-        for e in profiles.iter() {
-            let profile_id = e.id().clone();
-            let health = e.health();
-            // Once a profile is down it stays down until the operator sets it
-            // online and its tunnel passes `recovery_check` — no
-            // auto-recovery.
-            if health.status == ProfileStatus::VpnDown {
-                // A fence that is lifted later starts the unanswered clock
-                // afresh, rather than from a poll before the fence: that
-                // would read as the whole fenced span without a handshake and
-                // fence the profile again on the first poll after it.
-                unanswered.remove(&profile_id);
-                continue;
-            }
-
-            // The probes shell out. Three processes per profile per tick is
-            // cheap, but it is still blocking work and it belongs off the
-            // runtime's worker threads.
-            // A host profile has no tunnel to watch.
-            let Some(iface) = e.config.vpn_interface().map(str::to_string) else {
-                continue;
-            };
-            let is_wg = e.config.vpn_type() == Some(VpnType::Wireguard);
-            let probed = tokio::task::spawn_blocking({
-                let iface = iface.clone();
-                let probe = probe.clone();
-                let counters = counters.clone();
-                move || (probe(&iface, is_wg), is_wg.then(|| counters(&iface)))
+        // Every profile's probes start at once, each on the blocking pool,
+        // each gets PROBE_TIMEOUT, and each profile is judged as its probes
+        // return: probed one after another, one hung `ip` or `wg` held back
+        // every later profile's verdict, a fence included, by as long as it
+        // hung.
+        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+        let mut polled: futures_util::stream::FuturesUnordered<_> = profiles
+            .iter()
+            .filter_map(|e| {
+                let health = e.health();
+                // Once a profile is down it stays down until the operator
+                // sets it online and its tunnel passes `recovery_check` — no
+                // auto-recovery.
+                if health.status == ProfileStatus::VpnDown {
+                    // A fence that is lifted later starts the unanswered
+                    // clock afresh, rather than from a poll before the fence:
+                    // that would read as the whole fenced span without a
+                    // handshake and fence the profile again on the first poll
+                    // after it. The run of unavailable probes starts over
+                    // likewise.
+                    unanswered.remove(e.id());
+                    unavailable.remove(e.id());
+                    return None;
+                }
+                // A host profile has no tunnel to watch.
+                let iface = e.config.vpn_interface()?.to_string();
+                let is_wg = e.config.vpn_type() == Some(VpnType::Wireguard);
+                // The probes shell out: blocking work, off the runtime's
+                // worker threads.
+                let task = tokio::task::spawn_blocking({
+                    let iface = iface.clone();
+                    let probe = probe.clone();
+                    let counters = counters.clone();
+                    move || (probe(&iface, is_wg), is_wg.then(|| counters(&iface)))
+                });
+                Some(async move {
+                    let probed = tokio::time::timeout_at(deadline, task).await;
+                    (e, health, iface, is_wg, probed)
+                })
             })
-            .await;
-            let (addr_probe, route_probe, handshake_probe, transfer_probe) = match probed {
-                Ok((p, transfer)) => (p.ip, p.route, p.handshake, transfer),
-                Err(e) => {
+            .collect();
+
+        while let Some((e, health, iface, is_wg, probed)) = polled.next().await {
+            let profile_id = e.id().clone();
+            // A probe task that failed or did not return in time read
+            // nothing: every probe it would have made is unavailable this
+            // poll. Skipping the poll instead left a prober that always
+            // failed this way with no check in force and nothing fencing.
+            let (p, transfer_probe) = match probed {
+                Ok(Ok(probed)) => probed,
+                Ok(Err(why)) => {
                     error!(
                         target: "torrentd::vpn_monitor",
                         profile_id = %profile_id,
-                        error.cause = %e,
-                        "tunnel probe task failed; skipping this tick",
+                        error.cause = %why,
+                        "tunnel probe task failed; reading every probe as unavailable this poll",
                     );
-                    continue;
+                    unavailable_probes(
+                        is_wg,
+                        format!("the probe task failed: {why}"),
+                        vpn::HandshakeProbeUnavailable::TaskFailed,
+                    )
                 }
+                Err(_) => {
+                    warn!(
+                        target: "torrentd::vpn_monitor",
+                        profile_id = %profile_id,
+                        vpn_iface = %iface,
+                        timeout_secs = PROBE_TIMEOUT.as_secs(),
+                        "tunnel probes did not return in time; reading every probe as \
+                         unavailable this poll",
+                    );
+                    unavailable_probes(
+                        is_wg,
+                        format!("the probes did not return within {PROBE_TIMEOUT:?}"),
+                        vpn::HandshakeProbeUnavailable::TimedOut,
+                    )
+                }
+            };
+            let (addr_probe, route_probe, handshake_probe) = (p.ip, p.route, p.handshake);
+            // A WireGuard tunnel with nothing to send does not handshake, so
+            // on a profile with nothing to carry its handshake, never made or
+            // aging, says nothing about the tunnel: the clock reads zero and
+            // the profile is judged on the address and the route alone, as
+            // `recovery_check` judges a fenced one. Otherwise a static-port
+            // tunnel with no keepalive is fenced some minutes after its last
+            // traffic — an empty profile, a fully paused one — and stays
+            // fenced until an operator lifts it.
+            //
+            // A profile the operator holds offline has its whole session
+            // paused, so nothing in it sends, whatever its torrents' phases.
+            let carrying =
+                !profiles.held_offline(&profile_id) && profile_carries_traffic(&state, &profile_id);
+            // Whether a check this tunnel needs could not run this poll. The
+            // transfer probe is not one: an aged handshake is judged without
+            // it (`unanswered_clock`), so its failure leaves no check off.
+            // Nor is the handshake probe while the profile carries nothing:
+            // its handshake is not judged then, so its failure leaves no
+            // check off either, and a host whose `wg` cannot run fences an
+            // idle or offline-held profile only once it has traffic to carry.
+            let unchecked = addr_probe.is_err()
+                || matches!(route_probe, Some(Err(_)))
+                || (carrying && matches!(handshake_probe, Some(Err(_))));
+            let unavailable_polls = if unchecked {
+                let n = unavailable.entry(profile_id.clone()).or_insert(0);
+                *n = n.saturating_add(1);
+                *n
+            } else {
+                unavailable.remove(&profile_id);
+                0
             };
             // Handshake liveness applies to WireGuard only; OpenVPN keeps the
             // IP-presence check (no cheap equivalent probe).
@@ -1924,19 +2060,6 @@ async fn run_with(
                 }
                 None => None,
             };
-            // A WireGuard tunnel with nothing to send does not handshake, so
-            // on a profile with nothing to carry its handshake, never made or
-            // aging, says nothing about the tunnel: the clock reads zero and
-            // the profile is judged on the address and the route alone, as
-            // `recovery_check` judges a fenced one. Otherwise a static-port
-            // tunnel with no keepalive is fenced some minutes after its last
-            // traffic — an empty profile, a fully paused one — and stays
-            // fenced until an operator lifts it.
-            //
-            // A profile the operator holds offline has its whole session
-            // paused, so nothing in it sends, whatever its torrents' phases.
-            let carrying =
-                !profiles.held_offline(&profile_id) && profile_carries_traffic(&state, &profile_id);
             let unanswered_for = unanswered_clock(
                 &mut unanswered,
                 &profile_id,
@@ -1955,7 +2078,12 @@ async fn run_with(
                 unanswered_for,
             };
 
+            // A failure the checks that did run found is the reason, ahead of
+            // the run of probes that could not: it says what is wrong.
             let reason = match evaluate(&observation, handshake_max_age) {
+                Ok(()) if unavailable_polls >= PROBE_FAILURES_TO_FENCE => {
+                    DownReason::ProbeUnavailable
+                }
                 Ok(()) => {
                     // Under the health lock, and only while the profile is
                     // not fenced: a kill-switch fence that landed during the
@@ -1978,11 +2106,12 @@ async fn run_with(
                 Address::Unknown => health.tunnel_ip,
                 seen => seen.held(),
             };
-            let paused = fence(e, &state, fenced_ip, metrics.as_ref());
+            let paused = fence(e, &state, fenced_ip, reason, metrics.as_ref());
             // The clock goes with the fence, not with the next poll: a fence
             // lifted before that poll would otherwise keep the clock from
             // before it and be fenced again on the first poll after.
             unanswered.remove(&profile_id);
+            unavailable.remove(&profile_id);
 
             // `fence` has set `profile_vpn_tunnel_up` to 0 with its mark.
             // Only an actual IP change increments the IP-change counter. It
@@ -2010,6 +2139,7 @@ async fn run_with(
                     None => "",
                 },
                 handshake_age_secs = handshake_age.flatten().map(|a| a.as_secs()).unwrap_or_default(),
+                unavailable_polls,
                 torrent_count = paused,
                 "VPN tunnel unhealthy; paused all profile torrents \
                  (no auto-restart — operator must intervene)",
@@ -3098,17 +3228,32 @@ mod tests {
             "at warn, with the cause: {log}"
         );
 
-        // Still fenced on a stale handshake: the other checks decide. The
-        // fence keeps the address the profile was last seen with, since
-        // nobody saw it go. Seeding, so the handshake has traffic to answer;
-        // the eighth poll is the first past `MAX` (210s) since the first.
+        // Still fenced on a stale handshake: the other checks decide, and the
+        // failure they find is the reason ahead of the run of unavailable
+        // address probes that reaches its count on the same poll. The fence
+        // keeps the address the profile was last seen with, since nobody saw
+        // it go. Seeding, so the handshake has traffic to answer; the third
+        // poll is the first to judge it on the 60s the profile has carried,
+        // past the 45s allowed.
         let stale = Ok(Some(Duration::from_secs(600)));
         let seeding = StateMap::new();
         loaded(&seeding, 1, "acct_a", TorrentPhase::Seeding);
-        let (health, exported) =
-            poll_acct_a_health(seeding, MAX, addr_unavailable(stale), 8, false).await;
+        let (health, exported) = poll_acct_a_health(
+            seeding,
+            Duration::from_secs(45),
+            addr_unavailable(stale),
+            PROBE_FAILURES_TO_FENCE,
+            false,
+        )
+        .await;
         assert_eq!(health.status, ProfileStatus::VpnDown, "{exported}");
         assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
+        assert!(
+            exported.contains(
+                "torrentd_profile_vpn_fenced_total{profile_id=\"acct_a\",reason=\"probe_unavailable\"} 0"
+            ),
+            "{exported}"
+        );
         assert_eq!(
             health.tunnel_ip,
             ip(2),
@@ -3130,6 +3275,191 @@ mod tests {
         assert!(
             exported.contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"acct_a\"} 1"),
             "{exported}"
+        );
+    }
+
+    /// `PROBE_FAILURES_TO_FENCE` polls in a row on which a check the tunnel
+    /// needs cannot run — its address, its route, its handshake — fence the
+    /// profile `probe_unavailable`, keeping the address it was last seen
+    /// with; one poll short of that fences nothing, and a poll on which every
+    /// check ran starts the count over. The handshake counts only while the
+    /// profile has traffic to carry, the only time it is judged.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_cannot_run_n_times_fences() {
+        let fresh = Ok(Some(Duration::from_secs(5)));
+        let via = || Some(Ok(RouteProbe::ViaTunnel));
+        let seeding = || {
+            let s = StateMap::new();
+            loaded(&s, 1, "acct_a", TorrentPhase::Seeding);
+            s
+        };
+        let no_wg = || scripted(via(), Err(vpn::HandshakeProbeUnavailable::NoTool));
+        for (label, probe, state) in [
+            (
+                "address",
+                addr_unavailable(fresh),
+                StateMap::new as fn() -> StateMap,
+            ),
+            (
+                "route",
+                scripted(Some(Err(vpn::route::RouteProbeUnavailable::NoTool)), fresh),
+                StateMap::new,
+            ),
+            ("handshake", no_wg(), seeding),
+        ] {
+            let (status, exported) =
+                poll_acct_a(state(), MAX, probe.clone(), PROBE_FAILURES_TO_FENCE - 1).await;
+            assert_eq!(status, ProfileStatus::Active, "{label}: {exported}");
+            let (health, exported) =
+                poll_acct_a_health(state(), MAX, probe, PROBE_FAILURES_TO_FENCE, false).await;
+            assert_eq!(health.status, ProfileStatus::VpnDown, "{label}: {exported}");
+            assert!(
+                fenced_once_for(&exported, "probe_unavailable"),
+                "{label}: {exported}"
+            );
+            assert!(
+                exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 0"),
+                "{label}: {exported}"
+            );
+            assert_eq!(health.tunnel_ip, ip(2), "{label}");
+            assert_eq!(
+                health.fence_reason,
+                Some("probe_unavailable"),
+                "{label}: the profile reports the reason it was counted under"
+            );
+        }
+
+        // A handshake probe that cannot run on a profile with nothing to
+        // carry leaves no check off: its handshake is not judged.
+        let (status, exported) =
+            poll_acct_a(StateMap::new(), MAX, no_wg(), PROBE_FAILURES_TO_FENCE * 3).await;
+        assert_eq!(status, ProfileStatus::Active, "{exported}");
+
+        // Failing one poll short of the count, then answering, over and over.
+        let polls = Arc::new(atomic::AtomicU32::new(0));
+        let flaky: Prober = Arc::new(move |_iface: &str, is_wg: bool| {
+            let n = polls.fetch_add(1, atomic::Ordering::SeqCst);
+            if n % PROBE_FAILURES_TO_FENCE == PROBE_FAILURES_TO_FENCE - 1 {
+                scripted(via(), fresh)("wg-acct_a", is_wg)
+            } else {
+                addr_unavailable(fresh)("wg-acct_a", is_wg)
+            }
+        });
+        let (status, exported) =
+            poll_acct_a(StateMap::new(), MAX, flaky, PROBE_FAILURES_TO_FENCE * 3).await;
+        assert_eq!(status, ProfileStatus::Active, "{exported}");
+    }
+
+    /// Poll `done` between yields to the runtime until it holds, for up to
+    /// ten seconds of wall time: for a test whose paused clock cannot advance
+    /// on its own while a probe is blocked on the blocking pool.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out waiting until {what}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The profiles are probed at once: a profile whose `ip` hangs holds
+    /// back no other profile's verdict, and is read as unavailable once
+    /// `PROBE_TIMEOUT` has passed, which alone fences nothing. Its WireGuard
+    /// probes are logged as timed out, not as a `wg` that could not be run.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_probe_holds_back_no_other_profile() {
+        use crate::profile_registry::test_entry;
+
+        let log = crate::tracing_init::Buf::default();
+        let (_reload, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let (release, hang) = std::sync::mpsc::channel::<()>();
+        let hang = Arc::new(std::sync::Mutex::new(hang));
+        let probe: Prober = Arc::new(move |iface: &str, is_wg: bool| {
+            let hung = iface == "wg-acct_a";
+            if hung {
+                // Until the test drops `release`.
+                let _ = hang.lock().unwrap().recv();
+            }
+            TunnelProbes {
+                ip: Ok(ip(2)),
+                route: Some(Ok(if hung {
+                    RouteProbe::ViaTunnel
+                } else {
+                    RouteProbe::Elsewhere("leaves by eth0".into())
+                })),
+                handshake: is_wg.then_some(Ok(Some(Duration::from_secs(5)))),
+            }
+        });
+        // acct_a first, as the registry iterates them.
+        let profiles = Arc::new(ProfileRegistry::new(vec![
+            test_entry("acct_a", ProfileStatus::Active),
+            test_entry("acct_b", ProfileStatus::Active),
+        ]));
+        let metrics = Arc::new(PromSink::new());
+        let stop = FencingStop::new();
+        let task = tokio::spawn(run_with(
+            profiles.clone(),
+            Arc::new(StateMap::new()),
+            metrics.clone(),
+            MAX,
+            stop.subscribe(),
+            probe,
+            no_counters(),
+        ));
+        let mut entries = profiles.iter();
+        let (a, b) = (entries.next().unwrap(), entries.next().unwrap());
+        assert_eq!((a.id().as_str(), b.id().as_str()), ("acct_a", "acct_b"));
+        let a_unavailable = || {
+            String::from_utf8(metrics.render())
+                .unwrap()
+                .contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"acct_a\"} 0")
+        };
+
+        // To just past the first poll. The clock is moved by hand from here:
+        // while acct_a's probe is blocked it does not move on its own.
+        tokio::time::sleep(POLL_INTERVAL - Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        until("acct_b is fenced", || {
+            b.health().status == ProfileStatus::VpnDown
+        })
+        .await;
+        assert_eq!(a.health().status, ProfileStatus::Active);
+        assert!(!a_unavailable(), "acct_a's probe is still running");
+
+        tokio::time::advance(PROBE_TIMEOUT).await;
+        until("acct_a's probes read as unavailable", a_unavailable).await;
+        assert_eq!(
+            a.health().status,
+            ProfileStatus::Active,
+            "one poll whose probes did not return fences nothing"
+        );
+
+        drop(release);
+        assert!(stop.stop(Duration::from_secs(5)).await);
+        task.await.unwrap();
+        drop(guard);
+        let log = log.text();
+        let wg_warns: Vec<&str> = log
+            .lines()
+            .filter(|l| {
+                l.contains("acct_a") && l.contains("wireguard") && l.contains("unavailable")
+            })
+            .collect();
+        assert!(
+            wg_warns.iter().any(|l| l.contains("handshake"))
+                && wg_warns.iter().any(|l| l.contains("transfer")),
+            "the handshake and transfer probes: {log}"
+        );
+        assert!(
+            wg_warns
+                .iter()
+                .all(|l| l.contains("\"reason\":\"timed_out\"")),
+            "a timeout, not a missing tool: {log}"
         );
     }
 
@@ -3390,6 +3720,29 @@ mod tests {
             .chain([KILL_SWITCH_FENCE_REASON])
             .collect();
         assert_eq!(listed, &written[..]);
+        // `GET /v1/profiles` reports the same reasons as `fence_reason`, and
+        // its published schema names each of them.
+        let doc: serde_json::Value =
+            serde_json::from_str(&crate::http::document_json().expect("the document"))
+                .expect("json");
+        let described = doc["components"]["schemas"]["Profile"]["properties"]["fence_reason"]
+            ["description"]
+            .as_str()
+            .expect("fence_reason is documented");
+        for reason in &written {
+            assert!(
+                described.contains(&format!("`{reason}`")),
+                "{reason}: {described}"
+            );
+        }
+        // The count the catalogue, and so `deploy/metrics.md`, states.
+        for name in ["profile_vpn_fenced_total", "kill_switch_probe_errors_total"] {
+            let help = crate::metrics_sink::catalogued(name).expect(name).help;
+            assert!(
+                help.contains(&format!(" {PROBE_FAILURES_TO_FENCE} ")),
+                "{name}: {help}"
+            );
+        }
     }
 
     /// The profile the baseline block used to miss, for exactly the metric it
@@ -3685,7 +4038,15 @@ mod tests {
         loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
         let held = engine.hold_next("pause_torrent");
         std::thread::scope(|s| {
-            let fencing = s.spawn(|| fence(&entry, &state, ip(9), &PromSink::new()));
+            let fencing = s.spawn(|| {
+                fence(
+                    &entry,
+                    &state,
+                    ip(9),
+                    DownReason::IpLostOrChanged,
+                    &PromSink::new(),
+                )
+            });
             held.wait_entered();
             let mid_walk = entry.health().status;
             // Released before asserting, so a failure fails rather than hangs.
@@ -4267,7 +4628,13 @@ mod tests {
         let (fence, _engine) = kill_switch_fence(ProfileStatus::Active, true);
         let entry = fence.profiles.iter().next().unwrap();
         entry.note_running(handle(2), true);
-        super::fence(entry, &fence.state, ip(2), fence.metrics.as_ref());
+        super::fence(
+            entry,
+            &fence.state,
+            ip(2),
+            DownReason::IpLostOrChanged,
+            fence.metrics.as_ref(),
+        );
         assert_eq!(online_running(&fence), [1], "the state map's word stands");
     }
 
@@ -4420,13 +4787,60 @@ mod tests {
     /// `profile_vpn_fenced_total{reason="kill_switch"}` as the fence's sink
     /// exports it for `acct_a`; `None` while it has no sample.
     fn kill_switch_fenced(fence: &KillSwitchFence) -> Option<f64> {
+        fenced_for(fence, KILL_SWITCH_FENCE_REASON)
+    }
+
+    /// `profile_vpn_fenced_total{reason}` as the fence's sink exports it for
+    /// `acct_a`; `None` while it has no sample.
+    fn fenced_for(fence: &KillSwitchFence, reason: &str) -> Option<f64> {
         let exported = String::from_utf8(fence.metrics.render()).expect("utf-8");
+        let prefix = format!(
+            "torrentd_profile_vpn_fenced_total{{profile_id=\"acct_a\",reason=\"{reason}\"}} "
+        );
         exported.lines().find_map(|l| {
-            l.strip_prefix(
-                "torrentd_profile_vpn_fenced_total{profile_id=\"acct_a\",reason=\"kill_switch\"} ",
-            )
-            .map(|v| v.parse().expect("a number"))
+            l.strip_prefix(prefix.as_str())
+                .map(|v| v.parse().expect("a number"))
         })
+    }
+
+    /// A kill switch that could not be checked fences through the same
+    /// `KillSwitchFence` as one found not in force, but under its own reason:
+    /// `profile_vpn_fenced_total` counts it `probe_unavailable`, not
+    /// `kill_switch`, and the profile reports that reason.
+    #[tokio::test(start_paused = true)]
+    async fn an_unverifiable_kill_switch_fences_for_probe_unavailable() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
+        fence.fence_all_for(vpn::killswitch::FenceCause::Unverifiable);
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        assert_eq!(
+            pauses(&engine).len(),
+            2,
+            "every torrent, as for kill_switch"
+        );
+        assert_eq!(
+            fenced_for(&fence, DownReason::ProbeUnavailable.as_str()),
+            Some(1.0)
+        );
+        assert_eq!(
+            kill_switch_fenced(&fence).unwrap_or(0.0),
+            0.0,
+            "not counted as a kill switch found not in force"
+        );
+        let health = fence.profiles.iter().next().unwrap().health();
+        assert_eq!(health.fence_reason, Some("probe_unavailable"));
+
+        fence.lift();
+        settle(&fence).await;
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        fence.fence_all();
+        let health = fence.profiles.iter().next().unwrap().health();
+        assert_eq!(
+            health.fence_reason,
+            Some(KILL_SWITCH_FENCE_REASON),
+            "each fence records its own reason"
+        );
+        assert_eq!(kill_switch_fenced(&fence), Some(1.0));
     }
 
     /// The kill switch's fence is the monitor's: the profile is marked
@@ -4971,7 +5385,13 @@ mod tests {
                 let resolved = fence.profiles.resolve(&ProfileId::new("acct_a"));
                 let entry = resolved.active().expect("the profile");
                 entry.update_health(|h| h.status = ProfileStatus::Active);
-                super::fence(entry, &fence.state, None, fence.metrics.as_ref());
+                super::fence(
+                    entry,
+                    &fence.state,
+                    None,
+                    DownReason::IpLostOrChanged,
+                    fence.metrics.as_ref(),
+                );
                 healthy(iface, wg)
             }
         });
