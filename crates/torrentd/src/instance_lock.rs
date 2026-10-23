@@ -78,6 +78,7 @@ impl InstanceLock {
             .and_then(|()| writeln!(file, "{}", std::process::id()));
         if let Err(e) = record {
             warn!(
+                target: "torrentd::startup",
                 path = %path.display(),
                 error.cause = %e,
                 "could not record this process's pid in the single-instance lock; the lock \

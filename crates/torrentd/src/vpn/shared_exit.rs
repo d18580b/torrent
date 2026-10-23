@@ -24,6 +24,7 @@ pub fn warn_if_exits_are_shared(profiles: &[ProfileConfig]) {
             .collect::<Vec<_>>()
             .join(", ");
         warn!(
+            target: "torrentd::startup",
             vpn_endpoint = %shared.host,
             profiles = %profiles,
             "these profiles' WireGuard configs name the same Endpoint, so their accounts \

@@ -375,6 +375,7 @@ impl PoolService {
             Ok(cleared) => {
                 for (infohash, index_profile) in &cleared {
                     warn!(
+                        target: "torrentd::startup",
                         infohash = %infohash,
                         index_profile = %index_profile,
                         "the pool index named an owner for this torrent that no registry \
@@ -385,6 +386,7 @@ impl PoolService {
                 }
                 if !cleared.is_empty() {
                     info!(
+                        target: "torrentd::startup",
                         cleared = cleared.len(),
                         "cleared pool index owner records nothing backs",
                     );
@@ -396,6 +398,7 @@ impl PoolService {
             Ok(rewritten) => {
                 for (infohash, registry_profile, index_profile) in &rewritten {
                     warn!(
+                        target: "torrentd::startup",
                         infohash = %infohash,
                         registry_profile = %registry_profile,
                         index_profile = %index_profile,
@@ -430,6 +433,7 @@ impl PoolService {
         });
         for (infohash, registry_profile, index_profile) in &stale {
             warn!(
+                target: "torrentd::startup",
                 infohash = %infohash,
                 registry_profile = %registry_profile,
                 index_profile = %index_profile,
