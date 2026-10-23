@@ -1187,6 +1187,51 @@ mod tests {
     }
 
     #[test]
+    fn a_change_is_remembered_only_when_the_visible_screen_is_not_loading() {
+        // Each tab's own busy() decides, through the load flag it reads.
+        type SetLoading = fn(&mut Model, bool);
+        let tabs: [(Tab, SetLoading); 3] = [
+            (Tab::Dashboard, |m, on| m.dashboard.loading = on),
+            (Tab::Profiles, |m, on| m.profiles.loading = on),
+            (Tab::Pool, |m, on| m.pool.overview.loading = on),
+        ];
+        for (tab, set_loading) in tabs {
+            let mut m = signed_in(true);
+            m.tab = tab;
+            update(&mut m, Msg::LiveChanged(Live::Streaming));
+            // Every screen idle but the one shown, so only its gate decides.
+            m.dashboard.loading = false;
+            m.profiles.loading = false;
+            m.pool.overview.loading = false;
+            let tick = || Msg::Changed("00000000000000aa".to_owned());
+
+            set_loading(&mut m, true);
+            update(&mut m, tick());
+            assert_eq!(
+                m.fingerprint, None,
+                "{tab:?}: a change skipped mid-load is not remembered"
+            );
+
+            set_loading(&mut m, false);
+            assert!(
+                !update(&mut m, tick()).is_empty(),
+                "{tab:?}: its re-send refreshes the screen"
+            );
+            assert_eq!(
+                m.fingerprint.as_deref(),
+                Some("00000000000000aa"),
+                "{tab:?}: a change refreshed in full is remembered"
+            );
+
+            set_loading(&mut m, false);
+            assert!(
+                update(&mut m, tick()).is_empty(),
+                "{tab:?}: once remembered, a re-send fetches nothing"
+            );
+        }
+    }
+
+    #[test]
     fn a_change_whose_refresh_fails_is_retried_on_its_re_send() {
         let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut m = signed_in_as(model_at(&daemon), false);
