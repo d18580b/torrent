@@ -1086,11 +1086,28 @@ fn list_table_json(name: &str) -> io::Result<String> {
 /// reachable by a test with no sessions.
 pub(crate) trait Fence: Send + Sync {
     /// Fence every vpn profile that is not fenced already, as the VPN monitor
-    /// fences one whose tunnel is down.
-    fn fence_all(&self);
+    /// fences one whose tunnel is down, because the table was found gone or
+    /// changed ([`FenceCause::NotInForce`]).
+    fn fence_all(&self) {
+        self.fence_all_for(FenceCause::NotInForce);
+    }
+    /// [`Fence::fence_all`], for `cause`.
+    fn fence_all_for(&self, cause: FenceCause);
     /// Lift what [`Fence::fence_all`] fenced: called only once the ruleset
     /// has been verified intact again.
     fn lift(&self);
+}
+
+/// Why [`watch`] fences every vpn profile: what the fence's
+/// `profile_vpn_fenced_total` reason says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FenceCause {
+    /// A check found the table gone, or not as installed.
+    NotInForce,
+    /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
+    /// checks in a row could not run, so nothing has said for that long that
+    /// the table is in force.
+    Unverifiable,
 }
 
 /// How often [`watch`] checks the table is still installed.
@@ -1102,9 +1119,18 @@ enum Watch {
     /// The last check found the table as installed.
     #[default]
     Intact,
+    /// The last this many checks could not run, fewer than
+    /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE),
+    /// and nothing is fenced for them.
+    Unchecked(u32),
     /// A check found it gone or changed: every vpn profile was fenced, and the
     /// one reinstall this loss gets was tried and did not check intact.
     Lost,
+    /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
+    /// checks in a row could not run: every vpn profile was fenced
+    /// ([`FenceCause::Unverifiable`]), and stays so until a check finds the
+    /// table intact.
+    Unverified,
 }
 
 /// Check, for as long as the daemon runs, that the kill switch this boot
@@ -1123,8 +1149,12 @@ enum Watch {
 /// lifts the fence. While it is not intact the check repeats each interval,
 /// fencing again any profile set online meanwhile; a later check that finds it
 /// intact — restored by the operator — lifts the fence then. A check that
-/// cannot run counts in `kill_switch_probe_errors_total` and changes nothing,
-/// since not knowing is not the same as absent.
+/// cannot run counts in `kill_switch_probe_errors_total` and, alone, changes
+/// nothing, since not knowing is not the same as absent; but
+/// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
+/// in a row fence every vpn profile (`probe_unavailable`), since an `nft` that
+/// stays missing or stalled left every profile seeding with no check in force,
+/// and the fence comes off at the first check that finds the table intact.
 ///
 /// Before each check, each tunnel's addresses and transport are read off its
 /// link again ([`refresh`]), and a change installs the ruleset again with the
@@ -1239,8 +1269,8 @@ struct Gated<'a> {
 }
 
 impl Fence for Gated<'_> {
-    fn fence_all(&self) {
-        self.gate.run(|| self.fence.fence_all());
+    fn fence_all_for(&self, cause: FenceCause) {
+        self.gate.run(|| self.fence.fence_all_for(cause));
     }
     fn lift(&self) {
         self.gate.run(|| self.fence.lift());
@@ -1354,13 +1384,20 @@ fn refresh(
 /// and reinstall on a loss, lift on a verified recovery. Returns where it
 /// leaves the watch.
 ///
-/// Each loss found from [`Watch::Intact`] counts once in
+/// Each loss found from any state but [`Watch::Lost`] counts once in
 /// `kill_switch_lost_total`, by whether the one reinstall checked intact
 /// (`reinstalled`) or not (`lost`). The whole loss, fence and reinstall
 /// included, happens within this one call, so `kill_switch_table_present` is
 /// back at 1 before any scrape can read the 0: the counter is the only trace a
 /// loss the reinstall repaired leaves. The checks that repeat while the watch
 /// is [`Watch::Lost`] are the same loss, and are not counted again.
+///
+/// A check that cannot run fences nothing until it is the
+/// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)th
+/// in a row, which fences every vpn profile
+/// ([`FenceCause::Unverifiable`]); each later one fences again any profile set
+/// online meanwhile. One that cannot run while the watch is [`Watch::Lost`]
+/// leaves it so: every profile is fenced already, for the loss.
 fn tick(
     state: Watch,
     verify: impl Fn() -> io::Result<Verdict>,
@@ -1371,9 +1408,10 @@ fn tick(
     let why = match verify() {
         Ok(Verdict::Intact) => {
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
-            if state != Watch::Intact {
+            if matches!(state, Watch::Lost | Watch::Unverified) {
                 tracing::warn!(
                     target: "torrentd::vpn::killswitch",
+                    state = ?state,
                     "the network kill switch is in force as installed again; lifting the fence \
                      it put on the vpn profiles",
                 );
@@ -1391,7 +1429,7 @@ fn tick(
                 error.cause = %e,
                 "could not check the network kill switch is still installed",
             );
-            return state;
+            return unchecked(state, fence);
         }
     };
     metrics.set_gauge("kill_switch_table_present", 0.0, &[]);
@@ -1435,12 +1473,38 @@ fn tick(
             Watch::Lost
         }
     };
-    let outcome = match next {
-        Watch::Intact => "reinstalled",
-        Watch::Lost => "lost",
+    let outcome = if next == Watch::Intact {
+        "reinstalled"
+    } else {
+        "lost"
     };
     metrics.inc_counter("kill_switch_lost_total", &[("outcome", outcome)]);
     next
+}
+
+/// Where a check that could not run leaves the watch, from `state`: see
+/// [`tick`].
+fn unchecked(state: Watch, fence: &dyn Fence) -> Watch {
+    let failures = match state {
+        Watch::Lost => return Watch::Lost,
+        Watch::Intact => 1,
+        Watch::Unchecked(n) => n.saturating_add(1),
+        Watch::Unverified => crate::vpn_monitor::PROBE_FAILURES_TO_FENCE,
+    };
+    if failures < crate::vpn_monitor::PROBE_FAILURES_TO_FENCE {
+        return Watch::Unchecked(failures);
+    }
+    if state != Watch::Unverified {
+        tracing::error!(
+            target: "torrentd::vpn::killswitch",
+            failures,
+            "the network kill switch could not be checked this many times in a row, so \
+             nothing says the daemon's egress is still confined to the tunnels; fencing \
+             every vpn profile until a check finds it in force",
+        );
+    }
+    fence.fence_all_for(FenceCause::Unverifiable);
+    Watch::Unverified
 }
 
 /// Whether `nft list tables` output names the `inet` table `name`. Each line
@@ -2907,8 +2971,11 @@ table inet torrentd_ks_998 {
     struct Recorded(std::sync::Mutex<Vec<&'static str>>);
 
     impl Fence for Recorded {
-        fn fence_all(&self) {
-            self.0.lock().unwrap().push("fence");
+        fn fence_all_for(&self, cause: FenceCause) {
+            self.0.lock().unwrap().push(match cause {
+                FenceCause::NotInForce => "fence",
+                FenceCause::Unverifiable => "fence unverifiable",
+            });
         }
         fn lift(&self) {
             self.0.lock().unwrap().push("lift");
@@ -3159,23 +3226,117 @@ table inet torrentd_ks_998 {
         }
     }
 
+    fn cannot_run() -> io::Result<Verdict> {
+        Err(io::Error::other("nft: permission denied"))
+    }
+
+    /// One check that cannot run is counted and fences nothing: not knowing
+    /// is not absent. While the watch is lost, every profile is fenced
+    /// already, and it stays lost.
     #[test]
     fn a_check_that_cannot_run_is_counted_and_changes_nothing() {
-        for state in [Watch::Intact, Watch::Lost] {
+        for (state, after) in [
+            (Watch::Intact, Watch::Unchecked(1)),
+            (Watch::Lost, Watch::Lost),
+        ] {
             let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
             let next = tick(
                 state,
-                verdicts(vec![Err(io::Error::other("nft: permission denied"))]),
+                verdicts(vec![cannot_run()]),
                 || panic!("nothing is reinstalled on a check that did not run"),
                 &fence,
                 &metrics,
             );
-            assert_eq!(next, state);
+            assert_eq!(next, after);
             assert_eq!(gauge(&metrics), None, "not knowing is not absent");
             assert_eq!(fence.take(), Vec::<&str>::new());
             assert_eq!(metrics.count_for("kill_switch_probe_errors_total"), 1);
             assert_eq!(metrics.count_for("kill_switch_lost_total"), 0);
         }
+    }
+
+    /// `PROBE_FAILURES_TO_FENCE` checks in a row that cannot run fence every
+    /// vpn profile `probe_unavailable`; every later one fences again, and the
+    /// first that finds the table intact lifts it. A check that reaches a
+    /// verdict between them starts the count over.
+    #[test]
+    fn a_check_that_cannot_run_n_times_fences() {
+        use crate::vpn_monitor::PROBE_FAILURES_TO_FENCE;
+        let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+        let no_reinstall = || panic!("nothing is reinstalled on a check that did not run");
+        let mut state = Watch::Intact;
+        for _ in 1..PROBE_FAILURES_TO_FENCE {
+            state = tick(state, cannot_run, no_reinstall, &fence, &metrics);
+        }
+        assert_eq!(fence.take(), Vec::<&str>::new(), "one short of the count");
+        // A verdict between them starts the count over.
+        state = tick(
+            state,
+            || Ok(Verdict::Intact),
+            no_reinstall,
+            &fence,
+            &metrics,
+        );
+        assert_eq!(state, Watch::Intact);
+        assert_eq!(fence.take(), Vec::<&str>::new(), "nothing fenced to lift");
+        for _ in 1..PROBE_FAILURES_TO_FENCE {
+            state = tick(state, cannot_run, no_reinstall, &fence, &metrics);
+        }
+        assert_eq!(fence.take(), Vec::<&str>::new());
+
+        state = tick(state, cannot_run, no_reinstall, &fence, &metrics);
+        assert_eq!(state, Watch::Unverified);
+        assert_eq!(fence.take(), ["fence unverifiable"]);
+        assert_eq!(
+            gauge(&metrics),
+            Some(1.0),
+            "not knowing is still not absent"
+        );
+        assert_eq!(metrics.count_for("kill_switch_lost_total"), 0);
+
+        state = tick(state, cannot_run, no_reinstall, &fence, &metrics);
+        assert_eq!(state, Watch::Unverified);
+        assert_eq!(
+            fence.take(),
+            ["fence unverifiable"],
+            "fenced again, for a profile set online meanwhile"
+        );
+
+        state = tick(
+            state,
+            || Ok(Verdict::Intact),
+            no_reinstall,
+            &fence,
+            &metrics,
+        );
+        assert_eq!(state, Watch::Intact);
+        assert_eq!(fence.take(), ["lift"]);
+        assert_eq!(
+            metrics.count_for("kill_switch_probe_errors_total"),
+            u64::from(PROBE_FAILURES_TO_FENCE) * 2,
+        );
+    }
+
+    /// A table found gone while the watch is fenced for checks that could not
+    /// run is a loss like any other: fenced, reinstalled once, counted once.
+    #[test]
+    fn a_loss_found_after_unverified_checks_gets_its_reinstall() {
+        let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+        let reinstalled = std::cell::Cell::new(0);
+        let next = tick(
+            Watch::Unverified,
+            verdicts(vec![Ok(Verdict::Absent), Ok(Verdict::Intact)]),
+            || {
+                reinstalled.set(reinstalled.get() + 1);
+                Ok(())
+            },
+            &fence,
+            &metrics,
+        );
+        assert_eq!(next, Watch::Intact);
+        assert_eq!(fence.take(), ["fence", "lift"]);
+        assert_eq!(reinstalled.get(), 1);
+        assert_eq!(lost_for(&metrics, "reinstalled"), 1);
     }
 
     /// `verify` against a real `nft`: intact as installed, drift once the
