@@ -583,6 +583,29 @@ mod tests {
         assert!(indexed(&store, root, "locked/deep/c.bin"));
     }
 
+    /// Issue #440: the unseen subtree is named as it is on disk. Rewritten
+    /// to `x/y`, an unlistable `x\y` kept none of its rows and kept those of
+    /// the real `x/y` instead, though that one was walked.
+    #[test]
+    fn an_unlistable_subdirectory_named_with_a_backslash_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "x\\y/b.bin");
+        write(root, "x/y/c.bin");
+        let mut store = PoolStore::open_in_memory().unwrap();
+        scan_root(&mut store, root).unwrap();
+        assert_eq!(store.file_count().unwrap(), 2);
+
+        std::fs::remove_file(root.join("x/y/c.bin")).unwrap();
+        with_unlistable(&root.join("x\\y"), || {
+            let stats = scan_root(&mut store, root).unwrap();
+            assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+            assert!(indexed(&store, root, "x\\y/b.bin"), "kept");
+            assert!(!indexed(&store, root, "x/y/c.bin"), "walked, so dropped");
+            assert_eq!(store.file_count().unwrap(), 1);
+        });
+    }
+
     /// A file the walk lists but cannot stat (EIO, or here a directory
     /// readable but not searchable) was counted and then dropped by the
     /// swap, so the torrent over it read `missing`.
