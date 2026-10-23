@@ -1129,14 +1129,21 @@ The daemon sets none of these itself.
   listen failure, so it neither stops a single-profile daemon nor raises
   `listen_failure_active`; a counter that keeps rising means the limit is too
   low for the load. Any other accept error stops that listener and is a
-  listen failure. An API that runs out of descriptors accepting a connection cuts off
-  its open requests and serves again on the same socket after a backoff of
-  1 s doubling to 30 s, logging each time; the daemon does not restart. The
+  listen failure. An API that runs out of descriptors accepting a connection
+  keeps listening too: its open requests carry on, and it accepts again after
+  10 ms, doubling to 1 s on TCP and to 30 s on a unix socket, logging a
+  warning each time. The daemon does not restart. The
   HTTP API draws on the same table and holds at most 256 connections; the
   next waits in the listen backlog. An HTTP/2 connection carries at most 16
-  requests at once. It closes an HTTP/1 connection whose
-  request head takes more than 10 seconds, closes an HTTP/2 connection that
-  stops answering pings for 30 seconds, and answers `408` to a request whose
+  requests at once. It closes a connection that has not sent a whole
+  request head within 10 seconds of being accepted, whatever protocol it
+  speaks — one that sends no byte at all, or stops partway through the HTTP/2
+  preface, included — and an HTTP/1 connection whose later request head takes
+  more than 10 seconds. It closes an HTTP/2 connection that stops answering
+  pings for 30 seconds, and sends `GOAWAY` to and closes one that has held no
+  request in flight for 30 seconds however promptly it answers them; a
+  `/v1/events` stream is a request in flight for as long as it runs. It
+  answers `408` to a request whose
   body has not arrived and been answered within 30 seconds (300 for
   `POST /v1/torrents`). Adopting, creating a plan and applying one may run
   for minutes, so for them the 30 seconds bound only the body's arrival,
@@ -1152,16 +1159,15 @@ The daemon sets none of these itself.
   held in memory as it arrives, up to the operation's limit — 64 KiB, or
   96 MiB for `POST /v1/torrents` — so with `[auth]` configured only a
   credential holder can make the daemon spend that. Without `[auth]`, any
-  same-site caller is admitted as anonymous and can. **Two idle cases are not bounded:** a connection that
-  sends no byte at all (or stops partway through the HTTP/2 preface), and an
-  HTTP/2 connection that answers pings but sends no request. 256 such
-  sockets hold every API connection, and `/healthz` and `/metrics` stop
-  answering until they close. The default loopback bind keeps them out of reach of
-  anyone who cannot already run code on the host; a non-loopback
-  `http_listen` belongs behind the proxy of §6 with its own client idle
-  timeouts (nginx `client_header_timeout`, Caddy `timeouts.read_header` and
-  `timeouts.idle`, as `deploy/Caddyfile` sets them), which close such a
-  connection before it reaches the daemon. The proxy needs no body timeout
+  same-site caller is admitted as anonymous and can. Every idle connection is
+  bounded, but a caller that opens 256 connections, sends nothing on them, and
+  opens another as each is closed holds every API connection, and `/healthz`
+  and `/metrics` stop answering while it does. The default loopback bind leaves
+  that to callers who can already run code on the host; a
+  non-loopback `http_listen` belongs behind the proxy of §6 with its own
+  client idle timeouts (nginx `client_header_timeout`, Caddy
+  `timeouts.read_header` and `timeouts.idle`, as `deploy/Caddyfile` sets
+  them), which keep such connections from reaching the daemon. The proxy needs no body timeout
   of its own, since the daemon bounds every body; `deploy/Caddyfile` says
   why it sets none, and caps a body at the daemon's own 96 MiB.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound

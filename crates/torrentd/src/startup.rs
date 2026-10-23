@@ -72,6 +72,10 @@ const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsiz
 /// How long an HTTP/1 client has to send a request head, including the wait
 /// for the next request on a kept-alive connection.
 ///
+/// kynos counts a connection's first head from accept, whatever protocol it
+/// turns out to speak: a connection that sends no byte, or stops partway
+/// through the HTTP/2 preface, is closed at this bound too.
+///
 /// A head is a few hundred bytes. kynos' default of 30 s lets a client that
 /// never finishes one hold a connection — one of [`HTTP_MAX_CONNECTIONS`] —
 /// three times as long for no reason; the body's own deadline is
@@ -88,14 +92,21 @@ const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 16;
 
 /// How often an HTTP/2 (h2c) connection is pinged, and how long the peer has
-/// to acknowledge, so a silent peer is dropped within 30 s. It does not bound
-/// a peer that answers pings and sends nothing else, nor a connection that
-/// sends no byte at all (`docs/running.md` §7).
+/// to acknowledge, so a silent peer is dropped within 30 s. A peer that
+/// answers pings and sends no request is [`HTTP2_IDLE_TIMEOUT`]'s.
 const HTTP2_KEEP_ALIVE: kynos::server::protocol::http2::Http2KeepAlive =
     kynos::server::protocol::http2::Http2KeepAlive::new(
         std::time::Duration::from_secs(20),
         std::time::Duration::from_secs(10),
     );
+
+/// How long an HTTP/2 (h2c) connection may hold no request in flight before
+/// it is sent a GOAWAY and closed, however promptly it answers pings.
+///
+/// kynos' default, stated here so the bound `docs/running.md` §7 documents
+/// is set where it can be read. A `/v1/events` stream is a request in flight
+/// for as long as it runs, so it is never cut off by this.
+const HTTP2_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long the HTTP server's graceful shutdown waits for open requests
 /// before cutting them off. A drain that runs out exits 0 with a warning
@@ -490,9 +501,8 @@ const DESCRIPTORS_PER_SESSION: u64 = 32;
 
 /// What the process holds whatever its configuration: stdio, the log and
 /// journal, `pool.db` with its WAL and shared-memory files and a reader, the
-/// API listener and its spare (`serve_until_shutdown`), the runtime's
-/// reactor, signal and timer descriptors, the instance lock, and the pipes
-/// of the `nft` and `ip` commands it runs.
+/// API listener, the runtime's reactor, signal and timer descriptors, the
+/// instance lock, and the pipes of the `nft` and `ip` commands it runs.
 const DESCRIPTORS_FOR_THE_PROCESS: u64 = 64;
 
 /// [`HTTP_MAX_CONNECTIONS`] as a descriptor count.
@@ -3519,21 +3529,17 @@ impl DaemonHandle {
         // `GET /v1/openapi.json` costs nothing per request and is byte-for-byte
         // what `torrentd openapi` prints. Neither step can fail short of a bug
         // in a route's description; if one does, the daemon exits 70 through
-        // the same teardown a bind failure takes. Built again from the same
-        // parts each time the server is restarted after running out of
-        // descriptors (`serve_until_shutdown`).
-        let openapi = http::document_json()
+        // the same teardown a bind failure takes.
+        let app = http::document_json()
             // `{e:#}`: an `anyhow::Error`, whose plain Display drops its cause.
             .map_err(|e| error!(error.cause = %format_args!("{e:#}"), "build the HTTP API"))
             .ok()
-            .map(|openapi| Arc::new(bytes::Bytes::from(openapi)));
-        let build_app = move || {
-            let openapi = openapi.clone()?;
-            http::service(app_state.clone(), http::OpenApiJson(openapi))
-                .map_err(|e| error!(error.cause = %e, "build the HTTP router"))
-                .ok()
-        };
-        let app = build_app().map(|app| (app, build_app));
+            .and_then(|openapi| {
+                let openapi = http::OpenApiJson(Arc::new(bytes::Bytes::from(openapi)));
+                http::service(app_state, openapi)
+                    .map_err(|e| error!(error.cause = %e, "build the HTTP router"))
+                    .ok()
+            });
         let http_listen = cfg.http_listen.clone();
 
         // SIGHUP pump.
@@ -3565,12 +3571,11 @@ impl DaemonHandle {
         let mut exit_code = run_http_stage(
             listener,
             app,
-            |listener, (app, build_app)| async move {
+            |listener, app| async move {
                 announce_ready(&http_listen, posture, tx, alert);
                 match listener {
-                    ApiListener::Tcp(listener, addr) => {
-                        serve_until_shutdown(listener, app, build_app, addr, tx, shutdown_rx, gate)
-                            .await
+                    ApiListener::Tcp(listener) => {
+                        serve_until_shutdown(listener, app, shutdown_rx, gate).await
                     }
                     ApiListener::Unix(socket) => {
                         let work = Arc::clone(gate);
@@ -3781,9 +3786,7 @@ where
 }
 
 /// Serve the API on a bound listener until a shutdown is signalled, returning
-/// the exit code the server's own outcome implies. A server that stops
-/// because the process ran out of descriptors is started again on the same
-/// socket, with `build_app`'s router, after a backoff.
+/// the exit code the server's own outcome implies.
 ///
 /// Split out of `run_until_signal` so that function has no early return
 /// between `boot`'s `disarm` and its teardown: a failure to bind skips this
@@ -3791,9 +3794,6 @@ where
 async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
     app: kynos::router::service::Service<http::ctx::AppCtx>,
-    build_app: impl Fn() -> Option<kynos::router::service::Service<http::ctx::AppCtx>>,
-    http_listen: std::net::SocketAddr,
-    shutdown_tx: &broadcast::Sender<ShutdownReason>,
     shutdown_rx: broadcast::Receiver<ShutdownReason>,
     work: &Arc<crate::app_state::WorkGate>,
 ) -> i32 {
@@ -3806,29 +3806,20 @@ async fn serve_until_shutdown(
     // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
     // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
     //
-    // kynos gives up on a listener after five consecutive accept failures
-    // inside about 150 ms, `EMFILE` and `ENFILE` included, and drops it. A
-    // daemon briefly out of descriptors is not one to restart — the restart
-    // tears down every tunnel and session to fix what a closing peer socket
-    // fixes — so a second descriptor on the socket keeps it bound, and the
-    // server is started again on it after a backoff (`descriptor_exhaustion`).
-    serve_through_exhaustion(
-        listener,
-        app,
-        build_app,
-        |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned(),
-        |listener, app, server_shutdown| serve_once(listener, app, server_shutdown, work),
-        http_listen,
-        shutdown_tx,
-        shutdown_rx,
-    )
-    .await
+    // Running out of descriptors (`EMFILE`, `ENFILE`) in `accept` does not
+    // end the server: kynos waits 10 ms, doubling to 1 s, and accepts again,
+    // logging each failure, while the connections it holds carry on. A daemon
+    // briefly out of descriptors is not one to restart — the restart tears
+    // down every tunnel and session to fix what a closing peer socket fixes —
+    // and kynos' own retry is what spares it that
+    // (`http_bounds_tests::running_out_of_descriptors_in_accept_does_not_stop_the_server`).
+    http_exit_code(serve_once(listener, app, shutdown_rx, work).await)
 }
 
 /// The API's bound listener: a TCP socket, or a unix one.
 #[derive(Debug)]
 enum ApiListener {
-    Tcp(tokio::net::TcpListener, std::net::SocketAddr),
+    Tcp(tokio::net::TcpListener),
     Unix(crate::api_socket::ApiSocket),
 }
 
@@ -3836,7 +3827,7 @@ enum ApiListener {
 async fn bind_api_listener(cfg: &Config) -> Option<ApiListener> {
     match &cfg.http_listen {
         crate::config::HttpListen::Tcp(addr) => match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => Some(ApiListener::Tcp(l, *addr)),
+            Ok(l) => Some(ApiListener::Tcp(l)),
             Err(e) => {
                 error!(addr = %addr, error.cause = %e, "bind HTTP listener");
                 None
@@ -3916,138 +3907,6 @@ fn announce_ready(
     }
 }
 
-/// Run `serve` on `listener` until it stops for a reason other than running
-/// out of descriptors, starting it again on a second descriptor of the same
-/// socket after each that is, and return the exit code of the last run.
-///
-/// Returns 0 without serving again on a shutdown signalled before a run or
-/// during a backoff.
-///
-/// `hold` duplicates a descriptor (`BorrowedFd::try_clone_to_owned` in the
-/// daemon; a stand-in in tests). The second descriptor for a run is held
-/// before it starts: the first from the bound listener, every later one from
-/// the spare the next run is served on, during the backoff. A duplicate that
-/// fails because descriptors are still short (`EMFILE`, `ENFILE`) waits
-/// another backoff and is tried again, so exhaustion alone never has the API
-/// served again without a spare. One that fails for any other reason is not
-/// retried: the API is served again with no spare, as a warning says, and the
-/// next exhaustion in `accept` ends the server and the daemon with it.
-#[allow(clippy::too_many_arguments)]
-async fn serve_through_exhaustion<A, B, H, S, F>(
-    mut listener: tokio::net::TcpListener,
-    mut app: A,
-    build_app: B,
-    mut hold: H,
-    mut serve: S,
-    http_listen: std::net::SocketAddr,
-    shutdown_tx: &broadcast::Sender<ShutdownReason>,
-    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
-) -> i32
-where
-    B: Fn() -> Option<A>,
-    H: FnMut(std::os::fd::BorrowedFd<'_>) -> std::io::Result<std::os::fd::OwnedFd>,
-    S: FnMut(tokio::net::TcpListener, A, broadcast::Receiver<ShutdownReason>) -> F,
-    F: std::future::Future<Output = kynos::Result<()>>,
-{
-    let mut backoff = ACCEPT_EXHAUSTION_BACKOFF_INITIAL;
-    let mut spare = match hold(std::os::fd::AsFd::as_fd(&listener)) {
-        Ok(fd) => Some(fd),
-        Err(e) => {
-            warn!(
-                error.cause = %e,
-                "could not hold a second descriptor on the HTTP listener; \
-                 running out of descriptors in accept will stop the daemon",
-            );
-            None
-        }
-    };
-    loop {
-        // Subscribed before the check, so a signal is either already in
-        // `shutdown_rx` or reaches the server's own receiver.
-        let server_shutdown = shutdown_tx.subscribe();
-        if shutdown_requested(&mut shutdown_rx) {
-            return 0;
-        }
-        let started = tokio::time::Instant::now();
-        let outcome = serve(listener, app, server_shutdown).await;
-        let Some((cause, held)) = descriptor_exhaustion(&outcome).zip(spare.take()) else {
-            return http_exit_code(outcome);
-        };
-        if started.elapsed() > ACCEPT_EXHAUSTION_BACKOFF_MAX {
-            backoff = ACCEPT_EXHAUSTION_BACKOFF_INITIAL;
-        }
-        warn!(
-            addr = %http_listen,
-            error.cause = %cause,
-            retry_in_secs = backoff.as_secs(),
-            "the HTTP server ran out of descriptors accepting a connection and \
-             cut off its open requests; serving again after a backoff",
-        );
-        // `held` is the socket the next run serves on; it is not served on
-        // until a second descriptor of it is held for the run after that.
-        loop {
-            sd_notify::status(&format!(
-                "seeding; API on {http_listen} out of descriptors, serving again in {}s",
-                backoff.as_secs()
-            ));
-            tokio::select! {
-                _ = shutdown_rx.recv() => return 0,
-                () = tokio::time::sleep(backoff) => {}
-            }
-            backoff = (backoff * 2).min(ACCEPT_EXHAUSTION_BACKOFF_MAX);
-            match hold(std::os::fd::AsFd::as_fd(&held)) {
-                Ok(fd) => {
-                    spare = Some(fd);
-                    break;
-                }
-                Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
-                    warn!(
-                        addr = %http_listen,
-                        error.cause = %e,
-                        retry_in_secs = backoff.as_secs(),
-                        "still out of descriptors holding a second one on the HTTP \
-                         listener; serving again after another backoff",
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        error.cause = %e,
-                        "could not hold a second descriptor on the HTTP listener; \
-                         running out of descriptors in accept will stop the daemon",
-                    );
-                    break;
-                }
-            }
-        }
-        let held = std::net::TcpListener::from(held);
-        listener = match held
-            .set_nonblocking(true)
-            .and_then(|()| tokio::net::TcpListener::from_std(held))
-        {
-            Ok(l) => l,
-            Err(e) => {
-                error!(error.cause = %e, "take the HTTP listener back");
-                return 70;
-            }
-        };
-        app = match build_app() {
-            Some(app) => app,
-            None => return 70,
-        };
-        info!(addr = %http_listen, "HTTP server listening again");
-        sd_notify::status(&format!("seeding; API on {http_listen}"));
-    }
-}
-
-/// The first backoff before the API is served again after running out of
-/// descriptors in `accept`, doubling per consecutive failure to
-/// [`ACCEPT_EXHAUSTION_BACKOFF_MAX`]. A server that ran longer than the cap
-/// before failing starts again from here.
-const ACCEPT_EXHAUSTION_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The longest backoff between two of those restarts.
-const ACCEPT_EXHAUSTION_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// One run of the HTTP server on `listener`, to a signalled drain or its own
 /// failure.
 async fn serve_once(
@@ -4091,6 +3950,7 @@ pub(crate) fn http_server(
         .http2(
             kynos::server::protocol::http2::Http2Config::default()
                 .keep_alive(Some(HTTP2_KEEP_ALIVE))
+                .idle_timeout(Some(HTTP2_IDLE_TIMEOUT))
                 .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS),
         )
         // Off, rather than kynos's 30 s per-frame default: every operation
@@ -4099,20 +3959,6 @@ pub(crate) fn http_server(
         // states them, and the server's own 408 would replace the operation's
         // response, request id and shared headers included.
         .request_body_idle_timeout(None)
-}
-
-/// The accept failure in `outcome` when it is the process or the system
-/// running out of descriptors (`EMFILE`, `ENFILE`): a shortage that passes
-/// as connections close, rather than a listener that is broken.
-fn descriptor_exhaustion(outcome: &kynos::Result<()>) -> Option<&std::io::Error> {
-    match outcome {
-        Err(kynos::Error::Server(kynos::server::error::ServerError::Accept { source, .. }))
-            if matches!(source.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
-        {
-            Some(source)
-        }
-        _ => None,
-    }
 }
 
 /// The exit code the HTTP server's outcome implies.
@@ -5116,324 +4962,6 @@ mod shutdown_report_tests {
     }
 
     #[test]
-    fn only_running_out_of_descriptors_is_an_accept_failure_worth_retrying() {
-        assert!(descriptor_exhaustion(&accept_failure(libc::EMFILE)).is_some());
-        assert!(descriptor_exhaustion(&accept_failure(libc::ENFILE)).is_some());
-        assert!(descriptor_exhaustion(&accept_failure(libc::EINVAL)).is_none());
-        assert!(descriptor_exhaustion(&Ok(())).is_none());
-        let timed_out = Err(kynos::Error::Server(
-            kynos::server::error::ServerError::ShutdownTimeout {
-                timeout: HTTP_DRAIN_TIMEOUT,
-            },
-        ));
-        assert!(descriptor_exhaustion(&timed_out).is_none());
-    }
-
-    /// The daemon's `hold`: a second descriptor on the same socket.
-    fn dup(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<std::os::fd::OwnedFd> {
-        fd.try_clone_to_owned()
-    }
-
-    async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        (listener, addr)
-    }
-
-    #[tokio::test]
-    async fn running_out_of_descriptors_serves_the_same_socket_again() {
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        // Queued in the backlog before anything accepts: it is answered only
-        // if the socket survives the first run dropping its listener.
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let client_port = client.local_addr().unwrap().port();
-        let builds = std::cell::Cell::new(0);
-        let mut runs = 0;
-        let accepted = std::cell::Cell::new(None);
-        let code = serve_through_exhaustion(
-            listener,
-            0_u32,
-            || {
-                builds.set(builds.get() + 1);
-                Some(builds.get())
-            },
-            dup,
-            |listener, app, _shutdown| {
-                runs += 1;
-                let run = runs;
-                let accepted = &accepted;
-                async move {
-                    assert_eq!(app, run - 1, "each run has a router of its own");
-                    if run == 1 {
-                        drop(listener);
-                        return accept_failure(libc::EMFILE);
-                    }
-                    let (_, peer) = listener.accept().await.unwrap();
-                    accepted.set(Some(peer.port()));
-                    Ok(())
-                }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!(code, 0);
-        assert_eq!(runs, 2);
-        assert_eq!(builds.get(), 1);
-        assert_eq!(accepted.get(), Some(client_port));
-    }
-
-    #[tokio::test]
-    async fn any_other_server_failure_is_not_retried() {
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let mut runs = 0;
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            dup,
-            |_, (), _| {
-                runs += 1;
-                async { accept_failure(libc::EINVAL) }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!(code, 70);
-        assert_eq!(runs, 1);
-    }
-
-    #[tokio::test]
-    async fn a_shutdown_during_the_backoff_or_before_a_run_serves_no_more() {
-        // Signalled while the first run fails: the backoff ends at once.
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let mut runs = 0;
-        let started = std::time::Instant::now();
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            dup,
-            |_, (), _| {
-                runs += 1;
-                tx.send(ShutdownReason::Sigterm).unwrap();
-                async { accept_failure(libc::EMFILE) }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!(code, 0);
-        assert_eq!(runs, 1);
-        assert!(started.elapsed() < ACCEPT_EXHAUSTION_BACKOFF_INITIAL);
-
-        // Signalled before the first run, as during boot: nothing is served.
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        tx.send(ShutdownReason::Sigterm).unwrap();
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            dup,
-            |_, (), _| async { unreachable!("a stop was already asked for") },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!(code, 0);
-    }
-
-    /// The seconds since `origin` at which each run in `starts` began.
-    fn offsets(origin: tokio::time::Instant, starts: &[tokio::time::Instant]) -> Vec<u64> {
-        starts.iter().map(|s| (*s - origin).as_secs()).collect()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_backoff_doubles_from_a_second_to_thirty_and_resets_after_a_long_run() {
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let starts = std::cell::RefCell::new(Vec::new());
-        let origin = tokio::time::Instant::now();
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            dup,
-            |_, (), _| {
-                starts.borrow_mut().push(tokio::time::Instant::now());
-                let run = starts.borrow().len();
-                async move {
-                    match run {
-                        // Runs 1-7 fail at once; run 8 serves 31 s first.
-                        1..=7 => accept_failure(libc::EMFILE),
-                        8 => {
-                            tokio::time::sleep(std::time::Duration::from_secs(31)).await;
-                            accept_failure(libc::EMFILE)
-                        }
-                        _ => Ok(()),
-                    }
-                }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!(code, 0);
-        // Gaps of 1, 2, 4, 8, 16, 30, 30; then 31 s serving and 1 s again.
-        assert_eq!(
-            offsets(origin, &starts.borrow()),
-            [0, 1, 3, 7, 15, 31, 61, 91, 123]
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_spare_short_of_descriptors_is_held_again_after_another_backoff() {
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let holds = std::cell::Cell::new(0);
-        let starts = std::cell::RefCell::new(Vec::new());
-        let origin = tokio::time::Instant::now();
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            |fd: std::os::fd::BorrowedFd<'_>| {
-                holds.set(holds.get() + 1);
-                // The first two holds during the backoff are still short.
-                if matches!(holds.get(), 2 | 3) {
-                    return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
-                }
-                fd.try_clone_to_owned()
-            },
-            |_, (), _| {
-                starts.borrow_mut().push(tokio::time::Instant::now());
-                let run = starts.borrow().len();
-                async move {
-                    if run < 3 {
-                        accept_failure(libc::EMFILE)
-                    } else {
-                        Ok(())
-                    }
-                }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        // Run 2 had a spare after all: its exhaustion was retried, not 70.
-        assert_eq!(code, 0);
-        assert_eq!(holds.get(), 5);
-        // Held at 1 s and 3 s (short), 7 s; then 8 s more for run 3.
-        assert_eq!(offsets(origin, &starts.borrow()), [0, 7, 15]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_retry_that_cannot_serve_again_exits_70() {
-        // The router cannot be rebuilt.
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let mut runs = 0;
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || None,
-            dup,
-            |_, (), _| {
-                runs += 1;
-                async { accept_failure(libc::EMFILE) }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!((code, runs), (70, 1));
-
-        // The spare cannot be registered with the runtime: `/dev/null`
-        // cannot be polled, so `from_std` refuses it.
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let mut runs = 0;
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            |_: std::os::fd::BorrowedFd<'_>| {
-                std::fs::File::open("/dev/null").map(std::os::fd::OwnedFd::from)
-            },
-            |_, (), _| {
-                runs += 1;
-                async { accept_failure(libc::EMFILE) }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!((code, runs), (70, 1));
-
-        // No spare was held before the first run: exhaustion stops the daemon.
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let mut runs = 0;
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            |_: std::os::fd::BorrowedFd<'_>| Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
-            |_, (), _| {
-                runs += 1;
-                async { accept_failure(libc::EMFILE) }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!((code, runs), (70, 1));
-
-        // A hold during the backoff that fails for another reason serves
-        // once more without a spare, and that run's exhaustion stops it.
-        let (listener, addr) = bound().await;
-        let (tx, rx) = broadcast::channel(8);
-        let holds = std::cell::Cell::new(0);
-        let mut runs = 0;
-        let code = serve_through_exhaustion(
-            listener,
-            (),
-            || Some(()),
-            |fd: std::os::fd::BorrowedFd<'_>| {
-                holds.set(holds.get() + 1);
-                if holds.get() == 1 {
-                    fd.try_clone_to_owned()
-                } else {
-                    Err(std::io::Error::from_raw_os_error(libc::EBADF))
-                }
-            },
-            |_, (), _| {
-                runs += 1;
-                async { accept_failure(libc::EMFILE) }
-            },
-            addr,
-            &tx,
-            rx,
-        )
-        .await;
-        assert_eq!((code, runs, holds.get()), (70, 2, 2));
-    }
-
-    #[test]
     fn a_written_report_is_read_back_once_and_then_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let report = ShutdownReport {
@@ -5625,6 +5153,333 @@ listen_interfaces = "0.0.0.0:6881"
         let hash = crate::auth::hash_password("hunter2").unwrap();
         let cfg = cfg_from(&format!("[auth]\npassword_hash = \"{hash}\""));
         assert_eq!(unauthenticated_posture(&cfg), None);
+    }
+}
+
+/// The connection bounds [`http_server`] sets, held to the kynos server
+/// itself over real sockets, so a kynos release that changes one fails here
+/// rather than in `docs/running.md` §7. The bounds are seconds long, so each
+/// wait runs on tokio's paused clock, which jumps to the server's next timer
+/// whenever nothing else can run.
+#[cfg(test)]
+mod http_bounds_tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    /// The HTTP/2 client preface (RFC 9113 §3.4), before its SETTINGS frame.
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    const DATA: u8 = 0x0;
+    const SETTINGS: u8 = 0x4;
+    const PING: u8 = 0x6;
+    const GOAWAY: u8 = 0x7;
+    const HEADERS: u8 = 0x1;
+    const ACK: u8 = 0x1;
+    const END_STREAM: u8 = 0x1;
+    const END_HEADERS: u8 = 0x4;
+
+    /// The production server, on the full router, serving a loopback port.
+    async fn serving() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<kynos::Result<()>>,
+    ) {
+        let openapi =
+            http::OpenApiJson(Arc::new(bytes::Bytes::from(http::document_json().unwrap())));
+        let app = http::service(crate::app_state::build_test_state(None), openapi).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (
+            addr,
+            tokio::spawn(http_server(app).listener(listener).serve()),
+        )
+    }
+
+    /// Run `work` on the paused clock and return its output with the paused
+    /// time it took. A guard on a real thread, rather than a tokio timer the
+    /// paused clock would jump to first, fails a wait no bound ends.
+    async fn on_paused_clock<F: std::future::Future>(what: &str, work: F) -> (F::Output, Duration) {
+        let (done, done_rx) = std::sync::mpsc::channel::<()>();
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(60))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                let _ = fire.send(());
+            }
+        });
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let output = tokio::select! {
+            output = work => Some(output),
+            _ = fired => None,
+        };
+        let waited = started.elapsed();
+        drop(done);
+        tokio::time::resume();
+        let output = output.unwrap_or_else(|| panic!("{what}: still open after a real minute"));
+        (output, waited)
+    }
+
+    /// Read and discard until the server closes the connection.
+    async fn until_closed(stream: &mut tokio::net::TcpStream) {
+        let mut buf = [0u8; 1024];
+        while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+    }
+
+    /// Assert `waited` is `bound`, give or take the real time between the
+    /// accept that armed the server's deadline and the clock being paused.
+    fn assert_closed_at(what: &str, waited: Duration, bound: Duration) {
+        assert!(
+            waited + Duration::from_millis(500) >= bound && waited < bound + Duration::from_secs(2),
+            "{what}: closed after {waited:?}, not at {bound:?}",
+        );
+    }
+
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+        let mut out = vec![len[1], len[2], len[3], kind, flags];
+        out.extend_from_slice(&stream.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The next frame's type, flags and payload, or `None` once the server
+    /// closed the connection.
+    async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<(u8, u8, Vec<u8>)> {
+        let mut head = [0u8; 9];
+        stream.read_exact(&mut head).await.ok()?;
+        let len = usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]])).unwrap();
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.ok()?;
+        Some((head[3], head[4], payload))
+    }
+
+    /// Open a connection, send `opening`, and assert the server closes it at
+    /// the header-read timeout.
+    ///
+    /// One connection a test: kynos arms the deadline on the real clock and
+    /// sleeps to it on tokio's, so once a paused wait has moved tokio's clock
+    /// ahead, a later deadline in the same runtime reads as already past.
+    async fn assert_unheard_closed(what: &str, opening: &[u8]) {
+        let (addr, _server) = serving().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(opening).await.unwrap();
+        let ((), waited) = on_paused_clock(what, until_closed(&mut stream)).await;
+        assert_closed_at(what, waited, HTTP_HEADER_READ_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_sends_no_byte_is_closed_at_the_header_read_timeout() {
+        assert_unheard_closed("no byte at all", b"").await;
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_stops_inside_the_http2_preface_is_closed_at_the_header_read_timeout()
+    {
+        assert_unheard_closed("part of the HTTP/2 preface", &PREFACE[..16]).await;
+    }
+
+    #[tokio::test]
+    async fn an_http2_connection_that_never_sends_a_request_is_closed_at_the_header_read_timeout() {
+        let mut opening = PREFACE.to_vec();
+        opening.extend(frame(SETTINGS, 0, 0, &[]));
+        assert_unheard_closed("the HTTP/2 preface and no request", &opening).await;
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_http1_head_is_closed_at_the_header_read_timeout() {
+        assert_unheard_closed("part of an HTTP/1 head", b"GET /healthz HTTP/1.1\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn an_http2_connection_that_answers_pings_and_holds_no_request_is_sent_goaway() {
+        let (addr, _server) = serving().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut opening = PREFACE.to_vec();
+        opening.extend(frame(SETTINGS, 0, 0, &[]));
+        // `GET /healthz` on stream 1, ending the stream: `:method GET`,
+        // `:scheme http` from the static table, then `:path` and
+        // `:authority` as literals without Huffman coding (RFC 7541).
+        let mut block = vec![0x82, 0x86, 0x44, 8];
+        block.extend_from_slice(b"/healthz");
+        block.extend_from_slice(&[0x41, 9]);
+        block.extend_from_slice(b"localhost");
+        opening.extend(frame(HEADERS, END_HEADERS | END_STREAM, 1, &block));
+        stream.write_all(&opening).await.unwrap();
+
+        // Read to the response's last frame on the running clock: a paused
+        // one would jump to the server's next timer, the first-head deadline
+        // among them, whenever the request is between the two tasks.
+        loop {
+            let (kind, flags, payload) = read_frame(&mut stream)
+                .await
+                .expect("the connection closed before the response");
+            answer_control(&mut stream, kind, flags, &payload).await;
+            if matches!(kind, DATA | HEADERS) && flags & END_STREAM != 0 {
+                break;
+            }
+        }
+
+        // The stream is closed, and the connection holds none from here.
+        let (outcome, waited) = on_paused_clock("an idle HTTP/2 connection", async {
+            let mut pings = 0;
+            while let Some((kind, flags, payload)) = read_frame(&mut stream).await {
+                if kind == GOAWAY {
+                    let code = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    return Some((pings, code));
+                }
+                if answer_control(&mut stream, kind, flags, &payload).await {
+                    pings += 1;
+                }
+            }
+            None
+        })
+        .await;
+        let (pings, code) = outcome.expect("the server closed the connection without a GOAWAY");
+        assert!(pings > 0, "the server never pinged an idle connection");
+        assert_eq!(code, 0, "the GOAWAY is NO_ERROR, not a ping timeout");
+        // A lower bound only. The server has several timers here — the
+        // pings, their deadline, the idle period — and the paused clock can
+        // jump to a later one while the GOAWAY is still between the two
+        // tasks, so the time it is read at may be past the time it was sent.
+        // A timer never fires early, so it was not sent before the bound.
+        assert!(
+            waited + Duration::from_millis(500) >= HTTP2_IDLE_TIMEOUT,
+            "an idle HTTP/2 connection: sent GOAWAY after {waited:?}, before {HTTP2_IDLE_TIMEOUT:?}",
+        );
+    }
+
+    /// Acknowledge a SETTINGS or PING frame, as a live client does, and say
+    /// whether it was a PING.
+    async fn answer_control(
+        stream: &mut tokio::net::TcpStream,
+        kind: u8,
+        flags: u8,
+        payload: &[u8],
+    ) -> bool {
+        if flags & ACK != 0 || !matches!(kind, SETTINGS | PING) {
+            return false;
+        }
+        let ack = if kind == PING { payload } else { &[] };
+        stream.write_all(&frame(kind, ACK, 0, ack)).await.unwrap();
+        kind == PING
+    }
+
+    /// Set in the process [`running_out_of_descriptors_in_accept_does_not_stop_the_server`]
+    /// starts, the only one in which its half that exhausts descriptors runs.
+    const EXHAUST_DESCRIPTORS: &str = "TORRENTD_TEST_EXHAUST_DESCRIPTORS";
+
+    /// The process descriptor limit is shared by every test in the binary,
+    /// so the half that exhausts it runs in a process of its own: this test
+    /// binary again, filtered to that one test.
+    #[test]
+    fn running_out_of_descriptors_in_accept_does_not_stop_the_server() {
+        let name = "startup::http_bounds_tests::serves_through_descriptor_exhaustion";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                name,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EXHAUST_DESCRIPTORS, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the filter ran no test: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run by running_out_of_descriptors_in_accept_does_not_stop_the_server"]
+    async fn serves_through_descriptor_exhaustion() {
+        use std::io::Read;
+        use std::io::Write;
+
+        if std::env::var_os(EXHAUST_DESCRIPTORS).is_none() {
+            return;
+        }
+        let (addr, server) = serving().await;
+
+        // A soft limit a few dozen above what is open, so filling the table
+        // takes a few dozen descriptors rather than the whole hard limit.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid, writable `rlimit`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+            0
+        );
+        let open = std::fs::read_dir("/proc/self/fd").unwrap().count() as libc::rlim_t;
+        let lowered = libc::rlimit {
+            rlim_cur: (open + 32).min(limit.rlim_max),
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `lowered` is a valid `rlimit` no higher than the hard limit.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) },
+            0
+        );
+        let mut filler = Vec::new();
+        let exhausted = loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => filler.push(f),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(exhausted.raw_os_error(), Some(libc::EMFILE));
+
+        // The last free descriptor is the client's. The kernel completes the
+        // handshake from the backlog, and the server's `accept` then has no
+        // descriptor to give the connection.
+        drop(filler.pop());
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .unwrap();
+
+        // kynos 0.3 gave up on the listener after five failures inside about
+        // 150 ms; this is several times that.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        client.set_nonblocking(true).unwrap();
+        let unanswered = client.read(&mut [0u8; 64]).unwrap_err();
+        assert_eq!(
+            unanswered.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the request was answered while descriptors were exhausted, so \
+             nothing was exhausted"
+        );
+        assert!(
+            !server.is_finished(),
+            "the server stopped on running out of descriptors: {:?}",
+            server.await
+        );
+
+        drop(filler);
+        // SAFETY: `limit` is the `rlimit` read above.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+            0
+        );
+        let mut client = tokio::net::TcpStream::from_std(client).unwrap();
+        let mut head = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(10), client.read_exact(&mut head))
+            .await
+            .expect("the queued connection is answered once descriptors free up")
+            .unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 "), "{head:?}");
+        assert!(!server.is_finished());
     }
 }
 
