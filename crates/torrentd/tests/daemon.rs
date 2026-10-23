@@ -13,6 +13,7 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::process::Child;
 use std::process::Command;
+use std::process::ExitStatus;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -227,17 +228,33 @@ fn sigterm(child: &Child) {
         .expect("send SIGTERM");
 }
 
-fn wait_exit(child: &mut Child, timeout: Duration) -> bool {
+/// How `child` exited, once it has, or `None` (and `child` killed) when it
+/// has not within `timeout`. The status, not only the fact of an exit: a
+/// daemon that panicked or aborted on its way down has exited too.
+fn wait_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) => return true,
+            Ok(Some(status)) => return Some(status),
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
     let _ = child.kill();
-    false
+    None
+}
+
+/// Wait out a daemon sent SIGTERM: it must exit within `timeout`, and with
+/// status 0. A drain that panicked, or a teardown that failed, exits
+/// otherwise, and a test that only waited for the exit passed over it.
+fn assert_exits_zero(child: &mut Child, timeout: Duration) {
+    let status = wait_exit(child, timeout)
+        .unwrap_or_else(|| panic!("the daemon did not exit within {timeout:?} of SIGTERM"));
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a SIGTERM must end in a clean exit, not {status:?}"
+    );
 }
 
 #[test]
@@ -285,10 +302,7 @@ fn daemon_end_to_end() {
 
     // Graceful shutdown via SIGTERM (shell out to `kill`, no extra dep).
     sigterm(&child);
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM"
-    );
+    assert_exits_zero(&mut child, Duration::from_secs(30));
 
     // DHT/session state must be persisted on a graceful shutdown (Commit C).
     assert!(
@@ -334,10 +348,7 @@ fn a_configured_allowed_host_is_answered_and_another_is_refused() {
     assert_eq!(code, 403, "a Host not in allowed_hosts: {body}");
 
     sigterm(&child);
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM"
-    );
+    assert_exits_zero(&mut child, Duration::from_secs(30));
 }
 
 /// The rows of `deploy/metrics.md` a host-profile daemon with no pool and no
@@ -451,7 +462,7 @@ fn the_first_scrape_holds_every_series_present_from_boot() {
     }
 
     sigterm(&child);
-    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+    assert_exits_zero(&mut child, Duration::from_secs(30));
     // A clean exit still writes the report the next boot re-exports, and it
     // says nothing was left behind. This daemon has no kill switch, so
     // `kill_switch_removal_failed` is false with nothing to remove: the
@@ -480,11 +491,8 @@ fn daemon_http_bind_failure_still_drains() {
     let p = dir.path();
     let mut child = spawn_daemon(p, free_port(), &addr);
 
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "daemon did not exit within 30s of failing to bind its HTTP listener"
-    );
-    let status = child.wait().expect("reap daemon");
+    let status = wait_exit(&mut child, Duration::from_secs(30))
+        .expect("daemon did not exit within 30s of failing to bind its HTTP listener");
     assert_eq!(status.code(), Some(70), "bind failure must exit 70");
     assert!(
         p.join(format!("session_state-{PROFILE}.dat")).exists(),
@@ -536,12 +544,10 @@ fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() 
         .expect("piped stderr")
         .read_to_string(&mut out)
         .unwrap();
-    assert!(
-        exited,
-        "the second daemon did not refuse within 10s; output: {out}"
-    );
+    let exited = exited
+        .unwrap_or_else(|| panic!("the second daemon did not refuse within 10s; output: {out}"));
     assert_eq!(
-        second.wait().unwrap().code(),
+        exited.code(),
         Some(70),
         "a refused start exits 70 like every other startup failure; output: {out}"
     );
@@ -557,10 +563,7 @@ fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() 
     // The first is untouched and still serving.
     assert_eq!(http(addr, "GET", "/healthz", None).0, 200);
     sigterm(&first);
-    assert!(
-        wait_exit(&mut first, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM"
-    );
+    assert_exits_zero(&mut first, Duration::from_secs(30));
 }
 
 /// Graceful shutdown must stay graceful under load: with many torrents added,
@@ -592,10 +595,7 @@ fn daemon_graceful_shutdown_under_load() {
 
     // SIGTERM under load: must exit cleanly within the timeout.
     sigterm(&child);
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM under {n}-torrent load"
-    );
+    assert_exits_zero(&mut child, Duration::from_secs(30));
     assert!(
         p.join(format!("session_state-{PROFILE}.dat")).exists(),
         "a dht profile's session state should be written on SIGTERM"
@@ -654,14 +654,12 @@ fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound(
 
     let started = Instant::now();
     sigterm(&child);
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(45)),
-        "daemon did not exit within 45s of SIGTERM with clients holding on"
-    );
+    let status = wait_exit(&mut child, Duration::from_secs(45))
+        .expect("daemon did not exit within 45s of SIGTERM with clients holding on");
     let elapsed = started.elapsed();
-    let status = child.wait().unwrap();
-    assert!(
-        status.success(),
+    assert_eq!(
+        status.code(),
+        Some(0),
         "a drain cut short by a client is not a failure: {status:?} after {elapsed:?}",
     );
     // The stuck request holds the HTTP drain to its 10 s bound
@@ -708,10 +706,7 @@ fn the_configured_drain_deadline_reaches_the_alert_loop() {
     wait_healthy(HTTP);
 
     sigterm(&child);
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM"
-    );
+    assert_exits_zero(&mut child, Duration::from_secs(30));
     let out = reader.join().unwrap();
     let drain = out
         .lines()
@@ -777,12 +772,11 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
         .read_to_string(&mut err)
         .unwrap();
 
-    assert!(
-        exited,
-        "the daemon started against a registry it cannot serve; stderr: {err}"
-    );
+    let exited = exited.unwrap_or_else(|| {
+        panic!("the daemon started against a registry it cannot serve; stderr: {err}")
+    });
     assert_eq!(
-        child.wait().unwrap().code(),
+        exited.code(),
         Some(78),
         "a refusal no restart can fix exits EX_CONFIG, which the unit does not restart; \
          stderr: {err}"
@@ -857,7 +851,7 @@ fn unreadable_scan_files_are_exported_by_source_at_boot() {
     }
 
     sigterm(&child);
-    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+    assert_exits_zero(&mut child, Duration::from_secs(30));
 }
 
 /// Run the binary against `cfg` to its exit, with `--check-config` when
@@ -881,10 +875,8 @@ fn run_to_exit(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn daemon");
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "a refused config must not start the daemon"
-    );
+    let status = wait_exit(&mut child, Duration::from_secs(30))
+        .expect("a refused config must not start the daemon");
     let mut out = String::new();
     child
         .stdout
@@ -898,7 +890,7 @@ fn run_to_exit(
         .expect("piped stderr")
         .read_to_string(&mut out)
         .unwrap();
-    let code = child.wait().unwrap().code().expect("exited, not signalled");
+    let code = status.code().expect("exited, not signalled");
     (code, out)
 }
 
@@ -1030,10 +1022,7 @@ fn the_reconciliation_warning_names_both_registry_files() {
 
     wait_healthy(addr);
     sigterm(&child);
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM"
-    );
+    assert_exits_zero(&mut child, Duration::from_secs(30));
     let mut out = String::new();
     child
         .stdout
@@ -1070,10 +1059,7 @@ fn the_reconciliation_warning_names_both_registry_files() {
         .expect("spawn daemon");
     wait_healthy(addr);
     sigterm(&child);
-    assert!(
-        wait_exit(&mut child, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM"
-    );
+    assert_exits_zero(&mut child, Duration::from_secs(30));
     let mut out = String::new();
     child
         .stdout
@@ -1181,10 +1167,7 @@ fn a_non_reloadable_change_is_reported_on_the_second_reload_too() {
     }
 
     sigterm(&child.0);
-    assert!(
-        wait_exit(&mut child.0, Duration::from_secs(30)),
-        "daemon did not exit within 30s of SIGTERM"
-    );
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
 /// A one-file `.torrent` named `name`, announcing to `announce`.
@@ -1342,7 +1325,7 @@ fn the_boot_scans_hold_every_torrent_to_the_profiles_tracker_domains() {
     );
 
     sigterm(&child);
-    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+    assert_exits_zero(&mut child, Duration::from_secs(30));
 }
 
 /// Issue #186's acceptance: a torrent added through `POST /v1/torrents` whose
@@ -1449,7 +1432,7 @@ fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
         "the added torrent never loaded",
     );
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 
     // What a crash before the first save, or an unreadable resume file,
     // leaves: the claim, the `.torrent` and its recorded save path.
@@ -1518,7 +1501,7 @@ fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
             "a torrent the pool records drifted was re-added",
         );
         sigterm(&child.0);
-        assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+        assert_exits_zero(&mut child.0, Duration::from_secs(30));
         return;
     }
     assert_eq!(
@@ -1556,7 +1539,7 @@ fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
     }
 
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
 /// Issue #354's regression: a plain `DELETE` of a torrent the boot left
@@ -1642,7 +1625,7 @@ fn a_plain_delete_of_a_torrent_whose_resume_add_failed_keeps_its_resume_file() {
     assert_eq!(std::fs::read(&kept).ok(), Some(bytes));
 
     sigterm(&child);
-    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+    assert_exits_zero(&mut child, Duration::from_secs(30));
 }
 
 /// [`http`] with a read timeout of `timeout`, for a request that runs long.
@@ -1861,7 +1844,7 @@ fn a_million_file_scan_leaves_the_daemon_responsive() {
     );
 
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(60)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(60));
     listening.store(false, std::sync::atomic::Ordering::Relaxed);
     listener.join().unwrap();
 }
@@ -1967,7 +1950,7 @@ fn an_adopted_torrent_keeps_its_metadata_across_a_restart() {
     };
     let stop = |mut child: KillOnDrop| {
         sigterm(&child.0);
-        assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+        assert_exits_zero(&mut child.0, Duration::from_secs(30));
     };
 
     let child = spawn();
@@ -2155,7 +2138,7 @@ fn an_add_whose_payload_is_absent_or_wrong_is_never_reported_seeding() {
     }
 
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
 /// The adoption state `GET /v1/pool/torrents` reports for `ih`.
@@ -2186,6 +2169,53 @@ fn pool_state(addr: &str, ih: &str) -> Option<String> {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent and hashes 8 GiB; run with --ignored"]
 fn a_restart_while_an_adoption_hashes_still_records_its_verdict() {
+    restart_mid_verification(Stop::Term, Interrupt::WhileChecking);
+}
+
+/// [`a_restart_while_an_adoption_hashes_still_records_its_verdict`] with
+/// the daemon killed rather than stopped: no drain, no resume save, no
+/// shutdown of the verify queue. The adoption's queue entry is all the next
+/// boot has to go on, and it must still hash the payload and record the
+/// verdict.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent and hashes 8 GiB; run with --ignored"]
+fn a_sigkill_while_an_adoption_hashes_still_records_its_verdict() {
+    restart_mid_verification(Stop::Kill, Interrupt::WhileChecking);
+}
+
+/// A SIGKILL straight after the adoption is answered
+/// `queued_for_verification`, while the verify queue is admitting it: the
+/// persisted queue entry is requeued at the next boot, and the payload is
+/// hashed and its verdict recorded as if nothing had happened.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent and hashes 8 GiB; run with --ignored"]
+fn a_sigkill_during_verify_admission_requeues_the_adoption() {
+    restart_mid_verification(Stop::Kill, Interrupt::AtAdmission);
+}
+
+/// How a test ends a daemon it restarts.
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    /// SIGTERM, and a clean exit within the bound.
+    Term,
+    /// SIGKILL: nothing after it runs.
+    Kill,
+}
+
+/// Where [`restart_mid_verification`] interrupts the adoption.
+#[derive(Clone, Copy, Debug)]
+enum Interrupt {
+    /// As soon as the adoption is answered, before or while the verify queue
+    /// admits it.
+    AtAdmission,
+    /// Once libtorrent reports it `checking`.
+    WhileChecking,
+}
+
+/// Adopt an 8 GiB payload with one wrong byte, stop the daemon at `at` by
+/// `stop`, and boot it again: the torrent has to end `paused` and the index
+/// `drifted`, whatever the stop interrupted.
+fn restart_mid_verification(stop: Stop, at: Interrupt) {
     use sha1::Digest;
 
     const PIECE: u64 = 16 << 20;
@@ -2262,19 +2292,29 @@ fn a_restart_while_an_adoption_hashes_still_records_its_verdict() {
     );
     assert_eq!(code, 200, "{body}");
     assert!(body.contains("queued_for_verification"), "{body}");
-    // The verify queue admits it within a tick or two, and 8 GiB takes
-    // libtorrent a good while longer than that to hash.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while torrent_phase(addr, &ih).as_deref() != Some("checking") {
-        assert!(
-            Instant::now() < deadline,
-            "the adoption never started hashing: {:?}",
-            torrent_phase(addr, &ih),
-        );
-        std::thread::sleep(Duration::from_millis(100));
+    if let Interrupt::WhileChecking = at {
+        // The verify queue admits it within a tick or two, and 8 GiB takes
+        // libtorrent a good while longer than that to hash.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while torrent_phase(addr, &ih).as_deref() != Some("checking") {
+            assert!(
+                Instant::now() < deadline,
+                "the adoption never started hashing: {:?}",
+                torrent_phase(addr, &ih),
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
-    sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(60)));
+    match stop {
+        Stop::Term => {
+            sigterm(&child.0);
+            assert_exits_zero(&mut child.0, Duration::from_secs(60));
+        }
+        Stop::Kill => {
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+        }
+    }
 
     let _child = spawn();
     let deadline = Instant::now() + Duration::from_secs(300);
@@ -2286,7 +2326,7 @@ fn a_restart_while_an_adoption_hashes_still_records_its_verdict() {
         }
         assert!(
             Instant::now() < deadline,
-            "after a restart mid-verify the failed payload was left {phase:?} and \
+            "after a {stop:?} {at:?} the failed payload was left {phase:?} and \
              indexed {state:?}, not paused and drifted",
         );
         std::thread::sleep(Duration::from_millis(500));
@@ -2435,7 +2475,7 @@ fn delete_files_refuses_a_payload_a_torrent_added_over_it_still_serves() {
     assert!(!file.exists(), "the payload was not moved to the trash");
 
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
 /// Issue #199's acceptance: a rescan never relabels an adopted torrent a
@@ -2557,7 +2597,7 @@ fn a_rescan_with_the_root_or_payload_gone_keeps_a_loaded_torrent_adopted() {
     );
 
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
 /// Issue #189: a `DELETE` answered `204` stays deleted across a SIGKILL.
@@ -2650,7 +2690,7 @@ fn a_delete_answered_204_stays_deleted_across_a_sigkill() {
     }
 
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
 /// Which pieces a two-piece torrent's resume file records as held: the
@@ -2781,7 +2821,7 @@ fn a_recheck_verdict_survives_a_sigkill() {
     assert_eq!(code, 201, "{body}");
     seeding("after the add");
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
     let stopped = std::fs::read(&resume).expect("the graceful stop wrote no resume file");
     assert_eq!(resume_pieces(&stopped), Some([true, true]));
     assert!(
@@ -2836,7 +2876,7 @@ fn a_recheck_verdict_survives_a_sigkill() {
     );
 
     sigterm(&child.0);
-    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    assert_exits_zero(&mut child.0, Duration::from_secs(30));
 }
 
 /// A spawned daemon, killed if the test panics before stopping it: an
@@ -2846,7 +2886,7 @@ struct Running(Child);
 impl Running {
     fn stop(mut self) {
         sigterm(&self.0);
-        assert!(wait_exit(&mut self.0, Duration::from_secs(30)));
+        assert_exits_zero(&mut self.0, Duration::from_secs(30));
     }
 }
 
@@ -3509,4 +3549,417 @@ fn a_bt_backup_directory_imports_fast_path_and_verify_mixed() {
             String::from_utf8_lossy(seed_mode)
         );
     }
+}
+
+/// Spawn the daemon against `cfg`, its output appended to `log`.
+fn start(cfg: &std::path::Path, log: &DaemonLog) -> Running {
+    Running(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(cfg)
+            .stdout(log.stdio())
+            .stderr(log.stdio())
+            .spawn()
+            .expect("spawn daemon"),
+    )
+}
+
+/// SIGKILL `child` and reap it: no drain, nothing after this runs.
+fn sigkill(mut child: Running) {
+    child.0.kill().unwrap();
+    let status = child.0.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL),
+        "the daemon had already exited, as {status:?}, before the kill",
+    );
+}
+
+/// `n` distinct infohashes, numbered from `base`.
+fn infohashes(base: u64, n: u64) -> std::collections::BTreeSet<String> {
+    (base..base + n).map(|i| format!("{i:040x}")).collect()
+}
+
+/// Add a magnet for each of `ihs` to [`PROFILE`] through the API.
+fn add_magnets<'a>(addr: &str, ihs: impl IntoIterator<Item = &'a String>) {
+    for ih in ihs {
+        let body = add_magnet(&format!("magnet:?xt=urn:btih:{ih}"));
+        let (code, answer) = http(addr, "POST", "/v1/torrents", Some(&body));
+        assert_eq!(code, 201, "add {ih}: {answer}");
+    }
+}
+
+/// Every torrent `GET /v1/torrents` lists, as `(infohash, phase)`, across
+/// every page and in the order listed.
+fn listed(addr: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(c) => format!("/v1/torrents?limit=1000&cursor={c}"),
+            None => "/v1/torrents?limit=1000".to_owned(),
+        };
+        let (code, body) = http(addr, "GET", &path, None);
+        assert_eq!(code, 200, "{path}: {body}");
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for t in page["items"].as_array().expect("items") {
+            out.push((
+                t["infohash"].as_str().unwrap().to_owned(),
+                t["phase"].as_str().unwrap().to_owned(),
+            ));
+        }
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_owned()),
+            None => return out,
+        }
+    }
+}
+
+/// Wait until the daemon lists exactly `ihs`, each of them once, and every
+/// one is loaded into a session: its phase is anything but `unknown`, which
+/// the listing reports for a torrent assigned and held by no session.
+/// Returns each one's phase.
+fn every_one_loaded_once(
+    addr: &str,
+    ihs: &std::collections::BTreeSet<String>,
+    within: Duration,
+) -> std::collections::BTreeMap<String, String> {
+    let deadline = Instant::now() + within;
+    loop {
+        let list = listed(addr);
+        let phases: std::collections::BTreeMap<String, String> = list.iter().cloned().collect();
+        assert_eq!(phases.len(), list.len(), "a torrent is listed twice");
+        let missing: Vec<&String> = ihs.iter().filter(|ih| !phases.contains_key(*ih)).collect();
+        let extra: Vec<&String> = phases.keys().filter(|ih| !ihs.contains(*ih)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "{} torrents lost, {} never added listed; first lost {:?}, first extra {:?}",
+            missing.len(),
+            extra.len(),
+            missing.first(),
+            extra.first(),
+        );
+        let unloaded = phases.values().filter(|ph| *ph == "unknown").count();
+        if unloaded == 0 {
+            return phases;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{unloaded} of {} torrents were never loaded into a session within {within:?}",
+            ihs.len(),
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The infohash of every `<infohash>.resume` file in [`PROFILE`]'s resume
+/// directory under `p`.
+fn resume_files(p: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(p.join("resume").join(PROFILE))
+        .map(|dir| {
+            dir.filter_map(|e| {
+                let name = e.unwrap().file_name().into_string().ok()?;
+                name.strip_suffix(".resume").map(str::to_owned)
+            })
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The SIGTERM drain saves every torrent's resume data, not only the ones
+/// whose files already exist: a pause made just before the SIGTERM reaches
+/// no resume file but by the drain (the periodic sweep is 30 minutes off),
+/// and the next boot on the same directory has to load every torrent, that
+/// one still paused.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_sigterm_saves_every_torrent_and_a_pause_for_the_next_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let log = DaemonLog::new(p);
+    let ihs = infohashes(0x40_0000, 200);
+    let paused = ihs.first().unwrap().clone();
+
+    let child = start(&cfg, &log);
+    wait_healthy(addr);
+    add_magnets(addr, &ihs);
+    let (code, body) = http(addr, "POST", &format!("/v1/torrents/{paused}/pause"), None);
+    assert!((200..300).contains(&code), "pause: {code} {body}");
+    poll("the pause to take", Duration::from_secs(30), || {
+        (torrent_phase(addr, &paused).as_deref() == Some("paused")).then_some(())
+    });
+    child.stop();
+
+    assert_eq!(
+        resume_files(p),
+        ihs,
+        "every torrent has a resume file after the drain"
+    );
+    let report = std::fs::read_to_string(p.join("last_shutdown.json")).expect("shutdown report");
+    assert!(report.contains("\"unsaved_resumes\":0"), "{report}");
+
+    let child = start(&cfg, &log);
+    wait_healthy(addr);
+    let phases = every_one_loaded_once(addr, &ihs, Duration::from_secs(60));
+    assert_eq!(
+        phases[&paused], "paused",
+        "the pause made before the SIGTERM was lost"
+    );
+    let also_paused: Vec<_> = phases
+        .iter()
+        .filter(|(ih, phase)| **ih != paused && *phase == "paused")
+        .collect();
+    assert!(
+        also_paused.is_empty(),
+        "torrents never paused came back paused: {also_paused:?}"
+    );
+    child.stop();
+}
+
+/// A `kill -9` anywhere in the boot, with 5,000 resume files to scan, loses
+/// none of them and duplicates none: the next boot loads every torrent
+/// exactly once.
+///
+/// The boot claims each resume file's torrent in the assignment registry as
+/// it loads it, so a kill partway through leaves some claimed and some not.
+/// A clean boot is timed first, and each later boot is killed at a fraction
+/// of that, before `/healthz` answers: the HTTP listener binds only once the
+/// boot's scans have returned, so an unanswered `/healthz` is a boot that
+/// had not finished.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent with 5,000 torrents; run with --ignored"]
+fn a_sigkill_mid_boot_scan_reloads_every_torrent_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let log = DaemonLog::new(p);
+    let ihs = infohashes(0x50_0000, 5_000);
+    let boot_budget = Duration::from_secs(300);
+
+    let child = start(&cfg, &log);
+    wait_healthy(addr);
+    add_magnets(addr, &ihs);
+    child.stop();
+    assert_eq!(resume_files(p), ihs);
+
+    let started = Instant::now();
+    let child = start(&cfg, &log);
+    wait_healthy_within(addr, boot_budget);
+    let boot = started.elapsed();
+    child.stop();
+
+    for (round, fraction) in [0.15, 0.35, 0.55].into_iter().enumerate() {
+        let child = start(&cfg, &log);
+        std::thread::sleep(boot.mul_f64(fraction));
+        let finished = try_http_as(addr, "GET", "/healthz", None, "localhost")
+            .is_ok_and(|(code, _)| code == 200);
+        sigkill(child);
+        assert!(
+            !finished,
+            "round {round}: the boot finished before the kill at {fraction} of {boot:?}",
+        );
+        assert_eq!(
+            resume_files(p),
+            ihs,
+            "round {round}: a kill mid-boot lost or made a resume file"
+        );
+    }
+
+    let child = start(&cfg, &log);
+    wait_healthy_within(addr, boot_budget);
+    every_one_loaded_once(addr, &ihs, boot_budget);
+    child.stop();
+}
+
+/// Every step of `plan_id`, across every page, as `(seq, status, src)`.
+fn plan_steps(addr: &str, plan_id: i64) -> Vec<(i64, String, String)> {
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(c) => format!("/v1/pool/plans/{plan_id}/steps?limit=1000&cursor={c}"),
+            None => format!("/v1/pool/plans/{plan_id}/steps?limit=1000"),
+        };
+        let (code, body) = http(addr, "GET", &path, None);
+        assert_eq!(code, 200, "{path}: {body}");
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for s in page["items"].as_array().expect("items") {
+            out.push((
+                s["seq"].as_i64().unwrap(),
+                s["status"].as_str().unwrap().to_owned(),
+                s["src"].as_str().unwrap().to_owned(),
+            ));
+        }
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_owned()),
+            None => return out,
+        }
+    }
+}
+
+/// Every regular file under `dir`, recursively.
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                todo.push(e.path());
+            } else {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// A `kill -9` while a large delete plan is applying leaves every step in a
+/// state the next boot can account for: a `done` step's file is gone, a
+/// `pending` one's is still in place, and the only steps whose outcome is
+/// unknown (`in_progress`) are one journal batch's, at most 64 contiguous
+/// steps. Nothing is lost either way: every file is in the root or in its
+/// trash. The boot's re-drive then finishes the plan when no step's outcome
+/// is unknown, and parks it `failed` for a human when one is.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_sigkill_mid_delete_plan_leaves_every_step_recoverable() {
+    const FILES: usize = 1_500;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let library = p.join("library");
+    let junk = root.join("junk");
+    std::fs::create_dir_all(&library).unwrap();
+    for i in 0..FILES {
+        let f = junk.join(format!("d{:02}/f{i:05}.bin", i % 20));
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, [1u8]).unwrap();
+    }
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\nallow_mutations = true\n",
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    let log = DaemonLog::new(p);
+
+    let child = start(&cfg, &log);
+    wait_healthy(addr);
+    let (code, body) = http_within(addr, "POST", "/v1/pool/scan", Duration::from_secs(120));
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http(addr, "GET", "/v1/pool", None);
+    assert_eq!(code, 200, "{body}");
+    let pool: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let root_id = pool["roots"][0]["root_id"].as_i64().expect("a root id");
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/pool/plans",
+        Some(&format!(
+            "{{\"kind\":\"delete_orphans\",\"root_id\":{root_id},\"prefix\":\"junk\"}}"
+        )),
+    );
+    assert_eq!(code, 201, "{body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let plan_id = plan["id"].as_i64().unwrap();
+    assert_eq!(plan["step_counts"]["total"].as_u64(), Some(FILES as u64));
+    let token = plan["confirm_token"].as_str().expect("a delete's token");
+
+    // The apply answers only once it is done, which the kill forestalls.
+    let apply = {
+        let (addr, body) = (addr.clone(), format!("{{\"confirm_token\":\"{token}\"}}"));
+        std::thread::spawn(move || {
+            let path = format!("/v1/pool/plans/{plan_id}/apply");
+            try_http_as(&addr, "POST", &path, Some(&body), "localhost")
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let left = files_under(&junk).len();
+        assert!(
+            left > 0,
+            "the plan finished before the kill; nothing was interrupted"
+        );
+        if left <= FILES - 200 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the apply never got going: {left} files left"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    sigkill(child);
+    let _ = apply.join();
+
+    let left = files_under(&junk);
+    let trashed = files_under(&root.join(".torrentd-trash"));
+    assert_eq!(
+        left.len() + trashed.len(),
+        FILES,
+        "a file was lost: {} left in place and {} in the trash",
+        left.len(),
+        trashed.len(),
+    );
+
+    let child = start(&cfg, &log);
+    wait_healthy(addr);
+    let status = poll(
+        "the boot's re-drive to settle the plan",
+        Duration::from_secs(120),
+        || {
+            let (code, body) = http(addr, "GET", &format!("/v1/pool/plans/{plan_id}"), None);
+            assert_eq!(code, 200, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let status = v["status"].as_str().unwrap().to_owned();
+            (status != "applying").then_some(status)
+        },
+    );
+    let steps = plan_steps(addr, plan_id);
+    assert_eq!(steps.len(), FILES);
+    let unknown: Vec<i64> = steps
+        .iter()
+        .filter(|(_, status, _)| status == "in_progress")
+        .map(|(seq, _, _)| *seq)
+        .collect();
+    for (seq, status, src) in &steps {
+        let present = std::path::Path::new(src).exists();
+        match status.as_str() {
+            "done" => assert!(!present, "step {seq} is done and {src} is still there"),
+            "pending" => assert!(present, "step {seq} is pending and {src} is gone"),
+            "in_progress" => {}
+            other => panic!("step {seq} is {other} after a kill and a re-drive"),
+        }
+    }
+    if unknown.is_empty() {
+        assert_eq!(
+            status, "applied",
+            "nothing was unknown, so the re-drive finishes"
+        );
+        assert!(files_under(&junk).is_empty());
+    } else {
+        assert_eq!(status, "failed", "a step of unknown outcome parks the plan");
+        assert!(
+            unknown.len() <= 64,
+            "{} steps of unknown outcome, more than one journal batch",
+            unknown.len(),
+        );
+        assert!(
+            unknown.windows(2).all(|w| w[1] == w[0] + 1),
+            "the unknown steps are not one batch: {unknown:?}",
+        );
+    }
+    let trashed = files_under(&root.join(".torrentd-trash"));
+    assert_eq!(files_under(&junk).len() + trashed.len(), FILES);
+    child.stop();
 }
