@@ -240,8 +240,7 @@ pub fn delete_removed_files(
 /// profile is fenced, and queue its first resume save. Returns whether the map
 /// had no entry for it yet.
 ///
-/// For its `add_torrent_alert`, and for a torrent the session holds whose
-/// alert libtorrent dropped (`handlers::dropped`). Idempotent: where the boot
+/// For its `add_torrent_alert`. Idempotent: where the boot
 /// scan already put the torrent in the map from the handle `add_torrent`
 /// returned, the entry is kept rather than reset. The hold and the save are
 /// asked again either way; a pause is idempotent, and a save already queued
@@ -256,6 +255,15 @@ pub fn track(handle: TorrentHandle, ctx: &HandlerCtx<'_>) -> bool {
     // For a torrent already tracked the answer is unused: its entry is kept.
     let has_metadata =
         ctx.state.tracks(handle, &ctx.profile_id) || session_has_metadata(handle, ctx);
+    track_known(handle, has_metadata, ctx)
+}
+
+/// [`track`], with whether the session holds `handle`'s metadata already
+/// known. For the reconciliation of dropped add alerts
+/// (`handlers::dropped`), which learns it for every missing torrent from one
+/// `torrent_statuses` listing rather than a `torrent_details` query each, on
+/// an alert loop already behind.
+pub fn track_known(handle: TorrentHandle, has_metadata: bool, ctx: &HandlerCtx<'_>) -> bool {
     let fresh = ctx
         .state
         .track_added(handle, &ctx.profile_id, has_metadata, ctx.clock.now());
