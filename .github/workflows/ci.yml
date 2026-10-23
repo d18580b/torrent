@@ -26,6 +26,10 @@ env:
   # Must equal the $XDG_CACHE_HOME/torrentd/native default build.rs
   # computes, so a developer and CI resolve the same prefix layout.
   LIBTORRENT_SYS_CACHE_DIR: /home/runner/.cache/torrentd/native
+  # insta never writes or accepts a snapshot here: a snapshot that differs
+  # only fails the test. Its default, `auto`, leaves that to its own guess at
+  # whether it runs in CI. Quoted: a bare `no` is a YAML 1.1 boolean.
+  INSTA_UPDATE: 'no'
 
 jobs:
   fmt:
