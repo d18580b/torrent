@@ -1083,7 +1083,10 @@ pub(crate) fn spawn_run(
             id.clone(),
             run.handles(),
             REANNOUNCE_PACE,
-            || run.cancelled(),
+            {
+                let run = run.clone();
+                move || run.cancelled()
+            },
             run.gate().clone(),
             metrics,
             |h, err| {
@@ -1166,7 +1169,7 @@ enum Batch {
         /// How many of the batch a pause of the profile left unreached.
         halted: Option<usize>,
     },
-    /// Not started: the profile is fenced, or gone.
+    /// Not started: the profile is fenced or gone, or the run was cancelled.
     Stopped,
     /// Fenced while the batch went out; what it resumed was paused again.
     Fenced,
@@ -1184,7 +1187,12 @@ enum Batch {
 /// holds no thread.
 ///
 /// The run stops before a batch once the profile is fenced (`vpn_down`) or
-/// `cancelled` says so, and what it has not reached stays paused. A fence can
+/// `cancelled` says so, and what it has not reached stays paused. `cancelled`
+/// is read again on the blocking pool once the batch has read the profile
+/// unfenced: a lift that replaces this run cancels it before it marks the
+/// profile active, so a batch that reads the profile active only because of
+/// that lift sees the cancel and leaves its torrents to the lift's own run,
+/// rather than resuming them a second time. A fence can
 /// also land while a batch is going out, its walk pausing some of the batch
 /// before this resumes them. So after each batch the profile's mark is read
 /// again: the fence marks before it walks, so either this read sees the mark
@@ -1201,7 +1209,7 @@ pub(crate) async fn resume_paced(
     id: ProfileId,
     handles: &[TorrentHandle],
     pace: Duration,
-    cancelled: impl Fn() -> bool,
+    cancelled: impl Fn() -> bool + Clone + Send + 'static,
     gate: Arc<ResumeGate>,
     metrics: Arc<PromSink>,
     mut refused: impl FnMut(TorrentHandle, torrentd_engine::EngineError),
@@ -1222,9 +1230,14 @@ pub(crate) async fn resume_paced(
         }
         let batch = handles[range].to_vec();
         let ran = tokio::task::spawn_blocking({
-            let (profiles, id, metrics, gate) =
-                (profiles.clone(), id.clone(), metrics.clone(), gate.clone());
-            move || resume_batch(&profiles, &id, batch, &gate, metrics.as_ref())
+            let (profiles, id, metrics, gate, cancelled) = (
+                profiles.clone(),
+                id.clone(),
+                metrics.clone(),
+                gate.clone(),
+                cancelled.clone(),
+            );
+            move || resume_batch(&profiles, &id, batch, &gate, &cancelled, metrics.as_ref())
         })
         .await;
         match ran {
@@ -1267,12 +1280,20 @@ fn resume_batch(
     id: &ProfileId,
     batch: Vec<TorrentHandle>,
     gate: &ResumeGate,
+    cancelled: &dyn Fn() -> bool,
     metrics: &dyn MetricsSink,
 ) -> Batch {
     let Some(entry) = profiles.resolve(id).active() else {
         return Batch::Stopped;
     };
     if entry.health().status == ProfileStatus::VpnDown {
+        return Batch::Stopped;
+    }
+    // Read after the mark: a lift cancels the run it replaces before it marks
+    // the profile active, so a run whose check before this batch passed while
+    // the profile was fenced, and which reads it active only now, sees that
+    // cancel here. Its torrents are the lift's run's to resume.
+    if cancelled() {
         return Batch::Stopped;
     }
     let mut resumed = Vec::with_capacity(batch.len());
@@ -3818,6 +3839,7 @@ mod tests {
                 &id,
                 vec![h],
                 &ResumeGate::default(),
+                &|| false,
                 &PromSink::new(),
             );
             assert!(
@@ -3838,6 +3860,7 @@ mod tests {
             &id,
             vec![handle(3)],
             &ResumeGate::default(),
+            &|| false,
             &PromSink::new(),
         );
         assert!(noted_running(entry, &[3], false).is_empty());
