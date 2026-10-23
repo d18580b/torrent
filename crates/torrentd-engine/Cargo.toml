@@ -41,8 +41,13 @@ libc = { workspace = true }
 [features]
 # The test doubles: `MockEngine`, `MockVpn` and `MockForwarder`. Compiled into
 # this crate's own tests regardless; a dependent crate enables this for its
-# tests (a dev-dependency) or for the alert drill's `fault-injection` build,
-# and a release build of the daemon carries none of them.
+# tests (a dev-dependency) or for the alert drill's `fault-injection` build.
+# That build is optimised too (`cargo build --release` in deploy/Containerfile
+# with `torrentd/fault-injection`), so `--release` alone says nothing: the
+# daemon carries these exactly when built with `fault-injection`, which then
+# refuses to start without TORRENTD_FAULT_INJECTION=1. A build without the
+# feature carries none of them, and `mise run release-features` fails CI if
+# a normal dependency ever turns this on for the workspace's own build.
 test-support = []
 
 [dev-dependencies]

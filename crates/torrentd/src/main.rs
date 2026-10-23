@@ -319,6 +319,32 @@ fn refuse_config(e: &anyhow::Error) -> ! {
     std::process::exit(EX_CONFIG);
 }
 
+/// The variable a `fault-injection` build needs set to `1` before the daemon
+/// or `--check-config` will run.
+const FAULT_INJECTION_ENV: &str = "TORRENTD_FAULT_INJECTION";
+
+/// Refuse to run a `fault-injection` build that nobody asked to run.
+///
+/// That build wraps every session in `FaultEngine` and mounts
+/// `POST /v1/faults`, through which a write-scope token can panic a task,
+/// stall the alert loop, or report a kill switch gone. It exists for the
+/// alert drill (deploy/drill), which sets [`FAULT_INJECTION_ENV`]; a binary
+/// from that build that reached a real host does not, and stops here with
+/// `EX_CONFIG` before it reads a config or raises anything. `built` is
+/// `cfg!(feature = "fault-injection")`, a parameter so a default build's
+/// tests reach both answers; `env` is the variable's value. Only `1` opts in.
+fn fault_injection_refusal(built: bool, env: Option<&std::ffi::OsStr>) -> Option<anyhow::Error> {
+    if !built || env.is_some_and(|v| v == "1") {
+        return None;
+    }
+    Some(anyhow::anyhow!(
+        "this torrentd is a fault-injection build (cargo feature `fault-injection`): it \
+         mounts POST /v1/faults, which injects panics, alert-loop stalls and fake alerts \
+         into the daemon, and exists only for the alert drill (deploy/drill). Deploy a \
+         build without that feature; to run this one anyway, set {FAULT_INJECTION_ENV}=1",
+    ))
+}
+
 /// Load the config with the validation this invocation actually needs.
 ///
 /// The daemon and `--check-config` get the full check, authentication posture
@@ -470,6 +496,15 @@ fn main() -> anyhow::Result<()> {
         eprintln!("error: --config <PATH> is required");
         std::process::exit(2);
     };
+    // The daemon and its pre-flight, before the config is read: a
+    // fault-injection build refuses both unless the drill opted in.
+    if cli.command.is_none() {
+        let env = std::env::var_os(FAULT_INJECTION_ENV);
+        if let Some(e) = fault_injection_refusal(cfg!(feature = "fault-injection"), env.as_deref())
+        {
+            refuse_config(&e);
+        }
+    }
     // 78 is for the daemon and its pre-flight, the two a unit's
     // `RestartPreventExitStatus=78` can see. An operator subcommand keeps
     // exiting 1 for a config it cannot load: its exit statuses are its own
@@ -570,6 +605,52 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fault_injection_build_refuses_to_start_unless_the_variable_is_1() {
+        use std::ffi::OsStr;
+        // A build without the feature never consults the variable.
+        assert!(fault_injection_refusal(false, None).is_none());
+        assert!(fault_injection_refusal(false, Some(OsStr::new("0"))).is_none());
+        // One with it refuses unset, and every value but `1`.
+        for env in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some(" 1"),
+        ] {
+            let e = fault_injection_refusal(true, env.map(OsStr::new))
+                .unwrap_or_else(|| panic!("{env:?} let a fault-injection build start"));
+            let msg = format!("{e:#}");
+            assert!(msg.contains("fault-injection build"), "{msg}");
+            assert!(msg.contains("TORRENTD_FAULT_INJECTION=1"), "{msg}");
+        }
+        assert!(fault_injection_refusal(true, Some(OsStr::new("1"))).is_none());
+    }
+
+    #[test]
+    fn the_alert_drill_opts_its_fault_injection_build_in() {
+        // The drill's daemon is the one fault-injection build meant to run;
+        // without the variable it would exit 78 and the drill would fail on
+        // a dead API rather than on a missing alert. run.sh's `--check-config`
+        // of the generated config runs the same build outside compose.
+        let drill = |file: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/drill")
+                .join(file);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        assert!(
+            drill("compose.yaml").contains(&format!("{FAULT_INJECTION_ENV}: \"1\"")),
+            "deploy/drill/compose.yaml must set {FAULT_INJECTION_ENV}: \"1\" on torrentd",
+        );
+        assert!(
+            drill("run.sh").contains(&format!("-e {FAULT_INJECTION_ENV}=1")),
+            "deploy/drill/run.sh's config check must pass -e {FAULT_INJECTION_ENV}=1",
+        );
+    }
 
     /// The config an existing non-loopback deployment is holding on upgrade:
     /// no `[auth]`, no opt-out, and a bind it cannot move — a container

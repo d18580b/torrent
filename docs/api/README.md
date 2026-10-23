@@ -281,7 +281,9 @@ has:
 
 The alert drill's `fault-injection` build adds `POST /v1/faults`, tagged
 `testing`. No deployment runs that build, and the committed document does not
-include it.
+include it. Such a binary exits 78 at startup unless `TORRENTD_FAULT_INJECTION=1`
+is set, which only the drill does, and exports
+`torrentd_build_fault_injection 1` while it runs.
 
 ## Deleting a torrent's payload
 
