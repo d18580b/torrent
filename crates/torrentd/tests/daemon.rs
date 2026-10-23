@@ -3943,19 +3943,24 @@ fn a_sigterm_saves_every_torrent_and_a_pause_for_the_next_boot() {
     let child = start(&cfg, &log);
     wait_healthy(addr);
     every_one_loaded_once(addr, &ihs, Duration::from_secs(60));
-    // A torrent reads `idle` from its add until its first state update, and
-    // a magnet with no metadata is never `idle` after one: wait them out, so
-    // each phase below is the session's word rather than the placeholder.
+    // A magnet reads `awaiting_metadata` from its add until its first state
+    // update, and one never paused goes on reading it after: only the paused
+    // one leaves it, so wait for that, which a lost pause never does. For the
+    // rest the placeholder cannot be told from the session's word, so the
+    // check that none came back paused holds once their updates have landed,
+    // which the paused one's having landed makes likely but does not prove.
     let phases = poll(
-        "every torrent's first state update",
+        "the paused torrent's first state update (none: the pause made before the SIGTERM was \
+         lost)",
         Duration::from_secs(60),
         || {
             let phases: std::collections::BTreeMap<String, String> =
                 listed(addr).into_iter().collect();
-            phases
-                .values()
-                .all(|phase| phase != "idle" && phase != "unknown")
-                .then_some(phases)
+            (phases.values().all(|phase| phase != "unknown")
+                && phases
+                    .get(&paused)
+                    .is_some_and(|phase| phase != "awaiting_metadata"))
+            .then_some(phases)
         },
     );
     assert_eq!(
