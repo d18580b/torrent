@@ -890,8 +890,13 @@ listen_interfaces = "0.0.0.0:6881"
     /// Issue 455: a reload raising `connections_limit` past the open-file
     /// limit is refused, by the sum boot warns by, and the rest of the reload
     /// still applies. Two profiles at the key's maximum need over two million
-    /// descriptors, past any soft limit the kernel's default `nr_open` allows.
-    /// The refused key does not advance, so the next reload refuses it again.
+    /// descriptors, past the usual soft limit (the kernel's default `nr_open`
+    /// is 1048576). A host whose soft limit holds even that, as systemd's
+    /// raised `fs.nr_open` with `LimitNOFILE=infinity` allows, can refuse
+    /// nothing here, so the test is skipped there; the rule's edges are
+    /// covered against a given limit by
+    /// `only_a_raise_past_the_open_file_limit_is_refused`. The refused key
+    /// does not advance, so the next reload refuses it again.
     #[tokio::test]
     async fn a_connections_limit_past_the_open_file_limit_is_refused_on_reload() {
         use torrentd_engine::MockEngine;
@@ -933,10 +938,10 @@ listen_interfaces = "0.0.0.0:6882"
         let mut raised = boot.clone();
         raised.connections_limit = Some(1_000_000);
         let limit = crate::startup::nofile_soft_limit().expect("RLIMIT_NOFILE is readable");
-        assert!(
-            crate::startup::descriptors_needed(&raised) > limit,
-            "the premise: {limit} holds the raise",
-        );
+        if crate::startup::descriptors_needed(&raised) <= limit {
+            eprintln!("skipped: the soft RLIMIT_NOFILE {limit} holds the largest raise");
+            return;
+        }
 
         let mock = Arc::new(MockEngine::new());
         let engine: Arc<dyn TorrentEngine> = mock.clone();
