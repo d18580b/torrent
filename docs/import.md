@@ -354,18 +354,23 @@ while :; do
   cursor=$(jq -r '.next_cursor // empty' <<<"$page")
   [ -n "$cursor" ] || break
 done
-split -l 1000 acct_a.hashes acct_a.batch.
-for b in acct_a.batch.*; do
-  jq -Rn --arg p acct_a '{profile_id: $p, dry_run: true,
-        selector: {kind: "infohashes", infohashes: [inputs]}}' < "$b" \
-    | curl -sX POST localhost:8080/v1/pool/adoptions -H "Authorization: Bearer $TOKEN" \
-           -H 'content-type: application/json' -d @- \
-    | jq '{fast_path: (.fast_path | length), queued: (.queued_for_verification | length), verify_bytes, refused}'
-done
+rm -f acct_a.batch.*
+if [ -s acct_a.hashes ]; then
+  split -l 1000 acct_a.hashes acct_a.batch.
+  for b in acct_a.batch.*; do
+    jq -Rn --arg p acct_a '{profile_id: $p, dry_run: true,
+          selector: {kind: "infohashes", infohashes: [inputs]}}' < "$b" \
+      | curl -sX POST localhost:8080/v1/pool/adoptions -H "Authorization: Bearer $TOKEN" \
+             -H 'content-type: application/json' -d @- \
+      | jq '{fast_path: (.fast_path | length), queued: (.queued_for_verification | length), verify_bytes, refused}'
+  done
+fi
 ```
 
-Run it again with `state=shared` for cross-seeds, and with `dry_run: false`
-once every batch's dry run reads as expected.
+The `rm -f` clears the previous run's batch files, so a re-run that splits
+into fewer files does not post leftovers; with no matching hashes nothing is
+posted. Run it again with `state=shared` for cross-seeds, and with
+`dry_run: false` once every batch's dry run reads as expected.
 
 **Sizing the hashing.** Every queued torrent is read in full once, so
 `verify_bytes` divided by what the disks holding the payload sustain in
