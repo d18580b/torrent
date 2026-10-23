@@ -3739,10 +3739,11 @@ fn a_sigterm_saves_every_torrent_and_a_pause_for_the_next_boot() {
 ///
 /// The boot claims each resume file's torrent in the assignment registry as
 /// it loads it, so a kill partway through leaves some claimed and some not.
-/// A clean boot is timed first, and each later boot is killed at a fraction
-/// of that, before `/healthz` answers: the HTTP listener binds only once the
-/// boot's scans have returned, so an unanswered `/healthz` is a boot that
-/// had not finished.
+/// A clean boot is timed first, and three later boots are each killed at a
+/// fraction of that while `/healthz` has not yet answered: the HTTP listener
+/// binds only once the boot's scans have returned, so an unanswered
+/// `/healthz` is a boot that had not finished. A kill that finds the boot
+/// already done is repeated sooner.
 #[test]
 #[ignore = "spawns the real daemon + libtorrent with 5,000 torrents; run with --ignored"]
 fn a_sigkill_mid_boot_scan_reloads_every_torrent_once() {
@@ -3782,20 +3783,32 @@ fn a_sigkill_mid_boot_scan_reloads_every_torrent_once() {
     let boot = started.elapsed();
     child.stop();
 
-    for (round, fraction) in [0.15, 0.35, 0.55].into_iter().enumerate() {
-        let child = start(&cfg, &log);
-        std::thread::sleep(boot.mul_f64(fraction));
-        let finished = try_http_as(addr, "GET", "/healthz", None, "localhost")
-            .is_ok_and(|(code, _)| code == 200);
-        sigkill(child);
+    // A boot runs faster or slower than the timed one, so a kill that lands
+    // after it finished is retried at half the delay until one lands inside
+    // it. Every kill, inside the boot or not, must lose nothing.
+    for fraction in [0.6, 0.4, 0.2] {
+        let mut delay = boot.mul_f64(fraction);
+        let mut landed = false;
+        for _ in 0..6 {
+            let child = start(&cfg, &log);
+            std::thread::sleep(delay);
+            let finished = try_http_as(addr, "GET", "/healthz", None, "localhost")
+                .is_ok_and(|(code, _)| code == 200);
+            sigkill(child);
+            assert_eq!(
+                resume_files(p),
+                ihs,
+                "a kill {delay:?} into the boot lost or made a resume file"
+            );
+            if !finished {
+                landed = true;
+                break;
+            }
+            delay /= 2;
+        }
         assert!(
-            !finished,
-            "round {round}: the boot finished before the kill at {fraction} of {boot:?}",
-        );
-        assert_eq!(
-            resume_files(p),
-            ihs,
-            "round {round}: a kill mid-boot lost or made a resume file"
+            landed,
+            "no kill landed inside the boot, down to {delay:?} of a {boot:?} boot",
         );
     }
 
