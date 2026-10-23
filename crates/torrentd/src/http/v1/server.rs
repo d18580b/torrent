@@ -243,6 +243,12 @@ pub struct EventFeed {
     /// so a failure is logged when it starts and when it clears rather than
     /// once a tick.
     pool_read_failing: std::sync::atomic::AtomicBool,
+    /// The state read, kept here rather than in the task so it outlives a
+    /// feed: a read still running when the last stream closes is the one
+    /// the next feed collects, not one it starts beside it. Held across the
+    /// wait for a read, which is why it is an async lock: two streams
+    /// starting a feed at once wait their turn instead of each starting one.
+    read: tokio::sync::Mutex<StateRead>,
 }
 
 impl Default for EventFeed {
@@ -258,6 +264,7 @@ impl EventFeed {
             slots: Arc::new(tokio::sync::Semaphore::new(streams)),
             feed: parking_lot::Mutex::new(None),
             pool_read_failing: std::sync::atomic::AtomicBool::new(false),
+            read: tokio::sync::Mutex::new(StateRead::default()),
         }
     }
 
@@ -294,32 +301,44 @@ impl EventFeed {
         if let Some(rx) = s.events.join() {
             return rx;
         }
-        // Seeded with a real value where the read finishes within a tick, so
-        // the first tick a stream sends carries the daemon's state rather
-        // than a placeholder.
-        let mut read = StateRead::default();
-        read.start(s);
-        read.collect(TICK).await;
+        let last = {
+            let mut read = s.events.read.lock().await;
+            // Another stream started a feed while this one waited for the
+            // read.
+            if let Some(rx) = s.events.join() {
+                return rx;
+            }
+            // Seeded with a real value where the read finishes within a
+            // tick, so the first tick a stream sends carries the daemon's
+            // state rather than a placeholder. A read an earlier feed left
+            // running is collected, not started again.
+            read.start(s);
+            read.collect(TICK).await;
+            read.last
+        };
         let mut feed = s.events.feed.lock();
         if let Some(tx) = feed.as_ref() {
-            // Another stream started a feed while this one read.
+            // Another stream started a feed between this one releasing the
+            // read and taking the feed.
             return tx.subscribe();
         }
-        let (tx, rx) = tokio::sync::watch::channel(with_heartbeat(read.last, s));
+        let (tx, rx) = tokio::sync::watch::channel(with_heartbeat(last, s));
         let tx = Arc::new(tx);
         *feed = Some(Arc::clone(&tx));
-        tokio::spawn(Self::run(Arc::clone(s), tx, read));
+        tokio::spawn(Self::run(Arc::clone(s), tx));
         rx
     }
 
     /// Recompute the fingerprint every [`TICK`] while anything listens.
     ///
-    /// The state is read on a blocking thread, one read at a time. A read
-    /// still running when a tick is due (a session that does not answer)
-    /// does not hold the tick: it goes out with the state last read and the
-    /// heartbeat age as it is now, so the streams keep ticking and a stalled
-    /// alert loop still shows.
-    async fn run(s: Arc<AppState>, tx: Arc<tokio::sync::watch::Sender<u64>>, mut read: StateRead) {
+    /// The state is read on a blocking thread, one read at a time across
+    /// every feed the daemon starts: the read lives on the [`EventFeed`], so
+    /// one left running when a feed ends is the one the next feed waits on.
+    /// A read still running when a tick is due (a session that does not
+    /// answer) does not hold the tick: it goes out with the state last read
+    /// and the heartbeat age as it is now, so the streams keep ticking and a
+    /// stalled alert loop still shows.
+    async fn run(s: Arc<AppState>, tx: Arc<tokio::sync::watch::Sender<u64>>) {
         let mut shutdown = s.shutdown.subscribe();
         loop {
             tokio::select! {
@@ -338,11 +357,15 @@ impl EventFeed {
                     return;
                 }
             }
-            read.start(&s);
-            read.collect(TICK / 2).await;
+            let last = {
+                let mut read = s.events.read.lock().await;
+                read.start(&s);
+                read.collect(TICK / 2).await;
+                read.last
+            };
             // `send_replace` stores the value whether or not anyone is
             // waiting; each stream decides for itself whether it changed.
-            tx.send_replace(with_heartbeat(read.last, &s));
+            tx.send_replace(with_heartbeat(last, &s));
         }
         // The daemon is going away: every stream ends on the same signal,
         // and a stream opened later finds no feed and starts one that ends
@@ -517,8 +540,8 @@ const READ_STALL: Duration = IDLE_TICK;
 
 /// The feed's read of [`state_fingerprint`], on a blocking thread, at most
 /// one at a time: a read that never returns holds one thread, not one per
-/// tick.
-#[derive(Default)]
+/// tick or one per feed.
+#[derive(Debug, Default)]
 struct StateRead {
     /// The value the last finished read returned.
     last: u64,
@@ -870,21 +893,11 @@ mod tests {
     #[tokio::test]
     async fn a_state_read_that_does_not_return_does_not_hold_the_ticks() {
         let s = Arc::new(steady());
-        let (release, blocked) = std::sync::mpsc::channel::<()>();
-        let read = StateRead {
-            pending: Some((
-                tokio::task::spawn_blocking(move || {
-                    let _ = blocked.recv();
-                    0
-                }),
-                std::time::Instant::now(),
-            )),
-            ..StateRead::default()
-        };
-        let (tx, mut rx) = tokio::sync::watch::channel(with_heartbeat(read.last, &s));
+        let release = block_state_read(&s).await;
+        let (tx, mut rx) = tokio::sync::watch::channel(with_heartbeat(0, &s));
         let tx = Arc::new(tx);
         *s.events.feed.lock() = Some(Arc::clone(&tx));
-        tokio::spawn(EventFeed::run(Arc::clone(&s), tx, read));
+        tokio::spawn(EventFeed::run(Arc::clone(&s), tx));
         let before = *rx.borrow_and_update();
 
         // The alert loop stalls: its heartbeat age jumps.
@@ -896,6 +909,72 @@ mod tests {
             .expect("no tick went out while the state read was blocked")
             .unwrap();
         assert_ne!(*rx.borrow(), before, "the tick did not carry the heartbeat");
+    }
+
+    /// Put a state read on `s`'s feed that does not return until the
+    /// returned sender sends or drops.
+    async fn block_state_read(s: &AppState) -> std::sync::mpsc::Sender<()> {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        s.events.read.lock().await.pending = Some((
+            tokio::task::spawn_blocking(move || {
+                let _ = blocked.recv();
+                0
+            }),
+            std::time::Instant::now(),
+        ));
+        release
+    }
+
+    /// The id of the state read running on `s`'s feed, if one is.
+    async fn pending_read(s: &AppState) -> Option<tokio::task::Id> {
+        s.events
+            .read
+            .lock()
+            .await
+            .pending
+            .as_ref()
+            .map(|(task, _)| task.id())
+    }
+
+    /// A read that has not returned when its feed ends is the read the next
+    /// feed waits on, and two streams starting a feed at once start one
+    /// read between them: a wedged session holds one blocking thread however
+    /// often the feed closes and reopens.
+    #[tokio::test]
+    async fn a_restarted_feed_waits_on_the_read_the_last_one_left_running() {
+        let s = Arc::new(steady());
+        let release = block_state_read(&s).await;
+        let stuck = pending_read(&s).await.expect("a read is running");
+
+        // Two streams racing to start the first feed.
+        let (a, b) = tokio::join!(EventFeed::subscribe(&s), EventFeed::subscribe(&s));
+        assert!(s.events.is_running());
+        assert_eq!(pending_read(&s).await, Some(stuck), "a second read started");
+
+        // The last stream closes; the feed ends at its next tick.
+        drop((a, b));
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while s.events.is_running() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the feed did not end with its last stream");
+        assert_eq!(
+            pending_read(&s).await,
+            Some(stuck),
+            "the ended feed dropped its read"
+        );
+
+        // The next stream starts a feed that waits on the same read.
+        let _c = EventFeed::subscribe(&s).await;
+        assert!(s.events.is_running());
+        assert_eq!(
+            pending_read(&s).await,
+            Some(stuck),
+            "the restarted feed started a read beside the one still running"
+        );
+        release.send(()).unwrap();
     }
 
     #[test]
