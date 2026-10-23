@@ -3,9 +3,11 @@
 //! loop is falling behind.
 //!
 //! When the lost types include the resume-data answers, every save in flight
-//! is asked for again: libtorrent reports which *types* it dropped and never
-//! which torrents, so any of them may be one whose answer is gone, and a save
-//! nobody answers holds the shutdown drain open until its deadline.
+//! to the profile's session is asked for again: libtorrent reports which
+//! *types* it dropped and never which torrents, so any of them may be one
+//! whose answer is gone, and a save nobody answers holds the shutdown drain
+//! open until its deadline. Another profile's session has a queue of its own,
+//! and its saves stay in flight.
 //!
 //! When they include `add_torrent_alert`, the session's torrents are compared
 //! against the state map and every one it is missing is tracked, since the
@@ -77,12 +79,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         // "not modified" about data that was never written.
         let requeued = ctx
             .state
-            .requeue_in_flight_resume_saves(ResumeFlags::empty());
+            .requeue_in_flight_resume_saves(&ctx.profile_id, ResumeFlags::empty());
         warn!(
             target: "torrentd_engine::handler::dropped",
             torrent_count = requeued,
             "resume-data answers were among the dropped alerts; asking again for every save in \
-             flight",
+             flight to this profile's session",
         );
         // Under the profile whose queue overflowed, like every other counter
         // this loop emits: that is the session falling behind.
@@ -390,6 +392,31 @@ mod tests {
                 "type {ty}",
             );
         }
+    }
+
+    #[test]
+    fn a_dropped_resume_answer_leaves_another_profiles_saves_in_flight() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        let now = std::time::Instant::now();
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        for (b, profile) in [(1u8, &p), (2, &q), (3, &q)] {
+            let h = TorrentHandle {
+                id: u64::from(b),
+                infohash: InfoHash([b; 20]),
+            };
+            assert!(state.track_added(h, profile, now));
+            state.queue_resume_save(h.infohash, ResumeFlags::ONLY_IF_MODIFIED);
+        }
+        state.dispatch_resume_saves(usize::MAX);
+        // `run` handles the overflow in profile `p`.
+        run(&state, &metrics, [1u64 << SAVE_RESUME_DATA_TYPE, 0]);
+        assert_eq!(state.resume_saves_in_flight(), 2, "q's two are still owed");
+        assert_eq!(
+            state.dispatch_resume_saves(usize::MAX),
+            vec![(InfoHash([1; 20]), ResumeFlags::empty())],
+        );
+        assert_eq!(metrics.count_for("resume_saves_requeued_total"), 1);
     }
 
     #[test]
