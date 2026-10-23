@@ -188,14 +188,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         }
         Msg::DriftChecked(Ok(report)) => {
             state.checking_drift = false;
-            let toast = if report.drifted.is_empty() {
-                Toast::success("drift check: nothing drifted")
-            } else {
-                Toast::info(format!(
-                    "drift check: {} torrents drifted — rescan and verify them",
-                    report.drifted.len()
-                ))
-            };
+            let toast = drift_toast(&report);
             state.drift = Some(report);
             let mut effects = vec![Effect::toast(toast)];
             effects.extend(load(state, ctx));
@@ -205,6 +198,38 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             state.checking_drift = false;
             vec![Effect::now(failed("checking for drift", failure))]
         }
+    }
+}
+
+/// What a drift check found and what it could not see, both at once: an
+/// unmounted root must neither read as "nothing drifted" nor hide the
+/// torrents that did drift under another root.
+fn drift_toast(report: &types::DriftReport) -> Toast {
+    let drifted = (!report.drifted.is_empty()).then(|| {
+        format!(
+            "{} torrents drifted — rescan and verify them",
+            report.drifted.len()
+        )
+    });
+    let unseen = if !report.unreadable_roots.is_empty() {
+        Some(format!(
+            "{} roots could not be read — {} torrents unchecked",
+            report.unreadable_roots.len(),
+            report.unchecked.len()
+        ))
+    } else if !report.unchecked.is_empty() {
+        Some(format!("{} torrents unchecked", report.unchecked.len()))
+    } else {
+        None
+    };
+    match (drifted, unseen) {
+        (None, None) => Toast::success("drift check: nothing drifted"),
+        (None, Some(unseen)) if report.unreadable_roots.is_empty() => {
+            Toast::info(format!("drift check: nothing drifted, {unseen}"))
+        }
+        (None, Some(unseen)) => Toast::info(format!("drift check: {unseen}")),
+        (Some(drifted), None) => Toast::info(format!("drift check: {drifted}")),
+        (Some(drifted), Some(unseen)) => Toast::info(format!("drift check: {drifted}; {unseen}")),
     }
 }
 
@@ -572,6 +597,56 @@ fn result_lines<'a>(state: &State, ctx: &Ctx<'_>, wide: bool) -> Vec<Line<'a>> {
             fmt::count(d.files_vanished)
         )));
         lines.push(Line::from(spans));
+        // What the check could not see, so an unmounted root does not pass
+        // for a clean check. On a narrow screen the roots take a line of
+        // their own.
+        let mut unseen = Vec::new();
+        let warn = |text: String| {
+            Line::from(vec![
+                label(""),
+                Span::styled(format!("◐ {text}"), theme.fg(Tone::Warn)),
+            ])
+        };
+        if !d.unreadable_roots.is_empty() {
+            let shown = if wide { 2 } else { 1 };
+            let mut roots = d
+                .unreadable_roots
+                .iter()
+                .take(shown)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if d.unreadable_roots.len() > shown {
+                roots.push_str(&format!(" +{}", d.unreadable_roots.len() - shown));
+            }
+            let roots = format!("unreadable: {roots}");
+            if wide {
+                unseen.push(roots);
+            } else {
+                lines.push(warn(roots));
+            }
+        }
+        if !d.unmounted_dirs.is_empty() {
+            unseen.push(format!(
+                "{} unmounted dirs",
+                fmt::count(d.unmounted_dirs.len() as i64)
+            ));
+        }
+        if d.files_unreadable > 0 {
+            unseen.push(format!(
+                "{} files unstatable",
+                fmt::count(d.files_unreadable)
+            ));
+        }
+        if !d.unchecked.is_empty() {
+            unseen.push(format!(
+                "{} unchecked",
+                fmt::count(d.unchecked.len() as i64)
+            ));
+        }
+        if !unseen.is_empty() {
+            lines.push(warn(unseen.join(" · ")));
+        }
     }
     lines
 }

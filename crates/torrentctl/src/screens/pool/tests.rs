@@ -498,7 +498,7 @@ fn scanning_asks_first_and_drift_runs_once_at_a_time() {
         "already checking"
     );
     let report =
-        testing::from_json(json!({"drifted": [hash(9)], "files_changed": 2, "files_vanished": 1}));
+        drift_report(json!({"drifted": [hash(9)], "files_changed": 2, "files_vanished": 1}));
     let effects = send(
         &mut state,
         Msg::Overview(overview::Msg::DriftChecked(Ok(report))),
@@ -506,6 +506,85 @@ fn scanning_asks_first_and_drift_runs_once_at_a_time() {
     );
     assert_eq!(effects, 2, "a toast and a reload");
     assert!(!state.overview.checking_drift);
+}
+
+/// A drift report: `fields` over one that found and missed nothing.
+fn drift_report(fields: serde_json::Value) -> types::DriftReport {
+    let mut report = json!({"drifted": [], "files_changed": 0, "files_vanished": 0,
+        "files_unreadable": 0, "unreadable_roots": [], "unmounted_dirs": [], "unchecked": []});
+    for (k, v) in fields.as_object().unwrap() {
+        report[k] = v.clone();
+    }
+    testing::from_json(report)
+}
+
+/// The toast a drift report raises.
+fn drift_toast(report: types::DriftReport) -> crate::app::Toast {
+    let mut state = with_overview();
+    let server = testing::server(true, true);
+    let effects = testing::with_ctx(Some(&server), |ctx| {
+        update(
+            &mut state,
+            Msg::Overview(overview::Msg::DriftChecked(Ok(report))),
+            ctx,
+        )
+    });
+    match effects.into_iter().next().map(testing::deliver) {
+        Some(crate::app::Msg::Toast(toast)) => toast,
+        other => panic!("a toast first, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_drift_check_that_could_not_read_a_root_does_not_say_nothing_drifted() {
+    use crate::app::ToastKind;
+
+    let clean = drift_toast(drift_report(json!({})));
+    assert_eq!(
+        (clean.kind, clean.text.as_str()),
+        (ToastKind::Success, "drift check: nothing drifted")
+    );
+    // An unmounted root: nothing marked, everything over it unchecked.
+    let unmounted = drift_toast(drift_report(
+        json!({"unreadable_roots": ["/srv/pool/a"], "unchecked": [hash(9), hash(10)]}),
+    ));
+    assert_eq!(unmounted.kind, ToastKind::Info);
+    assert_eq!(
+        unmounted.text,
+        "drift check: 1 roots could not be read — 2 torrents unchecked"
+    );
+    let unstatable = drift_toast(drift_report(
+        json!({"files_unreadable": 1, "unchecked": [hash(9)]}),
+    ));
+    assert_eq!(unstatable.kind, ToastKind::Info);
+    assert_eq!(
+        unstatable.text,
+        "drift check: nothing drifted, 1 torrents unchecked"
+    );
+    // Drift under a readable root still asks for a rescan when another
+    // root could not be read.
+    let both = drift_toast(drift_report(json!({
+        "drifted": [hash(11)],
+        "files_changed": 1,
+        "unreadable_roots": ["/srv/pool/a"],
+        "unchecked": [hash(9), hash(10)]
+    })));
+    assert_eq!(both.kind, ToastKind::Info);
+    assert_eq!(
+        both.text,
+        "drift check: 1 torrents drifted — rescan and verify them; \
+         1 roots could not be read — 2 torrents unchecked"
+    );
+    // Drift alongside unstatable files keeps the unchecked count too.
+    let drifted_unstatable = drift_toast(drift_report(json!({
+        "drifted": [hash(11)],
+        "files_unreadable": 1,
+        "unchecked": [hash(9)]
+    })));
+    assert_eq!(
+        drifted_unstatable.text,
+        "drift check: 1 torrents drifted — rescan and verify them; 1 torrents unchecked"
+    );
 }
 
 // The tree.
@@ -2095,9 +2174,11 @@ fn the_overview_renders() {
         "torrents": 1234, "matched": 300, "partial": 50, "missing": 40, "overlap": 11, "shared": 6,
         "drifted": 3, "errors": 2}),
     ));
-    state.overview.drift = Some(testing::from_json(
+    state.overview.drift = Some(drift_report(
         json!({"drifted": [hash(9), hash(10), hash(11)],
-        "files_changed": 4, "files_vanished": 1}),
+        "files_changed": 4, "files_vanished": 1, "files_unreadable": 2,
+        "unreadable_roots": ["/srv/pool/b", "/srv/pool/c", "/srv/pool/d"],
+        "unmounted_dirs": ["/srv/pool/a/disk"], "unchecked": [hash(12)]}),
     ));
     for (w, h) in [(80, 24), (160, 48)] {
         snapshot(&format!("pool_overview_{w}x{h}"), shot(&state, w, h, false));

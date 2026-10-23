@@ -137,8 +137,15 @@ pub fn check(cfg: &Config) -> anyhow::Result<()> {
     let roots: HashMap<i64, std::path::PathBuf> = store.roots()?.into_iter().collect();
     let report = torrentd_pool::drift::detect(&mut store, |id| roots.get(&id).cloned())?;
 
+    for line in unseen_lines(&report) {
+        println!("{line}");
+    }
     if report.drifted.is_empty() {
-        println!("no drift: every claimed file matches the indexed snapshot");
+        if report.unchecked.is_empty() && report.files_unreadable == 0 {
+            println!("no drift: every claimed file matches the indexed snapshot");
+        } else {
+            println!("no drift in what could be checked");
+        }
         return Ok(());
     }
     println!(
@@ -158,6 +165,34 @@ pub fn check(cfg: &Config) -> anyhow::Result<()> {
     // only libtorrent re-hashing the payload can settle that.
     println!("\nrun a verification pass over these before trusting them to seed");
     Ok(())
+}
+
+/// What a drift check could not see, one line each: printed ahead of the
+/// verdict so an unmounted root reads as such, not as a clean check.
+fn unseen_lines(report: &torrentd_pool::drift::DriftReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    for root in &report.unreadable_roots {
+        lines.push(format!(
+            "root unreadable (missing, unlistable, or empty — unmounted?): {}",
+            root.display()
+        ));
+    }
+    for dir in &report.unmounted_dirs {
+        lines.push(format!("directory looks unmounted: {}", dir.display()));
+    }
+    if report.files_unreadable > 0 {
+        lines.push(format!(
+            "{} claimed file(s) could not be stated (permission or I/O error)",
+            report.files_unreadable
+        ));
+    }
+    if !report.unchecked.is_empty() {
+        lines.push(format!(
+            "{} torrent(s) left unchecked: their payload could not be seen",
+            report.unchecked.len()
+        ));
+    }
+    lines
 }
 
 /// List the bytes no torrent in the library claims — the "what do I even have"
@@ -381,6 +416,26 @@ listen_interfaces = "0.0.0.0:6881"
 
         drop(daemon);
         scan(&cfg).expect("the scan runs once the daemon is gone");
+    }
+
+    #[test]
+    fn a_check_names_what_it_could_not_see() {
+        use torrentd_pool::drift::DriftReport;
+
+        assert!(unseen_lines(&DriftReport::default()).is_empty());
+        let report = DriftReport {
+            files_unreadable: 2,
+            unreadable_roots: vec!["/mnt/a".into()],
+            unmounted_dirs: vec!["/mnt/b/disk".into()],
+            unchecked: vec!["x".into(), "y".into(), "z".into()],
+            ..DriftReport::default()
+        };
+        let lines = unseen_lines(&report);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("root unreadable") && lines[0].ends_with("/mnt/a"));
+        assert!(lines[1].ends_with("/mnt/b/disk"));
+        assert!(lines[2].starts_with("2 claimed file(s)"));
+        assert!(lines[3].starts_with("3 torrent(s) left unchecked"));
     }
 
     #[test]
