@@ -91,11 +91,11 @@ const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 16;
 /// to acknowledge, so a silent peer is dropped within 30 s. It does not bound
 /// a peer that answers pings and sends nothing else, nor a connection that
 /// sends no byte at all (`docs/running.md` §7).
-const HTTP2_KEEP_ALIVE: kynos::server::protocol::Http2KeepAlive =
-    kynos::server::protocol::Http2KeepAlive {
-        interval: std::time::Duration::from_secs(20),
-        timeout: std::time::Duration::from_secs(10),
-    };
+const HTTP2_KEEP_ALIVE: kynos::server::protocol::http2::Http2KeepAlive =
+    kynos::server::protocol::http2::Http2KeepAlive::new(
+        std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(10),
+    );
 
 /// How long the HTTP server's graceful shutdown waits for open requests
 /// before cutting them off. A drain that runs out exits 0 with a warning
@@ -3983,11 +3983,11 @@ async fn serve_once(
         .listener(listener)
         .max_connections(HTTP_MAX_CONNECTIONS)
         .http1(
-            kynos::server::protocol::Http1Config::default()
+            kynos::server::protocol::http1::Http1Config::default()
                 .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
         )
         .http2(
-            kynos::server::protocol::Http2Config::default()
+            kynos::server::protocol::http2::Http2Config::default()
                 .keep_alive(Some(HTTP2_KEEP_ALIVE))
                 .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS),
         )

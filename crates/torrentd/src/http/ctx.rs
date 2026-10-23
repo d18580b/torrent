@@ -11,10 +11,14 @@ use crate::http::OpenApiJson;
 
 /// What kynos hands each request: the daemon's shared state, the rendered
 /// OpenAPI document, and the authenticator for the bearer scheme.
-#[derive(Clone)]
+///
+/// Handlers are provided the state and the document; the authenticator is
+/// reached only through [`Authenticates`].
+#[derive(Clone, kynos::Provider)]
 pub struct AppCtx {
     pub state: Arc<AppState>,
     openapi: OpenApiJson,
+    #[provide(skip)]
     gate: Gate,
 }
 
@@ -31,18 +35,6 @@ impl AppCtx {
             openapi,
             gate,
         }
-    }
-}
-
-impl kynos::di::Provides<OpenApiJson> for AppCtx {
-    fn provide(&self) -> OpenApiJson {
-        self.openapi.clone()
-    }
-}
-
-impl kynos::di::Provides<Arc<AppState>> for AppCtx {
-    fn provide(&self) -> Arc<AppState> {
-        Arc::clone(&self.state)
     }
 }
 

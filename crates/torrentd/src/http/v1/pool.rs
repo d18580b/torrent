@@ -535,7 +535,6 @@ pub struct TreeQuery {
     /// Resume after the last entry of the previous page.
     pub cursor: Option<String>,
     /// Entries per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -803,7 +802,6 @@ pub struct PoolTorrentQuery {
     /// Resume after the last torrent of the previous page.
     pub cursor: Option<String>,
     /// Torrents per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -1813,7 +1811,6 @@ pub struct PlanQuery {
     /// Resume after the last plan of the previous page.
     pub cursor: Option<String>,
     /// Plans per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -2090,7 +2087,6 @@ pub struct PlanStepQuery {
     /// inline `steps`, with its `steps_next_cursor`.
     pub cursor: Option<String>,
     /// Steps per page; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 

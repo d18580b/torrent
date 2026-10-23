@@ -138,7 +138,7 @@ async fn events(cov: &Arc<Coverage>) {
     resp.assert_status(kynos::http::StatusCode::OK);
     let events = resp.events();
     let first = events.first().expect("at least one tick");
-    assert_eq!(first.name.as_deref(), Some("tick"));
+    assert_eq!(first.event.as_deref(), Some("tick"));
     assert_eq!(first.retry, Some(5_000));
     let data: serde_json::Value = serde_json::from_str(&first.data).unwrap();
     assert_eq!(data["kind"], "tick");

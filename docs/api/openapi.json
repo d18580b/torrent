@@ -79,7 +79,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -243,7 +242,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -367,7 +365,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -491,7 +488,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -659,7 +655,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -820,7 +815,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -942,7 +936,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1138,7 +1131,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1355,7 +1347,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1425,6 +1416,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1704,28 +1717,6 @@
                 }
               }
             }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -1762,7 +1753,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1963,7 +1953,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2285,7 +2274,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2479,7 +2467,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2695,7 +2682,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2911,7 +2897,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3154,7 +3139,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3418,7 +3402,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3608,7 +3591,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3743,7 +3725,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3930,7 +3911,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4000,6 +3980,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4183,28 +4185,6 @@
                 }
               }
             }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -4230,7 +4210,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4376,7 +4355,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4533,7 +4511,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4734,7 +4711,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4924,7 +4900,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5048,7 +5023,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5172,7 +5146,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5391,7 +5364,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5694,7 +5666,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5991,7 +5962,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6222,7 +6192,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6390,7 +6359,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6603,7 +6571,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6842,7 +6809,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6927,6 +6893,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7096,28 +7084,6 @@
               }
             }
           },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "408": {
             "description": "the request body did not arrive within the configured limit",
             "content": {
@@ -7176,7 +7142,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -7397,7 +7362,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -7662,7 +7626,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -7941,6 +7904,28 @@
               }
             }
           },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "415": {
             "description": "Unsupported Media Type",
             "content": {
@@ -8153,28 +8138,6 @@
                 }
               }
             }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         }
       }
@@ -8214,7 +8177,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -8284,6 +8246,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8457,28 +8441,6 @@
                 }
               }
             }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -8537,7 +8499,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -8607,6 +8568,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8823,28 +8806,6 @@
                 }
               }
             }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -8880,7 +8841,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -8950,6 +8910,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9108,28 +9090,6 @@
                 }
               }
             }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -9165,7 +9125,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -9235,6 +9194,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9453,28 +9434,6 @@
               }
             }
           },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "408": {
             "description": "the request body did not arrive within the configured limit",
             "content": {
@@ -9543,7 +9502,6 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
-                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -9628,6 +9586,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9860,28 +9840,6 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "the request body exceeds the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
                         }
                       }
                     }

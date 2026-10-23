@@ -24,7 +24,7 @@ mod tests;
 use std::sync::Arc;
 
 use kynos::extract::body::binary::Binary;
-use kynos::extract::media;
+use kynos::http::media;
 use kynos::openapi::Document;
 use kynos::openapi::ExternalDocumentation;
 use kynos::openapi::Info;
@@ -57,24 +57,23 @@ pub async fn get_openapi(Inject(doc): Inject<OpenApiJson>) -> Binary<media::Json
 /// document — each need the whole of it.
 macro_rules! daemon_router {
     () => {{
+        let request_id = kynos::middleware::request_id::RequestId::new()
+            .source(crate::http::headers::RandomRequestId);
+        // One event per request at each end, the closing one carrying the
+        // status, the latency and the request id: the line an operator
+        // quoting `X-Request-Id` is looking for. Read from the `RequestId`
+        // mounted below, so the two agree on the header and on whether an
+        // inbound id is echoed.
+        let trace = kynos::middleware::trace::Trace::new().correlating(&request_id);
         let router = Router::<AppCtx>::new()
             .info(info())
             // On the router rather than a group, so every routed response —
             // the root routes included — carries them, and one id source
             // serves every request. kynos answers an unknown path or method
             // before any interceptor runs, so those 404/405s carry neither.
-            .intercept(
-                kynos::middleware::request_id::RequestId::new()
-                    .source(crate::http::headers::RandomRequestId),
-            )
+            .intercept(request_id)
             .intercept(crate::http::headers::ApiHeaders)
-            // One event per request at each end, the closing one carrying the
-            // status, the latency and the request id: the line an operator
-            // quoting `X-Request-Id` is looking for.
-            .observe(
-                kynos::middleware::trace::Trace::new()
-                    .correlating::<kynos::middleware::request_id::XRequestId>(),
-            )
+            .observe(trace)
             .not_found(FallbackPolicy::Problem)
             .method_not_allowed(FallbackPolicy::Problem)
             .trailing_slashes(TrailingSlashPolicy::Strict)

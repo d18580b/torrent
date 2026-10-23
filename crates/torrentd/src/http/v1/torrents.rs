@@ -331,7 +331,6 @@ pub struct ListTorrentsQuery {
     /// Resume after the page this cursor ended.
     pub cursor: Option<String>,
     /// Torrents per page, 1 to 1000; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 
@@ -2362,7 +2361,6 @@ pub struct ListFilesQuery {
     /// Resume after the page this cursor ended.
     pub cursor: Option<String>,
     /// Files per page, 1 to 1000; 100 when absent.
-    #[schema(minimum = 1, maximum = 1000)]
     pub limit: Option<PageLimit>,
 }
 

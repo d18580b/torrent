@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use kynos::extract::body::binary::Binary;
-use kynos::extract::media::MediaType;
+use kynos::http::media::MediaType;
 use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use torrentd_engine::MetricsSink;
