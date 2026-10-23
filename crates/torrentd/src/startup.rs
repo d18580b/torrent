@@ -3452,12 +3452,16 @@ impl DaemonHandle {
                 .map(|(ih, _)| ih)
                 .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
                 .collect();
+            // Read here, before the server below serves: a plan an API apply
+            // claims during the wait is that apply's, not the re-drive's.
+            let plans = crate::pool_apply::unfinished_at_boot(&pool);
             crate::pool_apply::spawn_resume_unfinished(
                 pool,
                 source.clone(),
                 state.clone(),
                 Arc::clone(&work),
                 loaded,
+                plans,
             );
         }
 
