@@ -59,6 +59,14 @@ fn null_and_unknown_handle_ops_are_safe() {
         unsafe { lt_torrent_unset_flags(ptr::null_mut(), 1, LT_TF_DISABLE_DHT) },
         LT_ERR
     );
+    assert_eq!(
+        unsafe { lt_torrent_enforce_no_download(s, 999_999) },
+        LT_ERR
+    );
+    assert_eq!(
+        unsafe { lt_torrent_enforce_no_download(ptr::null_mut(), 1) },
+        LT_ERR
+    );
     assert_eq!(unsafe { lt_torrent_force_recheck(s, 0) }, LT_ERR);
     assert_eq!(unsafe { lt_torrent_force_recheck(s, 999_999) }, LT_ERR);
     assert_eq!(

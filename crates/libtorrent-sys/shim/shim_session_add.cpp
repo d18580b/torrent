@@ -269,12 +269,21 @@ void apply_settings_from_json(lt::settings_pack& pack, const char* json) {
 //
 // The Rust side states the same set once, as `FORBIDDEN_TORRENT_FLAGS` in
 // libtorrent-safe's session.rs; a change to one is a change to both.
-const lt::torrent_flags_t forbidden_torrent_flags =
+// lt_torrent_enforce_no_download clears it from a live torrent too.
+}  // namespace
+
+namespace lt_shim {
+
+extern const lt::torrent_flags_t forbidden_torrent_flags =
       lt::torrent_flags::auto_managed
     | lt::torrent_flags::share_mode
     | lt::torrent_flags::super_seeding
     | lt::torrent_flags::sequential_download
     | lt::torrent_flags::stop_when_ready;
+
+}  // namespace lt_shim
+
+namespace {
 
 // The no-download invariant, applied last on every add path so neither the
 // caller nor resume data can undo it: upload_mode on, and every flag that can

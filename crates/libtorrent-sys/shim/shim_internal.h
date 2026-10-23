@@ -320,6 +320,10 @@ namespace lt_shim {
 // shim_session_add.cpp: caller bits to libtorrent flags and nothing else.
 lt::torrent_flags_t translate_torrent_flags(std::uint32_t caller_flags);
 
+// shim_session_add.cpp: the flags no torrent this daemon holds may carry.
+// Every add clears them; lt_torrent_enforce_no_download clears them again.
+extern const lt::torrent_flags_t forbidden_torrent_flags;
+
 // shim_session_add.cpp: replace the metadata's trackers with the caller's.
 void apply_tracker_override(lt::add_torrent_params& atp,
                             const char* const* urls, const int* tiers,
