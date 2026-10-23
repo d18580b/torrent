@@ -463,7 +463,7 @@ impl PoolService {
                 return None;
             }
         };
-        let bytes = match std::fs::read(&path) {
+        let bytes = match torrentd_pool::scan::read_capped(&path) {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -2334,7 +2334,7 @@ fn admit_adoption(
         release_dropped_claim(pool, Writer::Held(store), registry, &item);
         return Admission::Skipped;
     };
-    let bytes = match std::fs::read(&item.torrent_path) {
+    let bytes = match torrentd_pool::scan::read_capped(&item.torrent_path) {
         Ok(b) => b,
         Err(e) => {
             warn!(
@@ -3055,7 +3055,7 @@ fn refuse_if_rekeyed(infohash: &str, torrent_path: &std::path::Path) -> Result<(
     let Some(filed) = libtorrent_safe::InfoHash::from_hex(infohash) else {
         return Ok(());
     };
-    let Ok(bytes) = std::fs::read(torrent_path) else {
+    let Ok(bytes) = torrentd_pool::scan::read_capped(torrent_path) else {
         return Ok(());
     };
     let Ok(hashes) = libtorrent_safe::info_hashes_from_torrent(&bytes) else {
@@ -3201,7 +3201,7 @@ pub fn execute_adopt(
                 )
                 .into()
             };
-            let resume = match std::fs::read(&resume_path) {
+            let resume = match torrentd_pool::scan::read_capped(&resume_path) {
                 Ok(b) => b,
                 Err(e) if files_renamed => {
                     return Err(no_fallback(&format!("resume data unreadable: {e}")));
@@ -3223,7 +3223,7 @@ pub fn execute_adopt(
             // The .torrent rides along because resume data written without
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
-            let torrent = std::fs::read(&torrent_path).ok();
+            let torrent = torrentd_pool::scan::read_capped(&torrent_path).ok();
             let params = adoption_resume_params(
                 profile_cfg,
                 resume,
@@ -3401,7 +3401,7 @@ fn enqueue_verify(
     // the file when it admits the item; one with a list cannot pass the guard
     // without its trackers, so a `.torrent` that cannot be read is refused.
     if !profile_cfg.allowed_tracker_domains.is_empty() {
-        let bytes = std::fs::read(&torrent_path)
+        let bytes = torrentd_pool::scan::read_capped(&torrent_path)
             .map_err(|e| format!("cannot read the .torrent to check its trackers: {e}"))?;
         let params = verify_add_params(
             profile_cfg,
@@ -3781,6 +3781,21 @@ mod tests {
         );
         let orphans = pool.with_store(|s| s.orphan_files(root_id, "").unwrap());
         assert_eq!(orphans, vec!["seed/a".to_owned()]);
+    }
+
+    /// `torrent` with an unknown top-level key holding a cap's worth of
+    /// bytes put in front: the same torrent to a parser, past the library
+    /// read cap, so only the cap keeps it from being read whole.
+    fn padded_past_the_cap(torrent: &[u8]) -> Vec<u8> {
+        let pad = torrentd_pool::scan::MAX_LIBRARY_FILE_BYTES as usize;
+        let mut big = format!("d1:a{pad}:").into_bytes();
+        big.resize(big.len() + pad, 0);
+        big.extend_from_slice(&torrent[1..]);
+        assert_eq!(
+            libtorrent_safe::info_hashes_from_torrent(&big).unwrap(),
+            libtorrent_safe::info_hashes_from_torrent(torrent).unwrap(),
+        );
+        big
     }
 
     fn pending(ih: InfoHash, profile: &str) -> super::PendingVerify {
@@ -4476,7 +4491,7 @@ mod tests {
             &pool,
             &profiles,
             &ih.to_hex(),
-            torrent,
+            torrent.clone(),
             dir.path().join("payload"),
             None,
             ProfileId::new("acct"),
@@ -4485,6 +4500,28 @@ mod tests {
         .unwrap_err();
         assert!(e.isolation);
         assert!(e.reason.contains("no tracker"), "{}", e.reason);
+
+        // Issue #543: past the library read cap the `.torrent` is not read,
+        // so the allow-list cannot pass it, its trackers allowed or not.
+        let bare = std::fs::read(&torrent).unwrap();
+        std::fs::write(&torrent, padded_past_the_cap(&bare)).unwrap();
+        let e = super::enqueue_verify(
+            &pool,
+            &profiles,
+            &ih.to_hex(),
+            torrent,
+            dir.path().join("payload"),
+            Some(&resume),
+            ProfileId::new("acct"),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            e.reason.contains("cannot read the .torrent"),
+            "{}",
+            e.reason
+        );
+        assert!(pool.verify_queue().pop_pending().is_none());
     }
 
     /// `execute_adopt` hands the verify queue the `.fastresume` the scan
@@ -4642,6 +4679,78 @@ mod tests {
         assert_eq!(pool.library_torrent(&InfoHash([0x77; 20])), None);
     }
 
+    /// A library over `dir` whose one torrent's `.torrent` and `.fastresume`
+    /// the scan indexed and paired for a fast-path adopt into `p`, with the
+    /// engine that adopt adds to.
+    fn fast_path_library(
+        dir: &std::path::Path,
+    ) -> (
+        std::sync::Arc<super::PoolService>,
+        String,
+        std::sync::Arc<torrentd_engine::MockEngine>,
+        std::sync::Arc<dyn torrentd_engine::AlertSource>,
+    ) {
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::TorrentEngine;
+
+        let cfg = crate::config::Config::minimal_for_tests(dir, false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        pool.set_torrent_store(std::sync::Arc::new(
+            torrentd_engine::MemoryTorrentStore::new(),
+        ));
+        std::fs::write(dir.join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.join("library/t.torrent"), &bare).unwrap();
+        let mut fastresume =
+            b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+        fastresume.extend_from_slice(&libtorrent_safe::info_hash_from_torrent(&bare).unwrap().0);
+        fastresume.extend_from_slice(b"6:pieces1:\x01e");
+        std::fs::write(dir.join("library/t.fastresume"), &fastresume).unwrap();
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+        let engine = std::sync::Arc::new(MockEngine::new());
+        let source: std::sync::Arc<dyn torrentd_engine::AlertSource> =
+            std::sync::Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                ProfileId::new("p"),
+                std::sync::Arc::clone(&engine) as std::sync::Arc<dyn TorrentEngine>,
+            )]));
+        (pool, ih, engine, source)
+    }
+
+    /// Issue #543: a `.torrent` the library has grown past the read cap
+    /// since the scan is not read whole. The plan cannot hold the resume
+    /// data to metadata it did not read, so the adopt verifies instead of
+    /// adding; and the file is not offered as the resume scan's fallback.
+    #[test]
+    fn an_adopt_does_not_read_a_torrent_past_the_cap() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih, engine, source) = fast_path_library(dir.path());
+        let torrent = dir.path().join("library/t.torrent");
+        std::fs::write(
+            &torrent,
+            padded_past_the_cap(&std::fs::read(&torrent).unwrap()),
+        )
+        .unwrap();
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+
+        let adopted =
+            super::execute_adopt(&pool, &source, &profiles, &ih, ProfileId::new("p"), false)
+                .unwrap_or_else(|e| panic!("{}", e.reason));
+        assert_eq!(adopted, super::Adopted::QueuedForVerification);
+        assert!(engine.calls().is_empty(), "{:?}", engine.calls());
+        assert_eq!(
+            pool.library_torrent(&InfoHash::from_hex(&ih).unwrap()),
+            None
+        );
+    }
+
     /// Issue #251: an index row an earlier build keyed by a hybrid torrent's
     /// truncated v2 hash is refused before either adoption path adds it,
     /// since its session keys it by its v1 hash. Its v1 key passes, and so
@@ -4661,6 +4770,11 @@ mod tests {
         assert!(super::refuse_if_rekeyed(&v1, &path).is_ok());
         let dir = tempfile::tempdir().unwrap();
         assert!(super::refuse_if_rekeyed(&v2, &dir.path().join("missing.torrent")).is_ok());
+        // Issue #543: past the library read cap it is not read, so passes
+        // like one that cannot be read.
+        let big = dir.path().join("big.torrent");
+        std::fs::write(&big, padded_past_the_cap(&std::fs::read(&path).unwrap())).unwrap();
+        assert!(super::refuse_if_rekeyed(&v2, &big).is_ok());
     }
 
     /// Issue #412: resume data is held to the key it is filed under as the
@@ -6312,6 +6426,36 @@ mod tests {
             .calls()
             .iter()
             .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
+    }
+
+    /// Issue #543: an adoption whose `.torrent` has grown past the library
+    /// read cap since it was queued is not read whole: it is dropped as a
+    /// failed verify, as an unreadable one is, and nothing is added.
+    #[test]
+    fn an_adoption_whose_torrent_is_past_the_cap_is_dropped_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = Arc::new(super::VerifyQueue::new(4));
+        let w = Worker::new(dir.path());
+        let q = pool.verify_queue();
+        let mut t = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee");
+        let path = dir.path().join("big.torrent");
+        std::fs::write(&path, padded_past_the_cap(&t)).unwrap();
+        q.enqueue(super::PendingVerify {
+            torrent_path: path,
+            save_path: dir.path().to_path_buf(),
+            ..pending(InfoHash([0xD3; 20]), "p")
+        });
+
+        w.tick(&pool);
+        assert!(!w
+            .engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
+        assert_eq!((q.failed(), q.depth(), q.in_flight()), (1, 0, 0));
     }
 
     /// Re-hashes held for a fenced profile log the hold once per profile per
