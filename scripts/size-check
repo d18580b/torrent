@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# File-length gate: no tracked source file may exceed LIMIT lines unless
+# .size-baseline lists it, and .size-baseline may only shrink.
+#
+# Fails when:
+#   - a tracked source file is over LIMIT lines and the baseline does not list it;
+#   - the baseline lists a path that no longer exists, is not a tracked source
+#     file, or is now at or under LIMIT lines (a stale entry: delete it);
+#   - the baseline lists a path twice.
+#
+# "Source" is a tracked file with one of the extensions in EXTENSIONS. Generated
+# and data files (docs/api/openapi.json, Cargo.lock, insta snapshots) are not
+# source and are not measured. Submodule contents are not tracked here, so
+# vendor/ is never measured.
+#
+# Run as `mise run size-check`; CI and the pre-push hook call that task.
+set -euo pipefail
+
+LIMIT=2689
+EXTENSIONS=(rs c cc cpp h hpp py sh)
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+baseline=.size-baseline
+
+pathspecs=()
+for ext in "${EXTENSIONS[@]}"; do
+  pathspecs+=(":(glob)**/*.$ext")
+done
+
+declare -A lines=()
+while IFS= read -r -d '' path; do
+  # A tracked file deleted in the working tree has nothing to measure.
+  [ -f "$path" ] || continue
+  # awk's NR counts a final line with no newline, which `wc -l` would miss.
+  lines["$path"]=$(awk 'END { print NR }' "$path")
+done < <(git ls-files -z -- "${pathspecs[@]}")
+
+declare -A listed=()
+failed=0
+if [ -f "$baseline" ]; then
+  n=0
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    n=$((n + 1))
+    # Comments and blank lines; surrounding whitespace is not part of a path.
+    entry=${entry%%#*}
+    entry=$(printf '%s' "$entry" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$entry" ] || continue
+    if [ -n "${listed[$entry]+x}" ]; then
+      echo "::error file=$baseline,line=$n::$entry is listed twice; delete the duplicate."
+      failed=1
+      continue
+    fi
+    listed["$entry"]=1
+    if [ -z "${lines[$entry]+x}" ]; then
+      echo "::error file=$baseline,line=$n::$entry is not a tracked source file (deleted or renamed?); delete the entry."
+      failed=1
+    elif [ "${lines[$entry]}" -le "$LIMIT" ]; then
+      echo "::error file=$baseline,line=$n::$entry is ${lines[$entry]} lines, within the $LIMIT-line limit; delete the entry so it cannot grow back."
+      failed=1
+    fi
+  done <"$baseline"
+fi
+
+over=0
+for path in "${!lines[@]}"; do
+  count=${lines[$path]}
+  [ "$count" -gt "$LIMIT" ] || continue
+  over=$((over + 1))
+  if [ -z "${listed[$path]+x}" ]; then
+    echo "::error file=$path::$path is $count lines, over the $LIMIT-line limit; split it. ($baseline only shrinks: do not add to it.)"
+    failed=1
+  fi
+done
+
+if [ "$failed" -ne 0 ]; then
+  exit 1
+fi
+echo "size-check: ${#lines[@]} source files measured; $over over $LIMIT lines, all in $baseline."
