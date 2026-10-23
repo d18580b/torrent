@@ -48,8 +48,8 @@ use std::path::PathBuf;
 const BOOST_DIR: &str = "../../vendor/boost";
 const LIBTORRENT_DIR: &str = "../../vendor/libtorrent";
 
-/// Set to `1` to embed the compiler's libstdc++ directory in the binary as an
-/// rpath. Any other value, or none, embeds nothing.
+/// Set to `1` to embed the compiler's libstdc++ directory as an rpath in this
+/// crate's own test binaries. Any other value, or none, embeds nothing.
 const LIBSTDCXX_RPATH_VAR: &str = "LIBTORRENT_SYS_LIBSTDCXX_RPATH";
 
 /// The shim's headers, relative to this crate: the C ABI bindgen reads, and
@@ -572,14 +572,15 @@ fn emit_link_directives(lt_install: &Path, boost_install: &Path, shim_prefix: &P
     // On hosts where the compiler isn't /usr/bin/g++ (e.g. Homebrew GCC) the
     // distro's /usr/bin/cc linker driver doesn't know where libstdc++ lives.
     //
-    // That is a link-time search path only, and it is the one directive here
-    // that reaches dependents' binaries (torrentd's included). No rpath is
-    // embedded unless LIBTORRENT_SYS_LIBSTDCXX_RPATH=1: on every distro
-    // compiler the directory is one the dynamic loader already searches
-    // (`/usr/lib64` on Fedora), so an rpath to it does nothing but write the
-    // build host's layout into the binary, where DT_RUNPATH is searched before
-    // the system's own directories. A host whose libstdc++ lives somewhere the
-    // loader does not look (a Homebrew or /opt GCC) sets the variable.
+    // That is a link-time search path only, and like every link-search and
+    // link-lib directive here it reaches dependents' links (torrentd's
+    // included). No rpath is embedded unless LIBTORRENT_SYS_LIBSTDCXX_RPATH=1:
+    // on every distro compiler the directory is one the dynamic loader
+    // already searches (`/usr/lib64` on Fedora), so an rpath to it does
+    // nothing but write the build host's layout into a binary, where
+    // DT_RUNPATH is searched before the system's own directories. A host whose
+    // libstdc++ lives somewhere the loader does not look (a Homebrew or /opt
+    // GCC) sets the variable.
     //
     // Even then it reaches only this crate's own test binaries: cargo applies
     // `rustc-link-arg` to the targets of the package whose build script emits
