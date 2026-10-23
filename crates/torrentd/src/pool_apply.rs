@@ -617,7 +617,6 @@ fn apply_inner(
                 ops::MOVE_TORRENT => move_torrent(pool, source, state, step, stop),
                 ops::DELETE_FILE => {
                     delete_file(pool, Path::new(&step.src), plan_id, &bucket, &mut guards)
-                        .map_err(StepFailure::Failed)
                 }
                 other => Err(StepFailure::Failed(format!(
                     "unknown plan operation {other:?}"
@@ -731,12 +730,14 @@ fn journal_batch_len(rest: &[PlanStepRow]) -> usize {
 }
 
 /// How a step did not succeed.
+#[derive(Debug)]
 enum StepFailure {
     /// It did not happen, or was undone; the journal says `failed`.
     Failed(String),
     /// It was started and its verdict is not known — a storage move libtorrent
-    /// has not reported on by the deadline. Recording that as `failed` invited
-    /// a retry of a move that may still land.
+    /// has not reported on by the deadline, or a rename that happened but
+    /// whose fsync failed. Recording that as `failed` invited a retry of a
+    /// move that may still land, or already has.
     Unknown(String),
 }
 
@@ -826,9 +827,13 @@ fn move_torrent(
             .into());
         }
         refuse_live_files_under(source, state, Path::new(&step.src))?;
-        move_directory(Path::new(&step.src), Path::new(dst))?;
-        record_new_base(pool, &infohash, Path::new(dst));
-        return Ok(());
+        let moved = move_directory(Path::new(&step.src), Path::new(dst));
+        // An unknown outcome is one whose rename happened: the payload is at
+        // `dst` now, so the base follows it as it does a move that is done.
+        if !matches!(moved, Err(StepFailure::Failed(_))) {
+            record_new_base(pool, &infohash, Path::new(dst));
+        }
+        return moved;
     };
     let engine = source
         .engine_for(&st.profile_id)
@@ -1213,39 +1218,55 @@ fn refuse_live_files_under(
 }
 
 /// Move a directory tree torrentd owns outright.
-fn move_directory(src: &Path, dst: &Path) -> Result<(), String> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+///
+/// The move is `renameat2(RENAME_NOREPLACE)` between the two parents, so an
+/// entry already at `dst` refuses it, an empty directory included, and one
+/// that appears there after a check cannot be replaced either. Both parents
+/// are then fsynced, so the rename survives a crash; a failure there comes
+/// after the rename happened, and is [`StepFailure::Unknown`] rather than
+/// `failed`, which would say the payload is still at `src`.
+fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
+    fn named(p: &Path) -> Result<(&Path, &str), String> {
+        let name = p.file_name().and_then(|n| n.to_str());
+        p.parent()
+            .zip(name)
+            .ok_or_else(|| format!("{} is not a directory that can be renamed", p.display()))
     }
-    if dst.exists() {
-        return Err(format!("destination {} already exists", dst.display()));
-    }
-    match std::fs::rename(src, dst) {
-        Ok(()) => sync_parents(&[src, dst]),
-        Err(e) if e.raw_os_error() == Some(libc_exdev()) => Err(format!(
-            "cross-device directory move is not attempted automatically \
-                 ({} → {}); move the data and rescan",
-            src.display(),
-            dst.display(),
-        )),
-        Err(e) => Err(format!("rename {} → {}: {e}", src.display(), dst.display())),
-    }
-}
-
-/// Fsync the directory holding each path, so a rename or unlink in it
-/// survives a crash rather than leaving the journal describing a directory
-/// entry the disk never recorded.
-fn sync_parents(paths: &[&Path]) -> Result<(), String> {
-    let mut done: Vec<&Path> = Vec::new();
-    for p in paths {
-        let Some(parent) = p.parent() else { continue };
-        if done.contains(&parent) {
-            continue;
+    let ((src_parent, src_name), (dst_parent, dst_name)) = (named(src)?, named(dst)?);
+    std::fs::create_dir_all(dst_parent)
+        .map_err(|e| format!("create {}: {e}", dst_parent.display()))?;
+    let open = |p: &Path| std::fs::File::open(p).map_err(|e| format!("open {}: {e}", p.display()));
+    let (from, to) = (open(src_parent)?, open(dst_parent)?);
+    match fsat::rename_noreplace(&from, src_name, &to, dst_name) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            return Err(format!("destination {} already exists", dst.display()).into())
         }
-        std::fs::File::open(parent)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| format!("fsync {}: {e}", parent.display()))?;
-        done.push(parent);
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            return Err(format!(
+                "cross-device directory move is not attempted automatically \
+                 ({} → {}); move the data and rescan",
+                src.display(),
+                dst.display(),
+            )
+            .into())
+        }
+        Err(e) => return Err(format!("rename {} → {}: {e}", src.display(), dst.display()).into()),
+    }
+    for (dir, path) in [(&from, src_parent), (&to, dst_parent)] {
+        fsat::fsync(dir).map_err(|e| {
+            StepFailure::Unknown(format!(
+                "outcome unknown: {} was renamed to {}, but fsync {} failed ({e}), so the \
+                 rename may not survive a crash. {}",
+                src.display(),
+                dst.display(),
+                path.display(),
+                unknown_outcome_remedy(
+                    &src.display().to_string(),
+                    Some(&dst.display().to_string()),
+                ),
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1289,7 +1310,36 @@ fn delete_file(
     plan_id: i64,
     bucket: &str,
     guards: &mut DeleteGuards,
-) -> Result<(), String> {
+) -> Result<(), StepFailure> {
+    let (root, rel, stamp) = sanctioned_delete(pool, path, guards)?;
+    move_into_trash(&root, path, &rel, stamp, bucket).map_err(|e| match e {
+        StepFailure::Unknown(e) => StepFailure::Unknown(format!(
+            "{e} {}",
+            unknown_outcome_remedy(&path.display().to_string(), None)
+        )),
+        failed => failed,
+    })?;
+    info!(
+        target: "torrentd::pool::apply",
+        plan_id,
+        bucket,
+        path = %path.display(),
+        "moved to the trash",
+    );
+    Ok(())
+}
+
+/// A file's indexed `(size, mtime, inode, device)`.
+type FileStamp = (u64, i64, u64, u64);
+
+/// Checks 1 and 3 to 5 of [`delete_file`] for `path`, whose root, path
+/// relative to it, and indexed `(size, mtime, inode, device)` it returns,
+/// or why the delete is refused.
+fn sanctioned_delete(
+    pool: &PoolService,
+    path: &Path,
+    guards: &mut DeleteGuards,
+) -> Result<(std::path::PathBuf, String, FileStamp), String> {
     let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
         path.strip_prefix(root)
             .ok()
@@ -1333,16 +1383,7 @@ fn delete_file(
         ));
     }
 
-    let stamp = (row.size, row.mtime_ns, row.ino, row.dev);
-    move_into_trash(&root, path, &rel, stamp, bucket)?;
-    info!(
-        target: "torrentd::pool::apply",
-        plan_id,
-        bucket,
-        path = %path.display(),
-        "moved to the trash",
-    );
-    Ok(())
+    Ok((root, rel, (row.size, row.mtime_ns, row.ino, row.dev)))
 }
 
 /// The directory under `<root>/.torrentd-trash/` a delete plan's files go
@@ -1366,14 +1407,16 @@ fn plan_trash_bucket(plan_id: i64, created_at: i64) -> String {
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, the file is examined and moved through its parent's
 /// descriptor, the move is `renameat2(RENAME_NOREPLACE)`, and both
-/// directories are fsynced so it survives a crash.
+/// directories are fsynced so it survives a crash. A failed fsync comes after
+/// the file moved, so it is [`StepFailure::Unknown`]: `failed` would say the
+/// file is still where it was.
 fn move_into_trash(
     root: &Path,
     path: &Path,
     rel: &str,
-    stamp: (u64, i64, u64, u64),
+    stamp: FileStamp,
     bucket: &str,
-) -> Result<(), String> {
+) -> Result<(), StepFailure> {
     let (dirs, name) = match rel.rsplit_once('/') {
         Some((d, n)) => (d.split('/').collect::<Vec<_>>(), n),
         None => (Vec::new(), rel),
@@ -1387,13 +1430,14 @@ fn move_into_trash(
     let md =
         fsat::stat_nofollow(parent, name).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if !md.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+        return Err(format!("{} is not a regular file", path.display()).into());
     }
     if torrentd_pool::file_stamp(&md) != stamp {
         return Err(format!(
             "{} changed since the scan that indexed it; rescan before deleting",
             path.display(),
-        ));
+        )
+        .into());
     }
 
     let mut trash_dirs = vec![torrentd_pool::plan::TRASH_DIR, bucket];
@@ -1410,8 +1454,17 @@ fn move_into_trash(
     })?;
     // Both directory entries changed; without these the rename can be lost
     // to a crash and the file reappear where the journal says it is gone.
-    fsat::fsync(parent).map_err(|e| format!("fsync {}: {e}", path.display()))?;
-    fsat::fsync(&trash).map_err(|e| format!("fsync trash: {e}"))?;
+    let trash_path = root.join(torrentd_pool::plan::TRASH_DIR).join(bucket);
+    for (dir, what) in [(parent, "its directory"), (&trash, "the trash")] {
+        fsat::fsync(dir).map_err(|e| {
+            StepFailure::Unknown(format!(
+                "outcome unknown: {} was moved into {}, but fsync of {what} failed ({e}), so \
+                 the move may not survive a crash.",
+                path.display(),
+                trash_path.display(),
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -1559,8 +1612,9 @@ pub struct TrashOutcome {
     pub trash: Vec<std::path::PathBuf>,
     /// How many files were moved.
     pub moved: usize,
-    /// The first file that could not be moved, and why. The move stops
-    /// there, so it and every file after it are still in place.
+    /// The file the move stopped at, and why: one that could not be moved,
+    /// which is still in place, or one moved but whose move could not be
+    /// fsynced, which `moved` counts. Every file after it is still in place.
     pub failed: Option<(std::path::PathBuf, String)>,
 }
 
@@ -1711,8 +1765,10 @@ pub fn torrent_payload(
 
 /// Move `payload` into `<root>/.torrentd-trash/<bucket>/`, each file
 /// re-stat'd against the index at the moment it moves. Stops at the first
-/// file that cannot be moved, and leaves it and the rest in place: nothing
-/// is ever unlinked.
+/// file whose move fails, and reports it as [`TrashOutcome::failed`]: a file
+/// that could not be moved is left in place, a file that was moved but whose
+/// move could not be fsynced is already in the trash and counted in `moved`,
+/// and every file after it is left in place. Nothing is ever unlinked.
 pub fn trash_torrent_payload(payload: &TorrentPayload, bucket: &str) -> TrashOutcome {
     let mut out = TrashOutcome {
         trash: Vec::new(),
@@ -1720,7 +1776,8 @@ pub fn trash_torrent_payload(payload: &TorrentPayload, bucket: &str) -> TrashOut
         failed: None,
     };
     for f in &payload.files {
-        if let Err(e) = move_into_trash(&f.root, &f.path, &f.rel, f.stamp, bucket) {
+        let moved = move_into_trash(&f.root, &f.path, &f.rel, f.stamp, bucket);
+        if let Err(StepFailure::Failed(e)) = moved {
             out.failed = Some((f.path.clone(), e));
             break;
         }
@@ -1729,6 +1786,11 @@ pub fn trash_torrent_payload(payload: &TorrentPayload, bucket: &str) -> TrashOut
             out.trash.push(trash);
         }
         out.moved += 1;
+        // Moved, but not made durable: counted as moved, and the move stops.
+        if let Err(StepFailure::Unknown(e)) = moved {
+            out.failed = Some((f.path.clone(), e));
+            break;
+        }
         info!(
             target: "torrentd::pool::apply",
             infohash = %payload.infohash,
@@ -1896,7 +1958,18 @@ mod fsat {
     }
 
     pub fn fsync(dir: &File) -> io::Result<()> {
+        #[cfg(test)]
+        if FAIL_FSYNC.get() {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
         dir.sync_all()
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Fails every [`fsync`] on this thread with `EIO`, for the tests of
+        /// a rename that happened but could not be made durable.
+        pub static FAIL_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
 
@@ -2022,13 +2095,23 @@ fn recheck_relocatable(pool: &PoolService, infohash: &str, src: &Path) -> Result
                 foreign.join(", "),
             ));
         }
-        Ok(())
+        let listed = torrentd_pool::plan::listed_under(store, infohash, root_id, &base)
+            .map_err(|e| e.to_string())?;
+        Ok((base, listed))
     })
-}
-
-/// `EXDEV`. Spelled out rather than pulled from a crate for one constant.
-fn libc_exdev() -> i32 {
-    18
+    .and_then(|(base, listed)| {
+        // The disk, asked again: anything that landed under the source since
+        // the plan was built would travel with the rename unseen. `src` is
+        // this base under its root, as `torrent_at` resolved it. Walked
+        // outside the store, which a large directory would otherwise hold.
+        match torrentd_pool::plan::unlisted_entry(src, &base, &listed) {
+            Some(entry) => Err(format!(
+                "{} now holds {entry}; moving it would take that too",
+                src.display(),
+            )),
+            None => Ok(()),
+        }
+    })
 }
 
 /// [`resume_unfinished`] on the blocking pool, as boot runs it: `work` is
@@ -3627,6 +3710,198 @@ mod tests {
         assert!(!dir.path().join("pool/new").exists(), "{why}");
     }
 
+    /// The refusal a step that failed outright carries; panics on success or
+    /// on an unknown outcome.
+    fn failed(r: Result<(), StepFailure>) -> String {
+        match r {
+            Err(StepFailure::Failed(e)) => e,
+            other => panic!("expected a failed step, got {other:?}"),
+        }
+    }
+
+    /// The planner walks the source directory: a file the scan never saw
+    /// would travel with the rename without appearing in the plan.
+    #[test]
+    fn planning_a_relocate_refuses_a_file_the_index_does_not_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        write(&root, "old/T/a.bin", 100);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        add_and_rematch(
+            &pool,
+            &ih,
+            "T",
+            Some(&root.join("old")),
+            &[("T/a.bin", 100)],
+        );
+        write(&root, "old/T/since-the-scan.bin", 5);
+
+        let spec = torrentd_pool::plan::PlanSpec::Relocate {
+            infohash: ih,
+            dest_root_id: pool.roots()[0].0,
+            dest_rel: "new".into(),
+        };
+        let built = pool
+            .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
+            .unwrap();
+        let why = built
+            .expect_err("the plan was built over an unlisted file")
+            .0;
+        assert!(
+            why.contains("old/T/since-the-scan.bin") && why.contains("does not list"),
+            "{why}"
+        );
+    }
+
+    /// The executor walks it again: whatever appears under the source after
+    /// the plan was built refuses the rename, which moves nothing.
+    #[test]
+    fn relocating_refuses_a_file_that_appeared_since_planning() {
+        assert_relocate_refused(
+            |dir| {
+                write(&dir.join("pool"), "old/T/late.bin", 5);
+                engine_and_state()
+            },
+            &["old/T/late.bin", "does not list", "would take that too"],
+        );
+    }
+
+    #[test]
+    fn relocating_refuses_a_symlink_under_the_source() {
+        assert_relocate_refused(
+            |dir| {
+                std::os::unix::fs::symlink(dir, dir.join("pool/old/T/link")).unwrap();
+                engine_and_state()
+            },
+            &["old/T/link, a symlink"],
+        );
+    }
+
+    #[test]
+    fn relocating_refuses_a_name_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt as _;
+        assert_relocate_refused(
+            |dir| {
+                let name = std::ffi::OsStr::from_bytes(b"\xff.bin");
+                std::fs::write(dir.join("pool/old/T").join(name), b"x").unwrap();
+                engine_and_state()
+            },
+            &["is not UTF-8"],
+        );
+    }
+
+    /// A subdirectory that cannot be listed may hold anything. Root lists
+    /// it regardless, so there the case cannot be built and is not asserted.
+    #[test]
+    fn relocating_refuses_a_subdirectory_that_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, src_file) = unowned_relocate(dir.path());
+        let sealed = dir.path().join("pool/old/T/sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+        let why = pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0]
+            .error
+            .clone()
+            .unwrap_or_default();
+        assert!(why.contains("cannot be listed"), "{why}");
+        assert!(src_file.exists(), "the payload was renamed: {why}");
+    }
+
+    /// The rename itself refuses to replace what is at the destination, an
+    /// empty directory included, and leaves the source where it was.
+    #[test]
+    fn moving_a_directory_never_replaces_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_file = write(dir.path(), "src/a.bin", 3);
+        std::fs::create_dir(dir.path().join("dst")).unwrap();
+        let e = failed(move_directory(
+            &dir.path().join("src"),
+            &dir.path().join("dst"),
+        ));
+        assert!(e.contains("already exists"), "{e}");
+        assert!(src_file.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("dst")).unwrap().count(),
+            0
+        );
+    }
+
+    /// An fsync that fails after the rename is not a step that did not
+    /// happen: the payload is at the destination, so the step stays
+    /// `in_progress` for a human and the adoption base follows the payload.
+    #[test]
+    fn a_relocate_whose_fsync_fails_after_the_rename_is_an_unknown_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, src_file) = unowned_relocate(dir.path());
+        let (source, state) = engine_and_state();
+        fsat::FAIL_FSYNC.set(true);
+        let out = apply(&pool, &source, &state, plan_id, &|| false);
+        fsat::FAIL_FSYNC.set(false);
+        let out = out.unwrap();
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (0, 1, "failed"),
+            "{out:?}"
+        );
+        let step = &pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0];
+        assert_eq!(step.status, step_status::IN_PROGRESS);
+        let why = step.error.clone().unwrap_or_default();
+        assert!(
+            why.contains("outcome unknown") && why.contains("fsync"),
+            "{why}"
+        );
+        assert!(!src_file.exists());
+        assert!(dir.path().join("pool/new/T/a.bin").exists());
+        let base = pool
+            .with_store(|s| s.adoption_base(&"ab".repeat(20)))
+            .unwrap();
+        assert_eq!(base.map(|(_, b)| b), Some("new".to_owned()));
+    }
+
+    /// Likewise a delete step: the file is in the trash, not where it was.
+    #[test]
+    fn a_delete_whose_fsync_fails_after_the_move_is_an_unknown_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, orphan, _other) = one_orphan_delete_plan(dir.path());
+        let (source, state) = engine_and_state();
+        fsat::FAIL_FSYNC.set(true);
+        let out = apply(&pool, &source, &state, plan_id, &|| false);
+        fsat::FAIL_FSYNC.set(false);
+        let out = out.unwrap();
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (0, 1, "failed"),
+            "{out:?}"
+        );
+        let step = &pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0];
+        assert_eq!(step.status, step_status::IN_PROGRESS);
+        let why = step.error.clone().unwrap_or_default();
+        assert!(
+            why.contains("outcome unknown") && why.contains("fsync"),
+            "{why}"
+        );
+        assert!(!orphan.exists());
+        let trash = dir.path().join("pool").join(torrentd_pool::plan::TRASH_DIR);
+        let buckets: Vec<_> = std::fs::read_dir(&trash).unwrap().collect();
+        assert_eq!(buckets.len(), 1);
+        assert!(buckets[0]
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("junk/old.bin")
+            .exists());
+    }
+
     /// A torrent added through the API over the unloaded torrent's files has
     /// no claims, so only its session shows it serves them: renaming the
     /// directory would pull them from under it.
@@ -4261,7 +4536,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&f, vec![9u8; 48]).unwrap();
 
-        let e = delete_file(&pool, &f, 1, "1-0", &mut Default::default()).unwrap_err();
+        let e = failed(delete_file(&pool, &f, 1, "1-0", &mut Default::default()));
         assert!(e.contains("changed since the scan"), "got {e}");
         assert!(f.exists());
     }
@@ -4276,19 +4551,37 @@ mod tests {
         pool.scan().unwrap();
 
         let sneaked = write(&root, "after/the/scan.bin", 8);
-        let e = delete_file(&pool, &sneaked, 1, "1-0", &mut Default::default()).unwrap_err();
+        let e = failed(delete_file(
+            &pool,
+            &sneaked,
+            1,
+            "1-0",
+            &mut Default::default(),
+        ));
         assert!(e.contains("never sanctioned"), "got {e}");
         assert!(sneaked.exists());
 
         let outside = dir.path().join("elsewhere.bin");
         std::fs::write(&outside, b"x").unwrap();
-        let e = delete_file(&pool, &outside, 1, "1-0", &mut Default::default()).unwrap_err();
+        let e = failed(delete_file(
+            &pool,
+            &outside,
+            1,
+            "1-0",
+            &mut Default::default(),
+        ));
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
 
         // A traversal component walks back out of the root once resolved.
         let escaping = root.join("misc/../../elsewhere.bin");
-        let e = delete_file(&pool, &escaping, 1, "1-0", &mut Default::default()).unwrap_err();
+        let e = failed(delete_file(
+            &pool,
+            &escaping,
+            1,
+            "1-0",
+            &mut Default::default(),
+        ));
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
     }
@@ -4342,7 +4635,7 @@ mod tests {
 
         // The executor still refuses it, for a plan built before the claim.
         let mut guards = DeleteGuards::default();
-        let e = delete_file(&pool, &alias, 1, "1-0", &mut guards).unwrap_err();
+        let e = failed(delete_file(&pool, &alias, 1, "1-0", &mut guards));
         assert!(
             e.contains("same file") && e.contains("a torrent claims"),
             "got {e}"
@@ -5072,6 +5365,33 @@ mod tests {
             std::fs::read(root.join(".torrentd-trash/torrent-x-1/T/a.bin")).unwrap(),
             vec![7u8; 16]
         );
+    }
+
+    /// A file that reached the trash but could not be fsynced there is
+    /// counted as moved, and the move stops at it.
+    #[test]
+    fn a_torrents_payload_file_whose_fsync_fails_is_counted_moved_and_stops_the_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let f = write(&root, "T/a.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        let payload = torrent_payload(&pool, &ih, &root, &["T/a.bin".to_owned()]).unwrap();
+
+        fsat::FAIL_FSYNC.set(true);
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        fsat::FAIL_FSYNC.set(false);
+        assert_eq!(out.moved, 1);
+        let (at, why) = out.failed.expect("the fsync failure is reported");
+        assert_eq!(at, f);
+        assert!(
+            why.contains("outcome unknown") && why.contains("fsync"),
+            "{why}"
+        );
+        assert!(!f.exists());
+        assert!(root.join(".torrentd-trash/torrent-x-1/T/a.bin").exists());
     }
 
     #[test]
