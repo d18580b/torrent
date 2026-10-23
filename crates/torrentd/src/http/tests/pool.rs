@@ -2404,6 +2404,9 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let pool = service(dir.path(), true);
     let root_id = pool.roots()[0].0;
+    // A root that is present and not empty, so the drift check trusts its
+    // not-found for `big/x` rather than reading the root as unmounted.
+    write(&dir.path().join("pool"), "present", 1);
     const BAD: &str = "not-an-infohash";
     let bogus_step_plan = pool.with_store_mut(|st| {
         // Two files whose sizes sum past `i64::MAX`. The materialised tree
