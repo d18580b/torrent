@@ -1507,7 +1507,9 @@ automating.
 
 **It reports the health monitor's own verdict.** The `route` line is the
 monitor's route probe (`ip route get 1.1.1.1 from <tunnel address>` must
-leave by the tunnel device), and the `health` line is what the monitor's
+leave by the tunnel device; the monitor also asks
+`ip route get 2606:4700:4700::1111 from <address>` from each global IPv6
+address on the device, which this command does not), and the `health` line is what the monitor's
 judgement — the same function, on the address, route and handshake just
 observed — would decide about the profile. The `kill_switch_ruleset` line
 dry-runs the exact script boot hands to `nft -f`, rendered by the same
@@ -1849,10 +1851,10 @@ On a scratch pool, not your real one.
    socket to the address alone, for TCP as for the listen sockets. The
    traffic then follows the routing table. From the tunnel's IPv4 address it
    can leave by the physical interface, with that source address, until the
-   next poll fences the profile. The route probe asks only from the IPv4
-   address, so it would never fence that path for an IPv6 address. A listen
-   socket on an IPv6 address that is bound to no device therefore stops the
-   daemon, as a wrong device does (below). On such a kernel, a tunnel that
+   next poll fences the profile. The route probe asks from each global IPv6
+   address on the device as well, so a lost `ip -6 rule` fences the profile
+   the same way, but a listen socket on an IPv6 address that is bound to no
+   device still stops the daemon, as a wrong device does (below). On such a kernel, a tunnel that
    holds an IPv6 address runs only once the unit grants `CAP_NET_RAW` or the
    address is dropped from the tunnel's config. With
    `network_kill_switch = true` the kill switch drops this traffic.
@@ -1923,7 +1925,8 @@ On a scratch pool, not your real one.
    interfaces for the daemon's uid, one line per tunnel address pairing it
    with its own interface:
    `meta skuid <uid> ip saddr <tunnel address> oifname "<iface>" accept`.
-   The addresses are read off the live link when the switch is installed:
+   The addresses are read off the live link when the switch is installed,
+   and again before each of its checks (below):
    its first IPv4 address, which a tunnel with none fails the install for,
    and each of its global IPv6 addresses, paired the same way with
    `ip6 saddr`. A session listens on its tunnel device, so it listens and
@@ -1994,10 +1997,14 @@ On a scratch pool, not your real one.
    the daemon's attached; with a tunnel's `from <address>` rule lost, its
    answer to a probe of the tunnel address arriving on the physical link
    used to leave by that link from the tunnel address (drill 8). Each global
-   IPv6 address the link holds when the switch is installed gets the same
-   fence as `ip6 saddr <address> oifname != { … } drop`; one added to the
-   link later is not fenced until the next start, and a link whose IPv6
-   addresses cannot be read gets no IPv6 fence (the warning above).
+   IPv6 address the link holds gets the same fence as `ip6 saddr <address>
+   oifname != { … } drop`, and a link whose IPv6 addresses cannot be read
+   when the switch is installed gets no IPv6 fence (the warning above).
+   Before each of its 30 s checks the switch reads every tunnel's addresses
+   again, as it reads its transport, and installs the ruleset again when
+   they changed: an IPv6 address the link gains after start is paired and
+   fenced from the next check, and one it loses is no longer paired. A read
+   that fails keeps the addresses last read.
 
    What that leaves:
 
@@ -2048,7 +2055,11 @@ On a scratch pool, not your real one.
       anything is created, because only `AllowedIPs` are routed through the
       tunnel and the probe's packet would leave by the main table. The
       profile is reported failed with the reason. Use `AllowedIPs =
-      0.0.0.0/0` (plus `::/0` for IPv6). The `Table = off` case, a link
+      0.0.0.0/0` (plus `::/0` for IPv6). The monitor asks the same of each
+      global IPv6 address (toward `2606:4700:4700::1111`), so a config with
+      an IPv6 `Address` and no `::/0` comes up and is fenced as
+      `route_mismatch` on its first poll; drop the IPv6 `Address` or route
+      `::/0`. The `Table = off` case, a link
       whose installed routing is outranked by another rule, and one whose
       routing could not be installed at all are reported as a routing
       failure; `vpn check --bring-up` reports each as a tunnel that came up
