@@ -278,8 +278,10 @@ torrent is not in the index.
 
 ## `plan-applying`
 
-**409**, from `DELETE /v1/pool/plans/{plan_id}`. The plan is mid-apply. It
-will be resumed rather than discarded.
+**409**, from `DELETE /v1/pool/plans/{plan_id}`. The plan is `applying`, and
+nothing was deleted: an apply is running it now, or a crash left it and the
+next boot re-drives it. Either way it ends `applied`, or `failed` when a step
+fails or the re-drive refuses it, and can then be discarded.
 
 ## `plan-not-draft`
 

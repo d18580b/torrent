@@ -7342,7 +7342,7 @@
           "pool"
         ],
         "summary": "Discard a mutation plan.",
-        "description": "Removes the plan and its steps, whatever it did. Nothing on disk changes:\ndiscarding an applied plan does not undo it. A plan mid-apply is refused —\nstartup resumes it rather than losing track of half a change.",
+        "description": "Removes the plan and its steps, whatever it did. Nothing on disk changes:\ndiscarding an applied plan does not undo it. A plan in `applying` is\nrefused with `409`, decided in the same statement as the delete, so no\napply can claim the plan in between: an apply is running it now, or a\ncrash left it, and the next boot re-drives it to `applied`, or to `failed`\nwhen the re-drive refuses it. Either can then be discarded. With\n`[pool] allow_mutations` off at boot the re-drive does not run, and the\nplan stays `applying` until it is turned back on.",
         "operationId": "delete_plan",
         "parameters": [
           {
@@ -11959,7 +11959,7 @@
           },
           "status": {
             "$ref": "#/components/schemas/PlanStatus",
-            "description": "Where the plan stands now: `applied`, or `failed` when a step failed —\nthe plan's steps then show which, and why."
+            "description": "Where the plan stands now: `applied`; `failed` when a step failed —\nthe plan's steps then show which, and why; or `applying` when a\ndaemon shutdown stopped the apply between steps, which the next boot\nre-drives."
           }
         },
         "type": "object",
