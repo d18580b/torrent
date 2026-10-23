@@ -657,17 +657,34 @@ fn a_panic_hands_the_terminal_back() {
     // The child holds the only copies of the pty's other end now.
     drop(command);
 
-    // Read until the child closes its end; Linux reports that as EIO.
-    let mut output = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match master.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => output.extend_from_slice(&buf[..n]),
-            Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
-            Err(e) => panic!("read the pty ({}): {e}", master.as_raw_fd()),
+    // Read on a thread until the child closes its end (Linux reports that as
+    // EIO), so a binary that neither panics nor exits fails the test at a
+    // deadline instead of hanging it.
+    let mut reader = master.try_clone().unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buf = [0u8; 4096];
+        let result = loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break Ok(output),
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break Ok(output),
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = done.send(result);
+    });
+    let output = match finished.recv_timeout(STEP) {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => panic!("read the pty ({}): {e}", master.as_raw_fd()),
+        Err(_) => {
+            // Killing the child closes its end, which ends the reader too.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("torrentctl neither panicked nor exited within {STEP:?}");
         }
-    }
+    };
     let status = child.wait().unwrap();
     let output = String::from_utf8_lossy(&output);
     assert!(!status.success(), "a panic is a failure exit: {output:?}");
