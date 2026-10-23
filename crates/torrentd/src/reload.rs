@@ -29,6 +29,10 @@
 //! a value, so the way to get it is a restart; the journal says that rather
 //! than implying the deletion took.
 //!
+//! A raised `connections_limit` that the open-file limit cannot hold is
+//! refused rather than applied, by the sum boot warns by
+//! ([`refuse_short_descriptors`]), and counted as a failed `apply_settings`.
+//!
 //! A reload that touched only ignored keys stops after those warnings: the
 //! per-profile settings loop is skipped when the patch it would apply sets
 //! nothing, so the journal's last word on such a reload is the warning and
@@ -154,6 +158,43 @@ fn warning_for(change: &ProfileChange) -> &'static str {
     }
 }
 
+/// Take a reloaded `connections_limit` the open-file limit cannot hold out of
+/// `diff`, and return the limit and what the change would need.
+///
+/// The rule boot warns by (`startup::warn_if_descriptors_are_short`): every
+/// descriptor the daemon may hold at once against the soft `RLIMIT_NOFILE`
+/// `limit`. A raise that ends past it is refused here rather than applied,
+/// because applied it is a daemon that fails `accept` and `open` with
+/// `EMFILE` once its peers grow. A change that lowers the need is applied
+/// even where the limit is still short of it, since it only helps, and an
+/// unreadable limit refuses nothing, as at boot.
+///
+/// The key leaves `reloadable_changes` with its value, so it reaches no
+/// profile, is not reported as withheld from one, and does not advance the
+/// running config: the next reload compares against the running value and
+/// refuses it again until the limit or the key changes.
+fn refuse_short_descriptors(
+    diff: &mut ConfigDiff,
+    current: &Config,
+    next: &Config,
+    limit: Option<u64>,
+) -> Option<(u64, u64)> {
+    const KEY: &str = "connections_limit";
+    if !diff.reloadable_changes.contains(&KEY) || diff.reloadable_deletions.contains(&KEY) {
+        return None;
+    }
+    let mut candidate = current.clone();
+    candidate.connections_limit = next.connections_limit;
+    let needed = crate::startup::descriptors_needed(&candidate);
+    let limit = limit?;
+    if needed <= limit || needed <= crate::startup::descriptors_needed(current) {
+        return None;
+    }
+    diff.connections_limit = None;
+    diff.reloadable_changes.retain(|k| *k != KEY);
+    Some((limit, needed))
+}
+
 pub async fn run(
     config_path: PathBuf,
     initial: Config,
@@ -188,10 +229,26 @@ pub async fn run(
                 continue;
             }
         };
-        let diff = Config::diff(&current, &next);
+        let mut diff = Config::diff(&current, &next);
         if diff.is_empty() {
             info!("SIGHUP: config unchanged");
             continue;
+        }
+        if let Some((limit, needed)) = refuse_short_descriptors(
+            &mut diff,
+            &current,
+            &next,
+            crate::startup::nofile_soft_limit(),
+        ) {
+            warn!(
+                changed_field = "connections_limit",
+                rlimit_nofile = limit,
+                needed,
+                "SIGHUP: connections_limit refused: the open-file limit is below what the \
+                 daemon could then hold at once; raise LimitNOFILE and restart, or choose a \
+                 lower value; not applied",
+            );
+            failed("apply_settings");
         }
         for nr in &diff.non_reloadable_changes {
             warn!(changed_field = %nr, "{NON_RELOADABLE_WARNING}");
@@ -828,6 +885,162 @@ listen_interfaces = "0.0.0.0:6881"
             "an applied level advances and is not set again on the retry: {log}",
         );
         assert_eq!(count("SIGHUP: config unchanged"), 1, "{log}");
+    }
+
+    /// Issue 455: a reload raising `connections_limit` past the open-file
+    /// limit is refused, by the sum boot warns by, and the rest of the reload
+    /// still applies. Two profiles at the key's maximum need over two million
+    /// descriptors, past any soft limit the kernel's default `nr_open` allows.
+    /// The refused key does not advance, so the next reload refuses it again.
+    #[tokio::test]
+    async fn a_connections_limit_past_the_open_file_limit_is_refused_on_reload() {
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileSource;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::TorrentEngine;
+
+        const TOP_LEVEL: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
+"#;
+        const PROFILES: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+
+[[profile]]
+id = "other"
+network = "host"
+listen_interfaces = "0.0.0.0:6882"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.toml");
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}connections_limit = 100\n{PROFILES}"),
+        )
+        .unwrap();
+        let boot = Config::load(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}connections_limit = 1000000\nupload_rate_limit = 5000\n{PROFILES}"),
+        )
+        .unwrap();
+        let mut raised = boot.clone();
+        raised.connections_limit = Some(1_000_000);
+        let limit = crate::startup::nofile_soft_limit().expect("RLIMIT_NOFILE is readable");
+        assert!(
+            crate::startup::descriptors_needed(&raised) > limit,
+            "the premise: {limit} holds the raise",
+        );
+
+        let mock = Arc::new(MockEngine::new());
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let entries = boot
+            .profile
+            .iter()
+            .map(|p| {
+                crate::profile_registry::ProfileEntry::new(p.clone(), engine.clone(), None, None, 0)
+            })
+            .collect();
+        let registry = Arc::new(crate::profile_registry::ProfileRegistry::new(entries));
+        let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(
+            boot.profile
+                .iter()
+                .map(|p| (p.id.clone(), engine.clone()))
+                .collect(),
+        ));
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+
+        let log = crate::tracing_init::Buf::default();
+        let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        for _ in 0..2 {
+            tx.try_send(()).unwrap();
+        }
+        drop(tx);
+        run(
+            path,
+            boot,
+            source,
+            registry,
+            rx,
+            log_handle,
+            metrics.clone(),
+        )
+        .await;
+
+        let applies: Vec<_> = mock
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::ApplySettings(s) => Some((s.connections_limit, s.upload_rate_limit)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            applies,
+            vec![(None, Some(5000)), (None, Some(5000))],
+            "each profile takes the rest of the first reload and never the refused key",
+        );
+        let log = log.text();
+        assert_eq!(
+            log.matches("SIGHUP: connections_limit refused").count(),
+            2,
+            "refused on both reloads: {log}",
+        );
+        assert!(
+            !log.contains("withheld from this profile"),
+            "a refusal is not a withholding: {log}",
+        );
+        let exported = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            exported.lines().any(|l| l
+                .starts_with("torrentd_config_reload_failures_total{stage=\"apply_settings\"} 2")),
+            "{exported}",
+        );
+    }
+
+    /// The rule's edges, against a limit given rather than read: a raise
+    /// that fits, a cut that still does not fit, and an unreadable limit all
+    /// pass; only a raise past the limit is taken out.
+    #[test]
+    fn only_a_raise_past_the_open_file_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut current = Config::minimal_for_tests(dir.path(), true);
+        current.connections_limit = Some(5_000);
+        current.profile = vec![host(None)];
+        let with = |n: u32| {
+            let mut c = current.clone();
+            c.connections_limit = Some(n);
+            c
+        };
+        let refused = |next: &Config, limit: Option<u64>| {
+            let mut diff = Config::diff(&current, next);
+            let out = refuse_short_descriptors(&mut diff, &current, next, limit);
+            let kept = diff.reloadable_changes.contains(&"connections_limit");
+            assert_eq!(kept, out.is_none());
+            assert_eq!(diff.connections_limit.is_some(), kept);
+            out.is_some()
+        };
+        let need = |n: u32| crate::startup::descriptors_needed(&with(n));
+
+        assert!(!refused(&with(6_000), Some(need(6_000))), "fits exactly");
+        assert!(refused(&with(6_000), Some(need(6_000) - 1)));
+        assert!(
+            !refused(&with(4_000), Some(need(4_000) - 1)),
+            "a cut helps even where it still does not fit",
+        );
+        assert!(
+            !refused(&with(6_000), None),
+            "an unreadable limit is unchecked"
+        );
     }
 
     #[tokio::test]

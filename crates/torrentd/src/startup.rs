@@ -449,6 +449,10 @@ const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(6
 /// libtorrent's logs, as disk and peer errors, far from the cause. The values
 /// are the effective ones: `Settings::server_seed_overrides` sets both, and
 /// the config's keys override that.
+///
+/// Boot warns and carries on, since the limit is the unit file's and the
+/// daemon cannot raise it. A reload holds `connections_limit` to the same
+/// sum and refuses a raise past the limit (`reload::refuse_short_descriptors`).
 fn warn_if_descriptors_are_short(cfg: &Config) {
     let need = descriptors_needed(cfg);
     match nofile_soft_limit() {
@@ -469,7 +473,7 @@ fn warn_if_descriptors_are_short(cfg: &Config) {
 /// `connections_limit + file_pool_size` and [`DESCRIPTORS_PER_SESSION`] per
 /// configured profile, plus the HTTP connection cap and
 /// [`DESCRIPTORS_FOR_THE_PROCESS`].
-fn descriptors_needed(cfg: &Config) -> u64 {
+pub(crate) fn descriptors_needed(cfg: &Config) -> u64 {
     let s = cfg.libtorrent_settings();
     let per_session = u64::from(s.connections_limit.unwrap_or_default())
         + u64::from(s.file_pool_size.unwrap_or_default())
@@ -497,7 +501,7 @@ fn http_connection_cap() -> u64 {
 }
 
 /// The soft `RLIMIT_NOFILE`, or `None` if it cannot be read.
-fn nofile_soft_limit() -> Option<u64> {
+pub(crate) fn nofile_soft_limit() -> Option<u64> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
