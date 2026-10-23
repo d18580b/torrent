@@ -3702,7 +3702,22 @@ fn a_sigterm_saves_every_torrent_and_a_pause_for_the_next_boot() {
 
     let child = start(&cfg, &log);
     wait_healthy(addr);
-    let phases = every_one_loaded_once(addr, &ihs, Duration::from_secs(60));
+    every_one_loaded_once(addr, &ihs, Duration::from_secs(60));
+    // A torrent reads `idle` from its add until its first state update, and
+    // a magnet with no metadata is never `idle` after one: wait them out, so
+    // each phase below is the session's word rather than the placeholder.
+    let phases = poll(
+        "every torrent's first state update",
+        Duration::from_secs(60),
+        || {
+            let phases: std::collections::BTreeMap<String, String> =
+                listed(addr).into_iter().collect();
+            phases
+                .values()
+                .all(|phase| phase != "idle" && phase != "unknown")
+                .then_some(phases)
+        },
+    );
     assert_eq!(
         phases[&paused], "paused",
         "the pause made before the SIGTERM was lost"
@@ -3736,12 +3751,28 @@ fn a_sigkill_mid_boot_scan_reloads_every_torrent_once() {
     let addr = &free_http();
     let cfg = write_config(p, free_port(), addr);
     let log = DaemonLog::new(p);
-    let ihs = infohashes(0x50_0000, 5_000);
     let boot_budget = Duration::from_secs(300);
 
+    // Through the torrent dir, which the first boot adds in one scan: 5,000
+    // API adds, each a durable write, take many minutes. The SIGTERM then
+    // writes every one's resume file, and from there on the resume scan
+    // loads them.
+    let store = p.join("torrents").join(PROFILE);
+    std::fs::create_dir_all(&store).unwrap();
+    let ihs: std::collections::BTreeSet<String> = (0..5_000)
+        .map(|i| {
+            let torrent = metainfo(&format!("boot{i:04}"), "http://127.0.0.1:1/announce");
+            let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+                .unwrap()
+                .to_hex();
+            std::fs::write(store.join(format!("{ih}.torrent")), &torrent).unwrap();
+            ih
+        })
+        .collect();
+    assert_eq!(ihs.len(), 5_000);
     let child = start(&cfg, &log);
-    wait_healthy(addr);
-    add_magnets(addr, &ihs);
+    wait_healthy_within(addr, boot_budget);
+    every_one_loaded_once(addr, &ihs, boot_budget);
     child.stop();
     assert_eq!(resume_files(p), ihs);
 
