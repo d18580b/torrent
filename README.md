@@ -97,8 +97,12 @@ you set.
 torrentd --config … pool scan      # index + match
 torrentd --config … pool status    # summarise
 torrentd --config … pool check     # what changed since the scan
-torrentd --config … pool orphans   # unclaimed bytes
+torrentd --config … pool orphans   # unclaimed bytes, 40 entries per root
+torrentd --config … pool orphans --limit 200   # more of them
 ```
+
+The step-by-step migration, multi-terabyte libraries included, is
+[`docs/import.md`](docs/import.md).
 
 Adoption is tiered too: if the previous client's `.fastresume` says the
 torrent was complete and every file still matches the index, it is added in
@@ -134,6 +138,17 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 Everything is served under `/v1/…`; `/healthz` and `/metrics` stay at the
 root, where probes and scrapes conventionally look. Default bind
 `127.0.0.1:8080`.
+
+**Or a unix socket, and no TCP port.** `http_listen =
+"unix:/run/torrentd/api.sock"` serves the same API on a socket whose
+permission bits (`http_socket_mode`, default `0o660`) and group
+(`http_socket_group`, default the daemon's own) decide who may call it, and
+the kernel enforces that. Every local user can reach a loopback port, and can
+take it over while the daemon is down; nobody else can create a file at the
+socket's path. `torrentctl` uses that socket whenever it exists. Prometheus
+cannot scrape a socket, and the three keys take a restart.
+[docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other)
+has the details.
 
 The contract is **[`docs/api/openapi.json`](docs/api/openapi.json)**, an
 OpenAPI 3.2 document the daemon derives from its own handlers and types
@@ -179,6 +194,9 @@ that needs one answers `409 profile-unavailable` naming the failure reason.
 
 `torrentctl` is a terminal UI for everything an operator does over the API:
 
+- **Dashboard.** Torrent counts by phase, upload and download rates over
+  time, each profile's health, and the daemon itself. `R` asks the daemon to
+  reload its config file, after a confirmation.
 - **Torrents.** Browse every torrent, cursor-paged and filterable by profile
   and phase. Pause, resume, recheck, reannounce or remove one, pause or resume
   them all, and open one for its files (with priorities), trackers and upload
@@ -195,17 +213,39 @@ down.
 
 ```bash
 cargo run --release -p torrentctl -- --url http://127.0.0.1:8080
+cargo run --release -p torrentctl -- --url unix:/run/torrentd/api.sock
 ```
 
-**Authentication.** It takes a static token from `--token-file`, which must
-be mode `0600`, or from `TORRENTCTL_TOKEN`. With neither, it asks for the
-operator password and holds the session token it gets in memory, revoking it
-on quit. The URL and the token file can also go in
-`$XDG_CONFIG_HOME/torrentctl/config.toml` as `url` and `token_file`. It logs
-to `$XDG_STATE_HOME/torrentctl/torrentctl.log`, never to the terminal.
+**Where the daemon is.** `--url` takes the daemon's base URL, or
+`unix:/path` for its socket. Without the flag, `TORRENTCTL_URL` decides, then
+`url` in the config file; with none of the three it connects to
+`unix:/run/torrentd/api.sock` when that socket exists, and to
+`http://127.0.0.1:8080` otherwise.
+
+**Authentication.** A static token comes from `--token`, `--token-file`,
+`TORRENTCTL_TOKEN` or the config file's `token_file`, in that order. Prefer a
+file or the environment variable: a token on the command line shows in the
+process list. A token file must be private to its owner (mode `0600`), and
+one readable by anyone else is refused rather than used. With no token, it
+asks for the operator password and holds the session token it gets in memory,
+revoking it on quit.
+
+**Config file.** `$XDG_CONFIG_HOME/torrentctl/config.toml`, or the file
+`--config` names, which must then exist. It takes `url` and `token_file`, and
+an unknown key is an error:
+
+```toml
+url        = "unix:/run/torrentd/api.sock"
+token_file = "/home/me/.config/torrentctl/token"
+```
+
+**Logs.** `$XDG_STATE_HOME/torrentctl/torrentctl.log`, never the terminal, at
+`info`. `TORRENTCTL_LOG` takes a `tracing` filter
+(`TORRENTCTL_LOG=debug`, or `torrentctl=debug`) for more.
 
 **Keys.** `?` lists the keys on every screen, `1`–`4` switch screens, and `:`
-opens a command line.
+opens a command line (`:dashboard`, `:torrents`, `:profiles`, `:pool`,
+`:add`, `:reload`, `:help`, `:quit`).
 
 **Colour.** Truecolor terminals get the full palette, others 256 colours, and
 `NO_COLOR` none. Every state also carries a symbol, so nothing is carried by
@@ -397,7 +437,22 @@ read only series it holds.
 `deploy/` has a hardened systemd unit (`Type=notify`,
 `RestartPreventExitStatus=78`, resource limits), a multi-stage `Containerfile`, and a
 `compose.yaml`. Run torrentd as its own user. Setup is
-[`docs/running.md`](docs/running.md).
+[`docs/running.md`](docs/running.md), whose §8 also brings up the compose
+stack, and §9 has the day-one runbook for WireGuard behind the kill switch.
+
+### The daemon's command line
+
+`--config <PATH>` comes first and is required by everything but `openapi`.
+With no subcommand, `torrentd` runs the daemon.
+
+| Invocation | What it does |
+| --- | --- |
+| `torrentd --config … --check-config` | Validate the file and exit, `78` on a refusal, without starting anything. With `network_kill_switch = true` it also checks that `nft` runs and that it is not uid 0, judged for the invoking process, so run it as the daemon's user: `sudo -u torrentd torrentd --config … --check-config`. |
+| `torrentd --config … vpn check` | Check every `vpn` profile's tunnel without seeding anything. `--profile ID` checks one, `--json` prints JSON, `--egress IP:PORT` requires a reply from a socket bound to the tunnel, `--bring-up` raises a tunnel that is not up (needs `CAP_NET_ADMIN`), and `--as-uid UID` renders and dry-runs the kill-switch ruleset for that uid, the daemon's, rather than the invoker's. |
+| `torrentd --config … pool scan \| status \| check \| orphans [--limit N]` | The managed pool ([Managed pool](#managed-pool)). |
+| `torrentd --config … hash-password`, `new-token --name N --scopes S` | Generate `[auth]` values ([Authentication](#authentication)). |
+| `torrentd --config … net-cleanup` | Remove what a daemon that did not exit cleanly left on the host: its uid's kill-switch table and the WireGuard links it raised, with their `ip rule`s. The packaged unit runs it as `ExecStopPost=` after every exit, so it is rarely typed. It needs `CAP_NET_ADMIN`, refuses while a daemon holds the state directory, and exits `1` when something it found would not go. |
+| `torrentd openapi [--out PATH]` | Print the API's OpenAPI document. |
 
 ## Testing
 

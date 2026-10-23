@@ -1172,7 +1172,14 @@ The daemon sets none of these itself.
   bare metal. The kernel uses `max(conf/all, conf/<iface>)` per interface, so
   `all = 2` is sufficient on its own — but `all = 0` is *not* safe, because a
   tunnel interface created later inherits `conf/default` and may come up
-  strict. `vpn check` reports both values and the effective mode.
+  strict. `vpn check` reports both values and the effective mode. On the
+  host, write it to a `sysctl.d` file so it outlasts a reboot, and load it:
+
+  ```bash
+  echo 'net.ipv4.conf.all.rp_filter = 2' | sudo tee /etc/sysctl.d/90-torrentd.conf
+  sudo sysctl --system
+  sysctl net.ipv4.conf.all.rp_filter          # net.ipv4.conf.all.rp_filter = 2
+  ```
 
 ## 8. Start it
 
@@ -1252,6 +1259,57 @@ its files. They are still not reloadable — the stores are opened once at
 startup — but pointing a profile at its files is routine configuration, and
 the privacy warning is the line an alert rule watches for an account's identity
 changing under a live session.
+
+### On the compose stack
+
+[`deploy/compose.yaml`](../deploy/compose.yaml) runs the daemon from the
+image `deploy/Containerfile` builds, behind Caddy, which terminates TLS
+(§6a). Every command runs from the repository root; `docker compose` takes
+the same arguments as `podman compose`.
+
+1. **Write the config the stack mounts**, `deploy/torrentd.toml` (git ignores
+   it). Create it before anything else: a bind mount of a file that does not
+   exist mounts an empty directory in its place.
+
+   ```bash
+   cp deploy/torrentd.sample.toml deploy/torrentd.toml
+   ```
+
+   In it, set `http_listen = "0.0.0.0:8080"`, since `proxy` reaches the
+   daemon over the compose network and a loopback bind inside the container
+   is a dead port; uncomment `trusted_proxies = ["172.28.0.2"]`, the address
+   `compose.yaml` pins `proxy` to; and delete `allow_unauthenticated = true`,
+   which a non-loopback bind refuses. The rest of the sample's paths are the
+   ones the stack mounts.
+2. **Name the site.** In [`deploy/Caddyfile`](../deploy/Caddyfile), replace
+   `torrentd.example.com` with the name the host answers to. Caddy fetches a
+   certificate for it, so that name must resolve to this host and ports 80
+   and 443 must reach it.
+3. **Create the payload directory** for the container's uid, as §4 shows for
+   rootful and rootless engines.
+4. **Generate the credentials** and add them to `deploy/torrentd.toml` as an
+   `[auth]` section (§6, and the bottom of the sample), with a `metrics` token
+   if a Prometheus will scrape through the proxy:
+
+   ```bash
+   podman compose -f deploy/compose.yaml build
+   podman compose -f deploy/compose.yaml run --rm torrentd hash-password
+   podman compose -f deploy/compose.yaml run --rm torrentd new-token --name prometheus --scopes metrics
+   ```
+
+5. **Start it**, and check it from inside the container (§9):
+
+   ```bash
+   podman compose -f deploy/compose.yaml up -d
+   podman compose -f deploy/compose.yaml exec torrentd curl -s localhost:8080/healthz
+   curl -s https://<your host>/healthz
+   ```
+
+A `vpn` profile in this container needs the `user`, `cap_add` and `devices`
+lines and the `/etc/wireguard` volume that `compose.yaml` carries commented,
+and runs **without** the kill
+switch: the comment above them says why the two cannot be combined here. A
+deployment that needs both runs from `deploy/torrentd.service` instead.
 
 ## 9. First-run checks
 
@@ -1506,6 +1564,132 @@ To check the exit address itself, ask something that reports it:
 ```bash
 curl --interface wg-acct-a -s https://api.ipify.org; echo
 ```
+
+### Day one: WireGuard behind the kill switch
+
+One ordered sequence, for a host running the packaged unit, from nothing to
+a WireGuard account seeding behind the kill switch. Each step points at the
+section that explains it; none can be skipped. The account here is `acct_a`
+on `wg-acct-a`. Run the steps before anything is seeded through the
+profile.
+
+1. **The user, the binary and the capability.** Create the dedicated user
+   and the directories as §4 does: the kill switch matches the daemon's uid,
+   so no other process may share it, and it refuses uid 0. Install the unit
+   (§8) without starting it, and in `/etc/systemd/system/torrentd.service`
+   uncomment `AmbientCapabilities=CAP_NET_ADMIN` and
+   `CapabilityBoundingSet=CAP_NET_ADMIN`. Install `iproute2`,
+   `wireguard-tools` and `nftables` (§1).
+2. **The WireGuard config.** Put it at
+   `/etc/wireguard/wg-acct-a.conf`, the one path a profile on `wg-acct-a`
+   accepts (§5), and keep it to what the daemon applies itself (§11, drill
+   6, step 3): `PrivateKey` in the file, no `PreUp`, `PostUp`, `PreDown` or
+   `PostDown`, `Table` absent or `auto`, and
+   `AllowedIPs = 0.0.0.0/0` (plus `::/0` for IPv6). A `DNS` line is ignored.
+   (`Table = off` works only for a link raised by root before the daemon,
+   which the daemon adopts.)
+   `PersistentKeepalive = 25` keeps the handshake fresh on a quiet profile
+   (§11, drill 5). Each account needs its own tunnel address and its own
+   server (`Endpoint`); see [Account isolation](#account-isolation). Then
+   let the daemon's group read it:
+
+   ```bash
+   sudo chgrp torrentd /etc/wireguard /etc/wireguard/wg-acct-a.conf
+   sudo chmod 0750 /etc/wireguard
+   sudo chmod 0640 /etc/wireguard/wg-acct-a.conf
+   ```
+
+   For tracker lookups through the tunnel, raise the link as root before the
+   daemon instead, with the hooks [Tracker lookups through a
+   tunnel](#tracker-lookups-through-a-tunnel) gives; the daemon adopts it.
+3. **The profile and the switch.** A daemon with the kill switch carries
+   `vpn` profiles only: a `network = "host"` profile beside it is refused, and
+   so is an OpenVPN one. Host profiles, and OpenVPN accounts, go in a second
+   daemon under a user of its own (§11, drill 6, "Two daemons in one network
+   namespace"). In `/etc/torrentd/torrentd.toml`:
+
+   ```toml
+   http_listen         = "unix:/run/torrentd/api.sock"
+   allow_unauthenticated = true          # or [auth]: §6
+   network_kill_switch = true
+
+   [[profile]]
+   id                      = "acct_a"
+   network                 = "vpn"
+   vpn_type                = "wireguard"
+   vpn_config              = "/etc/wireguard/wg-acct-a.conf"
+   vpn_interface           = "wg-acct-a"
+   listen_port             = 6891        # or port_forward = "natpmp": step 9
+   peer_fingerprint        = "-qB5030-"
+   user_agent              = "qBittorrent/5.0.3"
+   allowed_tracker_domains = ["tracker.example.com"]
+   ```
+
+   beside the required keys of §5. The unix socket keeps the API to the
+   socket's group (§6); a TCP `http_listen` works too, with `[auth]` on a
+   shared host.
+4. **Reverse-path filtering.** Write and load the `sysctl.d` file of §7, so
+   `net.ipv4.conf.all.rp_filter` is `2` now and after a reboot.
+5. **Validate the file as the daemon's user.** As root it would judge uid 0
+   and refuse the kill switch:
+
+   ```bash
+   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config   # config OK
+   ```
+
+6. **Raise the tunnel once, by hand.** `--bring-up` raises it exactly as the
+   daemon will, checks it, and lowers it again; it needs `CAP_NET_ADMIN`, so
+   it runs under `sudo`, and `--as-uid` dry-runs the kill-switch ruleset for
+   the daemon's uid rather than root's:
+
+   ```bash
+   sudo torrentd --config /etc/torrentd/torrentd.toml vpn check --profile acct_a \
+        --bring-up --egress 1.1.1.1:53 --as-uid "$(id -u torrentd)"
+   ```
+
+   Exit `0` is a pass. The `kill_switch_uid` line reads `[?cap]` here by
+   design ("Checking the VPN on its own" above). Anything that fails is
+   fixed before the next step.
+7. **Start the daemon**, and check the tunnel again as the daemon's user,
+   against the link the daemon now holds. This form changes nothing and is
+   the one to automate:
+
+   ```bash
+   sudo systemctl enable --now torrentd
+   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml vpn check \
+        --profile acct_a --egress 1.1.1.1:53
+   ```
+
+8. **Confirm the switch is armed.** The table stands, named for the daemon's
+   uid, with one accept line pairing the tunnel's address with its
+   interface and a `udp sport` exemption for the tunnel's own transport
+   (§11, drill 6):
+
+   ```bash
+   sudo nft list table inet "torrentd_ks_$(id -u torrentd)"
+   curl -s --unix-socket /run/torrentd/api.sock http://localhost/metrics \
+     | grep -E '^torrentd_kill_switch_(active|table_present) '
+   ```
+
+   Both gauges read `1`: `torrentd_kill_switch_active` says the daemon
+   installed the table, and `torrentd_kill_switch_table_present` that the
+   last 30-second check found it intact. Over TCP, `GET /metrics` takes a
+   `metrics` token (§9). With the alert rules loaded (§9, "Monitoring"),
+   `TorrentdKillSwitchGone` fires while the first reads `1` and the second
+   `0`, and `TorrentdKillSwitchLost` for a loss the next check's reinstall
+   repaired, which the first never sees. Then
+   confirm the exit address is the provider's, not the host's:
+   `curl --interface wg-acct-a -s https://api.ipify.org`.
+9. **On Proton, with a forwarded port.** Generate the WireGuard config with
+   *NAT-PMP (Port Forwarding)* on, for a P2P server, and set
+   `port_forward = "natpmp"` with no `listen_port` (§5, "ProtonVPN"); the
+   gateway defaults to Proton's `10.2.0.1`. Step 6's `vpn check` then also
+   asks the gateway for a port. Every Proton WireGuard config gives the
+   tunnel `10.2.0.2/32`, so a second Proton account goes in a daemon of its
+   own, in its own network namespace, with a config for a different server.
+
+Only then add torrents, or adopt a library into the profile
+([`import.md`](import.md)).
 
 ## 10. Migrating a pool from another client
 
