@@ -2724,7 +2724,9 @@ PublicKey = x
     ///
     /// It needs a non-root uid holding `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` in
     /// a private network namespace, `ip`, `wg`, `nft`, `unshare` and
-    /// `nsenter`, so it is ignored by default. Unprivileged:
+    /// `nsenter`, so it is ignored by default. `mise run test-netns` runs it
+    /// this way, beside every other real-kernel test (the `vpn-netns` CI job
+    /// does, on every pull request). Unprivileged:
     ///
     /// ```text
     /// cargo test -p torrentd --bin torrentd --no-run
