@@ -446,10 +446,24 @@ pub async fn stream_events(
 
 /// Collapse the state a client renders into one number.
 ///
-/// Deliberately coarse: it needs to change when something visible changes, not
-/// to describe what. Torrent count, aggregate rates and the alert-loop
-/// heartbeat between them cover adds, removals, rate changes and the loop
-/// stalling.
+/// It needs to change when something visible changes, not to describe what,
+/// so it hashes what `/v1/status`, the torrent listings, `/v1/profiles` and
+/// the pool's overview and plans render:
+///
+/// - every assigned torrent's profile, phase, progress, rates, transfer
+///   totals, peer count and flags, so a phase change on a torrent whose rates
+///   do not move (paused against idle, an error, a recheck starting) shows;
+/// - every profile's status, tunnel address, forwarded port, fence count,
+///   desired state and whether its session runs;
+/// - the pool index's generation (bumped by every scan's match), its adoption
+///   counts (moved by an adoption, a verification or a drift check), every
+///   plan's status and the step progress of a plan being applied, and the
+///   verify queue;
+/// - the alert-loop heartbeat age in seconds, so a stalled loop shows.
+///
+/// One pass over the registry, as before; torrents and plans are combined by
+/// a wrapping sum of per-item hashes, so the result does not depend on the
+/// order a map iterates in.
 pub(crate) fn fingerprint(s: &AppState) -> u64 {
     let mut acc: u64 = 1469598103934665603;
     let mut mix = |v: u64| {
@@ -461,28 +475,99 @@ pub(crate) fn fingerprint(s: &AppState) -> u64 {
     mix(s.state.len() as u64);
     mix(s.state.pending_resume_count());
 
-    let mut up = 0i64;
-    let mut seeding = 0u64;
-    s.registry.for_each(|ih, _| {
-        if let Some(st) = s.state.get(ih) {
-            up += st.upload_rate;
-            if st.is_seeding {
-                seeding += 1;
-            }
-        }
+    let mut torrents = 0u64;
+    s.registry.for_each(|ih, profile| {
+        torrents = torrents.wrapping_add(match s.state.get(ih) {
+            Some(st) => hash_of(&(
+                ih,
+                profile,
+                st.phase,
+                st.progress.to_bits(),
+                st.upload_rate,
+                st.download_rate,
+                st.total_uploaded,
+                st.total_payload_uploaded,
+                st.num_peers,
+                (st.is_finished, st.is_seeding, st.has_error),
+            )),
+            None => hash_of(&(ih, profile)),
+        });
     });
-    mix(up as u64);
-    mix(seeding);
+    mix(torrents);
+
+    mix(profiles_fingerprint(s));
 
     if let Some(pool) = &s.pool {
         mix(pool.verify_queue().depth() as u64);
         mix(pool.verify_queue().in_flight() as u64);
         mix(pool.verify_queue().completed());
+        mix(pool_fingerprint(pool));
     }
 
     // Coarse enough not to churn, fine enough that a stalled loop shows up.
     mix(heartbeat_age(&s.alert_heartbeat).as_secs());
     acc
+}
+
+/// `v` hashed with a fixed key, so equal state hashes equal across ticks.
+fn hash_of<T: std::hash::Hash>(v: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::hash::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+/// What `/v1/profiles` renders of every configured profile, live or failed.
+fn profiles_fingerprint(s: &AppState) -> u64 {
+    let record = s.profiles.states();
+    let mut acc = hash_of(&record.offline_all);
+    for e in s.profiles.iter() {
+        let h = e.health();
+        // As `/v1/profiles` reads `effective_state`: from the session, which
+        // can differ from the record when it refused a change.
+        let paused = e.engine.session_paused().ok();
+        acc = acc.wrapping_add(hash_of(&(
+            e.id(),
+            &h.status,
+            h.tunnel_ip,
+            h.forwarded_port,
+            h.port_forward_ok,
+            h.paused_for_vpn,
+            h.fence_generation,
+            record.holds_offline(e.id()),
+            record.desired(e.id()),
+            paused,
+        )));
+    }
+    for f in s.profiles.failed() {
+        let id = &f.config.id;
+        acc = acc.wrapping_add(hash_of(&(id, record.desired(id))));
+    }
+    acc
+}
+
+/// What the pool's overview and plan listings render that the pool index
+/// holds, read on the read-only connection, which never waits for a scan.
+///
+/// A failed read hashes to a fixed value rather than failing the tick: the
+/// next read that succeeds changes the fingerprint back.
+fn pool_fingerprint(pool: &crate::pool_service::PoolService) -> u64 {
+    pool.with_reader(|st| -> Result<u64, torrentd_pool::PoolError> {
+        let mut acc = hash_of(&st.index_generation()?);
+        for (state, n) in st.counts_by_state()? {
+            acc = acc.wrapping_add(hash_of(&(state, n)));
+        }
+        for plan in st.plans()? {
+            let steps = if plan.status == "applying" {
+                st.plan_step_counts(plan.id)?
+            } else {
+                Vec::new()
+            };
+            acc = acc.wrapping_add(hash_of(&(plan.id, &plan.status, plan.applied_at, steps)));
+        }
+        Ok(acc)
+    })
+    .unwrap_or(u64::MAX)
 }
 
 /// Why a reload was not queued.
@@ -535,5 +620,156 @@ pub async fn reload_config(
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(
             ReloadError::ReloadUnavailable("the reload task is not running"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use torrentd_engine::InfoHash;
+    use torrentd_engine::ProfileId;
+    use torrentd_engine::ProfileStatus;
+    use torrentd_engine::TorrentHandle;
+    use torrentd_engine::TorrentPhase;
+    use torrentd_engine::TorrentState;
+
+    use super::*;
+
+    /// A test state whose heartbeat age reads zero on every tick, so two
+    /// fingerprints differ only where the state they hash does.
+    fn steady() -> AppState {
+        let s = crate::app_state::build_test_state(None);
+        s.alert_heartbeat
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        s
+    }
+
+    /// One torrent assigned to profile `p` and loaded, `Idle`, with nothing
+    /// moving.
+    fn load(s: &AppState) -> InfoHash {
+        let ih = InfoHash([7; 20]);
+        s.registry.assign(ih, ProfileId::new("p")).unwrap();
+        let h = TorrentHandle {
+            id: 7,
+            infohash: ih,
+        };
+        s.state.insert(
+            ih,
+            TorrentState::newly_added(h, ProfileId::new("p"), std::time::Instant::now()),
+        );
+        ih
+    }
+
+    /// `change` moves the fingerprint, and nothing between two reads does.
+    fn assert_moves(s: &AppState, what: &str, change: impl FnOnce()) {
+        let before = fingerprint(s);
+        assert_eq!(fingerprint(s), before, "unchanged state, {what}");
+        change();
+        assert_ne!(
+            fingerprint(s),
+            before,
+            "{what} did not move the fingerprint"
+        );
+    }
+
+    /// Each change is one the old fingerprint missed: none moves the torrent
+    /// count, the summed upload rate or the seeding count.
+    #[test]
+    fn a_torrents_phase_progress_and_download_rate_each_move_it() {
+        let s = steady();
+        let ih = load(&s);
+        let set = |f: fn(&mut TorrentState)| {
+            assert!(s.state.update(&ih, f));
+        };
+        assert_moves(&s, "paused", || set(|t| t.phase = TorrentPhase::Paused));
+        assert_moves(&s, "errored", || set(|t| t.phase = TorrentPhase::Errored));
+        assert_moves(&s, "checking", || set(|t| t.phase = TorrentPhase::Checking));
+        assert_moves(&s, "progress", || set(|t| t.progress = 0.5));
+        assert_moves(&s, "download rate", || set(|t| t.download_rate = 1024));
+        assert_moves(&s, "error flag", || set(|t| t.has_error = true));
+    }
+
+    #[test]
+    fn a_profiles_status_and_fence_each_move_it() {
+        let s = steady();
+        let p = s.profiles.iter().next().unwrap();
+        assert_moves(&s, "vpn down", || {
+            p.update_health(|h| h.status = ProfileStatus::VpnDown)
+        });
+        assert_moves(&s, "tunnel address", || {
+            p.update_health(|h| h.tunnel_ip = None)
+        });
+        assert_moves(&s, "fence", || p.update_health(|h| h.fence_generation += 1));
+    }
+
+    #[test]
+    fn a_scan_an_adoption_and_a_plans_progress_each_move_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = steady();
+        let pool = crate::pool_service::PoolService::open(
+            &crate::config::Config::minimal_for_tests(dir.path(), true),
+        )
+        .unwrap()
+        .expect("the fixture configures [pool]");
+        s.pool = Some(Arc::clone(&pool));
+
+        assert_moves(&s, "scan", || {
+            pool.scan().unwrap();
+        });
+        let ih = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        pool.with_store(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.to_owned(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "t".to_owned(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join("library").join("t.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+            .unwrap()
+        });
+        let adopt = |state| {
+            pool.with_store(|st| {
+                st.set_adoption(ih, state, None, None, None, None, None)
+                    .unwrap()
+            })
+        };
+        assert_moves(&s, "matched", || {
+            adopt(torrentd_pool::AdoptionState::Matched)
+        });
+        assert_moves(&s, "drifted", || {
+            adopt(torrentd_pool::AdoptionState::Drifted)
+        });
+
+        let mut plan = 0;
+        assert_moves(&s, "plan created", || {
+            plan = pool.with_store_mut(|st| {
+                let id = st.create_plan("delete_orphans", "{}", 0).unwrap();
+                let step = |src: &str| torrentd_pool::model::PlanStep {
+                    op: "delete_file".to_owned(),
+                    src: src.to_owned(),
+                    dst: None,
+                };
+                st.add_plan_steps(id, &[step("a"), step("b")]).unwrap();
+                id
+            });
+        });
+        assert_moves(&s, "plan applying", || {
+            pool.with_store(|st| st.set_plan_status(plan, "applying", Some(1)).unwrap())
+        });
+        assert_moves(&s, "step done", || {
+            pool.with_store(|st| st.set_step_status(plan, 0, "done", None).unwrap())
+        });
+        assert_moves(&s, "plan applied", || {
+            pool.with_store(|st| st.set_plan_status(plan, "applied", None).unwrap())
+        });
     }
 }

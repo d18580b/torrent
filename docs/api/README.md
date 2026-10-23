@@ -255,7 +255,10 @@ described in [`problems.md`](problems.md):
   the event's `kind`.
 - Today there is one kind, `tick`. It is sent when anything a client renders
   may have changed, and at least every ten seconds. It carries an opaque
-  `fingerprint`, not the change itself: refetch what is on screen.
+  `fingerprint`, not the change itself: refetch what is on screen. It covers
+  every torrent's phase, progress, rates and peers, every profile's status
+  and state, the pool index's scans and adoption states, and every plan's
+  status and step progress.
 - The first event carries `retry: 5000`, the reconnect delay in milliseconds.
 - A comment line every fifteen seconds keeps the connection alive through
   proxies.
