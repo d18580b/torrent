@@ -358,6 +358,60 @@ fn views_switch_with_brackets_and_arrows_but_not_tab() {
 }
 
 #[test]
+fn busy_reads_the_load_of_the_view_shown() {
+    // Overview: its own load.
+    let mut state = with_overview();
+    assert!(!busy(&state));
+    state.overview.loading = true;
+    assert!(busy(&state), "the overview is loading");
+
+    // Tree before a root is picked: the overview that picks it.
+    let mut state = with_overview();
+    state.view = View::Tree;
+    assert!(state.tree.root.is_none());
+    state.tree.entries.loading = true;
+    assert!(!busy(&state), "no root: the tree's entries are not read");
+    state.overview.loading = true;
+    assert!(busy(&state), "no root: the overview picking one is");
+
+    // Tree with a root: its entries, not the overview.
+    let mut state = with_tree();
+    assert_eq!(state.view, View::Tree);
+    assert!(!busy(&state));
+    state.overview.loading = true;
+    assert!(!busy(&state), "a root: the overview's load is not read");
+    state.tree.entries.loading = true;
+    assert!(busy(&state), "a root: its entries are loading");
+
+    // Library: its page of items, and no other view's load.
+    let mut state = with_library(3, None);
+    assert!(!busy(&state));
+    state.overview.loading = true;
+    state.tree.entries.loading = true;
+    state.plans.list.loading = true;
+    assert!(!busy(&state), "other views' loads are not read");
+    state.library.items.loading = true;
+    assert!(busy(&state), "the library is loading");
+
+    // Plans: the list, and an open plan's detail or its steps.
+    let mut state = with_plans();
+    assert!(!busy(&state));
+    state.library.items.loading = true;
+    assert!(!busy(&state), "the library's load is not read");
+    state.plans.list.loading = true;
+    assert!(busy(&state), "the plan list is loading");
+
+    let mut state = with_detail(delete_plan("draft"));
+    assert!(!busy(&state));
+    state.plans.detail.as_mut().unwrap().loading = true;
+    assert!(busy(&state), "the open plan is loading");
+    let detail = state.plans.detail.as_mut().unwrap();
+    detail.loading = false;
+    detail.steps.loading = true;
+    assert!(busy(&state), "the open plan's steps are loading");
+}
+
+#[test]
 fn the_tree_waits_for_the_overview_to_pick_a_root() {
     let mut state = State::default();
     assert_eq!(
