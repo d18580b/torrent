@@ -269,7 +269,12 @@ sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool check
 ```
 
 (or `POST /v1/pool/drift-check`). Do not rescan in place of either. A rescan
-records the rewritten file as the new truth.
+records the rewritten file as the new truth. Both report what the check could
+not see beside what drifted: the unreadable roots, the directories that look
+unmounted, how many files could not be stated, and the torrents left
+unchecked (`unreadable_roots`, `unmounted_dirs`, `files_unreadable` and
+`unchecked` in the API's response). A check that drifted nothing but names an
+unreadable root has not checked that root.
 
 Then see what no torrent claims:
 
