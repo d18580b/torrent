@@ -3979,8 +3979,32 @@ async fn serve_once(
     work: &Arc<crate::app_state::WorkGate>,
 ) -> kynos::Result<()> {
     let work = Arc::clone(work);
-    kynos::server::Server::new(app)
+    http_server(app)
         .listener(listener)
+        .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
+            let _ = shutdown_rx.recv().await;
+            // Latched first, so an apply still running stops at its next step
+            // and a `/v1/events` stream opened from here on ends at once.
+            work.cancel();
+            sd_notify::stopping();
+            sd_notify::status("draining HTTP requests");
+        }))
+        // Explicit rather than kynos's 25 s default: the drain is one stage
+        // of a stop budget (`deploy/torrentd.service` `TimeoutStopSec`) that
+        // the pool-work wait, the resume drain and the teardown share.
+        .shutdown_timeout(HTTP_DRAIN_TIMEOUT)
+        .serve()
+        .await
+}
+
+/// The server `serve_once` runs for `app`, with every connection and request
+/// bound it sets but the listener and the drain. Shared with the HTTP tests'
+/// stalled-body harness, so the bounds a stalled request meets there are the
+/// ones production sets.
+pub(crate) fn http_server(
+    app: kynos::router::service::Service<http::ctx::AppCtx>,
+) -> kynos::server::Server<http::ctx::AppCtx> {
+    kynos::server::Server::new(app)
         .max_connections(HTTP_MAX_CONNECTIONS)
         .http1(
             kynos::server::protocol::http1::Http1Config::default()
@@ -3997,20 +4021,6 @@ async fn serve_once(
         // states them, and the server's own 408 would replace the operation's
         // response, request id and shared headers included.
         .request_body_idle_timeout(None)
-        .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
-            let _ = shutdown_rx.recv().await;
-            // Latched first, so an apply still running stops at its next step
-            // and a `/v1/events` stream opened from here on ends at once.
-            work.cancel();
-            sd_notify::stopping();
-            sd_notify::status("draining HTTP requests");
-        }))
-        // Explicit rather than kynos's 25 s default: the drain is one stage
-        // of a stop budget (`deploy/torrentd.service` `TimeoutStopSec`) that
-        // the pool-work wait, the resume drain and the teardown share.
-        .shutdown_timeout(HTTP_DRAIN_TIMEOUT)
-        .serve()
-        .await
 }
 
 /// The accept failure in `outcome` when it is the process or the system
