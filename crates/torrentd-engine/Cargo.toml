@@ -21,17 +21,11 @@ tracing = { workspace = true }
 
 # Errors
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
-# Serialization (AssignmentRegistry's one-time JSON import)
+# Serialization (profile config, port-forward and VPN types)
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 # Misc
-bytes = { workspace = true }
-hex = { workspace = true }
-once_cell = { workspace = true }
-tempfile = { workspace = true }
 libc = { workspace = true }
 
 [features]
@@ -56,6 +50,10 @@ torrentd-engine = { path = ".", features = ["test-support"] }
 # torrent's payload download counter, which only `test-api` exposes.
 libtorrent-safe = { workspace = true, features = ["test-api"] }
 tempfile = { workspace = true }
+# Serde round trips in the profile and port-forward tests.
+serde_json = { workspace = true }
+# Magnet URIs in tests/lifecycle.rs.
+hex = { workspace = true }
 # Layer 3 integration fixtures: real SHA-1 piece hashes for generated .torrents.
 sha1 = { workspace = true }
 

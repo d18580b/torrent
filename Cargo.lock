@@ -3598,14 +3598,11 @@ dependencies = [
 name = "torrentd-engine"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "bytes",
  "crossbeam-channel",
  "dashmap",
  "hex",
  "libc",
  "libtorrent-safe",
- "once_cell",
  "parking_lot",
  "serde",
  "serde_json",
