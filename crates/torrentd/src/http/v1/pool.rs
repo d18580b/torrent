@@ -41,6 +41,7 @@ use crate::http::v1::server::count;
 use crate::http::v1::Pool;
 use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
+use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
 use crate::pool_service::execute_adopt;
 use crate::pool_service::PoolService;
@@ -1040,7 +1041,7 @@ from_profile_problem!(AdoptError);
 pub async fn adopt_pool_torrents(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
-    Json(req): Json<AdoptRequest>,
+    Json(Unenforced(req)): Json<Unenforced<AdoptRequest>>,
 ) -> Result<Json<AdoptionResult>, AdoptError> {
     // `allow_mutations` is deliberately not consulted. It gates the plan
     // surface — creating a plan as well as applying one — because a plan
@@ -1383,7 +1384,7 @@ from_invalid!(VerifyError);
 pub async fn verify_pool_torrents(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
-    Json(req): Json<VerifyRequest>,
+    Json(Unenforced(req)): Json<Unenforced<VerifyRequest>>,
 ) -> Result<Accepted<Json<VerifyResult>>, VerifyError> {
     let pool = s.pool.clone().ok_or(VerifyError::PoolNotConfigured)?;
     req.validate()?;

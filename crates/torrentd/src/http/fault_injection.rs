@@ -73,6 +73,7 @@ use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::Testing;
 use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
+use crate::http::validate::Unenforced;
 
 /// The longest stall accepted. Long enough for `TorrentdAlertLoopStalled`
 /// (15 s, held for a minute) with room for scrape and evaluation; bounded so
@@ -360,7 +361,7 @@ fn invalid(pointer: &str, detail: String) -> FaultError {
 pub async fn inject_fault(
     _caller: Scoped<Bearer, Write>,
     Inject(state): Inject<Arc<AppState>>,
-    Json(fault): Json<Fault>,
+    Json(Unenforced(fault)): Json<Unenforced<Fault>>,
 ) -> Result<NoContent, FaultError> {
     tracing::warn!(fault = ?fault, "fault-injection build: injecting a fault");
     apply(&state, fault)?;
