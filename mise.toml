@@ -8,7 +8,7 @@
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check
 #   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
-#   mise run openapi|openapi-check|test-fault-injection|deny
+#   mise run openapi|openapi-check|test-fault-injection|release-features|deny
 #   mise run lint-tracing|size-check|container|commit-lint <file-or-range>
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
@@ -253,6 +253,29 @@ run = [
 [tasks.test-fault-injection]
 description = "Run torrentd's tests in the fault-injection build"
 run = "cargo test -p torrentd --features fault-injection"
+
+# The features the shipped build resolves: deploy/Containerfile's
+# `cargo build --release --workspace --bin torrentd` with no extra features,
+# which is every workspace member's normal and build dependencies unified.
+# `fault-injection` (and the engine's `test-support` doubles it pulls in) must
+# be off there; a member that depended on torrentd or the engine with either
+# on would turn them on for the release build too. Reads `cargo metadata`;
+# builds nothing.
+[tasks.release-features]
+description = "Fail if the release build resolves fault-injection or test-support on"
+run = '''
+set -eu
+tree=$(cargo tree --locked --workspace -e normal,build --prefix none -f '{p} [{f}]')
+leaks=$(printf '%s\n' "$tree" \
+  | grep -E '^torrentd(-engine)? v.*\[([^]]*,)?(fault-injection|test-support)(,[^]]*)?\]' \
+  | sort -u || true)
+if [ -n "$leaks" ]; then
+  echo "::error::the release build resolves a test-only feature on:"
+  printf '%s\n' "$leaks"
+  exit 1
+fi
+printf '%s\n' "$tree" | grep -E '^torrentd(-engine)? v' | sort -u
+'''
 
 # The dependency policy in deny.toml: RustSec advisories, licenses, duplicate
 # and wildcard bans, and allowed sources. Reads Cargo.lock and the advisory
