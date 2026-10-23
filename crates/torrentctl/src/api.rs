@@ -292,7 +292,7 @@ pub async fn call<T, E: AsProblem>(
 }
 
 /// Run a request that may legitimately take minutes — a pool scan, a drift
-/// check, applying a plan — with no timeout: the daemon answers when the work
+/// check, applying a plan, an adoption or its preview — with no timeout: the daemon answers when the work
 /// is done, and giving up early would report a failure for work that went on.
 #[allow(
     clippy::result_large_err,

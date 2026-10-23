@@ -308,15 +308,11 @@ fn send(d: &mut Dialog, dry_run: bool, ctx: &Ctx<'_>) -> Vec<Effect> {
     let serial = d.serial;
     let api = ctx.api.clone();
     vec![Effect::new(async move {
-        // The preview is quick; the adoption itself claims and loads every
-        // target before answering, which for a large subtree outlasts the
-        // ordinary timeout — and giving up early would report a failure for
-        // work that went on.
-        let result = if dry_run {
-            crate::api::call(api.client.adopt_pool_torrents(&body)).await
-        } else {
-            crate::api::call_unbounded(api.client.adopt_pool_torrents(&body)).await
-        };
+        // Neither is held to the ordinary timeout. The adoption claims and
+        // loads every target before answering, and giving up early would
+        // report a failure for work that went on; the preview classifies
+        // every target of a large subtree first, which can outlast it too.
+        let result = crate::api::call_unbounded(api.client.adopt_pool_torrents(&body)).await;
         wrap(super::Msg::Adopt(Msg::Answered {
             serial,
             dry_run,
