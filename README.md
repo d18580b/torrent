@@ -156,7 +156,8 @@ heading in [`docs/api/problems.md`](docs/api/problems.md).
 
 **Input is confined, not just size-capped.** A `.torrent` named by
 `server_path` is read from the daemon's own filesystem, so it is restricted to
-`torrent_dir`, the pool library and the managed roots, with a 64 MiB cap, no
+`torrent_dir` (and each profile's own `torrent_dir`), the pool library and the
+managed roots, with a 64 MiB cap, no
 symlink followed at the last component, and errors that do not disclose
 whether a path exists. `save_path` must be inside `default_save_path` or a
 managed root, so an add cannot point libtorrent at any other directory the

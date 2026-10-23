@@ -58,8 +58,10 @@ pub struct AppState {
     pub alert_heartbeat: Arc<AtomicU64>,
     /// Save path used when `POST /v1/torrents` omits `save_path`.
     pub default_save_path: PathBuf,
-    /// Root of the `.torrent` store on disk. Used to confine a caller-supplied
-    /// `server_path` to directories the daemon already owns.
+    /// Root of the `.torrent` store on disk: every profile's directory without
+    /// a `torrent_dir` override of its own is under it. One of the directories
+    /// a caller-supplied `server_path` is confined to
+    /// ([`AppState::local_torrent_dirs`]).
     pub torrent_dir: PathBuf,
     /// Asks the reload pump to re-read the config file. `None` only in tests,
     /// which do not run one.
@@ -194,11 +196,18 @@ impl WorkGate {
 impl AppState {
     /// Directories a caller-supplied `server_path` may point into.
     ///
-    /// The daemon's own torrent store, the pool's `.torrent` library, and the
-    /// managed roots — the places a `.torrent` the daemon is meant to load
-    /// actually lives. Anything else and the route is a filesystem reader.
+    /// The daemon's own torrent store — the top-level `torrent_dir` and every
+    /// live profile's own `torrent_dir` override, which need not sit under it
+    /// — the pool's `.torrent` library, and the managed roots: the places a
+    /// `.torrent` the daemon is meant to load actually lives. Anything else
+    /// and the route is a filesystem reader.
     pub fn local_torrent_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.torrent_dir.clone()];
+        dirs.extend(
+            self.profiles
+                .iter()
+                .filter_map(|e| e.config.torrent_dir.clone()),
+        );
         if let Some(pool) = self.pool.as_ref() {
             dirs.push(pool.library_dir().to_path_buf());
             dirs.extend(pool.roots().iter().map(|(_, p)| p.clone()));
@@ -220,8 +229,8 @@ impl AppState {
         self.profiles.held_offline(profile_id)
     }
 
-    /// The configuration of a live profile, or `None` if no such profile is
-    /// configured.
+    /// The configuration of a live profile, or `None` where no live profile
+    /// has that id — including a configured one that failed to come up.
     pub fn profile_config(&self, profile_id: &ProfileId) -> Option<&ProfileConfig> {
         self.profiles.config(profile_id)
     }
@@ -382,6 +391,37 @@ mod tests {
         assert!(s.profile_vpn_down(&ProfileId::new("down")));
         // Unknown profile → not "down" (handlers resolve it to a 404 elsewhere).
         assert!(!s.profile_vpn_down(&ProfileId::new("missing")));
+    }
+
+    /// A profile whose `torrent_dir` override is outside the top-level one:
+    /// a `.torrent` in it is inside the directories `server_path` is confined
+    /// to, and a path in neither is not.
+    #[test]
+    fn a_server_path_in_a_profiles_own_torrent_dir_is_confined() {
+        let top = tempfile::tempdir().unwrap();
+        let own = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut config = test_entry("acct", ProfileStatus::Active).config;
+        config.torrent_dir = Some(own.path().to_path_buf());
+        let engine: Arc<dyn torrentd_engine::TorrentEngine> =
+            Arc::new(torrentd_engine::MockEngine::new());
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            crate::profile_registry::ProfileEntry::new(config, engine, None, None, 0),
+        ]));
+        let mut s = build_test_state(Some(reg));
+        s.torrent_dir = top.path().to_path_buf();
+
+        let confined = |p: &std::path::Path| {
+            s.local_torrent_dirs()
+                .iter()
+                .any(|d| torrentd_pool::plan::contains(d, p))
+        };
+        assert!(confined(&top.path().join("a.torrent")));
+        assert!(
+            confined(&own.path().join("a.torrent")),
+            "a profile's own torrent_dir is the daemon's torrent store too"
+        );
+        assert!(!confined(&elsewhere.path().join("a.torrent")));
     }
 
     #[test]

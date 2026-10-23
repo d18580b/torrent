@@ -1117,7 +1117,10 @@ The daemon sets none of these itself.
   daemon warns at boot when the soft limit is below `connections_limit +
   file_pool_size + 32` per profile plus the API's 256-connection cap and 64
   for the process itself (the database, logs, listeners and the commands it
-  runs). A peer listener that runs out of descriptors accepting a connection
+  runs), and a reload that raises `connections_limit` past that soft limit is
+  refused: the key keeps its running value, the reload warns and counts under
+  `config_reload_failures_total{stage="apply_settings"}`, and the rest of the
+  reload still applies. A peer listener that runs out of descriptors accepting a connection
   keeps listening: libtorrent accepts again at once, disconnecting a peer and
   lowering `connections_limit` only while that limit is above 10 and a
   torrent has a peer to drop. The daemon counts every such failure in

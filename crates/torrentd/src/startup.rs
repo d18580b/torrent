@@ -449,6 +449,10 @@ const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(6
 /// libtorrent's logs, as disk and peer errors, far from the cause. The values
 /// are the effective ones: `Settings::server_seed_overrides` sets both, and
 /// the config's keys override that.
+///
+/// Boot warns and carries on, since the limit is the unit file's and the
+/// daemon cannot raise it. A reload holds `connections_limit` to the same
+/// sum and refuses a raise past the limit (`reload::refuse_short_descriptors`).
 fn warn_if_descriptors_are_short(cfg: &Config) {
     let need = descriptors_needed(cfg);
     match nofile_soft_limit() {
@@ -469,7 +473,7 @@ fn warn_if_descriptors_are_short(cfg: &Config) {
 /// `connections_limit + file_pool_size` and [`DESCRIPTORS_PER_SESSION`] per
 /// configured profile, plus the HTTP connection cap and
 /// [`DESCRIPTORS_FOR_THE_PROCESS`].
-fn descriptors_needed(cfg: &Config) -> u64 {
+pub(crate) fn descriptors_needed(cfg: &Config) -> u64 {
     let s = cfg.libtorrent_settings();
     let per_session = u64::from(s.connections_limit.unwrap_or_default())
         + u64::from(s.file_pool_size.unwrap_or_default())
@@ -497,7 +501,7 @@ fn http_connection_cap() -> u64 {
 }
 
 /// The soft `RLIMIT_NOFILE`, or `None` if it cannot be read.
-fn nofile_soft_limit() -> Option<u64> {
+pub(crate) fn nofile_soft_limit() -> Option<u64> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -989,8 +993,9 @@ pub async fn boot(
     // *next* iteration, so the last profile's 30-second bring-up had no check
     // against it at all — and a one-profile deployment had none anywhere. Ask
     // once more before boot commits to running, while the drop guard still
-    // owns every tunnel this boot raised.
-    if boot_shutdown.try_recv().is_ok() {
+    // owns every tunnel this boot raised. A lagged or closed receiver counts
+    // as a shutdown, as at every other boot check.
+    if shutdown_requested(&mut boot_shutdown) {
         anyhow::bail!("shutdown requested during profile bring-up");
     }
     if profile_entries.is_empty() {
@@ -1440,48 +1445,28 @@ pub async fn boot(
                 // back out where nothing else of this profile's is filed under
                 // the session's key, and refused either way.
                 Ok(h) if h.infohash != ih => {
-                    let may_unload = may_unload_rekeyed(
+                    let Rekeyed {
+                        unloaded,
+                        claimed,
+                        paused,
+                    } = settle_rekeyed(
                         &registry,
                         &*resume_store,
                         &*torrent_store,
+                        &profile_source,
+                        &state,
+                        &*engine,
+                        &*metrics,
                         &profile,
-                        &h.infohash,
+                        h,
                     );
-                    let mut unloaded = may_unload
-                        && unload_rekeyed(&profile_source, &state, &*engine, &profile, h);
-                    // Left in the session, it is claimed under the key the
-                    // session gave it, as rule 4 requires of every torrent a
-                    // session holds. Where it cannot be (another profile
-                    // holds the key, or the claim did not persist), it is
-                    // taken back out even at the cost of this profile's files
-                    // under that key, rather than seeded with no claim.
-                    let mut claimed = false;
-                    if !unloaded {
-                        claimed = match registry.assign(h.infohash, profile.clone()) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                warn!(profile_id = %profile, infohash = %h.infohash,
-                                      error.cause = %e,
-                                      "could not claim a torrent its session keys by another \
-                                       infohash than the one it is filed under");
-                                metrics.inc_counter(
-                                    "profile_assignment_registry_errors_total",
-                                    &[("profile_id", profile.as_str())],
-                                );
-                                false
-                            }
-                        };
-                        if !claimed && !may_unload {
-                            unloaded =
-                                unload_rekeyed(&profile_source, &state, &*engine, &profile, h);
-                        }
-                    }
                     warn!(
                         profile_id = %profile,
                         infohash = %ih,
                         session_infohash = %h.infohash,
                         scan = "resume",
                         unloaded,
+                        paused,
                         "boot scan: torrent filed under an infohash its session does not key it by; \
                          refused (operator must reconcile: re-add it under the session's infohash)",
                     );
@@ -1501,13 +1486,17 @@ pub async fn boot(
                     // Left in the session, it is held to the fence like any
                     // other, under the key the session gave it, and counted
                     // loaded where the profile's claim on that key is what
-                    // the unloaded-claims gauge compares it with.
+                    // the unloaded-claims gauge compares it with. One left
+                    // there unclaimed and paused is kept from the fence,
+                    // whose lift resumes what it recorded.
                     if !unloaded {
                         loaded.insert(h.infohash);
                         if claimed {
                             added_from_resume += 1;
                         }
-                        scan_fence.added(&profile_registry, &metrics, &profile, h);
+                        if !paused {
+                            scan_fence.added(&profile_registry, &metrics, &profile, h);
+                        }
                     }
                 }
                 Ok(h) => {
@@ -2684,6 +2673,91 @@ fn unload_rekeyed(
     }
 }
 
+/// What [`settle_rekeyed`] did with a torrent its session keyed by another
+/// infohash than the one it was filed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rekeyed {
+    /// Taken back out of the session.
+    unloaded: bool,
+    /// Left in the session and claimed for the profile under the session's
+    /// key.
+    claimed: bool,
+    /// Left in the session with no claim, and paused there.
+    paused: bool,
+}
+
+/// Settle `profile`'s torrent `h`, which its session keyed by another
+/// infohash than the one it was filed under, so that it never seeds without
+/// the claim rule 4 requires of every torrent a session holds.
+///
+/// Taken back out where [`may_unload_rekeyed`] allows. Left in the session,
+/// it is claimed under the key the session gave it. Where it cannot be
+/// (another profile holds the key, or the claim did not persist), it is taken
+/// back out even at the cost of this profile's files under that key, rather
+/// than seeded with no claim. Where the session refuses that removal too, it
+/// is paused, so it stays in the session unclaimed but sends nothing; only an
+/// operator's resume starts it again.
+#[allow(clippy::too_many_arguments)]
+fn settle_rekeyed(
+    registry: &AssignmentRegistry,
+    resume: &dyn ResumeStore,
+    torrents: &dyn TorrentStore,
+    profile_source: &ProfileSource,
+    state: &StateMap,
+    engine: &dyn TorrentEngine,
+    metrics: &dyn MetricsSink,
+    profile: &ProfileId,
+    h: torrentd_engine::TorrentHandle,
+) -> Rekeyed {
+    let may_unload = may_unload_rekeyed(registry, resume, torrents, profile, &h.infohash);
+    let mut out = Rekeyed {
+        unloaded: may_unload && unload_rekeyed(profile_source, state, engine, profile, h),
+        claimed: false,
+        paused: false,
+    };
+    if out.unloaded {
+        return out;
+    }
+    out.claimed = match registry.assign(h.infohash, profile.clone()) {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(profile_id = %profile, infohash = %h.infohash, error.cause = %e,
+                  "could not claim a torrent its session keys by another infohash than the \
+                   one it is filed under");
+            metrics.inc_counter(
+                "profile_assignment_registry_errors_total",
+                &[("profile_id", profile.as_str())],
+            );
+            false
+        }
+    };
+    if out.claimed {
+        return out;
+    }
+    // A removal `may_unload` allowed has already failed once; one it did
+    // not is tried now, at the cost of this profile's files under the key.
+    if !may_unload {
+        out.unloaded = unload_rekeyed(profile_source, state, engine, profile, h);
+        if out.unloaded {
+            return out;
+        }
+    }
+    match engine.pause_torrent(h) {
+        Ok(()) => {
+            out.paused = true;
+            error!(profile_id = %profile, infohash = %h.infohash,
+                   "a torrent its session keys by another infohash could be neither claimed \
+                    nor taken back out; left paused in the session (operator must reconcile)");
+        }
+        Err(e) => {
+            error!(profile_id = %profile, infohash = %h.infohash, error.cause = %e,
+                   "a torrent its session keys by another infohash could be neither claimed, \
+                    taken back out, nor paused; it is in the session with no claim");
+        }
+    }
+    out
+}
+
 /// Where the boot torrent-dir scan re-adds a `.torrent` no resume data
 /// covered: the save path recorded beside it when it was added, or `default`
 /// when there is none to use.
@@ -2886,7 +2960,8 @@ where
     for p in &cfg.profile {
         // A shutdown asked for during a previous profile's bring-up is
         // honoured here rather than after every remaining tunnel is raised.
-        if boot_shutdown.try_recv().is_ok() {
+        // A lagged receiver missed signals, so it counts as one too.
+        if shutdown_requested(boot_shutdown) {
             anyhow::bail!("shutdown requested during profile bring-up");
         }
 
@@ -3852,8 +3927,11 @@ fn announce_ready(
 /// daemon; a stand-in in tests). The second descriptor for a run is held
 /// before it starts: the first from the bound listener, every later one from
 /// the spare the next run is served on, during the backoff. A duplicate that
-/// fails because descriptors are still short waits another backoff and is
-/// tried again, so the API is never served again without a spare.
+/// fails because descriptors are still short (`EMFILE`, `ENFILE`) waits
+/// another backoff and is tried again, so exhaustion alone never has the API
+/// served again without a spare. One that fails for any other reason is not
+/// retried: the API is served again with no spare, as a warning says, and the
+/// next exhaustion in `accept` ends the server and the daemon with it.
 #[allow(clippy::too_many_arguments)]
 async fn serve_through_exhaustion<A, B, H, S, F>(
     mut listener: tokio::net::TcpListener,
@@ -6624,6 +6702,86 @@ mod tests {
         }
     }
 
+    /// Issue 455: a torrent its session keyed by another infohash, whose
+    /// claim under that key fails because another profile holds it, never
+    /// seeds unclaimed. Where the session also refuses to take it back out —
+    /// the removal `may_unload_rekeyed` allowed, or the one forced where it
+    /// did not — it is paused; where the forced removal succeeds it is gone.
+    #[test]
+    fn a_rekeyed_torrent_that_can_be_neither_claimed_nor_unloaded_is_paused() {
+        use torrentd_engine::EngineError;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+
+        let p = ProfileId::new("p");
+        let key = libtorrent_safe::InfoHash([7; 20]);
+        // `files_under_key`: whether the profile files a `.torrent` under the
+        // key itself, which makes the only removal one forced after the claim
+        // failed; `remove_fails`: whether the session refuses that removal.
+        let settle = |files_under_key: bool, remove_fails: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = AssignmentRegistry::new_empty(dir.path().join("registry.db"));
+            registry.assign(key, ProfileId::new("other")).unwrap();
+            let torrents = torrentd_engine::MemoryTorrentStore::new();
+            if files_under_key {
+                torrents.write(&p, &key, b"d4:infode").unwrap();
+            }
+            let engine = Arc::new(MockEngine::new());
+            let h = engine.register_handle(key);
+            if remove_fails {
+                engine.inject_error(
+                    "remove_torrent",
+                    EngineError::MockInjected {
+                        op: "remove_torrent",
+                        message: "refused".into(),
+                    },
+                );
+            }
+            let source =
+                ProfileSource::new(vec![(p.clone(), engine.clone() as Arc<dyn TorrentEngine>)]);
+            let out = settle_rekeyed(
+                &registry,
+                &torrentd_engine::MemoryResumeStore::new(),
+                &torrents,
+                &source,
+                &StateMap::new(),
+                &*engine,
+                &torrentd_engine::NoopSink,
+                &p,
+                h,
+            );
+            let paused = engine
+                .calls()
+                .into_iter()
+                .any(|c| matches!(c, RecordedCall::PauseTorrent(x) if x == h));
+            assert_eq!(registry.lookup(&key), Some(ProfileId::new("other")));
+            (out, paused)
+        };
+        let paused_unclaimed = Rekeyed {
+            unloaded: false,
+            claimed: false,
+            paused: true,
+        };
+
+        assert_eq!(
+            settle(false, true),
+            (paused_unclaimed, true),
+            "the allowed removal failed, then the claim",
+        );
+        assert_eq!(
+            settle(true, true),
+            (paused_unclaimed, true),
+            "the claim failed, then the forced removal",
+        );
+        let unloaded = Rekeyed {
+            unloaded: true,
+            claimed: false,
+            paused: false,
+        };
+        assert_eq!(settle(false, false), (unloaded, false));
+        assert_eq!(settle(true, false), (unloaded, false));
+    }
+
     /// Issue 166: both boot scans hold what they add to the profile's account
     /// binding. Account A's torrent, in account B's resume directory (with
     /// and without its `.torrent`) or torrent directory, is refused and
@@ -7986,6 +8144,42 @@ mod profile_construction_tests {
             vpn.bring_up_calls().is_empty(),
             "no tunnel is raised after the shutdown",
         );
+    }
+
+    /// A receiver that lagged past the shutdown missed it, and reads as one:
+    /// the bring-up stops as it does for a signal it saw.
+    #[tokio::test]
+    async fn a_lagged_shutdown_receiver_stops_the_bring_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[vpn("acct_a", "wg-a", 1)]);
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        let vpn_for = vpn.clone();
+        let mut cleanup = BootCleanup::with_vpn_factory(
+            PathBuf::from("/var/lib/torrentd"),
+            Arc::new(move |_t, _dir| {
+                Arc::new(vpn_for.clone()) as Arc<dyn torrentd_engine::VpnManager>
+            }),
+        );
+        let (tx, mut boot_shutdown) = broadcast::channel(1);
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        tx.send(ShutdownReason::Sigterm).unwrap();
+
+        let r = build_profiles(
+            &cfg,
+            &mut cleanup,
+            &MockForwarder::new(),
+            &torrentd_engine::NoopSink,
+            &mut boot_shutdown,
+            &crate::profile_state::Record::default(),
+            |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
+                panic!("no session is built after a shutdown was missed")
+            },
+        )
+        .await;
+
+        assert!(r.is_err(), "the bring-up is abandoned");
+        assert!(vpn.bring_up_calls().is_empty());
     }
 
     /// A profile left offline, read back from the state file a crash left,
