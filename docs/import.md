@@ -334,9 +334,13 @@ takes.
 A queued torrent is hashed after the request answers, so its hashing adds
 nothing to the wait.
 
-A torrent listed under `fast_path` can still end up hashed: when its resume
-data turns out unreadable or libtorrent rejects it, the adopt falls back to
-the verify queue and logs `falling back to verification`.
+A torrent the index plans for the fast path can still end up hashed: when its
+resume data turns out unreadable, unparseable or keyed by another info-hash,
+or libtorrent rejects its add, the adopt falls back to the verify queue and
+logs `falling back to verification`. The response lists it where it went,
+under `queued_for_verification`, with its bytes in `verify_bytes`; a dry run
+reports the fallbacks it can see before the add, every one but the rejected
+add.
 
 **Batches by account.** Where one root holds several accounts' torrents, a
 subtree does not separate them, but the qBittorrent category often does
@@ -475,11 +479,18 @@ as `verify_queue_depth` and `verify_in_flight`.
   admission, or libtorrent rejected the add. Its registry claim is released,
   so it adopts again once the cause is fixed. The log line ends `dropping
   verify`, or reads `verify dropped: …` or `verify add failed`.
-- **A fenced or offline profile** holds the queue: nothing is admitted for it
-  until it is back (`verify held: profile is off the network`, or `re-hash
-  held: …` for a queued re-hash, logged once per profile each second). A
+- **A fenced or offline profile** holds its own items: nothing is admitted
+  for it until it is back, and the items behind them, for other profiles,
+  are admitted meanwhile (`verify held: profile is off the network`, or
+  `re-hash held: …` for a queued re-hash, logged once per profile each
+  second). A
   queued re-hash also waits while the profile's fence is lifted, until the
   lift's paced resume reaches its torrent.
+- **A running scan** holds the pool index until it commits. Meanwhile no
+  waiting adoption is admitted and no adoption's or re-hash's verdict is
+  recorded; each keeps its place and its slot, and goes on once the scan
+  ends. Re-hashes and `.torrent` adds waiting for a slot are started as
+  usual.
 - **A re-hash paused while it checks** keeps its slot until the check ends,
   because libtorrent goes on with it once the torrent is resumed. Resume or
   remove the torrent to free the slot; otherwise it is freed after 24 hours.

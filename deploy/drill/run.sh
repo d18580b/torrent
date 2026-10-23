@@ -13,7 +13,9 @@
 #   TORRENTD_IMAGE  image to run (default localhost/torrentd:drill, built from
 #                   deploy/Containerfile with the fault-injection feature when
 #                   absent). It must be a fault-injection build: the drill
-#                   checks, and says how to rebuild one that is not.
+#                   checks, and says how to rebuild one that is not. Such a
+#                   build exits 78 unless TORRENTD_FAULT_INJECTION=1, which
+#                   compose.yaml and the config check below set.
 #   DRILL_DIR       where the config and faults are written (default: mktemp)
 #   DEADLINE_SECS   how long to wait for the alerts (default 240)
 #   KEEP=1          leave the stack running
@@ -161,9 +163,12 @@ user_agent = "qBittorrent/5.0.3"
 allowed_tracker_domains = ["tracker.example.com"]
 EOF
 # Refuse to start a stack whose daemon would exit on its config: a compose
-# dependency on an exited service can wait indefinitely.
+# dependency on an exited service can wait indefinitely. A fault-injection
+# build refuses --check-config, as it refuses to start, without the opt-in
+# compose.yaml gives the daemon; the operator subcommands `tool` runs need none.
 tool_check() {
-  "$engine" run --rm -v "$DRILL_DIR:/drill:z" --entrypoint /usr/local/bin/torrentd \
+  "$engine" run --rm -e TORRENTD_FAULT_INJECTION=1 -v "$DRILL_DIR:/drill:z" \
+    --entrypoint /usr/local/bin/torrentd \
     "$TORRENTD_IMAGE" --config /drill/torrentd.toml --check-config
 }
 # Named for an info-hash, so the boot scan tries to add it, and not a torrent.

@@ -91,6 +91,20 @@ jobs:
       # Advisories, licenses, bans and sources, against deny.toml.
       - run: mise run deny
 
+  release-features:
+    name: release build has no fault injection
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # `cargo tree` reads `cargo metadata`, so it needs cargo, not a build.
+      - uses: ./.github/actions/setup-rust
+      # The feature set deploy/Containerfile's release build resolves must
+      # leave `fault-injection` and the engine's `test-support` off.
+      - run: mise run release-features
+
   tracing-lint:
     name: tracing field-name lint
     runs-on: ubuntu-24.04

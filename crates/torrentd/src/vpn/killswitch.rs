@@ -22,7 +22,9 @@
 //! the address its profile's sessions are bound to: one rule per profile,
 //! `meta skuid <uid> ip saddr <tunnel address> oifname "<its interface>"
 //! accept`, with the address read off the live link when the ruleset is
-//! installed ([`Tunnel`]). A shared `oifname { every tunnel }` set let any
+//! installed ([`Tunnel`]) and read again before each of [`watch`]'s checks
+//! ([`refresh`]), so an address the link gains or changes after boot is
+//! paired from the next check. A shared `oifname { every tunnel }` set let any
 //! socket the daemon owns leave by any profile's tunnel, so a packet from
 //! profile A's address that the routing table sent out of profile B's tunnel
 //! — A's per-source `ip rule` lost or shadowed — was accepted, and A's
@@ -32,6 +34,9 @@
 //! ([`Tunnel::with_v6`]), since a session listens on its tunnel device and so
 //! listens and announces on every address the device holds. The daemon's
 //! IPv6 egress from any other address (a link-local one included) is dropped.
+//! The VPN monitor's route probe asks from the same addresses, each toward a
+//! destination of its own family ([`super::route`]), so a paired IPv6
+//! address needs an IPv6 route through the tunnel as its IPv4 one does.
 //!
 //! **It does not put DNS through the tunnel.** The ruleset matches sockets the
 //! daemon's uid owns. A tracker hostname is resolved by libc, and on a host
@@ -396,8 +401,8 @@ fn replace_script(uid: u32, table: &str) -> String {
 /// The kill switch as `enable` installed it: the uid it confines, the
 /// tunnels and the transport of each it was rendered over, and the table it
 /// rendered, which [`verify`] compares the live one with and [`watch`]
-/// installs again when they differ. [`refresh`] replaces the transports and
-/// the table when a link's transport changes.
+/// installs again when they differ. [`refresh`] replaces the tunnels, the
+/// transports and the table when a link's addresses or transport change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub uid: u32,
@@ -1121,10 +1126,11 @@ enum Watch {
 /// cannot run counts in `kill_switch_probe_errors_total` and changes nothing,
 /// since not knowing is not the same as absent.
 ///
-/// Before each check, each tunnel's transport is read off its link again
-/// ([`refresh`]), and a change installs the ruleset again with the live one,
-/// so a link re-raised on another port or to another endpoint carries again
-/// at the next check rather than at the next restart. A reinstall that fails
+/// Before each check, each tunnel's addresses and transport are read off its
+/// link again ([`refresh`]), and a change installs the ruleset again with the
+/// live ones, so a link re-raised on another port or to another endpoint, or
+/// holding an IPv6 address it did not hold at boot, carries again at the next
+/// check rather than at the next restart. A reinstall that fails
 /// leaves the live table differing from the one now rendered, which the
 /// check reads as drift.
 ///
@@ -1173,7 +1179,13 @@ pub(crate) async fn watch(
                 let _span = span.entered();
                 let apply = gated_apply(&gate, apply);
                 let mut installed = installed.lock().unwrap_or_else(|p| p.into_inner());
-                refresh(&mut installed, transport, &apply);
+                refresh(
+                    &mut installed,
+                    super::ip_lookup::first_ipv4,
+                    super::ip_lookup::global_ipv6,
+                    transport,
+                    &apply,
+                );
                 let installed = &*installed;
                 tick(
                     state,
@@ -1235,16 +1247,24 @@ impl Fence for Gated<'_> {
     }
 }
 
-/// Read each tunnel's transport off its link, and where any changed since
-/// `installed` was rendered, render it again with the live ones and install
-/// that. Returns whether it changed.
+/// Read each tunnel's addresses — its first IPv4 address (`tunnel_addr`) and
+/// its global IPv6 ones (`tunnel_v6`) — and its transport off its link, and
+/// where any changed since `installed` was rendered, render it again with the
+/// live ones and install that. Returns whether it changed.
+///
+/// The addresses are read again for the same reason as the transport: they
+/// were fixed at install, so an IPv6 address the link gained after boot (a
+/// provider's client adding it once the link is up, an operator's `ip -6
+/// addr add`) was never paired. A session listening on the device sends from
+/// it, and the ruleset dropped every such packet for the rest of the run,
+/// while the route probe judged its route healthy.
 ///
 /// A link that cannot be read — down, or gone while its provider's client
-/// raises it again — keeps the transport last read: the exemption is scoped
-/// to the provider's endpoint, so a stale one reaches nothing else, and
-/// dropping it on a read that failed for any other reason would silence a
-/// working tunnel until the next check. The VPN monitor reports and fences a
-/// link that is down.
+/// raises it again — keeps what was last read of it: the exemption is scoped
+/// to the provider's endpoint and each accept to the tunnel's own interface,
+/// so a stale one reaches nothing else, and dropping it on a read that failed
+/// for any other reason would silence a working tunnel until the next check.
+/// The VPN monitor reports and fences a link that is down.
 ///
 /// `installed` is replaced whether or not the install takes: a failed one
 /// leaves the live table differing from the rendered one, and the check that
@@ -1252,9 +1272,34 @@ impl Fence for Gated<'_> {
 /// again.
 fn refresh(
     installed: &mut Installed,
+    tunnel_addr: impl Fn(&str) -> io::Result<Ipv4Addr>,
+    tunnel_v6: impl Fn(&str) -> io::Result<Vec<Ipv6Addr>>,
     transport: impl Fn(&str) -> io::Result<Transport>,
     apply: impl Fn(&str) -> io::Result<()>,
 ) -> bool {
+    let kept = |iface: &str, what: &str, e: io::Error| {
+        tracing::debug!(
+            target: "torrentd::vpn::killswitch",
+            iface = %iface,
+            error.cause = %e,
+            "could not read the tunnel's {what}; keeping its pairing as last read",
+        );
+    };
+    let tunnels: Vec<Tunnel> = installed
+        .tunnels
+        .iter()
+        .map(|t| {
+            let addr = tunnel_addr(&t.iface).unwrap_or_else(|e| {
+                kept(&t.iface, "IPv4 address", e);
+                t.addr
+            });
+            let v6 = tunnel_v6(&t.iface).unwrap_or_else(|e| {
+                kept(&t.iface, "IPv6 addresses", e);
+                t.v6.clone()
+            });
+            Tunnel::new(t.iface.as_str(), addr).with_v6(v6)
+        })
+        .collect();
     let mut live = installed.transports.clone();
     for (iface, t) in &mut live {
         match transport(iface) {
@@ -1267,10 +1312,10 @@ fn refresh(
             ),
         }
     }
-    if live == installed.transports {
+    if tunnels == installed.tunnels && live == installed.transports {
         return false;
     }
-    let next = match Installed::render(installed.uid, installed.tunnels.clone(), live) {
+    let next = match Installed::render(installed.uid, tunnels, live) {
         Ok(next) => next,
         // Not reached: the same names rendered at install.
         Err(e) => {
@@ -1278,17 +1323,20 @@ fn refresh(
                 target: "torrentd::vpn::killswitch",
                 uid = installed.uid,
                 error.cause = %e,
-                "could not render the kill switch over the tunnels' live transport",
+                "could not render the kill switch over the tunnels' live addresses and \
+                 transport",
             );
             return false;
         }
     };
     tracing::warn!(
         target: "torrentd::vpn::killswitch",
+        was_tunnels = ?installed.tunnels,
+        now_tunnels = ?next.tunnels,
         was = ?installed.transports,
         now = ?next.transports,
-        "a tunnel's transport changed since the kill switch was installed; installing it \
-         again with the live one",
+        "a tunnel's addresses or transport changed since the kill switch was installed; \
+         installing it again with the live ones",
     );
     *installed = next;
     if let Err(e) = apply(&installed.script()) {
@@ -1296,7 +1344,7 @@ fn refresh(
             target: "torrentd::vpn::killswitch",
             uid = installed.uid,
             error.cause = %e,
-            "could not install the kill switch with the tunnels' live transport",
+            "could not install the kill switch with the tunnels' live addresses and transport",
         );
     }
     true
@@ -2661,6 +2709,8 @@ table inet torrentd_ks_998 {
         let moved = Transport::new(45136, [ENDPOINT.parse().unwrap()]);
         let changed = refresh(
             &mut installed,
+            addr_of,
+            unchanged_v6,
             reads(&[("wg-a", Ok(moved.clone()))]),
             |script| {
                 applied.borrow_mut().push(script.to_string());
@@ -2687,6 +2737,8 @@ table inet torrentd_ks_998 {
         let before = installed.clone();
         let changed = refresh(
             &mut installed,
+            addr_of,
+            unchanged_v6,
             reads(&[("wg-a", Ok(two_peer_transport()))]),
             |_| panic!("nothing changed, nothing to install"),
         );
@@ -2703,6 +2755,8 @@ table inet torrentd_ks_998 {
         let before = installed.clone();
         let changed = refresh(
             &mut installed,
+            addr_of,
+            unchanged_v6,
             reads(&[("wg-a", Err(io::Error::other("Unable to access interface")))]),
             |_| panic!("nothing read, nothing to install"),
         );
@@ -2718,6 +2772,8 @@ table inet torrentd_ks_998 {
         let mut installed = installed();
         let changed = refresh(
             &mut installed,
+            addr_of,
+            unchanged_v6,
             reads(&[("wg-a", Ok(transport_on(45136)))]),
             |_| Err(io::Error::other("nft -f - exited 1")),
         );
@@ -2730,6 +2786,107 @@ table inet torrentd_ks_998 {
         )
         .unwrap();
         assert!(matches!(verdict, Verdict::Drifted(_)), "got {verdict:?}");
+    }
+
+    /// [`installed`]'s link as it was at install: no IPv6 address.
+    fn unchanged_v6(_: &str) -> io::Result<Vec<Ipv6Addr>> {
+        Ok(Vec::new())
+    }
+
+    /// #446: an IPv6 address the link gained after boot. The pairing was
+    /// fixed at install, so the ruleset kept dropping every packet the
+    /// session sent from it for the rest of the run. The next check reads it
+    /// and installs the ruleset again with it paired.
+    #[test]
+    fn a_v6_address_added_after_boot_is_paired() {
+        let mut installed = installed();
+        let before = installed.clone();
+        assert!(!before.table.contains(&ADDR_A6.to_string()));
+        let applied = std::cell::RefCell::new(Vec::<String>::new());
+        let changed = refresh(
+            &mut installed,
+            addr_of,
+            |_| Ok(vec![ADDR_A6]),
+            reads(&[("wg-a", Ok(two_peer_transport()))]),
+            |script| {
+                applied.borrow_mut().push(script.to_string());
+                Ok(())
+            },
+        );
+        assert!(changed);
+        assert_eq!(installed.tunnels, vec![tunnel("wg-a").with_v6([ADDR_A6])]);
+        assert_eq!(
+            installed.transports, before.transports,
+            "the transport is kept"
+        );
+        let applied = applied.borrow();
+        assert_eq!(applied.len(), 1, "one install: {applied:?}");
+        assert_eq!(applied[0], installed.script());
+        assert!(
+            applied[0].contains(&format!(
+                "meta skuid 998 ip6 saddr {ADDR_A6} oifname \"wg-a\" accept"
+            )),
+            "the new address is paired with its tunnel: {}",
+            applied[0],
+        );
+    }
+
+    /// A changed IPv4 address is paired in its place, and an IPv6 address
+    /// the link no longer holds is no longer paired.
+    #[test]
+    fn a_changed_or_removed_address_is_installed_again_with_the_live_ones() {
+        let moved = Ipv4Addr::new(10, 2, 0, 9);
+        let mut installed = Installed::render(
+            998,
+            vec![tunnel("wg-a").with_v6([ADDR_A6])],
+            vec![("wg-a".to_string(), two_peer_transport())],
+        )
+        .unwrap();
+        let changed = refresh(
+            &mut installed,
+            |_| Ok(moved),
+            unchanged_v6,
+            reads(&[("wg-a", Ok(two_peer_transport()))]),
+            |_| Ok(()),
+        );
+        assert!(changed);
+        assert_eq!(installed.tunnels, vec![Tunnel::new("wg-a", moved)]);
+        assert!(
+            installed
+                .table
+                .contains(&format!("ip saddr {moved} oifname \"wg-a\" accept"))
+                && !installed.table.contains(&ADDR_A.to_string())
+                && !installed.table.contains(&ADDR_A6.to_string()),
+            "{}",
+            installed.table,
+        );
+    }
+
+    /// Addresses that will not read keep the pairing last read, as a
+    /// transport that will not read keeps its exemption.
+    #[test]
+    fn addresses_that_will_not_read_keep_the_last_ones() {
+        let mut installed = Installed::render(
+            998,
+            vec![tunnel("wg-a").with_v6([ADDR_A6])],
+            vec![("wg-a".to_string(), two_peer_transport())],
+        )
+        .unwrap();
+        let before = installed.clone();
+        let changed = refresh(
+            &mut installed,
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no IPv4 address on wg-a",
+                ))
+            },
+            |_| Err(io::Error::other("Device \"wg-a\" does not exist.")),
+            reads(&[("wg-a", Ok(two_peer_transport()))]),
+            |_| panic!("nothing read, nothing to install"),
+        );
+        assert!(!changed);
+        assert_eq!(installed, before);
     }
 
     /// A check that cannot run is an error, not a verdict: not knowing is
