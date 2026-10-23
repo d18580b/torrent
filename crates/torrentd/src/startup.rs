@@ -624,7 +624,7 @@ async fn between_scan_batches(
     scan: &str,
     shutdown: &mut broadcast::Receiver<ShutdownReason>,
     progress: &sd_notify::Progress,
-    each_batch: impl FnOnce(),
+    each_batch: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     if !i.is_multiple_of(SCAN_SHUTDOWN_CHECK_EVERY) {
         return Ok(());
@@ -636,7 +636,7 @@ async fn between_scan_batches(
         anyhow::bail!("shutdown requested during the {scan} scan");
     }
     progress.advance();
-    each_batch();
+    each_batch()?;
     tokio::task::yield_now().await;
     Ok(())
 }
@@ -657,24 +657,25 @@ const LISTEN_CHECK_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// the wrong device while the alert loop, which checks each socket as it
 /// comes up, has not started yet.
 ///
-/// Waits until each vpn session in `source` has reported a listen outcome,
-/// succeeded or failed: libtorrent opens a session's listen sockets in one
-/// pass and posts each socket's outcome from it, so the first outcome comes
-/// with the rest of that pass's. A host profile is not waited for. The alerts
-/// stay held for the alert loop, which dispatches them, and checks each
-/// again, as before.
+/// Waits until each vpn session in `hold` has reported a listen outcome,
+/// succeeded or failed. A host profile is not waited for. A session that
+/// opens more sockets in the same pass (another socket type, the IPv6
+/// endpoint) may report them after its first outcome; those are checked by
+/// the scans' own holds through the same [`CheckedHold`]. The alerts stay
+/// held for the alert loop, which dispatches them, and checks each again, as
+/// before.
 ///
 /// `Err` fails the boot: a socket `check` refuses (with any number of
 /// sessions, as the alert loop treats it), a session that reports nothing
 /// within `bound`, and a shutdown asked for meanwhile.
 async fn check_listen_devices(
     profiles: &ProfileRegistry,
-    source: &ProfileSource,
-    check: &torrentd_engine::alert_loop::ListenDeviceCheck,
+    hold: &CheckedHold<'_>,
     bound: std::time::Duration,
     shutdown: &mut broadcast::Receiver<ShutdownReason>,
 ) -> anyhow::Result<()> {
-    let mut waiting: Vec<ProfileId> = source
+    let mut waiting: Vec<ProfileId> = hold
+        .source
         .profiles()
         .into_iter()
         .filter(|id| {
@@ -686,35 +687,8 @@ async fn check_listen_devices(
         .collect();
     let deadline = tokio::time::Instant::now() + bound;
     loop {
-        let mut refused = Vec::new();
-        waiting.retain(|id| {
-            let mut reported = false;
-            source.hold_alerts_inspecting(id, |alert| match alert {
-                torrentd_engine::Alert::ListenSucceeded { endpoint, .. } => {
-                    reported = true;
-                    if let Err(cause) = check(id, endpoint) {
-                        error!(
-                            profile_id = %id,
-                            endpoint = %endpoint,
-                            error.kind = "listen_wrong_device",
-                            error.cause = %cause,
-                            "a listen socket is not held to the profile's tunnel device",
-                        );
-                        refused.push(format!("profile {id}, {endpoint}: {cause}"));
-                    }
-                }
-                torrentd_engine::Alert::ListenFailed { .. } => reported = true,
-                _ => {}
-            });
-            !reported
-        });
-        if !refused.is_empty() {
-            anyhow::bail!(
-                "a vpn session's listen socket is not held to its tunnel device, so its \
-                 torrents would announce from outside the tunnel; no torrent was loaded: {}",
-                refused.join("; "),
-            );
-        }
+        waiting.retain(|id| !hold.hold(id));
+        hold.verdict()?;
         if waiting.is_empty() {
             return Ok(());
         }
@@ -735,6 +709,72 @@ async fn check_listen_devices(
             );
         }
         tokio::time::sleep(LISTEN_CHECK_POLL).await;
+    }
+}
+
+/// The boot's alert hold from [`check_listen_devices`] until the alert loop
+/// starts: every alert a session posts is held for the loop, and each
+/// `listen_succeeded` among them is held to `check` as it is taken, so a
+/// socket reported after a session's first listen outcome is checked before
+/// the scans go on giving that session torrents to announce.
+struct CheckedHold<'a> {
+    source: &'a ProfileSource,
+    check: torrentd_engine::alert_loop::ListenDeviceCheck,
+    /// Each socket `check` refused, as `profile ID, ENDPOINT: CAUSE`.
+    refused: parking_lot::Mutex<Vec<String>>,
+}
+
+impl<'a> CheckedHold<'a> {
+    fn new(
+        source: &'a ProfileSource,
+        check: torrentd_engine::alert_loop::ListenDeviceCheck,
+    ) -> Self {
+        Self {
+            source,
+            check,
+            refused: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Hold `profile`'s alerts, checking each listen socket among them.
+    /// Whether one of them was a listen outcome, succeeded or failed.
+    fn hold(&self, profile: &ProfileId) -> bool {
+        let mut reported = false;
+        self.source
+            .hold_alerts_inspecting(profile, |alert| match alert {
+                torrentd_engine::Alert::ListenSucceeded { endpoint, .. } => {
+                    reported = true;
+                    if let Err(cause) = (self.check)(profile, endpoint) {
+                        error!(
+                            profile_id = %profile,
+                            endpoint = %endpoint,
+                            error.kind = "listen_wrong_device",
+                            error.cause = %cause,
+                            "a listen socket is not held to the profile's tunnel device",
+                        );
+                        self.refused
+                            .lock()
+                            .push(format!("profile {profile}, {endpoint}: {cause}"));
+                    }
+                }
+                torrentd_engine::Alert::ListenFailed { .. } => reported = true,
+                _ => {}
+            });
+        reported
+    }
+
+    /// `Err`, which fails the boot, once any socket a hold took was refused.
+    fn verdict(&self) -> anyhow::Result<()> {
+        let refused = self.refused.lock();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "a vpn session's listen socket is not held to its tunnel device, so its torrents \
+             would announce from outside the tunnel; the boot stops before the alert loop \
+             starts: {}",
+            refused.join("; "),
+        )
     }
 }
 
@@ -1177,7 +1217,7 @@ pub async fn boot(
     );
     profile_registry.export_offline(&*metrics);
     // Kept as itself too: the scans below hold each session's alerts on it
-    // between batches (`ProfileSource::hold_alerts`).
+    // between batches (`CheckedHold::hold`).
     let profile_source = Arc::new(ProfileSource::new(source_entries));
     let source: Arc<dyn AlertSource> = profile_source.clone();
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
@@ -1395,11 +1435,15 @@ pub async fn boot(
 
     // The alert loop checks each listen socket's device as it comes up, and
     // it starts only after the scans: a vpn session's sockets are checked
-    // here instead, before the scans give any session a torrent to announce.
+    // here instead, before the scans give any session a torrent to announce,
+    // and by every hold the scans take through `checked_hold` after it.
+    let checked_hold = CheckedHold::new(
+        &profile_source,
+        listen_device_check(profile_registry.clone()),
+    );
     check_listen_devices(
         &profile_registry,
-        &profile_source,
-        &listen_device_check(profile_registry.clone()),
+        &checked_hold,
         LISTEN_CHECK_BOUND,
         &mut boot_shutdown,
     )
@@ -1448,7 +1492,8 @@ pub async fn boot(
         for (i, ih) in listing.names.into_iter().enumerate() {
             between_scan_batches(i, "resume", &mut boot_shutdown, &boot_progress, || {
                 scan_fence.enforce_all(&profile_registry, &metrics);
-                profile_source.hold_alerts(&profile);
+                checked_hold.hold(&profile);
+                checked_hold.verdict()
             })
             .await?;
             if removed_at_boot.contains(&(profile.clone(), ih)) {
@@ -1646,7 +1691,7 @@ pub async fn boot(
                         &registry,
                         &*resume_store,
                         &*torrent_store,
-                        &profile_source,
+                        &checked_hold,
                         &state,
                         &*engine,
                         &*metrics,
@@ -1706,7 +1751,8 @@ pub async fn boot(
                 }
             }
         }
-        profile_source.hold_alerts(&profile);
+        checked_hold.hold(&profile);
+        checked_hold.verdict()?;
         if !unheld.is_empty() {
             // Loaded unpaused, so no longer the record's: saved now, so their
             // resume data stops saying paused, and released, so a pause the
@@ -1829,7 +1875,8 @@ pub async fn boot(
         for (i, ih) in entries.into_iter().enumerate() {
             between_scan_batches(i, "torrent-dir", &mut boot_shutdown, &boot_progress, || {
                 scan_fence.enforce_all(&profile_registry, &metrics);
-                profile_source.hold_alerts(&profile);
+                checked_hold.hold(&profile);
+                checked_hold.verdict()
             })
             .await?;
             // Resume data already loaded this torrent, or it was removed and
@@ -2003,7 +2050,8 @@ pub async fn boot(
                 }
             }
         }
-        profile_source.hold_alerts(&profile);
+        checked_hold.hold(&profile);
+        checked_hold.verdict()?;
         if added > 0 {
             info!(profile_id = %profile, torrent_count = added, "torrent dir scan: added new torrents");
         }
@@ -2865,15 +2913,16 @@ fn may_unload_rekeyed(
 /// removal drops only the entry of the handle it names, and an add alert
 /// translated after the removal names a handle the shim issued anew
 /// (`register_handle`), whose entry would outlive the torrent and hold the
-/// shutdown drain.
+/// shutdown drain. A listen socket this hold takes is checked through `hold`,
+/// and a refusal stops the scan at its next batch boundary.
 fn unload_rekeyed(
-    profile_source: &ProfileSource,
+    hold: &CheckedHold<'_>,
     state: &StateMap,
     engine: &dyn TorrentEngine,
     profile: &ProfileId,
     h: torrentd_engine::TorrentHandle,
 ) -> bool {
-    profile_source.hold_alerts(profile);
+    hold.hold(profile);
     state.begin_removal(profile, h);
     match engine.remove_torrent(h, false) {
         Ok(()) => true,
@@ -2915,7 +2964,7 @@ fn settle_rekeyed(
     registry: &AssignmentRegistry,
     resume: &dyn ResumeStore,
     torrents: &dyn TorrentStore,
-    profile_source: &ProfileSource,
+    hold: &CheckedHold<'_>,
     state: &StateMap,
     engine: &dyn TorrentEngine,
     metrics: &dyn MetricsSink,
@@ -2924,7 +2973,7 @@ fn settle_rekeyed(
 ) -> Rekeyed {
     let may_unload = may_unload_rekeyed(registry, resume, torrents, profile, &h.infohash);
     let mut out = Rekeyed {
-        unloaded: may_unload && unload_rekeyed(profile_source, state, engine, profile, h),
+        unloaded: may_unload && unload_rekeyed(hold, state, engine, profile, h),
         claimed: false,
         paused: false,
     };
@@ -2950,7 +2999,7 @@ fn settle_rekeyed(
     // A removal `may_unload` allowed has already failed once; one it did
     // not is tried now, at the cost of this profile's files under the key.
     if !may_unload {
-        out.unloaded = unload_rekeyed(profile_source, state, engine, profile, h);
+        out.unloaded = unload_rekeyed(hold, state, engine, profile, h);
         if out.unloaded {
             return out;
         }
@@ -6098,8 +6147,7 @@ mod tests {
         let check = listen_device_check_with(profiles.clone(), read);
         let err = check_listen_devices(
             &profiles,
-            &source,
-            &check,
+            &CheckedHold::new(&source, check.clone()),
             LISTEN_CHECK_BOUND,
             &mut shutdown,
         )
@@ -6121,8 +6169,7 @@ mod tests {
         let check = listen_device_check_with(profiles.clone(), read);
         check_listen_devices(
             &profiles,
-            &source,
-            &check,
+            &CheckedHold::new(&source, check.clone()),
             LISTEN_CHECK_BOUND,
             &mut shutdown,
         )
@@ -6155,8 +6202,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         check_listen_devices(
             &profiles,
-            &source,
-            &check,
+            &CheckedHold::new(&source, check.clone()),
             LISTEN_CHECK_BOUND,
             &mut shutdown,
         )
@@ -6171,8 +6217,7 @@ mod tests {
         let check = listen_device_check_with(profiles.clone(), passing());
         check_listen_devices(
             &profiles,
-            &source,
-            &check,
+            &CheckedHold::new(&source, check.clone()),
             LISTEN_CHECK_BOUND,
             &mut shutdown,
         )
@@ -6185,8 +6230,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let err = check_listen_devices(
             &profiles,
-            &source,
-            &check,
+            &CheckedHold::new(&source, check.clone()),
             LISTEN_CHECK_BOUND,
             &mut shutdown,
         )
@@ -6202,8 +6246,7 @@ mod tests {
         tx.send(ShutdownReason::Sigterm).unwrap();
         let err = check_listen_devices(
             &profiles,
-            &source,
-            &check,
+            &CheckedHold::new(&source, check.clone()),
             LISTEN_CHECK_BOUND,
             &mut shutdown,
         )
@@ -6214,6 +6257,49 @@ mod tests {
             err.contains("shutdown requested during the listen device check"),
             "{err}"
         );
+    }
+
+    /// A socket a vpn session reports after its first listen outcome (here
+    /// the IPv6 endpoint of the same pass) is checked by the scans' next
+    /// batch hold: one on the wrong device stops the scan there, as it would
+    /// have stopped the boot before the scans, and its alert is still held.
+    #[tokio::test(start_paused = true)]
+    async fn a_listen_socket_reported_during_the_scans_is_checked_at_their_next_batch() {
+        let (_tx, mut shutdown) = broadcast::channel::<ShutdownReason>(1);
+        let progress = sd_notify::Progress::new();
+
+        let vpn = Arc::new(torrentd_engine::MockEngine::new());
+        vpn.push_alert(listen_alert(true, "10.2.0.2:6881"));
+        let (profiles, source) = listen_check_source(&vpn);
+        let check = listen_device_check_with(profiles.clone(), |at: std::net::SocketAddr| {
+            let device = if at.is_ipv6() { "eth0" } else { "wg-acct_a" };
+            Ok(vec![socket("tcp", Some(device))])
+        });
+        let hold = CheckedHold::new(&source, check);
+        check_listen_devices(&profiles, &hold, LISTEN_CHECK_BOUND, &mut shutdown)
+            .await
+            .expect("the first socket is on the tunnel");
+
+        let acct_a = ProfileId::new("acct_a");
+        vpn.push_alert(listen_alert(true, "[fd00::2]:6881"));
+        let batch = || {
+            hold.hold(&acct_a);
+            hold.verdict()
+        };
+        between_scan_batches(1, "resume", &mut shutdown, &progress, batch)
+            .await
+            .expect("only a batch boundary holds");
+        let err = between_scan_batches(256, "resume", &mut shutdown, &progress, batch)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not held to its tunnel device")
+                && err.contains("profile acct_a, [fd00::2]:6881")
+                && err.contains("held to eth0"),
+            "{err}"
+        );
+        assert_eq!(source.drain().len(), 2, "both alerts are left for the loop");
     }
 
     /// A boot scan gives the runtime back between batches. On a
@@ -6237,9 +6323,12 @@ mod tests {
         let progress = sd_notify::Progress::new();
         let mut batches = 0usize;
         for i in 0..5000 {
-            between_scan_batches(i, "resume", &mut shutdown, &progress, || batches += 1)
-                .await
-                .unwrap();
+            between_scan_batches(i, "resume", &mut shutdown, &progress, || {
+                batches += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
             // The entry's own work, which does not await: a read and an add.
             std::hint::black_box(i);
         }
@@ -7104,7 +7193,7 @@ mod tests {
                 &registry,
                 &torrentd_engine::MemoryResumeStore::new(),
                 &torrents,
-                &source,
+                &CheckedHold::new(&source, Arc::new(|_: &ProfileId, _: &str| Ok(()))),
                 &StateMap::new(),
                 &*engine,
                 &torrentd_engine::NoopSink,
