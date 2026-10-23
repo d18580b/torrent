@@ -6,8 +6,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        This form restates [`CONTRIBUTING.md` § *Reporting bugs*](https://github.com/d18580b/torrent/blob/master/CONTRIBUTING.md#reporting-bugs),
-        which stays the authority on what a bug report contains. Every command you
+        This form follows [`CONTRIBUTING.md` § *Reporting bugs*](https://github.com/d18580b/torrent/blob/master/CONTRIBUTING.md#reporting-bugs),
+        which is the authority on what a bug report contains. Every command you
         need is given with the field that wants its output.
 
         Each command below names the machine it is run on: `journalctl -u
@@ -79,26 +79,15 @@ body:
       label: JSON log output
       description: |
         The daemon's JSON log around the failure, taken from the **running**
-        service: `journalctl -u torrentd` (add `-o cat` for the raw JSON lines).
-        If it reproduces, raise the verbosity in place — set `log_level = "debug"`
-        in the config and `systemctl reload torrentd`, which sends `SIGHUP`; the
-        level is swapped at runtime and no restart is needed.
+        service (`journalctl -u torrentd -o cat`), at `debug` if it reproduces.
+        [`docs/running.md` § *12. Capturing a log*](https://github.com/d18580b/torrent/blob/master/docs/running.md#12-capturing-a-log)
+        says how to take it and raise the level without a restart. Please do
+        **not** start a second `torrentd` to collect a log.
 
-        If there is no systemd unit where you run it — the `Containerfile` and
-        `compose.yaml` in `deploy/` have none — take the log however your
-        deployment collects the daemon's stdout, and raise the verbosity with
-        `RUST_LOG=debug` in the daemon's own environment, which is read once at
-        startup, so restart that same instance.
-
-        Either way, please do **not** start a second `torrentd` to collect a
-        log: it would contend with the running one for the same tunnels,
-        kill-switch table, resume directory and pool index.
-
-        **Redact before you paste, and know where this is going.** Take out the
-        tracker announce URLs — the passkey in one identifies your account on
-        that tracker — and any API token. This tracker is **public**: anything
-        you paste here is readable by anyone, the moment you submit it
-        (`SECURITY.md` says so under *Reporting a vulnerability*).
+        **Redact before you paste.** This tracker is **public**: anything you
+        paste here is readable by anyone, the moment you submit it.
+        [`CONTRIBUTING.md` § *Reporting bugs*](https://github.com/d18580b/torrent/blob/master/CONTRIBUTING.md#reporting-bugs)
+        says what the daemon already redacts and what remains yours to check.
 
         A line looks like this:
 

@@ -15,9 +15,6 @@ which torrents point at data that moved or vanished.
 - [x] **Never downloads payload.** Every add carries libtorrent's `upload_mode`
       — "will not make any piece requests" — so the guarantee survives magnets,
       hash failures and rechecks. Magnet *metadata* still arrives.
-- [x] **Understands the pool, not just the torrents** — which bytes on disk a
-      torrent protects, which nothing protects, and which torrents point at
-      data that moved or vanished
 - [x] **Moves and deletes files inside the directories you give it**, planned,
       journaled and re-checked at apply time. Off unless you turn it on.
 - [x] **Profiles**: one libtorrent session each, with its own network posture,
@@ -84,14 +81,9 @@ them, and reports per path:
 Plus byte rollups per directory, so an unprotected subtree is visible without
 reading a file listing.
 
-Change detection is tiered because hashing a petabyte is days of I/O: a
-`(size, mtime, inode, device)` sweep catches essentially every real change
-cheaply, and libtorrent's own piece hashing is the authoritative check, run on
-drift and on adopt. Every torrent, v1, v2 or hybrid, matches on `(path, size)`
-against a small set of candidate directories, and a match is confirmed by that
-verification, with one exception: a complete, unchanged torrent whose previous
-client's `.fastresume` says so is adopted in seed mode on the strength of that
-client's own check, without hashing (see the tiered adoption paragraph below).
+Change detection is tiered, a cheap stat sweep routinely and libtorrent's own
+piece hashing on drift and on adopt, as the
+[`torrentd-pool` crate documentation](crates/torrentd-pool/src/lib.rs) sets out.
 
 **Migrating from qBittorrent, or another libtorrent-based client, is just the
 first scan** — point `library_dir` at its state directory (qBittorrent's
@@ -273,9 +265,9 @@ listening port is either static or negotiated over NAT-PMP against the tunnel
 gateway (ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the
 live socket rebinding when it changes).
 
-Verify a tunnel before trusting it, with no torrents involved. `vpn check`
-checks every profile unless `--profile` names one; a `host` profile has no
-tunnel to check and reports `skip`, which does not change the exit status:
+Verify a tunnel before trusting it, with no torrents, no session and no
+tracker involved
+([docs/running.md §9](docs/running.md#checking-the-vpn-on-its-own)):
 
 ```bash
 torrentd --config … vpn check --profile acct_a   # --bring-up also raises it
@@ -292,9 +284,8 @@ a `vpn` profile's isolation is layered:
 - **Health monitor** — every 30s it checks the tunnel address and, for
   WireGuard, the latest-handshake age. On loss, change, or a stale handshake it
   pauses that profile's torrents and **fences** it: no auto-restart, and
-  `add`/`resume` return 409 until an operator sets the profile online
-  (`PATCH /v1/profiles/{id}`), which re-checks the tunnel and lifts the fence
-  only if it passes. No daemon restart is needed.
+  `add`/`resume` return 409 until an operator lifts the fence
+  ([docs/operations.md](docs/operations.md#recovering-a-fenced-profile)).
 - **Online/offline** — an operator can hold one profile offline, or every
   profile with `POST /v1/profiles/offline-all`. Offline pauses the profile's
   whole libtorrent session, so torrents added to it later are held too, stops
@@ -317,41 +308,9 @@ a `vpn` profile's isolation is layered:
   and `wg` under `CAP_NET_ADMIN`, and the ruleset exempts each tunnel's own
   encrypted transport.
 
-**Checking a tunnel without seeding anything** — `vpn check` runs the VPN
-pre-flight the daemon depends on and reports each part separately, with no
-libtorrent session, no torrents and no tracker contact.
-
-```bash
-torrentd --config … vpn check                 # every profile; host ones report skip
-torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
-torrentd --config … vpn check --egress 1.1.1.1:53      # route it via the tunnel, then a reply through it
-```
-
-Verdicts are four-valued — `pass`, `fail`, `skip`, `unknown` — so a green
-summary cannot quietly mean "mostly not checked", and the exit status carries
-the same distinction: `0` clean, `1` any failure, `2` nothing failed but
-something could not be checked.
-
-With one exception, which a `0` depends on. An `unknown` that *nothing this
-invocation could be given would settle* — most often because the check needs
-`CAP_NET_ADMIN` and an operator shell does not hold it — is printed `[?cap]`,
-marked `"needs_capability": true` in the JSON, and **not** counted towards `2`.
-Otherwise a host where nothing is wrong would exit `2` every time, and both
-consumers of the status would learn to accept it. So a `0` means "nothing
-failed and nothing was left unsettled that this invocation could have
-settled", which is less than it sounds: on the recommended unprivileged run
-the handshake and the kill-switch ruleset are two of those. [What a pass
-establishes](docs/running.md#9-first-run-checks) says which, line by line.
-
-The default path makes no host change and deletes nothing: it reads state and
-asks the gateway for a NAT-PMP mapping with the daemon's own short lease,
-which it leaves to expire. Against a running daemon that request is its only
-interaction, sent from the same NAT-PMP client identity; whether a gateway
-coalesces it with the daemon's existing mapping is gateway-dependent and is
-not tested here. `--bring-up` is the only option that raises a tunnel, and it
-lowers again only what it was observed to have raised. What a pass does and
-does not establish is set out in
-[docs/running.md](docs/running.md#9-first-run-checks).
+**Checking a tunnel without seeding anything** — its flags, verdicts, exit
+status, and what a pass does and does not establish are in
+[docs/running.md §9](docs/running.md#checking-the-vpn-on-its-own).
 
 The eight rules this is built on, and why each exists, are documented on the
 `torrentd-engine::profile` module — where the code that enforces them is. The
@@ -375,27 +334,10 @@ content that wants DHT belongs in a `network = "host"` profile.
 ## Authentication
 
 **Required, one way or the other.** The daemon refuses to start unless you
-have either configured `[auth]` or written `allow_unauthenticated = true`.
-Without `[auth]` it authenticates nothing — every route, including every
-mutating one, is open to any client that can reach the port, except a browser
-sent by another site: a request whose `Host` is neither loopback nor in
-`allowed_hosts` (a DNS-rebound page), or a state-changing one that
-`Sec-Fetch-Site`, a foreign `Origin` or a form `Content-Type` marks as
-cross-site, is refused with a `403` ([docs/api/README.md](docs/api/README.md)).
-That is a legitimate
-posture behind a reverse proxy that does its own access control, but only on a
-single-user host, or in a network namespace or container no other uid shares:
-every local user can reach `127.0.0.1`, and without `[auth]` any of them
-controls the daemon ([docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other)).
-It is not one to arrive at by omission. The opt-out does not extend to a
-routable address either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
-and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
-inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. Every key not listed as reloadable under
-[HTTP API](#http-api) — these three, `trusted_proxies` and `allowed_hosts`
-among them — is read once, at startup, and takes a restart, not a `SIGHUP`. A
-`SIGHUP` that changes one says so — "requires daemon restart;
-ignored" — rather than reporting the config unchanged.
+have either configured `[auth]` or written `allow_unauthenticated = true`;
+[docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other)
+says when running without `[auth]` is safe and which keys take a restart
+rather than a `SIGHUP`.
 
 Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
 there are two kinds, hashed differently on purpose. The **operator password**
@@ -429,14 +371,10 @@ declaration is what the daemon checks.
 ## Reverse proxy
 
 torrentd does not terminate TLS and will not; `deploy/Caddyfile` and
-`deploy/compose.yaml` are a working pair that does. `X-Forwarded-For`,
-`X-Forwarded-Proto` and RFC 7239 `Forwarded` — all three, which is what your
-proxy has to strip or overwrite — are read **only** from peers listed in
-`trusted_proxies`, empty by default, meaning no forwarding header is read at
-all and the socket's peer address is the client. They feed two things: a
-per-client throttle on `POST /v1/sessions` instead of one shared bucket, and
-the `client_ip` field on the login log lines — the record of who tried, which
-is the consumer this support exists to create.
+`deploy/compose.yaml` are a working pair that does. Forwarding headers are
+read only from peers listed in `trusted_proxies`, empty by default; which
+headers, what they feed, and what your proxy must strip are
+[docs/running.md §6a](docs/running.md#6a-reverse-proxy).
 
 ## Metrics
 
@@ -448,63 +386,11 @@ Per-session series carry a `profile_id` label. Per-*torrent* series are
 deliberately absent — they are unusable at 10K+ torrents, and the HTTP API
 serves per-torrent status on demand.
 
-What follows is the series worth building a panel or an alert on, named so you
-can find them; a scrape of a running daemon is the authoritative list.
-Alongside the libtorrent gauges (`torrentd_libtorrent_*`) there are daemon
-counters for torrent lifecycle, resume writes, disk and hash errors, dropped
-alerts, storage moves and pool verification. Tunnel health and fencing are
-carried by the `profile_id`-labelled `profile_vpn_tunnel_up`,
-`profile_torrents_paused_vpn_down`, `profile_vpn_tunnel_ip_changes_total` and
-`profile_vpn_fenced_total`, and they are meaningful only on a tunnelled
-profile: a sample carrying the `profile_id` of a profile with no tunnel says
-nothing about any tunnel, so scope a panel or an alert to the profiles you
-actually tunnel rather than aggregating over every profile. Handshake age is
-reported per WireGuard profile. Port-forward state is reported per profile that
-negotiates its port over NAT-PMP, and `profile_vpn_gateway_reboots_total`
-counts the gateway restarts a renewal detects on such a profile. A
-`profile_id` label marks a series as one session's rather than the daemon's,
-which is why most of those daemon counters carry one too — pool verification is
-daemon-wide and carries none. Outside both VPN groups, these are the labelled
-series worth an alert of their own: `listen_failure_active`, 1 while any of a
-profile's listen sockets is failed (a dual-stack `0.0.0.0:6881,[::]:6881`
-profile holds two) and 0 once every one of them is up; `listen_failures_total`, which counts
-those failures — and a listen failure on a daemon left with a single live
-session is fatal, so on that shape the alert that fires is the daemon going
-away; and `profile_assignment_registry_errors_total`, which counts the torrents
-a profile's registry refused to take, whether for a duplicate info-hash, a
-resume file found under another profile, or a tracker outside
-`allowed_tracker_domains` or `allowed_tracker_urls` — the cross-account contamination profiles exist to
-prevent. `kill_switch_active` is none of these: it is a single unlabelled
-daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
-`vpn` profile is configured.
-
-> Every series, and when it first exists, is listed in
-> [`deploy/metrics.md`](deploy/metrics.md). The alert rules in
-> [`deploy/prometheus/`](deploy/prometheus) and the Grafana dashboard in
-> [`deploy/dashboard.json`](deploy/dashboard.json) read only series that table
-> holds, and `cargo test -p torrentd` fails if either reads one it does not.
-> Most daemon counters are written at zero from boot, so `increase()` sees an
-> event that follows the first scrape. What a boot counts comes before any
-> scrape, so it is already in the counter's first sample, where `increase()`
-> cannot see it; the `torrentd_boot_*` gauges carry what the boot counted, and
-> the alerts that read those counters also fire on them. A series the table
-> marks "on first event" reads as "no data" rather than zero until something
-> happens. The per-profile families do
-> not wait for one: every family a per-profile monitor owns is pre-registered at
-> its baseline when that monitor starts, so `rate()` and alerting queries over
-> it resolve on a healthy daemon rather than on the first event ever to occur.
-> That is tunnel health and fencing on every profile, and port-forward state —
-> `profile_vpn_gateway_reboots_total` included — on every profile that
-> negotiates over NAT-PMP. `profile_vpn_handshake_probe_ok` and
-> `profile_vpn_transfer_probe_ok` are seeded at 1 on
-> every live WireGuard profile, so an alert on either reads "no" from a cold
-> start; neither is ever seeded on a profile that is not WireGuard, nor on one whose tunnel
-> never came up, where a 0 would wrongly blame the host's `wg` tooling.
-> `profile_vpn_handshake_age_seconds` is the exception, because it registers on
-> the first probe rather than when the monitor starts: an alert on it reads "no
-> data" until the first poll completes, and permanently on a `vpn` profile that
-> is not WireGuard. A `vpn` profile whose tunnel never came up at boot carries
-> `profile_vpn_tunnel_up` at 0 and none of the other per-profile series.
+Every series, its labels, which instances carry it, when it first exists, and
+what it means are in [`deploy/metrics.md`](deploy/metrics.md), the one
+authoritative list; the alert rules in [`deploy/prometheus/`](deploy/prometheus)
+and the Grafana dashboard in [`deploy/dashboard.json`](deploy/dashboard.json)
+read only series it holds.
 
 ## Deployment
 
@@ -541,13 +427,8 @@ mise run test-all        # test and every test-* task above, in turn; not check,
 mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```
 
-`mise run vpn-check` verifies a real VPN configuration against a real tunnel,
-with no torrents and no tracker involved. It checks every profile unless
-`--profile` names one; a `host` profile has no tunnel and reports `skip`:
-
-```bash
-mise run vpn-check /etc/torrentd/torrentd.toml --profile acct_a
-```
+`mise run vpn-check <config> [-- <flags>]` runs `vpn check` (see
+[Profiles](#profiles)) from a source checkout, against a real tunnel.
 
 ## Contributing & license
 

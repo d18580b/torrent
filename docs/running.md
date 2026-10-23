@@ -78,9 +78,9 @@ something cryptic.
 The submodules are needed only to build the native prefix described in §3.
 Once that exists they can be absent.
 
-`.gitmodules` pins libtorrent to v2.0.14 and Boost to 1.83.0 by commit, and
-names the immutable tag `v2.0.14` for libtorrent rather than a branch. The
-Boost entry has no `branch` at all, so `git submodule update --remote` would
+The pins are the submodule commits [`.gitmodules`](../.gitmodules) declares
+(`git submodule status` prints them). libtorrent's entry names an immutable
+tag rather than a branch; the Boost entry has no `branch` at all, so `git submodule update --remote` would
 still move it to boostorg/boost's default branch. Don't run it unless you mean
 to re-pin.
 
@@ -376,19 +376,10 @@ The requests name internal port `1`, the value Proton documents (`natpmpc -a
 delete-all request. TCP is mapped first and UDP (uTP) is asked for on the
 same port.
 
-Metrics, each labelled `profile_id`:
-
-| Series | Meaning |
-| --- | --- |
-| `torrentd_profile_forwarded_port` | the port the session listens on |
-| `torrentd_profile_port_forward_up` | `1` while the last renewal succeeded and the session is bound to its result |
-| `torrentd_profile_port_forward_udp_mapped` | `0` while the gateway mapped TCP only; uTP peers cannot reach the session then |
-| `torrentd_profile_port_forward_renewals_total` | successful renewals |
-| `torrentd_profile_port_forward_failures_total` | every failed attempt, labelled `stage`: `renew` when the gateway did not answer or refused the lease, `rebind` when it answered with a port the session could not be rebound to, `port_taken` when it answered with a port another live profile holds |
-| `torrentd_profile_port_forward_rebind_failures_total` | the same count as `stage="rebind"` above |
-| `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
-| `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
-| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the renewal that saw it re-created the mapping on the spot |
+The `torrentd_profile_forwarded_port*`, `torrentd_profile_port_forward_*`,
+`torrentd_profile_port_change_reannounce_seconds` and
+`torrentd_profile_vpn_gateway_reboots_total` series, each labelled
+`profile_id`, are described in [`deploy/metrics.md`](../deploy/metrics.md).
 
 Several Proton accounts cannot share one daemon: every Proton WireGuard
 config gives the tunnel `10.2.0.2/32`, and the paragraph above says what
@@ -1161,8 +1152,8 @@ The daemon sets none of these itself.
   credential is answered `401` or `403` at once, so it can neither hold a
   connection until the deadline nor make the daemon buffer its body. A body
   sent without `Content-Length` (chunked, or HTTP/2 without the header) is
-  held in memory as it arrives, up to the operation's limit — 64 KiB, or
-  96 MiB for `POST /v1/torrents` — so with `[auth]` configured only a
+  held in memory as it arrives, up to the operation's limit
+  ([body limits](api/README.md#requests-and-responses)), so with `[auth]` configured only a
   credential holder can make the daemon spend that. Without `[auth]`, any
   same-site caller is admitted as anonymous and can. Every idle connection is
   bounded, but a caller that opens 256 connections, sends nothing on them, and
@@ -1174,7 +1165,7 @@ The daemon sets none of these itself.
   `timeouts.read_header` and `timeouts.idle`, as `deploy/Caddyfile` sets
   them), which keep such connections from reaching the daemon. The proxy needs no body timeout
   of its own, since the daemon bounds every body; `deploy/Caddyfile` says
-  why it sets none, and caps a body at the daemon's own 96 MiB.
+  why it sets none, and caps a body at the daemon's own largest limit.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
@@ -1447,10 +1438,7 @@ it with the mapping the daemon already holds or hands out a second one is
 gateway behaviour, and nothing here tests it. `--bring-up` is the exception
 that changes the host: it skips an interface that already exists and lowers
 again only what it was observed to have raised, because lowering a live
-profile's tunnel fences that profile until its tunnel is back and it is set
-online (`PATCH /v1/profiles/<id>` with `{"state":"online"}`); no restart is
-needed unless the tunnel comes back on a different address, which only a
-restart recovers ([Recovering a fenced
+profile's tunnel fences that profile ([Recovering a fenced
 profile](operations.md#recovering-a-fenced-profile)).
 
 **`--bring-up` needs `CAP_NET_ADMIN`.** It raises a WireGuard link exactly as
@@ -1629,11 +1617,7 @@ On a scratch pool, not your real one.
 5. **Pull a tunnel down** (`ip link delete <iface>`). Within 30s the
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you bring the tunnel back and set the profile
-   online (`PATCH /v1/profiles/<id>` with `{"state":"online"}`, as the end of
-   this drill shows); no restart is needed while the tunnel comes back on
-   the address the profile's session is bound to. One that comes back on a
-   different address fails that check for good, and only a restart brings
-   the profile back ([Recovering a fenced
+   online ([Recovering a fenced
    profile](operations.md#recovering-a-fenced-profile)). It must not lift
    the fence itself.
 
@@ -1665,14 +1649,8 @@ On a scratch pool, not your real one.
    log says `VPN tunnel unhealthy` with `reason=route_mismatch`). Set
    `METRICS_URL` and `METRICS_TOKEN` if `/metrics` is not on
    `127.0.0.1:8080` or needs the scrape token. Afterwards, restore the
-   rules (or restart the tunnel) and set the profile online —
-   `torrentctl`'s Profiles screen, or
-   `curl -X PATCH -H 'content-type: application/json' -d '{"state":"online"}' …/v1/profiles/<id>`.
-   That request re-runs the address and route checks and lifts the fence
-   only if they pass; while they fail it answers `409` and the profile stays
-   fenced. The handshake is not part of that check — a fenced profile sends
-   nothing, so its handshake is stale by construction — and the monitor
-   measures it again from its next poll.
+   rules (or restart the tunnel) and set the profile online, as [Recovering
+   a fenced profile](operations.md#recovering-a-fenced-profile) describes.
 
    What can leave by the physical interface before the fence trips depends
    on the socket and on whether the kernel lets the daemon bind a socket to a
@@ -2157,7 +2135,7 @@ run it by hand instead, start the service again afterwards:
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
-| `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, bring the tunnels back, then set each fenced profile online with `PATCH /v1/profiles/<id>` and `{"state":"online"}` (or `torrentctl`'s Profiles screen), which re-checks the tunnel and lifts the fence only if it passes, answering `409` while it fails. Fenced profiles do not resume themselves by design. No restart is needed unless a tunnel came back on a different address, which fails that check for good ([Recovering a fenced profile](operations.md#recovering-a-fenced-profile)). A profile counted by `profiles_failed` (`status: "failed"`) never came up and has no session for `PATCH` to lift: bring its tunnel back, then restart. |
+| `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, then recover each fenced profile as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes; fenced profiles do not resume themselves by design. A profile counted by `profiles_failed` (`status: "failed"`) never came up and has no session for `PATCH` to lift: bring its tunnel back, then restart. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
@@ -2165,7 +2143,7 @@ run it by hand instead, start the service again afterwards:
 | Config refused or an OpenVPN profile fails, "`<directive>` is refused: it …" | The profile's `.ovpn` names a hook, a plugin, a management interface or another directive the daemon does not let it run (§5). Remove the line the error names. Catchable before a restart with `--check-config`. |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
-| Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced, and it does not lift the fence itself by design. Bring its tunnel back, then set it online with `PATCH /v1/profiles/<id>` and `{"state":"online"}`, which lifts the fence once the tunnel passes the check; while it fails, that request answers the same `409`. No restart is needed unless the tunnel came back on a different address, which fails that check for good and only a restart recovers ([Recovering a fenced profile](operations.md#recovering-a-fenced-profile)). |
+| Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced, and it does not lift the fence itself by design. Recover it as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes. |
 | Delete plan refuses, "no claims in the index" | A torrent the daemon owns - loaded, assigned in the registry, or queued for verification - that the matcher has not placed, and that may hold a file under the plan's root: its session saves it under or above that root, one of its files resolves into it or is the same file (device and inode) as one the plan deletes, or no session can say where it is. One a session holds entirely outside the root never refuses. If its `.torrent` is in the library, run `pool scan` and rebuild the plan. If it was added through `POST /v1/torrents`, a scan never claims it: copy its `.torrent` into the library and rescan, move its payload out of the root, or remove it. A torrent whose profile is down keeps refusing until its profile loads it or it is removed. |
 | Relocate step fails, "is not loaded, but the registry assigns it" | The torrent belongs to a profile that did not load it, so its resume data and save path name the source directory. Bring the profile up and apply the plan again. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `GET /v1/profiles`, then `POST /v1/profiles/<id>/resume-all`. |

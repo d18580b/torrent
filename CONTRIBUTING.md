@@ -17,27 +17,9 @@ The binary is not supported on Windows or macOS.
 
 ### System prerequisites
 
-You need a working C/C++ toolchain plus CMake to build the vendored libtorrent and Boost.
-
-**Fedora 43:**
-
-```bash
-sudo dnf install -y \
-    gcc-c++ make cmake ninja-build pkgconf-pkg-config \
-    openssl-devel clang-devel \
-    git
-```
-
-**Ubuntu 24.04:**
-
-```bash
-sudo apt-get install -y \
-    build-essential cmake ninja-build pkg-config \
-    libssl-dev libclang-dev \
-    git
-```
-
-`clang-devel` / `libclang-dev` is required by `bindgen` to parse the C shim header.
+You need a working C/C++ toolchain plus CMake to build the vendored libtorrent and Boost;
+the package lists for Fedora and Ubuntu are in
+[`docs/running.md` §1](docs/running.md#1-packages).
 
 ### Rust toolchain
 
@@ -81,18 +63,15 @@ unstable); `mise run setup` installs it and the `fmt` tasks invoke `cargo +night
 Everything else builds/lints/tests on the pinned stable toolchain.
 
 `vpn-check` is deliberately outside every `test` task: it needs a real host
-with real tunnels and is meaningless in CI. It takes a config path and
-forwards any trailing flags to `torrentd … vpn check`, and it exits with that
-subcommand's status — `0` clean, `1` any failure, `2` nothing failed but
-something could not be checked.
+with real tunnels and is meaningless in CI. It takes a config path, forwards
+any trailing flags to `torrentd … vpn check`, and exits with that subcommand's
+status, which [docs/running.md](docs/running.md#checking-the-vpn-on-its-own)
+defines along with what a pass does and does not establish.
 
 ```bash
 mise run vpn-check /etc/torrentd/torrentd.toml
 mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
 ```
-
-See [docs/running.md](docs/running.md#checking-the-vpn-on-its-own) for what a
-pass does and does not establish.
 
 ### Git hooks
 
@@ -107,10 +86,9 @@ pass does and does not establish.
 
 ### Submodules
 
-Vendored C/C++ dependencies live under `vendor/` as git submodules:
-
-- `vendor/libtorrent` — pinned to `v2.0.14` (arvidn/libtorrent)
-- `vendor/boost` — pinned to `boost-1.83.0` (boostorg/boost super-repo)
+Vendored C/C++ dependencies live under `vendor/` as git submodules, `vendor/libtorrent`
+(arvidn/libtorrent) and `vendor/boost` (the boostorg/boost super-repo), declared in
+[`.gitmodules`](./.gitmodules); `git submodule status` prints the commit each is pinned to.
 
 After cloning the repo:
 
@@ -134,10 +112,8 @@ cargo build --workspace          # debug
 cargo build --workspace --release
 ```
 
-Beyond Rust and the vendored C++, the build needs a C++ toolchain, CMake, Ninja,
-`pkg-config`, the OpenSSL headers and `libclang` (for `bindgen`): the package lists
-for Fedora and Ubuntu are in [`docs/running.md` §1](docs/running.md#1-packages), and
-[§3](docs/running.md#3-build) has the build itself.
+The system packages are under [System prerequisites](#system-prerequisites), and
+[`docs/running.md` §3](docs/running.md#3-build) has the build itself.
 
 ### The shared native prefix
 
@@ -199,11 +175,6 @@ Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
 Layer 2 runs as its own CI job; the three Layer 3 suites share one, and
 `test-alerts` has its own.
 
-`mise run vpn-check <config>` verifies a real VPN configuration against the
-real host. It checks every profile unless `--profile <id>` names one; a
-`host` profile has no tunnel and reports `skip`. It is deliberately not part of any `test` task: it needs real
-tunnels and is meaningless in CI.
-
 Deploying it for real — packages, submodules, the service user, directories,
 config, auth bootstrap, ulimits, and the drills worth running once before you
 trust it — is in [`docs/running.md`](docs/running.md).
@@ -260,25 +231,16 @@ daemon you are starting anyway, such as one under `cargo run`; do not start a
 second copy beside a running service to get a log.
 
 The daemon redacts tracker credentials from its own JSON log before writing
-it, at every level. A URL carrying userinfo (`user:pass@`), a `passkey`,
-`apikey`, `api_key`, `authkey`, `torrent_pass`, `token`, `pid`, `uid`,
-`rsskey` or `pass` query parameter (compared after percent-decoding), or a
-path segment of 32 or more letters and digits (a passkey in the path), or
-holding such a URL nested inside it, unencoded or percent-encoded, is logged
-as its scheme and host plus a marker, e.g.
-`https://tracker.example/[redacted:1a2b3c4d]`. A URL percent-encoded on its
-own (`https%3A%2F%2F…`) is judged by what it decodes to. In libtorrent's own
-log messages and in the tracker warning, scrape-failed and announce-failed
-lines (target `torrentd_engine::handler::tracker`), which quote tracker URLs
-verbatim, every URL is cut at its host unless it is a bare
-`scheme://host/announce`. The marker is a short hash of
-the full URL, stable across runs, so two announce URLs on one host stay
-distinguishable. What remains yours to check before pasting:
+it, at every level, logging a credential-carrying URL as its scheme and host
+plus a marker such as `https://tracker.example/[redacted:1a2b3c4d]`; which
+URLs count is set out in the
+[`tracing_init` module documentation](crates/torrentd/src/tracing_init.rs).
+What remains yours to check before pasting:
 
 - tracker hostnames, which are logged as-is and still say which private
   trackers you use;
-- credentials in any other shape, such as a secret in a parameter not listed
-  above or one that is not in a URL at all;
+- credentials in any other shape, such as a secret in a parameter the module
+  does not list or one that is not in a URL at all;
 - anything that did not come from the JSON log on stdout: your config file,
   shell history, or anything the daemon printed to stderr, such as a panic
   or a startup error.

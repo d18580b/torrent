@@ -268,8 +268,7 @@ run = "cargo deny check"
 #   mise run vpn-check /etc/torrentd/torrentd.toml
 #   mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
 #
-# The exit status is the subcommand's: 0 clean, 1 any failure, 2 nothing
-# failed but something could not be checked.
+# The exit status is the subcommand's; docs/running.md §9 defines it.
 #
 # Declared with `usage` rather than the `{{arg()}}` template: the template
 # form cannot take a flag at all, so the second line above did not run, and

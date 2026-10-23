@@ -30,8 +30,8 @@
 //! reading the whole pool — so it plays no part in placing a file, and a
 //! match is confirmed by step 2, with one exception: the [`adopt`] fast path
 //! seeds a complete, unchanged torrent whose previous client's `.fastresume`
-//! says so in seed mode, on the strength of that client's own check. The
-//! README's "Managed pool" section states the same split.
+//! says so in seed mode, on the strength of that client's own check. This is
+//! the authoritative statement of that split; the README links here.
 
 pub mod adopt;
 pub mod drift;
