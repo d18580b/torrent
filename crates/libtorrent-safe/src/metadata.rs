@@ -10,6 +10,8 @@ use libtorrent_sys as ffi;
 
 use crate::error::Error;
 use crate::error::Result;
+use crate::ffi_util::fixed_c_str;
+use crate::ffi_util::sized_str;
 use crate::handle::InfoHash;
 
 /// A BitTorrent v2 info-hash (SHA-256 of the info dict).
@@ -192,28 +194,6 @@ pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
 
     unsafe { ffi::lt_torrent_meta_free(&mut raw) };
     Ok(meta)
-}
-
-/// A shim string returned as a pointer and a byte length, read whole.
-///
-/// The length, not a NUL, bounds it, so nothing is cut short whatever its
-/// size. A null pointer reads as empty.
-///
-/// # Safety
-///
-/// `ptr` is null, or points at `len` readable bytes that outlive the call.
-pub(crate) unsafe fn sized_str(ptr: *const std::os::raw::c_char, len: usize) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-pub(crate) fn fixed_c_str(buf: &[std::os::raw::c_char]) -> String {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
-    let cstr = std::ffi::CStr::from_bytes_until_nul(bytes).unwrap_or(c"");
-    String::from_utf8_lossy(cstr.to_bytes()).into_owned()
 }
 
 fn err_to_string(buf: &[std::os::raw::c_char]) -> String {

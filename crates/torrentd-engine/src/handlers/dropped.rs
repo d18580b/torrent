@@ -42,7 +42,7 @@ use crate::handlers::HandlerCtx;
 /// *n*.
 ///
 /// The shim `static_assert`s each of these five numbers against libtorrent's
-/// own `alert_type` (`libtorrent_shim.cpp`, beside the `alerts_dropped`
+/// own `alert_type` (`shim_alerts.cpp`, beside the `alerts_dropped`
 /// translation), so a libtorrent that renumbers one fails the build.
 const SAVE_RESUME_DATA_TYPE: u32 = 37;
 const SAVE_RESUME_DATA_FAILED_TYPE: u32 = 38;

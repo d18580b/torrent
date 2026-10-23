@@ -25,7 +25,7 @@ mod link_smoke {
 
     #[test]
     fn lt_buf_free_null_is_safe() {
-        // A no-op on null per libtorrent_shim.cpp; serves to assert that
+        // A no-op on null per shim_session_add.cpp; serves to assert that
         // the symbol resolved at link time.
         unsafe { lt_buf_free(std::ptr::null_mut()) };
     }

@@ -62,7 +62,6 @@ pub enum MoveFlags {
 /// so absent overrides leave libtorrent's `high_performance_seed()` defaults
 /// in place.
 #[derive(Clone, Debug, Default, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Settings {
     // ---- Listen / network identity ----
     #[serde(skip_serializing_if = "Option::is_none")]

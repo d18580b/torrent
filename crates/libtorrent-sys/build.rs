@@ -9,8 +9,9 @@
 //   2. Provision `<cache>/lt-<key>`: CMake-install Boost headers into
 //      `boost/` (libtorrent v2.0.14 + Boost >= 1.69 needs only
 //      Boost::headers) and static libtorrent into `libtorrent/`.
-//   3. Provision `<cache>/shim-<key>`: compile shim/libtorrent_shim.cpp via
-//      cc::Build with the same C++ standard and ABI flags libtorrent used.
+//   3. Provision `<cache>/shim-<key>`: compile the shim's translation units
+//      (SHIM_SOURCES) via cc::Build with the same C++ standard and ABI flags
+//      libtorrent used.
 //   4. Emit cargo link directives in the order Linux's static linker
 //      requires: shim -> libtorrent -> OpenSSL -> pthread -> stdc++.
 //
@@ -42,12 +43,32 @@ use std::path::PathBuf;
 const BOOST_DIR: &str = "../../vendor/boost";
 const LIBTORRENT_DIR: &str = "../../vendor/libtorrent";
 
+/// The shim's headers, relative to this crate: the C ABI bindgen reads, and
+/// the one header its translation units share.
+const SHIM_HEADERS: &[&str] = &[
+    "shim/libtorrent_shim.h",
+    "shim/alert_union.h",
+    "shim/shim_internal.h",
+];
+
+/// The shim's translation units, relative to this crate. The one list that
+/// compiles them, watches them and keys the shim cache on them, so a unit
+/// added here is never compiled without invalidating the cached archive.
+const SHIM_SOURCES: &[&str] = &[
+    "shim/shim_session_add.cpp",
+    "shim/shim_alerts.cpp",
+    "shim/shim_tracker_guard.cpp",
+    "shim/shim_metadata.cpp",
+    "shim/shim_torrent_ops.cpp",
+    "shim/shim_queries.cpp",
+];
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-changed=shim/libtorrent_shim.h");
-    println!("cargo:rerun-if-changed=shim/alert_union.h");
-    println!("cargo:rerun-if-changed=shim/libtorrent_shim.cpp");
+    for rel in SHIM_HEADERS.iter().chain(SHIM_SOURCES) {
+        println!("cargo:rerun-if-changed={rel}");
+    }
     // Individual files, not `vendor/**`: cargo walks a rerun-if-changed
     // directory recursively, and walking 634 MB of Boost on every build is
     // exactly what this cache exists to avoid.
@@ -177,7 +198,7 @@ fn main() {
         }
     };
 
-    // Tier B: the shim, ~4 MB. Split out so editing libtorrent_shim.cpp costs
+    // Tier B: the shim, ~4 MB. Split out so editing the shim's sources costs
     // seconds instead of a full libtorrent rebuild. Keyed on tier A's identity,
     // so a vendor bump invalidates this too.
     let shim_key = key_shim(&manifest_dir, &cxx_id, &tier_a_id, &lt_install);
@@ -383,7 +404,7 @@ fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path, ds
         .flag("-std=c++17")
         .flag_if_supported("-Wno-deprecated-declarations")
         .define("_GLIBCXX_USE_CXX11_ABI", "1")
-        .file(manifest_dir.join("shim").join("libtorrent_shim.cpp"))
+        .files(SHIM_SOURCES.iter().map(|rel| manifest_dir.join(rel)))
         .include(manifest_dir.join("shim"))
         .include(lt_install.join("include"))
         .include(boost_install.join("include"));
@@ -980,12 +1001,13 @@ fn key_shim(manifest_dir: &Path, cxx_id: &str, tier_a_id: &str, lt_install: &Pat
     key.file(&libtorrent_targets_file(lt_install));
     key.file(&manifest_dir.join("build.rs"));
     key.file(&manifest_dir.join("Cargo.toml"));
-    for rel in [
-        "wrapper.h",
-        "shim/libtorrent_shim.h",
-        "shim/alert_union.h",
-        "shim/libtorrent_shim.cpp",
-    ] {
+    // Each path is hashed with its contents, so moving code between two units
+    // or renaming one changes the key even where the bytes do not.
+    for rel in std::iter::once(&"wrapper.h")
+        .chain(SHIM_HEADERS)
+        .chain(SHIM_SOURCES)
+    {
+        key.str(rel);
         key.file(&manifest_dir.join(rel));
     }
     key.hex()

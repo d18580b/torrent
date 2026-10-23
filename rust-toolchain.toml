@@ -1,4 +1,9 @@
+# The exact stable release every build, lint and test runs on, locally, in CI
+# and in deploy/Containerfile. An exact version, not `stable`, so a new Rust
+# release cannot change what a commit builds with or what clippy reports; it
+# moves only by editing this line. The oldest release the workspace must still
+# compile on is `rust-version` in Cargo.toml, which `mise run msrv` checks.
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rustfmt", "clippy", "rust-src"]
 profile = "minimal"
