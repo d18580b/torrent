@@ -62,13 +62,19 @@ impl ScanStats {
 /// A root that cannot be read at all — missing, or present but not listable
 /// — counts a `walk` error and keeps its previous index: swapping in the
 /// empty walk would read every torrent over it as `missing`, though nothing
-/// on disk is known to have changed.
+/// on disk is known to have changed. A subdirectory that cannot be listed,
+/// or an entry below the root the walk could not read, counts a `walk` error
+/// the same way and keeps that subtree's previous rows; the rest of the root
+/// is re-indexed as usual.
 pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, PoolError> {
     let root_id = store.upsert_root(root_path)?;
     let mut stats = ScanStats::default();
     store.begin_staging()?;
     let mut files = Vec::with_capacity(STAGE_BATCH);
     let mut root_unreadable = false;
+    // Paths below the root the walk could not read, each keeping its
+    // previous rows through the swap.
+    let mut unseen: Vec<String> = Vec::new();
 
     for entry in jwalk::WalkDir::new(root_path)
         .follow_links(false)
@@ -79,13 +85,22 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             Err(e) => {
                 warn!(target: "torrentd_pool::scan", root = %root_path.display(), error.cause = %e, "walk error");
                 stats.note_error("walk");
-                root_unreadable |= e.depth() == 0;
+                // An error that names no path below the root says nothing
+                // about which subtree went unseen, so it is the whole walk's.
+                match e.path().filter(|_| e.depth() > 0) {
+                    Some(p) => unseen.extend(rel_of(p, root_path)),
+                    None => root_unreadable = true,
+                }
                 continue;
             }
         };
         if let Some(e) = &entry.read_children_error {
             note_unlistable(&mut stats, &entry.path(), e);
-            root_unreadable |= entry.depth == 0;
+            if entry.depth == 0 {
+                root_unreadable = true;
+            } else {
+                unseen.extend(rel_of(&entry.path(), root_path));
+            }
         }
         if !entry.file_type().is_file() {
             continue;
@@ -144,6 +159,19 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             "root could not be read; its previous index is kept",
         );
         return Ok(stats);
+    }
+    let mut carried = 0u64;
+    for rel in &unseen {
+        carried += store.stage_previous_subtree(root_id, rel)?;
+    }
+    if !unseen.is_empty() {
+        warn!(
+            target: "torrentd_pool::scan",
+            root = %root_path.display(),
+            subtree_count = unseen.len(),
+            file_count = carried,
+            "subtrees could not be read; their previous index rows are kept",
+        );
     }
     store.swap_staged_root(root_id, now_secs())?;
     info!(
@@ -364,6 +392,13 @@ fn note_unlistable(stats: &mut ScanStats, dir: &Path, e: &jwalk::Error) {
     stats.note_error("walk");
 }
 
+/// `path` relative to `root`, in the index's form, or `None` where it is not
+/// under `root` or is not UTF-8 — a path the index cannot hold rows for.
+fn rel_of(path: &Path, root: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?.to_str()?.replace('\\', "/");
+    (!rel.is_empty()).then_some(rel)
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -404,9 +439,79 @@ fn device(m: &std::fs::Metadata) -> u64 {
     m.dev()
 }
 
+/// Run `f` with `dir` at mode `0o000`, restoring its mode afterwards, or skip
+/// `f` where permissions do not bind (running as root) and the directory
+/// still lists.
+#[cfg(test)]
+pub(crate) fn with_unlistable(dir: &Path, f: impl FnOnce()) {
+    use std::os::unix::fs::PermissionsExt;
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let binds = std::fs::read_dir(dir).is_err();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if binds {
+            f();
+        }
+    }));
+    std::fs::set_permissions(dir, original).unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    fn indexed(store: &PoolStore, root: &Path, rel: &str) -> bool {
+        let root_id = store.upsert_root(root).unwrap();
+        store.file(root_id, rel).unwrap().is_some()
+    }
+
+    /// A walk that cannot list a subdirectory saw nothing in it; swapping
+    /// the walk in dropped that subtree's rows, so every torrent over it
+    /// read `missing`.
+    #[test]
+    fn an_unlistable_subdirectory_keeps_its_previous_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.bin");
+        write(root, "locked/b.bin");
+        write(root, "locked/deep/c.bin");
+        // Shares the prefix `locked` but is not under `locked/`.
+        write(root, "locked2/d.bin");
+        let mut store = PoolStore::open_in_memory().unwrap();
+        scan_root(&mut store, root).unwrap();
+        assert_eq!(store.file_count().unwrap(), 4);
+
+        // Changed while readable, then locked: the rest is re-indexed.
+        std::fs::remove_file(root.join("a.bin")).unwrap();
+        std::fs::remove_file(root.join("locked2/d.bin")).unwrap();
+        write(root, "new.bin");
+        with_unlistable(&root.join("locked"), || {
+            let stats = scan_root(&mut store, root).unwrap();
+            assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+            assert!(indexed(&store, root, "locked/b.bin"), "kept");
+            assert!(indexed(&store, root, "locked/deep/c.bin"), "kept");
+            assert!(indexed(&store, root, "new.bin"), "the rest re-indexed");
+            assert!(!indexed(&store, root, "a.bin"), "the rest re-indexed");
+            assert!(!indexed(&store, root, "locked2/d.bin"), "not under locked/");
+            assert_eq!(store.file_count().unwrap(), 3);
+        });
+
+        // Readable again, the subtree is re-indexed from disk.
+        std::fs::remove_file(root.join("locked/b.bin")).unwrap();
+        let stats = scan_root(&mut store, root).unwrap();
+        assert_eq!(stats.errors, 0, "{stats:?}");
+        assert!(!indexed(&store, root, "locked/b.bin"));
+        assert!(indexed(&store, root, "locked/deep/c.bin"));
+    }
 
     #[test]
     fn an_unparseable_torrent_is_a_parse_error_by_kind() {

@@ -51,8 +51,9 @@ and `ProtectHome=yes` ([`deploy/torrentd.service`](../deploy/torrentd.service)).
 
 - **Payload must be readable by `torrentd`.** The scan counts an unreadable
   directory under `errors` (and `torrentd_pool_scan_errors_total{kind="walk"}`
-  or `"stat"`). An unreadable subdirectory of a root is indexed as empty, so
-  the torrents over it read `missing`. An unreadable or missing root keeps the
+  or `"stat"`). An unreadable subdirectory of a root keeps the rows from its
+  last readable scan, so the torrents over it keep their previous state, and
+  the rest of the root is re-indexed. An unreadable or missing root keeps the
   index from its last readable scan, so the torrents over it keep their
   previous state; a root that was never read has no index, and its torrents
   read `missing`. If you will use `allow_mutations` (plans
@@ -196,7 +197,12 @@ selected before it plans any of them. It re-stats each file a `matched` or
 `shared` torrent claims and marks a torrent whose files changed or vanished
 since the scan `drifted`, which the adopt then hashes instead of trusting. A
 qBittorrent torrent rewritten at the same size between the scan and the adopt
-is therefore queued for verification, not fast-pathed. To check the whole pool,
+is therefore queued for verification, not fast-pathed. A file counts as
+vanished only when it is not found under a root that is present, listable and
+not empty; a root that is missing, unreadable, or empty (an unmounted mount
+point) is logged as unreadable and no torrent over it changes state, and a file
+that cannot be stated for another reason (permission, I/O) is logged and is not
+drift. To check the whole pool,
 adopted torrents included, run one yourself:
 
 ```bash
