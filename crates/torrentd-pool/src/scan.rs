@@ -31,12 +31,23 @@ pub struct ScanStats {
     pub errors: u64,
     /// `errors`, by kind: `walk` (the walk could not read an entry, or list a
     /// directory), `stat`,
-    /// `path` (not UTF-8), `read` (a `.torrent` that could not be read) and
+    /// `path` (not UTF-8), `read` (a `.torrent` that could not be read, or is
+    /// larger than [`MAX_LIBRARY_FILE_BYTES`]) and
     /// `parse` (one that is not a torrent, or names no info-hash). A kind that
     /// never happened is absent. The daemon exports each as its own series, so
     /// an unreadable root and a library of corrupt files alert differently.
     pub errors_by_kind: std::collections::BTreeMap<&'static str, u64>,
+    /// `.torrent` files skipped because another one, earlier in path order,
+    /// holds the same info-hash. Not an error: the torrent is indexed, from
+    /// the first. Each is logged with the path that won.
+    pub duplicate_infohashes: u64,
 }
+
+/// Upper bound on a `.torrent` or `.fastresume` the library scan reads: the
+/// daemon's own limit on a `.torrent` (`MAX_TORRENT_FILE_BYTES` in the HTTP
+/// API), which a sidecar of the same torrent has no reason to exceed. A file
+/// past it is not read, and counts a `read` error.
+pub const MAX_LIBRARY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl ScanStats {
     /// Every value `errors_by_kind` can hold as a key.
@@ -139,7 +150,10 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
         stats.bytes_indexed += meta.len();
         files.push(PoolFile {
             root_id,
-            rel_path: rel_str.replace('\\', "/"),
+            // As it is on disk: a backslash is an ordinary character in a
+            // Linux file name, and `a\b` rewritten to `a/b` names another
+            // file. Only a torrent's own declared paths are normalised.
+            rel_path: rel_str.to_owned(),
             size: meta.len(),
             mtime_ns: mtime_ns(&meta),
             ino: inode(&meta),
@@ -197,6 +211,10 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
 /// save-path, category and tag hints. Nothing here is qBittorrent-specific —
 /// a plain directory of `.torrent` files works the same, minus the hints.
 ///
+/// Of two `.torrent` files holding one info-hash, the first in path order is
+/// indexed, with its own sidecar's hints, and the other is counted in
+/// [`ScanStats::duplicate_infohashes`].
+///
 /// A torrent whose `.torrent` is gone leaves the index, except one in
 /// `loaded` (hex info-hashes a session serves) — see
 /// [`PoolStore::retain_torrents`].
@@ -206,7 +224,9 @@ pub fn scan_library(
     loaded: &std::collections::HashSet<String>,
 ) -> Result<ScanStats, PoolError> {
     let mut stats = ScanStats::default();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Each info-hash indexed so far, and the `.torrent` it was indexed from.
+    let mut seen: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
     // `read` and `parse` errors that were a sidecar's, whose torrent was
     // still seen.
     let mut sidecar_errors = 0u64;
@@ -219,9 +239,12 @@ pub fn scan_library(
         return Ok(stats);
     }
 
+    // Sorted, so that of two `.torrent` files holding one info-hash the
+    // same one is met first, and indexed, on every scan. A library is
+    // thousands of small files, so the sort costs nothing that matters.
     for entry in jwalk::WalkDir::new(library_dir)
         .follow_links(false)
-        .sort(false)
+        .sort(true)
     {
         let entry = match entry {
             Ok(e) => e,
@@ -243,7 +266,7 @@ pub fn scan_library(
             continue;
         }
 
-        let bytes = match std::fs::read(&path) {
+        let bytes = match read_capped(&path) {
             Ok(b) => b,
             Err(e) => {
                 warn!(target: "torrentd_pool::scan", path = %path.display(), error.cause = %e, "read failed");
@@ -268,6 +291,19 @@ pub fn scan_library(
         };
 
         let infohash = best.to_hex();
+        if let Some(winner) = seen.get(&infohash) {
+            // Indexing this one too would overwrite the winner's row, its
+            // source path and its sidecar's hints with this one's.
+            warn!(
+                target: "torrentd_pool::scan",
+                infohash,
+                path = %path.display(),
+                winner = %winner.display(),
+                "duplicate .torrent skipped; the info-hash is indexed from the first in path order",
+            );
+            stats.duplicate_infohashes += 1;
+            continue;
+        }
         let fr_path = path.with_extension("fastresume");
         let (fastresume_path, hints) = if fr_path.is_file() {
             match fastresume::read_hints(&fr_path) {
@@ -286,7 +322,7 @@ pub fn scan_library(
                         known.fastresume_path = Some(fr_path);
                         store.upsert_torrent(&known, now_secs())?;
                         stats.torrents_indexed += 1;
-                        seen.insert(infohash);
+                        seen.insert(infohash, path);
                         continue;
                     }
                     // A torrent the index has never held has nothing to keep,
@@ -344,7 +380,7 @@ pub fn scan_library(
             .collect();
         store.replace_torrent_files(&infohash, &rows)?;
         stats.torrents_indexed += 1;
-        seen.insert(infohash);
+        seen.insert(infohash, path);
     }
 
     // A torrent whose `.torrent` is gone from the library leaves the index,
@@ -360,6 +396,7 @@ pub fn scan_library(
         .sum::<u64>()
         - sidecar_errors;
     if unseen == 0 {
+        let seen = seen.into_keys().collect();
         let dropped = store.retain_torrents(&seen, loaded)?;
         if dropped > 0 {
             info!(
@@ -400,8 +437,36 @@ fn note_unlistable(stats: &mut ScanStats, dir: &Path, e: &jwalk::Error) {
 /// `path` relative to `root`, in the index's form, or `None` where it is not
 /// under `root` or is not UTF-8 — a path the index cannot hold rows for.
 fn rel_of(path: &Path, root: &Path) -> Option<String> {
-    let rel = path.strip_prefix(root).ok()?.to_str()?.replace('\\', "/");
+    let rel = path.strip_prefix(root).ok()?.to_str()?.to_owned();
     (!rel.is_empty()).then_some(rel)
+}
+
+/// The whole of the library file at `path`, or an error where it cannot be
+/// read or is larger than [`MAX_LIBRARY_FILE_BYTES`]. One oversized file
+/// would otherwise be read whole into memory however large it is.
+///
+/// The cap is checked against the file's size and again while reading, so a
+/// file that grows between the two is cut off rather than read past it.
+pub(crate) fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let too_large = || {
+        std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("larger than the {MAX_LIBRARY_FILE_BYTES}-byte limit"),
+        )
+    };
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > MAX_LIBRARY_FILE_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(MAX_LIBRARY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LIBRARY_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 fn now_secs() -> i64 {

@@ -120,7 +120,7 @@ pub fn match_all_serving(
 fn base_under_roots(roots: &[(i64, PathBuf)], save_path: &Path) -> Option<(i64, String)> {
     roots.iter().find_map(|(id, root)| {
         let rel = save_path.strip_prefix(root).ok()?;
-        Some((*id, normalize(&rel.to_string_lossy())))
+        Some((*id, trim_base(&rel.to_string_lossy())))
     })
 }
 
@@ -477,9 +477,11 @@ struct Search {
 /// Try every candidate base across every root.
 ///
 /// `preferred` is tried first, in order, and the first of it that is complete
-/// wins. Every candidate is tried even after a complete one is found, because
-/// a second complete copy is something a delete plan has to know about: which
-/// of two identical copies a session reads from is not in the index.
+/// wins; then the declared save path, on whichever root holds it; then each
+/// root's other candidates. Every candidate is tried even after a complete
+/// one is found, because a second complete copy is something a delete plan
+/// has to know about: which of two identical copies a session reads from is
+/// not in the index.
 fn search_placements(
     store: &PoolStore,
     roots: &[(i64, PathBuf)],
@@ -493,18 +495,18 @@ fn search_placements(
         // A base recorded against a root no longer configured resolves
         // nothing; leave it out rather than look it up.
         if roots.iter().any(|(id, _)| *id == root_id) {
-            candidates.push((root_id, normalize(base)));
+            candidates.push((root_id, trim_base(base)));
         }
     }
-    for (root_id, root_path) in roots {
-        for base in candidate_bases(
-            store,
-            *root_id,
-            root_path,
-            declared_save_path,
-            torrent_name,
-            files,
-        )? {
+    // Ahead of every root's own candidates, not among them: tried root by
+    // root, a size-anchor copy on a root sorting first beat the declared
+    // path complete on a later one.
+    if let Some(declared) = declared_save_path.and_then(|sp| base_under_roots(roots, Path::new(sp)))
+    {
+        candidates.push(declared);
+    }
+    for (root_id, _) in roots {
+        for base in candidate_bases(store, *root_id, torrent_name, files)? {
             candidates.push((*root_id, base));
         }
     }
@@ -566,12 +568,12 @@ pub(crate) fn complete_copies(
     .complete)
 }
 
-/// Candidate base directories, relative to the root, in cost order.
+/// Candidate base directories on one root, relative to it, in cost order:
+/// every candidate but (1), the declared save path, which
+/// [`search_placements`] tries ahead of every root's.
 fn candidate_bases(
     store: &PoolStore,
     root_id: i64,
-    root_path: &Path,
-    declared_save_path: Option<&str>,
     torrent_name: &str,
     files: &[TorrentFileRow],
 ) -> Result<Vec<String>, PoolError> {
@@ -585,13 +587,6 @@ fn candidate_bases(
             out.push(c);
         }
     };
-
-    // (1) The previous client's save path, if it points inside this root.
-    if let Some(sp) = declared_save_path {
-        if let Ok(rel) = Path::new(sp).strip_prefix(root_path) {
-            push(normalize(&rel.to_string_lossy()));
-        }
-    }
 
     // (2) The root itself, and a directory named after the torrent. Which one
     //     is right depends on whether the torrent's own paths already include
@@ -688,8 +683,16 @@ fn join_rel(base: &str, rel: &str) -> String {
     }
 }
 
+/// A path a torrent declares, in the index's form: its separators `/`.
 fn normalize(p: &str) -> String {
     p.replace('\\', "/").trim_matches('/').to_string()
+}
+
+/// A base found on disk, in the index's form. A backslash in it is part of a
+/// file name, as the scan indexed it, and is kept: rewritten to `/`, it names
+/// another directory.
+fn trim_base(p: &str) -> String {
+    p.trim_matches('/').to_string()
 }
 
 /// Per-state counts for reporting.

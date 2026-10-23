@@ -198,11 +198,13 @@ fn normalised_relative(p: &str) -> Option<String> {
 }
 
 /// The hints in the `.fastresume` at `path`, or why there are none: a file
-/// that cannot be read, or that is not a bencoded dictionary. A caller holding
-/// hints from an earlier read keeps them on an error, rather than taking it
-/// for a sidecar that holds none.
+/// that cannot be read or is larger than
+/// [`MAX_LIBRARY_FILE_BYTES`](crate::scan::MAX_LIBRARY_FILE_BYTES), or that is
+/// not a bencoded dictionary. A caller holding hints from an earlier read
+/// keeps them on an error, rather than taking it for a sidecar that holds
+/// none.
 pub fn read_hints(path: &Path) -> Result<ResumeHints, SidecarError> {
-    let bytes = std::fs::read(path)?;
+    let bytes = crate::scan::read_capped(path)?;
     parse_hints(&bytes).ok_or(SidecarError::Parse)
 }
 
