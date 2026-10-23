@@ -88,15 +88,22 @@ pub fn resolve(overrides: Overrides) -> Result<Config, ConfigError> {
     let env_token = std::env::var("TORRENTCTL_TOKEN")
         .ok()
         .filter(|v| !v.is_empty());
-    let path = overrides.config.clone().or_else(default_path);
-    let file = match &path {
-        Some(p) if p.exists() => load(p)?,
-        _ => File::default(),
-    };
+    let file = read_file(overrides.config.as_deref(), default_path().as_deref())?;
     let default_socket = DEFAULT_SOCKET
         .strip_prefix(crate::api::UNIX_PREFIX)
         .is_some_and(|p| Path::new(p).exists());
     resolve_from(overrides, env_url, env_token, file, default_socket)
+}
+
+/// The config file: `explicit` must exist, since a path the operator named
+/// and mistyped would otherwise fall back to the defaults unnoticed; only the
+/// `default` path may be absent.
+fn read_file(explicit: Option<&Path>, default: Option<&Path>) -> Result<File, ConfigError> {
+    match (explicit, default) {
+        (Some(path), _) => load(path),
+        (None, Some(path)) if path.exists() => load(path),
+        (None, _) => Ok(File::default()),
+    }
 }
 
 fn load(path: &Path) -> Result<File, ConfigError> {
@@ -272,6 +279,58 @@ mod tests {
             read_token_file(&empty).unwrap_err(),
             ConfigError::EmptyTokenFile { .. }
         ));
+    }
+
+    #[test]
+    fn an_explicit_config_path_that_does_not_exist_is_an_error_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("typo.toml");
+        let err = resolve(Overrides {
+            config: Some(missing.clone()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Read { path, source }
+                if path == &missing && source.kind() == std::io::ErrorKind::NotFound),
+            "{err}"
+        );
+        assert!(err.to_string().contains(&*missing.to_string_lossy()));
+
+        let present = dir.path().join("config.toml");
+        std::fs::write(&present, "not toml").unwrap();
+        let err = resolve(Overrides {
+            config: Some(present.clone()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Parse { path, .. } if path == &present),
+            "an existing explicit file is still read: {err}"
+        );
+    }
+
+    #[test]
+    fn only_the_default_config_path_may_be_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("config.toml");
+        assert_eq!(read_file(None, Some(&missing)).unwrap(), File::default());
+        assert_eq!(read_file(None, None).unwrap(), File::default());
+        assert!(matches!(
+            read_file(Some(&missing), None).unwrap_err(),
+            ConfigError::Read { .. }
+        ));
+
+        let present = dir.path().join("present.toml");
+        std::fs::write(&present, "url = 'http://file:1'").unwrap();
+        let file = read_file(None, Some(&present)).unwrap();
+        assert_eq!(file.url.as_deref(), Some("http://file:1"));
+        let file = read_file(Some(&present), Some(&missing)).unwrap();
+        assert_eq!(
+            file.url.as_deref(),
+            Some("http://file:1"),
+            "an explicit path replaces the default"
+        );
     }
 
     #[test]
