@@ -86,9 +86,7 @@ allow_unauthenticated = true
 
 # `resume_dir` and `torrent_dir` are roots: each profile gets its own
 # subdirectory under them, named after the profile id. A profile may override
-# either with an absolute path of its own — which is also how you point a
-# profile at directories from a pre-profiles deployment, where resume files
-# lived directly under the root.
+# either with an absolute path of its own.
 #
 # Optional. Defaults to <resume_dir>/../registry.db, a SQLite database that
 # records which profile owns which info-hash. A path ending in .json names an
@@ -249,9 +247,8 @@ dht               = true
 # `peer_fingerprint` and `user_agent` are required here and must be unique
 # across profiles: they are what a tracker sees as the account's client.
 # `peer_fingerprint` takes the same 8-character raw form as the top-level key.
-# The older `peer_fingerprint_hex` key is no longer read, and a profile that
-# still sets it is refused at load: its sixteen hex characters were never
-# decoded, so they did not reach the wire as the prefix they spelled.
+# A profile that sets `peer_fingerprint_hex` is refused at load, with that key
+# named.
 #
 # A wireguard profile's `vpn_config` must be
 # /etc/wireguard/<vpn_interface>.conf — the file root's `wg-quick up <iface>`
@@ -361,35 +358,6 @@ dht               = true
 # Run them as the daemon's user: run as root, `pool scan` creates `pool.db`
 # (and `registry.db`, with `import_legacy_registry` set) owned by root, which
 # the daemon cannot write, and the next start fails.
-#
-# The index schema moves forward one way. The first open on this build
-# migrates the torrent→account column from `slot` to `profile`, and a build
-# predating that change cannot open the result. The pre-migration database is
-# left beside it as `<db_path>.pre-v3.bak`; restoring that file is how you go
-# back to a build that predates this change. It is the only copy of the
-# `plan` / `plan_step` mutation journal, which a rescan does not reconstruct.
-#
-# That copy is a full second copy of the index, so the first open needs free
-# space equal to the size of `pool.db`. If it cannot be written the migration
-# stops, names the backup path and the reason, and leaves the index as it was.
-# Nothing deletes it afterwards and nothing ages it out: remove it yourself
-# once you would not go back. Where a copy is already at that path, a fresh one
-# is taken beside it as `<db_path>.pre-v3.bak.new`, which needs that free space
-# again; once the migration commits it replaces the old copy, and if the
-# migration fails it is discarded and the old copy stays. That holds only where
-# what is at that path really is a copy: it has to be a pool
-# index, at a schema version this build understands, and not this same `pool.db`
-# reached through a symlink. Anything else stops the migration instead, because
-# keeping it would run the one-way rename with no rollback at all.
-#
-# A `pool.db` from one of this change's own pre-release builds can carry
-# `profile` without v3's indexes, and can report any version from 0 to 3
-# depending on which of them wrote it and where it stopped. Such a file is
-# recognised whichever it was, because the indexes are checked before the
-# version is trusted: where they did not come with the columns — no index on
-# `profile`, or the old `torrent_by_slot` name over it — they are put right,
-# and the version stamped, in the same transaction. No data moves; the
-# `.pre-v3.bak` copy is not a remedy for it, having the same contents.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest

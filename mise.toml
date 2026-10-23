@@ -6,9 +6,11 @@
 #
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
-#   mise run fmt|lint|test|check
+#   mise run fmt|fmt-fix|lint|lint-fix|test|check
 #   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|deny
+#   mise run native|native-clean
+#   mise run vpn-check <config> [-- <flags>]
 #   mise run bench -- <subcommand>
 
 [tools]
@@ -57,9 +59,8 @@ description = "Workspace tests (default features; parity with CI)"
 run = "cargo test --workspace"
 
 # The layers above `test`, each needing something `test` does not. The rule at
-# the top of this file — that a command lives in exactly one place — now covers
-# these too; until it did, the four were spelled out longhand in CI *and* in
-# the README, so there were three copies of each and nothing kept them in step.
+# the top of this file — that a command lives in exactly one place — covers
+# these too: CI and the docs call the tasks, never the commands.
 
 [tasks.test-shim]
 description = "Layer 2: FFI shim tests (needs the vendored libtorrent fixtures)"
@@ -104,7 +105,7 @@ promtool test rules torrentd.rules.test.yml
 [tasks.test-all]
 description = "Every automated test, including the ignored integration layers"
 # Sequential `run`, not `depends`: mise schedules dependencies in parallel
-# (`--jobs` defaults to 4, exactly the number of layers here). `test` and
+# (`--jobs` defaults to 4). `test` and
 # `test-shim` resolve `libtorrent-sys` features differently against one
 # `target/`, so run together they thrash cargo's build-directory lock; and the
 # two Layer 3 suites are wall-clock tests — a 15s seeding budget and a 30s
@@ -139,10 +140,9 @@ run = [
   "git diff --exit-code -- docs/api/openapi.json",
 ]
 
-# The alert drill's build (deploy/drill), with its tests run. This used to be
-# `cargo check --all-targets`, which proved the fault-injection code and its
-# tests compile and never ran one: `POST /v1/faults`' scenarios and
-# `FaultEngine`'s own tests exist only in this build, so nothing executed them.
+# The alert drill's build (deploy/drill), with its tests run: `POST /v1/faults`'
+# scenarios and `FaultEngine`'s own tests exist only in this build, so a
+# `cargo check` of it would prove they compile and run none of them.
 [tasks.test-fault-injection]
 description = "Run torrentd's tests in the fault-injection build"
 run = "cargo test -p torrentd --features fault-injection"

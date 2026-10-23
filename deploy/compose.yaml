@@ -24,8 +24,7 @@ services:
     # together with `user: "0:0"` below. The image runs as `USER 1000:1000`,
     # and `cap_add` only fills the container's bounding and permitted sets: a
     # non-root uid with no ambient and no file capabilities gets nothing
-    # effective from it, so the tunnel still fails with EPERM. The
-    # Containerfile's own comment beside that USER line says the same thing.
+    # effective from it, so the tunnel still fails with EPERM.
     #
     # **A vpn profile and `network_kill_switch = true` cannot be combined in
     # this container.** The two requirements exclude each other:

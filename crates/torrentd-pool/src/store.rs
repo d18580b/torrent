@@ -640,7 +640,7 @@ impl PoolStore {
     }
 
     /// Suffix of the copy [`PoolStore::migrate`] leaves before the v2 → v3
-    /// rename. Named in `docs/running.md`'s rollback note.
+    /// rename; restoring it is the way back to a build that predates v3.
     pub const PRE_V3_BACKUP_SUFFIX: &'static str = ".pre-v3.bak";
 
     /// Copy an existing index aside before the v2 → v3 rename, which nothing

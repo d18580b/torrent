@@ -83,9 +83,8 @@
 //!    — the stores are opened at startup — but they are not identity: no
 //!    announce, handshake or peer message carries where a profile keeps its
 //!    files. They get the ordinary non-reloadable warning, so this rule's
-//!    warning stays the privacy event an alert rule can watch for, and the
-//!    upgrade step in `docs/running.md` that tells an operator to set those
-//!    two keys does not fire it.
+//!    warning stays the privacy event an alert rule can watch for, and an
+//!    operator setting those two keys does not fire it.
 //! 8. **Listen ports are unique across profiles.** The port is announced, so two
 //!    profiles sharing one would be correlatable by a tracker operator even from
 //!    different IPs. Enforced for every profile that names its own port — a

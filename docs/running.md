@@ -1,8 +1,7 @@
 # Running torrentd
 
 Everything needed to take `torrentd` from a clone to a daemon seeding a real
-pool, in order. Written from the source, not from memory — where a step is easy
-to miss, the failure it causes is named.
+pool, in order. Where a step is easy to miss, the failure it causes is named.
 
 If you only want to hack on it, [`CONTRIBUTING.md`](../CONTRIBUTING.md) is
 shorter and covers the dev loop.
@@ -111,7 +110,8 @@ anything you put there before the first start.
 #     shared with anything else that talks to the network.
 sudo useradd --system --home-dir /var/lib/torrentd --shell /usr/sbin/nologin torrentd
 
-# 4b. The unit's ExecStart hardcodes /usr/bin/torrentd.
+# 4b. The unit's ExecStart hardcodes /usr/bin/torrentd. (The container image
+#     installs to /usr/local/bin instead; that path is the image's alone.)
 sudo install -m0755 target/release/torrentd /usr/bin/torrentd
 
 # 4c. Directories.
@@ -631,208 +631,11 @@ and from then its tracker names fall back to the host's resolvers; the VPN
 monitor pauses that profile on the next poll (§11.5), so it stops announcing,
 but a lookup inside that window leaves by the host's resolver.
 
-### Upgrading from a pre-profiles deployment
+### What a profile is refused for
 
-Several things changed at once, and most of them will stop an upgraded daemon
-serving your library. Do all of this before you start it.
-
-**1. Remove the two top-level keys that no longer exist.** `session_state_path`
-and top-level `listen_interfaces` are gone. `Config` rejects unknown keys, so an
-existing config file is now a fatal startup error naming whichever it reaches
-first. `listen_interfaces` moved onto each `network = "host"` profile; session
-state moved to `session_state-<profile_id>.dat` beside the old file and needs no
-key.
-
-**1a. Rewrite each `[[slot]]` table as a `[[profile]]`.** `[[slot]]` is gone,
-and a file with no `[[profile]]` at all is refused: a single-session deployment
-that had no `[[slot]]` needs one `network = "host"` profile carrying the
-`listen_interfaces` it used to set at the top level. For each old slot:
-
-- Rename the header to `[[profile]]` and add `network = "vpn"`.
-- Rename `vpn_profile` to `vpn_config`. The value is the same file.
-- `resume_dir` and `torrent_dir` were required on a slot and are optional now,
-  defaulting to `<resume_dir>/<id>` and `<torrent_dir>/<id>` under the
-  top-level roots. Keeping the slot's own values is fine, and is how step 3 is
-  done for that profile.
-- **Delete `upload_rate_limit = 0`, do not carry it over.** On a slot, `0`
-  meant "no override — inherit the daemon-wide cap". On a profile it means
-  **unlimited**, the same as the top-level key's `0`, so a slot that wrote `0`
-  to inherit the cap becomes an uncapped profile, and nothing warns: the file
-  is valid either way. Leave the key out to inherit; any other value carries
-  over unchanged.
-- Every other key — `id`, `vpn_type`, `vpn_interface`, `listen_port`,
-  `user_agent`, `allowed_tracker_domains`, `port_forward`,
-  `port_forward_gateway` — keeps its name and meaning.
-- **Replace `peer_fingerprint_hex` with `peer_fingerprint`.** The old key was
-  documented as sixteen hex characters, and nothing decoded them: libtorrent
-  was handed the sixteen characters themselves, not the eight bytes they
-  spelled. `peer_fingerprint` takes the 8-character prefix as written — the
-  same form as the top-level key — so write the prefix you meant, such as
-  `"-XX0002-"`. A profile that still sets `peer_fingerprint_hex` is refused at
-  load with that key named.
-
-**2. Give a profile the id your registry already uses, or clear the entries.**
-The assignment registry — which torrent belongs to which account — is the
-SQLite database `registry.db` in the state directory, and it is migrated
-automatically. On the first boot, before anything else reads it, the daemon
-imports `profile_assignments.json` into it in one transaction — or, where that
-file does not exist, the pre-profiles `slot_assignments.json` — and renames the
-file it read to `<name>.imported`, which is kept for a rollback and not read
-again. The import is *verbatim*, so every entry still names the id that
-deployment used, which on a single-session deployment is `default`.
-
-Nothing reconciles those ids with your `[[profile]]` tables, so the daemon
-refuses to start until they agree, listing the ids it does not recognise and
-naming both the database and the file they were imported from. Either name one
-of your profiles `default` — `default` is a legal profile id — or delete those
-rows from the database, with the `sqlite3` statement the refusal prints, and
-re-add the torrents. Edit `registry.db`, not the `.imported` file: the daemon
-does not read that again.
-
-To roll back to a release that predates the database, stop the daemon and
-rename the newest imported copy back to its original name. The first import
-leaves `<name>.imported`, and each later one takes the next free
-`<name>.imported.N`, so where numbered copies exist the newest is the one with
-the highest `N`; `<name>.imported` itself is then the oldest. Assignments made
-since the upgrade exist only in `registry.db`. A `profile_assignments.json` that
-reappears beside the database — the rolled-back release wrote it — is imported
-again on the next boot of this one: entries the database lacks are
-added, and one that assigns an info-hash to a different profile than the
-database does refuses the boot, naming both, with nothing imported.
-
-That merge only adds. An assignment the rolled-back release *removed* — a
-torrent it deleted — is still in `registry.db`, which that release never
-opened, so it survives the return to this one: nothing loads for that
-info-hash, and adding it again answers 409 until `DELETE
-/v1/torrents/{infohash}` or the `sqlite3` statement clears the row. Where the
-rolled-back release's file should replace the database rather than merge into
-it, stop the daemon and move `registry.db` (with its `registry.db-wal` and
-`registry.db-shm`, if present) aside before booting this release: with no
-database, the boot imports the JSON file into a new one.
-
-`torrentd pool scan` opens the same registry the same way, performing the
-import itself if the daemon has not yet — so running the scan before the
-daemon's first boot, which is the order this section uses, still folds your
-assignments into the pool index. It prints where it read them from and how many
-entries it took.
-
-**2a. The pool index migrates one way, and leaves a copy.** If you have a
-`[pool]` section, the first open on this build renames the index's
-torrent→account column from `slot` to `profile`. A build predating this change
-cannot open the result. Before that step the daemon copies the database aside
-as `<db_path>.pre-v3.bak`; restoring that file is how you go back to a build
-that predates this change. It is the only copy of the `plan`/`plan_step`
-mutation journal, which a rescan does not reconstruct. The migration is applied
-in one transaction, so a failure part way through leaves the index exactly as
-it was.
-
-A further step, schema version 4, adds a column marking BEP 47 padding files
-and a table holding the index generation. It is additive and takes no copy, but
-a build that knows only version 3 refuses the result. Torrents indexed before it
-keep reading their padding entries as payload, and so as `partial`, until the
-library is scanned again: run `torrentd pool scan` once after upgrading.
-
-Schema version 5 materialises the directory tree: each file's directory, and
-per directory the byte accounting the tree listing and `GET /v1/pool` show.
-The step derives all of it from the index already on disk, in the same
-transaction as the version write, so it needs no rescan; on an index of
-millions of files it adds seconds to that first start. It is additive and
-takes no copy, but a build that knows only version 4 refuses the result.
-
-Schema version 6 adds the `verify_queue` table, which keeps the adoptions
-waiting for verification so a restart queues them again. It starts empty, is
-additive and takes no copy, but a build that knows only version 5 refuses the
-result.
-
-Schema version 7 rebuilds the `plan` table so a discarded plan's id is never
-handed out again, copying every plan and its steps across under their own
-ids. It takes no copy, and a build that knows only version 6 refuses the
-result. From this version a delete plan files into
-`<root>/.torrentd-trash/<plan id>-<created_at>/` rather than
-`<root>/.torrentd-trash/<plan id>/`; trash an older build filed keeps its old
-name ([The trash](operations.md#archiving-payload)).
-
-**If the migration fails, that copy is not the remedy.** It is taken
-immediately before the steps that failed, so it is a copy of the index as it
-stands — same version, same columns, same tables — and restoring it puts you
-back where you started, to fail again on the next start. A `.pre-v3.bak` is a
-rollback only where it **predates the run that failed**: that is the copy from
-a successful earlier migration, or one you took yourself. Check its timestamp
-before you restore it. Where it does not predate the run, the way out is to
-move the index aside and let `torrentd pool scan` rebuild it, which
-reconstructs everything except the mutation journal — and the error message
-says so.
-
-**That copy is yours to remove, and nothing removes it for you.** Nothing
-deletes it, nothing ages it out, and no later start reclaims its space: keep it
-until the new index has been in service long enough that you would not go back,
-then delete it yourself. The daemon cannot make that judgement for you, and
-deleting an operator's only rollback on a timer is not a judgement it should
-be making. If a `.pre-v3.bak` is already at that path when a migration starts
-— from an earlier attempt, or from an earlier successful migration you rolled
-back by copying it over the index — it need not describe the index as it
-stands now, so the daemon takes a fresh copy beside it as
-`<db_path>.pre-v3.bak.new`. When the migration commits, the fresh copy replaces
-the old one; when it fails, the fresh copy is discarded and the old one stays,
-because it is the copy that predates the run that failed.
-
-That holds for something that is a copy of the index, and the daemon checks
-that it is one. What is at that path has to be a pool index, at a schema
-version this build understands, and not this same `pool.db` reached by another
-name. Anything else — a dangling symlink, a directory, a stray file, an empty
-file, an unrelated database, a symlink pointing back at `pool.db` itself — the
-migration **stops** and names it, without touching the index. Keeping it and
-carrying on would run the one-way rename with no rollback at all, while the
-paragraph above tells you restoring that file is how you go back; and a
-`.pre-v3.bak` that resolves to `pool.db` would leave you restoring the migrated
-file over itself. Move or remove whatever is there and start the daemon again.
-
-What the daemon cannot tell you is whether a file that passes those checks is a
-copy of *this* index or of another deployment's: two pool indexes have the same
-shape. Keep `<db_path>.pre-v3.bak` for this index and nothing else.
-
-The copy is a full second copy of the index, so **the first open on this build
-needs free space on the state volume equal to the size of `pool.db`**. The
-index carries one row per file, so on a large library that is not small. If the
-volume cannot take it the migration stops and says so, naming the backup path
-and the reason, and the index is left exactly as it was — free some space and
-start the daemon again.
-
-If you ran one of this change's own pre-release builds, you may hold a
-`pool.db` whose schema is not the one its version names, such as the `profile`
-column under version 2, or version 3 without `torrent_by_profile`. This build
-does not repair such a file; where the version is behind the schema, opening it
-fails and names the step. Move it aside and let `torrentd pool scan` rebuild
-it, which costs the `plan`/`plan_step` journal.
-
-**3. Point each profile at its files, or move them.** Resume and `.torrent`
-files used to live directly under `resume_dir` and `torrent_dir`; they now live
-in a per-profile subdirectory, `<resume_dir>/<profile_id>` and
-`<torrent_dir>/<profile_id>`. Set that profile's own `resume_dir` and
-`torrent_dir` to the old paths, or move the files into the subdirectory.
-
-Skipping this does **not** cost you a re-hash — it costs you the library. The
-torrent-directory inventory scan is partitioned exactly like the resume store,
-so it finds nothing either: the daemon comes up healthy, `GET /v1/torrents`
-lists every torrent at `phase: "unknown"`, and nothing seeds.
-
-**4. Delete the orphaned `session_state.dat`.** It is not migrated. A DHT
-routing table regenerates from the bootstrap nodes within minutes, and choosing
-which profile inherits one is a guess with a privacy cost — it would seed one
-profile's session with another's peer history. The assignment registry is
-migrated precisely because it is the one artefact that *cannot* be
-reconstructed.
-
-Metrics were renamed with it: every `slot_*` series is now `profile_*`, and the
-`slot_id` label is `profile_id`. There is no alias and no dual-emission period,
-so any dashboard or alert rule built on the old names stops firing silently
-rather than erroring. `/healthz`'s path is unchanged; its response keys
-`slots` / `slots_fenced` are now `profiles` / `profiles_fenced`. There is no
-key in place of `all_slots_fenced`: every live profile fenced is now a 503
-answer whose `reason` is `"all_profiles_fenced"`, so a check on
-`.all_slots_fenced == true` becomes the status code, or
-`.reason == "all_profiles_fenced"`. `profiles_failed`, the configured profiles
-that never came up, is new.
+**`peer_fingerprint_hex` is refused by name.** A profile that sets it fails to
+load with that key named; write the 8-character prefix you mean in
+`peer_fingerprint`, such as `"-XX0002-"`.
 
 **A WireGuard profile's `vpn_config` must be `/etc/wireguard/<vpn_interface>.conf`
 — exactly that directory, and a file name matching the interface.** This is
@@ -846,13 +649,10 @@ file root raises from and the file the daemon checks the key against the same
 file. OpenVPN profiles are unaffected —
 torrentd passes `--dev` explicitly, so their config's name carries no meaning.
 
-**Upgrading:** this rule is new, and it is a hard refusal, so a daemon that
-has been running for months with a WireGuard config somewhere else will not
-start after the upgrade. That is deliberate, and it is catchable before the running daemon stops: `--check-config` refuses
-the same config, so run it before restarting onto the upgrade. A daemon started
-on it anyway exits `78`, which `deploy/torrentd.service` leaves stopped rather
-than restarting. Move the file to `/etc/wireguard/<vpn_interface>.conf` and
-update `vpn_config`.
+It is a hard refusal: a daemon started on such a config exits `78`, which
+`deploy/torrentd.service` leaves stopped rather than restarting.
+`--check-config` refuses the same config, so run it before a restart. Move
+the file to `/etc/wireguard/<vpn_interface>.conf` and update `vpn_config`.
 
 **An OpenVPN profile's `vpn_config` is executable configuration.** An `.ovpn`
 can run programs (`up`, `route-up` and the other hooks, once `script-security
@@ -1443,7 +1243,7 @@ directories. The field name is on the event either way, and never its value.
 The store directories are in the second group because nothing a tracker reads
 is not an identity, and no announce or handshake carries where a profile keeps
 its files. They are still not reloadable — the stores are opened once at
-startup — but setting them is exactly what step 3 above tells you to do, and
+startup — but pointing a profile at its files is routine configuration, and
 the privacy warning is the line an alert rule watches for an account's identity
 changing under a live session.
 
@@ -2168,9 +1968,6 @@ On a scratch pool, not your real one.
       change and the backlog clearing, the gauge stays at `0` long enough to
       fire `TorrentdPortForwardDown`.
 
-   This drill has not yet been run against a live Proton gateway from this
-   repository: the renewal, rebind and reannounce are tested against a fake
-   NAT-PMP gateway and a mock session. Record the result here when it has.
    A fence that lands during a renewal is drill 8's `natpmp-fence.sh`.
 
    The ruleset also confines the daemon's **replies**: a request to
@@ -2189,8 +1986,9 @@ On a scratch pool, not your real one.
    Inside the namespace the drill is uid 0, so the kill switch it installs,
    the ruleset `killswitch::render_ruleset_with_transport` renders, matches
    every socket there. Each drill exits 0 when it finds no gap, 1 when it
-   finds one, and prints a line per check: `gap` fails the drill, while `ok`
-   and `info` do not.
+   finds one, and 2 when its topology could not be set up (`natpmp-fence.sh`
+   also exits 3, below). It prints a line per check: `gap` fails the drill,
+   while `ok` and `info` do not.
 
    ```bash
    deploy/drill/udp-transport.sh
@@ -2209,8 +2007,7 @@ On a scratch pool, not your real one.
    restores the rule, sets the profile online, and tries again (`ATTEMPTS`,
    default 4), and it exits 3 if no attempt lands.
 
-   Results, run on Linux 7.2 against this branch's head (every drill exits
-   0):
+   Results, run on Linux 7.2 (every drill exits 0):
 
    - **The transport exemption holds while the link is up.** A UDP socket
      of the daemon's uid cannot bind the tunnel's listen port: on the
@@ -2221,16 +2018,13 @@ On a scratch pool, not your real one.
      down` on an adopted link), a socket bound to the freed port, and an
      unbound one the kernel hands it as an ephemeral port (a resolver query,
      say), are refused with `EPERM`, and nothing reaches the physical link:
-     the exemption reaches only the provider's endpoint. Before #136 it was
-     a source port alone, and both left by the physical interface,
-     unencrypted (`udp 192.0.2.1 51821 -> 192.0.2.2 7` and `-> :53`).
+     the exemption reaches only the provider's endpoint.
    - **A link re-raised on another port carries again at the next check.**
      Re-raised without a `ListenPort`, the link gets a port the kernel picks
      (`33979` in the run recorded here), and under the ruleset read before
      it carries nothing: handshakes complete, so every health check passes.
      Installed again with the live port, as the watch's next check does, it
-     carries. Before #136 the ruleset was read once, at boot, and the tunnel
-     carried nothing until the daemon restarted.
+     carries.
    - **The daemon's listeners do not answer on the physical link.** A SYN to
      a wildcard listener (an `http_listen` off loopback) at the host's
      physical address gets no SYN-ACK. With the tunnel routed, every reply
@@ -2248,9 +2042,7 @@ On a scratch pool, not your real one.
      `route-fence.sh` makes, before the next poll fences the profile. The
      listener's SYN-ACK is dropped by the uid rules, and the kernel's reset
      and port-unreachable by the address fence; the prober's connect and
-     datagram time out. Before #136 the reset and the port-unreachable left
-     by the physical link from the tunnel address (`tcp 10.200.0.1:9 -> RA`,
-     `icmp 10.200.0.1 -> type 3`), which tied that address to the host.
+     datagram time out.
    - **IPv6 does not leave.** With a global IPv6 address and default route
      on the physical link, and a tunnel with only an IPv4 address, nothing
      the uid sends over IPv6 reaches the link: a datagram, unbound or bound
@@ -2259,13 +2051,10 @@ On a scratch pool, not your real one.
      each reached the peer. A WireGuard link has no IPv6 link-local address
      to send into the tunnel from.
    - **A fence during a renewal stops the rebind and the reannounce.**
-     Against the daemon on this branch the fence landed inside a renewal on
-     the wire, and the renewal logged `NAT-PMP renewed with a new port after
-     the profile was fenced; not rebinding the session or reannouncing` and
-     rebound nothing (exit 0). Against `master` at `ee25dbf`, which read the
-     profile's status only before the exchange, the same drill saw the
-     renewal rebind the fenced profile and reannounce its torrents (exit 1).
-     The status is now checked once the gateway has answered, before the
+     The fence landed inside a renewal on the wire, and the renewal logged
+     `NAT-PMP renewed with a new port after the profile was fenced; not
+     rebinding the session or reannouncing` and rebound nothing (exit 0).
+     The status is checked once the gateway has answered, before the
      session is touched, and again before each reannounce batch. A fence
      that lands while the batches are going out stops the batches still
      to come.

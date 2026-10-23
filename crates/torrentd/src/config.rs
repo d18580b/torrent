@@ -964,7 +964,8 @@ impl Config {
     /// Refuse two profiles that would share a store directory, by effective
     /// path, so an override equal to another profile's derived `<base>/<id>`
     /// is caught. Equality only: a store scans one level, so a directory
-    /// containing another's is harmless, and is the documented upgrade.
+    /// containing another's is harmless, and is how a profile keeps files at
+    /// the shared root.
     fn validate_effective_store_dirs(&self) -> Result<(), ProfileConfigError> {
         let dirs: Vec<(&str, PathBuf, PathBuf)> = self
             .profile
@@ -2109,14 +2110,15 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn an_override_containing_another_profiles_resume_dir_is_accepted() {
-        // The documented upgrade (`docs/running.md` step 3).
+        // One profile pointed at the shared root that holds another profile's
+        // default subdirectory.
         let dir = tempdir().unwrap();
         let p = write_cfg(
             dir.path(),
             &two_host_profiles(r#"resume_dir = "/var/lib/torrentd/resume""#, ""),
         );
         Config::load(&p).expect(
-            "an outer resume_dir containing an inner one is the documented upgrade, and \
+            "an outer resume_dir containing an inner one is a valid layout, and \
              neither store descends into a subdirectory",
         );
     }
@@ -2175,8 +2177,7 @@ listen_interfaces = "eth0:6882"
         std::fs::write(inner_dir.join(format!("{inner_ih}.torrent")), b"inner").unwrap();
 
         // `default` overrides to the old root, `acct_a` derives
-        // `<outer>/acct_a` inside it: the documented upgrade, which the
-        // validator now accepts.
+        // `<outer>/acct_a` inside it: a layout the validator accepts.
         let store = FsTorrentStore::new(outer_dir.clone())
             .with_profile_dir(ProfileId::new("default"), outer_dir.clone());
 

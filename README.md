@@ -259,13 +259,12 @@ user_agent              = "qBittorrent/5.0.3"  # of the same client
 allowed_tracker_domains = ["tracker.example.com"]  # required on vpn
 ```
 
-> **Config break.** A `vpn` profile without `allowed_tracker_domains`, two
+> **Account isolation.** A `vpn` profile without `allowed_tracker_domains`, two
 > profiles whose `allowed_tracker_domains` overlap unless both set
 > `allowed_tracker_urls`, a host profile listening on `0.0.0.0` or `[::]`
 > beside a `vpn` profile, and any `peer_fingerprint` starting `-LT` are
 > refused at load. See
-> [docs/running.md](docs/running.md#account-isolation) for what each means
-> and what to write instead.
+> [docs/running.md](docs/running.md#account-isolation) for what each means.
 
 A `vpn` profile pins every socket to its tunnel address and disables DHT, PEX
 and LSD unconditionally — there is no key that turns them back on. Its

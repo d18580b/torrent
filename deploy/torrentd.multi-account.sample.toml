@@ -136,10 +136,7 @@ network_kill_switch = false
 #     they are `<resume_dir>/<id>` and `<torrent_dir>/<id>`; an override must
 #     not equal another profile's. One that *contains* another's is fine: each
 #     store lists a single directory and keeps only the `.resume` / `.torrent`
-#     files in it, never descending into a profile subdirectory — which is what
-#     leaves the upgrade from a pre-profiles deployment writable, where one
-#     profile is pointed at the old roots and the rest derive `<root>/<id>`
-#     inside them.
+#     files in it, never descending into a profile subdirectory.
 
 # The untunnelled profile: public trackers and DHT content. Peers and trackers
 # see this machine's address, so nothing that must not be traced here belongs

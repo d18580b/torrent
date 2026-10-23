@@ -16,10 +16,8 @@ The small state files are described in full in
 | Path | What it holds | Lost without it | Rebuilt by |
 | --- | --- | --- | --- |
 | `registry.db`, plus `registry.db-wal` and `registry.db-shm` while the daemon runs (`registry_path`) | Which profile owns each info-hash. This is the authority: the pool index's owner column defers to it. | Ownership of every torrent. | The next boot. Its resume and torrent-dir scans re-assign every info-hash they load to the profile whose directory holds it. Claims whose files are gone are not rebuilt, and do not need to be. |
-| `profile_assignments.json.imported` (also `.imported.N`, or `slot_assignments.json.imported`) | The legacy JSON registry, already imported into `registry.db` and renamed so it is not read again. | Nothing the daemon reads. It is the rollback copy for a build that predates `registry.db`. | Nothing. |
 | `pool.db`, plus `pool.db-wal` and `pool.db-shm` (`[pool] db_path`) | The library index (roots, files, torrents, matches, claims) and the mutation journal (`plan` and `plan_step`). | The index, each torrent's adoption state and owner, and every plan with its steps. | A rescan (`POST /v1/pool/scan`) rebuilds the file index and the matches. It does **not** rebuild the plan journal, `adopted` verdicts, owners, or drift markers. |
 | `pool.db.lock` (beside `pool.db`) | Nothing. Every process that writes the index holds an advisory lock on it: shared for the daemon and `pool check`, exclusive for a CLI `pool scan`, which is how that scan refuses to run beside the daemon. It is made readable by every user, so a `pool scan` run as root leaves one the daemon's user can still lock; one a process cannot read at all is skipped with a warning, and the index opens without the lock. | Nothing. The lock is the kernel's and goes with the process. | Every open of the index for writing. |
-| `pool.db.pre-v3.bak` | The index as it stood before this build's one-way schema migration. | Nothing the daemon reads. It is the only way back to a pre-v3 build. | Nothing. |
 | `resume/<profile>/<infohash>.resume` (`resume_dir`, or a profile's own `resume_dir`) | libtorrent resume data: save path, piece state, and settings. | Piece state and settings. A torrent whose `.torrent` survives is re-added at the save path recorded beside it and hashed there, or, with no such record, at `default_save_path`, which is logged and counted in `torrentd_boot_save_path_fallbacks_total`. | Nothing. Pool torrents can be re-adopted after a rescan. |
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
 | `library/` (`[pool] library_dir`; the sample config puts it here, though it can sit anywhere outside a managed root) | The `.torrent` files the pool index is built from: each scan indexes every torrent in it and matches it against the roots. | The pool's metainfo, including the only remaining copy of a pool torrent whose `torrents/<profile>/` file is gone. A scan of a missing `library_dir` logs `torrent library directory does not exist` and changes nothing; a scan of an empty one drops from the index every torrent no session is serving. | Nothing. Whatever filled it: you, or the client whose state directory it was copied from. |
@@ -129,9 +127,7 @@ tombstone, because the report may be only late and a resume save can still
 land before it; the late report, or the next boot, settles it. It logs how many
 it settled and counts them in `torrentd_removals_reconciled_total`, which also
 counts a report that was only late, and that report is then counted again in
-`torrentd_torrents_removed_total`. Before this fix, a dropped report left the
-torrent tracked until a restart, and every `delete_files` and pool delete plan
-on the host was refused for a torrent that could not be read from its session.
+`torrentd_torrents_removed_total`.
 
 What stays behind:
 
@@ -143,8 +139,7 @@ What stays behind:
   orphaned like any other unclaimed file. The exception is a torrent the
   delete leaves `drifted`: a rescan never drops a `drifted` torrent, so its
   files stay claimed and are never offered as orphaned. A rescan also demotes an `adopted`
-  torrent that no session holds and no profile owns, which clears one a
-  delete before this fix left behind.
+  torrent that no session holds and no profile owns.
 - **The payload,** which you remove by archiving it (next section), or by hand
   where it lies outside every managed root.
 
@@ -375,12 +370,6 @@ off. To remove it now: `sudo nft delete table inet torrentd_ks_$(id -u torrentd)
 
 ### Housekeeping
 
-- **`pool.db.pre-v3.bak`.** Nothing deletes or ages it out. It is a full copy
-  of the index from before the schema migration, as large as `pool.db` was.
-  Remove it once you will not go back to a pre-v3 build:
-  `sudo rm /var/lib/torrentd/pool.db.pre-v3.bak`.
-- **`*.imported`.** The same applies to the legacy JSON registry once you will
-  not go back to a build that read it.
 - **Trash.** Watch the disk use of every `<root>/.torrentd-trash/`. It only
   grows. `du -sh /data/torrents/.torrentd-trash/*` shows it per plan.
 - **The stores.** `registry.db` grows with the number of torrents, and
@@ -481,7 +470,7 @@ A crash here is any exit that skipped the stop sequence: `kill -9`, an OOM
 kill, a panic abort, or a power cut. `Restart=on-failure` starts the daemon
 again after 5 s. Work through these in order once it is up.
 
-**Network state (#105).** Nothing ran the teardown, so the kill-switch table,
+**Network state.** Nothing ran the teardown, so the kill-switch table,
 the tunnels and their `ip rule` entries are still in place. The boot cleans up
 what it has a record of:
 
@@ -517,7 +506,7 @@ what it has a record of:
   its records. Anything else stays up. Remove it as
   [Retiring a profile](#retiring-a-profile) describes.
 
-**Adoptions (#109, #139, #187).** An adoption writes its registry claim
+**Adoptions.** An adoption writes its registry claim
 before the add. The verify queue is kept in `pool.db`, and the boot queues
 again every adoption that was still waiting in it, in its old order, once the
 scans have run: the boot logs `queued the adoptions left waiting for
@@ -611,7 +600,7 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
 - With `[pool] allow_mutations` off, nothing is re-driven. The plan stays
   `applying` until a boot that allows mutations.
 
-**Resume data (#109, #110).** A torrent's first resume file is saved as soon
+**Resume data.** A torrent's first resume file is saved as soon
 as the session adds it, unless the profile already holds one for it, as it
 does for every torrent the boot loads from its resume file. It is saved
 again at once when a recheck finishes (`POST /v1/torrents/{ih}/recheck`, the
@@ -641,7 +630,7 @@ resume file at all:
   payload is elsewhere, the torrent finds nothing there and never seeds.
   `DELETE` it without `delete_files`, then add or adopt it again. The add may
   follow the `204` at once: the session settles the removal afterwards, and
-  keeps the `.torrent` and save path the new add wrote (#185). An adopted
+  keeps the `.torrent` and save path the new add wrote. An adopted
   torrent whose `.torrent` write failed too has neither file in the stores,
   so it is one of the unloaded claims above.
 

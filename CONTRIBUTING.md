@@ -70,7 +70,7 @@ Everyday tasks:
 | `mise run lint-fix`| Clippy autofix                                           |
 | `mise run test`    | Workspace unit tests (see Test, below)                   |
 | `mise run check`   | fmt + lint                                               |
-| `mise run test-all`| every test layer, including the ignored ones             |
+| `mise run test-all`| every automated test layer, including the ignored ones (not `deny` or `bench`) |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
 | `mise run native-clean` | Delete every cached native prefix                   |
 | `mise run vpn-check <config> [-- <flags>]` | Verify a real VPN configuration (see below) |
@@ -189,11 +189,14 @@ Every test command is a mise task, and CI runs the same tasks:
 | `mise run test-shim` | Layer 2, the C ABI boundary. Needs the `vendor/libtorrent` submodule for its `.torrent` fixtures. |
 | `mise run test-lifecycle` | Layer 3, real libtorrent against real disk. No network. |
 | `mise run test-daemon` | Layer 3, spawns the built binary and drives it over HTTP |
-| `mise run test-all` | all of the above |
+| `mise run test-torrentctl` | Layer 3, torrentctl's generated client against a spawned daemon (builds `torrentd` first) |
+| `mise run test-alerts` | `promtool` checks `deploy/prometheus`'s alert rules and runs their fixtures. Needs podman or docker. |
+| `mise run test-all` | every row above except `deny`, in order |
 | `mise run bench -- <subcommand>` | Layer 4, manual: minutes and GBs of RAM |
 
-Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast,
-and each runs as its own CI job.
+Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
+Layer 2 runs as its own CI job; the three Layer 3 suites share one, and
+`test-alerts` has its own.
 
 `mise run vpn-check <config>` verifies a real VPN configuration against the
 real host. It checks every profile unless `--profile <id>` names one; a

@@ -355,23 +355,26 @@ mod tests {
         assert_eq!(b["profiles_failed"], 0);
     }
 
-    /// `docs/running.md`'s migration note tells an operator what to rewrite a
-    /// `/healthz` check to. It once named `all_profiles_fenced` as a key, which
-    /// this report has never had, so a check written from it never fired.
-    /// Every new name it gives must be a key of the serialised report or a
-    /// `reason` value, and it must name every profile count the report has.
+    /// `docs/running.md` §9 tells an operator what a `/healthz` answer holds,
+    /// and an alert or probe is written from it. A doc that names a key this
+    /// report does not have, as one once named `all_profiles_fenced`, gives a
+    /// check that never fires. Every name it gives must be a key of the
+    /// serialised report or a `reason` value, and it must name every profile
+    /// count and every reason the report has.
     #[test]
-    fn the_running_docs_healthz_migration_note_names_real_report_keys() {
+    fn the_running_docs_healthz_section_names_real_report_keys() {
         let doc = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/running.md"
         ))
         .unwrap();
         let start = doc
-            .find("`/healthz`'s path is unchanged")
-            .expect("running.md no longer has the /healthz migration note");
+            .find("`profiles` is the number of **live** sessions")
+            .expect("running.md no longer describes the /healthz report");
         let note = &doc[start..];
-        let note = &note[..note.find("\n\n").unwrap_or(note.len())];
+        let note = &note[..note
+            .find("Confirm settings actually applied")
+            .expect("running.md's /healthz section no longer ends where it did")];
 
         let report = serde_json::to_value(HealthReport {
             ok: true,
@@ -407,10 +410,6 @@ mod tests {
             |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_');
         let spans: Vec<&str> = note.split('`').skip(1).step_by(2).collect();
         for span in &spans {
-            // The old names are the ones being retired.
-            if span.contains("slot") {
-                continue;
-            }
             // `.reason == "x"` or `"x"`: the quoted value must be a reason.
             for quoted in span.split('"').skip(1).step_by(2) {
                 assert!(
@@ -431,8 +430,9 @@ mod tests {
             }
             if is_ident(span) {
                 assert!(
-                    keys.contains(span),
-                    "the note names `{span}` as a key, and the report has none: {keys:?}"
+                    keys.contains(span) || reasons.iter().any(|r| r == span),
+                    "the note names `{span}`, which is neither a key nor a `reason` value: \
+                     {keys:?} {reasons:?}"
                 );
             }
         }
@@ -440,6 +440,12 @@ mod tests {
             assert!(
                 spans.contains(key),
                 "the note does not name the report's `{key}`: {note}"
+            );
+        }
+        for reason in &reasons {
+            assert!(
+                spans.contains(&reason.as_str()),
+                "the note does not name the `reason` value `{reason}`: {note}"
             );
         }
     }
