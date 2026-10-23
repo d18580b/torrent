@@ -859,17 +859,12 @@ fn assert_fencing_held_through_the_drain(log: &std::path::Path) {
     let drained = at("the alert loop's exit", &|l| {
         l.contains("alert loop exited")
     });
-    let monitor = at("the VPN monitor's stop", &|l| {
-        l.contains("vpn monitor shutting down")
-    });
-    let watch = at("the kill-switch watch's stop", &|l| {
-        l.contains("kill switch watch stopping")
-    });
     let closed = at("the sessions closing", &|l| l.contains("sessions closed"));
-    for (task, stopped) in [
-        ("the VPN monitor", monitor),
-        ("the kill-switch watch", watch),
+    for (task, line) in [
+        ("the VPN monitor", "vpn monitor shutting down"),
+        ("the kill-switch watch", "kill switch watch stopping"),
     ] {
+        let stopped = at(&format!("{task}'s stop"), &|l| l.contains(line));
         assert!(
             drained < stopped && stopped < closed,
             "{task} stopped at line {stopped}, not between the drain's end (line {drained}) \
