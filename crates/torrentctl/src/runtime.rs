@@ -26,8 +26,12 @@ const TICK: Duration = Duration::from_millis(250);
 /// (the alternate screen left, the cursor shown) rather than leaving it raw.
 pub const PANIC_AFTER_DRAW: &str = "TORRENTCTL_TEST_PANIC";
 
-/// Run until the user quits.
-pub async fn run(mut model: Model, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+/// Run until the user quits, returning what to tell them once the terminal
+/// is theirs again ([`Model::exit_notice`]).
+pub async fn run(
+    mut model: Model,
+    terminal: &mut DefaultTerminal,
+) -> std::io::Result<Option<String>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     // The event stream follows whichever credential is in use: a sign-in or
     // a sign-out changes it.
@@ -65,7 +69,7 @@ pub async fn run(mut model: Model, terminal: &mut DefaultTerminal) -> std::io::R
         });
         spawn(&tx, effects);
     }
-    Ok(())
+    Ok(model.exit_notice)
 }
 
 /// Run each effect on its own task, sending its message to `tx`.

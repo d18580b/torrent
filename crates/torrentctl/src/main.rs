@@ -65,7 +65,11 @@ fn main() -> color_eyre::Result<()> {
     let mut terminal = ratatui::init();
     let result = runtime.block_on(runtime::run(model, &mut terminal));
     ratatui::restore();
-    result.wrap_err("the terminal failed")
+    // Printed only now: on the alternate screen it would vanish with it.
+    if let Ok(Some(notice)) = &result {
+        eprintln!("{notice}");
+    }
+    result.map(drop).wrap_err("the terminal failed")
 }
 
 /// Log to a file in the XDG state directory, never to the terminal the UI

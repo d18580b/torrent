@@ -192,6 +192,9 @@ pub struct Model {
     pub palette: Option<tui_input::Input>,
     pub tick: u64,
     pub quit: bool,
+    /// What to print once the terminal is restored: a revocation on the way
+    /// out that failed.
+    pub exit_notice: Option<String>,
     pub login: screens::login::State,
     pub dashboard: screens::dashboard::State,
     pub torrents: screens::torrents::State,
@@ -227,8 +230,10 @@ pub enum Msg {
     ShowTorrentsOf(String),
     Toast(Toast),
     Quit,
-    /// Quit now: the session token is revoked (or needed no revoking).
-    Exit,
+    /// Quit now: the session token is revoked, needed no revoking, or could
+    /// not be revoked — then this says so, to print once the terminal is
+    /// back.
+    Exit(Option<String>),
     Login(screens::login::Msg),
     Dashboard(screens::dashboard::Msg),
     Torrents(screens::torrents::Msg),
@@ -258,6 +263,7 @@ impl Model {
             palette: None,
             tick: 0,
             quit: false,
+            exit_notice: None,
             login: Default::default(),
             dashboard: Default::default(),
             torrents: Default::default(),
@@ -406,7 +412,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             // replaced, not orphaned for the rest of its lifetime.
             let mut effects = Vec::new();
             if model.minted {
-                effects.push(revoke(&model.api, None));
+                effects.push(revoke(&model.api, false));
             }
             model.api = api;
             model.minted = true;
@@ -457,7 +463,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             // whatever state the session is, since a token minted a moment
             // ago and still being described is just as live.
             if model.minted {
-                vec![revoke(&model.api, Some(Msg::Exit))]
+                vec![revoke(&model.api, true)]
             } else if model.login.busy {
                 // A sign-in is in flight: its token is revoked when it lands
                 // (see `Msg::Login`), not left live on the daemon.
@@ -469,7 +475,8 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 Vec::new()
             }
         }
-        Msg::Exit => {
+        Msg::Exit(notice) => {
+            model.exit_notice = notice;
             model.quit = true;
             Vec::new()
         }
@@ -481,7 +488,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 .ok()
                 .and_then(|token| model.api.with_token(&token).ok())
             {
-                Some(api) => vec![revoke(&api, Some(Msg::Exit))],
+                Some(api) => vec![revoke(&api, true)],
                 None => {
                     model.quit = true;
                     Vec::new()
@@ -738,13 +745,39 @@ fn sign_out(model: &mut Model, failure: &Failure) {
     });
 }
 
-/// Revoke the session token `api` holds, then deliver `then` (or a no-op
-/// tick).
-fn revoke(api: &Api, then: Option<Msg>) -> Effect {
+/// How long revoking a session token may take: quitting waits for it, and a
+/// daemon that does not answer must not hold the terminal for the full
+/// request timeout.
+pub const REVOKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Revoke the session token `api` holds. Quitting, deliver [`Msg::Exit`]
+/// with what to tell the user if the revocation failed; otherwise a no-op
+/// tick.
+fn revoke(api: &Api, quitting: bool) -> Effect {
     let api = api.clone();
     Effect::new(async move {
-        let _ = crate::api::call(api.client.delete_current_session()).await;
-        then.unwrap_or(Msg::Tick)
+        let failure = match tokio::time::timeout(
+            REVOKE_TIMEOUT,
+            crate::api::call(api.client.delete_current_session()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(failure)) => Some(failure),
+            Err(_) => Some(Failure::local(
+                "The daemon did not answer",
+                Some(format!("no response within {}s", REVOKE_TIMEOUT.as_secs())),
+            )),
+        };
+        if !quitting {
+            return Msg::Tick;
+        }
+        Msg::Exit(failure.map(|failure| {
+            format!(
+                "torrentctl: the session token could not be revoked ({failure}); it stays \
+                 valid on the daemon until it expires"
+            )
+        }))
     })
 }
 
@@ -885,9 +918,60 @@ mod tests {
             }],
             "one revocation, of the minted token"
         );
-        assert!(matches!(msgs[..], [Msg::Exit]), "{msgs:?}");
-        update(&mut m, Msg::Exit);
+        assert!(matches!(msgs[..], [Msg::Exit(None)]), "{msgs:?}");
+        update(&mut m, Msg::Exit(None));
         assert!(m.quit);
+        assert_eq!(m.exit_notice, None, "revoked: nothing to report");
+    }
+
+    /// A daemon that accepts the connection and never answers: the
+    /// revocation gives up after [`REVOKE_TIMEOUT`], not the 15s request
+    /// timeout, and the user is told the token is still live.
+    #[test]
+    fn a_revocation_on_quit_is_bounded_and_reported_when_it_fails() {
+        let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", wedged.local_addr().expect("an address"));
+        let mut m = model();
+        update(
+            &mut m,
+            Msg::SignedIn(
+                Api::new(&url, None)
+                    .and_then(|api| api.with_token("tds_minted"))
+                    .expect("a valid URL"),
+            ),
+        );
+        let effects = update(&mut m, Msg::Quit);
+        let started = Instant::now();
+        let msgs = testing::run(effects);
+        let waited = started.elapsed();
+        assert!(
+            waited >= REVOKE_TIMEOUT && waited < REVOKE_TIMEOUT + Duration::from_secs(2),
+            "gave up after {waited:?}"
+        );
+        let [Msg::Exit(Some(notice))] = &msgs[..] else {
+            panic!("leaves, saying why: {msgs:?}");
+        };
+        assert!(
+            notice.contains("could not be revoked") && notice.contains("did not answer"),
+            "{notice}"
+        );
+        let notice = notice.clone();
+        update(&mut m, msgs.into_iter().next().expect("one message"));
+        assert!(m.quit);
+        assert_eq!(m.exit_notice, Some(notice), "kept for main to print");
+
+        // A refusal is reported the same way, with what the daemon said.
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = model();
+        update(
+            &mut m,
+            Msg::SignedIn(daemon.api().with_token("tds_minted").expect("a valid URL")),
+        );
+        let msgs = testing::run(update(&mut m, Msg::Quit));
+        assert!(
+            matches!(&msgs[..], [Msg::Exit(Some(n))] if n.contains("HTTP 500")),
+            "{msgs:?}"
+        );
     }
 
     #[test]
@@ -1214,7 +1298,10 @@ mod tests {
             }],
             "revokes what it minted"
         );
-        assert!(matches!(msgs[..], [Msg::Exit]), "then leaves: {msgs:?}");
+        assert!(
+            matches!(msgs[..], [Msg::Exit(None)]),
+            "then leaves: {msgs:?}"
+        );
 
         // A second quit leaves at once.
         let mut m = model();
