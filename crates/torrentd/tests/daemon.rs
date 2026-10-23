@@ -6,7 +6,11 @@
 //! state. Marked `#[ignore]` (binds ports, starts libtorrent) so it stays
 //! out of the default `cargo test`; run with:
 //!
-//!   cargo test -p torrentd --test daemon -- --ignored
+//!   cargo test -p torrentd --test daemon -- --ignored --test-threads=1
+//!
+//! One test at a time (`mise run test-daemon` passes the flag): every daemon
+//! a test spawns runs as this user, and a daemon holds its uid's kill-switch
+//! table lock for its life, so a second one running beside it exits 78.
 
 use std::io::Read;
 use std::io::Write;
@@ -564,6 +568,55 @@ fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() 
     assert_eq!(http(addr, "GET", "/healthz", None).0, 200);
     sigterm(&first);
     assert_exits_zero(&mut first, Duration::from_secs(30));
+}
+
+/// A second start under the same uid on a *different* state directory, which
+/// the single-instance lock cannot see, is refused by the kill-switch table
+/// lock: the `inet torrentd_ks_<uid>` table is per uid, and every boot
+/// replaces it (switch on) or removes it as stale (switch off). The refusal
+/// exits 78, which the unit does not restart, and names the running daemon's
+/// pid. Without the lock the second came up healthy beside the first, and a
+/// boot of it would have removed or replaced the first one's kill switch.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_second_daemon_of_the_same_uid_on_another_state_dir_exits_ex_config() {
+    let addr = free_http();
+    let addr = addr.as_str();
+    let second_addr = free_http();
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let mut first = spawn_daemon(first_dir.path(), free_port(), addr);
+    wait_healthy(addr);
+
+    let cfg = write_config(second_dir.path(), free_port(), &second_addr);
+    let (code, out) = run_to_exit(&cfg, false, None);
+    assert_eq!(code, 78, "a same-uid second daemon exits EX_CONFIG: {out}");
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(second_dir.path()).unwrap());
+    assert!(
+        out.contains(&format!("@torrentd_ks_{uid}"))
+            && out.contains(&format!("pid {}", first.id())),
+        "the refusal names the socket and the running daemon's pid: {out}"
+    );
+    assert!(
+        TcpStream::connect(&second_addr).is_err(),
+        "the second daemon got as far as binding its HTTP port"
+    );
+
+    // The first is untouched and still serving.
+    assert_eq!(http(addr, "GET", "/healthz", None).0, 200);
+    sigterm(&first);
+    assert_exits_zero(&mut first, Duration::from_secs(30));
+
+    // With the first gone the name is free, and the same config boots.
+    let second_http = second_addr.as_str();
+    let mut second = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn second daemon");
+    wait_healthy(second_http);
+    sigterm(&second);
+    assert_exits_zero(&mut second, Duration::from_secs(30));
 }
 
 /// Graceful shutdown must stay graceful under load: with many torrents added,

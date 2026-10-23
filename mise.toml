@@ -155,9 +155,12 @@ run = "cargo test -p libtorrent-sys --features shim-tests"
 description = "Layer 3: real libtorrent sessions against real disk (no network)"
 run = "cargo test -p torrentd-engine --test lifecycle -- --ignored"
 
+# One test at a time, here and in test-torrentctl: every daemon they spawn
+# runs as this user, and a daemon holds its uid's kill-switch table lock
+# (`@torrentd_ks_<uid>`) for its life, so a second one beside it exits 78.
 [tasks.test-daemon]
 description = "Layer 3: spawns the built binary and drives it over HTTP"
-run = "cargo test -p torrentd --test daemon -- --ignored"
+run = "cargo test -p torrentd --test daemon -- --ignored --test-threads=1"
 
 # The spargen-generated client torrentctl is built on, against a real daemon:
 # the other half of the contract, a second tool's reading of the document held
@@ -166,7 +169,7 @@ run = "cargo test -p torrentd --test daemon -- --ignored"
 description = "Layer 3: torrentctl's generated client against a spawned daemon"
 run = [
   "cargo build -p torrentd",
-  "cargo test -p torrentctl --test e2e -- --ignored",
+  "cargo test -p torrentctl --test e2e -- --ignored --test-threads=1",
 ]
 
 # Every test that needs a real kernel network stack: the kill switch's real
