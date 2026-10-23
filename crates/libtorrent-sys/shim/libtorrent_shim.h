@@ -144,7 +144,10 @@ typedef enum {
     LT_ALERT_SESSION_STATS,
     LT_ALERT_ALERTS_DROPPED,
     LT_ALERT_TRACKER_ERROR,
-    LT_ALERT_PEER_DISCONNECTED,
+    /* Was LT_ALERT_PEER_DISCONNECTED, which could never fire: the session's
+     * alert mask has no `connect` category. Reserved so every later
+     * discriminant keeps its value; never emitted. */
+    LT_ALERT_RESERVED_16,
     LT_ALERT_TORRENT_LOG,
     LT_ALERT_LOG,
     LT_ALERT_TORRENT_CHECKED,
@@ -295,7 +298,8 @@ int         lt_torrent_unset_flags(lt_session* s, lt_handle h, uint32_t flags);
 /* Move a torrent's payload to `new_path`, letting libtorrent perform the move
  * so its own storage state stays consistent. Completion arrives as
  * LT_ALERT_STORAGE_MOVED (or LT_ALERT_STORAGE_MOVED_FAILED).
- * `flags` is one of the LT_MOVE_* constants above. */
+ * `flags` is one of the LT_MOVE_* constants above; any other value returns
+ * LT_ERR and moves nothing. */
 int         lt_torrent_move_storage(lt_session* s, lt_handle h,
                                     const char* new_path, uint32_t flags);
 

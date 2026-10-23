@@ -168,12 +168,6 @@ struct lt_alert_warning {
     char    message[LT_MSG_MAX];
 };
 
-struct lt_alert_peer_disconnected {
-    char    peer_address[LT_ADDR_MAX];
-    int32_t error_code;
-    char    message[LT_MSG_MAX];
-};
-
 struct lt_alert_log {
     char    message[LT_MSG_MAX];
 };
@@ -230,7 +224,6 @@ union lt_alert_payload_u {
     struct lt_alert_session_stats     session_stats;
     struct lt_alert_alerts_dropped    alerts_dropped;
     struct lt_alert_tracker_error     tracker_error;
-    struct lt_alert_peer_disconnected peer_disconnected;
     struct lt_alert_log               log_msg;
     struct lt_alert_torrent_checked   torrent_checked;
     struct lt_alert_storage_moved     storage_moved;

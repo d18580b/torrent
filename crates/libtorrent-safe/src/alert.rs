@@ -33,7 +33,6 @@ pub enum AlertKind {
     SessionStats,
     AlertsDropped,
     TrackerError,
-    PeerDisconnected,
     TorrentLog,
     Log,
     TorrentChecked,
@@ -69,7 +68,6 @@ impl AlertKind {
             AlertKind::SessionStats => "session_stats",
             AlertKind::AlertsDropped => "alerts_dropped",
             AlertKind::TrackerError => "tracker_error",
-            AlertKind::PeerDisconnected => "peer_disconnected",
             AlertKind::TorrentLog => "torrent_log",
             AlertKind::Log => "log",
             AlertKind::TrackerWarning => "tracker_warning",
@@ -277,12 +275,6 @@ pub enum Alert {
         tracker_url: String,
         message: String,
     },
-    PeerDisconnected {
-        hdr: AlertHeader,
-        peer_address: String,
-        error_code: i32,
-        message: String,
-    },
     TorrentLog {
         hdr: AlertHeader,
         message: String,
@@ -332,7 +324,6 @@ impl Alert {
             | Alert::SessionStats { hdr, .. }
             | Alert::AlertsDropped { hdr, .. }
             | Alert::TrackerError { hdr, .. }
-            | Alert::PeerDisconnected { hdr, .. }
             | Alert::TorrentLog { hdr, .. }
             | Alert::Log { hdr, .. }
             | Alert::Warning { hdr, .. }
@@ -376,7 +367,6 @@ impl Alert {
             ffi::lt_alert_kind_LT_ALERT_SESSION_STATS => AlertKind::SessionStats,
             ffi::lt_alert_kind_LT_ALERT_ALERTS_DROPPED => AlertKind::AlertsDropped,
             ffi::lt_alert_kind_LT_ALERT_TRACKER_ERROR => AlertKind::TrackerError,
-            ffi::lt_alert_kind_LT_ALERT_PEER_DISCONNECTED => AlertKind::PeerDisconnected,
             ffi::lt_alert_kind_LT_ALERT_TORRENT_LOG => AlertKind::TorrentLog,
             ffi::lt_alert_kind_LT_ALERT_LOG => AlertKind::Log,
             ffi::lt_alert_kind_LT_ALERT_TORRENT_CHECKED => AlertKind::TorrentChecked,
@@ -558,15 +548,6 @@ impl Alert {
                     message: c_str_to_owned(&p.message),
                 }
             }
-            AlertKind::PeerDisconnected => {
-                let p = unsafe { &raw.payload.peer_disconnected };
-                Alert::PeerDisconnected {
-                    hdr,
-                    peer_address: c_str_to_owned(&p.peer_address),
-                    error_code: p.error_code,
-                    message: c_str_to_owned(&p.message),
-                }
-            }
             AlertKind::TrackerWarning
             | AlertKind::ScrapeFailed
             | AlertKind::PortmapError
@@ -642,5 +623,20 @@ mod tests {
         }
         assert_eq!(ErrorCategory::from_raw(-1), ErrorCategory::Other);
         assert_eq!(ErrorCategory::from_raw(i32::MAX), ErrorCategory::Other);
+    }
+
+    /// Discriminant 16 was the peer-disconnect alert, which the session's
+    /// alert mask (no `connect` category) never let fire. Its slot stays
+    /// reserved: a union carrying it is no known alert, and every kind after
+    /// it keeps the value it had.
+    #[test]
+    fn the_retired_peer_disconnect_slot_is_reserved() {
+        let mut raw: ffi::lt_alert_union = unsafe { std::mem::zeroed() };
+        raw.kind = 16;
+        assert!(unsafe { Alert::from_raw_owned(&mut raw) }.is_none());
+
+        assert_eq!(ffi::lt_alert_kind_LT_ALERT_TRACKER_ERROR, 15);
+        assert_eq!(ffi::lt_alert_kind_LT_ALERT_TORRENT_LOG, 17);
+        assert_eq!(ffi::lt_alert_kind_LT_ALERT_TRACKER_REPLY, 28);
     }
 }
