@@ -585,7 +585,9 @@ fn a_second_daemon_of_the_same_uid_on_another_state_dir_exits_ex_config() {
     let second_addr = free_http();
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
-    let mut first = spawn_daemon(first_dir.path(), free_port(), addr);
+    // Killed on a panic: left running, it would hold the lock against every
+    // test after this one.
+    let first = Running(spawn_daemon(first_dir.path(), free_port(), addr));
     wait_healthy(addr);
 
     let cfg = write_config(second_dir.path(), free_port(), &second_addr);
@@ -594,7 +596,7 @@ fn a_second_daemon_of_the_same_uid_on_another_state_dir_exits_ex_config() {
     let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(second_dir.path()).unwrap());
     assert!(
         out.contains(&format!("@torrentd_ks_{uid}"))
-            && out.contains(&format!("pid {}", first.id())),
+            && out.contains(&format!("pid {}", first.0.id())),
         "the refusal names the socket and the running daemon's pid: {out}"
     );
     assert!(
@@ -604,19 +606,18 @@ fn a_second_daemon_of_the_same_uid_on_another_state_dir_exits_ex_config() {
 
     // The first is untouched and still serving.
     assert_eq!(http(addr, "GET", "/healthz", None).0, 200);
-    sigterm(&first);
-    assert_exits_zero(&mut first, Duration::from_secs(30));
+    first.stop();
 
     // With the first gone the name is free, and the same config boots.
-    let second_http = second_addr.as_str();
-    let mut second = Command::new(env!("CARGO_BIN_EXE_torrentd"))
-        .arg("--config")
-        .arg(&cfg)
-        .spawn()
-        .expect("spawn second daemon");
-    wait_healthy(second_http);
-    sigterm(&second);
-    assert_exits_zero(&mut second, Duration::from_secs(30));
+    let second = Running(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .expect("spawn second daemon"),
+    );
+    wait_healthy(&second_addr);
+    second.stop();
 }
 
 /// Graceful shutdown must stay graceful under load: with many torrents added,
