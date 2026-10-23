@@ -20,13 +20,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::sync::broadcast;
 use torrentd_engine::port_forward::Pacer;
 use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
-use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -1565,19 +1563,68 @@ pub(crate) fn resume_unless_fenced(
     Ok(SingleResume::Fenced)
 }
 
+/// Stops the tasks that fence vpn profiles — [`run`] and
+/// `vpn::killswitch::watch` — at the point the shutdown chooses, which is
+/// just before it closes the sessions and takes the network down.
+///
+/// Not the shutdown broadcast: that fires as the stop begins, and the
+/// sessions keep seeding through the HTTP drain, the pool-work wait and the
+/// resume drain after it (up to `shutdown_drain_secs`). A tunnel lost or a
+/// ruleset flushed in that window has to be fenced as at any other time.
+///
+/// Dropping it stops them too, so a boot that fails, or a handle that is
+/// never run, leaves nothing fencing sessions that are being closed.
+#[derive(Debug)]
+pub(crate) struct FencingStop(tokio::sync::watch::Sender<bool>);
+
+impl FencingStop {
+    pub(crate) fn new() -> Self {
+        Self(tokio::sync::watch::Sender::new(false))
+    }
+
+    /// The receiving end one fencing task holds for as long as it runs.
+    pub(crate) fn subscribe(&self) -> FencingStopped {
+        FencingStopped(self.0.subscribe())
+    }
+
+    /// Tell every subscriber to stop, then wait up to `bound` for each to
+    /// have returned (dropped its [`FencingStopped`]). Returns whether they
+    /// all did: a poll or check already running on the blocking pool
+    /// finishes first, and one that outlasts `bound` is still running.
+    pub(crate) async fn stop(self, bound: Duration) -> bool {
+        self.0.send_replace(true);
+        tokio::time::timeout(bound, self.0.closed()).await.is_ok()
+    }
+}
+
+/// A fencing task's half of [`FencingStop`].
+#[derive(Debug)]
+pub(crate) struct FencingStopped(tokio::sync::watch::Receiver<bool>);
+
+impl FencingStopped {
+    /// Resolves once the stop is asked for, or its [`FencingStop`] is
+    /// dropped. Cancel safe: the stop is a level, read afresh each call.
+    pub(crate) async fn stopped(&mut self) {
+        // `Err` is the sender gone, which is a stop as well.
+        let _ = self.0.wait_for(|stop| *stop).await;
+    }
+}
+
+/// Watch every vpn profile's tunnel and fence the profile whose tunnel is
+/// lost, until `stop` says the shutdown is about to take the network down.
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
     handshake_max_age: Duration,
-    shutdown: broadcast::Receiver<ShutdownReason>,
+    stop: FencingStopped,
 ) {
     run_with(
         profiles,
         state,
         metrics,
         handshake_max_age,
-        shutdown,
+        stop,
         host_prober(),
         Arc::new(vpn::wireguard_transfer),
     )
@@ -1592,7 +1639,7 @@ async fn run_with(
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
     handshake_max_age: Duration,
-    mut shutdown: broadcast::Receiver<ShutdownReason>,
+    mut stop: FencingStopped,
     probe: Prober,
     counters: CounterProber,
 ) {
@@ -1606,7 +1653,7 @@ async fn run_with(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
-            _ = shutdown.recv() => {
+            () = stop.stopped() => {
                 info!(target: "torrentd::vpn_monitor", "vpn monitor shutting down");
                 return;
             }
@@ -2554,18 +2601,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (tx, rx) = broadcast::channel(1);
+        let stop = FencingStop::new();
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(state),
             metrics.clone(),
             max_age,
-            rx,
+            stop.subscribe(),
             probe,
             counters,
         ));
         tokio::time::sleep(POLL_INTERVAL * polls + Duration::from_secs(1)).await;
-        tx.send(ShutdownReason::Test).unwrap();
+        assert!(stop.stop(Duration::from_secs(5)).await);
         task.await.unwrap();
         let health = profiles.iter().next().unwrap().health();
         let exported = String::from_utf8(metrics.render()).expect("utf-8");
@@ -2578,6 +2625,101 @@ mod tests {
                 && l.contains(&format!("reason=\"{reason}\""))
                 && l.ends_with(" 1")
         })
+    }
+
+    /// The shutdown's drain — HTTP, pool work, resume data — runs with the
+    /// sessions still up, so a tunnel lost in it is fenced as at any other
+    /// time: the monitor stops only at [`FencingStop::stop`], which the
+    /// shutdown fires just before it closes the sessions, not at the
+    /// shutdown broadcast that starts the drain. After the stop it probes
+    /// nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_lost_during_drain_still_fences() {
+        use crate::profile_registry::test_entry;
+
+        let lost = Arc::new(atomic::AtomicBool::new(false));
+        let probes = Arc::new(atomic::AtomicU32::new(0));
+        let probe: Prober = {
+            let (lost, probes) = (lost.clone(), probes.clone());
+            Arc::new(move |_iface: &str, is_wg: bool| {
+                probes.fetch_add(1, atomic::Ordering::SeqCst);
+                TunnelProbes {
+                    ip: Ok(ip(2)),
+                    route: Some(Ok(if lost.load(atomic::Ordering::SeqCst) {
+                        RouteProbe::Elsewhere("leaves by eth0".into())
+                    } else {
+                        RouteProbe::ViaTunnel
+                    })),
+                    handshake: is_wg.then_some(Ok(Some(Duration::from_secs(5)))),
+                }
+            })
+        };
+        let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "acct_a",
+            ProfileStatus::Active,
+        )]));
+        let metrics = Arc::new(PromSink::new());
+        let stop = FencingStop::new();
+        let task = tokio::spawn(run_with(
+            profiles.clone(),
+            Arc::new(StateMap::new()),
+            metrics.clone(),
+            MAX,
+            stop.subscribe(),
+            probe,
+            no_counters(),
+        ));
+        let entry = profiles.iter().next().unwrap();
+        tokio::time::sleep(POLL_INTERVAL + Duration::from_secs(1)).await;
+        assert_eq!(entry.health().status, ProfileStatus::Active);
+
+        // The shutdown has begun and is draining: the tunnel goes.
+        lost.store(true, atomic::Ordering::SeqCst);
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert_eq!(
+            entry.health().status,
+            ProfileStatus::VpnDown,
+            "fenced during the drain: {exported}"
+        );
+        assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
+
+        // The teardown's stop: the monitor returns, and polls no more.
+        assert!(
+            stop.stop(Duration::from_secs(5)).await,
+            "the monitor returned"
+        );
+        assert!(task.is_finished());
+        let seen = probes.load(atomic::Ordering::SeqCst);
+        tokio::time::sleep(POLL_INTERVAL * 3).await;
+        assert_eq!(probes.load(atomic::Ordering::SeqCst), seen);
+    }
+
+    /// A dropped [`FencingStop`] stops its tasks as a fired one does: a boot
+    /// that fails leaves nothing fencing the sessions it closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_fencing_stop_stops_the_monitor() {
+        use crate::profile_registry::test_entry;
+
+        let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "acct_a",
+            ProfileStatus::Active,
+        )]));
+        let stop = FencingStop::new();
+        let task = tokio::spawn(run_with(
+            profiles,
+            Arc::new(StateMap::new()),
+            Arc::new(PromSink::new()),
+            MAX,
+            stop.subscribe(),
+            scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
+            no_counters(),
+        ));
+        drop(stop);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the monitor returns")
+            .unwrap();
     }
 
     /// The route probe as `run` calls it: its answer reaches the verdict,
@@ -2908,13 +3050,13 @@ mod tests {
             ProfileStatus::Active,
         )]));
         let metrics = Arc::new(PromSink::new());
-        let (tx, rx) = broadcast::channel(1);
+        let stop = FencingStop::new();
         let task = tokio::spawn(run_with(
             profiles.clone(),
             Arc::new(state),
             metrics.clone(),
             max_age,
-            rx,
+            stop.subscribe(),
             scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
             no_counters(),
         ));
@@ -2928,7 +3070,7 @@ mod tests {
         // fifth and sixth polls (0s, 30s unanswered) leave it up.
         entry.update_health(|h| h.status = ProfileStatus::Active);
         tokio::time::sleep(POLL_INTERVAL * 2).await;
-        tx.send(ShutdownReason::Test).unwrap();
+        assert!(stop.stop(Duration::from_secs(5)).await);
         task.await.unwrap();
         let exported = String::from_utf8(metrics.render()).expect("utf-8");
         assert_eq!(entry.health().status, ProfileStatus::Active, "{exported}");

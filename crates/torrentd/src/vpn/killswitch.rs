@@ -1128,12 +1128,16 @@ enum Watch {
 /// leaves the live table differing from the one now rendered, which the
 /// check reads as drift.
 ///
-/// Only spawned when the kill switch is active.
+/// Only spawned when the kill switch is active. Runs until `stop`, which
+/// the shutdown fires just before it closes the sessions and removes the
+/// table, so the check holds through the shutdown's drain, while the
+/// sessions still seed; past that point it would read the removal as a
+/// flush and install the table again.
 pub(crate) async fn watch(
     installed: Installed,
     fence: std::sync::Arc<dyn Fence>,
     metrics: std::sync::Arc<crate::metrics_sink::PromSink>,
-    mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
+    mut stop: crate::vpn_monitor::FencingStopped,
 ) {
     use torrentd_engine::MetricsSink;
     // Installed moments ago by `enable`, and verified by the boot.
@@ -1147,7 +1151,7 @@ pub(crate) async fn watch(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(WATCH_INTERVAL) => {}
-            _ = shutdown.recv() => return,
+            () = stop.stopped() => return,
         }
         // Blocking throughout: the checks and the reinstall shell out to nft,
         // and fencing pauses torrents under each session's lock.
@@ -2711,6 +2715,29 @@ table inet torrentd_ks_998 {
         fn take(&self) -> Vec<&'static str> {
             std::mem::take(&mut *self.0.lock().unwrap())
         }
+    }
+
+    /// The watch runs until its own stop, which the shutdown fires only once
+    /// its drain is over, and returns at it without a further check: it
+    /// does not end with the shutdown broadcast that starts the drain.
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_runs_until_its_stop_and_returns_at_it() {
+        let stop = crate::vpn_monitor::FencingStop::new();
+        let fence = std::sync::Arc::new(Recorded::default());
+        let task = tokio::spawn(watch(
+            installed(),
+            fence.clone(),
+            std::sync::Arc::new(crate::metrics_sink::PromSink::new()),
+            stop.subscribe(),
+        ));
+        tokio::time::sleep(WATCH_INTERVAL / 2).await;
+        assert!(!task.is_finished(), "nothing has stopped the watch");
+        assert!(
+            stop.stop(std::time::Duration::from_secs(5)).await,
+            "the watch returned"
+        );
+        task.await.unwrap();
+        assert_eq!(fence.take(), Vec::<&str>::new(), "no check ran");
     }
 
     /// Verdicts handed out in order, one per call.
