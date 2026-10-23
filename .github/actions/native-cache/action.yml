@@ -1,7 +1,8 @@
 name: native-cache
 description: >-
   Restore the shared vendored libtorrent/Boost prefix, and fetch the vendor
-  submodules only when it missed.
+  submodules only when it missed. Runs mise's `native-fetch` task for that, so
+  setup-rust must run first.
 
 inputs:
   path:
@@ -40,7 +41,7 @@ runs:
     # two vendor SHAs so a shim-only edit still restores the ~111 MB libtorrent
     # prefix and rebuilds only the ~4 MB shim.
     - id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ inputs.path }}
         key: >-
@@ -53,13 +54,11 @@ runs:
           native-v1-${{ runner.os }}-${{ steps.ids.outputs.lt }}-${{ steps.ids.outputs.boost }}-
 
     # ~4 minutes per job. vendor/boost is a 165-sub-repo superproject and is
-    # needed only to *build* the prefix, never to consume one. libtorrent's
-    # own libsimulator submodule is skipped: it serves the simulation tests,
-    # which nothing here builds, and its pin is unreachable at --depth 1, so
-    # fetching it only dirties vendor/libtorrent.
+    # needed only to *build* the prefix, never to consume one. mise.toml's
+    # native-fetch task says why libtorrent's libsimulator is skipped.
     - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
-      run: git -c 'submodule.simulation/libsimulator.update=none' submodule update --init --recursive --depth 1 vendor/libtorrent vendor/boost
+      run: mise run native-fetch
 
     - if: inputs.fixtures == 'true' && steps.cache.outputs.cache-hit == 'true'
       shell: bash
