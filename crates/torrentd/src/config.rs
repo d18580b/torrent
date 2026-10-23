@@ -3472,7 +3472,27 @@ upload_rate_limit = 0"#,
              user_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n"
         );
         let p = write_cfg(dir.path(), &body);
-        Config::load(&p).unwrap().check_boot_rules().unwrap();
+        // `Config::load` runs the boot rules, so loading is the pre-flight;
+        // what it loaded is the tunnelled profile the file describes.
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.network_kill_switch);
+        assert_eq!(cfg.profile.len(), 1);
+        let profile = &cfg.profile[0];
+        assert_eq!(profile.id.as_str(), "acct_a");
+        assert_eq!(
+            profile.network,
+            torrentd_engine::ProfileNetwork::Vpn {
+                vpn_type: torrentd_engine::VpnType::Wireguard,
+                vpn_config: "/etc/wireguard/wg0.conf".into(),
+                vpn_interface: "wg0".into(),
+                listen_port: Some(6891),
+                port_forward: torrentd_engine::PortForwardMode::Static,
+                port_forward_gateway: None,
+            },
+        );
+        assert_eq!(profile.peer_fingerprint.as_deref(), Some("-AA1000-"));
+        assert_eq!(profile.user_agent.as_deref(), Some("ua-a"));
+        assert_eq!(profile.allowed_tracker_domains, vec!["t.example"]);
     }
 
     #[test]
@@ -3499,13 +3519,6 @@ upload_rate_limit = 0"#,
             msg.contains("network_kill_switch") && msg.contains("public"),
             "got: {msg}",
         );
-    }
-
-    #[test]
-    fn the_default_config_has_no_boot_rule_to_break() {
-        let dir = tempdir().unwrap();
-        let p = write_cfg(dir.path(), &single_session());
-        Config::load(&p).unwrap().check_boot_rules().unwrap();
     }
 
     #[test]

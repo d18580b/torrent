@@ -887,6 +887,138 @@ listen_interfaces = "0.0.0.0:6881"
         assert_eq!(count("SIGHUP: config unchanged"), 1, "{log}");
     }
 
+    /// A file that fails to load applies nothing and is counted under
+    /// `stage="load"`, the series `TorrentdReloadFailed` alerts on; the same
+    /// edit made loadable then applies once, against the boot config the
+    /// failed reload left running.
+    #[tokio::test]
+    async fn a_reload_of_a_bad_file_applies_nothing_and_the_fixed_file_applies_once() {
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileSource;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::TorrentEngine;
+
+        const TOP_LEVEL: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
+"#;
+        const PROFILE: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.toml");
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}connections_limit = 100\n{PROFILE}"),
+        )
+        .unwrap();
+        let boot = Config::load(&path).unwrap();
+        // The intended edit, with a value the schema refuses beside it.
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}connections_limit = 200\naio_threads = -1\n{PROFILE}"),
+        )
+        .unwrap();
+        Config::load(&path).expect_err("the edit does not load");
+
+        let mock = Arc::new(MockEngine::new());
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let profile = boot.profile[0].clone();
+        let id = profile.id.clone();
+        let registry = Arc::new(crate::profile_registry::ProfileRegistry::new(vec![
+            crate::profile_registry::ProfileEntry::new(profile, engine.clone(), None, None, 0),
+        ]));
+        let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![(id, engine)]));
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+        let failures = |stage: &str| -> Option<String> {
+            let exported = String::from_utf8(metrics.render()).unwrap();
+            let series = format!("torrentd_config_reload_failures_total{{stage=\"{stage}\"}} ");
+            exported
+                .lines()
+                .find_map(|l| l.strip_prefix(series.as_str()).map(str::to_owned))
+        };
+        let applies = || -> Vec<Option<u32>> {
+            mock.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::ApplySettings(s) => Some(s.connections_limit),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let log = crate::tracing_init::Buf::default();
+        let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // One pump across both reloads, so the second is diffed against
+        // whatever the first left running. Each reload's body runs to the
+        // next `recv` without yielding, so a send followed by yields until
+        // the pump is parked again has seen that reload through.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let pump = tokio::spawn(run(
+            path.clone(),
+            boot,
+            source,
+            registry,
+            rx,
+            log_handle,
+            metrics.clone(),
+        ));
+        let reload = || async {
+            tx.send(()).await.unwrap();
+            // The pump takes the message on its first poll; a full slot
+            // here means it has not run yet.
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+                if tx.capacity() == 1 {
+                    break;
+                }
+            }
+            assert_eq!(tx.capacity(), 1, "the pump took the reload");
+            tokio::task::yield_now().await;
+        };
+
+        reload().await;
+        assert_eq!(
+            applies(),
+            Vec::<Option<u32>>::new(),
+            "a bad file applies nothing"
+        );
+        assert_eq!(failures("load").as_deref(), Some("1"));
+
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}connections_limit = 200\n{PROFILE}"),
+        )
+        .unwrap();
+        reload().await;
+        drop(tx);
+        pump.await.unwrap();
+
+        assert_eq!(applies(), vec![Some(200)], "the fixed file applies once");
+        assert_eq!(failures("load").as_deref(), Some("1"), "not counted again");
+        assert_eq!(
+            failures("apply_settings"),
+            None,
+            "the apply succeeded, so no other stage is counted"
+        );
+        let log = log.text();
+        assert_eq!(
+            log.matches("SIGHUP: failed to reload config; keeping current settings")
+                .count(),
+            1,
+            "{log}",
+        );
+        assert_eq!(log.matches("SIGHUP: settings applied").count(), 1, "{log}");
+    }
+
     /// Issue 455: a reload raising `connections_limit` past the open-file
     /// limit is refused, by the sum boot warns by, and the rest of the reload
     /// still applies. Two profiles at the key's maximum need over two million
