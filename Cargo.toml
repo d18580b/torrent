@@ -104,6 +104,10 @@ tracing-appender = "0.2.5"
 tui-input = "0.15"
 insta = "1.48"
 
+# Property tests (dev-dependency only). `std` alone: no forking runner and no
+# per-case timeout, so a case runs in the test's own thread like any test.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+
 # Internal crates
 libtorrent-sys = { path = "crates/libtorrent-sys" }
 libtorrent-safe = { path = "crates/libtorrent-safe" }

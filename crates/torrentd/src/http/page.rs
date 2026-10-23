@@ -256,4 +256,31 @@ mod tests {
         assert!(invalid.violations.is_empty());
         assert_eq!(page.unwrap().limit, DEFAULT_LIMIT as usize);
     }
+
+    proptest::proptest! {
+        /// A cursor decodes, for the listing it was made for, to the key it
+        /// was made from, whatever either holds.
+        #[test]
+        fn a_cursor_decodes_to_its_key(listing in ".*", key in ".*") {
+            proptest::prop_assert_eq!(decode(&listing, &encode(&listing, &key)), Ok(key));
+        }
+
+        /// Another listing's cursor is refused: a listing name holds no `:`,
+        /// so one is never the other's prefix up to the separator.
+        #[test]
+        fn another_listings_cursor_is_refused(
+            listing in "[a-z_]{1,12}",
+            other in "[a-z_]{1,12}",
+            key in ".*",
+        ) {
+            proptest::prop_assume!(listing != other);
+            proptest::prop_assert_eq!(decode(&other, &encode(&listing, &key)), Err(InvalidCursor));
+        }
+
+        /// Whatever a client sends as a cursor, decoding it answers.
+        #[test]
+        fn decoding_any_cursor_answers(cursor in ".*") {
+            let _ = decode("things", &cursor);
+        }
+    }
 }

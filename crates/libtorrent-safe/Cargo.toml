@@ -24,6 +24,7 @@ bitflags = { workspace = true }
 test-api = []
 
 [dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true
