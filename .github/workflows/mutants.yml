@@ -13,6 +13,13 @@ name: Mutants
 #
 # Every command is a mise task (mise.toml's mutants section), and these
 # jobs provision the way ci.yml's do; its header comments apply here.
+#
+# No job caches cargo's registry or target/ (setup-rust's cache-prefix is
+# left empty). cargo-mutants builds every mutant in a copy of the tree
+# without target/, so a cached one would speed up nothing but the prefix
+# lookup, and a restored target/ would carry an earlier run's mutants.out,
+# which the upload step would publish as this run's whenever the job
+# failed before cargo-mutants replaced it.
 
 on:
   pull_request:
@@ -67,7 +74,6 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           system-deps: 'true'
-          cache-prefix: cargo-mutants
 
       - if: steps.diff.outputs.rust == 'true'
         uses: ./.github/actions/native-cache
@@ -108,7 +114,6 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           system-deps: 'true'
-          cache-prefix: cargo-mutants
 
       - uses: ./.github/actions/native-cache
         with:
@@ -146,7 +151,6 @@ jobs:
         with:
           system-deps: 'true'
           extra-packages: nftables wireguard-tools iproute2 util-linux
-          cache-prefix: cargo-mutants
 
       - uses: ./.github/actions/native-cache
         with:
