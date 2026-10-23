@@ -2140,15 +2140,20 @@ table inet torrentd_ks_998 {
             &[Tunnel::new("wg-b", ADDR_A), Tunnel::new("wg-a", ADDR_A)],
         )
         .unwrap();
-        assert_eq!(
-            rs.matches("oifname != ").count(),
-            1,
-            "one fence for the address:\n{rs}"
-        );
-        assert!(
-            rs.contains("ip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\", \"wg-b\" } drop"),
-            "{rs}"
-        );
+        // One fence for the address, ahead of every accept.
+        let expected = "\
+table inet torrentd_ks_998 {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\", \"wg-b\" } drop
+\t\tmeta skuid 998 oifname \"lo\" accept
+\t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
+\t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-b\" accept
+\t\tmeta skuid 998 counter drop
+\t}
+}
+";
+        assert_eq!(rs, expected);
         assert_eq!(verdict(&rs, pkt(998, ADDR_A, "wg-a")), "accept");
         assert_eq!(verdict(&rs, pkt(998, ADDR_A, "wg-b")), "accept");
     }
@@ -2235,12 +2240,25 @@ table inet torrentd_ks_998 {
             installed.tunnels,
             vec![tunnel("wg-a").with_v6([ADDR_A6]), tunnel("wg-b")]
         );
-        assert_eq!(
-            installed.table.matches("ip6 saddr").count(),
-            2,
-            "{}",
-            installed.table
-        );
+        // wg-a's IPv6 address is fenced and accepted beside its IPv4 one;
+        // wg-b, with none, gets IPv4 rules only.
+        let expected = "\
+table inet torrentd_ks_998 {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
+\t\tip saddr 10.64.0.7 oifname != { \"lo\", \"wg-b\" } drop
+\t\tip6 saddr 2001:db8::2 oifname != { \"lo\", \"wg-a\" } drop
+\t\tmeta skuid 998 oifname \"lo\" accept
+\t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
+\t\tmeta skuid 998 ip6 saddr 2001:db8::2 oifname \"wg-a\" accept
+\t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
+\t\tmeta skuid 998 ip daddr 198.51.100.1 udp sport 51820 udp dport 51820 accept
+\t\tmeta skuid 998 counter drop
+\t}
+}
+";
+        assert_eq!(installed.table, expected);
     }
 
     #[test]
@@ -2672,20 +2690,39 @@ table inet torrentd_ks_998 {
         assert_eq!(rs, expected);
     }
 
+    /// One fence and one accept for the interface, and still fail-closed: the
+    /// loopback accept, the tunnel's accept, then the drop, in that order.
     #[test]
     fn ruleset_dedups_shared_interface() {
         let rs = render_ruleset(1000, &[tunnel("wg0"), tunnel("wg0")]).unwrap();
-        assert_eq!(rs.matches("wg0").count(), 2, "one fence, one accept:\n{rs}");
-        // Still fails closed: lo accept, one tunnel accept, then drop.
-        assert!(rs.contains("meta skuid 1000 counter drop"));
+        let expected = "\
+table inet torrentd_ks_1000 {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tip saddr 10.64.0.7 oifname != { \"lo\", \"wg0\" } drop
+\t\tmeta skuid 1000 oifname \"lo\" accept
+\t\tmeta skuid 1000 ip saddr 10.64.0.7 oifname \"wg0\" accept
+\t\tmeta skuid 1000 counter drop
+\t}
+}
+";
+        assert_eq!(rs, expected);
     }
 
+    /// No fence and no tunnel accept: the loopback accept, then the drop.
     #[test]
     fn ruleset_with_no_tunnels_allows_only_loopback() {
         let rs = render_ruleset(1000, &[]).unwrap();
-        assert!(!rs.contains("saddr"));
-        assert!(rs.contains("oifname \"lo\" accept"));
-        assert!(rs.contains("counter drop"));
+        let expected = "\
+table inet torrentd_ks_1000 {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tmeta skuid 1000 oifname \"lo\" accept
+\t\tmeta skuid 1000 counter drop
+\t}
+}
+";
+        assert_eq!(rs, expected);
     }
 
     /// The shape from #33: a quote closes the set's quoted token early and
