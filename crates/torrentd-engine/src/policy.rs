@@ -350,17 +350,14 @@ mod tests {
 
     /// The no-download invariant as a property of the policy: for every
     /// profile and every builder, the flags carry `UPLOAD_MODE` and nothing
-    /// [`forbidden`], and what a resume add clears after setting them (the
-    /// shim applies the set, then the clear) can take neither away.
+    /// [`forbidden`]. What a resume add clears after setting them (the shim
+    /// applies the set, then the clear) is [`resume_flags_clear`], plus
+    /// `PAUSED` for pool adoption; neither may take `UPLOAD_MODE` away.
     #[test]
     fn every_builder_on_every_profile_keeps_upload_mode_and_nothing_forbidden() {
         let profiles = every_profile();
         assert_eq!(profiles.len(), 36);
-        // What the resume reload and pool adoption clear.
-        let clears = [
-            resume_flags_clear(),
-            resume_flags_clear() | TorrentFlags::PAUSED,
-        ];
+        assert!(!resume_flags_clear().contains(TorrentFlags::UPLOAD_MODE));
         for p in &profiles {
             for (name, build) in BUILDERS {
                 let flags = build(p);
@@ -374,13 +371,6 @@ mod tests {
                     "{name}({}) = {flags:?} sets a forbidden flag",
                     p.id,
                 );
-                for clear in clears {
-                    assert!(
-                        (flags - clear).contains(TorrentFlags::UPLOAD_MODE),
-                        "{name}({}) then clearing {clear:?} drops UPLOAD_MODE",
-                        p.id,
-                    );
-                }
             }
         }
     }
