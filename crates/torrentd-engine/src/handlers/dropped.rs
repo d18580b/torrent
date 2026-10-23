@@ -184,9 +184,9 @@ fn refresh_statuses(ctx: &HandlerCtx<'_>) {
 /// A torrent enters the map from its add alert, so one whose alert was lost
 /// would seed with nothing tracking it: no fence pauses it, no sweep or drain
 /// saves it, and `DELETE` refuses it. Each torrent the session holds that the
-/// map is missing gets what its alert would have given it (`add::track`). An
-/// add alert that was not lost and is still queued finds its torrent tracked
-/// and keeps the entry.
+/// map is missing gets what its alert would have given it
+/// (`add::track_known`). An add alert that was not lost and is still queued
+/// finds its torrent tracked and keeps the entry.
 fn reconcile_session(ctx: &HandlerCtx<'_>, adds: bool, removals: bool) {
     // The profile's entries as they stood before the session was listed. A
     // torrent the boot scan adds meanwhile is in the session before it is in
@@ -219,16 +219,21 @@ fn reconcile_session(ctx: &HandlerCtx<'_>, adds: bool, removals: bool) {
     if !adds {
         return;
     }
+    // Only the missing: a tracked torrent's add was handled, or seeded by the
+    // boot scan, and re-asking its save and hold for every torrent in a 100K
+    // session would cost a store lookup each.
+    let missing: Vec<TorrentHandle> = held
+        .into_iter()
+        .filter(|&h| !ctx.state.tracks(h, &ctx.profile_id))
+        .collect();
+    let without_metadata = if missing.is_empty() {
+        HashSet::new()
+    } else {
+        without_metadata(ctx)
+    };
     let mut recovered = 0u64;
-    for h in held {
-        // Only the missing: a tracked torrent's add was handled, or seeded by
-        // the boot scan, and re-asking its save and hold for every torrent in
-        // a 100K session would cost a store lookup each.
-        let tracked = ctx
-            .state
-            .get(&h.infohash)
-            .is_some_and(|st| st.handle == h && st.profile_id == ctx.profile_id);
-        if !tracked && add::track(h, ctx) {
+    for h in missing {
+        if add::track_known(h, !without_metadata.contains(&h), ctx) {
             recovered += 1;
         }
     }
@@ -238,6 +243,33 @@ fn reconcile_session(ctx: &HandlerCtx<'_>, adds: bool, removals: bool) {
         "add-torrent alerts were among the dropped alerts; tracked the session's torrents the \
          state map was missing",
     );
+}
+
+/// The torrents the session lists without metadata, from one
+/// `torrent_statuses` listing, so each torrent the reconciliation tracks
+/// starts in the phase its add implies without a `torrent_details` query
+/// apiece on an alert loop that is already behind. A session that cannot be
+/// listed has every one read `Checking`, the state libtorrent starts each in,
+/// until its first state update.
+fn without_metadata(ctx: &HandlerCtx<'_>) -> HashSet<TorrentHandle> {
+    match ctx.engine.torrent_statuses() {
+        Ok(statuses) => statuses
+            .into_iter()
+            .filter(|s| !s.has_metadata)
+            .map(|s| s.handle)
+            .collect(),
+        Err(e) => {
+            warn!(
+                target: "torrentd_engine::handler::dropped",
+                op = "torrent_statuses",
+                error.cause = %e,
+                "could not list the session's torrents for the ones lacking metadata; the \
+                 torrents tracked after dropped add alerts read checking until their first \
+                 state update, magnets included",
+            );
+            HashSet::new()
+        }
+    }
 }
 
 /// Settle every one of `entries`, the profile's state-map entries, that the
@@ -405,7 +437,7 @@ mod tests {
                 id: u64::from(b),
                 infohash: InfoHash([b; 20]),
             };
-            assert!(state.track_added(h, profile, now));
+            assert!(state.track_added(h, profile, true, now));
             state.queue_resume_save(h.infohash, ResumeFlags::ONLY_IF_MODIFIED);
         }
         state.dispatch_resume_saves(usize::MAX);
@@ -474,7 +506,7 @@ mod tests {
         let metrics = RecordingSink::new();
         let p = ProfileId::new("p");
         // `a`'s alert was handled, and its entry has moved on since.
-        assert!(state.track_added(a, &p, std::time::Instant::now()));
+        assert!(state.track_added(a, &p, true, std::time::Instant::now()));
         state.update(&a.infohash, |st| st.phase = TorrentPhase::Seeding);
 
         run_on(mock.clone(), &state, &metrics, ADD_DROPPED);
@@ -493,6 +525,61 @@ mod tests {
             .collect();
         saved.sort_by_key(|ih| ih.0);
         assert_eq!(saved, vec![b.infohash, c.infohash]);
+    }
+
+    /// A torrent tracked after dropped add alerts starts in the phase its
+    /// metadata implies, learnt from one `torrent_statuses` listing and no
+    /// `torrent_details` query per torrent; a listing that fails leaves each
+    /// reading `Checking`.
+    #[test]
+    fn dropped_add_alerts_take_each_missing_torrents_metadata_from_one_listing() {
+        use crate::mock::RecordedCall;
+        use crate::state::TorrentPhase;
+
+        for listing_fails in [false, true] {
+            let mock = Arc::new(MockEngine::new());
+            let (magnet, file) = (
+                mock.register_handle(InfoHash([5; 20])),
+                mock.register_handle(InfoHash([6; 20])),
+            );
+            for (h, has_metadata) in [(magnet, false), (file, true)] {
+                mock.set_torrent_status(libtorrent_safe::alert::TorrentStatusView {
+                    has_metadata,
+                    ..paused_status(h)
+                });
+            }
+            if listing_fails {
+                mock.inject_error("torrent_statuses", EngineError::Shutdown);
+            }
+            let state = StateMap::new();
+            let metrics = RecordingSink::new();
+
+            run_on(mock.clone(), &state, &metrics, ADD_DROPPED);
+
+            let phase = |h: TorrentHandle| state.get(&h.infohash).expect("tracked").phase;
+            let magnet_phase = if listing_fails {
+                TorrentPhase::Checking
+            } else {
+                TorrentPhase::AwaitingMetadata
+            };
+            assert_eq!(
+                phase(magnet),
+                magnet_phase,
+                "listing fails: {listing_fails}"
+            );
+            assert_eq!(
+                phase(file),
+                TorrentPhase::Checking,
+                "listing fails: {listing_fails}"
+            );
+            let calls = mock.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| matches!(c, RecordedCall::TorrentDetails(_))),
+                "no query per torrent: {calls:?}",
+            );
+        }
     }
 
     #[test]
@@ -562,7 +649,7 @@ mod tests {
     ) -> TorrentHandle {
         let p = ProfileId::new("p");
         let h = mock.register_handle(ih);
-        assert!(state.track_added(h, &p, std::time::Instant::now()));
+        assert!(state.track_added(h, &p, true, std::time::Instant::now()));
         resume.write(&p, &ih, b"old-resume").unwrap();
         torrents.write(&p, &ih, b"old-torrent").unwrap();
         resume.write_tombstone(&p, &ih).unwrap();
@@ -604,7 +691,7 @@ mod tests {
         removed_by_delete(&mock, &state, &resume, &torrents, ih);
         // Still held, and tracked: untouched.
         let kept = mock.register_handle(InfoHash([7; 20]));
-        assert!(state.track_added(kept, &p, std::time::Instant::now()));
+        assert!(state.track_added(kept, &p, true, std::time::Instant::now()));
 
         run_with(
             mock.clone(),
@@ -682,7 +769,7 @@ mod tests {
             assert_ne!(new, old);
             torrents.write(&p, &ih, b"new-torrent").unwrap();
             if readd_tracked {
-                assert!(state.track_added(new, &p, std::time::Instant::now()));
+                assert!(state.track_added(new, &p, true, std::time::Instant::now()));
             }
 
             run_with(mock, &state, &resume, &torrents, &metrics, bits);
@@ -718,7 +805,7 @@ mod tests {
         let p = ProfileId::new("p");
         let ih = InfoHash([9; 20]);
         let h = mock.register_handle(ih);
-        assert!(state.track_added(h, &p, std::time::Instant::now()));
+        assert!(state.track_added(h, &p, true, std::time::Instant::now()));
         torrents.write(&p, &ih, b"torrent").unwrap();
         mock.remove_torrent(h, false).unwrap();
 
@@ -782,7 +869,7 @@ mod tests {
             mock.register_handle(InfoHash([11; 20])),
         );
         for h in [a, b] {
-            assert!(state.track_added(h, &p, std::time::Instant::now()));
+            assert!(state.track_added(h, &p, true, std::time::Instant::now()));
             state.update(&h.infohash, |st| {
                 st.phase = TorrentPhase::Seeding;
                 st.is_seeding = true;
@@ -827,7 +914,7 @@ mod tests {
     fn seeding_entry(state: &StateMap, h: TorrentHandle, profile: &ProfileId) {
         use crate::state::TorrentPhase;
 
-        assert!(state.track_added(h, profile, std::time::Instant::now()));
+        assert!(state.track_added(h, profile, true, std::time::Instant::now()));
         state.update(&h.infohash, |st| {
             st.phase = TorrentPhase::Seeding;
             st.is_seeding = true;
@@ -899,7 +986,7 @@ mod tests {
         let h = mock.register_handle(InfoHash([13; 20]));
         let state = StateMap::new();
         let metrics = RecordingSink::new();
-        assert!(state.track_added(h, &ProfileId::new("p"), std::time::Instant::now()));
+        assert!(state.track_added(h, &ProfileId::new("p"), true, std::time::Instant::now()));
         state.update(&h.infohash, |st| st.phase = TorrentPhase::Seeding);
         mock.set_torrent_status(paused_status(h));
         let mut bits = [u64::MAX, u64::MAX];
@@ -917,7 +1004,7 @@ mod tests {
         let h = mock.register_handle(InfoHash([14; 20]));
         let state = StateMap::new();
         let metrics = RecordingSink::new();
-        assert!(state.track_added(h, &ProfileId::new("p"), std::time::Instant::now()));
+        assert!(state.track_added(h, &ProfileId::new("p"), true, std::time::Instant::now()));
         state.update(&h.infohash, |st| st.phase = TorrentPhase::Seeding);
         mock.set_torrent_status(paused_status(h));
         mock.inject_error("torrent_statuses", EngineError::Shutdown);
