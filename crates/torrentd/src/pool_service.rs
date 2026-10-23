@@ -3308,7 +3308,11 @@ mod tests {
         engine
             .add_torrent(super::adoption_resume_params(
                 &profile,
-                vec![2; 32],
+                // Resume data libtorrent reads: the add refuses anything else.
+                b"d11:file-format22:libtorrent resume file12:file-versioni1e\
+                  9:info-hash20:\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\
+                  \x02\x02\x02\x02\x02\x02\x02\x02\x02\x02e"
+                    .to_vec(),
                 None,
                 "/p".into(),
             ))
@@ -4373,8 +4377,14 @@ mod tests {
         bare.extend_from_slice(&[0u8; 20]);
         bare.extend_from_slice(b"ee");
         std::fs::write(dir.path().join("library/t.torrent"), &bare).unwrap();
-        // One piece had: the fast path.
-        std::fs::write(dir.path().join("library/t.fastresume"), b"d6:pieces1:\x01e").unwrap();
+        // One piece had: the fast path. In libtorrent's own format, with the
+        // info-hash it requires: the session's add, and the mock's, refuse
+        // resume data short of that.
+        let mut fastresume =
+            b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+        fastresume.extend_from_slice(&libtorrent_safe::info_hash_from_torrent(&bare).unwrap().0);
+        fastresume.extend_from_slice(b"6:pieces1:\x01e");
+        std::fs::write(dir.path().join("library/t.fastresume"), &fastresume).unwrap();
         pool.scan().unwrap();
         let ih = pool.with_store(|s| s.torrents().unwrap())[0]
             .infohash
