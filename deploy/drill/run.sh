@@ -10,9 +10,13 @@
 #   deploy/drill/run.sh
 #
 # Environment:
-#   TORRENTD_IMAGE  image to run (default localhost/torrentd:drill, built from
-#                   deploy/Containerfile with the fault-injection feature when
-#                   absent). It must be a fault-injection build: the drill
+#   TORRENTD_IMAGE  image to run, as it is: the drill builds it only when it
+#                   is absent. Unset, the drill rebuilds localhost/torrentd:drill
+#                   from deploy/Containerfile, with the fault-injection
+#                   feature, on every run, so it drills the checkout it runs
+#                   from and never an image an older checkout left behind
+#                   (the build's layer cache keeps an unchanged rebuild
+#                   short). It must be a fault-injection build: the drill
 #                   checks, and says how to rebuild one that is not. Such a
 #                   build exits 78 unless TORRENTD_FAULT_INJECTION=1, which
 #                   compose.yaml and the config check below set.
@@ -65,6 +69,8 @@ engine=$(command -v podman || command -v docker || true)
 [ -n "$engine" ] || { echo "drill: needs podman or docker" >&2; exit 2; }
 compose=("$engine" compose)
 
+# Whether the image is the caller's, read before the default fills it in.
+image_given=${TORRENTD_IMAGE:+1}
 export TORRENTD_IMAGE=${TORRENTD_IMAGE:-localhost/torrentd:drill}
 export DRILL_DIR=${DRILL_DIR:-$(mktemp -d)}
 # The stall and task alerts each hold for a minute before firing, after
@@ -84,7 +90,7 @@ teardown() {
 }
 trap teardown EXIT
 
-if ! "$engine" image inspect "$TORRENTD_IMAGE" >/dev/null 2>&1; then
+if [ -z "$image_given" ] || ! "$engine" image inspect "$TORRENTD_IMAGE" >/dev/null 2>&1; then
   echo "drill: building $TORRENTD_IMAGE"
   "${compose[@]}" -f "$here/compose.yaml" build torrentd
 fi
@@ -227,7 +233,7 @@ probe=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $write_
   -H 'Content-Type: application/json' -d '{"fault":"none"}' "$api/v1/faults")
 if [ "$probe" != 422 ]; then
   echo "drill: $TORRENTD_IMAGE is not a fault-injection build (POST /v1/faults answered $probe);" \
-    "remove it and rerun to rebuild: $engine rmi $TORRENTD_IMAGE" >&2
+    "unset TORRENTD_IMAGE to drill a fault-injection build of this checkout" >&2
   exit 2
 fi
 fault() {
