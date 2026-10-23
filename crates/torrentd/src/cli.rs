@@ -123,14 +123,8 @@ pub enum VpnCmd {
     ///
     /// Exit status: 0 when every check passed, 1 when any check failed, and 2
     /// when nothing failed but at least one check could not be performed. A
-    /// check that nothing this invocation could be given would settle is
-    /// reported `?cap` and does not raise the status to 2 — usually for want
-    /// of CAP_NET_ADMIN, which the daemon holds and an operator shell usually
-    /// does not, and also for the `kill_switch_uid` mismatch, which no
-    /// argument or privilege resolves. Counting either would make 2 the normal
-    /// answer on a healthy host. A caller that treats only 0 as success gets
-    /// the strict reading; one that accepts 0 and 2 gets "nothing is known to
-    /// be broken".
+    /// check reported `?cap`, which nothing this invocation could settle, does
+    /// not raise it to 2. docs/running.md §9 says what each status establishes.
     Check {
         /// Check only this profile. Default: every configured profile.
         #[arg(long, value_name = "ID")]

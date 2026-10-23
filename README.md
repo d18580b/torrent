@@ -15,9 +15,6 @@ which torrents point at data that moved or vanished.
 - [x] **Never downloads payload.** Every add carries libtorrent's `upload_mode`
       — "will not make any piece requests" — so the guarantee survives magnets,
       hash failures and rechecks. Magnet *metadata* still arrives.
-- [x] **Understands the pool, not just the torrents** — which bytes on disk a
-      torrent protects, which nothing protects, and which torrents point at
-      data that moved or vanished
 - [x] **Moves and deletes files inside the directories you give it**, planned,
       journaled and re-checked at apply time. Off unless you turn it on.
 - [x] **Profiles**: one libtorrent session each, with its own network posture,
@@ -84,14 +81,9 @@ them, and reports per path:
 Plus byte rollups per directory, so an unprotected subtree is visible without
 reading a file listing.
 
-Change detection is tiered because hashing a petabyte is days of I/O: a
-`(size, mtime, inode, device)` sweep catches essentially every real change
-cheaply, and libtorrent's own piece hashing is the authoritative check, run on
-drift and on adopt. Every torrent, v1, v2 or hybrid, matches on `(path, size)`
-against a small set of candidate directories, and a match is confirmed by that
-verification, with one exception: a complete, unchanged torrent whose previous
-client's `.fastresume` says so is adopted in seed mode on the strength of that
-client's own check, without hashing (see the tiered adoption paragraph below).
+Change detection is tiered, a cheap stat sweep routinely and libtorrent's own
+piece hashing on drift and on adopt, as the
+[`torrentd-pool` crate documentation](crates/torrentd-pool/src/lib.rs) sets out.
 
 **Migrating from qBittorrent, or another libtorrent-based client, is just the
 first scan** — point `library_dir` at its state directory (qBittorrent's
@@ -273,9 +265,9 @@ listening port is either static or negotiated over NAT-PMP against the tunnel
 gateway (ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the
 live socket rebinding when it changes).
 
-Verify a tunnel before trusting it, with no torrents involved. `vpn check`
-checks every profile unless `--profile` names one; a `host` profile has no
-tunnel to check and reports `skip`, which does not change the exit status:
+Verify a tunnel before trusting it, with no torrents, no session and no
+tracker involved
+([docs/running.md §9](docs/running.md#checking-the-vpn-on-its-own)):
 
 ```bash
 torrentd --config … vpn check --profile acct_a   # --bring-up also raises it
@@ -317,41 +309,9 @@ a `vpn` profile's isolation is layered:
   and `wg` under `CAP_NET_ADMIN`, and the ruleset exempts each tunnel's own
   encrypted transport.
 
-**Checking a tunnel without seeding anything** — `vpn check` runs the VPN
-pre-flight the daemon depends on and reports each part separately, with no
-libtorrent session, no torrents and no tracker contact.
-
-```bash
-torrentd --config … vpn check                 # every profile; host ones report skip
-torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
-torrentd --config … vpn check --egress 1.1.1.1:53      # route it via the tunnel, then a reply through it
-```
-
-Verdicts are four-valued — `pass`, `fail`, `skip`, `unknown` — so a green
-summary cannot quietly mean "mostly not checked", and the exit status carries
-the same distinction: `0` clean, `1` any failure, `2` nothing failed but
-something could not be checked.
-
-With one exception, which a `0` depends on. An `unknown` that *nothing this
-invocation could be given would settle* — most often because the check needs
-`CAP_NET_ADMIN` and an operator shell does not hold it — is printed `[?cap]`,
-marked `"needs_capability": true` in the JSON, and **not** counted towards `2`.
-Otherwise a host where nothing is wrong would exit `2` every time, and both
-consumers of the status would learn to accept it. So a `0` means "nothing
-failed and nothing was left unsettled that this invocation could have
-settled", which is less than it sounds: on the recommended unprivileged run
-the handshake and the kill-switch ruleset are two of those. [What a pass
-establishes](docs/running.md#9-first-run-checks) says which, line by line.
-
-The default path makes no host change and deletes nothing: it reads state and
-asks the gateway for a NAT-PMP mapping with the daemon's own short lease,
-which it leaves to expire. Against a running daemon that request is its only
-interaction, sent from the same NAT-PMP client identity; whether a gateway
-coalesces it with the daemon's existing mapping is gateway-dependent and is
-not tested here. `--bring-up` is the only option that raises a tunnel, and it
-lowers again only what it was observed to have raised. What a pass does and
-does not establish is set out in
-[docs/running.md](docs/running.md#9-first-run-checks).
+**Checking a tunnel without seeding anything** — its flags, verdicts, exit
+status, and what a pass does and does not establish are in
+[docs/running.md §9](docs/running.md#checking-the-vpn-on-its-own).
 
 The eight rules this is built on, and why each exists, are documented on the
 `torrentd-engine::profile` module — where the code that enforces them is. The
@@ -541,13 +501,8 @@ mise run test-all        # test and every test-* task above, in turn; not check,
 mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```
 
-`mise run vpn-check` verifies a real VPN configuration against a real tunnel,
-with no torrents and no tracker involved. It checks every profile unless
-`--profile` names one; a `host` profile has no tunnel and reports `skip`:
-
-```bash
-mise run vpn-check /etc/torrentd/torrentd.toml --profile acct_a
-```
+`mise run vpn-check <config> [-- <flags>]` runs `vpn check` (see
+[Profiles](#profiles)) from a source checkout, against a real tunnel.
 
 ## Contributing & license
 

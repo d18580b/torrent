@@ -81,18 +81,15 @@ unstable); `mise run setup` installs it and the `fmt` tasks invoke `cargo +night
 Everything else builds/lints/tests on the pinned stable toolchain.
 
 `vpn-check` is deliberately outside every `test` task: it needs a real host
-with real tunnels and is meaningless in CI. It takes a config path and
-forwards any trailing flags to `torrentd … vpn check`, and it exits with that
-subcommand's status — `0` clean, `1` any failure, `2` nothing failed but
-something could not be checked.
+with real tunnels and is meaningless in CI. It takes a config path, forwards
+any trailing flags to `torrentd … vpn check`, and exits with that subcommand's
+status, which [docs/running.md](docs/running.md#checking-the-vpn-on-its-own)
+defines along with what a pass does and does not establish.
 
 ```bash
 mise run vpn-check /etc/torrentd/torrentd.toml
 mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
 ```
-
-See [docs/running.md](docs/running.md#checking-the-vpn-on-its-own) for what a
-pass does and does not establish.
 
 ### Git hooks
 
@@ -198,11 +195,6 @@ Every test command is a mise task, and CI runs the same tasks:
 Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
 Layer 2 runs as its own CI job; the three Layer 3 suites share one, and
 `test-alerts` has its own.
-
-`mise run vpn-check <config>` verifies a real VPN configuration against the
-real host. It checks every profile unless `--profile <id>` names one; a
-`host` profile has no tunnel and reports `skip`. It is deliberately not part of any `test` task: it needs real
-tunnels and is meaningless in CI.
 
 Deploying it for real — packages, submodules, the service user, directories,
 config, auth bootstrap, ulimits, and the drills worth running once before you
