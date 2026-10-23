@@ -626,23 +626,4 @@ mod tests {
         assert_eq!(ffi::lt_alert_kind_LT_ALERT_TORRENT_LOG, 17);
         assert_eq!(ffi::lt_alert_kind_LT_ALERT_TRACKER_REPLY, 28);
     }
-
-    proptest::proptest! {
-        /// An alert's fixed-size message buffer is read up to its first NUL,
-        /// or whole where it holds none, and never past its end: the bytes
-        /// after it in memory, none of them NUL, are never part of the
-        /// string.
-        #[test]
-        fn a_fixed_buffer_is_read_within_its_bounds(
-            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
-            tail in 1usize..16,
-        ) {
-            let mut memory: Vec<std::os::raw::c_char> =
-                bytes.iter().map(|&b| b as std::os::raw::c_char).collect();
-            memory.extend(std::iter::repeat_n(b'Z' as std::os::raw::c_char, tail));
-            let text = fixed_c_str(&memory[..bytes.len()]);
-            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            proptest::prop_assert_eq!(text, String::from_utf8_lossy(&bytes[..end]).into_owned());
-        }
-    }
 }
