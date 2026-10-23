@@ -315,6 +315,37 @@ dht               = true
 # allowed_tracker_domains  = ["tracker.example.com"]
 # allowed_tracker_urls     = ["https://tracker.example.com/<proton_a's passkey>/"]
 
+# An OpenVPN profile. `vpn_config` is the provider's `.ovpn`, anywhere the
+# daemon can read it; its name carries no meaning, because the daemon passes
+# `--dev` itself, and `vpn_interface` names the routed `tun` device it creates
+# (a bridged `tap` profile is not supported). The file is executable
+# configuration: one that names a hook (`up`, `route-up`, ...), a plugin, a
+# management socket or a nested `config` is refused at load, and by
+# --check-config, with the line named; docs/running.md §5 lists every refused
+# directive. Two things differ from WireGuard:
+#
+#   * `network_kill_switch` is refused beside it: `openvpn` runs under the
+#     daemon's uid, so the ruleset would drop its own connection to the
+#     provider. Run OpenVPN profiles in a daemon without the switch.
+#   * With `port_forward = "natpmp"`, `port_forward_gateway` must be set to
+#     this tunnel's own gateway (`ip route show dev <vpn_interface>` once it
+#     is up); 10.2.0.1 is only Proton's WireGuard default.
+#
+# The shipped container image has no `openvpn`; run this profile on a host.
+#
+# [[profile]]
+# id                       = "acct_c"
+# network                  = "vpn"
+# vpn_type                 = "openvpn"
+# vpn_config               = "/etc/openvpn/client/acct-c.ovpn"
+# vpn_interface            = "tun-acct-c"
+# listen_port              = 6893
+# peer_fingerprint         = "-qB4520-"
+# user_agent               = "qBittorrent/4.5.2"
+# resume_dir               = "/var/lib/torrentd/resume/acct_c"
+# torrent_dir              = "/var/lib/torrentd/torrents/acct_c"
+# allowed_tracker_domains  = ["tracker-c.example.org"]
+
 # A two-account deployment, live and uncommented, is in
 # deploy/torrentd.multi-account.sample.toml. Both files are parsed and
 # validated by this repository's own test suite, so what ships here is a
@@ -342,6 +373,11 @@ dht               = true
 # Run them as the daemon's user: run as root, `pool scan` creates `pool.db`
 # (and `registry.db`, with `import_legacy_registry` set) owned by root, which
 # the daemon cannot write, and the next start fails.
+#
+# Every root and library_dir must exist and, under the packaged unit, be
+# listed in ReadWritePaths= (a drop-in: `systemctl edit torrentd`). [pool] is
+# not reloadable: adding or changing it takes a restart. The import runbook,
+# multi-terabyte libraries included, is docs/import.md.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest
