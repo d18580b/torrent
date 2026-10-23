@@ -2111,7 +2111,7 @@ pub async fn boot(
     // only from their add alerts: an alert libtorrent dropped would leave its
     // torrent seeding with no fence, save or `DELETE` reaching it. The alert
     // loop's handling of each add alert, held above, keeps these entries.
-    scan_fence.track_all(&state);
+    scan_fence.track_all(&state, &*source);
 
     // A profile fenced after its own scan's last add would otherwise keep
     // what that scan loaded running: a fenced profile is skipped by the
@@ -2728,11 +2728,47 @@ impl ScanFence {
     /// A fence whose walk of `state` runs after this pauses them too; both
     /// count each torrent once under that fence
     /// (`ProfileHealth::count_paused_for_vpn`).
-    fn track_all(&self, state: &StateMap) {
+    ///
+    /// Each starts in the phase its add implies (`TorrentPhase::on_add`): a
+    /// torrent its session lists without metadata reads `AwaitingMetadata`,
+    /// any other `Checking`, until its first state update. One listing per
+    /// profile from `source`, rather than a query per torrent: a profile can
+    /// hold many thousands. A profile whose session cannot be listed has its
+    /// torrents read `Checking`, the state libtorrent starts each in.
+    fn track_all(&self, state: &StateMap, source: &dyn AlertSource) {
         let now = std::time::Instant::now();
         for (profile, fenced) in &self.profiles {
+            let without_metadata = Self::without_metadata(source, profile);
             for &h in &fenced.handles {
-                state.track_added(h, profile, now);
+                state.track_added(h, profile, !without_metadata.contains(&h), now);
+            }
+        }
+    }
+
+    /// The torrents `profile`'s session lists without metadata: magnets, and
+    /// resume entries that came back with neither an info dict nor a
+    /// `.torrent`.
+    fn without_metadata(
+        source: &dyn AlertSource,
+        profile: &ProfileId,
+    ) -> HashSet<torrentd_engine::TorrentHandle> {
+        let Some(engine) = source.engine_for(profile) else {
+            return HashSet::new();
+        };
+        match engine.torrent_statuses() {
+            Ok(statuses) => statuses
+                .into_iter()
+                .filter(|s| !s.has_metadata)
+                .map(|s| s.handle)
+                .collect(),
+            Err(e) => {
+                warn!(
+                    profile_id = %profile,
+                    error.cause = %e,
+                    "boot scan: could not list the session's torrents; what the scans loaded \
+                     reads checking until its first state update, magnets included",
+                );
+                HashSet::new()
             }
         }
     }
@@ -7189,7 +7225,7 @@ mod tests {
             loaded.push(h);
         }
         source.hold_alerts(&p);
-        scan.track_all(&state);
+        scan.track_all(&state, &*source);
         let tracked_before_the_loop = state.len();
 
         let metrics = Arc::new(RecordingSink::new());
@@ -7224,6 +7260,65 @@ mod tests {
             let st = state.get(&h.infohash).expect("tracked");
             assert_eq!((st.handle, &st.profile_id), (h, &p));
         }
+    }
+
+    /// What the scans loaded is listed, before any state update, as what
+    /// its session holds: a resume entry that came back without metadata as
+    /// fetching it, the rest as checking. Neither as `Idle`, which says the
+    /// torrent was checked. A session that cannot be listed leaves them all
+    /// checking, libtorrent's starting state.
+    #[test]
+    fn the_boot_tracks_a_scanned_torrent_in_the_phase_its_metadata_implies() {
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::TorrentPhase;
+
+        let engine = Arc::new(MockEngine::new());
+        let p = ProfileId::new("p");
+        let source =
+            ProfileSource::new(vec![(p.clone(), engine.clone() as Arc<dyn TorrentEngine>)]);
+        let magnet = engine.register_handle(libtorrent_safe::InfoHash([1; 20]));
+        let file = engine.register_handle(libtorrent_safe::InfoHash([2; 20]));
+        let status = |handle, has_metadata| libtorrent_safe::alert::TorrentStatusView {
+            handle,
+            state: if has_metadata { 7 } else { 2 },
+            flags: 0,
+            total_uploaded: 0,
+            total_payload_uploaded: 0,
+            upload_rate: 0,
+            download_rate: 0,
+            num_peers: 0,
+            num_seeds: 0,
+            num_connections: 0,
+            progress: 0.0,
+            has_metadata,
+            needs_save_resume: false,
+            is_finished: false,
+            is_seeding: false,
+            has_error: false,
+        };
+        engine.set_torrent_status(status(magnet, false));
+        engine.set_torrent_status(status(file, true));
+        let mut scan = ScanFence::default();
+        scan.profiles
+            .entry(p.clone())
+            .or_default()
+            .handles
+            .extend([magnet, file]);
+        let phases = |state: &StateMap| {
+            [magnet, file].map(|h| state.get(&h.infohash).expect("tracked").phase)
+        };
+
+        let state = StateMap::new();
+        scan.track_all(&state, &source);
+        assert_eq!(
+            phases(&state),
+            [TorrentPhase::AwaitingMetadata, TorrentPhase::Checking]
+        );
+
+        engine.inject_error("torrent_statuses", torrentd_engine::EngineError::Shutdown);
+        let state = StateMap::new();
+        scan.track_all(&state, &source);
+        assert_eq!(phases(&state), [TorrentPhase::Checking; 2]);
     }
 
     /// Issue 455: a torrent its session keyed by another infohash, whose
@@ -7595,6 +7690,14 @@ mod tests {
                 .register_handle(libtorrent_safe::InfoHash([n; 20]))
         }
 
+        /// The profile's session, as the boot hands it to `track_all`.
+        fn source(&self) -> ProfileSource {
+            ProfileSource::new(vec![(
+                self.a.clone(),
+                self.engine.clone() as Arc<dyn TorrentEngine>,
+            )])
+        }
+
         fn calls(
             &self,
             want: fn(&torrentd_engine::RecordedCall) -> Option<torrentd_engine::TorrentHandle>,
@@ -7797,7 +7900,7 @@ mod tests {
         t.settle().await;
         assert_eq!(t.paused_for_vpn(), 0, "the lift started the count over");
 
-        scan.track_all(&state);
+        scan.track_all(&state, &t.source());
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
         let walked = crate::vpn_monitor::fence(
@@ -7834,7 +7937,7 @@ mod tests {
             scan.added(&t.profiles, &t.metrics, &t.a, h);
         }
         assert!(t.pauses().is_empty(), "not fenced yet");
-        scan.track_all(&state);
+        scan.track_all(&state, &t.source());
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
         let walked = crate::vpn_monitor::fence(
@@ -7868,7 +7971,7 @@ mod tests {
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
         crate::vpn_monitor::mark_fenced(entry, None, "ip_lost_or_changed", t.metrics.as_ref());
-        scan.track_all(&state);
+        scan.track_all(&state, &t.source());
         let walked = crate::vpn_monitor::walk_fenced(entry, &state, t.metrics.as_ref());
         assert_eq!(walked, 3, "the walk finds the tracked torrents");
 

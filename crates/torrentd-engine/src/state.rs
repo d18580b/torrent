@@ -81,6 +81,23 @@ impl TorrentPhase {
             TorrentPhase::Removed => "removed",
         }
     }
+
+    /// What a torrent the session has just added is doing, before its first
+    /// state update says more: the phase that update maps libtorrent's
+    /// starting state to.
+    ///
+    /// libtorrent builds every torrent in `checking_resume_data`, which
+    /// [`TorrentPhase::Checking`] covers, and moves one without metadata to
+    /// `downloading_metadata` as it starts it. Not `Idle`:
+    /// that says the torrent has metadata, and that nothing is in its way
+    /// but peers, which is not known of any torrent until its check is over.
+    pub fn on_add(has_metadata: bool) -> Self {
+        if has_metadata {
+            TorrentPhase::Checking
+        } else {
+            TorrentPhase::AwaitingMetadata
+        }
+    }
 }
 
 /// Retry schedule for recovering a torrent after a disk error: 60→120→240→…
@@ -204,6 +221,11 @@ pub struct TorrentState {
 }
 
 impl TorrentState {
+    /// An entry for `handle` with nothing reported yet, in phase `Idle`
+    /// whatever the torrent is doing: for a caller that sets the phase it
+    /// needs. A torrent a session adds is tracked through
+    /// [`StateMap::track_added`], which starts it in the phase its add
+    /// implies ([`TorrentPhase::on_add`]).
     pub fn newly_added(handle: TorrentHandle, profile: ProfileId, now: Instant) -> Self {
         Self {
             handle,
@@ -384,9 +406,24 @@ impl StateMap {
         }
     }
 
+    /// Whether the map tracks `handle` for `profile`: an entry under that
+    /// info-hash, for that very torrent, of that profile.
+    pub fn tracks(&self, handle: TorrentHandle, profile: &ProfileId) -> bool {
+        self.inner
+            .get(&handle.infohash)
+            .is_some_and(|st| st.handle == handle && st.profile_id == *profile)
+    }
+
     /// Track `handle`, a torrent `profile`'s session holds, unless the map
     /// already tracks that very torrent for that profile. Returns whether it
     /// inserted a fresh entry.
+    ///
+    /// A fresh entry starts in the phase the add implies
+    /// ([`TorrentPhase::on_add`]): `has_metadata` is whether the session
+    /// holds the torrent's metadata. Until its first state update that is all
+    /// the daemon knows of what it is doing, and a listing in between must
+    /// not show a magnet still fetching its metadata, or a torrent not yet
+    /// checked, as `Idle`.
     ///
     /// Every path that learns of a torrent goes through this: the boot scans
     /// with the handle `add_torrent` returned, the `add_torrent_alert`
@@ -395,18 +432,28 @@ impl StateMap {
     /// must not reset what the earlier one's entry has gathered since. An
     /// entry under another handle or profile is a torrent the info-hash has
     /// outlived, and is replaced, as an add has always replaced it.
-    pub fn track_added(&self, handle: TorrentHandle, profile: &ProfileId, now: Instant) -> bool {
+    pub fn track_added(
+        &self,
+        handle: TorrentHandle,
+        profile: &ProfileId,
+        has_metadata: bool,
+        now: Instant,
+    ) -> bool {
         use dashmap::mapref::entry::Entry;
+        let fresh = || TorrentState {
+            phase: TorrentPhase::on_add(has_metadata),
+            ..TorrentState::newly_added(handle, profile.clone(), now)
+        };
         let inserted = match self.inner.entry(handle.infohash) {
             Entry::Occupied(e) if e.get().handle == handle && e.get().profile_id == *profile => {
                 false
             }
             Entry::Occupied(mut e) => {
-                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                e.insert(fresh());
                 true
             }
             Entry::Vacant(e) => {
-                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                e.insert(fresh());
                 true
             }
         };
@@ -1010,9 +1057,9 @@ mod tests {
         let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
         let now = Instant::now();
         // 1 and 2 are p's, 3 is q's, 4 is no longer tracked by anyone.
-        assert!(m.track_added(handle(1, 1), &p, now));
-        assert!(m.track_added(handle(2, 2), &p, now));
-        assert!(m.track_added(handle(3, 3), &q, now));
+        assert!(m.track_added(handle(1, 1), &p, true, now));
+        assert!(m.track_added(handle(2, 2), &p, true, now));
+        assert!(m.track_added(handle(3, 3), &q, true, now));
         for b in 1..=4 {
             m.queue_resume_save(ih(b), ResumeFlags::ONLY_IF_MODIFIED);
         }
@@ -1046,19 +1093,48 @@ mod tests {
         m.insert(a.infohash, TorrentState::newly_added(a, p.clone(), now));
         let g1 = m.generation();
         assert!(g1 > g0);
-        assert!(!m.track_added(a, &p, now), "already tracked");
+        assert!(!m.track_added(a, &p, true, now), "already tracked");
         assert!(m.remove(&a.infohash, &ProfileId::new("q"), None).is_none());
         assert!(m.remove(&b.infohash, &p, None).is_none());
         m.update(&a.infohash, |s| s.retry = None);
         assert_eq!(m.generation(), g1, "a no-op moved the generation");
 
         assert!(m.remove(&a.infohash, &p, Some(a)).is_some());
-        assert!(m.track_added(b, &p, now));
+        assert!(m.track_added(b, &p, true, now));
         assert_eq!(m.len(), 1);
         assert_eq!(m.generation(), g1 + 2, "a swap left the generation");
         // The same info-hash under another handle is another torrent.
-        assert!(m.track_added(handle(3, 2), &p, now));
+        assert!(m.track_added(handle(3, 2), &p, true, now));
         assert_eq!(m.generation(), g1 + 3);
+    }
+
+    /// Before its first state update, a torrent reads as what its add
+    /// implies: a magnet as fetching its metadata, one with metadata as
+    /// checking. Never `Idle`, which says it has been checked.
+    #[test]
+    fn a_tracked_add_starts_in_the_phase_its_metadata_implies() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let p = ProfileId::new("p");
+        let (magnet, file) = (handle(1, 1), handle(2, 2));
+        assert!(m.track_added(magnet, &p, false, now));
+        assert!(m.track_added(file, &p, true, now));
+        assert_eq!(
+            m.get(&magnet.infohash).unwrap().phase,
+            TorrentPhase::AwaitingMetadata
+        );
+        assert_eq!(m.get(&file.infohash).unwrap().phase, TorrentPhase::Checking);
+
+        // A second report of the same torrent keeps what the entry gathered.
+        m.update(&file.infohash, |s| s.phase = TorrentPhase::Seeding);
+        assert!(!m.track_added(file, &p, false, now));
+        assert_eq!(m.get(&file.infohash).unwrap().phase, TorrentPhase::Seeding);
+        assert!(m.tracks(file, &p));
+        assert!(!m.tracks(file, &ProfileId::new("q")));
+        assert!(
+            !m.tracks(handle(3, 2), &p),
+            "another torrent under the info-hash"
+        );
     }
 
     #[test]

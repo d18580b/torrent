@@ -224,11 +224,7 @@ fn reconcile_session(ctx: &HandlerCtx<'_>, adds: bool, removals: bool) {
         // Only the missing: a tracked torrent's add was handled, or seeded by
         // the boot scan, and re-asking its save and hold for every torrent in
         // a 100K session would cost a store lookup each.
-        let tracked = ctx
-            .state
-            .get(&h.infohash)
-            .is_some_and(|st| st.handle == h && st.profile_id == ctx.profile_id);
-        if !tracked && add::track(h, ctx) {
+        if !ctx.state.tracks(h, &ctx.profile_id) && add::track(h, ctx) {
             recovered += 1;
         }
     }
@@ -405,7 +401,7 @@ mod tests {
                 id: u64::from(b),
                 infohash: InfoHash([b; 20]),
             };
-            assert!(state.track_added(h, profile, now));
+            assert!(state.track_added(h, profile, true, now));
             state.queue_resume_save(h.infohash, ResumeFlags::ONLY_IF_MODIFIED);
         }
         state.dispatch_resume_saves(usize::MAX);
@@ -474,7 +470,7 @@ mod tests {
         let metrics = RecordingSink::new();
         let p = ProfileId::new("p");
         // `a`'s alert was handled, and its entry has moved on since.
-        assert!(state.track_added(a, &p, std::time::Instant::now()));
+        assert!(state.track_added(a, &p, true, std::time::Instant::now()));
         state.update(&a.infohash, |st| st.phase = TorrentPhase::Seeding);
 
         run_on(mock.clone(), &state, &metrics, ADD_DROPPED);
@@ -562,7 +558,7 @@ mod tests {
     ) -> TorrentHandle {
         let p = ProfileId::new("p");
         let h = mock.register_handle(ih);
-        assert!(state.track_added(h, &p, std::time::Instant::now()));
+        assert!(state.track_added(h, &p, true, std::time::Instant::now()));
         resume.write(&p, &ih, b"old-resume").unwrap();
         torrents.write(&p, &ih, b"old-torrent").unwrap();
         resume.write_tombstone(&p, &ih).unwrap();
@@ -604,7 +600,7 @@ mod tests {
         removed_by_delete(&mock, &state, &resume, &torrents, ih);
         // Still held, and tracked: untouched.
         let kept = mock.register_handle(InfoHash([7; 20]));
-        assert!(state.track_added(kept, &p, std::time::Instant::now()));
+        assert!(state.track_added(kept, &p, true, std::time::Instant::now()));
 
         run_with(
             mock.clone(),
@@ -682,7 +678,7 @@ mod tests {
             assert_ne!(new, old);
             torrents.write(&p, &ih, b"new-torrent").unwrap();
             if readd_tracked {
-                assert!(state.track_added(new, &p, std::time::Instant::now()));
+                assert!(state.track_added(new, &p, true, std::time::Instant::now()));
             }
 
             run_with(mock, &state, &resume, &torrents, &metrics, bits);
@@ -718,7 +714,7 @@ mod tests {
         let p = ProfileId::new("p");
         let ih = InfoHash([9; 20]);
         let h = mock.register_handle(ih);
-        assert!(state.track_added(h, &p, std::time::Instant::now()));
+        assert!(state.track_added(h, &p, true, std::time::Instant::now()));
         torrents.write(&p, &ih, b"torrent").unwrap();
         mock.remove_torrent(h, false).unwrap();
 
@@ -782,7 +778,7 @@ mod tests {
             mock.register_handle(InfoHash([11; 20])),
         );
         for h in [a, b] {
-            assert!(state.track_added(h, &p, std::time::Instant::now()));
+            assert!(state.track_added(h, &p, true, std::time::Instant::now()));
             state.update(&h.infohash, |st| {
                 st.phase = TorrentPhase::Seeding;
                 st.is_seeding = true;
@@ -827,7 +823,7 @@ mod tests {
     fn seeding_entry(state: &StateMap, h: TorrentHandle, profile: &ProfileId) {
         use crate::state::TorrentPhase;
 
-        assert!(state.track_added(h, profile, std::time::Instant::now()));
+        assert!(state.track_added(h, profile, true, std::time::Instant::now()));
         state.update(&h.infohash, |st| {
             st.phase = TorrentPhase::Seeding;
             st.is_seeding = true;
@@ -899,7 +895,7 @@ mod tests {
         let h = mock.register_handle(InfoHash([13; 20]));
         let state = StateMap::new();
         let metrics = RecordingSink::new();
-        assert!(state.track_added(h, &ProfileId::new("p"), std::time::Instant::now()));
+        assert!(state.track_added(h, &ProfileId::new("p"), true, std::time::Instant::now()));
         state.update(&h.infohash, |st| st.phase = TorrentPhase::Seeding);
         mock.set_torrent_status(paused_status(h));
         let mut bits = [u64::MAX, u64::MAX];
@@ -917,7 +913,7 @@ mod tests {
         let h = mock.register_handle(InfoHash([14; 20]));
         let state = StateMap::new();
         let metrics = RecordingSink::new();
-        assert!(state.track_added(h, &ProfileId::new("p"), std::time::Instant::now()));
+        assert!(state.track_added(h, &ProfileId::new("p"), true, std::time::Instant::now()));
         state.update(&h.infohash, |st| st.phase = TorrentPhase::Seeding);
         mock.set_torrent_status(paused_status(h));
         mock.inject_error("torrent_statuses", EngineError::Shutdown);

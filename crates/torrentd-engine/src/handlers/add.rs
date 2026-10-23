@@ -246,13 +246,43 @@ pub fn delete_removed_files(
 /// returned, the entry is kept rather than reset. The hold and the save are
 /// asked again either way; a pause is idempotent, and a save already queued
 /// or in flight is not asked for twice.
+///
+/// A fresh entry starts in the phase the add implies, from whether the
+/// session holds the torrent's metadata: a magnet reads `AwaitingMetadata`
+/// and any other torrent `Checking` until its first state update. The
+/// session is asked only for a torrent the map lacks, so the boot's add
+/// alerts, whose torrents the scans already tracked, cost no query each.
 pub fn track(handle: TorrentHandle, ctx: &HandlerCtx<'_>) -> bool {
+    // For a torrent already tracked the answer is unused: its entry is kept.
+    let has_metadata =
+        ctx.state.tracks(handle, &ctx.profile_id) || session_has_metadata(handle, ctx);
     let fresh = ctx
         .state
-        .track_added(handle, &ctx.profile_id, ctx.clock.now());
+        .track_added(handle, &ctx.profile_id, has_metadata, ctx.clock.now());
     hold_if_fenced(handle, ctx);
     queue_first_resume_save(handle, ctx);
     fresh
+}
+
+/// Whether `handle`'s session holds its metadata. A torrent the session
+/// cannot describe is taken to have it: libtorrent starts every torrent in
+/// `checking_resume_data`, and only one the session says lacks metadata is
+/// known to be fetching it.
+fn session_has_metadata(handle: TorrentHandle, ctx: &HandlerCtx<'_>) -> bool {
+    match ctx.engine.torrent_details(handle) {
+        Ok(details) => details.has_metadata,
+        Err(e) => {
+            warn!(
+                target: "torrentd_engine::handler::add",
+                infohash = %handle.infohash,
+                op = "torrent_details",
+                error.cause = %e,
+                "could not read an added torrent's details; it reads checking until its first \
+                 state update",
+            );
+            true
+        }
+    }
 }
 
 /// Make an add durable now rather than at the next 30-minute sweep or the
@@ -681,7 +711,7 @@ mod tests {
             id: 1,
             infohash: ih,
         };
-        assert!(state.track_added(th, &profile, clock.now()));
+        assert!(state.track_added(th, &profile, true, clock.now()));
         state.update(&ih, |st| {
             st.phase = TorrentPhase::Seeding;
             st.total_uploaded = 5;
@@ -707,6 +737,82 @@ mod tests {
         assert_eq!(
             state.dispatch_resume_saves(8),
             vec![(ih, ResumeFlags::empty())],
+        );
+    }
+
+    /// The phase an add alert's fresh entry carries before any state update,
+    /// with the session describing the torrent as `details` does (`None`: it
+    /// cannot describe it), and whether the handler asked the session.
+    fn phase_after_add_alert(
+        details: Option<bool>,
+        tracked: bool,
+    ) -> (crate::state::TorrentPhase, bool) {
+        let ih = InfoHash([0x83; 20]);
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let clock = MockClock::new();
+        let mock = Arc::new(MockEngine::new());
+        let th = mock.register_handle(ih);
+        match details {
+            Some(has_metadata) => mock.set_torrent_details(
+                th,
+                libtorrent_safe::TorrentDetails {
+                    has_metadata,
+                    ..MockEngine::default_details()
+                },
+            ),
+            None => mock.inject_error("torrent_details", crate::engine::EngineError::Shutdown),
+        }
+        if tracked {
+            assert!(state.track_added(th, &profile, false, clock.now()));
+        }
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &NoopSink,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            fence_hold: None,
+            profile_id: profile,
+            span: tracing::info_span!("test"),
+        };
+        handle(&add_alert(ih, Some(th), 0), &mut ctx);
+        let asked = mock
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::mock::RecordedCall::TorrentDetails(h) if *h == th));
+        (state.get(&ih).expect("tracked").phase, asked)
+    }
+
+    /// A magnet whose metadata has not arrived is listed as fetching it, and
+    /// a torrent with metadata as checking, from the moment its add alert is
+    /// handled: neither as `Idle`, which says the torrent was checked.
+    #[test]
+    fn an_added_torrent_reads_the_phase_its_metadata_implies_before_any_update() {
+        use crate::state::TorrentPhase;
+        assert_eq!(
+            phase_after_add_alert(Some(false), false),
+            (TorrentPhase::AwaitingMetadata, true)
+        );
+        assert_eq!(
+            phase_after_add_alert(Some(true), false),
+            (TorrentPhase::Checking, true)
+        );
+        // A session that cannot describe it: libtorrent's starting state.
+        assert_eq!(
+            phase_after_add_alert(None, false),
+            (TorrentPhase::Checking, true)
+        );
+        // Already tracked (the boot scan's torrents): the session is not
+        // asked, and the entry keeps its phase.
+        assert_eq!(
+            phase_after_add_alert(Some(true), true),
+            (TorrentPhase::AwaitingMetadata, false)
         );
     }
 

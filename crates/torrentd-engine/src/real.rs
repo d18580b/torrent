@@ -505,7 +505,7 @@ mod tests {
         engine.torrent_statuses().expect("statuses");
         while !engine.pop_alerts().is_empty() {}
         for h in &paused {
-            assert!(state.track_added(*h, &p, Instant::now()));
+            assert!(state.track_added(*h, &p, true, Instant::now()));
             state.update(&h.infohash, |st| st.phase = TorrentPhase::Incomplete);
         }
         // Paused, and then the flood: the next update, the only one that
