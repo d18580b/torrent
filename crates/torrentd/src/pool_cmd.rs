@@ -5,6 +5,7 @@
 //! matcher got it right *before* anything is handed to a session.
 
 use std::collections::HashMap;
+use std::io::Write;
 
 use anyhow::Context;
 use torrentd_engine::AssignmentRegistry;
@@ -101,25 +102,31 @@ fn scan_inner(
         // and "you ran this as the wrong user".
         println!("  {errors} entries could not be read (see warnings above)");
     }
-    print_rollups(&*store)?;
+    print_rollups(&mut std::io::stdout().lock(), &*store)?;
     Ok(())
 }
 
 /// Summarise the index without touching the filesystem.
 pub fn status(cfg: &Config) -> anyhow::Result<()> {
+    status_to(cfg, &mut std::io::stdout().lock())
+}
+
+/// [`status`], written to `out`.
+fn status_to(cfg: &Config, out: &mut dyn Write) -> anyhow::Result<()> {
     let db = cfg.pool_db_path();
     if !db.exists() {
         anyhow::bail!("no pool index at {} — run `pool scan` first", db.display());
     }
     let store = PoolStore::open(&db)?;
-    println!("index: {}", db.display());
-    println!(
+    writeln!(out, "index: {}", db.display())?;
+    writeln!(
+        out,
         "{} files, {} torrents",
         store.file_count()?,
         store.torrent_count()?,
-    );
-    print_state_counts(&store.counts_by_state()?);
-    print_rollups(&store)?;
+    )?;
+    print_state_counts(out, &store.counts_by_state()?)?;
+    print_rollups(out, &store)?;
     Ok(())
 }
 
@@ -129,6 +136,11 @@ pub fn status(cfg: &Config) -> anyhow::Result<()> {
 /// so can never disagree with it. This compares the two, which is the question
 /// worth asking between scans: has anything under me changed?
 pub fn check(cfg: &Config) -> anyhow::Result<()> {
+    check_to(cfg, &mut std::io::stdout().lock())
+}
+
+/// [`check`], written to `out`.
+fn check_to(cfg: &Config, out: &mut dyn Write) -> anyhow::Result<()> {
     let db = cfg.pool_db_path();
     if !db.exists() {
         anyhow::bail!("no pool index at {} — run `pool scan` first", db.display());
@@ -138,32 +150,39 @@ pub fn check(cfg: &Config) -> anyhow::Result<()> {
     let report = torrentd_pool::drift::detect(&mut store, |id| roots.get(&id).cloned())?;
 
     for line in unseen_lines(&report) {
-        println!("{line}");
+        writeln!(out, "{line}")?;
     }
     if report.drifted.is_empty() {
         if report.unchecked.is_empty() && report.files_unreadable == 0 {
-            println!("no drift: every claimed file matches the indexed snapshot");
+            writeln!(
+                out,
+                "no drift: every claimed file matches the indexed snapshot"
+            )?;
         } else {
-            println!("no drift in what could be checked");
+            writeln!(out, "no drift in what could be checked")?;
         }
         return Ok(());
     }
-    println!(
+    writeln!(
+        out,
         "{} torrent(s) drifted — {} file(s) changed, {} vanished",
         report.drifted.len(),
         report.files_changed,
         report.files_vanished,
-    );
+    )?;
     for ih in report.drifted.iter().take(50) {
         let name = store
             .torrent(ih)?
             .map(|t| t.name)
             .unwrap_or_else(|| "?".into());
-        println!("  {ih}  {name}");
+        writeln!(out, "  {ih}  {name}")?;
     }
     // A stat-level difference is a reason to verify, not proof of corruption:
     // only libtorrent re-hashing the payload can settle that.
-    println!("\nrun a verification pass over these before trusting them to seed");
+    writeln!(
+        out,
+        "\nrun a verification pass over these before trusting them to seed"
+    )?;
     Ok(())
 }
 
@@ -199,6 +218,11 @@ fn unseen_lines(report: &torrentd_pool::drift::DriftReport) -> Vec<String> {
 /// question, which is the whole reason to index a pool rather than a client's
 /// torrent list.
 pub fn orphans(cfg: &Config, limit: usize) -> anyhow::Result<()> {
+    orphans_to(cfg, limit, &mut std::io::stdout().lock())
+}
+
+/// [`orphans`], written to `out`.
+fn orphans_to(cfg: &Config, limit: usize, out: &mut dyn Write) -> anyhow::Result<()> {
     let db = cfg.pool_db_path();
     if !db.exists() {
         anyhow::bail!("no pool index at {} — run `pool scan` first", db.display());
@@ -206,12 +230,13 @@ pub fn orphans(cfg: &Config, limit: usize) -> anyhow::Result<()> {
     let store = PoolStore::open(&db)?;
     for (root_id, path) in store.roots()? {
         let r = store.rollup(root_id, "")?;
-        println!(
+        writeln!(
+            out,
             "{}: {} unclaimed in {} files",
             path.display(),
             human_bytes(r.bytes_orphan),
             r.files_orphan,
-        );
+        )?;
         // Walk the top level so the operator sees which subtree to look at,
         // rather than a flat list of a million paths.
         for (child, is_dir) in store.children(root_id, "")?.into_iter().take(limit) {
@@ -219,12 +244,13 @@ pub fn orphans(cfg: &Config, limit: usize) -> anyhow::Result<()> {
             if cr.bytes_orphan == 0 {
                 continue;
             }
-            println!(
+            writeln!(
+                out,
                 "  {:<50} {:>12} unclaimed{}",
                 child,
                 human_bytes(cr.bytes_orphan),
                 if is_dir { "" } else { " (file)" },
-            );
+            )?;
         }
     }
     Ok(())
@@ -280,9 +306,13 @@ fn import_legacy(store: &mut PoolStore, registry: &AssignmentRegistry) -> anyhow
     Ok(())
 }
 
-fn print_state_counts(counts: &HashMap<AdoptionState, u64>) {
+fn print_state_counts(
+    out: &mut dyn Write,
+    counts: &HashMap<AdoptionState, u64>,
+) -> std::io::Result<()> {
     let get = |s: AdoptionState| counts.get(&s).copied().unwrap_or(0);
-    println!(
+    writeln!(
+        out,
         "  adopted {}   matched {}   partial {}   missing {}   drifted {}   overlap {}   shared {}",
         get(AdoptionState::Adopted),
         get(AdoptionState::Matched),
@@ -291,20 +321,21 @@ fn print_state_counts(counts: &HashMap<AdoptionState, u64>) {
         get(AdoptionState::Drifted),
         get(AdoptionState::Overlap),
         get(AdoptionState::Shared),
-    );
+    )
 }
 
-fn print_rollups(store: &PoolStore) -> anyhow::Result<()> {
+fn print_rollups(out: &mut dyn Write, store: &PoolStore) -> anyhow::Result<()> {
     for (root_id, path) in store.roots()? {
         let r = store.rollup(root_id, "")?;
-        println!(
+        writeln!(
+            out,
             "\n{}\n  total {:>12}   adopted {:>12}   matched {:>12}   unclaimed {:>12}",
             path.display(),
             human_bytes(r.bytes_total),
             human_bytes(r.bytes_adopted),
             human_bytes(r.bytes_matched),
             human_bytes(r.bytes_orphan),
-        );
+        )?;
     }
     Ok(())
 }
@@ -416,6 +447,126 @@ listen_interfaces = "0.0.0.0:6881"
 
         drop(daemon);
         scan(&cfg).expect("the scan runs once the daemon is gone");
+    }
+
+    /// A pool of one torrent, `a`, whose one-byte payload `pool/a` is on
+    /// disk, plus the one-byte file nothing claims, `pool/extras/stray`;
+    /// scanned. Returns the config and the torrent's infohash.
+    fn scanned_pool(dir: &Path) -> (Config, String) {
+        let cfg = Config::minimal_for_tests(dir, false);
+        std::fs::write(dir.join("pool/a"), b"x").unwrap();
+        std::fs::create_dir(dir.join("pool/extras")).unwrap();
+        std::fs::write(dir.join("pool/extras/stray"), b"z").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.join("library/t.torrent"), &bare).unwrap();
+        scan(&cfg).unwrap();
+        let ih = PoolStore::open(&cfg.pool_db_path())
+            .unwrap()
+            .torrents()
+            .unwrap()[0]
+            .infohash
+            .clone();
+        (cfg, ih)
+    }
+
+    fn output(run: impl FnOnce(&mut dyn Write) -> anyhow::Result<()>) -> String {
+        let mut out = Vec::new();
+        run(&mut out).expect("the command succeeds");
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Payload rewritten since the scan: `pool check` marks its torrent
+    /// `drifted` in the index, names it, and still succeeds — drift is a
+    /// finding, not a failed check, so the exit status is 0.
+    #[test]
+    fn a_check_marks_a_rewritten_payload_drifted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, ih) = scanned_pool(dir.path());
+        assert_eq!(
+            output(|out| check_to(&cfg, out)),
+            "no drift: every claimed file matches the indexed snapshot\n"
+        );
+
+        // Same size, new bytes and mtime.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(dir.path().join("pool/a"), b"y").unwrap();
+        assert_eq!(
+            output(|out| check_to(&cfg, out)),
+            format!(
+                "1 torrent(s) drifted — 1 file(s) changed, 0 vanished\n  {ih}  a\n\n\
+                 run a verification pass over these before trusting them to seed\n"
+            )
+        );
+        let store = PoolStore::open(&cfg.pool_db_path()).unwrap();
+        assert_eq!(
+            store.adoption_state(&ih).unwrap(),
+            Some(AdoptionState::Drifted)
+        );
+        drop(store);
+        let status = output(|out| status_to(&cfg, out));
+        assert!(
+            status.contains("\n  adopted 0   matched 0   partial 0   missing 0   drifted 1   "),
+            "{status}"
+        );
+    }
+
+    /// `pool status` reads the index as the scan left it: the counts, the
+    /// states, and each root's rollup.
+    #[test]
+    fn a_status_reports_the_scanned_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _) = scanned_pool(dir.path());
+        let root = dir.path().join("pool");
+        assert_eq!(
+            output(|out| status_to(&cfg, out)),
+            format!(
+                "index: {}\n\
+                 2 files, 1 torrents\n  \
+                 adopted 0   matched 1   partial 0   missing 0   drifted 0   overlap 0   shared 0\n\
+                 \n{}\n  total {:>12}   adopted {:>12}   matched {:>12}   unclaimed {:>12}\n",
+                cfg.pool_db_path().display(),
+                root.display(),
+                "2 B",
+                "0 B",
+                "1 B",
+                "1 B",
+            )
+        );
+    }
+
+    /// `pool orphans` names the bytes no torrent claims, by top-level
+    /// directory, and nothing a torrent claims.
+    #[test]
+    fn orphans_lists_only_what_no_torrent_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _) = scanned_pool(dir.path());
+        assert_eq!(
+            output(|out| orphans_to(&cfg, 50, out)),
+            format!(
+                "{}: 1 B unclaimed in 1 files\n  {:<50} {:>12} unclaimed\n",
+                dir.path().join("pool").display(),
+                "extras",
+                "1 B",
+            )
+        );
+    }
+
+    /// Before any scan there is no index to read, and each read-only command
+    /// fails, pointing at `pool scan`, rather than creating an empty one.
+    #[test]
+    fn the_read_only_commands_refuse_before_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::minimal_for_tests(dir.path(), false);
+        for e in [
+            status_to(&cfg, &mut Vec::new()).unwrap_err(),
+            check_to(&cfg, &mut Vec::new()).unwrap_err(),
+            orphans_to(&cfg, 50, &mut Vec::new()).unwrap_err(),
+        ] {
+            assert!(e.to_string().ends_with("run `pool scan` first"), "{e}");
+        }
+        assert!(!cfg.pool_db_path().exists());
     }
 
     #[test]
