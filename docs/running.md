@@ -2168,9 +2168,6 @@ On a scratch pool, not your real one.
       change and the backlog clearing, the gauge stays at `0` long enough to
       fire `TorrentdPortForwardDown`.
 
-   This drill has not yet been run against a live Proton gateway from this
-   repository: the renewal, rebind and reannounce are tested against a fake
-   NAT-PMP gateway and a mock session. Record the result here when it has.
    A fence that lands during a renewal is drill 8's `natpmp-fence.sh`.
 
    The ruleset also confines the daemon's **replies**: a request to
@@ -2189,8 +2186,9 @@ On a scratch pool, not your real one.
    Inside the namespace the drill is uid 0, so the kill switch it installs,
    the ruleset `killswitch::render_ruleset_with_transport` renders, matches
    every socket there. Each drill exits 0 when it finds no gap, 1 when it
-   finds one, and prints a line per check: `gap` fails the drill, while `ok`
-   and `info` do not.
+   finds one, and 2 when its topology could not be set up (`natpmp-fence.sh`
+   also exits 3, below). It prints a line per check: `gap` fails the drill,
+   while `ok` and `info` do not.
 
    ```bash
    deploy/drill/udp-transport.sh
@@ -2209,8 +2207,7 @@ On a scratch pool, not your real one.
    restores the rule, sets the profile online, and tries again (`ATTEMPTS`,
    default 4), and it exits 3 if no attempt lands.
 
-   Results, run on Linux 7.2 against this branch's head (every drill exits
-   0):
+   Results, run on Linux 7.2 (every drill exits 0):
 
    - **The transport exemption holds while the link is up.** A UDP socket
      of the daemon's uid cannot bind the tunnel's listen port: on the
@@ -2221,16 +2218,13 @@ On a scratch pool, not your real one.
      down` on an adopted link), a socket bound to the freed port, and an
      unbound one the kernel hands it as an ephemeral port (a resolver query,
      say), are refused with `EPERM`, and nothing reaches the physical link:
-     the exemption reaches only the provider's endpoint. Before #136 it was
-     a source port alone, and both left by the physical interface,
-     unencrypted (`udp 192.0.2.1 51821 -> 192.0.2.2 7` and `-> :53`).
+     the exemption reaches only the provider's endpoint.
    - **A link re-raised on another port carries again at the next check.**
      Re-raised without a `ListenPort`, the link gets a port the kernel picks
      (`33979` in the run recorded here), and under the ruleset read before
      it carries nothing: handshakes complete, so every health check passes.
      Installed again with the live port, as the watch's next check does, it
-     carries. Before #136 the ruleset was read once, at boot, and the tunnel
-     carried nothing until the daemon restarted.
+     carries.
    - **The daemon's listeners do not answer on the physical link.** A SYN to
      a wildcard listener (an `http_listen` off loopback) at the host's
      physical address gets no SYN-ACK. With the tunnel routed, every reply
@@ -2248,9 +2242,7 @@ On a scratch pool, not your real one.
      `route-fence.sh` makes, before the next poll fences the profile. The
      listener's SYN-ACK is dropped by the uid rules, and the kernel's reset
      and port-unreachable by the address fence; the prober's connect and
-     datagram time out. Before #136 the reset and the port-unreachable left
-     by the physical link from the tunnel address (`tcp 10.200.0.1:9 -> RA`,
-     `icmp 10.200.0.1 -> type 3`), which tied that address to the host.
+     datagram time out.
    - **IPv6 does not leave.** With a global IPv6 address and default route
      on the physical link, and a tunnel with only an IPv4 address, nothing
      the uid sends over IPv6 reaches the link: a datagram, unbound or bound
@@ -2259,13 +2251,10 @@ On a scratch pool, not your real one.
      each reached the peer. A WireGuard link has no IPv6 link-local address
      to send into the tunnel from.
    - **A fence during a renewal stops the rebind and the reannounce.**
-     Against the daemon on this branch the fence landed inside a renewal on
-     the wire, and the renewal logged `NAT-PMP renewed with a new port after
-     the profile was fenced; not rebinding the session or reannouncing` and
-     rebound nothing (exit 0). Against `master` at `ee25dbf`, which read the
-     profile's status only before the exchange, the same drill saw the
-     renewal rebind the fenced profile and reannounce its torrents (exit 1).
-     The status is now checked once the gateway has answered, before the
+     The fence landed inside a renewal on the wire, and the renewal logged
+     `NAT-PMP renewed with a new port after the profile was fenced; not
+     rebinding the session or reannouncing` and rebound nothing (exit 0).
+     The status is checked once the gateway has answered, before the
      session is touched, and again before each reannounce batch. A fence
      that lands while the batches are going out stops the batches still
      to come.

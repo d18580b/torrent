@@ -129,9 +129,7 @@ tombstone, because the report may be only late and a resume save can still
 land before it; the late report, or the next boot, settles it. It logs how many
 it settled and counts them in `torrentd_removals_reconciled_total`, which also
 counts a report that was only late, and that report is then counted again in
-`torrentd_torrents_removed_total`. Before this fix, a dropped report left the
-torrent tracked until a restart, and every `delete_files` and pool delete plan
-on the host was refused for a torrent that could not be read from its session.
+`torrentd_torrents_removed_total`.
 
 What stays behind:
 
@@ -143,8 +141,7 @@ What stays behind:
   orphaned like any other unclaimed file. The exception is a torrent the
   delete leaves `drifted`: a rescan never drops a `drifted` torrent, so its
   files stay claimed and are never offered as orphaned. A rescan also demotes an `adopted`
-  torrent that no session holds and no profile owns, which clears one a
-  delete before this fix left behind.
+  torrent that no session holds and no profile owns.
 - **The payload,** which you remove by archiving it (next section), or by hand
   where it lies outside every managed root.
 
@@ -481,7 +478,7 @@ A crash here is any exit that skipped the stop sequence: `kill -9`, an OOM
 kill, a panic abort, or a power cut. `Restart=on-failure` starts the daemon
 again after 5 s. Work through these in order once it is up.
 
-**Network state (#105).** Nothing ran the teardown, so the kill-switch table,
+**Network state.** Nothing ran the teardown, so the kill-switch table,
 the tunnels and their `ip rule` entries are still in place. The boot cleans up
 what it has a record of:
 
@@ -517,7 +514,7 @@ what it has a record of:
   its records. Anything else stays up. Remove it as
   [Retiring a profile](#retiring-a-profile) describes.
 
-**Adoptions (#109, #139, #187).** An adoption writes its registry claim
+**Adoptions.** An adoption writes its registry claim
 before the add. The verify queue is kept in `pool.db`, and the boot queues
 again every adoption that was still waiting in it, in its old order, once the
 scans have run: the boot logs `queued the adoptions left waiting for
@@ -611,7 +608,7 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
 - With `[pool] allow_mutations` off, nothing is re-driven. The plan stays
   `applying` until a boot that allows mutations.
 
-**Resume data (#109, #110).** A torrent's first resume file is saved as soon
+**Resume data.** A torrent's first resume file is saved as soon
 as the session adds it, unless the profile already holds one for it, as it
 does for every torrent the boot loads from its resume file. It is saved
 again at once when a recheck finishes (`POST /v1/torrents/{ih}/recheck`, the
@@ -641,7 +638,7 @@ resume file at all:
   payload is elsewhere, the torrent finds nothing there and never seeds.
   `DELETE` it without `delete_files`, then add or adopt it again. The add may
   follow the `204` at once: the session settles the removal afterwards, and
-  keeps the `.torrent` and save path the new add wrote (#185). An adopted
+  keeps the `.torrent` and save path the new add wrote. An adopted
   torrent whose `.torrent` write failed too has neither file in the stores,
   so it is one of the unloaded claims above.
 
