@@ -10,11 +10,9 @@ use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::DesiredState;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode as EnginePortForwardMode;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus as EngineProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use tracing::info;
@@ -38,8 +36,10 @@ use crate::http::v1::Torrents;
 use crate::pacing::REANNOUNCE_PACE;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
+use crate::profile_registry::ProfileStatus as ObservedStatus;
 use crate::profile_registry::Resolution;
 use crate::profile_registry::ResumeGate;
+use crate::profile_state::DesiredState;
 
 /// Operations that take no request body.
 macro_rules! bodyless_routes {
@@ -111,12 +111,11 @@ pub enum ProfileStatus {
     VpnDown,
 }
 
-impl From<&EngineProfileStatus> for ProfileStatus {
-    fn from(s: &EngineProfileStatus) -> Self {
+impl From<&ObservedStatus> for ProfileStatus {
+    fn from(s: &ObservedStatus) -> Self {
         match s {
-            EngineProfileStatus::Active => Self::Active,
-            EngineProfileStatus::Failed => Self::Failed,
-            EngineProfileStatus::VpnDown => Self::VpnDown,
+            ObservedStatus::Active => Self::Active,
+            ObservedStatus::VpnDown => Self::VpnDown,
         }
     }
 }
@@ -282,7 +281,7 @@ fn profile_of(s: &AppState, e: &ProfileEntry) -> Profile {
         Ok(paused) => !paused,
         Err(_) => !states.holds_offline(e.id()),
     };
-    let on_network = h.status == EngineProfileStatus::Active && session_running;
+    let on_network = h.status == ObservedStatus::Active && session_running;
     Profile {
         profile_id: e.config.id.as_str().to_owned(),
         status: ProfileStatus::from(&h.status),
@@ -301,7 +300,7 @@ fn profile_of(s: &AppState, e: &ProfileEntry) -> Profile {
         forwarded_port: h.forwarded_port.or(listen_port),
         user_agent: e.config.user_agent.clone(),
         failure_reason: None,
-        fence_reason: (h.status == EngineProfileStatus::VpnDown)
+        fence_reason: (h.status == ObservedStatus::VpnDown)
             .then_some(h.fence_reason)
             .flatten()
             .map(str::to_owned),
@@ -505,7 +504,7 @@ fn set_state(
         .profiles
         .resolve(profile_id)
         .active()
-        .filter(|e| e.health().status == EngineProfileStatus::VpnDown);
+        .filter(|e| e.health().status == ObservedStatus::VpnDown);
     let lift = match (desired, fenced) {
         (DesiredState::Online, Some(entry)) => {
             if let Err(reason) = crate::vpn_monitor::recovery_check(entry, &s.tunnel_probe) {
@@ -559,7 +558,7 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     // finds it active with no run to resume its torrents.
     let run = entry.begin_resume(handles);
     entry.update_health(|h| {
-        h.status = EngineProfileStatus::Active;
+        h.status = ObservedStatus::Active;
         h.tunnel_ip = entry.session_ip;
         h.paused_for_vpn = 0;
     });
@@ -1089,7 +1088,7 @@ pub async fn resume_all_torrents(
         .map(|entry| (entry, entry.open_gate()))
         .collect();
     for (entry, gate) in gates {
-        let held = if entry.health().status == EngineProfileStatus::VpnDown {
+        let held = if entry.health().status == ObservedStatus::VpnDown {
             Some(ProfileProblem::vpn_down())
         } else if s.profile_offline(entry.id()) {
             Some(ProfileProblem::offline())
@@ -1200,7 +1199,7 @@ mod tests {
 
         let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
             "p",
-            EngineProfileStatus::VpnDown,
+            ObservedStatus::VpnDown,
         )]));
         let s = build_test_state(Some(reg));
         let id = ProfileId::new("p");
@@ -1222,7 +1221,7 @@ mod tests {
 
         lift_fence(&s, entry);
         tokio::time::sleep(REANNOUNCE_PACE / 2).await;
-        assert_eq!(entry.health().status, EngineProfileStatus::Active);
+        assert_eq!(entry.health().status, ObservedStatus::Active);
         assert!(
             entry.resume_pending(&last),
             "the first batch went out; the last torrent is still the run's to resume",

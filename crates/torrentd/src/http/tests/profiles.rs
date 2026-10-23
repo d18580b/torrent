@@ -12,7 +12,6 @@ use torrentd_engine::InfoHash;
 use torrentd_engine::MockEngine;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileSource;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RecordedCall;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -28,6 +27,7 @@ use crate::profile_registry::test_vpn_entry;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 
 /// A live profile whose engine the test keeps a handle on.
 fn live(id: &str, status: ProfileStatus) -> (ProfileEntry, Arc<MockEngine>) {

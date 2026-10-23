@@ -49,7 +49,6 @@ use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RenewOutcome;
 use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
@@ -62,6 +61,7 @@ use crate::pacing::Pacer;
 use crate::pacing::REANNOUNCE_PACE;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 use crate::vpn::NatpmpForwarder;
 
 /// NAT-PMP lease lifetime we request (seconds). Also used by startup for the

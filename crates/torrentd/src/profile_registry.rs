@@ -19,7 +19,6 @@ use torrentd_engine::InfoHash;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::Settings;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -27,6 +26,20 @@ use torrentd_engine::TorrentHandle;
 use crate::profile_state::DesiredStates;
 use crate::profile_state::PacedHolds;
 use crate::profile_state::Record;
+
+/// What the daemon observed of a running profile's tunnel and session.
+///
+/// A profile whose VPN bring-up failed at startup never gets an entry here:
+/// it is listed among the registry's failed profiles instead.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ProfileStatus {
+    /// VPN bring-up succeeded and the engine is constructed.
+    Active,
+    /// VPN tunnel went down mid-session; all torrents in this profile are
+    /// paused until the operator sets the profile online and its tunnel
+    /// checks healthy again.
+    VpnDown,
+}
 
 /// Mutable per-profile health, updated by the VPN monitor and read by `/profiles`.
 #[derive(Clone, Debug)]
@@ -1187,10 +1200,11 @@ mod tests {
     /// online; one without DHT is never sent the setting.
     #[test]
     fn a_host_profile_with_dht_has_it_stopped_while_offline() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::ProfileNetwork;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let entry = |id: &str, dht: bool| {
             let mut e = test_host_entry(id);
@@ -1266,9 +1280,10 @@ mod tests {
     /// resume, less what the operator paused while it ran.
     #[test]
     fn going_online_holds_and_pauses_what_would_start_then_paces_it() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let mut e = test_host_entry("p");
         let mock = Arc::new(MockEngine::new());
@@ -1339,9 +1354,10 @@ mod tests {
     /// paused unrecorded.
     #[test]
     fn a_hold_that_cannot_be_written_leaves_the_session_paused() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
@@ -1379,10 +1395,11 @@ mod tests {
     /// where a retry would not reach them because the session runs.
     #[test]
     fn a_failed_dht_start_still_paces_what_the_set_online_paused() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::EngineError;
         use torrentd_engine::MockEngine;
         use torrentd_engine::ProfileNetwork;
+
+        use crate::profile_state::DesiredState;
 
         let mut e = test_host_entry("p");
         e.config.network = ProfileNetwork::Host {
@@ -1422,10 +1439,11 @@ mod tests {
     /// paused, rather than resumed bare with every torrent at once.
     #[test]
     fn an_unreadable_session_state_is_paced_as_paused() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::EngineError;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let mut e = test_host_entry("p");
         let mock = Arc::new(MockEngine::new());

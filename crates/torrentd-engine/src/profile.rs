@@ -1475,55 +1475,6 @@ impl ProfileConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Profile — runtime state
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub enum ProfileStatus {
-    /// VPN bring-up succeeded and the engine is constructed.
-    Active,
-    /// VPN bring-up failed at startup; engine never constructed.
-    Failed,
-    /// VPN tunnel went down mid-session; all torrents in this profile are
-    /// paused until the operator sets the profile online and its tunnel
-    /// checks healthy again.
-    VpnDown,
-}
-
-impl ProfileStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ProfileStatus::Active => "active",
-            ProfileStatus::Failed => "failed",
-            ProfileStatus::VpnDown => "vpn_down",
-        }
-    }
-}
-
-/// Whether the operator wants a profile on the network.
-///
-/// Set by the operator and persisted across restarts, unlike
-/// [`ProfileStatus`], which is what the daemon observed. The two compose: an
-/// `Online` profile the VPN monitor fenced is still off the network, and an
-/// `Offline` profile is held off it however healthy its tunnel is.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DesiredState {
-    #[default]
-    Online,
-    Offline,
-}
-
-impl DesiredState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DesiredState::Online => "online",
-            DesiredState::Offline => "offline",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

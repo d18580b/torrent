@@ -18,7 +18,6 @@ use torrentd_engine::InfoHash;
 use torrentd_engine::MockEngine;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileSource;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RecordedCall;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
@@ -38,6 +37,7 @@ use crate::profile_registry::test_failed_profile;
 use crate::profile_registry::test_host_entry;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 use crate::registry::AssignmentRegistry;
 
 const MAGNET: &str = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101";

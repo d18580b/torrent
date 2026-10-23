@@ -11,13 +11,13 @@ use parking_lot::Mutex;
 use torrentd_engine::AlertSource;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::ResumeStore;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentStore;
 
 use crate::metrics_sink::PromSink;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 use crate::registry::AssignmentRegistry;
 
 #[derive(Clone)]

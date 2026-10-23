@@ -27,7 +27,6 @@ use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileNetwork;
 use torrentd_engine::ProfileSource;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RealEngine;
 use torrentd_engine::ResumeStore;
 use torrentd_engine::ShutdownReason;
@@ -46,6 +45,7 @@ use crate::metrics_sink::PromSink;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 use crate::registry::AssignmentRegistry;
 use crate::reload;
 use crate::sd_notify;
@@ -8841,7 +8841,7 @@ mod profile_construction_tests {
                 |r| {
                     r.set(
                         &ProfileId::new("acct_b"),
-                        torrentd_engine::DesiredState::Offline,
+                        crate::profile_state::DesiredState::Offline,
                     )
                 },
                 |_| (),

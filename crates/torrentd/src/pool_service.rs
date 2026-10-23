@@ -18,7 +18,6 @@ use torrentd_engine::AddParams;
 use torrentd_engine::AlertSource;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentPhase;
@@ -33,6 +32,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::profile_registry::ProfileStatus;
 use crate::registry::AssignmentRegistry;
 
 /// How often the verify queue re-checks what finished hashing.
@@ -3459,13 +3459,13 @@ mod tests {
 
     use torrentd_engine::InfoHash;
     use torrentd_engine::ProfileId;
-    use torrentd_engine::ProfileStatus;
     use torrentd_engine::TorrentHandle;
     use torrentd_engine::TorrentPhase;
     use torrentd_engine::TorrentState;
 
     use super::verify_outcome;
     use super::VerifyOutcome;
+    use crate::profile_registry::ProfileStatus;
 
     const SETTLE: Duration = Duration::from_secs(5);
 
@@ -5352,7 +5352,6 @@ mod tests {
         use std::collections::HashSet;
         use std::sync::Arc;
 
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
         use torrentd_engine::StateMap;
@@ -5361,6 +5360,7 @@ mod tests {
         use crate::profile_registry::Gated;
         use crate::profile_registry::NoTorrents;
         use crate::profile_registry::ProfileRegistry;
+        use crate::profile_state::DesiredState;
 
         let failed = TorrentHandle {
             id: 1,

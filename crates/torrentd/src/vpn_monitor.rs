@@ -28,7 +28,6 @@ use std::time::Instant;
 use futures_util::StreamExt as _;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -44,6 +43,7 @@ use crate::pacing::REANNOUNCE_PACE;
 use crate::profile_registry::Gated;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 use crate::profile_registry::ResumeGate;
 use crate::vpn;
 
@@ -2939,7 +2939,7 @@ mod tests {
                     |r| {
                         r.set(
                             &torrentd_engine::ProfileId::new("acct_a"),
-                            torrentd_engine::DesiredState::Offline,
+                            crate::profile_state::DesiredState::Offline,
                         )
                     },
                     &*metrics.0,
