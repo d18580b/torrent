@@ -742,7 +742,7 @@ pub(crate) fn walk_fenced(
             }
         }
     }
-    // Added, not assigned: the boot scans' fence (`startup::ScanFence`) acts
+    // Added, not assigned: the boot scans' fence (`startup::scan_fence::ScanFence`) acts
     // as soon as it sees the fence's mark, which may be before this walk ends,
     // and adds what it paused to the same count. A torrent it already counted
     // under this fence is not counted again, whichever of the two paused it
@@ -876,7 +876,7 @@ impl KillSwitchFence {
     /// `profile_id`: `Some` while this fence holds the profile, `None` while
     /// it does not.
     ///
-    /// For the boot scans (`startup::ScanFence`), which add torrents no
+    /// For the boot scans (`startup::scan_fence::ScanFence`), which add torrents no
     /// state-map walk reaches: a fence that lands mid-scan records none of
     /// them, so its lift would leave paused every one the scans paused for it.
     /// `hold` runs under the lock [`vpn::killswitch::Fence::fence_all`] and

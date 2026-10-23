@@ -12,7 +12,6 @@ crates/torrentd/src/http/tests/torrents.rs
 crates/torrentd/src/http/v1/torrents.rs
 crates/torrentd/src/pool_apply.rs
 crates/torrentd/src/pool_service.rs
-crates/torrentd/src/startup.rs
 crates/torrentd/src/vpn/killswitch.rs
 crates/torrentd/src/vpn/wireguard.rs
 crates/torrentd/src/vpn_cmd.rs
