@@ -6,13 +6,18 @@
 #
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
-#   mise run fmt|fmt-fix|lint|lint-fix|test|check
+#   mise run fmt|fmt-fix|lint|lint-fix|test|check|msrv|rustfmt-toolchain
 #   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|release-features|deny
 #   mise run lint-tracing|size-check|container|commit-lint <file-or-range>
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
 #   mise run bench -- <subcommand>
+
+# The oldest mise these tasks are run on: the version CI pins in
+# .github/actions/setup-rust. An older mise refuses this file rather than
+# running the tasks with behaviour nothing here was tested against.
+min_version = "2026.10.17"
 
 [tools]
 hk = "1.48.0"
@@ -36,8 +41,11 @@ jobs = 1
 [env]
 # Nightly is used ONLY for rustfmt: granular import normalization
 # (imports_granularity / group_imports in rustfmt.toml) is an unstable feature.
-# Everything else builds/lints/tests on the pinned stable toolchain.
-RUSTFMT_TOOLCHAIN = "nightly"
+# Everything else builds/lints/tests on the stable release rust-toolchain.toml
+# pins. A dated nightly, not `nightly`, so a rustfmt change cannot reformat the
+# tree or fail `fmt` without a commit here; this is its only definition, and
+# `setup`, `rustfmt-toolchain`, `fmt` and `fmt-fix` all read it.
+RUSTFMT_TOOLCHAIN = "nightly-2026-10-22"
 # Warnings are errors everywhere a mise task builds, locally exactly as in CI,
 # so a warning fails a hook or a local `mise run test` instead of first
 # surfacing as a red CI run. It replaces, rather than extends, a RUSTFLAGS the
@@ -359,6 +367,36 @@ run = 'rm -rf "${LIBTORRENT_SYS_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torre
 [tasks.setup]
 description = "One-time dev setup: nightly rustfmt toolchain + activate git hooks"
 run = [
-  "rustup toolchain install nightly --profile minimal --component rustfmt",
+  "mise run rustfmt-toolchain",
   "hk install",
 ]
+
+# Also what CI's fmt job runs, so the job and a developer install the same
+# nightly from the one RUSTFMT_TOOLCHAIN above. Rerun after that value moves.
+[tasks.rustfmt-toolchain]
+description = "Install the dated nightly toolchain rustfmt runs on"
+run = "rustup toolchain install $RUSTFMT_TOOLCHAIN --profile minimal --component rustfmt"
+
+# The workspace's `rust-version` is a claim that it builds on that release;
+# rust-toolchain.toml pins a newer one, so nothing else ever compiles there.
+# The version is read from Cargo.toml rather than copied, so moving the MSRV is
+# one edit (plus clippy.toml's `msrv`, which must match it). `cargo +VERSION`
+# overrides rust-toolchain.toml. RUSTFLAGS from [env] applies, so a warning
+# only that release reports fails this too.
+[tasks.msrv]
+description = "Check the workspace and its tests compile on the MSRV (rust-version)"
+run = '''
+set -eu
+msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+if [ -z "$msrv" ]; then
+  echo "::error::no rust-version in Cargo.toml"
+  exit 1
+fi
+clippy_msrv=$(sed -n 's/^msrv = "\(.*\)"$/\1/p' clippy.toml)
+if [ "$clippy_msrv" != "$msrv" ]; then
+  echo "::error::clippy.toml msrv ($clippy_msrv) must equal Cargo.toml rust-version ($msrv)"
+  exit 1
+fi
+rustup toolchain install "$msrv" --profile minimal
+cargo "+$msrv" check --workspace --all-targets --locked
+'''
