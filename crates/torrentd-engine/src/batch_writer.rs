@@ -11,9 +11,14 @@
 //! queued and returns at once; the writer thread takes whatever has queued up,
 //! and for the whole batch:
 //!
-//! 1. writes every temp file, without flushing each;
-//! 2. flushes each filesystem once with `syncfs(2)`, so every temp file's data
-//!    is on disk before any rename can expose it;
+//! 1. opens each directory, then writes every temp file, without flushing
+//!    each;
+//! 2. flushes each filesystem once with `syncfs(2)` through the directory
+//!    opened in step 1, so every temp file's data is on disk before any
+//!    rename can expose it. The descriptor predates the writes because
+//!    `syncfs` reports a writeback error only to descriptors opened before
+//!    it was recorded: one opened after could see a clean flush while a temp
+//!    file's data was lost, and the rename would replace a good file with it;
 //! 3. renames every temp file over its target;
 //! 4. `fsync`s each directory once, so the renames are durable. This step is
 //!    best effort: a failure is logged once per directory, counted every
@@ -72,6 +77,8 @@ use crate::profile::ProfileId;
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Step {
+    /// This directory was opened for the `syncfs(2)` that flushes a batch.
+    OpenDir(PathBuf),
     /// The temp file at this path was written, not yet flushed.
     Write(PathBuf),
     /// The file at this path was `fsync`ed.
@@ -110,7 +117,8 @@ pub(crate) fn steps_under(root: &Path) -> Vec<Step> {
         .unwrap()
         .iter()
         .filter(|s| {
-            let (Step::Write(p)
+            let (Step::OpenDir(p)
+            | Step::Write(p)
             | Step::SyncFile(p)
             | Step::SyncFs(p)
             | Step::Rename(p)
@@ -331,15 +339,32 @@ fn run_batch(shared: &Shared) {
         }
     };
 
+    // 0. Each directory, created and opened before any temp file in it is
+    //    written. `syncfs(2)` reports a writeback error only to a descriptor
+    //    opened before the error was recorded (the filesystem's errseq is
+    //    sampled at open), so a descriptor opened after the temp files were
+    //    written and closed can miss an EIO on them, and step 3 would then
+    //    rename a file whose data never reached the disk over a good one.
+    let mut dir_fds: HashMap<PathBuf, Result<fs::File, io::ErrorKind>> = HashMap::new();
+    for (path, _) in &batch {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        if dir_fds.contains_key(dir) {
+            continue;
+        }
+        let r = fs::create_dir_all(dir).and_then(|()| fs::File::open(dir));
+        if r.is_ok() {
+            record(|| Step::OpenDir(dir.to_path_buf()));
+        }
+        dir_fds.insert(dir.to_path_buf(), r.map_err(|e| e.kind()));
+    }
+
     // 1. Every temp file, unflushed.
-    let mut made_dirs: HashSet<PathBuf> = HashSet::new();
     let mut written: Vec<(&PathBuf, &Queued)> = Vec::with_capacity(batch.len());
     for (path, q) in &batch {
         let dir = path.parent().unwrap_or(Path::new("."));
         let r = (|| {
-            if !made_dirs.contains(dir) {
-                fs::create_dir_all(dir)?;
-                made_dirs.insert(dir.to_path_buf());
+            if let Some(Err(kind)) = dir_fds.get(dir) {
+                return Err(io::Error::from(*kind));
             }
             let mut f = fs::OpenOptions::new()
                 .write(true)
@@ -371,12 +396,17 @@ fn run_batch(shared: &Shared) {
     let mut flushed_devices: HashMap<u64, Result<(), io::ErrorKind>> = HashMap::new();
     let mut dir_ok: HashMap<PathBuf, Result<(), io::ErrorKind>> = HashMap::new();
     for dir in &dirs {
-        let r = fs::File::open(dir).and_then(|d| {
+        let d = match dir_fds.get(dir) {
+            Some(Ok(d)) => Ok(d),
+            Some(Err(kind)) => Err(io::Error::from(*kind)),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        };
+        let r = d.and_then(|d| {
             let dev = d.metadata()?.dev();
             if let Some(done) = flushed_devices.get(&dev) {
                 return done.map_err(io::Error::from);
             }
-            let r = syncfs(&d);
+            let r = syncfs(d);
             if r.is_ok() {
                 record(|| Step::SyncFs(dir.clone()));
             }
@@ -648,6 +678,39 @@ mod tests {
         );
         assert_eq!(count(|s| matches!(s, Step::SyncDir(_))), 1, "{steps:?}");
         assert_eq!(count(|s| matches!(s, Step::SyncFile(_))), 0, "{steps:?}");
+    }
+
+    /// `syncfs(2)` reports a writeback error only to a descriptor opened
+    /// before the error was recorded. A batch that opened its directory
+    /// after writing and closing its temp files could miss an EIO on one of
+    /// them and rename lost data over a good file, so the directory the
+    /// flush goes through is opened before the first temp file is written.
+    #[test]
+    fn a_batch_opens_the_directory_it_flushes_before_writing_any_temp_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("p");
+        let w = BatchWriter::spawn("test-writer", None);
+        let paths: Vec<PathBuf> = (1..=2u8)
+            .map(|i| root.join(format!("{i}.resume")))
+            .collect();
+        {
+            let _io = w.shared.io.lock();
+            for (i, p) in (1u8..).zip(&paths) {
+                w.enqueue(p.clone(), &ProfileId::new("p"), &ih(i), b"x");
+            }
+        }
+        w.flush();
+        let steps = steps_under(&root);
+        let opened = at(&steps, &Step::OpenDir(root.clone()));
+        for p in &paths {
+            assert!(
+                opened < at(&steps, &Step::Write(tmp_for(p))),
+                "{} was written before the directory its flush goes through was opened: \
+                 {steps:?}",
+                p.display(),
+            );
+        }
+        assert!(opened < at(&steps, &Step::SyncFs(root.clone())));
     }
 
     /// The per-file protocol, [`write_atomic`] and [`BatchWriter::write_now`]:
