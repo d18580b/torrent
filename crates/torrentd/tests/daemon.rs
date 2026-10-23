@@ -453,7 +453,10 @@ fn the_first_scrape_holds_every_series_present_from_boot() {
     sigterm(&child);
     assert!(wait_exit(&mut child, Duration::from_secs(30)));
     // A clean exit still writes the report the next boot re-exports, and it
-    // says nothing was left behind.
+    // says nothing was left behind. This daemon has no kill switch, so
+    // `kill_switch_removal_failed` is false with nothing to remove: the
+    // removal itself is asserted with the switch on, and the table checked
+    // gone, in tests/vpn_netns_e2e.rs.
     let report = std::fs::read_to_string(p.join("last_shutdown.json")).expect("shutdown report");
     assert!(report.contains("\"unsaved_resumes\":0"), "{report}");
     assert!(

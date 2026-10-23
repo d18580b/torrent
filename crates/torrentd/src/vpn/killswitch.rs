@@ -2235,8 +2235,9 @@ table inet torrentd_ks_998 {
 
     /// `disable` against a real `nft`: absent, then present, then absent
     /// again. Needs `CAP_NET_ADMIN` in a network namespace of its own, so it
-    /// is ignored by default; run it unprivileged, under a non-English locale,
-    /// with
+    /// is ignored by default. `mise run test-netns` runs it with every other
+    /// real-kernel test (the `vpn-netns` CI job does, on every pull request);
+    /// alone, unprivileged and under a non-English locale:
     ///
     /// ```text
     /// LC_ALL=de_DE.UTF-8 unshare -rn cargo test -p torrentd --bin torrentd \
@@ -2246,15 +2247,26 @@ table inet torrentd_ks_998 {
     #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
     fn disable_against_real_nft() {
         remove_table_for(998).expect("no table yet: success, in any locale");
-        apply(&install_script(998, &[tunnel("wg0")], &[]).unwrap()).expect("install onto no table");
-        apply(&install_script(998, &[tunnel("wg1")], &[transport_on(51820)]).unwrap())
-            .expect("and replace a standing one in the same transaction");
-        let listed = exec::run_ok("nft", &["list", "table", "inet", TABLE], None, exec::QUICK)
-            .expect("list the table");
-        let listed = String::from_utf8_lossy(&listed.stdout);
+        let first = Installed::render(998, vec![tunnel("wg0")], vec![]).unwrap();
+        apply(&first.script()).expect("install onto no table");
+        let second = Installed::render(
+            998,
+            vec![tunnel("wg1")],
+            vec![("wg1".to_string(), transport_on(51820))],
+        )
+        .unwrap();
+        apply(&second.script()).expect("and replace a standing one in the same transaction");
+        // Read back through `verify`, which compares the live table rule for
+        // rule with what was rendered, rather than through `nft list`'s
+        // pretty-printed text, whose layout differs between nft releases.
+        assert_eq!(
+            verify(&second).unwrap(),
+            Verdict::Intact,
+            "the replace leaves exactly this install's rules"
+        );
         assert!(
-            listed.contains("wg1") && !listed.contains("wg0"),
-            "the replace leaves only this install's rules: {listed}"
+            matches!(verify(&first).unwrap(), Verdict::Drifted(_)),
+            "and none of the one it replaced"
         );
         // #168: a second daemon's, under another uid, beside it.
         apply(&install_script(1000, &[tunnel("wg2")], &[]).unwrap()).expect("install uid 1000's");
@@ -2917,14 +2929,17 @@ table inet torrentd_ks_998 {
             vec![("wg-a".to_string(), two_peer_transport())],
         )
         .unwrap();
-        apply(&installed.script()).expect("install");
-        let listed = exec::run_ok("nft", &["list", "table", "inet", TABLE], None, exec::QUICK)
-            .expect("list the table");
-        let listed = String::from_utf8_lossy(&listed.stdout);
         assert!(
-            listed.contains("ip6 saddr 2001:db8::2 oifname != { \"lo\", \"wg-a\" } drop"),
-            "the IPv6 fence is installed: {listed}"
+            installed
+                .table
+                .contains("ip6 saddr 2001:db8::2 oifname != { \"lo\", \"wg-a\" } drop"),
+            "the rendered table carries the IPv6 fence: {}",
+            installed.table
         );
+        apply(&installed.script()).expect("install");
+        // The live table matches the rendered one rule for rule, the fence
+        // included; read through `verify` rather than `nft list`'s
+        // pretty-printed text, whose layout differs between nft releases.
         assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
         apply(&self::installed().script()).expect("install the table without it");
         assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));

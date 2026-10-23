@@ -7,7 +7,7 @@
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check
-#   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-all|test-alerts
+#   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|deny
 #   mise run native|native-clean
 #   mise run vpn-check <config> [-- <flags>]
@@ -84,6 +84,35 @@ run = [
   "cargo test -p torrentctl --test e2e -- --ignored",
 ]
 
+# Every test that needs a real kernel network stack: the kill switch's real
+# `nft` tests and WireGuard's live-link tests in the binary target, the
+# listen-device test, and the daemon end to end over a real tunnel
+# (tests/vpn_netns_e2e.rs). Each runs in a user and network namespace of its
+# own, so nothing touches the host's interfaces or ruleset; the host only has
+# to let this user create those namespaces, and carry `ip`, `wg`, `nft`,
+# `unshare` and `nsenter`. Built first, outside any namespace, so the runs
+# inside need no network.
+#
+# The live-link test that installs the kill switch over its own link must
+# run as a uid that is not 0 (the kill switch refuses root), so it runs in
+# the second namespace, as uid 998 with its capabilities kept; the rest run
+# as the first namespace's root.
+# TORRENTD_REQUIRE_NETNS=1 turns listen_device's "cannot create a namespace
+# here, skipped" into a failure: this task exists to run it.
+[tasks.test-netns]
+description = "Real-kernel VPN tests: nft, WireGuard and the daemon in private network namespaces"
+run = '''
+set -eu
+cargo test -p torrentd --bin torrentd --test listen_device --test vpn_netns_e2e --no-run
+unshare --user --map-root-user --net -- \
+  cargo test --offline -p torrentd --bin torrentd -- --ignored --test-threads=1 \
+  --skip live_link_the_kill_switch killswitch:: wireguard::
+unshare --user --map-user=998 --map-group=998 --net --keep-caps -- \
+  cargo test --offline -p torrentd --bin torrentd -- --ignored --test-threads=1 live_link
+TORRENTD_REQUIRE_NETNS=1 cargo test --offline -p torrentd --test listen_device
+cargo test --offline -p torrentd --test vpn_netns_e2e -- --ignored --test-threads=1
+'''
+
 [tasks.test-alerts]
 description = "promtool: check deploy/prometheus's alert rules and run their fixtures (needs podman or docker)"
 # In a container rather than as a [tools] entry: promtool ships only inside the
@@ -119,6 +148,7 @@ run = [
   "mise run test-lifecycle",
   "mise run test-daemon",
   "mise run test-torrentctl",
+  "mise run test-netns",
   "mise run test-alerts",
 ]
 
