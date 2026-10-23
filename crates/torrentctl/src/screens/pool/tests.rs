@@ -654,6 +654,50 @@ fn a_tree_refresh_keeps_the_selected_entry() {
     );
 }
 
+#[test]
+fn a_move_during_a_tree_refresh_is_the_entry_kept() {
+    let mut state = with_tree();
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    assert!(state.tree.entries.loading);
+    assert_eq!(state.tree.reselect.as_deref(), Some("movies"));
+
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 0);
+    assert_eq!(state.tree.selected, 1, "a key moves while the reload runs");
+    assert_eq!(
+        state.tree.reselect.as_deref(),
+        Some("series"),
+        "the reload now restores the entry the operator moved to"
+    );
+
+    // An entry appeared ahead of it: its row moved, and the selection must
+    // follow the name rather than stay on row 1.
+    let mut page = tree_page(None);
+    page.items.insert(
+        0,
+        testing::from_json(entry("anime", "anime", true, &["adopted"])),
+    );
+    let generation = state.tree.entries.generation;
+    send(
+        &mut state,
+        Msg::Tree(tree::Msg::Page {
+            generation,
+            first: true,
+            result: Ok(page),
+        }),
+        true,
+    );
+    assert!(!state.tree.entries.loading);
+    assert_eq!(
+        state.tree.entries.items[state.tree.selected].name, "series",
+        "the selection follows the entry the operator moved to during the reload"
+    );
+    assert!(
+        state.tree.reselect.is_none(),
+        "spent once the reload settles"
+    );
+}
+
 /// `n` directory entries from the `from`th, in name order, continuing at
 /// `next`.
 fn wide_tree(from: usize, n: usize, next: Option<&str>) -> types::TreePage {
