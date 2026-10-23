@@ -13,6 +13,7 @@ use kynos::security::auth::Scoped;
 use serde::Serialize;
 use torrentd_engine::heartbeat_age;
 use tracing::info;
+use tracing::warn;
 
 use crate::app_state::AppState;
 use crate::http::security::Bearer;
@@ -228,7 +229,7 @@ pub const MAX_EVENT_STREAMS: usize = 64;
 /// The fingerprint every `/v1/events` stream reads, computed once per tick
 /// for all of them, and the cap on how many are open.
 ///
-/// Each stream used to compute [`fingerprint`] itself, every second, and the
+/// Each stream used to compute the fingerprint itself, every second, and the
 /// fingerprint walks the whole assignment registry: a hundred thousand
 /// torrents times every open client, once a second. One task now computes it
 /// and broadcasts it on a `watch` channel. The task starts with the first
@@ -238,6 +239,10 @@ pub const MAX_EVENT_STREAMS: usize = 64;
 pub struct EventFeed {
     slots: Arc<tokio::sync::Semaphore>,
     feed: parking_lot::Mutex<Option<Arc<tokio::sync::watch::Sender<u64>>>>,
+    /// Whether the last read of the pool index for the fingerprint failed,
+    /// so a failure is logged when it starts and when it clears rather than
+    /// once a tick.
+    pool_read_failing: std::sync::atomic::AtomicBool,
 }
 
 impl Default for EventFeed {
@@ -252,6 +257,7 @@ impl EventFeed {
         Self {
             slots: Arc::new(tokio::sync::Semaphore::new(streams)),
             feed: parking_lot::Mutex::new(None),
+            pool_read_failing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -273,24 +279,47 @@ impl EventFeed {
         self.feed.lock().is_some()
     }
 
+    /// A receiver of the running feed, if there is one.
+    fn join(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.feed.lock().as_ref().map(|tx| tx.subscribe())
+    }
+
     /// A receiver of the shared fingerprint, starting the task that computes
     /// it if none is running.
-    fn subscribe(s: &Arc<AppState>) -> tokio::sync::watch::Receiver<u64> {
+    ///
+    /// The state is read with the lock released: it makes an engine call per
+    /// profile and reads the pool index, and a stream joining a running feed
+    /// must not wait on either.
+    async fn subscribe(s: &Arc<AppState>) -> tokio::sync::watch::Receiver<u64> {
+        if let Some(rx) = s.events.join() {
+            return rx;
+        }
+        // Seeded with a real value where the read finishes within a tick, so
+        // the first tick a stream sends carries the daemon's state rather
+        // than a placeholder.
+        let mut read = StateRead::default();
+        read.start(s);
+        read.collect(TICK).await;
         let mut feed = s.events.feed.lock();
         if let Some(tx) = feed.as_ref() {
+            // Another stream started a feed while this one read.
             return tx.subscribe();
         }
-        // Seeded with a real value, so the first tick a stream sends carries
-        // the daemon's state rather than a placeholder.
-        let (tx, rx) = tokio::sync::watch::channel(fingerprint(s));
+        let (tx, rx) = tokio::sync::watch::channel(with_heartbeat(read.last, s));
         let tx = Arc::new(tx);
         *feed = Some(Arc::clone(&tx));
-        tokio::spawn(Self::run(Arc::clone(s), tx));
+        tokio::spawn(Self::run(Arc::clone(s), tx, read));
         rx
     }
 
     /// Recompute the fingerprint every [`TICK`] while anything listens.
-    async fn run(s: Arc<AppState>, tx: Arc<tokio::sync::watch::Sender<u64>>) {
+    ///
+    /// The state is read on a blocking thread, one read at a time. A read
+    /// still running when a tick is due (a session that does not answer)
+    /// does not hold the tick: it goes out with the state last read and the
+    /// heartbeat age as it is now, so the streams keep ticking and a stalled
+    /// alert loop still shows.
+    async fn run(s: Arc<AppState>, tx: Arc<tokio::sync::watch::Sender<u64>>, mut read: StateRead) {
         let mut shutdown = s.shutdown.subscribe();
         loop {
             tokio::select! {
@@ -309,9 +338,11 @@ impl EventFeed {
                     return;
                 }
             }
+            read.start(&s);
+            read.collect(TICK / 2).await;
             // `send_replace` stores the value whether or not anyone is
             // waiting; each stream decides for itself whether it changed.
-            tx.send_replace(fingerprint(&s));
+            tx.send_replace(with_heartbeat(read.last, &s));
         }
         // The daemon is going away: every stream ends on the same signal,
         // and a stream opened later finds no feed and starts one that ends
@@ -356,7 +387,7 @@ pub async fn stream_events(
     EventsError,
 > {
     let slot = s.events.admit().ok_or(EventsError::TooManyEventStreams)?;
-    let mut feed = EventFeed::subscribe(&s);
+    let mut feed = EventFeed::subscribe(&s).await;
     let mut shutdown = s.shutdown.subscribe();
     // The credential is checked once, when the request arrives; a stream
     // outlives that check by as long as the client keeps it open. A session
@@ -464,7 +495,92 @@ pub async fn stream_events(
 /// One pass over the registry, as before; torrents and plans are combined by
 /// a wrapping sum of per-item hashes, so the result does not depend on the
 /// order a map iterates in.
+///
+/// Not covered: what a torrent's detail reads from its session on request
+/// (its trackers' status and messages, its peers, its files), which no state
+/// the daemon keeps holds.
+#[cfg(test)]
 pub(crate) fn fingerprint(s: &AppState) -> u64 {
+    with_heartbeat(state_fingerprint(s), s)
+}
+
+/// `state` with the alert-loop heartbeat age in seconds: coarse enough not
+/// to churn, fine enough that a stalled loop shows up. Read on every tick,
+/// whether or not the state read behind `state` has finished.
+fn with_heartbeat(state: u64, s: &AppState) -> u64 {
+    hash_of(&(state, heartbeat_age(&s.alert_heartbeat).as_secs()))
+}
+
+/// How long a state read may run before the feed logs that its ticks carry
+/// an old state.
+const READ_STALL: Duration = IDLE_TICK;
+
+/// The feed's read of [`state_fingerprint`], on a blocking thread, at most
+/// one at a time: a read that never returns holds one thread, not one per
+/// tick.
+#[derive(Default)]
+struct StateRead {
+    /// The value the last finished read returned.
+    last: u64,
+    /// The read running now, and when it started.
+    pending: Option<(tokio::task::JoinHandle<u64>, std::time::Instant)>,
+    /// Whether the running read has been logged as stalled.
+    warned: bool,
+}
+
+impl StateRead {
+    /// Start a read, unless one is still running.
+    fn start(&mut self, s: &Arc<AppState>) {
+        if self.pending.is_none() {
+            let s = Arc::clone(s);
+            self.pending = Some((
+                tokio::task::spawn_blocking(move || state_fingerprint(&s)),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    /// Take the running read's value if it finishes within `bound`; past
+    /// that, leave it running and keep the last value.
+    async fn collect(&mut self, bound: Duration) {
+        let Some((task, started)) = self.pending.as_mut() else {
+            return;
+        };
+        match tokio::time::timeout(bound, &mut *task).await {
+            Ok(done) => {
+                let elapsed = started.elapsed();
+                self.pending = None;
+                match done {
+                    Ok(v) => self.last = v,
+                    Err(err) => warn!(
+                        error.cause = %err,
+                        "the event feed's state read did not finish; ticks carry the state \
+                         last read",
+                    ),
+                }
+                if std::mem::take(&mut self.warned) {
+                    info!(
+                        elapsed_secs = elapsed.as_secs(),
+                        "the event feed's stalled state read finished",
+                    );
+                }
+            }
+            Err(_) if !self.warned && started.elapsed() >= READ_STALL => {
+                self.warned = true;
+                warn!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "the event feed's state read has not returned (a session or the pool index \
+                     not answering); ticks carry the state last read until it does",
+                );
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// The fingerprint without the heartbeat age: everything that takes an
+/// engine call or a pool read.
+fn state_fingerprint(s: &AppState) -> u64 {
     let mut acc: u64 = 1469598103934665603;
     let mut mix = |v: u64| {
         acc ^= v;
@@ -501,11 +617,8 @@ pub(crate) fn fingerprint(s: &AppState) -> u64 {
         mix(pool.verify_queue().depth() as u64);
         mix(pool.verify_queue().in_flight() as u64);
         mix(pool.verify_queue().completed());
-        mix(pool_fingerprint(pool));
+        mix(pool_fingerprint(pool, &s.events.pool_read_failing));
     }
-
-    // Coarse enough not to churn, fine enough that a stalled loop shows up.
-    mix(heartbeat_age(&s.alert_heartbeat).as_secs());
     acc
 }
 
@@ -550,15 +663,23 @@ fn profiles_fingerprint(s: &AppState) -> u64 {
 /// holds, read on the read-only connection, which never waits for a scan.
 ///
 /// A failed read hashes to a fixed value rather than failing the tick: the
-/// next read that succeeds changes the fingerprint back.
-fn pool_fingerprint(pool: &crate::pool_service::PoolService) -> u64 {
-    pool.with_reader(|st| -> Result<u64, torrentd_pool::PoolError> {
+/// next read that succeeds changes the fingerprint back. `failing` records
+/// whether the last read failed, so the failure is logged once when it
+/// starts and once when it clears.
+fn pool_fingerprint(
+    pool: &crate::pool_service::PoolService,
+    failing: &std::sync::atomic::AtomicBool,
+) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    use torrentd_pool::model::plan_status;
+    let read = pool.with_reader(|st| -> Result<u64, torrentd_pool::PoolError> {
         let mut acc = hash_of(&st.index_generation()?);
         for (state, n) in st.counts_by_state()? {
             acc = acc.wrapping_add(hash_of(&(state, n)));
         }
         for plan in st.plans()? {
-            let steps = if plan.status == "applying" {
+            let steps = if plan.status == plan_status::APPLYING {
                 st.plan_step_counts(plan.id)?
             } else {
                 Vec::new()
@@ -566,8 +687,25 @@ fn pool_fingerprint(pool: &crate::pool_service::PoolService) -> u64 {
             acc = acc.wrapping_add(hash_of(&(plan.id, &plan.status, plan.applied_at, steps)));
         }
         Ok(acc)
-    })
-    .unwrap_or(u64::MAX)
+    });
+    match read {
+        Ok(v) => {
+            if failing.swap(false, Ordering::Relaxed) {
+                info!("the event feed reads the pool index again");
+            }
+            v
+        }
+        Err(err) => {
+            if !failing.swap(true, Ordering::Relaxed) {
+                warn!(
+                    error.cause = %err,
+                    "the event feed could not read the pool index; until it can, a change to \
+                     the pool does not change the event fingerprint",
+                );
+            }
+            u64::MAX
+        }
+    }
 }
 
 /// Why a reload was not queued.
@@ -699,6 +837,65 @@ mod tests {
             p.update_health(|h| h.tunnel_ip = None)
         });
         assert_moves(&s, "fence", || p.update_health(|h| h.fence_generation += 1));
+    }
+
+    /// A live profile taken offline, by its own state and by `offline_all`,
+    /// and its session pausing apart from the record.
+    #[test]
+    fn a_profile_taken_offline_and_its_session_pausing_each_move_it() {
+        let s = steady();
+        let p = s.profiles.iter().next().unwrap();
+        let id = p.id().clone();
+        let change = |edit: &dyn Fn(&mut crate::profile_state::Record)| {
+            s.profiles
+                .change_states(
+                    edit,
+                    &torrentd_engine::NoopSink,
+                    &crate::profile_registry::NoTorrents,
+                )
+                .unwrap()
+        };
+        // The session pauses first, so taking the profile offline after it
+        // changes the record alone: its session is already paused.
+        assert_moves(&s, "session paused", || p.engine.pause_session().unwrap());
+        assert_moves(&s, "desired offline", || {
+            change(&|r| r.set(&id, torrentd_engine::DesiredState::Offline))
+        });
+        assert!(p.engine.session_paused().unwrap());
+        assert_moves(&s, "offline_all", || change(&|r| r.offline_all = true));
+    }
+
+    /// A tick goes out while the state read behind it has not returned, and
+    /// carries the heartbeat age as it is now.
+    #[tokio::test]
+    async fn a_state_read_that_does_not_return_does_not_hold_the_ticks() {
+        let s = Arc::new(steady());
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let read = StateRead {
+            pending: Some((
+                tokio::task::spawn_blocking(move || {
+                    let _ = blocked.recv();
+                    0
+                }),
+                std::time::Instant::now(),
+            )),
+            ..StateRead::default()
+        };
+        let (tx, mut rx) = tokio::sync::watch::channel(with_heartbeat(read.last, &s));
+        let tx = Arc::new(tx);
+        *s.events.feed.lock() = Some(Arc::clone(&tx));
+        tokio::spawn(EventFeed::run(Arc::clone(&s), tx, read));
+        let before = *rx.borrow_and_update();
+
+        // The alert loop stalls: its heartbeat age jumps.
+        s.alert_heartbeat
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let ticked = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+        release.send(()).unwrap();
+        ticked
+            .expect("no tick went out while the state read was blocked")
+            .unwrap();
+        assert_ne!(*rx.borrow(), before, "the tick did not carry the heartbeat");
     }
 
     #[test]

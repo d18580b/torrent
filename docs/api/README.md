@@ -258,7 +258,9 @@ described in [`problems.md`](problems.md):
   `fingerprint`, not the change itself: refetch what is on screen. It covers
   every torrent's phase, progress, rates and peers, every profile's status
   and state, the pool index's scans and adoption states, and every plan's
-  status and step progress.
+  status and step progress. It does not cover what a torrent's detail reads
+  from its session on request (its trackers' status and messages, its peers,
+  its files): a client showing those polls them.
 - The first event carries `retry: 5000`, the reconnect delay in milliseconds.
 - A comment line every fifteen seconds keeps the connection alive through
   proxies.
