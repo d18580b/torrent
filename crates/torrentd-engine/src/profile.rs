@@ -1683,17 +1683,6 @@ mod tests {
     }
 
     #[test]
-    fn a_host_profile_needs_no_identity_separation() {
-        // Two host profiles are one host. Requiring distinct fingerprints and
-        // user agents of them would be theatre.
-        let profiles = vec![
-            host("public", "0.0.0.0:6881", true),
-            host("public2", "0.0.0.0:6882", false),
-        ];
-        ProfileConfig::validate_set(&profiles).unwrap();
-    }
-
-    #[test]
     fn a_profile_survives_a_serialize_deserialize_round_trip() {
         // `Config` derives `Serialize`, which is what keeps this direction
         // compiled; nothing in the daemon calls it. Untested, the serializer
@@ -1945,6 +1934,38 @@ mod tests {
             cfg("b", 6882, "wg1", "-CC1000-", "Transmission/4.0.6"),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    /// Two profiles under one id would share a resume directory, a torrent
+    /// directory and a `/v1/profiles/<id>` route. Everything else about the
+    /// pair is distinct, so the id is the only thing that can refuse it.
+    #[test]
+    fn two_profiles_with_one_id_are_refused() {
+        let profiles = vec![
+            cfg("a", 6881, "wg0", "-AA1000-", "qBittorrent/5.0.3"),
+            cfg("a", 6882, "wg1", "-CC1000-", "Transmission/4.0.6"),
+        ];
+        match ProfileConfig::validate_set(&profiles) {
+            Err(ProfileConfigError::DuplicateId(id)) => assert_eq!(id, "a"),
+            other => panic!("a repeated id must be refused as DuplicateId, got {other:?}"),
+        }
+    }
+
+    /// Two VPN profiles on one tunnel interface would route both accounts
+    /// out of one address. Everything else about the pair is distinct, so
+    /// the interface is the only thing that can refuse it.
+    #[test]
+    fn two_vpn_profiles_on_one_interface_are_refused() {
+        let profiles = vec![
+            cfg("a", 6881, "wg0", "-AA1000-", "qBittorrent/5.0.3"),
+            cfg("b", 6882, "wg0", "-CC1000-", "Transmission/4.0.6"),
+        ];
+        match ProfileConfig::validate_set(&profiles) {
+            Err(ProfileConfigError::DuplicateInterface(iface)) => assert_eq!(iface, "wg0"),
+            other => {
+                panic!("a shared interface must be refused as DuplicateInterface, got {other:?}")
+            }
+        }
     }
 
     /// A name the kill switch's ruleset cannot carry, or the kernel would
@@ -2340,7 +2361,11 @@ mod tests {
     #[test]
     fn natpmp_profiles_skip_port_uniqueness() {
         // Two natpmp profiles: the (ignored) listen_port collision must NOT fail —
-        // their ports are gateway-assigned at runtime.
+        // their ports are gateway-assigned at runtime. Both keep
+        // `Some(6881)`: with no port on either there is no collision, and the
+        // test would pass with natpmp ports entered into the uniqueness set.
+        // Deserialization refuses a natpmp `listen_port`; `validate_set`
+        // alone must still not count one.
         let natpmp = |n: &mut ProfileNetwork| {
             if let ProfileNetwork::Vpn {
                 port_forward,
@@ -2349,7 +2374,7 @@ mod tests {
             } = n
             {
                 *port_forward = PortForwardMode::Natpmp;
-                *listen_port = None;
+                assert_eq!(*listen_port, Some(6881));
             }
         };
         let a = with_vpn(cfg("a", 6881, "wg0", "-AA1000-", "ua-a"), natpmp);

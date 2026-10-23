@@ -142,6 +142,7 @@ mod tests {
     use libtorrent_safe::TorrentHandle;
 
     use super::*;
+    use crate::clock::Clock;
     use crate::clock::MockClock;
     use crate::engine::TorrentEngine;
     use crate::metrics::MetricCall;
@@ -149,6 +150,7 @@ mod tests {
     use crate::mock::MockEngine;
     use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
+    use crate::state::RetryState;
     use crate::state::StateMap;
     use crate::state::TorrentState;
     use crate::torrent_store::MemoryTorrentStore;
@@ -391,10 +393,10 @@ mod tests {
 
         dispatch(&update(5, TorrentFlags::empty()), &state, &metrics);
         assert_eq!(phase(&state), TorrentPhase::Seeding);
+        let clock = MockClock::new();
         {
             let resume = MemoryResumeStore::new();
             let torrents = MemoryTorrentStore::new();
-            let clock = MockClock::new();
             let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
             let mut ctx = HandlerCtx {
                 state: &state,
@@ -425,6 +427,7 @@ mod tests {
             );
         }
         assert_eq!(phase(&state), TorrentPhase::DiskError);
+        let due = clock.now() + RetryState::INITIAL_DELAY;
 
         for lt_state in [5, 4] {
             dispatch(&update(lt_state, TorrentFlags::empty()), &state, &metrics);
@@ -435,7 +438,12 @@ mod tests {
                 "a seeding report with no error cleared the peer-read disk error",
             );
             assert!(!st.has_error, "has_error still follows libtorrent");
-            assert!(st.retry.is_some(), "the retry that clears it stays armed");
+            let retry = st.retry.expect("the retry that clears it stays armed");
+            assert_eq!(
+                (retry.next_attempt, retry.attempts),
+                (due, 1),
+                "a status report leaves the armed retry as the error set it",
+            );
         }
 
         dispatch(&update(5, TorrentFlags::PAUSED), &state, &metrics);
@@ -471,10 +479,10 @@ mod tests {
         let checked = Alert::TorrentChecked {
             hdr: hdr(AlertKind::TorrentChecked),
         };
+        let clock = MockClock::new();
         {
             let resume = MemoryResumeStore::new();
             let torrents = MemoryTorrentStore::new();
-            let clock = MockClock::new();
             let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
             let mut ctx = HandlerCtx {
                 state: &state,
@@ -491,7 +499,11 @@ mod tests {
             crate::handlers::storage::handle(&checked, &mut ctx);
         }
         let st = state.get(&ih(0x66)).unwrap();
-        assert!(st.checked_at.is_some());
+        assert_eq!(
+            st.checked_at,
+            Some(clock.now()),
+            "stamped when the check ended"
+        );
         assert!(!st.phase_since_check);
         assert_eq!(st.phase, TorrentPhase::Seeding, "stale, and marked so");
 
