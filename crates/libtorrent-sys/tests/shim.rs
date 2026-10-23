@@ -2420,14 +2420,20 @@ fn drain(s: *mut lt_session) {
 /// names. (`add_torrent_alert` alone still registers; it is drained first
 /// here, so every alert counted below is a non-add one.)
 ///
+/// The same holds for the state update queued before the removal: its alert
+/// names no torrent at the top level, so it is read entry by entry, and every
+/// status entry for the removed torrent must carry no handle either.
+///
 /// Whether the torrent is still alive when its queued alerts are translated
 /// is a race this test does not control, so the scenario repeats until it has
-/// seen at least one such alert, and every one it saw must carry no handle.
+/// seen at least one such alert and one such status entry, and every one it
+/// saw must carry no handle.
 #[test]
 fn alerts_translated_after_a_removal_do_not_register_the_removed_torrent() {
     let bytes = multi_file_tracker_torrent();
     let ih = v1_hash(&bytes);
     let mut late = Vec::new();
+    let mut late_states = Vec::new();
     for _ in 0..20 {
         let s = make_session();
         let h = add_file(s, &bytes);
@@ -2445,17 +2451,33 @@ fn alerts_translated_after_a_removal_do_not_register_the_removed_torrent() {
             if u.kind == lt_alert_kind_LT_ALERT_TORRENT_REMOVED {
                 return Some(());
             }
-            if u.infohash == ih {
+            if u.kind == lt_alert_kind_LT_ALERT_STATE_UPDATE {
+                let su = unsafe { u.payload.state_update };
+                if !su.statuses.is_null() {
+                    let views = unsafe { std::slice::from_raw_parts(su.statuses, su.count) };
+                    late_states.extend(views.iter().filter(|v| v.infohash == ih).map(|v| v.handle));
+                }
+            } else if u.infohash == ih {
                 late.push((u.kind, u.handle));
             }
             None
         });
         assert!(removed.is_some(), "no torrent_removed_alert");
         unsafe { lt_session_destroy(s) };
-        if !late.is_empty() {
+        if !late.is_empty() && !late_states.is_empty() {
             break;
         }
     }
+    // The state view first: once it registers the torrent, every later alert
+    // resolves to that id too, so its failure would show up as theirs.
+    assert!(
+        !late_states.is_empty(),
+        "no state update was translated while the removed torrent still existed, so nothing was tested"
+    );
+    assert!(
+        late_states.iter().all(|&handle| handle == 0),
+        "a state update translated after the removal registered the removed torrent: {late_states:?}"
+    );
     assert!(
         !late.is_empty(),
         "no alert was translated while the removed torrent still existed, so nothing was tested"
