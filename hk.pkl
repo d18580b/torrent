@@ -64,6 +64,11 @@ hooks {
       ["test"] {
         check = nogit + "mise run test"
       }
+      // No glob: deleting or shrinking any file can make a .size-baseline
+      // entry stale, so this runs on every push.
+      ["size-check"] {
+        check = "mise run size-check"
+      }
     }
   }
 
