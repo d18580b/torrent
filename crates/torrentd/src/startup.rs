@@ -763,6 +763,16 @@ impl<'a> CheckedHold<'a> {
         reported
     }
 
+    /// [`Self::hold`] on every session, as the scans hold at each batch and
+    /// at the end of each profile's scan: a socket a vpn session reports
+    /// while another profile's torrents are being loaded is checked there
+    /// too, not only once the alert loop starts.
+    fn hold_all(&self) {
+        for profile in self.source.profiles() {
+            self.hold(&profile);
+        }
+    }
+
     /// `Err`, which fails the boot, once any socket a hold took was refused.
     fn verdict(&self) -> anyhow::Result<()> {
         let refused = self.refused.lock();
@@ -1492,7 +1502,7 @@ pub async fn boot(
         for (i, ih) in listing.names.into_iter().enumerate() {
             between_scan_batches(i, "resume", &mut boot_shutdown, &boot_progress, || {
                 scan_fence.enforce_all(&profile_registry, &metrics);
-                checked_hold.hold(&profile);
+                checked_hold.hold_all();
                 checked_hold.verdict()
             })
             .await?;
@@ -1751,7 +1761,7 @@ pub async fn boot(
                 }
             }
         }
-        checked_hold.hold(&profile);
+        checked_hold.hold_all();
         checked_hold.verdict()?;
         if !unheld.is_empty() {
             // Loaded unpaused, so no longer the record's: saved now, so their
@@ -1875,7 +1885,7 @@ pub async fn boot(
         for (i, ih) in entries.into_iter().enumerate() {
             between_scan_batches(i, "torrent-dir", &mut boot_shutdown, &boot_progress, || {
                 scan_fence.enforce_all(&profile_registry, &metrics);
-                checked_hold.hold(&profile);
+                checked_hold.hold_all();
                 checked_hold.verdict()
             })
             .await?;
@@ -2050,7 +2060,7 @@ pub async fn boot(
                 }
             }
         }
-        checked_hold.hold(&profile);
+        checked_hold.hold_all();
         checked_hold.verdict()?;
         if added > 0 {
             info!(profile_id = %profile, torrent_count = added, "torrent dir scan: added new torrents");
@@ -6263,6 +6273,8 @@ mod tests {
     /// the IPv6 endpoint of the same pass) is checked by the scans' next
     /// batch hold: one on the wrong device stops the scan there, as it would
     /// have stopped the boot before the scans, and its alert is still held.
+    /// The hold takes every session, so the socket is caught while the scan
+    /// is loading the host profile's torrents, not only `acct_a`'s.
     #[tokio::test(start_paused = true)]
     async fn a_listen_socket_reported_during_the_scans_is_checked_at_their_next_batch() {
         let (_tx, mut shutdown) = broadcast::channel::<ShutdownReason>(1);
@@ -6280,10 +6292,10 @@ mod tests {
             .await
             .expect("the first socket is on the tunnel");
 
-        let acct_a = ProfileId::new("acct_a");
+        // The scan is on `public`'s torrents; `acct_a`'s were loaded first.
         vpn.push_alert(listen_alert(true, "[fd00::2]:6881"));
         let batch = || {
-            hold.hold(&acct_a);
+            hold.hold_all();
             hold.verdict()
         };
         between_scan_batches(1, "resume", &mut shutdown, &progress, batch)

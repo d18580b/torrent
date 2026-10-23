@@ -1,8 +1,9 @@
 # Formatting is deterministic and merge-resilient.
 #
-# Requires nightly rustfmt — invoked via `cargo +nightly fmt` (centralized in the
-# mise `fmt` / `fmt-fix` tasks). `imports_granularity` and `group_imports` are
-# unstable, hence nightly. Everything else stays on the pinned stable toolchain.
+# Requires nightly rustfmt — the dated nightly mise.toml's RUSTFMT_TOOLCHAIN
+# names, invoked by the mise `fmt` / `fmt-fix` tasks. `imports_granularity`
+# and `group_imports` are unstable, hence nightly. Everything else stays on
+# the pinned stable toolchain.
 
 # One import per line: adding/removing an import touches a single distinct line,
 # so parallel branches auto-merge instead of colliding on a shared `use {...}`.
