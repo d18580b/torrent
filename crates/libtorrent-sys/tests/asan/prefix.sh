@@ -69,8 +69,38 @@ if [ "${1:-}" = --key ]; then
   exit 0
 fi
 
-if [ "$(head -1 "$prefix/.stamp" 2>/dev/null)" = "$key" ]; then
+stamp_matches() {
+  [ "$(head -1 "$prefix/.stamp" 2>/dev/null)" = "$key" ]
+}
+
+if stamp_matches; then
   echo "shim-asan: cache hit asan-lt-$key" >&2
+  echo "$prefix"
+  exit 0
+fi
+
+# build.rs's ensure_prefix: one builder per key across every worktree sharing
+# this cache root. Without it, a second run finishing the same cold build
+# would replace the prefix a first run.sh is still compiling and linking
+# against. The lock is held on fd 9 until this script exits.
+mkdir -p "$cache_root"
+lock=$cache_root/asan-lt-$key.lock
+if command -v flock >/dev/null && exec 9>"$lock"; then
+  rc=0
+  flock -n -E 75 9 || rc=$?
+  if [ "$rc" -eq 75 ]; then
+    echo "shim-asan: waiting for a concurrent build of asan-lt-$key" >&2
+    flock 9
+  elif [ "$rc" -ne 0 ]; then
+    # A filesystem without flock. The re-check before publishing below still
+    # keeps a published prefix in place; at worst the work is duplicated.
+    echo "shim-asan: cannot lock $lock; building unlocked" >&2
+  fi
+fi
+
+# Whoever held the lock may have built exactly what we need.
+if stamp_matches; then
+  echo "shim-asan: cache hit asan-lt-$key (built concurrently)" >&2
   echo "$prefix"
   exit 0
 fi
@@ -81,7 +111,6 @@ for marker in vendor/libtorrent/CMakeLists.txt vendor/boost/CMakeLists.txt \
     || die "$marker is missing and asan-lt-$key is not cached; run: mise run native-fetch"
 done
 echo "shim-asan: building asan-lt-$key (instrumented libtorrent, 5-15 min)" >&2
-mkdir -p "$cache_root"
 staging=$(mktemp -d "$cache_root/.tmp-asan-lt.XXXXXX")
 trap 'rm -rf "$staging"' EXIT
 
@@ -129,6 +158,12 @@ boost_dir=$(find "$staging/boost" -path '*/cmake/Boost-*' -type d -prune | head 
   || die "the libtorrent install has no libtorrent-rasterbar.a; refusing to stamp it"
 rm -rf "$staging/boost-build" "$staging/lt-build"
 printf '%s\n' "$key" >"$staging/.stamp"
+# Lost the race to a run that could not lock: its published tree is as good
+# as ours, and a run.sh may already be linking against it.
+if stamp_matches; then
+  echo "$prefix"
+  exit 0
+fi
 # An unstamped or mismatched tree under this name is a failed earlier run.
 # -T: a tree another run published since is replaced, never nested into.
 rm -rf "$prefix"
