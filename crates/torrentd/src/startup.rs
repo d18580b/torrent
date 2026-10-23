@@ -1884,8 +1884,8 @@ pub async fn boot(
                 torrent_dir = %dirs_of(&cfg, &profile).1.display(),
                 // Both, as the refusal above names both. On the import boot
                 // `source_path()` is the JSON file under its `.imported` name
-                // — the file `docs/running.md` tells the operator explicitly
-                // not to edit — so naming it alone pointed at the wrong one.
+                // — a file the daemon never reads again, so editing it changes
+                // nothing — and naming it alone pointed at the wrong one.
                 registry_path = %registry.path().display(),
                 registry_read_from = %registry.source_path().display(),
                 "the assignment registry claims more torrents for this profile than the scans \

@@ -1243,7 +1243,7 @@ directories. The field name is on the event either way, and never its value.
 The store directories are in the second group because nothing a tracker reads
 is not an identity, and no announce or handshake carries where a profile keeps
 its files. They are still not reloadable — the stores are opened once at
-startup — but setting them is exactly what step 3 above tells you to do, and
+startup — but pointing a profile at its files is routine configuration, and
 the privacy warning is the line an alert rule watches for an account's identity
 changing under a live session.
 

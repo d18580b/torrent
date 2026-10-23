@@ -720,8 +720,7 @@ fn the_configured_drain_deadline_reaches_the_alert_loop() {
     );
 }
 
-/// The upgrade every pre-profiles deployment takes, and the one the published
-/// upgrade note does not cover.
+/// The upgrade every pre-profiles deployment takes.
 ///
 /// A single-session deployment's `slot_assignments.json` maps every info-hash
 /// to `default`. The operator writes a `[[profile]]` table with some other id
@@ -994,10 +993,9 @@ fn a_kill_switch_with_no_nft_exits_ex_config() {
 /// A registry that survives the boot check — every id it names is configured —
 /// can still claim torrents no scan loaded, which is the silent total outage
 /// that warning exists to catch. On this one boot the entries were imported
-/// from the pre-rename `slot_assignments.json`, and that is the file
-/// `docs/running.md` tells the operator explicitly *not* to edit: the daemon
-/// imports it into `registry.db` on the same boot, renames it, and reads only
-/// the database from here on. Naming the old file alone sent them to the
+/// from the pre-rename `slot_assignments.json`, and editing that file changes
+/// nothing: the daemon imports it into `registry.db` on the same boot, renames
+/// it, and reads only the database from here on. Naming the old file alone sent them to the
 /// wrong one.
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
