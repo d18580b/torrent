@@ -293,7 +293,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); while it has torrents to carry, 3 failed polls in a row (about 90s) fence it probe_unavailable, so it seeds nothing until it is set online with the probe running again"
+              summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); while it has torrents to carry, 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
 
   - interval: 1m
     input_series:
@@ -334,7 +334,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "The route probe cannot run for acct_a; the tunnel's routing is not being checked, so 3 failed polls in a row (about 90s) fence it probe_unavailable, and it seeds nothing until it is set online with the probe running again"
+              summary: "The route probe cannot run for acct_a; the tunnel's routing is not being checked, so 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
 
   # Handshakes landing late, over and over, without yet crossing the fence:
   # one every five minutes.
