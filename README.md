@@ -225,8 +225,13 @@ cargo run --release -p torrentctl -- --url unix:/run/torrentd/api.sock
 **Authentication.** A static token comes from `--token`, `--token-file`,
 `TORRENTCTL_TOKEN` or the config file's `token_file`, in that order. Prefer a
 file or the environment variable: a token on the command line shows in the
-process list. A token file must be private to its owner (mode `0600`), and
-one readable by anyone else is refused rather than used. With no token, it
+process list. A token file must be private to its owner: no group or other
+permission bit may be set (`0600` and `0400` pass), and one that grants
+anyone else access is refused rather than used; its owner is not checked. A
+relative `token_file`, from the flag or the config file, is resolved against
+the current directory. `TORRENTCTL_TOKEN` and a token file are trimmed, and a
+token from any source that is not visible ASCII (a space, a control or a
+non-ASCII character) is refused at startup. With no token, it
 asks for the operator password and holds the session token it gets in memory,
 revoking it on quit.
 

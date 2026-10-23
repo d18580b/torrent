@@ -27,7 +27,9 @@ struct Cli {
     /// token on the command line is visible in the process list.
     #[arg(long, value_name = "TOKEN")]
     token: Option<String>,
-    /// A file holding a bearer token; it must be mode 0600.
+    /// A file holding a bearer token. It must have no group or other
+    /// permission bits (0600 or 0400); a relative path is from the current
+    /// directory.
     #[arg(long, value_name = "PATH")]
     token_file: Option<PathBuf>,
     /// The config file [default: $XDG_CONFIG_HOME/torrentctl/config.toml].

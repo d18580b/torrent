@@ -125,23 +125,35 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
                 "The daemon's answer did not match the API document",
                 Some(format!("at {path}")),
             ),
-            // spargen reports a refused connection here, as reqwest's own
-            // request-error class, rather than as `Transport` (gap S12). A
-            // credential problem is the only other cause this client can
-            // produce, so everything else is an unreachable daemon.
             Error::RequestConstruction(
                 e @ (generated::RequestError::MissingCredential { .. }
                 | generated::RequestError::CredentialProvider { .. }),
             ) => Failure::local("No credential for this request", Some(e.to_string())),
-            Error::RequestConstruction(e) => {
-                Failure::local("Cannot reach the daemon", Some(root_cause(&e)))
-            }
+            Error::RequestConstruction(e) => request_failure(&e),
             Error::Protocol(e) => {
                 Failure::local("The daemon's answer was malformed", Some(e.to_string()))
             }
             Error::Redirect(e) => Failure::local("Too many redirects", Some(e.to_string())),
         }
     }
+}
+
+/// A [`generated::RequestError::Other`] as the UI shows it. spargen reports a
+/// refused connection there, as reqwest's own request-error class, rather
+/// than as `Transport` (gap S12); the same variant carries a request that
+/// could not be built — a header value no header can carry, an unparseable
+/// URL, a body that did not serialize. Only a failed connect is an
+/// unreachable daemon.
+fn request_failure(e: &generated::RequestError) -> Failure {
+    let connect = std::error::Error::source(e)
+        .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_connect);
+    let title = if connect {
+        "Cannot reach the daemon"
+    } else {
+        "The request could not be sent"
+    };
+    Failure::local(title, Some(root_cause(e)))
 }
 
 /// The innermost cause of `e`: reqwest wraps "connection refused" several
@@ -401,11 +413,44 @@ mod tests {
             Failure::from(missing).title,
             "No credential for this request"
         );
+        // A cause that is not a failed connect is not called one, whatever
+        // its message says.
         let other =
             generated::Error::<generated::GetStatusError>::request_message("connection refused");
         let f = Failure::from(other);
-        assert_eq!(f.title, "Cannot reach the daemon");
+        assert_eq!(f.title, "The request could not be sent");
         assert_eq!(f.detail.as_deref(), Some("connection refused"));
+    }
+
+    /// A port nobody listens on: bound, then released.
+    fn closed_port() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_an_unreachable_daemon() {
+        let api = Api::new(&closed_port(), Some("tdp_valid")).unwrap();
+        let f = call(api.client.get_status()).await.unwrap_err();
+        assert_eq!(f.title, "Cannot reach the daemon", "{f:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = format!("unix:{}", dir.path().join("absent.sock").display());
+        let api = Api::new(&socket, Some("tdp_valid")).unwrap();
+        let f = call(api.client.get_status()).await.unwrap_err();
+        assert_eq!(f.title, "Cannot reach the daemon", "{f:?}");
+    }
+
+    /// A token no header can carry fails before anything is sent, and says
+    /// so: it is not a daemon that is down. `config` refuses such a token at
+    /// startup; this is what remains if one reached the client anyway.
+    #[tokio::test]
+    async fn a_request_that_cannot_be_built_is_not_an_unreachable_daemon() {
+        let api = Api::new(&closed_port(), Some("tdp_bad\ntoken")).unwrap();
+        let f = call(api.client.get_status()).await.unwrap_err();
+        assert_eq!(f.title, "The request could not be sent", "{f:?}");
     }
 
     #[test]

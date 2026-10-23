@@ -729,3 +729,37 @@ fn a_panic_hands_the_terminal_back() {
     assert_ne!(lflag & libc::ICANON, 0, "canonical mode restored");
     assert_ne!(lflag & libc::ECHO, 0, "echo restored");
 }
+
+/// A token no request could carry stops the binary before it takes the
+/// terminal, with a message naming where the token came from — rather than
+/// a UI reporting an unreachable daemon every few seconds. Needs no daemon
+/// and no terminal, so it is not ignored.
+#[test]
+fn a_malformed_token_is_refused_before_the_terminal_is_taken() {
+    const TOKEN: &str = "tdp_bad\u{1}token";
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_torrentctl"))
+        .args(["--url", "http://127.0.0.1:9"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("TERM", "xterm-256color")
+        .env("TORRENTCTL_TOKEN", TOKEN)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run torrentctl");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the token from TORRENTCTL_TOKEN is not valid"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(TOKEN), "the token never prints: {stderr}");
+    assert!(
+        !stdout.contains("\x1b[?1049h"),
+        "the alternate screen is never entered: {stdout:?}"
+    );
+}
