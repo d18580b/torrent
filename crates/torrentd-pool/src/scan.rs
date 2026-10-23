@@ -509,9 +509,9 @@ fn device(m: &std::fs::Metadata) -> u64 {
     m.dev()
 }
 
-/// Run `f` with `dir` at mode `0o000`, restoring its mode afterwards, or skip
-/// `f` where permissions do not bind (running as root) and the directory
-/// still lists.
+/// Run `f` with `dir` at mode `0o000`, restoring its mode afterwards. Where
+/// permissions do not bind (running as root) and the directory still lists,
+/// `f` is not run, through [`permissions_do_not_bind`].
 #[cfg(test)]
 pub(crate) fn with_unlistable(dir: &Path, f: impl FnOnce()) {
     use std::os::unix::fs::PermissionsExt;
@@ -521,12 +521,30 @@ pub(crate) fn with_unlistable(dir: &Path, f: impl FnOnce()) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if binds {
             f();
+        } else {
+            permissions_do_not_bind("an unlistable directory");
         }
     }));
     std::fs::set_permissions(dir, original).unwrap();
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// A test of what a permission refusal does cannot build its case where
+/// permissions do not bind (root, or `CAP_DAC_OVERRIDE`). Locally that skips
+/// the test with a note on stderr. Where `CI` is set, as every CI runner sets
+/// it, it fails the test instead: CI runs the suite as a non-root user, and a
+/// runner that stopped doing so would otherwise pass every such test without
+/// running it.
+#[cfg(test)]
+pub(crate) fn permissions_do_not_bind(case: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "permissions do not bind for this user, so {case} cannot be built: \
+         CI must run the tests as a user they bind for"
+    );
+    eprintln!("skipped: permissions do not bind for this user, so {case} cannot be built");
 }
 
 #[cfg(test)]
@@ -627,6 +645,7 @@ mod tests {
         let binds = std::fs::metadata(half.join("b.bin")).is_err();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if !binds {
+                permissions_do_not_bind("an unsearchable directory");
                 return;
             }
             let stats = scan_root(&mut store, root).unwrap();

@@ -53,6 +53,7 @@ fn a_lock_file_that_cannot_be_written_still_locks() {
     drop(PoolStore::open(&db).unwrap());
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
     if bypasses_permissions(&lock) {
+        crate::scan::permissions_do_not_bind("a lock file this user may not write");
         return;
     }
 
@@ -96,6 +97,7 @@ fn the_lock_file_is_left_readable_and_an_unreadable_one_is_skipped() {
 
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
     if bypasses_permissions(&lock) {
+        crate::scan::permissions_do_not_bind("a lock file this user may not write");
         return;
     }
     let store = PoolStore::open(&db).expect("an unreadable lock file does not refuse the open");
