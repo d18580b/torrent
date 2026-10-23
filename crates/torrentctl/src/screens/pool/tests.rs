@@ -204,6 +204,9 @@ fn problem(status: u16, slug: &str, detail: Option<&str>) -> Failure {
 
 /// Apply `msg` under a daemon with the pool configured and `mutations` as
 /// given, returning how many effects it asked for.
+/// What reloading the plan list and plan 8 sends.
+const PLAN_RELOAD: [&str; 2] = ["GET /v1/pool/plans", "GET /v1/pool/plans/8"];
+
 fn send(state: &mut State, msg: Msg, mutations: bool) -> usize {
     let server = testing::server(true, mutations);
     testing::with_ctx(Some(&server), |ctx| update(state, msg, ctx).len())
@@ -1285,16 +1288,29 @@ fn a_deleting_plan_applies_only_with_its_token_typed_back() {
 
     let outcome = testing::from_json(json!({"plan_id": 8, "done": 1, "failed": 1, "skipped": 0,
         "status": "failed"}));
-    let effects = send(
-        &mut state,
-        Msg::Plans(plans::Msg::Applied {
-            id: 8,
-            result: Ok(outcome),
-        }),
-        true,
-    );
-    assert_eq!(effects, 3, "a toast, the list and the plan reloaded");
+    let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+    let server = testing::server(true, true);
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| {
+        update(
+            &mut state,
+            Msg::Plans(plans::Msg::Applied {
+                id: 8,
+                result: Ok(outcome),
+            }),
+            ctx,
+        )
+    });
     assert!(state.plans.applying.is_none());
+    let msgs = testing::run(effects);
+    assert!(
+        matches!(&msgs[0], crate::app::Msg::Toast(_)),
+        "a toast: {msgs:?}"
+    );
+    assert_eq!(
+        daemon.lines(),
+        PLAN_RELOAD,
+        "and the list and the plan reloaded"
+    );
     assert!(state.plans.detail.as_ref().unwrap().outcome.is_some());
 }
 

@@ -1586,6 +1586,10 @@ mod tests {
 
     const NOW: i64 = 1_790_000_000;
 
+    /// What reloading the unfiltered list sends: the profiles, then the
+    /// first page.
+    const RELOAD: [&str; 2] = ["GET /v1/profiles", "GET /v1/torrents?limit=100"];
+
     fn hash(n: u8) -> String {
         format!("{n:02x}{}", "a1b2c3d4e5".repeat(4))[..40].to_owned()
     }
@@ -2009,20 +2013,32 @@ mod tests {
 
     #[test]
     fn single_torrent_actions_go_at_once() {
+        let daemon = testing::Recorder::start("204 No Content", "");
         let mut state = loaded(1..8, None);
-        testing::with_ctx(None, |ctx| {
+        let h = selected_summary(&state).unwrap().infohash.clone();
+        let effects = testing::with_api(&daemon.api(), None, |ctx| {
+            let mut effects = Vec::new();
             for c in ['p', 'r', 'c', 'a'] {
                 let msg = on_key(&state, testing::key(KeyCode::Char(c))).unwrap();
-                assert_eq!(update(&mut state, msg, ctx).len(), 1, "{c}");
-                assert!(state.confirm.is_none());
+                effects.extend(update(&mut state, msg, ctx));
+                assert!(state.confirm.is_none(), "{c}");
             }
+            effects
         });
+        testing::run(effects);
+        assert_eq!(
+            daemon.lines(),
+            ["pause", "resume", "recheck", "reannounce"]
+                .map(|a| format!("POST /v1/torrents/{h}/{a}"))
+        );
     }
 
     #[test]
     fn remove_asks_yes_or_no() {
+        let daemon = testing::Recorder::start("204 No Content", "");
         let mut state = loaded(1..8, None);
-        testing::with_ctx(None, |ctx| {
+        let h = selected_summary(&state).unwrap().infohash.clone();
+        let effects = testing::with_api(&daemon.api(), None, |ctx| {
             let msg = on_key(&state, testing::key(KeyCode::Char('d'))).unwrap();
             assert!(update(&mut state, msg, ctx).is_empty());
             assert!(matches!(
@@ -2031,9 +2047,16 @@ mod tests {
             ));
             assert!(capturing(&state));
             let msg = on_key(&state, testing::key(KeyCode::Char('y'))).unwrap();
-            assert_eq!(update(&mut state, msg, ctx).len(), 1, "one DELETE");
+            let effects = update(&mut state, msg, ctx);
             assert!(state.confirm.is_none());
+            effects
         });
+        testing::run(effects);
+        assert_eq!(
+            daemon.lines(),
+            [format!("DELETE /v1/torrents/{h}")],
+            "one DELETE, keeping the files"
+        );
     }
 
     #[test]
@@ -2108,8 +2131,10 @@ mod tests {
 
     #[test]
     fn pause_all_and_resume_all_ask_first() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = loaded(1..8, None);
-        testing::with_ctx(None, |ctx| {
+        let effects = testing::with_api(&daemon.api(), None, |ctx| {
+            let mut effects = Vec::new();
             for c in ['P', 'U'] {
                 let msg = on_key(&state, testing::key(KeyCode::Char(c))).unwrap();
                 assert!(update(&mut state, msg, ctx).is_empty());
@@ -2119,9 +2144,18 @@ mod tests {
                 let msg = on_key(&state, testing::key(KeyCode::Char(c))).unwrap();
                 update(&mut state, msg, ctx);
                 let msg = on_key(&state, testing::key(KeyCode::Char('y'))).unwrap();
-                assert_eq!(update(&mut state, msg, ctx).len(), 1, "{c}");
+                effects.extend(update(&mut state, msg, ctx));
             }
+            effects
         });
+        testing::run(effects);
+        assert_eq!(
+            daemon.lines(),
+            [
+                "POST /v1/torrents/pause-all",
+                "POST /v1/torrents/resume-all"
+            ]
+        );
     }
 
     #[test]
@@ -2153,9 +2187,10 @@ mod tests {
 
     #[test]
     fn an_action_result_is_a_toast_and_a_reload() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = opened(true);
-        testing::with_ctx(None, |ctx| {
-            let effects = update(
+        let (removed, refused) = testing::with_api(&daemon.api(), None, |ctx| {
+            let removed = update(
                 &mut state,
                 Msg::Acted {
                     action: Action::Remove,
@@ -2165,8 +2200,7 @@ mod tests {
                 ctx,
             );
             assert!(state.detail.is_none(), "a removed torrent's view closes");
-            assert!(effects.len() >= 2, "a toast and the reload");
-            let effects = update(
+            let refused = update(
                 &mut state,
                 Msg::Acted {
                     action: Action::Resume,
@@ -2175,8 +2209,22 @@ mod tests {
                 },
                 ctx,
             );
-            assert_eq!(effects.len(), 1, "a failure toast");
+            (removed, refused)
         });
+
+        let msgs = testing::run(removed);
+        assert!(
+            matches!(&msgs[0], crate::app::Msg::Toast(t) if t.kind == ToastKind::Success),
+            "a toast: {msgs:?}"
+        );
+        assert_eq!(daemon.lines(), RELOAD, "and the reload");
+
+        let msgs = testing::run(refused);
+        assert!(
+            matches!(&msgs[..], [crate::app::Msg::Toast(t)] if t.kind == ToastKind::Error),
+            "a failure toast: {msgs:?}"
+        );
+        assert_eq!(daemon.lines(), RELOAD, "and nothing sent");
     }
 
     // The detail view.

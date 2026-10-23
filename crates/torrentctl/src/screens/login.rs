@@ -204,12 +204,15 @@ mod tests {
 
     #[test]
     fn submitting_sends_once_and_ignores_keys_until_answered() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = typed("pw");
-        testing::with_ctx(None, |ctx| {
-            assert_eq!(update(&mut state, Msg::Submit, ctx).len(), 1);
+        let effects = testing::with_api(&daemon.api(), None, |ctx| {
+            update(&mut state, Msg::Submit, ctx)
         });
         assert!(state.busy);
         assert!(on_key(&state, testing::key(KeyCode::Enter)).is_none());
+        testing::run(effects);
+        assert_eq!(daemon.lines(), ["POST /v1/sessions"]);
     }
 
     #[test]
@@ -234,14 +237,26 @@ mod tests {
 
     #[test]
     fn a_granted_token_signs_the_app_in() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = typed("pw");
-        let effects = testing::with_ctx(None, |ctx| {
+        let effects = testing::with_api(&daemon.api(), None, |ctx| {
             update(&mut state, Msg::Answered(Ok("tds_abc".into())), ctx)
         });
-        assert_eq!(effects.len(), 1, "SignedIn with the new credential");
         assert!(
             state.password.value().is_empty(),
             "the password is not kept"
+        );
+        let msgs = testing::run(effects);
+        let [crate::app::Msg::SignedIn(api)] = &msgs[..] else {
+            panic!("SignedIn with the new credential: {msgs:?}");
+        };
+        // Nothing sent yet; what the new handle sends presents the token.
+        assert!(daemon.requests().is_empty());
+        testing::run(vec![crate::app::check_session(api)]);
+        let bearers: Vec<_> = daemon.requests().into_iter().map(|r| r.bearer).collect();
+        assert_eq!(
+            bearers,
+            [Some("tds_abc".to_owned()), Some("tds_abc".to_owned())]
         );
     }
 }
