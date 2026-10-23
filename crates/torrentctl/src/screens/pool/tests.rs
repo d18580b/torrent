@@ -1697,6 +1697,139 @@ fn a_plan_refreshed_while_its_steps_re_read_lets_the_re_read_finish() {
     assert!(!detail.steps.loading);
 }
 
+/// `n` plan summaries from id `from`, continuing at `next`.
+fn wide_plans(from: usize, n: usize, next: Option<&str>) -> types::PlanPage {
+    let items: Vec<_> = (from..from + n)
+        .map(|id| {
+            json!({"id": id, "kind": "relocate", "status": "draft",
+                   "created_at": "2026-09-27T10:00:00Z", "applied_at": null})
+        })
+        .collect();
+    testing::from_json(json!({"items": items, "next_cursor": next}))
+}
+
+#[test]
+fn a_plan_list_refresh_past_1000_plans_keeps_them_and_the_selection() {
+    let mut state = State {
+        view: View::Plans,
+        ..State::default()
+    };
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    let plans_page = |state: &State, first: bool, page: types::PlanPage| {
+        Msg::Plans(plans::Msg::Page {
+            generation: state.plans.list.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    // Loaded as the operator scrolled: two pages, 1800 plans.
+    let msg = plans_page(&state, true, wide_plans(0, 1000, Some("p1000")));
+    send(&mut state, msg, true);
+    let msg = plans_page(&state, false, wide_plans(1000, 800, Some("p1800")));
+    send(&mut state, msg, true);
+    assert_eq!(state.plans.list.items.len(), 1800);
+    state.plans.selected = 1700;
+
+    let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| refresh(&mut state, ctx));
+    testing::run(effects);
+    assert_eq!(daemon.lines(), ["GET /v1/pool/plans?limit=1000"]);
+
+    let msg = plans_page(&state, true, wide_plans(0, 1000, Some("p1000")));
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| {
+        update(&mut state, msg, ctx)
+    });
+    assert_eq!(state.plans.list.items.len(), 1800, "kept while it re-pages");
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 0);
+    assert_eq!(
+        state.plans.selected, 1701,
+        "a key moves, not clamped to 999"
+    );
+    testing::run(effects);
+    assert_eq!(
+        daemon.lines()[1],
+        "GET /v1/pool/plans?cursor=p1000&limit=800"
+    );
+    let msg = plans_page(&state, false, wide_plans(1000, 800, Some("p1800")));
+    send(&mut state, msg, true);
+    assert!(!state.plans.list.loading);
+    assert_eq!(state.plans.list.items.len(), 1800);
+    assert_eq!(
+        state.plans.list.items[state.plans.selected].id, 1701,
+        "the selection follows the plan the operator moved to during the reload"
+    );
+}
+
+#[test]
+fn a_plan_steps_refresh_past_1000_steps_keeps_them_and_the_selection() {
+    // A 1300-step plan whose body carries the first 100.
+    let plan = || -> types::Plan {
+        let steps: Vec<_> = (1..=100).map(step_json).collect();
+        testing::from_json(json!({
+            "id": 8, "kind": "delete_orphans", "status": "draft",
+            "created_at": "2026-09-27T10:00:00Z", "applied_at": null,
+            "confirm_token": "7f3a-9c21",
+            "steps": steps,
+            "steps_next_cursor": "after-100",
+            "step_counts": {"total": 1300, "pending": 1300, "in_progress": 0, "done": 0,
+                            "failed": 0, "skipped": 0},
+        }))
+    };
+    let mut state = with_detail(plan());
+    assert_eq!(press(&mut state, KeyCode::Char('G'), true), 1);
+    steps_answer(&mut state, false, steps_page(101, 1000, Some("after-1000")));
+    assert_eq!(press(&mut state, KeyCode::Char('G'), true), 1);
+    steps_answer(&mut state, false, steps_page(1001, 1300, None));
+    press(&mut state, KeyCode::Char('G'), true);
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 1300);
+    assert_eq!(detail.selected, 1299);
+
+    let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+    let server = testing::server(true, true);
+    let loaded = Msg::Plans(plans::Msg::DetailLoaded {
+        id: 8,
+        result: Ok(plan()),
+    });
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| {
+        update(&mut state, loaded, ctx)
+    });
+    testing::run(effects);
+    assert_eq!(
+        daemon.lines(),
+        ["GET /v1/pool/plans/8/steps?limit=1000"],
+        "one request's worth of the 1300 loaded steps first"
+    );
+
+    let (opening, generation) = steps_tag(&state);
+    let first = Msg::Plans(plans::Msg::StepsPage {
+        opening,
+        generation,
+        first: true,
+        result: Ok(steps_page(1, 1000, Some("after-1000"))),
+    });
+    let effects = testing::with_api(&daemon.api(), Some(&server), |ctx| {
+        update(&mut state, first, ctx)
+    });
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert_eq!(detail.steps.items.len(), 1300, "kept while it re-pages");
+    assert_eq!(detail.selected, 1299, "not clamped to 999");
+    testing::run(effects);
+    assert_eq!(
+        daemon.lines()[1],
+        "GET /v1/pool/plans/8/steps?cursor=after-1000&limit=300"
+    );
+    assert_eq!(
+        steps_answer(&mut state, false, steps_page(1001, 1300, None)),
+        0
+    );
+    let detail = state.plans.detail.as_ref().unwrap();
+    assert!(!detail.steps.loading);
+    assert_eq!(detail.steps.items.len(), 1300);
+    assert_eq!(detail.selected, 1299);
+}
+
 #[test]
 fn a_drafted_plan_is_counted_from_step_counts() {
     let mut state = with_plans();
