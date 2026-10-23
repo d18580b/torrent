@@ -606,9 +606,16 @@ impl PoolService {
     /// [`PoolService::lock_writer`] where nobody holds the writer, and
     /// `None`, at once, where somebody does: a scan holds it for its whole
     /// run.
+    ///
+    /// The verify tick calls this on a runtime worker. Taking the writer
+    /// never waits, but each deferred release is a SQLite write, so where
+    /// any are queued they are applied through [`off_worker`], as every
+    /// other writer acquisition does its work.
     fn try_lock_writer(&self) -> Option<parking_lot::MutexGuard<'_, PoolStore>> {
         let mut store = self.store.try_lock()?;
-        self.apply_deferred_releases(&mut store);
+        if !self.deferred_releases.lock().is_empty() {
+            off_worker(|| self.apply_deferred_releases(&mut store));
+        }
         Some(store)
     }
 
@@ -6231,6 +6238,48 @@ mod tests {
         w.tick(&pool);
         assert_eq!(adds(), 2);
         assert_eq!(q.depth(), 1);
+    }
+
+    /// Adoptions held for a fenced profile log the hold once per profile per
+    /// tick, not once per adoption, while each stays queued and none is
+    /// added to a session.
+    #[test]
+    fn adoptions_held_for_a_fenced_profile_log_once_per_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = Arc::new(super::VerifyQueue::new(4));
+        let w = Worker::new(dir.path());
+        let q = pool.verify_queue();
+        for i in 0..20u8 {
+            q.enqueue(pending(InfoHash([0xE0 + i; 20]), "down"));
+        }
+        let store = pool.lock_writer();
+        let mut logged = std::collections::HashSet::new();
+        for _ in 0..20 {
+            assert_eq!(
+                super::admit_adoption(
+                    &pool,
+                    &store,
+                    &w.source,
+                    &w.metrics,
+                    &w.profiles,
+                    &w.registry,
+                    &mut logged,
+                ),
+                super::Admission::Skipped,
+            );
+        }
+        assert_eq!(
+            logged.into_iter().collect::<Vec<_>>(),
+            [ProfileId::new("down")],
+            "one profile, logged once",
+        );
+        assert_eq!(q.depth(), 20, "every held adoption stays queued");
+        assert!(!w
+            .engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
     }
 
     /// Re-hashes held for a fenced profile log the hold once per profile per
