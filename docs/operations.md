@@ -26,7 +26,7 @@ The small state files are described in full in
 | `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
 | `paced_holds.json` | The torrents a profile set online paused itself and has not started again yet. Going online pauses every torrent that was running, then starts them 100 a second; this names them, so a boot in the middle loads them unpaused rather than as paused as their resume data says. Written before those pauses, and again as they start or as you pause one of them. | Those torrents come back paused after a restart in the middle of a set-online, like ones you paused yourself. `POST /v1/profiles/{id}/resume-all` starts them, and any you paused on purpose with them. | Nothing. Each set-online writes it again. |
 | `last_shutdown.json` | The last exit's unsaved-resume count and kill-switch-removal result. The next boot exports it as the `torrentd_last_shutdown_*` gauges, then deletes it. | One boot's report. | Every graceful exit writes a new one. |
-| `torrentd.lock` | The single-instance lock, holding the running daemon's pid. | Nothing while the daemon is stopped. | Every start. |
+| `torrentd.lock` | The single-instance lock for this state directory, holding the running daemon's pid. The kill switch's table is per uid, so a second daemon of the same uid is kept off it by the abstract socket `@torrentd_ks_<uid>`, which is not a file and is not here (running.md §11). | Nothing while the daemon is stopped. | Every start. |
 | `wireguard-<iface>.raised` | A note that this boot of this host raised the WireGuard link standing under that name, with the public key it carried. | For every profile: shutdown leaves the daemon's own link standing instead of removing it, because teardown removes only a link this record names by the key it carries. A config that carries its private key is still adopted by that key at the next start. For a keyless config (`PostUp = wg set %i private-key …`) the record is the only ground for adoption, so a restart finds the link still standing, after an unclean exit or after that shutdown, and cannot adopt it: that profile stays dark until you remove the link by hand and restart. | Every WireGuard bring-up. |
 | `openvpn-<iface>.pid` | The pid of that profile's `openvpn` process. It is the teardown's only handle on it. | The `openvpn` process keeps running past the next shutdown, and you must stop it by hand. | Every OpenVPN bring-up. |
 | `openvpn-<iface>.table` | The routing table that profile's source-address `ip rule` entries point at. | If that `openvpn` process dies on its own, its `ip rule` entries stay behind, and you must delete them by hand. | Every OpenVPN bring-up. |
@@ -355,7 +355,10 @@ kill-switch table stay up. The packaged unit's `ExecStopPost=` runs
 and every WireGuard link the daemon raised, with its rules, and runs the
 retired-OpenVPN-profile teardown described below. Run it by hand
 (`sudo torrentd --config /etc/torrentd/torrentd.toml net-cleanup`) after an
-unclean exit outside that unit; it refuses while a daemon is running. Each
+unclean exit outside that unit; it refuses while a daemon holds the state
+directory's `torrentd.lock`, and while a daemon of the table's uid on any
+state directory holds the kill-switch table lock `@torrentd_ks_<uid>`
+(running.md §11), since that table is then the running daemon's. Each
 boot also removes a WireGuard link a raised-interface record vouches for once
 no configured profile names it, and with `network_kill_switch = false` removes
 a leftover kill-switch table. For a retired OpenVPN profile, whose interface
