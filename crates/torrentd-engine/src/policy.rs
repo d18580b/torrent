@@ -40,17 +40,13 @@ fn no_download() -> TorrentFlags {
     TorrentFlags::UPLOAD_MODE
 }
 
-/// Flags no torrent this daemon adds may carry: each can take a torrent out of
-/// upload mode (`AUTO_MANAGED`), request pieces by design (`SHARE_MODE`), or
-/// is a downloading client's knob with no meaning for a torrent that never
-/// leaves upload mode. The shim enforces the same set on every add; stating it
-/// here keeps each add path's intent readable and testable without libtorrent.
+/// Flags no torrent this daemon adds may carry:
+/// [`FORBIDDEN_TORRENT_FLAGS`](libtorrent_safe::session::FORBIDDEN_TORRENT_FLAGS),
+/// the one Rust statement of the set. The shim enforces the same set on every
+/// add; naming it here keeps each add path's intent readable and testable
+/// without libtorrent.
 pub fn forbidden() -> TorrentFlags {
-    TorrentFlags::AUTO_MANAGED
-        | TorrentFlags::SHARE_MODE
-        | TorrentFlags::SUPER_SEEDING
-        | TorrentFlags::SEQUENTIAL_DOWNLOAD
-        | TorrentFlags::STOP_WHEN_READY
+    libtorrent_safe::session::FORBIDDEN_TORRENT_FLAGS
 }
 
 /// Per-torrent discovery guards for a torrent living in `profile`.

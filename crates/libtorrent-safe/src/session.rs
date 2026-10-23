@@ -8,6 +8,7 @@
 //! Methods return `Result<…, Error>`, never panic on shim failures, and
 //! never expose raw pointers.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::marker::PhantomData;
 
@@ -80,19 +81,35 @@ impl AddParams {
             torrent: None,
             save_path: None,
             flags_set: TorrentFlags::UPLOAD_MODE,
-            flags_clear: TorrentFlags::AUTO_MANAGED
-                | TorrentFlags::SHARE_MODE
-                | TorrentFlags::SUPER_SEEDING
-                | TorrentFlags::SEQUENTIAL_DOWNLOAD
-                | TorrentFlags::STOP_WHEN_READY,
+            flags_clear: FORBIDDEN_TORRENT_FLAGS,
         }
     }
 }
+
+/// Flags no torrent the daemon adds may carry, because each can take it out
+/// of upload mode (`AUTO_MANAGED`), requests pieces by design (`SHARE_MODE`),
+/// or is a downloading client's knob with no meaning for a torrent that never
+/// leaves upload mode.
+///
+/// The one Rust copy of the set: [`AddParams::resume`] clears it and the
+/// engine's add-time policy states it from here. The shim keeps the same set
+/// as libtorrent flags (`forbidden_torrent_flags` in `libtorrent_shim.cpp`)
+/// and clears it on every add whatever the caller passes, so a change here is
+/// a change there too.
+pub const FORBIDDEN_TORRENT_FLAGS: TorrentFlags = TorrentFlags::AUTO_MANAGED
+    .union(TorrentFlags::SHARE_MODE)
+    .union(TorrentFlags::SUPER_SEEDING)
+    .union(TorrentFlags::SEQUENTIAL_DOWNLOAD)
+    .union(TorrentFlags::STOP_WHEN_READY);
 
 const ERR_BUF_LEN: usize = 512;
 
 pub struct Session {
     ptr: *mut ffi::lt_session,
+    /// Alerts [`Session::pop_alert`] popped and skipped because their kind is
+    /// none this crate translates. Counted into
+    /// [`Session::alert_translate_errors`].
+    unknown_alerts: Cell<u64>,
     _marker: PhantomData<()>,
 }
 
@@ -126,6 +143,7 @@ impl Session {
         debug!(target: "libtorrent_safe", "session created");
         Ok(Self {
             ptr,
+            unknown_alerts: Cell::new(0),
             _marker: PhantomData,
         })
     }
@@ -152,6 +170,7 @@ impl Session {
         debug!(target: "libtorrent_safe", "session created from saved state");
         Ok(Self {
             ptr,
+            unknown_alerts: Cell::new(0),
             _marker: PhantomData,
         })
     }
@@ -575,7 +594,7 @@ impl Session {
     /// Drain one alert from the queue. Returns `None` if empty (after one
     /// pop_alerts inside the shim has already drained the libtorrent side).
     pub fn pop_alert(&self) -> Option<Alert> {
-        loop {
+        skip_unknown(&self.unknown_alerts, || {
             let mut raw: ffi::lt_alert_union = unsafe { std::mem::zeroed() };
             let got = unsafe { ffi::lt_pop_alert(self.ptr, &mut raw) };
             if got == 0 {
@@ -583,23 +602,20 @@ impl Session {
             }
             // SAFETY: raw is uninitialized only outside this branch; here it
             // was filled by lt_pop_alert.
-            match unsafe { Alert::from_raw_owned(&mut raw) } {
-                Some(alert) => return Some(alert),
-                None => {
-                    // Unknown alert kind. Skip and try the next one.
-                    continue;
-                }
-            }
-        }
+            Some(unsafe { Alert::from_raw_owned(&mut raw) })
+        })
     }
 
     /// How many alerts this session popped from libtorrent and then dropped
-    /// because translating them failed. The shim drops such an alert on its
-    /// own and still delivers the rest of its batch, so a nonzero count is
-    /// alerts lost one at a time, not a stalled queue. Monotonic for the
-    /// session's lifetime.
+    /// because translating them failed: the shim's own count, of alerts it
+    /// could not copy out, plus every alert [`Session::pop_alert`] skipped
+    /// because its kind is none this crate translates. Either is an alert the
+    /// daemon never saw, and each is dropped on its own while the rest of the
+    /// queue is still delivered, so a nonzero count is alerts lost one at a
+    /// time, not a stalled queue. Monotonic for the session's lifetime.
     pub fn alert_translate_errors(&self) -> u64 {
-        unsafe { ffi::lt_alert_translate_errors(self.ptr) }
+        let shim = unsafe { ffi::lt_alert_translate_errors(self.ptr) };
+        shim.saturating_add(self.unknown_alerts.get())
     }
 
     /// Test-only: hand torrent `h` the peer at `peer` to connect to.
@@ -788,6 +804,21 @@ impl AddInfoHashes {
             return None;
         }
         self.hashes.key()
+    }
+}
+
+/// The first alert `pop` yields that translated, counting into `unknown` each
+/// one it skips. `pop` answers `None` once the queue is empty, and
+/// `Some(None)` for an alert whose kind is none this crate translates.
+fn skip_unknown(
+    unknown: &Cell<u64>,
+    mut pop: impl FnMut() -> Option<Option<Alert>>,
+) -> Option<Alert> {
+    loop {
+        match pop()? {
+            Some(alert) => return Some(alert),
+            None => unknown.set(unknown.get().saturating_add(1)),
+        }
     }
 }
 
@@ -1127,6 +1158,51 @@ mod tests {
     use super::*;
     use crate::alert::AlertKind;
     use crate::metadata::InfoHashV2;
+
+    #[test]
+    fn an_alert_of_an_unknown_kind_is_skipped_and_counted() {
+        let dropped = |bits| {
+            Some(Alert::AlertsDropped {
+                hdr: crate::alert::AlertHeader {
+                    kind: AlertKind::AlertsDropped,
+                    infohash: None,
+                    handle: None,
+                    timestamp_us: 0,
+                },
+                bits,
+            })
+        };
+        let mut queue = vec![None, None, dropped([1, 0]), None, dropped([2, 0])].into_iter();
+        let unknown = Cell::new(0);
+        let mut pop = || skip_unknown(&unknown, || queue.next());
+        assert!(matches!(
+            pop(),
+            Some(Alert::AlertsDropped { bits: [1, 0], .. })
+        ));
+        assert_eq!(unknown.get(), 2);
+        assert!(matches!(
+            pop(),
+            Some(Alert::AlertsDropped { bits: [2, 0], .. })
+        ));
+        assert_eq!(unknown.get(), 3);
+        assert!(pop().is_none(), "an empty queue is the end");
+        assert_eq!(unknown.get(), 3);
+    }
+
+    #[test]
+    fn the_resume_constructor_clears_exactly_the_forbidden_flags() {
+        let AddParams::Resume {
+            flags_set,
+            flags_clear,
+            ..
+        } = AddParams::resume(vec![])
+        else {
+            unreachable!()
+        };
+        assert_eq!(flags_set, TorrentFlags::UPLOAD_MODE);
+        assert_eq!(flags_clear, FORBIDDEN_TORRENT_FLAGS);
+        assert!(!FORBIDDEN_TORRENT_FLAGS.contains(TorrentFlags::UPLOAD_MODE));
+    }
 
     /// Two real sessions on loopback, with nothing to discover peers but the
     /// magnet's own `x.pe`.

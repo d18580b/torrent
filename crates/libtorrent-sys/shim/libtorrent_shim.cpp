@@ -336,6 +336,9 @@ lt::torrent_flags_t translate_torrent_flags(std::uint32_t caller_flags) {
 //   - super_seeding, sequential_download, stop_when_ready: none is a download
 //     by itself, but each is a downloading client's knob, and none has a
 //     meaning for a torrent that must never leave upload mode.
+//
+// The Rust side states the same set once, as `FORBIDDEN_TORRENT_FLAGS` in
+// libtorrent-safe's session.rs; a change to one is a change to both.
 const lt::torrent_flags_t forbidden_torrent_flags =
       lt::torrent_flags::auto_managed
     | lt::torrent_flags::share_mode
