@@ -31,7 +31,9 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Atomically replace the `.torrent` file for `(profile, ih)` with `data`,
-    /// durably, before returning.
+    /// durably before returning in the sense
+    /// [`crate::resume_store`]'s Durability section gives: the data always,
+    /// the new name as far as a directory `fsync` can make it.
     fn write(
         &self,
         profile: &ProfileId,
@@ -56,11 +58,14 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     fn flush(&self) {}
 
     /// Delete the `.torrent` file for `(profile, ih)`, and the save path
-    /// recorded beside it, durably before returning: a crash after this
-    /// returns does not bring them back. Missing files are not an error.
+    /// recorded beside it, before returning, then `fsync` the directory: a
+    /// crash after this returns does not bring them back, and a power loss
+    /// can only where that `fsync` failed ([`crate::resume_store`]'s
+    /// Durability section). Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError>;
 
-    /// Atomically record, durably before returning, the save path
+    /// Atomically record, durably before returning (as
+    /// [`crate::resume_store`]'s Durability section defines it), the save path
     /// `(profile, ih)` was added at, beside its `.torrent`.
     ///
     /// The torrent-dir scan re-adds a `.torrent` whose resume file is gone;

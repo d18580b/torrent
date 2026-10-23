@@ -11,6 +11,26 @@
 //! `MemoryResumeStore` keeps everything in a `DashMap` keyed by
 //! `(profile, infohash)`. Used by Layer 1 unit tests so we don't hit the
 //! filesystem.
+//!
+//! # Durability
+//!
+//! Where this store and [`crate::torrent_store`] say a write or delete is
+//! durable before it returns, they mean exactly this:
+//!
+//! - A write's data reaches the disk before its new name can: its temp file
+//!   is `fsync`ed, or a batch's filesystem flushed, before the rename, and a
+//!   flush that reports an error abandons the rename. Any crash leaves the
+//!   previous file or the new one, never a torn mix.
+//! - The rename or unlink itself is made durable by `fsync`ing the
+//!   directory, and that step is best effort: a failure is logged, counted in
+//!   `dir_fsync_errors_total`, and does not fail the call (`sync_dir` in
+//!   [`crate::batch_writer`] says why). Until the filesystem commits
+//!   that directory on its own, a power loss can revert the name: a write to
+//!   the previous file, or to none, and a delete to the deleted file.
+//!
+//! A process crash that the machine survives loses nothing either way. Only
+//! a power loss after a failed directory `fsync` can, and the counter says
+//! when one has failed.
 
 use std::collections::HashMap;
 use std::fs;
@@ -59,7 +79,9 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Atomically replace the resume file for `(profile, ih)` with `data`,
-    /// durably, before returning.
+    /// durably before returning in the sense the module's Durability section
+    /// gives: the data always, the new name as far as a directory `fsync`
+    /// can make it.
     fn write(
         &self,
         profile: &ProfileId,
@@ -84,7 +106,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     fn flush(&self) {}
 
     /// Delete the resume file for `(profile, ih)`, and any write queued for
-    /// it, durably before returning. Missing files are not an error.
+    /// it, before returning, then `fsync` the directory, best effort (see the
+    /// module's Durability section). Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
 
     /// Whether `(profile, ih)` has a resume file, on disk or queued for one.
@@ -96,7 +119,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
         Ok(false)
     }
 
-    /// Record, durably before returning, that `(profile, ih)` was removed.
+    /// Record, durably before returning (as the module's Durability section
+    /// defines it), that `(profile, ih)` was removed.
     ///
     /// `DELETE` writes one before it removes the torrent from its session,
     /// and it stands until every file that would bring the torrent back is
@@ -117,7 +141,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Remove `(profile, ih)`'s tombstone, durably before returning. Missing
+    /// Remove `(profile, ih)`'s tombstone before returning, then `fsync` the
+    /// directory, best effort (see the module's Durability section). Missing
     /// is not an error.
     fn clear_tombstone(
         &self,
@@ -323,8 +348,9 @@ impl PartitionedDir {
         Ok(out)
     }
 
-    /// Replace the file durably before returning: temp file, `fsync`,
-    /// `rename`, `fsync` of the directory.
+    /// Replace the file before returning: temp file, `fsync`, `rename`, then
+    /// a best-effort `fsync` of the directory (the module's Durability
+    /// section).
     pub(crate) fn write(
         &self,
         profile: &ProfileId,
@@ -369,8 +395,9 @@ impl PartitionedDir {
     }
 
     /// Remove the file and any write queued for it, then `fsync` the
-    /// directory, so a crash or power loss after this returns cannot bring
-    /// the file back for the next boot's scan to load.
+    /// directory, so a crash after this returns cannot bring the file back
+    /// for the next boot's scan to load. A power loss can, where that `fsync`
+    /// failed (the module's Durability section).
     pub(crate) fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> std::io::Result<()> {
         let path = self.path_for(profile, ih);
         match &self.writer {
