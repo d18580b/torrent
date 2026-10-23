@@ -436,6 +436,23 @@ mod tests {
         assert_eq!(scan.entries, vec![(good, b"t".to_vec())]);
     }
 
+    /// `delete` removes the lower-case name only, so an upper-case `.torrent`
+    /// the scan loaded would bring the torrent back at every boot.
+    #[test]
+    fn an_upper_case_torrent_file_is_not_loaded() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path());
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0xcdu8; 20]);
+        let path = store.path_for(&profile, &ih);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let upper = path.with_file_name(format!("{}.torrent", ih.to_hex().to_uppercase()));
+        std::fs::write(&upper, b"t").unwrap();
+        let scan = store.scan(&profile).unwrap();
+        assert!(scan.entries.is_empty(), "{:?}", scan.entries);
+        assert_eq!(scan.unreadable, 0);
+    }
+
     #[test]
     fn a_batched_torrent_is_readable_before_it_lands() {
         // The resume-add path reads the `.torrent` back to re-attach

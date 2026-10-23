@@ -132,6 +132,17 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// The info-hash `name` spells, only where it is spelled exactly as this
+/// daemon writes it: 40 lower-case hex digits, [`InfoHash::to_hex`]'s form.
+///
+/// Every file and registry row is written and deleted under that one
+/// spelling. A name that decoded under any other — `ABCD…` for `abcd…` —
+/// would be loaded at boot, yet every delete removes only the lower-case
+/// name, so the torrent would come back after each removal.
+pub(crate) fn canonical_infohash(name: &str) -> Option<InfoHash> {
+    InfoHash::from_hex(name).filter(|ih| ih.to_hex() == name)
+}
+
 /// Read every `<infohash><suffix>` file in `dir`, skipping — with a warning
 /// — names that are not an info-hash and files that cannot be read. `what`
 /// names the store in the log.
@@ -167,12 +178,12 @@ pub(crate) fn scan_dir(
         let Some(stem) = name.strip_suffix(suffix) else {
             continue;
         };
-        let Some(ih) = InfoHash::from_hex(stem) else {
+        let Some(ih) = canonical_infohash(stem) else {
             warn!(
                 target: "torrentd_engine::store",
                 profile_id = %profile,
                 file = %path.display(),
-                "skipping {what} file with invalid name",
+                "skipping {what} file whose name is not a lower-case hex info-hash",
             );
             continue;
         };
@@ -270,7 +281,7 @@ impl PartitionedDir {
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(self.suffix)) else {
                 continue;
             };
-            if let Some(ih) = InfoHash::from_hex(stem) {
+            if let Some(ih) = canonical_infohash(stem) {
                 out.push(ih);
             }
         }
@@ -679,6 +690,52 @@ mod tests {
             !batch_tmp.exists() && !now_tmp.exists(),
             "the writes reused them"
         );
+    }
+
+    /// Every delete removes the lower-case name. A file named in upper case
+    /// that a scan still loaded would survive each `DELETE` and come back at
+    /// every boot, as would an upper-case tombstone that boot honours but
+    /// `clear_tombstone` never removes.
+    #[test]
+    fn only_a_lower_case_hex_name_is_scanned_or_listed() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let p = ProfileId::new("p");
+        let ih = InfoHash([0xabu8; 20]);
+        let profile_dir = dir.path().join("p");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let upper = ih.to_hex().to_uppercase();
+        let mixed = format!("Ab{}", &ih.to_hex()[2..]);
+        for stem in [&upper, &mixed] {
+            std::fs::write(profile_dir.join(format!("{stem}.resume")), b"x").unwrap();
+            std::fs::write(profile_dir.join(format!("{stem}.removed")), b"").unwrap();
+        }
+
+        let scan = store.scan(&p).unwrap();
+        assert!(scan.entries.is_empty(), "{:?}", scan.entries);
+        assert_eq!(scan.unreadable, 0);
+        assert!(store.tombstones(&p).unwrap().is_empty());
+
+        store.write(&p, &ih, b"canonical").unwrap();
+        store.write_tombstone(&p, &ih).unwrap();
+        assert_eq!(store.load_all(&p).unwrap().len(), 1);
+        assert_eq!(store.tombstones(&p).unwrap(), vec![ih]);
+        store.delete(&p, &ih).unwrap();
+        store.clear_tombstone(&p, &ih).unwrap();
+        assert!(
+            store.load_all(&p).unwrap().is_empty(),
+            "the delete is final"
+        );
+        assert!(store.tombstones(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_infohash_accepts_only_to_hex_spelling() {
+        let ih = InfoHash([0x0fu8; 20]);
+        assert_eq!(canonical_infohash(&ih.to_hex()), Some(ih));
+        assert_eq!(canonical_infohash(&ih.to_hex().to_uppercase()), None);
+        assert_eq!(canonical_infohash("0f"), None);
+        assert_eq!(canonical_infohash(&"g".repeat(40)), None);
     }
 
     #[test]
