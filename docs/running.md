@@ -1869,7 +1869,10 @@ On a scratch pool, not your real one.
    tunnel address (a `10.0.0.0/8` LAN beside Proton's `10.2.0.2/32`) would
    win, and `ss -tulnp` would show `10.2.0.2%eth0`. The daemon also checks
    every listen socket a vpn session opens against the kernel, as it comes
-   up and after each NAT-PMP rebind. A socket bound to any device but the
+   up and after each NAT-PMP rebind. At boot that check runs before the
+   scans load any torrent: a socket on the wrong device fails the boot with
+   no torrent loaded, and so does a vpn session that reports no listen
+   outcome within 30 s of every profile being up. A socket bound to any device but the
    profile's `vpn_interface` stops the whole daemon, whatever other
    sessions are up. It logs `a listen socket is not held to the profile's
    tunnel device`, closes that profile's listen sockets and then pauses its

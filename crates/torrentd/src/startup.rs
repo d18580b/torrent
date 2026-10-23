@@ -728,9 +728,9 @@ async fn check_listen_devices(
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!(
-                "vpn profile(s) {named} reported no listen socket within {}s of their session \
-                 starting, so which device their sockets are held to could not be checked \
-                 before any torrent was loaded",
+                "vpn profile(s) {named} reported no listen outcome in the {}s the boot waited \
+                 after bringing every profile up, so which device their sockets are held to \
+                 could not be checked before any torrent was loaded",
                 bound.as_secs(),
             );
         }
@@ -6194,7 +6194,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("vpn profile(s) acct_a reported no listen socket within 30s"),
+            err.contains("vpn profile(s) acct_a reported no listen outcome in the 30s"),
             "{err}"
         );
         assert!(started.elapsed() >= LISTEN_CHECK_BOUND);
