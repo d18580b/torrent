@@ -44,6 +44,7 @@ use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
 use crate::pool_service::execute_adopt;
+use crate::pool_service::Adopted;
 use crate::pool_service::PoolService;
 
 /// The most infohashes one adoption or verification request may name.
@@ -1020,7 +1021,10 @@ from_profile_problem!(AdoptError);
 /// torrent another profile already holds is refused rather than announced from
 /// a second account. A torrent whose previous client left trustworthy resume
 /// data seeds at once (`fast_path`); any other is hashed by libtorrent before
-/// it seeds (`queued_for_verification`). Torrents that are not `matched` are
+/// it seeds (`queued_for_verification`). Each is listed under the path it
+/// took: one planned for the fast path whose resume data turns out unusable,
+/// or whose add the session rejects, is verified instead and listed under
+/// `queued_for_verification`. Torrents that are not `matched` are
 /// refused, each with the reason. `dry_run` reports all of this and adopts
 /// nothing.
 ///
@@ -1147,21 +1151,20 @@ fn adopt_each(
             }
         };
 
-        // The two adoptable outcomes differ only in which bucket they land in
-        // and whether their bytes are counted, so collapse them: everything
-        // after this point — the registry claim above all — must hold for both,
-        // and holding it in two branches is how it came to hold in neither.
-        let verifies = match plan {
-            torrentd_pool::AdoptPlan::Refuse { reason } => {
-                refuse(&mut resp, reason.to_owned());
-                continue;
-            }
-            torrentd_pool::AdoptPlan::FastPath { .. } => false,
-            torrentd_pool::AdoptPlan::Verify { .. } => true,
-        };
+        // The plan is read here only to refuse before the registry claim: the
+        // two adoptable plans take the same steps below — the claim above all
+        // — and holding them in two branches is how they came to hold in
+        // neither. Which bucket a torrent lands in is not the plan's to say: a
+        // fast-path plan falls back to verification where its resume data
+        // will not do, so it is what `execute_adopt` did.
+        if let torrentd_pool::AdoptPlan::Refuse { reason } = plan {
+            refuse(&mut resp, reason.to_owned());
+            continue;
+        }
 
         // Counted only once it is taken, so a refused torrent's bytes are not.
-        let accept = |resp: &mut AdoptionResult| {
+        let accept = |resp: &mut AdoptionResult, adopted: Adopted| {
+            let verifies = adopted == Adopted::QueuedForVerification;
             if verifies {
                 resp.verify_bytes += pool
                     .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
@@ -1189,7 +1192,7 @@ fn adopt_each(
             // Everything up to the add, the account-isolation guard included,
             // so a dry run refuses what the adoption would.
             match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), true) {
-                Ok(_) => accept(&mut resp),
+                Ok(adopted) => accept(&mut resp, adopted),
                 Err(r) => refuse(&mut resp, r.reason),
             }
             continue;
@@ -1210,7 +1213,7 @@ fn adopt_each(
             continue;
         }
         match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), false) {
-            Ok(_) => accept(&mut resp),
+            Ok(adopted) => accept(&mut resp, adopted),
             Err(r) => {
                 release_claim(s, infohash);
                 if r.isolation {

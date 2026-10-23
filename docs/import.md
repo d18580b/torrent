@@ -254,9 +254,13 @@ takes.
 A queued torrent is hashed after the request answers, so its hashing adds
 nothing to the wait.
 
-A torrent listed under `fast_path` can still end up hashed: when its resume
-data turns out unreadable or libtorrent rejects it, the adopt falls back to
-the verify queue and logs `falling back to verification`.
+A torrent the index plans for the fast path can still end up hashed: when its
+resume data turns out unreadable, unparseable or keyed by another info-hash,
+or libtorrent rejects its add, the adopt falls back to the verify queue and
+logs `falling back to verification`. The response lists it where it went,
+under `queued_for_verification`, with its bytes in `verify_bytes`; a dry run
+reports the fallbacks it can see before the add, every one but the rejected
+add.
 
 ## 6. Refusals
 

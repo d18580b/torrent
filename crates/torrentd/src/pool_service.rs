@@ -2821,6 +2821,22 @@ fn unresolved_profile(
     }
 }
 
+/// Which path [`execute_adopt`] took a torrent down, and so which bucket of
+/// `POST /v1/pool/adoptions`'s response it is reported in.
+///
+/// Read from what the adopt did, not from its plan: a fast-path plan whose
+/// resume data turns out unreadable, unparseable, keyed otherwise than the
+/// index, or rejected by the session's add falls back to verification, and is
+/// queued, not seeding.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Adopted {
+    /// Added in seed mode from the previous client's resume data, or, in a
+    /// dry run, would be.
+    FastPath,
+    /// Queued to be hashed before it may seed, or, in a dry run, would be.
+    QueuedForVerification,
+}
+
 /// Why [`execute_adopt`] did not adopt a torrent.
 #[derive(Debug)]
 pub struct AdoptRefusal {
@@ -2970,6 +2986,11 @@ pub(crate) fn resume_key_refusal(
 /// profile's `allowed_tracker_domains`, or announcing to no tracker at all, is
 /// refused, and never falls back to the other path. `dry_run` runs everything up to the
 /// add or the enqueue, and does neither.
+///
+/// Where the fast path's resume data cannot be read, parsed, or keyed by the
+/// index's info-hash, or the session rejects its add, the torrent is verified
+/// from its `.torrent` instead, unless the previous client renamed its files.
+/// The [`Adopted`] returned names the path actually taken, fallbacks included.
 pub fn execute_adopt(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
@@ -2977,7 +2998,7 @@ pub fn execute_adopt(
     infohash: &str,
     profile: ProfileId,
     dry_run: bool,
-) -> Result<&'static str, AdoptRefusal> {
+) -> Result<Adopted, AdoptRefusal> {
     let plan = pool
         .with_store(|s| torrentd_pool::adopt::plan(s, infohash, |id| pool.root_path_of(id)))
         .map_err(|e| e.to_string())?;
@@ -3105,7 +3126,7 @@ pub fn execute_adopt(
                 return verify(torrent_path, save_path, profile);
             }
             if dry_run {
-                return Ok("fast_path");
+                return Ok(Adopted::FastPath);
             }
             match engine.add_torrent(params) {
                 Ok(handle) => {
@@ -3171,7 +3192,7 @@ pub fn execute_adopt(
             if let Err(e) = owner {
                 pool.note_store_error("set_profile", &e);
             }
-            Ok("fast_path")
+            Ok(Adopted::FastPath)
         }
         AdoptPlan::Verify {
             torrent_path,
@@ -3210,7 +3231,7 @@ fn enqueue_verify(
     resume_path: Option<&std::path::Path>,
     profile: ProfileId,
     dry_run: bool,
-) -> Result<&'static str, AdoptRefusal> {
+) -> Result<Adopted, AdoptRefusal> {
     let Some(profile_cfg) = profiles.config(&profile) else {
         return Err(format!("profile {profile} is not live").into());
     };
@@ -3230,7 +3251,7 @@ fn enqueue_verify(
         torrentd_engine::check_trackers(profile_cfg, &params).map_err(|e| tracker_refusal(&e))?;
     }
     if dry_run {
-        return Ok("queued_for_verification");
+        return Ok(Adopted::QueuedForVerification);
     }
     // An owner record that already names this profile is not the enqueue's,
     // so a drop leaves it; one the enqueue writes goes with the item.
@@ -3259,7 +3280,7 @@ fn enqueue_verify(
         pool.note_store_error("enqueue_verify", &e);
     }
     pool.verify_queue().enqueue(item);
-    Ok("queued_for_verification")
+    Ok(Adopted::QueuedForVerification)
 }
 
 fn now_secs() -> i64 {
@@ -4353,7 +4374,7 @@ mod tests {
         };
 
         // Incomplete: planned as a verify.
-        assert_eq!(adopt(), "queued_for_verification");
+        assert_eq!(adopt(), super::Adopted::QueuedForVerification);
         let item = pool.verify_queue().pending.lock().pop_front().unwrap();
         assert_eq!(item.trackers, want);
         assert!(engine.calls().is_empty(), "{:?}", engine.calls());
@@ -4362,7 +4383,7 @@ mod tests {
         // back to verifying.
         resume(1);
         engine.inject_error("add_torrent", torrentd_engine::EngineError::Shutdown);
-        assert_eq!(adopt(), "queued_for_verification");
+        assert_eq!(adopt(), super::Adopted::QueuedForVerification);
         assert_eq!(engine.calls().len(), 1, "{:?}", engine.calls());
         let item = pool.verify_queue().pending.lock().pop_front().unwrap();
         assert_eq!(item.trackers, want);
@@ -4416,7 +4437,7 @@ mod tests {
         let adopted =
             super::execute_adopt(&pool, &source, &profiles, &ih, ProfileId::new("p"), false)
                 .unwrap_or_else(|e| panic!("{}", e.reason));
-        assert_eq!(adopted, "fast_path");
+        assert_eq!(adopted, super::Adopted::FastPath);
         assert_eq!(
             store.read(&ProfileId::new("p"), &hash).unwrap().as_deref(),
             Some(bare.as_slice()),
@@ -4667,17 +4688,17 @@ mod tests {
             .check_drift_before_adopt(std::slice::from_ref(&ih))
             .unwrap();
         assert!(report.drifted.is_empty(), "{report:?}");
-        assert_eq!(dry_run(), "fast_path");
+        assert_eq!(dry_run(), super::Adopted::FastPath);
 
         // Same size, new bytes: invisible to the index until the pass runs.
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(dir.path().join("pool/a"), b"y").unwrap();
-        assert_eq!(dry_run(), "fast_path");
+        assert_eq!(dry_run(), super::Adopted::FastPath);
         let report = pool
             .check_drift_before_adopt(std::slice::from_ref(&ih))
             .unwrap();
         assert_eq!(report.drifted, vec![ih.clone()]);
-        assert_eq!(dry_run(), "queued_for_verification");
+        assert_eq!(dry_run(), super::Adopted::QueuedForVerification);
     }
 
     /// An owner record the enqueue did not write, or that names another

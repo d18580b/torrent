@@ -1019,9 +1019,11 @@ async fn resume_data_keyed_otherwise_than_the_index_is_verified_instead() {
             .await;
         resp.assert_status(StatusCode::OK);
         let r = resp.json::<Value>();
-        // Reported under the plan's bucket, as every fallback from the fast
-        // path to verification is.
-        assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+        // Issue #454: reported where it went, not under the plan's fast
+        // path, with its bytes counted as a verification's.
+        assert_eq!(r["fast_path"], json!([]), "{r}");
+        assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
+        assert_eq!(r["verify_bytes"], json!(96), "{r}");
         let queue = index.verify_queue();
         let queued = queue.depth() + queue.in_flight();
         assert_eq!(queued, usize::from(!dry_run), "dry run {dry_run}: {r}");
