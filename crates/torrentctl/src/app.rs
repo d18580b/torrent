@@ -763,6 +763,9 @@ fn revoke(api: &Api, quitting: bool) -> Effect {
         .await
         {
             Ok(Ok(_)) => None,
+            // A `401` means the daemon no longer accepts the token (it
+            // expired or was revoked already): what revoking it was for.
+            Ok(Err(failure)) if failure.is_unauthenticated() => None,
             Ok(Err(failure)) => Some(failure),
             Err(_) => Some(Failure::local(
                 "The daemon did not answer",
@@ -972,6 +975,20 @@ mod tests {
             matches!(&msgs[..], [Msg::Exit(Some(n))] if n.contains("HTTP 500")),
             "{msgs:?}"
         );
+
+        // A `401` says the token is already invalid: nothing to report.
+        let daemon = testing::Recorder::start(
+            "401 Unauthorized",
+            r#"{"type":"about:blank","title":"Unauthorized","status":401}"#,
+        );
+        let mut m = model();
+        update(
+            &mut m,
+            Msg::SignedIn(daemon.api().with_token("tds_minted").expect("a valid URL")),
+        );
+        let msgs = testing::run(update(&mut m, Msg::Quit));
+        assert_eq!(daemon.lines(), [REVOKE], "asked to revoke it");
+        assert!(matches!(msgs[..], [Msg::Exit(None)]), "{msgs:?}");
     }
 
     #[test]
