@@ -202,11 +202,11 @@ fn problem(status: u16, slug: &str, detail: Option<&str>) -> Failure {
 
 // Driving.
 
-/// Apply `msg` under a daemon with the pool configured and `mutations` as
-/// given, returning how many effects it asked for.
 /// What reloading the plan list and plan 8 sends.
 const PLAN_RELOAD: [&str; 2] = ["GET /v1/pool/plans", "GET /v1/pool/plans/8"];
 
+/// Apply `msg` under a daemon with the pool configured and `mutations` as
+/// given, returning how many effects it asked for.
 fn send(state: &mut State, msg: Msg, mutations: bool) -> usize {
     let server = testing::server(true, mutations);
     testing::with_ctx(Some(&server), |ctx| update(state, msg, ctx).len())
