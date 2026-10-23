@@ -1643,6 +1643,34 @@ impl VerifyQueue {
         self.in_flight.lock().iter().any(|f| f.infohash == infohash)
     }
 
+    /// The next adoption waiting for a slot, taken off the queue as an
+    /// admission takes it, so a test can read what was queued.
+    #[cfg(test)]
+    fn pop_pending(&self) -> Option<PendingVerify> {
+        self.pending.lock().pop_front()
+    }
+
+    /// Stop waiting on every adoption in flight, as their verdicts arriving
+    /// would, freeing their slots.
+    #[cfg(test)]
+    fn forget_in_flight(&self) {
+        self.in_flight.lock().clear();
+    }
+
+    /// Every check started as though `by` earlier, for a test of what the
+    /// queue does once a check has run that long. Returns what started each.
+    #[cfg(test)]
+    fn age_checks(&self, by: std::time::Duration) -> Vec<CheckSource> {
+        self.checking
+            .lock()
+            .iter_mut()
+            .map(|(r, started)| {
+                *started -= by;
+                r.source
+            })
+            .collect()
+    }
+
     /// Queue a re-hash of the loaded torrent `infohash`, to start once a slot
     /// is free. `record` says whether its verdict is written to the pool
     /// index. One already waiting or checking is not queued twice: the check
@@ -1713,6 +1741,12 @@ impl VerifyQueue {
 
     pub fn completed(&self) -> u64 {
         self.completed.load(Ordering::Relaxed)
+    }
+
+    /// Verdicts recorded as failed, as [`Self::completed`] counts passes.
+    #[cfg(test)]
+    fn failed(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
     }
 }
 
@@ -4117,7 +4151,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
-        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        let item = pool.verify_queue().pop_pending().unwrap();
         assert!(item.owner_recorded);
 
         super::release_dropped_claim(&pool, super::Writer::Wait, &reg, &item);
@@ -4182,8 +4216,8 @@ mod tests {
         let scanned: std::collections::HashSet<_> = [loaded, admitted].into();
         assert_eq!(pool.restore_verify_queue(&reg, &scanned), [waiting]);
 
-        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
-        assert!(pool.verify_queue().pending.lock().is_empty());
+        assert_eq!(pool.verify_queue().depth(), 1);
+        let item = pool.verify_queue().pop_pending().unwrap();
         assert_eq!(item.infohash, waiting.to_hex());
         assert_eq!(item.profile, ProfileId::new("p"));
         assert_eq!(item.torrent_path, dir.path().join("t.torrent"));
@@ -4219,7 +4253,6 @@ mod tests {
     /// the verdicts land once the writer is released.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_verdict_waiting_on_the_writer_does_not_block_the_queue_readers() {
-        use std::sync::atomic::Ordering;
         use std::sync::mpsc;
         use std::sync::Arc;
 
@@ -4315,7 +4348,7 @@ mod tests {
             .with_store(|s| s.adoption_state(&adopted.to_hex()))
             .unwrap();
         assert_eq!(got, Some(AdoptionState::Drifted));
-        assert_eq!(pool.verify_queue().failed.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.verify_queue().failed(), 1);
         assert_eq!(pool.verify_queue().completed(), 1);
     }
 
@@ -4432,7 +4465,7 @@ mod tests {
                 false,
             )
             .unwrap_or_else(|e| panic!("{profile}: {}", e.reason));
-            let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+            let item = pool.verify_queue().pop_pending().unwrap();
             assert_eq!(item.trackers, want, "{profile}");
             pool.with_store(|s| s.set_profile(&ih.to_hex(), None).unwrap());
         }
@@ -4503,7 +4536,7 @@ mod tests {
 
         // Incomplete: planned as a verify.
         assert_eq!(adopt(), super::Adopted::QueuedForVerification);
-        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        let item = pool.verify_queue().pop_pending().unwrap();
         assert_eq!(item.trackers, want);
         assert!(engine.calls().is_empty(), "{:?}", engine.calls());
 
@@ -4513,7 +4546,7 @@ mod tests {
         engine.inject_error("add_torrent", torrentd_engine::EngineError::Shutdown);
         assert_eq!(adopt(), super::Adopted::QueuedForVerification);
         assert_eq!(engine.calls().len(), 1, "{:?}", engine.calls());
-        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        let item = pool.verify_queue().pop_pending().unwrap();
         assert_eq!(item.trackers, want);
     }
 
@@ -4854,7 +4887,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        let item = pool.verify_queue().pop_pending().unwrap();
         assert!(!item.owner_recorded);
         super::release_dropped_claim(&pool, super::Writer::Wait, &reg, &item);
         assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
@@ -5524,7 +5557,7 @@ mod tests {
         let mut peaks = [0usize; 2];
         for tick in 0..200 {
             if tick == 10 {
-                pool.verify_queue().in_flight.lock().clear();
+                pool.verify_queue().forget_in_flight();
                 adoptions = 0;
             }
             w.tick(&pool);
@@ -5925,10 +5958,10 @@ mod tests {
         }
         super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
         assert_eq!(q.in_flight(), 2, "not before the settle");
-        for (r, started) in q.checking.lock().iter_mut() {
-            assert_eq!(r.source, DiskErrorRetry);
-            *started -= super::CHECK_SETTLE;
-        }
+        assert_eq!(
+            q.age_checks(super::CHECK_SETTLE),
+            [DiskErrorRetry, DiskErrorRetry]
+        );
         super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
         assert_eq!(q.in_flight(), 1);
         assert!(q.try_take(a, DiskErrorRetry));
@@ -5968,9 +6001,7 @@ mod tests {
         );
         assert!(!q.try_take(InfoHash([5; 20]), DiskErrorRetry));
 
-        for (_, started) in q.checking.lock().iter_mut() {
-            *started -= super::CHECK_SETTLE;
-        }
+        assert_eq!(q.age_checks(super::CHECK_SETTLE), [DiskErrorRetry]);
         super::retire_checking(&q, &state, super::RECHECK_EXPIRY);
         assert_eq!(q.in_flight(), 0, "still error-paused past the settle");
     }
@@ -6058,7 +6089,7 @@ mod tests {
         assert_eq!((q.in_flight(), q.depth()), (4, 2));
 
         // Every slot frees: the rest go in turn too.
-        q.in_flight.lock().clear();
+        q.forget_in_flight();
         for ih in &rehashes[..2] {
             w.finish_check(*ih);
         }

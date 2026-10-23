@@ -283,7 +283,6 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     assert!(detail.contains("unloaded"), "{detail}");
     assert!(detail.contains("delete_files"), "{detail}");
     assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
-    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
     assert!(
         h.state
             .resume
@@ -295,6 +294,8 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     );
     // Without `delete_files` too, while its resume file is there: the boot's
     // add of it failed, and the next boot loads it from that file (#354).
+    // That it answers `torrent-unloaded`, not `torrent-adding`, is the
+    // refused delete above having left it a boot leftover.
     let resp = h
         .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
         .await;
@@ -3273,10 +3274,20 @@ async fn a_delete_whose_tombstone_write_fails_counts_it_and_still_answers_204() 
     );
 }
 
-/// A resume store that cannot say whether it holds a file, and otherwise
-/// works.
+/// A resume store that cannot say whether it holds a file, until
+/// `recovered` is set, and otherwise works.
 #[derive(Debug, Default)]
-struct UncheckableResume(torrentd_engine::MemoryResumeStore);
+struct UncheckableResume(
+    torrentd_engine::MemoryResumeStore,
+    std::sync::atomic::AtomicBool,
+);
+
+impl UncheckableResume {
+    /// From now on, answer whether it holds a file.
+    fn recover(&self) {
+        self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 impl torrentd_engine::ResumeStore for UncheckableResume {
     fn scan(
         &self,
@@ -3304,9 +3315,12 @@ impl torrentd_engine::ResumeStore for UncheckableResume {
     }
     fn exists(
         &self,
-        _: &ProfileId,
-        _: &InfoHash,
+        p: &ProfileId,
+        ih: &InfoHash,
     ) -> Result<bool, torrentd_engine::resume_store::ResumeStoreError> {
+        if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.0.exists(p, ih);
+        }
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
     }
     fn write_tombstone(
@@ -3337,11 +3351,13 @@ async fn an_unloaded_delete_whose_resume_store_cannot_answer_answers_500_and_cha
     // the claim (#354). A store that cannot say must not be read as "absent",
     // or a load failure becomes a lost torrent.
     let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(UncheckableResume::default());
     let h = Harness::authed(&Coverage::new(), |s| {
         fixture(s, dir.path());
-        s.resume = Arc::new(UncheckableResume::default());
+        s.resume = store.clone();
     });
     let p = ProfileId::new("p");
+    // What the boot leaves for a claim none of its scans loaded.
     h.state.unloaded_at_boot.lock().insert(ADDING);
     h.state.resume.write(&p, &ADDING, b"resume-bytes").unwrap();
     h.state
@@ -3357,7 +3373,6 @@ async fn an_unloaded_delete_whose_resume_store_cannot_answer_answers_500_and_cha
     assert!(detail.contains("resume file"), "{detail}");
     assert!(detail.contains("Nothing was changed"), "{detail}");
     assert_eq!(h.state.registry.lookup(&ADDING), Some(p.clone()));
-    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
     assert!(
         h.state
             .resume
@@ -3368,6 +3383,14 @@ async fn an_unloaded_delete_whose_resume_store_cannot_answer_answers_500_and_cha
         "the resume file is kept"
     );
     assert!(h.state.torrents.exists(&p, &ADDING), "the .torrent is kept");
+
+    // Still a boot leftover once the store answers again: the retry is
+    // refused for the resume file it keeps, not taken for an add in flight.
+    store.recover();
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
+        .await;
+    assert_problem(&resp, 409, "torrent-unloaded");
 }
 
 #[tokio::test]
