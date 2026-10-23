@@ -168,6 +168,11 @@ impl TorrentEngine for RealEngine {
         Ok(self.session()?.unset_flags(h, flags)?)
     }
 
+    #[instrument(skip_all, fields(op = "enforce_no_download", infohash = %h.infohash))]
+    fn enforce_no_download(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        Ok(self.session()?.enforce_no_download(h)?)
+    }
+
     #[instrument(skip_all, fields(op = "move_storage", infohash = %h.infohash, new_path))]
     fn move_storage(
         &self,

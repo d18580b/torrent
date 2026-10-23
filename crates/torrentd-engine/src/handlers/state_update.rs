@@ -3,7 +3,9 @@
 use libtorrent_safe::alert::TorrentStatusView;
 use libtorrent_safe::Alert;
 use libtorrent_safe::TorrentFlags;
+use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 use crate::handlers::HandlerCtx;
 use crate::state::TorrentPhase;
@@ -128,6 +130,56 @@ pub(crate) fn apply(s: &TorrentStatusView, ctx: &HandlerCtx<'_>) {
         }
         st.phase_since_check = true;
     });
+    reassert_no_download(s, ctx);
+}
+
+/// Put a torrent whose status shows the no-download invariant lapsed —
+/// `UPLOAD_MODE` missing, or a [`crate::policy::forbidden`] flag in force —
+/// back under it, and count the re-assert.
+///
+/// Every add applies the invariant, but nothing held it afterwards: a torrent
+/// found out of upload mode went on requesting pieces until the next restart
+/// re-added it. Called outside the state-map update so no map lock is held
+/// across the engine call. Each status that shows the lapse re-asserts again
+/// and is counted again, so a re-assert that does not take is retried only
+/// when a status for that torrent next arrives: libtorrent posts one only once
+/// the torrent's status changes, and the overflow handler reads one back only
+/// after a dropped update. An idle torrent whose re-assert failed is neither
+/// retried nor counted again until something changes its status, which a
+/// torrent that starts requesting pieces does. No resume save is
+/// queued, because every add path re-applies the invariant whatever the resume
+/// data says.
+fn reassert_no_download(s: &TorrentStatusView, ctx: &HandlerCtx<'_>) {
+    let flags = TorrentFlags::from_bits_truncate(s.flags);
+    let forbidden = crate::policy::forbidden();
+    if flags.contains(TorrentFlags::UPLOAD_MODE) && !flags.intersects(forbidden) {
+        return;
+    }
+    let _enter = ctx.span.enter();
+    let ih = s.handle.infohash;
+    ctx.metrics.inc_counter(
+        "upload_mode_reasserts_total",
+        &[("profile_id", ctx.profile_id.as_str())],
+    );
+    match ctx.engine.enforce_no_download(s.handle) {
+        Ok(()) => warn!(
+            target: "torrentd_engine::handler::state_update",
+            infohash = %ih,
+            flags = ?flags,
+            "a torrent's status showed upload mode lifted or a forbidden flag set; re-asserted \
+             upload mode",
+        ),
+        Err(e) => error!(
+            target: "torrentd_engine::handler::state_update",
+            infohash = %ih,
+            flags = ?flags,
+            error.kind = "enforce_no_download",
+            error.cause = %e,
+            "a torrent's status showed upload mode lifted or a forbidden flag set, and \
+             re-asserting upload mode failed; retried only when this torrent's status next \
+             changes",
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -144,10 +196,12 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::clock::MockClock;
+    use crate::engine::EngineError;
     use crate::engine::TorrentEngine;
     use crate::metrics::MetricCall;
     use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
+    use crate::mock::RecordedCall;
     use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
     use crate::state::RetryState;
@@ -515,6 +569,169 @@ mod tests {
             &metrics,
         );
         assert!(state.get(&ih(0x66)).unwrap().phase_since_check);
+    }
+
+    fn reasserts(metrics: &RecordingSink) -> usize {
+        metrics
+            .calls()
+            .iter()
+            .filter(|c| {
+                matches!(c, MetricCall::IncCounter { name, labels, .. }
+                    if name == "upload_mode_reasserts_total"
+                        && labels.iter().any(|(k, v)| k == "profile_id" && v == "p"))
+            })
+            .count()
+    }
+
+    /// A status showing a torrent out of upload mode, or carrying a flag that
+    /// can take it out, re-asserts upload mode on that torrent and counts it
+    /// for the profile; one that shows the invariant holding does neither.
+    /// The overflow handler feeds its statuses through the same `apply`.
+    #[test]
+    fn a_status_out_of_upload_mode_reasserts_it_and_counts() {
+        let h = TorrentHandle {
+            id: 9,
+            infohash: ih(0x99),
+        };
+        let view = |flags: TorrentFlags| TorrentStatusView {
+            handle: h,
+            state: 5,
+            flags: flags.bits(),
+            total_uploaded: 0,
+            total_payload_uploaded: 0,
+            upload_rate: 0,
+            download_rate: 0,
+            num_peers: 0,
+            num_seeds: 0,
+            num_connections: 0,
+            progress: 1.0,
+            has_metadata: true,
+            needs_save_resume: false,
+            is_finished: true,
+            is_seeding: true,
+            has_error: false,
+        };
+        let cases = [
+            (TorrentFlags::UPLOAD_MODE, false),
+            (TorrentFlags::UPLOAD_MODE | TorrentFlags::PAUSED, false),
+            (TorrentFlags::empty(), true),
+            (TorrentFlags::PAUSED, true),
+            (TorrentFlags::UPLOAD_MODE | TorrentFlags::AUTO_MANAGED, true),
+            (TorrentFlags::UPLOAD_MODE | TorrentFlags::SHARE_MODE, true),
+            (
+                TorrentFlags::UPLOAD_MODE | TorrentFlags::SUPER_SEEDING,
+                true,
+            ),
+            (
+                TorrentFlags::UPLOAD_MODE | TorrentFlags::SEQUENTIAL_DOWNLOAD,
+                true,
+            ),
+            (
+                TorrentFlags::UPLOAD_MODE | TorrentFlags::STOP_WHEN_READY,
+                true,
+            ),
+        ];
+        for (flags, lapsed) in cases {
+            let state = StateMap::new();
+            seed_state(&state, h);
+            let metrics = RecordingSink::new();
+            let resume = MemoryResumeStore::new();
+            let torrents = MemoryTorrentStore::new();
+            let clock = MockClock::new();
+            let mock = Arc::new(MockEngine::new());
+            let engine: Arc<dyn TorrentEngine> = mock.clone();
+            let ctx = HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: &metrics,
+                clock: &clock,
+                engine: &engine,
+                profile_fenced: None,
+                fence_hold: None,
+                profile_id: ProfileId::new("p"),
+                span: tracing::info_span!("test"),
+            };
+            apply(&view(flags), &ctx);
+            let calls: Vec<_> = mock
+                .calls()
+                .into_iter()
+                .filter(|c| matches!(c, RecordedCall::EnforceNoDownload(_)))
+                .collect();
+            if lapsed {
+                assert!(
+                    matches!(calls.as_slice(), [RecordedCall::EnforceNoDownload(c)] if *c == h),
+                    "{flags:?}: {calls:?}"
+                );
+                assert_eq!(reasserts(&metrics), 1, "{flags:?}");
+            } else {
+                assert!(calls.is_empty(), "{flags:?}");
+                assert_eq!(reasserts(&metrics), 0, "{flags:?}");
+            }
+        }
+    }
+
+    /// A re-assert the engine refuses is still counted, and the status is
+    /// still folded into the state map; the next status that arrives for the
+    /// torrent tries again.
+    #[test]
+    fn a_failed_reassert_is_counted_and_retried_at_the_next_update() {
+        let h = TorrentHandle {
+            id: 10,
+            infohash: ih(0xAA),
+        };
+        let state = StateMap::new();
+        seed_state(&state, h);
+        let metrics = RecordingSink::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let clock = MockClock::new();
+        let mock = Arc::new(MockEngine::new());
+        mock.inject_error(
+            "enforce_no_download",
+            EngineError::Safe(libtorrent_safe::Error::TorrentNotFound(h.infohash)),
+        );
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            fence_hold: None,
+            profile_id: ProfileId::new("p"),
+            span: tracing::info_span!("test"),
+        };
+        let view = TorrentStatusView {
+            handle: h,
+            state: 5,
+            flags: 0,
+            total_uploaded: 7,
+            total_payload_uploaded: 0,
+            upload_rate: 0,
+            download_rate: 0,
+            num_peers: 0,
+            num_seeds: 0,
+            num_connections: 0,
+            progress: 1.0,
+            has_metadata: true,
+            needs_save_resume: false,
+            is_finished: true,
+            is_seeding: true,
+            has_error: false,
+        };
+        apply(&view, &ctx);
+        assert_eq!(state.get(&ih(0xAA)).unwrap().total_uploaded, 7);
+        apply(&view, &ctx);
+        let enforced = mock
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RecordedCall::EnforceNoDownload(_)))
+            .count();
+        assert_eq!(enforced, 2);
+        assert_eq!(reasserts(&metrics), 2);
     }
 
     #[test]

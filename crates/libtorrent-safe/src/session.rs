@@ -438,6 +438,19 @@ impl Session {
         }
     }
 
+    /// Put one torrent back under the no-download invariant every add
+    /// applies: clear [`FORBIDDEN_TORRENT_FLAGS`], then set
+    /// [`TorrentFlags::UPLOAD_MODE`]. It takes no flags, so it can never lift
+    /// upload mode or set anything else.
+    pub fn enforce_no_download(&self, h: TorrentHandle) -> Result<()> {
+        let rc = unsafe { ffi::lt_torrent_enforce_no_download(self.ptr, h.id as ffi::lt_handle) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
     /// Relocate the torrent's payload, letting libtorrent perform the move so
     /// its storage state stays consistent. Asynchronous — completion arrives
     /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.

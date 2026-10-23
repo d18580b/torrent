@@ -97,6 +97,19 @@ extern "C" int lt_torrent_unset_flags(lt_session* s, lt_handle h, std::uint32_t 
     LT_SHIM_CATCH(nullptr, 0, LT_ERR)
 }
 
+extern "C" int lt_torrent_enforce_no_download(lt_session* s, lt_handle h) {
+    if (!s) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    // The add paths' invariant, put back on a live torrent. It takes no
+    // flags, so it can only ever narrow what the torrent may do.
+    th.unset_flags(forbidden_torrent_flags);
+    th.set_flags(lt::torrent_flags::upload_mode);
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
 extern "C" int lt_torrent_move_storage(lt_session* s, lt_handle h,
                                        const char* new_path, uint32_t flags)
 {

@@ -127,6 +127,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
          boot deletes what a tombstone names rather than loading it.";
     "torrent_add_errors_total" Counter Profile Zero => "Adds libtorrent rejected after accepting the call.";
     "torrents_finished_total" Counter Profile Zero => "Torrents that finished downloading.";
+    "upload_mode_reasserts_total" Counter Profile Zero =>
+        "Status updates that showed a torrent out of upload mode or carrying a flag that can \
+         lift it; each one re-asserts upload mode on the torrent. Any rise means the \
+         no-download invariant lapsed on a live torrent.";
     "torrent_errors_total" Counter Profile Zero => "Torrents that entered libtorrent's error state.";
     "disk_errors_total" Counter Profile ("op": &[]) OnFirstEvent =>
         "File errors, by libtorrent operation; the torrent enters the disk-error phase.";

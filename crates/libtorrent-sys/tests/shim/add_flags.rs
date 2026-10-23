@@ -94,6 +94,22 @@ fn every_add_forces_upload_mode_and_clears_the_forbidden_flags() {
     let flags = status_flags(s, m);
     assert_ne!(flags & LT_TF_UPLOAD_MODE, 0, "flags={flags:#x}");
     assert_eq!(flags & forbidden, 0, "flags={flags:#x}");
+
+    // Re-asserting the invariant on a live torrent keeps it, and touches
+    // nothing outside it: a torrent resumed just before is not paused again.
+    // (The resume is also what makes the next state update report it:
+    // libtorrent reports only torrents whose status changed.)
+    for t in [h, m] {
+        assert_eq!(unsafe { lt_torrent_resume(s, t) }, LT_OK as i32);
+        assert_eq!(
+            unsafe { lt_torrent_enforce_no_download(s, t) },
+            LT_OK as i32
+        );
+        let flags = status_flags(s, t);
+        assert_ne!(flags & LT_TF_UPLOAD_MODE, 0, "flags={flags:#x}");
+        assert_eq!(flags & forbidden, 0, "flags={flags:#x}");
+        assert_eq!(flags & LT_TF_PAUSED, 0, "flags={flags:#x}");
+    }
     unsafe { lt_session_destroy(s) };
 }
 

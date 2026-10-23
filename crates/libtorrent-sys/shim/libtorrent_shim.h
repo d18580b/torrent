@@ -295,6 +295,14 @@ int         lt_torrent_force_reannounce(lt_session* s, lt_handle h);
  * resume data, so the change outlasts a restart only once a save follows. */
 int         lt_torrent_unset_flags(lt_session* s, lt_handle h, uint32_t flags);
 
+/* Put one torrent back under the no-download invariant every add applies:
+ * clear the flags that can take it out of upload mode or make it request
+ * pieces (LT_TF_AUTO_MANAGED, LT_TF_SHARE_MODE, LT_TF_SUPER_SEEDING,
+ * LT_TF_SEQUENTIAL_DOWNLOAD, LT_TF_STOP_WHEN_READY), then set
+ * LT_TF_UPLOAD_MODE. It takes no flags: it can never lift upload mode or set
+ * anything else. LT_ERR for a null session or an unknown handle. */
+int         lt_torrent_enforce_no_download(lt_session* s, lt_handle h);
+
 /* Move a torrent's payload to `new_path`, letting libtorrent perform the move
  * so its own storage state stays consistent. Completion arrives as
  * LT_ALERT_STORAGE_MOVED (or LT_ALERT_STORAGE_MOVED_FAILED).
