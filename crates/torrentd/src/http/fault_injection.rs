@@ -177,6 +177,9 @@ impl TorrentEngine for FaultEngine {
     ) -> Result<(), EngineError> {
         self.inner.unset_flags(h, flags)
     }
+    fn enforce_no_download(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        self.inner.enforce_no_download(h)
+    }
     fn move_storage(
         &self,
         h: TorrentHandle,

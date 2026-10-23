@@ -35,6 +35,7 @@ hold.
 | `torrentd_torrent_remove_cleanup_errors_total` | counter | `profile_id`; `store`: `resume`, `torrent`, `tombstone` | each profile | from boot, at 0 | Failed attempts to delete a removed torrent's resume file or its .torrent and save path, or to write or clear the tombstone that stands until they are gone; the next boot deletes what a tombstone names rather than loading it. |
 | `torrentd_torrent_add_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Adds libtorrent rejected after accepting the call. |
 | `torrentd_torrents_finished_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that finished downloading. |
+| `torrentd_upload_mode_reasserts_total` | counter | `profile_id` | each profile | from boot, at 0 | Status updates that showed a torrent out of upload mode or carrying a flag that can lift it; each one re-asserts upload mode on the torrent. Any rise means the no-download invariant lapsed on a live torrent. |
 | `torrentd_torrent_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that entered libtorrent's error state. |
 | `torrentd_disk_errors_total` | counter | `profile_id`; `op` | each profile | on first event | File errors, by libtorrent operation; the torrent enters the disk-error phase. |
 | `torrentd_hash_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | Pieces that failed their hash check. |
