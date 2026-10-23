@@ -11,7 +11,9 @@
 //! not a general bencode implementation and must never grow into one — in
 //! particular it is never used to compute an info-hash, which stays in
 //! libtorrent so the daemon cannot disagree with itself about a torrent's
-//! identity. Every failure degrades to "no hint", never to a wrong hint.
+//! identity. A hint that cannot be read is absent, never wrong; a sidecar that
+//! cannot be read or parsed at all is an error the caller reports, so that
+//! nothing mistakes it for a sidecar that holds no hints.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,10 +25,10 @@ pub struct ResumeHints {
     pub save_path: Option<String>,
     pub category: Option<String>,
     pub tags: Vec<String>,
-    /// Every piece is marked had in the resume data's `pieces` bitfield. A
-    /// complete torrent whose files still match on disk can skip
-    /// re-verification at adopt time.
-    pub is_complete: bool,
+    /// The resume data's `pieces` bitfield, where it has one. Whether it
+    /// claims completion depends on the torrent's piece count, which only the
+    /// `.torrent` holds: see [`ResumeHints::is_complete`].
+    pub bitfield: Option<Bitfield>,
     /// libtorrent's `mapped_files`: a file the previous client renamed, by
     /// index into the torrent's file list. `None` where it kept the name.
     pub mapped_files: Vec<Option<String>>,
@@ -42,6 +44,46 @@ pub struct ResumeHints {
     /// URLs that are not UTF-8 or hold a NUL, and tiers left empty are
     /// dropped.
     pub trackers: Vec<Vec<String>>,
+}
+
+/// libtorrent's `pieces` bitfield, as read: one byte per piece, the low bit
+/// set for a piece the client had.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bitfield {
+    /// How many pieces it has an entry for.
+    pub len: usize,
+    /// Every entry has its low bit set.
+    pub all_had: bool,
+}
+
+/// Why a `.fastresume` yielded no hints at all.
+#[derive(Debug, thiserror::Error)]
+pub enum SidecarError {
+    #[error("the .fastresume could not be read: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("the .fastresume is not a bencoded dictionary")]
+    Parse,
+}
+
+impl SidecarError {
+    /// The scan error kind this counts as: `read` or `parse`, the same kinds
+    /// an unreadable or unparseable `.torrent` counts as.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SidecarError::Read(_) => "read",
+            SidecarError::Parse => "parse",
+        }
+    }
+}
+
+/// How many pieces a torrent of `total_size` bytes, padding included, has in
+/// pieces of `piece_length`: libtorrent's own count, which a resume
+/// bitfield's length has to equal. `0` for a piece length of `0`.
+pub fn piece_count(total_size: u64, piece_length: u32) -> u64 {
+    if piece_length == 0 {
+        return 0;
+    }
+    total_size.div_ceil(u64::from(piece_length))
 }
 
 /// Where the previous client put a torrent's files, when not where the
@@ -63,6 +105,17 @@ pub struct Relayout {
 }
 
 impl ResumeHints {
+    /// Whether the resume data marks every one of the torrent's
+    /// `num_pieces` pieces had. A complete torrent whose files still match on
+    /// disk can skip re-verification at adopt time, so this holds only for a
+    /// bitfield with exactly one entry per piece, every one of them set: a
+    /// shorter one says nothing about the pieces it leaves out, and a longer
+    /// one was written for some other torrent.
+    pub fn is_complete(&self, num_pieces: u64) -> bool {
+        self.bitfield
+            .is_some_and(|b| num_pieces > 0 && b.len as u64 == num_pieces && b.all_had)
+    }
+
     /// The on-disk paths for a torrent whose `.torrent` lists `paths` under
     /// `name`, or `None` when the previous client kept them as they are.
     ///
@@ -81,12 +134,12 @@ impl ResumeHints {
                     let Some(m) = self.mapped_files.get(i).cloned().flatten() else {
                         return p.clone();
                     };
-                    let m = m.replace('\\', "/");
-                    if is_relative_and_contained(&m) {
-                        m.trim_matches('/').to_owned()
-                    } else {
-                        rejected += 1;
-                        p.clone()
+                    match normalised_relative(&m.replace('\\', "/")) {
+                        Some(n) => n,
+                        None => {
+                            rejected += 1;
+                            p.clone()
+                        }
                     }
                 })
                 .collect();
@@ -125,26 +178,38 @@ impl ResumeHints {
     }
 }
 
-/// A mapped path is joined onto a base directory; one that is absolute or
-/// walks out of it is not a layout, and is ignored.
-fn is_relative_and_contained(p: &str) -> bool {
-    !p.is_empty()
-        && Path::new(p)
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)))
-}
-
-pub fn read_hints(path: &Path) -> ResumeHints {
-    match std::fs::read(path) {
-        Ok(bytes) => parse_hints(&bytes),
-        Err(_) => ResumeHints::default(),
+/// A mapped path as the index stores it, or `None` for one that is not a
+/// layout: a mapped path is joined onto a base directory, so one that is
+/// empty, absolute or walks out of it is ignored.
+///
+/// A path that passes is rebuilt from its components, `/`-joined: `a/./b`,
+/// `a//b` and `a/b/` all name `a/b`, and the index has to store that one
+/// spelling, because every lookup against the scanned files compares it
+/// literally.
+fn normalised_relative(p: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for c in Path::new(p).components() {
+        match c {
+            std::path::Component::Normal(s) => parts.push(s.to_str()?),
+            _ => return None,
+        }
     }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
-    let Some(top) = top_level_entries(bytes) else {
-        return ResumeHints::default();
-    };
+/// The hints in the `.fastresume` at `path`, or why there are none: a file
+/// that cannot be read, or that is not a bencoded dictionary. A caller holding
+/// hints from an earlier read keeps them on an error, rather than taking it
+/// for a sidecar that holds none.
+pub fn read_hints(path: &Path) -> Result<ResumeHints, SidecarError> {
+    let bytes = std::fs::read(path)?;
+    parse_hints(&bytes).ok_or(SidecarError::Parse)
+}
+
+/// The hints in a `.fastresume`'s bytes, or `None` where they are not a
+/// bencoded dictionary this reader can step through.
+pub fn parse_hints(bytes: &[u8]) -> Option<ResumeHints> {
+    let top = top_level_entries(bytes)?;
     let get_str = |k: &str| -> Option<String> {
         top.get(k).and_then(|v| match v {
             Value::Str(s) => String::from_utf8(s.clone()).ok(),
@@ -173,10 +238,15 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
     // the claim this flag would stand in for. `qBt-seedStatus` is
     // qBittorrent's own idea of what it was doing, not a statement about the
     // pieces. Absent a bitfield, or with any piece missing from it,
-    // completion is unknown and adoption takes the verifying path.
-    let is_complete = match top.get("pieces") {
-        Some(Value::Str(bits)) => !bits.is_empty() && bits.iter().all(|b| b & 1 == 1),
-        _ => false,
+    // completion is unknown and adoption takes the verifying path. How many
+    // entries the bitfield has is kept too: only the `.torrent` knows how
+    // many it needs.
+    let bitfield = match top.get("pieces") {
+        Some(Value::Str(bits)) => Some(Bitfield {
+            len: bits.len(),
+            all_had: bits.iter().all(|b| b & 1 == 1),
+        }),
+        _ => None,
     };
 
     // An empty entry is a file the client did not rename. One that is not
@@ -214,16 +284,16 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
         _ => Vec::new(),
     };
 
-    ResumeHints {
+    Some(ResumeHints {
         save_path: save_path.filter(|s| !s.is_empty()),
         category: get_str("qBt-category").filter(|s| !s.is_empty()),
         tags,
-        is_complete,
+        bitfield,
         mapped_files,
         mapped_files_unreadable,
         content_layout: get_str("qBt-contentLayout").filter(|s| !s.is_empty()),
         trackers,
-    }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,11 +515,11 @@ mod tests {
             ("save_path", bstr("/old/path")),
         ]);
 
-        let h = parse_hints(&b);
+        let h = parse_hints(&b).unwrap();
         assert_eq!(h.save_path.as_deref(), Some("/data/pool"));
         assert_eq!(h.category.as_deref(), Some("movies"));
         assert_eq!(h.tags, vec!["hd", "seeded"]);
-        assert!(h.is_complete);
+        assert!(h.is_complete(3));
     }
 
     fn bbytes(b: &[u8]) -> Vec<u8> {
@@ -471,23 +541,115 @@ mod tests {
     fn completeness_is_the_pieces_bitfield_and_nothing_else() {
         // Every piece had: complete.
         let b = bdict(&[("pieces", bbytes(&[1, 1, 1, 1]))]);
-        assert!(parse_hints(&b).is_complete);
+        assert!(parse_hints(&b).unwrap().is_complete(4));
         // One missing: not, whatever the flags say.
         let b = bdict(&[
             ("pieces", bbytes(&[1, 0, 1])),
             ("qBt-seedStatus", bint(1)),
             ("seed_mode", bint(1)),
         ]);
-        assert!(!parse_hints(&b).is_complete);
+        assert!(!parse_hints(&b).unwrap().is_complete(3));
         // `seed_mode` is a torrent *added* as a seed, unchecked: not a claim.
         let b = bdict(&[("save_path", bstr("/data")), ("seed_mode", bint(1))]);
-        assert!(!parse_hints(&b).is_complete);
+        assert!(!parse_hints(&b).unwrap().is_complete(1));
         // Neither is qBittorrent's own status flag.
         let b = bdict(&[("qBt-seedStatus", bint(1))]);
-        assert!(!parse_hints(&b).is_complete);
-        // An empty bitfield proves nothing.
+        assert!(!parse_hints(&b).unwrap().is_complete(1));
+        // An empty bitfield proves nothing, even of a torrent with no pieces.
         let b = bdict(&[("pieces", bbytes(&[]))]);
-        assert!(!parse_hints(&b).is_complete);
+        assert!(!parse_hints(&b).unwrap().is_complete(0));
+        assert!(!parse_hints(&b).unwrap().is_complete(1));
+    }
+
+    /// A one-byte `\x01` for a four-piece torrent says nothing about three of
+    /// its pieces, and a bitfield longer than the torrent was written for
+    /// another one: neither is complete.
+    #[test]
+    fn a_bitfield_of_any_length_but_the_piece_count_is_not_complete() {
+        let h = parse_hints(&bdict(&[("pieces", bbytes(&[1]))])).unwrap();
+        assert!(h.is_complete(1));
+        assert!(!h.is_complete(4));
+        let h = parse_hints(&bdict(&[("pieces", bbytes(&[1; 5]))])).unwrap();
+        assert!(h.is_complete(5));
+        assert!(!h.is_complete(4));
+    }
+
+    /// `is_complete(n)` implies a bitfield of exactly `n` entries, every one
+    /// had: checked over every bitfield of up to six entries, each in every
+    /// pattern of had and missing (with the high bits, which libtorrent uses
+    /// for other flags, set), against every piece count up to eight.
+    #[test]
+    fn is_complete_implies_one_had_entry_per_piece() {
+        for len in 0..=6usize {
+            for pattern in 0u32..(1 << len) {
+                let bits: Vec<u8> = (0..len)
+                    .map(|i| 0xfe | u8::from(pattern & (1 << i) != 0))
+                    .collect();
+                let h = parse_hints(&bdict(&[("pieces", bbytes(&bits))])).unwrap();
+                let all_had = pattern == (1 << len) - 1;
+                for n in 0..=8u64 {
+                    assert_eq!(
+                        h.is_complete(n),
+                        n > 0 && len as u64 == n && all_had,
+                        "{bits:?} against {n} pieces",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_piece_count_rounds_a_short_last_piece_up() {
+        assert_eq!(piece_count(4096, 1024), 4);
+        assert_eq!(piece_count(4097, 1024), 5);
+        assert_eq!(piece_count(1, 16384), 1);
+        assert_eq!(piece_count(0, 16384), 0);
+        assert_eq!(piece_count(4096, 0), 0);
+        assert_eq!(piece_count(u64::MAX, 1), u64::MAX);
+    }
+
+    /// `a/./b`, `a//b` and `a/b/` name the file `a/b`, and are stored as that
+    /// one spelling; what was refused before is refused still.
+    #[test]
+    fn mapped_paths_are_stored_normalised() {
+        let b = bdict(&[(
+            "mapped_files",
+            blist(&[
+                "Show/./a.mkv",
+                "Show//b.mkv",
+                "Show\\c.nfo",
+                "Show/d.srt/",
+                "./e",
+            ]),
+        )]);
+        let paths: Vec<String> = ["S/a", "S/b", "S/c", "S/d", "S/e"]
+            .map(String::from)
+            .to_vec();
+        let r = parse_hints(&b).unwrap().relayout(&paths, "S").unwrap();
+        assert_eq!(
+            r.paths,
+            [
+                "Show/a.mkv",
+                "Show/b.mkv",
+                "Show/c.nfo",
+                "Show/d.srt",
+                "S/e"
+            ]
+        );
+        assert_eq!(r.rejected, 1, "a leading `.` is refused, as it was");
+    }
+
+    #[test]
+    fn a_sidecar_that_cannot_be_read_or_parsed_is_an_error_of_its_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = read_hints(&dir.path().join("gone.fastresume")).unwrap_err();
+        assert_eq!(missing.kind(), "read");
+        let truncated = dir.path().join("t.fastresume");
+        std::fs::write(&truncated, b"d12:qBt-savePath5:/da").unwrap();
+        assert_eq!(read_hints(&truncated).unwrap_err().kind(), "parse");
+        // A dictionary with nothing this reader wants is no error: no hints.
+        std::fs::write(&truncated, b"de").unwrap();
+        assert_eq!(read_hints(&truncated).unwrap(), ResumeHints::default());
     }
 
     #[test]
@@ -496,7 +658,7 @@ mod tests {
             "mapped_files",
             blist(&["", "Show/renamed.mkv", "../escape", ""]),
         )]);
-        let h = parse_hints(&b);
+        let h = parse_hints(&b).unwrap();
         let paths: Vec<String> = ["Show/a.mkv", "Show/b.mkv", "Show/c.nfo", "Show/d.srt"]
             .map(String::from)
             .to_vec();
@@ -511,6 +673,7 @@ mod tests {
         // An absolute mapping is refused before anything strips its slash.
         let b = bdict(&[("mapped_files", blist(&["/etc/passwd"]))]);
         let r = parse_hints(&b)
+            .unwrap()
             .relayout(&["Show/a.mkv".to_owned()], "Show")
             .unwrap();
         assert_eq!((r.paths[0].as_str(), r.rejected), ("Show/a.mkv", 1));
@@ -519,7 +682,7 @@ mod tests {
             ("mapped_files", b"li1ee".to_vec()),
             ("qBt-savePath", bstr("/p")),
         ]);
-        let h = parse_hints(&b);
+        let h = parse_hints(&b).unwrap();
         assert!(h.mapped_files.is_empty());
         assert_eq!(h.save_path.as_deref(), Some("/p"));
     }
@@ -547,7 +710,7 @@ mod tests {
             ),
             ("qBt-savePath", bstr("/p")),
         ]);
-        let h = parse_hints(&b);
+        let h = parse_hints(&b).unwrap();
         assert_eq!(
             h.trackers,
             vec![
@@ -568,7 +731,7 @@ mod tests {
         let mut list = b"l".to_vec();
         list.extend_from_slice(&tier);
         list.push(b'e');
-        let h = parse_hints(&bdict(&[("trackers", list)]));
+        let h = parse_hints(&bdict(&[("trackers", list)])).unwrap();
         assert_eq!(h.trackers, vec![vec!["https://t.example/a"]]);
     }
 
@@ -589,12 +752,12 @@ mod tests {
             if let Some(v) = value {
                 entries.push(("trackers", v));
             }
-            let h = parse_hints(&bdict(&entries));
+            let h = parse_hints(&bdict(&entries)).unwrap();
             assert!(h.trackers.is_empty(), "{shape}: {:?}", h.trackers);
             assert_eq!(h.save_path.as_deref(), Some("/p"), "{shape}");
         }
         // A truncated tier is a malformed file, not a skipped key.
-        assert_eq!(parse_hints(b"d8:trackersll1:a"), ResumeHints::default());
+        assert_eq!(parse_hints(b"d8:trackersll1:a"), None);
     }
 
     #[test]
@@ -625,13 +788,19 @@ mod tests {
             ("save_path", bstr("/old/path")),
             ("qBt-savePath", bstr("/new/path")),
         ]);
-        assert_eq!(parse_hints(&b).save_path.as_deref(), Some("/new/path"));
+        assert_eq!(
+            parse_hints(&b).unwrap().save_path.as_deref(),
+            Some("/new/path")
+        );
     }
 
     #[test]
     fn falls_back_to_plain_save_path() {
         let b = bdict(&[("save_path", bstr("/data/pool"))]);
-        assert_eq!(parse_hints(&b).save_path.as_deref(), Some("/data/pool"));
+        assert_eq!(
+            parse_hints(&b).unwrap().save_path.as_deref(),
+            Some("/data/pool")
+        );
     }
 
     #[test]
@@ -655,11 +824,14 @@ mod tests {
             ("peers", inner),
             ("qBt-savePath", bstr("/data/pool")),
         ]);
-        assert_eq!(parse_hints(&b).save_path.as_deref(), Some("/data/pool"));
+        assert_eq!(
+            parse_hints(&b).unwrap().save_path.as_deref(),
+            Some("/data/pool")
+        );
     }
 
     #[test]
-    fn malformed_input_yields_no_hints_rather_than_panicking() {
+    fn malformed_input_is_unparseable_rather_than_panicking() {
         for bad in [
             &b""[..],
             &b"not bencode"[..],
@@ -671,7 +843,7 @@ mod tests {
             // Unterminated nested container.
             &b"d10:file sizesli1e"[..],
         ] {
-            assert_eq!(parse_hints(bad), ResumeHints::default(), "input {bad:?}");
+            assert_eq!(parse_hints(bad), None, "input {bad:?}");
         }
     }
 
@@ -680,13 +852,13 @@ mod tests {
         // No bitfield at all: completion is unknown, so adoption must take
         // the verifying path rather than trusting the file.
         let b = bdict(&[("qBt-savePath", bstr("/data/pool"))]);
-        assert!(!parse_hints(&b).is_complete);
+        assert!(!parse_hints(&b).unwrap().is_complete(1));
     }
 
     #[test]
     fn empty_strings_are_treated_as_absent() {
         let b = bdict(&[("qBt-savePath", bstr("")), ("qBt-category", bstr(""))]);
-        let h = parse_hints(&b);
+        let h = parse_hints(&b).unwrap();
         assert_eq!(h.save_path, None);
         assert_eq!(h.category, None);
     }

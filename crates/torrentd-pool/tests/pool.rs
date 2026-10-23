@@ -1621,21 +1621,61 @@ fn a_rescan_never_clears_a_profile_assignment() {
 use torrentd_pool::adopt::refusal;
 use torrentd_pool::adopt::AdoptPlan;
 
-/// Write a `.fastresume` next to a `.torrent`, as another client would.
-fn write_fastresume(dir: &Path, stem: &str, complete: bool) -> PathBuf {
+/// The piece length [`v1_metainfo`] declares.
+const TEST_PIECE_LENGTH: u64 = 1024;
+
+/// A v1 `.torrent` named `name` over `files`, each given by its path under
+/// `name/`, in [`TEST_PIECE_LENGTH`] pieces whose hashes are never checked:
+/// the pool reads a torrent's shape, never its piece hashes.
+fn v1_metainfo(name: &str, files: &[(&str, u64)]) -> Vec<u8> {
+    let bstr = |s: &[u8]| {
+        let mut v = format!("{}:", s.len()).into_bytes();
+        v.extend_from_slice(s);
+        v
+    };
+    let mut t = b"d4:infod5:filesl".to_vec();
+    for (path, len) in files {
+        let rel = path
+            .strip_prefix(&format!("{name}/"))
+            .expect("a file under the torrent's directory");
+        t.extend_from_slice(format!("d6:lengthi{len}e4:pathl").as_bytes());
+        for part in rel.split('/') {
+            t.extend_from_slice(&bstr(part.as_bytes()));
+        }
+        t.extend_from_slice(b"ee");
+    }
+    t.extend_from_slice(b"e4:name");
+    t.extend_from_slice(&bstr(name.as_bytes()));
+    let total: u64 = files.iter().map(|(_, s)| *s).sum();
+    let pieces = total.div_ceil(TEST_PIECE_LENGTH) as usize;
+    t.extend_from_slice(format!("12:piece lengthi{TEST_PIECE_LENGTH}e6:pieces").as_bytes());
+    t.extend_from_slice(&bstr(&vec![0; 20 * pieces]));
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// Write a `.fastresume` next to a `.torrent`, as another client would, with
+/// a `pieces` bitfield of `pieces` entries: every piece had, or the second
+/// one missing.
+fn write_fastresume(dir: &Path, stem: &str, complete: bool, pieces: usize) -> PathBuf {
     let mut b = b"d".to_vec();
     let sp = "/irrelevant";
     b.extend_from_slice(format!("12:qBt-savePath{}:{sp}", sp.len()).as_bytes());
-    // Completion is the `pieces` bitfield: every piece had, or one missing.
-    b.extend_from_slice(b"6:pieces3:");
-    b.extend_from_slice(if complete { &[1, 1, 1] } else { &[1, 0, 1] });
+    let mut bits = vec![1u8; pieces];
+    if !complete {
+        bits[pieces.min(2) - 1] = 0;
+    }
+    b.extend_from_slice(format!("6:pieces{pieces}:").as_bytes());
+    b.extend_from_slice(&bits);
     b.push(b'e');
     let p = dir.join(format!("{stem}.fastresume"));
     std::fs::write(&p, b).unwrap();
     p
 }
 
-/// A torrent whose `source_path`/`fastresume_path` point at real files.
+/// A torrent whose `source_path`/`fastresume_path` point at real files: a
+/// `.torrent` over `files`, and a sidecar whose bitfield is as long as that
+/// torrent has pieces.
 fn add_torrent_with_sidecar(
     store: &mut PoolStore,
     lib: &Path,
@@ -1645,8 +1685,15 @@ fn add_torrent_with_sidecar(
     complete: Option<bool>,
 ) {
     let torrent_path = lib.join(format!("{infohash}.torrent"));
-    std::fs::write(&torrent_path, b"not-parsed-by-these-tests").unwrap();
-    let fastresume_path = complete.map(|c| write_fastresume(lib, infohash, c));
+    let metainfo = v1_metainfo(name, files);
+    libtorrent_safe::torrent_metadata(&metainfo).expect("a .torrent libtorrent parses");
+    std::fs::write(&torrent_path, metainfo).unwrap();
+    let pieces = files
+        .iter()
+        .map(|(_, s)| *s)
+        .sum::<u64>()
+        .div_ceil(TEST_PIECE_LENGTH) as usize;
+    let fastresume_path = complete.map(|c| write_fastresume(lib, infohash, c, pieces));
 
     let t = PoolTorrent {
         infohash: infohash.to_string(),
@@ -1929,6 +1976,195 @@ fn a_complete_fastresume_with_one_file_resized_since_the_match_is_verified() {
     );
 }
 
+/// Issue #438: a `pieces` bitfield of any length but the torrent's piece
+/// count claims nothing, however every entry in it reads. libtorrent seeds a
+/// fast-path torrent unhashed, so a one-byte `\x01` would otherwise seed a
+/// whole torrent nobody checked.
+#[test]
+fn a_short_bitfield_takes_the_verify_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    // Four pieces of TEST_PIECE_LENGTH.
+    write_file(&root, "T/a.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "fs",
+        "T",
+        &[("T/a.bin", 4096)],
+        Some(true),
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    let plan = || {
+        torrentd_pool::adopt::plan(&store, "fs", |id| (id == root_id).then(|| root.clone()))
+            .unwrap()
+    };
+    // Every one of the four pieces had: the fast path.
+    assert_eq!(plan().kind(), "fast_path", "{:?}", plan());
+
+    for bits in [&[1u8][..], &[1, 1, 1], &[1, 1, 1, 1, 1], &[0xff; 64]] {
+        let mut fr = format!("d6:pieces{}:", bits.len()).into_bytes();
+        fr.extend_from_slice(bits);
+        fr.push(b'e');
+        std::fs::write(lib.join("fs.fastresume"), fr).unwrap();
+        assert_eq!(
+            plan(),
+            AdoptPlan::Verify {
+                torrent_path: lib.join("fs.torrent"),
+                save_path: root.clone(),
+                resume_path: Some(lib.join("fs.fastresume")),
+            },
+            "a {}-entry bitfield for a 4-piece torrent",
+            bits.len(),
+        );
+    }
+}
+
+/// A library holding `pad_file.torrent` beside a sidecar that renames its one
+/// real file to `temp/renamed.txt`, marks it complete and files it under a
+/// category, indexed and matched against `root`, where the file is.
+fn renamed_and_indexed(dir: &Path) -> (PathBuf, PathBuf, PoolStore, String) {
+    let root = dir.join("root");
+    write_file(&root, "temp/renamed.txt", 45);
+    let mut mapped = b"l".to_vec();
+    mapped.extend_from_slice(&bstr_of("temp/renamed.txt"));
+    mapped.extend_from_slice(&bstr_of(""));
+    mapped.push(b'e');
+    let (library, mut store, ih) = library_with_sidecar(
+        dir,
+        "pad_file.torrent",
+        &[
+            ("mapped_files", mapped),
+            ("pieces", b"1:\x01".to_vec()),
+            ("qBt-category", bstr_of("imported")),
+            ("qBt-savePath", bstr_of(&root.to_string_lossy())),
+        ],
+    );
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+    (library, root, store, ih)
+}
+
+/// Issue #438: a sidecar a rescan cannot parse is reported, and the index
+/// keeps what the last good read of it said — the save path, the category,
+/// and above all where `mapped_files` put each file. Dropping them would read
+/// renamed payload as missing, and offer it up as orphans to delete.
+#[test]
+fn an_unparseable_sidecar_keeps_the_index_rows_a_good_one_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let (library, root, mut store, ih) = renamed_and_indexed(dir.path());
+    let before = store.torrent(&ih).unwrap().unwrap();
+    assert_eq!(before.category.as_deref(), Some("imported"));
+    let files_before = store.torrent_files(&ih).unwrap();
+    assert_eq!(files_before[0].rel_path, "temp/renamed.txt");
+    // A second torrent, indexed and then gone from the library by the rescan.
+    let gone = library.join("gone.torrent");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v2_hybrid.torrent"),
+        &gone,
+    )
+    .unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(store.torrents().unwrap().len(), 2);
+    std::fs::remove_file(&gone).unwrap();
+
+    // Cut off halfway, as an interrupted copy leaves it.
+    let sidecar = library.join("t.fastresume");
+    let bytes = std::fs::read(&sidecar).unwrap();
+    std::fs::write(&sidecar, &bytes[..bytes.len() / 2]).unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+
+    assert_eq!(stats.errors, 1, "{:?}", stats.errors_by_kind);
+    assert_eq!(stats.errors_by_kind.get("parse"), Some(&1));
+    assert_eq!(stats.torrents_indexed, 1);
+    assert_eq!(store.torrent(&ih).unwrap().unwrap(), before);
+    assert_eq!(store.torrent_files(&ih).unwrap(), files_before);
+    // The library was read in full, so the torrent gone from it still leaves:
+    // a failed sidecar hides no `.torrent`.
+    assert_eq!(
+        store
+            .torrents()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.infohash)
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&ih)
+    );
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+    let root_id = store.root_id(&root).unwrap();
+    assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+}
+
+/// Once the sidecar that placed a torrent's renamed files is unreadable,
+/// neither adoption path can be handed it: the fast path has no resume data
+/// to add from, and the verify path would look for the files at the
+/// `.torrent`'s own paths, where they are not.
+#[test]
+fn an_unparseable_sidecar_refuses_a_renamed_torrent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (library, root, store, ih) = renamed_and_indexed(dir.path());
+    std::fs::write(library.join("t.fastresume"), b"d6:pieces").unwrap();
+    let root_id = store.root_id(&root).unwrap();
+    assert_eq!(
+        torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| root.clone()))
+            .unwrap(),
+        AdoptPlan::Refuse {
+            reason: refusal::RESUME_UNREADABLE
+        }
+    );
+}
+
+/// Issue #438: a `mapped_files` entry spelled with a `.` component or a
+/// doubled slash names the same file as its plain spelling, and is stored as
+/// that, so the file is found where it is.
+#[test]
+fn a_mapped_path_with_a_dot_or_a_doubled_slash_is_stored_normalised() {
+    for spelling in [
+        "temp/./renamed.txt",
+        "temp//renamed.txt",
+        "temp/renamed.txt/",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write_file(&root, "temp/renamed.txt", 45);
+        let mut mapped = b"l".to_vec();
+        mapped.extend_from_slice(&bstr_of(spelling));
+        mapped.extend_from_slice(&bstr_of(""));
+        mapped.push(b'e');
+        let (_lib, mut store, ih) = library_with_sidecar(
+            dir.path(),
+            "pad_file.torrent",
+            &[
+                ("mapped_files", mapped),
+                ("pieces", b"1:\x01".to_vec()),
+                ("qBt-savePath", bstr_of(&root.to_string_lossy())),
+            ],
+        );
+        assert_eq!(
+            store.torrent_files(&ih).unwrap()[0].rel_path,
+            "temp/renamed.txt",
+            "{spelling}"
+        );
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched, "{spelling}");
+        let root_id = store.root_id(&root).unwrap();
+        assert!(
+            store.orphan_files(root_id, "").unwrap().is_empty(),
+            "{spelling}"
+        );
+    }
+}
+
 #[path = "fixtures/bt_backup.rs"]
 mod bt_backup;
 
@@ -1953,7 +2189,17 @@ fn a_generated_bt_backup_of_500_pairs_plans_each_torrent_by_its_case() {
     let mut store = PoolStore::open_in_memory().unwrap();
     let lib = torrentd_pool::scan_library(&mut store, &backup, &Default::default()).unwrap();
     assert_eq!(lib.torrents_indexed, indexed.len() as u64);
-    assert_eq!(lib.errors, 0, "{:?}", lib.errors_by_kind);
+    // Each truncated sidecar is reported, and costs its torrent nothing but
+    // the hints.
+    let truncated = indexed
+        .iter()
+        .filter(|g| g.case == Case::TruncatedSidecar)
+        .count() as u64;
+    assert_eq!(lib.errors, truncated, "{:?}", lib.errors_by_kind);
+    assert_eq!(
+        lib.errors_by_kind,
+        std::collections::BTreeMap::from([("parse", truncated)])
+    );
     let scan = torrentd_pool::scan_root(&mut store, &root).unwrap();
     assert_eq!(scan.errors, 0, "{:?}", scan.errors_by_kind);
     let stats = torrentd_pool::match_all(&mut store).unwrap();

@@ -8,8 +8,9 @@
 //! Hashing a petabyte is days of I/O, so this tiers:
 //!
 //! * **Fast path** — the previous client left a `.fastresume` saying the
-//!   torrent was complete, and every file is still in the index at the size the
-//!   torrent declares. Payload rewritten in place at the same size is caught
+//!   torrent was complete — a `pieces` bitfield with one entry for each of
+//!   the `.torrent`'s pieces, every one had — and every file is still in the
+//!   index at the size the torrent declares. Payload rewritten in place at the same size is caught
 //!   separately by the drift pass an adopt runs over its selection first,
 //!   which marks the torrent `Drifted` and so sends it down the verify path
 //!   instead. Given both, its piece state is as good as a verification
@@ -31,6 +32,9 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+
+use libtorrent_safe::TorrentMeta;
+use tracing::warn;
 
 use crate::model::AdoptionState;
 use crate::model::PoolError;
@@ -80,6 +84,10 @@ pub mod refusal {
     pub const LAYOUT_NOT_IN_RESUME: &str =
         "the previous client's content layout moved these files, and its resume data does not \
          tell libtorrent so; adopting would look for them in the wrong places";
+    pub const RESUME_UNREADABLE: &str =
+        "the previous client's resume data can no longer be read, and the index does not hold \
+         these files at the .torrent's own paths, where verifying would look for them; recopy \
+         the .fastresume and rescan";
     pub const RENAMED_INCOMPLETE: &str =
         "the previous client renamed these files, which only its resume data maps for \
          libtorrent, and that resume data does not mark every piece had";
@@ -167,14 +175,57 @@ pub fn plan(
         root.join(&base_rel)
     };
 
+    // The `.torrent`'s own metadata, read at most once and only where a
+    // decision below needs it.
+    let meta = std::cell::OnceCell::new();
+    let meta = || {
+        meta.get_or_init(|| torrent_meta(&torrent.source_path))
+            .as_ref()
+    };
+
+    // The sidecar the scan paired, read once for every decision below.
+    let hints = match &torrent.fastresume_path {
+        None => None,
+        Some(fr) => match crate::fastresume::read_hints(fr) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(
+                    target: "torrentd_pool::adopt",
+                    infohash,
+                    path = %fr.display(),
+                    error.cause = %e,
+                    "the previous client's resume data is unreadable; it vouches for nothing",
+                );
+                // No completion claim and no layout, so the fast path is
+                // out. Verifying adds from the `.torrent`, which is right only
+                // where the index placed the files at the `.torrent`'s own
+                // paths: a rescan keeps the rows an earlier read of this
+                // sidecar wrote, renamed files included.
+                return Ok(if files_follow_the_torrent(store, infohash, meta())? {
+                    AdoptPlan::Verify {
+                        torrent_path: torrent.source_path.clone(),
+                        save_path,
+                        resume_path: torrent.fastresume_path.clone(),
+                    }
+                } else {
+                    AdoptPlan::Refuse {
+                        reason: refusal::RESUME_UNREADABLE,
+                    }
+                });
+            }
+        },
+    };
+
     let can_fast_path = may_fast_path
-        && torrent.fastresume_path.is_some()
-        && fastresume_is_trustworthy(store, infohash)?;
+        && match &hints {
+            Some(h) => fastresume_is_trustworthy(store, infohash, h, meta())?,
+            None => false,
+        };
 
     // The matcher placed the files where the previous client renamed them
     // to. Adding from the `.torrent` alone, as the verify path does, has
     // libtorrent look for them at the `.torrent`'s own paths instead.
-    let relayout = relayout_of(&torrent);
+    let relayout = hints.as_ref().and_then(|h| relayout_of(h, meta()));
     match (&relayout, can_fast_path) {
         // The index placed a file the resume data maps somewhere this
         // reader refused at the `.torrent`'s own path, and libtorrent, handed
@@ -213,33 +264,65 @@ pub fn plan(
     })
 }
 
+/// The metadata of the `.torrent` at `path`, or `None` where it cannot be read
+/// or parsed.
+fn torrent_meta(path: &Path) -> Option<TorrentMeta> {
+    let bytes = std::fs::read(path).ok()?;
+    libtorrent_safe::torrent_metadata(&bytes).ok()
+}
+
+/// Each file's path as the `.torrent` gives it, `/`-separated: where the
+/// scan places a file the previous client left where the `.torrent` says.
+fn torrent_paths(meta: &TorrentMeta) -> Vec<String> {
+    meta.files
+        .iter()
+        .map(|f| f.path.replace('\\', "/"))
+        .collect()
+}
+
 /// How the previous client laid this torrent's files out differently from
 /// its `.torrent`, re-derived from the two files the scan read it from.
-fn relayout_of(torrent: &crate::model::PoolTorrent) -> Option<crate::fastresume::Relayout> {
-    let fr = torrent.fastresume_path.as_ref()?;
-    let hints = crate::fastresume::read_hints(fr);
+fn relayout_of(
+    hints: &crate::fastresume::ResumeHints,
+    meta: Option<&TorrentMeta>,
+) -> Option<crate::fastresume::Relayout> {
     if hints.mapped_files.iter().all(Option::is_none)
         && hints.mapped_files_unreadable == 0
         && hints.content_layout.is_none()
     {
         return None;
     }
-    let bytes = std::fs::read(&torrent.source_path).ok()?;
-    let meta = libtorrent_safe::torrent_metadata(&bytes).ok()?;
-    let paths: Vec<String> = meta
-        .files
-        .iter()
-        .map(|f| f.path.replace('\\', "/"))
+    let meta = meta?;
+    hints.relayout(&torrent_paths(meta), &meta.name)
+}
+
+/// Whether the index holds every one of this torrent's files at the path
+/// its `.torrent` gives, which is where verifying from that `.torrent` has
+/// libtorrent look. `false` where the `.torrent` cannot be read.
+fn files_follow_the_torrent(
+    store: &PoolStore,
+    infohash: &str,
+    meta: Option<&TorrentMeta>,
+) -> Result<bool, PoolError> {
+    let Some(meta) = meta else {
+        return Ok(false);
+    };
+    let indexed: Vec<String> = store
+        .torrent_files(infohash)?
+        .into_iter()
+        .map(|f| f.rel_path)
         .collect();
-    hints.relayout(&paths, &meta.name)
+    Ok(indexed == torrent_paths(meta))
 }
 
 /// Whether the previous client's completion claim can stand in for our own
 /// verification.
 ///
 /// Two conditions, both necessary. The sidecar has to say the torrent was
-/// complete — an incomplete one has nothing useful to assert — and every file
-/// has to still be present in the index at the size the torrent declares.
+/// complete — a bitfield with one entry per piece of the `.torrent`, every
+/// one had; an incomplete or mis-sized one has nothing useful to assert — and
+/// every file has to still be present in the index at the size the torrent
+/// declares.
 ///
 /// Note what that second condition does *not* cover: it compares the torrent
 /// against the index, so it only rules out payload that changed size. Payload
@@ -250,15 +333,19 @@ fn relayout_of(torrent: &crate::model::PoolTorrent) -> Option<crate::fastresume:
 /// [`crate::drift::detect_before_adopt`] over its selection before planning
 /// any of it. A caller of this planner that skips that pass trusts whatever
 /// the last scan or drift check saw.
-fn fastresume_is_trustworthy(store: &PoolStore, infohash: &str) -> Result<bool, PoolError> {
-    let Some(torrent) = store.torrent(infohash)? else {
+fn fastresume_is_trustworthy(
+    store: &PoolStore,
+    infohash: &str,
+    hints: &crate::fastresume::ResumeHints,
+    meta: Option<&TorrentMeta>,
+) -> Result<bool, PoolError> {
+    // The piece count is the `.torrent`'s; without it, no bitfield can be
+    // held to it.
+    let Some(meta) = meta else {
         return Ok(false);
     };
-    let Some(fr) = &torrent.fastresume_path else {
-        return Ok(false);
-    };
-    let hints = crate::fastresume::read_hints(fr);
-    if !hints.is_complete {
+    let pieces = crate::fastresume::piece_count(meta.total_size, meta.piece_length);
+    if !hints.is_complete(pieces) {
         return Ok(false);
     }
     let Some((root_id, base_rel)) = store.adoption_base(infohash)? else {
