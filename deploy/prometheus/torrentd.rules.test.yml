@@ -293,7 +293,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); only IP presence is checked"
+              summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); while it has torrents to carry, 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
 
   - interval: 1m
     input_series:
@@ -334,7 +334,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "The route probe cannot run for acct_a; the tunnel's routing is not being checked, so route loss will not fence it"
+              summary: "The route probe cannot run for acct_a; the tunnel's routing is not being checked, so 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
 
   # Handshakes landing late, over and over, without yet crossing the fence:
   # one every five minutes.
@@ -690,7 +690,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
-              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
+              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed; 3 checks in a row that nft cannot answer fence every vpn profile probe_unavailable until a check finds the kill switch intact"
 
   # Checks that could not run during the boot scans, before the first scrape.
   - interval: 1m
@@ -706,14 +706,14 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
-              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
+              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed; 3 checks in a row that nft cannot answer fence every vpn profile probe_unavailable until a check finds the kill switch intact"
       - eval_time: 30m
         alertname: TorrentdKillSwitchUnverifiable
         exp_alerts:
           - exp_labels:
               severity: warning
             exp_annotations:
-              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
+              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed; 3 checks in a row that nft cannot answer fence every vpn profile probe_unavailable until a check finds the kill switch intact"
 
   # A ruleset flush two minutes into an eight-minute boot: the watch
   # reinstalled the table before the first scrape, whose sample already
