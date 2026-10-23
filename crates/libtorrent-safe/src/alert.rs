@@ -5,13 +5,12 @@
 //! payloads out of the C union into owned Rust values and then calls
 //! `lt_alert_payload_free` so the C side never leaks.
 
-use std::ffi::CStr;
-
 use libtorrent_sys as ffi;
 
+use crate::ffi_util::fixed_c_str;
+use crate::ffi_util::sized_str;
 use crate::handle::InfoHash;
 use crate::handle::TorrentHandle;
-use crate::metadata::sized_str;
 use crate::resume::ResumeData;
 
 /// Compact tag enum mirroring `lt_alert_kind`. Useful for routing /
@@ -402,7 +401,7 @@ impl Alert {
         let alert = match kind {
             AlertKind::AddTorrent => {
                 let p = unsafe { &raw.payload.add_torrent };
-                let msg = c_str_to_owned(&p.message);
+                let msg = fixed_c_str(&p.message);
                 Alert::AddTorrent {
                     hdr,
                     error_code: p.error_code,
@@ -426,8 +425,8 @@ impl Alert {
                 Alert::TorrentError {
                     hdr,
                     error_code: p.error_code,
-                    filename: c_str_to_owned(&p.filename),
-                    message: c_str_to_owned(&p.message),
+                    filename: fixed_c_str(&p.filename),
+                    message: fixed_c_str(&p.message),
                 }
             }
             AlertKind::FileError => {
@@ -435,9 +434,9 @@ impl Alert {
                 Alert::FileError {
                     hdr,
                     error_code: p.error_code,
-                    filename: c_str_to_owned(&p.filename),
-                    operation: c_str_to_owned(&p.operation),
-                    message: c_str_to_owned(&p.message),
+                    filename: fixed_c_str(&p.filename),
+                    operation: fixed_c_str(&p.operation),
+                    message: fixed_c_str(&p.message),
                 }
             }
             AlertKind::HashFailed => {
@@ -477,7 +476,7 @@ impl Alert {
                     hdr,
                     error_code: p.error_code,
                     not_modified: p.not_modified != 0,
-                    message: c_str_to_owned(&p.message),
+                    message: fixed_c_str(&p.message),
                 }
             }
             AlertKind::ListenFailed => {
@@ -485,17 +484,17 @@ impl Alert {
                 Alert::ListenFailed {
                     hdr,
                     error_code: p.error_code,
-                    operation: c_str_to_owned(&p.operation),
-                    endpoint: c_str_to_owned(&p.endpoint),
-                    iface: c_str_to_owned(&p.iface),
-                    message: c_str_to_owned(&p.message),
+                    operation: fixed_c_str(&p.operation),
+                    endpoint: fixed_c_str(&p.endpoint),
+                    iface: fixed_c_str(&p.iface),
+                    message: fixed_c_str(&p.message),
                 }
             }
             AlertKind::ListenSucceeded => {
                 let p = unsafe { &raw.payload.listen_succeeded };
                 Alert::ListenSucceeded {
                     hdr,
-                    endpoint: c_str_to_owned(&p.endpoint),
+                    endpoint: fixed_c_str(&p.endpoint),
                 }
             }
             AlertKind::TorrentChecked => Alert::TorrentChecked { hdr },
@@ -514,9 +513,9 @@ impl Alert {
                 Alert::StorageMovedFailed {
                     hdr,
                     error_code: p.error_code,
-                    operation: c_str_to_owned(&p.operation),
-                    path: c_str_to_owned(&p.path),
-                    message: c_str_to_owned(&p.message),
+                    operation: fixed_c_str(&p.operation),
+                    path: fixed_c_str(&p.path),
+                    message: fixed_c_str(&p.message),
                 }
             }
             AlertKind::SessionStats => {
@@ -544,8 +543,8 @@ impl Alert {
                     error_category: ErrorCategory::from_raw(p.error_category),
                     aborted: p.aborted != 0,
                     times_in_row: p.times_in_row,
-                    tracker_url: c_str_to_owned(&p.tracker_url),
-                    message: c_str_to_owned(&p.message),
+                    tracker_url: fixed_c_str(&p.tracker_url),
+                    message: fixed_c_str(&p.message),
                 }
             }
             AlertKind::TrackerWarning
@@ -559,13 +558,13 @@ impl Alert {
                     hdr,
                     error_code: p.error_code,
                     warning_code: p.warning_code,
-                    message: c_str_to_owned(&p.message),
+                    message: fixed_c_str(&p.message),
                 }
             }
             AlertKind::TrackerReply => Alert::TrackerReply { hdr },
             AlertKind::TorrentLog | AlertKind::Log => {
                 let p = unsafe { &raw.payload.log_msg };
-                let msg = c_str_to_owned(&p.message);
+                let msg = fixed_c_str(&p.message);
                 if matches!(kind, AlertKind::TorrentLog) {
                     Alert::TorrentLog { hdr, message: msg }
                 } else {
@@ -576,20 +575,8 @@ impl Alert {
 
         // We've copied all heap payloads; release the C-side allocations.
         unsafe { ffi::lt_alert_payload_free(raw as *mut _) };
-        let _ = infohash; // keep the variable alive for the unused-warning lint
         Some(alert)
     }
-}
-
-/// Read a fixed-size NUL-terminated C buffer (e.g. `[c_char; LT_MSG_MAX]`)
-/// into an owned UTF-8 String. Invalid UTF-8 is replaced with U+FFFD; we
-/// never want a stray byte from libtorrent to crash the daemon.
-fn c_str_to_owned(buf: &[std::os::raw::c_char]) -> String {
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
-    // No NUL found — fall back to an empty string rather than read past the
-    // buffer. `c""` is a `&'static CStr`; no `unsafe` needed.
-    let cstr = CStr::from_bytes_until_nul(bytes).unwrap_or(c"");
-    String::from_utf8_lossy(cstr.to_bytes()).into_owned()
 }
 
 #[cfg(test)]

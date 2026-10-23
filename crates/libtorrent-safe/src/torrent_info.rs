@@ -9,8 +9,8 @@
 
 use libtorrent_sys as ffi;
 
-use crate::metadata::fixed_c_str;
-use crate::metadata::sized_str;
+use crate::ffi_util::fixed_c_str;
+use crate::ffi_util::sized_str;
 
 /// Details of one torrent in a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
