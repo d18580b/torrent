@@ -1161,8 +1161,8 @@ The daemon sets none of these itself.
   credential is answered `401` or `403` at once, so it can neither hold a
   connection until the deadline nor make the daemon buffer its body. A body
   sent without `Content-Length` (chunked, or HTTP/2 without the header) is
-  held in memory as it arrives, up to the operation's limit — 64 KiB, or
-  96 MiB for `POST /v1/torrents` — so with `[auth]` configured only a
+  held in memory as it arrives, up to the operation's limit
+  ([body limits](api/README.md#requests-and-responses)), so with `[auth]` configured only a
   credential holder can make the daemon spend that. Without `[auth]`, any
   same-site caller is admitted as anonymous and can. Every idle connection is
   bounded, but a caller that opens 256 connections, sends nothing on them, and
@@ -1174,7 +1174,7 @@ The daemon sets none of these itself.
   `timeouts.read_header` and `timeouts.idle`, as `deploy/Caddyfile` sets
   them), which keep such connections from reaching the daemon. The proxy needs no body timeout
   of its own, since the daemon bounds every body; `deploy/Caddyfile` says
-  why it sets none, and caps a body at the daemon's own 96 MiB.
+  why it sets none, and caps a body at the daemon's own largest limit.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on

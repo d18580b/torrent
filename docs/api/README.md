@@ -98,8 +98,8 @@ http://localhost/v1/server`). Two things differ from TCP: a request carries no
 client address, so `trusted_proxies` never applies and the login throttle
 counts every caller as one client; and a request body is read whole before
 the operation sees it, and before the request is authorized, under the same
-deadline; a body over 64 KiB, or over 96 MiB for `POST /v1/torrents`, is
-answered `413` with an `about:blank` problem before routing.
+deadline; a body over its limit (below) is answered `413` with an
+`about:blank` problem before routing.
 An `Authorization` header that is present but is not a well-formed bearer credential is still a `401`: a client that
 sent a credential nobody checked is not an anonymous one. That includes any
 other scheme — a `Basic` header a reverse proxy adds or passes through from
