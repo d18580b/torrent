@@ -26,11 +26,13 @@
 //   - lt_session owns a libtorrent::session, a per-session handle map
 //     (uintptr_t -> torrent_handle) protected by handle_mutex, and a deque
 //     of pre-translated lt_alert_union values that lt_pop_alert drains.
-//   - Settings JSON is parsed by a hand-written strict parser limited to flat
-//     {string: int|bool|string} objects. Adding a JSON dep would mean either
-//     vendoring nlohmann or pulling in boost::json as a separate compile
-//     unit; the parser here is well under 100 lines and serves only the
-//     known set of libtorrent settings.
+//   - Settings JSON is parsed by a hand-written strict parser limited to one
+//     flat {string: int|bool|string} object: integers only (no fractions or
+//     exponents), every JSON string escape including \uXXXX and surrogate
+//     pairs (but not \u0000), and nothing but whitespace after the closing
+//     brace. Adding a JSON dep would mean either vendoring nlohmann or
+//     pulling in boost::json as a separate compile unit, for a parser that
+//     serves only the known set of libtorrent settings.
 //   - Alert translation is centralized in translate_alert(); each branch
 //     handles exactly one libtorrent alert type via alert_cast<T>.
 
@@ -110,6 +112,17 @@ void set_err(char* err_out, int err_len, const std::string& msg) {
     set_err(err_out, err_len, msg.c_str());
 }
 
+// A caller's buffer length as the `int` libtorrent's torrent_info takes.
+// A narrowing cast would turn a length past INT_MAX into a negative one, or
+// into a truncated one (2^32 + n becomes n) that parses only a prefix of the
+// buffer and reports success; refuse it instead. Thrown inside LT_SHIM_TRY,
+// so the caller gets its function's failure return and this message.
+int buffer_len(std::size_t len) {
+    if (len > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::length_error("buffer longer than INT_MAX bytes");
+    return static_cast<int>(len);
+}
+
 // Macro pair to wrap every public shim function. fail_ret is the value to
 // return on exception (0 for handles, LT_ERR for ints, nullptr for pointers).
 #define LT_SHIM_TRY  try {
@@ -152,6 +165,57 @@ class json_parser {
         }
         ++p;
     }
+    // The four hex digits after a `\u`, with `p` on the `u`; leaves `p` past
+    // them.
+    std::uint32_t parse_hex4() {
+        ++p;
+        if (end - p < 4) throw std::runtime_error("truncated \\u escape");
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i, ++p) {
+            char const c = *p;
+            v <<= 4;
+            if (c >= '0' && c <= '9')      v |= static_cast<std::uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') v |= static_cast<std::uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v |= static_cast<std::uint32_t>(c - 'A' + 10);
+            else throw std::runtime_error("bad hex digit in \\u escape");
+        }
+        return v;
+    }
+    // One `\uXXXX` escape, or a `\uD8xx\uDCxx` surrogate pair, as the code
+    // point it names. A lone surrogate names no character and is refused, as
+    // is U+0000: every setting string reaches libtorrent as a C string at some
+    // point, where a NUL would silently cut it short.
+    std::uint32_t parse_unicode_escape() {
+        std::uint32_t cp = parse_hex4();
+        if (cp >= 0xDC00 && cp <= 0xDFFF) throw std::runtime_error("lone low surrogate");
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            if (end - p < 2 || p[0] != '\\' || p[1] != 'u')
+                throw std::runtime_error("lone high surrogate");
+            ++p;
+            std::uint32_t const lo = parse_hex4();
+            if (lo < 0xDC00 || lo > 0xDFFF) throw std::runtime_error("lone high surrogate");
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+        }
+        if (cp == 0) throw std::runtime_error("\\u0000 in a string");
+        return cp;
+    }
+    static void append_utf8(std::string& out, std::uint32_t cp) {
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
     std::string parse_string() {
         skip_ws();
         if (p >= end || *p != '"') throw std::runtime_error("expected string");
@@ -170,6 +234,7 @@ class json_parser {
                     case 'n':  out += '\n'; break;
                     case 'r':  out += '\r'; break;
                     case 't':  out += '\t'; break;
+                    case 'u':  append_utf8(out, parse_unicode_escape()); continue;
                     default:   throw std::runtime_error("bad escape");
                 }
                 ++p;
@@ -220,11 +285,8 @@ class json_parser {
         return v;
     }
 
-public:
-    json_parser(const char* s, std::size_t len) : p(s), end(s + len) {}
-
     template <typename Visit>
-    void parse_object(Visit visit) {
+    void parse_members(Visit& visit) {
         expect('{');
         skip_ws();
         if (p < end && *p == '}') { ++p; return; }
@@ -238,6 +300,19 @@ public:
             if (p < end && *p == '}') { ++p; return; }
             throw std::runtime_error("expected ',' or '}'");
         }
+    }
+
+public:
+    json_parser(const char* s, std::size_t len) : p(s), end(s + len) {}
+
+    // The whole input as one object: anything but whitespace after its
+    // closing brace is refused, so `{"a":1}garbage` is an error rather than
+    // `{"a":1}`.
+    template <typename Visit>
+    void parse_object(Visit visit) {
+        parse_members(visit);
+        skip_ws();
+        if (p != end) throw std::runtime_error("trailing bytes after the settings object");
     }
 };
 
@@ -364,11 +439,15 @@ lt::torrent_flags_t build_torrent_flags(std::uint32_t caller_flags) {
     return f;
 }
 
+// An unknown value is refused rather than mapped: always_replace_files, the
+// fallback it used to get, is the one choice that overwrites files at the
+// destination, so a typo or a newer caller's constant would have replaced data.
 lt::move_flags_t build_move_flags(std::uint32_t flags) {
     switch (flags) {
-        case LT_MOVE_FAIL_IF_EXIST: return lt::move_flags_t::fail_if_exist;
-        case LT_MOVE_DONT_REPLACE:  return lt::move_flags_t::dont_replace;
-        default:                    return lt::move_flags_t::always_replace_files;
+        case LT_MOVE_ALWAYS_REPLACE_FILES: return lt::move_flags_t::always_replace_files;
+        case LT_MOVE_FAIL_IF_EXIST:        return lt::move_flags_t::fail_if_exist;
+        case LT_MOVE_DONT_REPLACE:         return lt::move_flags_t::dont_replace;
+        default: throw std::invalid_argument("unknown move flags");
     }
 }
 
@@ -433,8 +512,9 @@ struct lt_session {
     //
     // An infohash can outlive the torrent it named. torrent_handle::is_valid()
     // only asks whether the torrent object still exists, and a removed torrent
-    // lingers until its disk jobs finish, so an alert it posted before the
-    // removal can still register it after lt_remove_torrent unregistered it.
+    // lingers until its disk jobs finish, so its add_torrent_alert (the one
+    // alert that registers; see resolve_handle) can still register it after
+    // lt_remove_torrent unregistered it.
     // A stored handle is therefore replaced, under a fresh id, when:
     //
     //   - `authoritative` is set: the handle is what session::add_torrent just
@@ -462,6 +542,20 @@ struct lt_session {
         handles_by_id.emplace(id, h);
         ids_by_ih.emplace(ih, id);
         return id;
+    }
+
+    // The id an alert from `h` is reported under, registering nothing: 0
+    // when `h`'s infohash has no entry. Only an add registers a torrent. A
+    // torrent can post alerts after its torrent_removed_alert has been
+    // translated (the reply to its stopping announce, a late disk job), and
+    // registering it from one of those would hand the removed torrent a
+    // fresh id that no later alert ever unregisters.
+    std::uintptr_t resolve_handle(const lt::torrent_handle& h) {
+        if (!h.is_valid()) return 0;
+        auto ih = torrent_key(h.info_hashes());
+        std::lock_guard<std::mutex> lk(handle_mutex);
+        auto it = ids_by_ih.find(ih);
+        return it == ids_by_ih.end() ? 0 : it->second;
     }
 
     // Look up by id. Returns invalid handle if id is unknown.
@@ -510,16 +604,23 @@ void zero_init(lt_alert_union& u) {
     std::memset(&u, 0, sizeof(u));
 }
 
-void fill_torrent_scope(lt_alert_union& u, lt_session* s, const lt::torrent_handle& h) {
+// The torrent an alert is about. Only add_torrent_alert (`is_add`) may
+// register the torrent; every other alert resolves to the id an add already
+// gave it, or to 0 once the torrent is gone from the registry (see
+// lt_session::resolve_handle). The infohash is filled either way.
+void fill_torrent_scope(lt_alert_union& u, lt_session* s, const lt::torrent_handle& h,
+                        bool is_add = false) {
     if (!h.is_valid()) return;
-    u.handle = s->register_handle(h);
+    u.handle = is_add ? s->register_handle(h) : s->resolve_handle(h);
     auto ih = torrent_key(h.info_hashes());
     std::memcpy(u.infohash, ih.data(), 20);
 }
 
 void fill_state_view(lt_torrent_status_view& v, lt_session* s, const lt::torrent_status& st) {
     if (st.handle.is_valid()) {
-        v.handle = s->register_handle(st.handle);
+        // Resolve, never register: a state_update_alert can be translated
+        // after the removal of a torrent it reports.
+        v.handle = s->resolve_handle(st.handle);
         auto ih = torrent_key(st.handle.info_hashes());
         std::memcpy(v.infohash, ih.data(), 20);
     }
@@ -567,7 +668,7 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
             out.payload.add_torrent.error_code = x->error.value();
             copy_str_truncated(out.payload.add_torrent.message, LT_MSG_MAX, x->error.message());
         }
-        fill_torrent_scope(out, s, x->handle);
+        fill_torrent_scope(out, s, x->handle, /*is_add=*/true);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::torrent_removed_alert>(a)) {
@@ -755,17 +856,6 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
                            x->tracker_url());
         copy_str_truncated(out.payload.tracker_error.message, LT_MSG_MAX,
                            std::string(x->error_message()));
-        fill_torrent_scope(out, s, x->handle);
-        return true;
-    }
-    if (auto* x = lt::alert_cast<lt::peer_disconnected_alert>(a)) {
-        out.kind = LT_ALERT_PEER_DISCONNECTED;
-        std::ostringstream ep;
-        ep << x->endpoint;
-        copy_str_truncated(out.payload.peer_disconnected.peer_address, LT_ADDR_MAX, ep.str());
-        out.payload.peer_disconnected.error_code = x->error.value();
-        copy_str_truncated(out.payload.peer_disconnected.message, LT_MSG_MAX,
-                           x->error.message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
@@ -1112,7 +1202,7 @@ extern "C" lt_handle lt_add_torrent_file(lt_session* s,
     LT_SHIM_TRY
     lt::add_torrent_params atp;
     atp.ti = std::make_shared<lt::torrent_info>(
-        reinterpret_cast<const char*>(data), static_cast<int>(len));
+        reinterpret_cast<const char*>(data), buffer_len(len));
     apply_add_params_common(atp, save_path, flags);
     apply_tracker_override(atp, tracker_urls, tracker_tiers, num_trackers);
 
@@ -1174,7 +1264,7 @@ extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
     // resume data, which is the check we want.
     if (!atp.ti && torrent_buf && torrent_len > 0) {
         atp.ti = std::make_shared<lt::torrent_info>(
-            reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+            reinterpret_cast<const char*>(torrent_buf), buffer_len(torrent_len));
     }
 
     if (save_path_override && *save_path_override) atp.save_path = save_path_override;
@@ -1219,7 +1309,7 @@ extern "C" int lt_torrent_info_hashes(const uint8_t* data, size_t len,
     if (!data || !out) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
     LT_SHIM_TRY
     std::memset(out, 0, sizeof(*out));
-    lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(len));
+    lt::torrent_info ti(reinterpret_cast<const char*>(data), buffer_len(len));
     fill_info_hashes(out, ti.info_hashes());
     return LT_OK;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
@@ -1261,14 +1351,14 @@ extern "C" int lt_add_info_hashes(const char* magnet_uri,
         if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
         if (!atp.ti && torrent_buf && torrent_len > 0) {
             atp.ti = std::make_shared<lt::torrent_info>(
-                reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+                reinterpret_cast<const char*>(torrent_buf), buffer_len(torrent_len));
         }
     } else if (magnet_uri) {
         atp = lt::parse_magnet_uri(magnet_uri, ec);
         if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
     } else if (torrent_buf && torrent_len > 0) {
         atp.ti = std::make_shared<lt::torrent_info>(
-            reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+            reinterpret_cast<const char*>(torrent_buf), buffer_len(torrent_len));
     } else {
         set_err(err_out, err_len, "no torrent source");
         return LT_ERR;
@@ -1391,7 +1481,7 @@ extern "C" int lt_torrent_metadata(const uint8_t* data, size_t len,
     LT_SHIM_TRY
     std::memset(out, 0, sizeof(*out));
 
-    lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(len));
+    lt::torrent_info ti(reinterpret_cast<const char*>(data), buffer_len(len));
     auto const& ih = ti.info_hashes();
 
     lt::file_storage const& fs = ti.files();
@@ -1530,14 +1620,14 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
         if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
         if (!atp.ti && torrent_buf && torrent_len > 0) {
             atp.ti = std::make_shared<lt::torrent_info>(
-                reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+                reinterpret_cast<const char*>(torrent_buf), buffer_len(torrent_len));
         }
     } else if (magnet_uri) {
         atp = lt::parse_magnet_uri(magnet_uri, ec);
         if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
     } else if (torrent_buf && torrent_len > 0) {
         atp.ti = std::make_shared<lt::torrent_info>(
-            reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+            reinterpret_cast<const char*>(torrent_buf), buffer_len(torrent_len));
         apply_tracker_override(atp, tracker_urls, tracker_tiers, num_trackers);
     } else {
         set_err(err_out, err_len, "no torrent source");
@@ -1648,9 +1738,10 @@ extern "C" int lt_torrent_move_storage(lt_session* s, lt_handle h,
 {
     if (!s || !new_path) return LT_ERR;
     LT_SHIM_TRY
+    lt::move_flags_t const mf = build_move_flags(flags);
     auto th = s->lookup(h);
     if (!th.is_valid()) return LT_ERR;
-    th.move_storage(new_path, build_move_flags(flags));
+    th.move_storage(new_path, mf);
     return LT_OK;
     LT_SHIM_CATCH(nullptr, 0, LT_ERR)
 }
