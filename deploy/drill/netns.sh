@@ -22,7 +22,8 @@
 #
 # Needs bash, ip, nft, wg, unshare, nsenter and python3, and a kernel that
 # lets an unprivileged user create user namespaces. Run as root it works the
-# same way.
+# same way. A drill that installs the kill switch (`ks_install`) also needs a
+# built torrentd, which renders it.
 
 DRILL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROBE=(python3 -I "$DRILL_DIR/probe.py")
@@ -192,30 +193,65 @@ tunnel_carries() {
   return 1
 }
 
-# The kill switch as `killswitch::render_ruleset_with_transport` renders it
-# for one tunnel: the tunnel's address fenced to its own interface and
-# loopback whoever sends it, loopback, the tunnel from its own address, the
-# tunnel's transport from its listen port to its peer's endpoint, and the
-# drop. $1 is the listen port, as the daemon reads it with `wg show <iface>
-# listen-port`; the endpoint is the one `wg_raise` gives the link. Kept line
-# for line with that function; its tests pin the same text.
-ks_install() {
-  local uid
-  uid=$(id -u)
-  nft -f - <<EOF
-add table inet torrentd_ks_$uid
-delete table inet torrentd_ks_$uid
-table inet torrentd_ks_$uid {
-	chain output {
-		type filter hook output priority 0; policy accept;
-		ip saddr $WG_ADDR oifname != { "lo", "$WG_IF" } drop
-		meta skuid $uid oifname "lo" accept
-		meta skuid $uid ip saddr $WG_ADDR oifname "$WG_IF" accept
-		meta skuid $uid ip daddr $PEER_V4 udp sport $1 udp dport $WG_PEER_PORT accept
-		meta skuid $uid counter drop
-	}
-}
+# The kill switch exactly as the daemon would install it over wg-drill, from
+# the daemon itself: `torrentd vpn check` renders, through
+# `killswitch::install_script` (`killswitch::render_ruleset_with_transport`
+# behind the replace that `enable` installs), the script boot hands `nft -f`
+# for this uid over the live link, reading its address, listen port and
+# endpoint off it as boot does, and prints it. The drills used to carry a
+# copy of that ruleset, which nothing kept in step with the renderer.
+#
+# The binary is $TORRENTD, by default target/debug/torrentd under the
+# directory the drill was started from (`cargo build -p torrentd`).
+#
+# `vpn check` exits 1 here whatever the ruleset: it is uid 0, which the kill
+# switch refuses, and the link has no route the daemon set up. Only its
+# `kill_switch_ruleset` check is read, and it has to have passed `nft
+# --check`.
+ks_render() {
+  local bin=${TORRENTD:-target/debug/torrentd} report
+  [[ -x $bin ]] || fail_setup "no daemon binary at $bin (cargo build -p torrentd, or set TORRENTD)"
+  cat >"$work/ks.toml" <<EOF
+default_save_path = "$work"
+resume_dir = "$work/resume"
+torrent_dir = "$work/torrents"
+allow_unauthenticated = true
+network_kill_switch = true
+
+[[profile]]
+id = "drill"
+network = "vpn"
+vpn_type = "wireguard"
+vpn_config = "/etc/wireguard/$WG_IF.conf"
+vpn_interface = "$WG_IF"
+listen_port = 6881
+peer_fingerprint = "-qB5030-"
+user_agent = "qBittorrent/5.0.3"
+allowed_tracker_domains = ["tracker.example"]
 EOF
+  # Its stderr only summarises the failures that are expected here; kept
+  # aside, and shown when no ruleset came of the run.
+  report=$("$bin" --config "$work/ks.toml" vpn check --json --profile drill --as-uid "$(id -u)" \
+    2>"$work/ks.err") || true
+  [[ -n $report ]] || { cat "$work/ks.err" >&2; return 1; }
+  python3 -I -c '
+import json, sys
+check = next(c for c in json.load(sys.stdin)["host"] if c["name"] == "kill_switch_ruleset")
+if check["verdict"] != "pass":
+    sys.exit("kill_switch_ruleset is %s: %s" % (check["verdict"], check["detail"]))
+sys.stdout.write(check["detail"].split("\n", 1)[1])
+' <<<"$report"
+}
+
+# Install it. $1 is the listen port the drill expects the exemption to name,
+# as `wg show <iface> listen-port` reads it; the daemon reads its own off the
+# link, so a mismatch is a drill that set up something other than it meant.
+ks_install() {
+  local script
+  script=$(ks_render) || fail_setup "torrentd did not render a kill switch"
+  [[ $script == *"udp sport $1 udp dport $WG_PEER_PORT accept"* ]] ||
+    fail_setup "the rendered kill switch does not exempt listen port $1: $script"
+  nft -f - <<<"$script"
 }
 
 ks_remove() { nft delete table inet "torrentd_ks_$(id -u)" 2>/dev/null || true; }

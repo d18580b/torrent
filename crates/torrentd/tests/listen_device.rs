@@ -12,7 +12,10 @@
 //! created second as a tunnel is. It re-runs itself under
 //! `unshare --user --map-root-user --net`, so it needs no privilege, only a
 //! kernel that lets an unprivileged user create user namespaces, and `ip`.
-//! Where either is missing it says so and passes without having run.
+//! Where either is missing it says so and passes without having run, unless
+//! `TORRENTD_REQUIRE_NETNS=1` is set: then a host that cannot run it fails it.
+//! `mise run test-netns`, and the `vpn-netns` CI job through it, set that, so
+//! the one run meant to exercise this test cannot pass without having.
 
 use std::net::SocketAddr;
 use std::process::Command;
@@ -24,6 +27,8 @@ use torrentd_engine::handlers::listen::BoundSocket;
 
 /// Set in the re-run that is inside the namespace.
 const IN_NAMESPACE: &str = "TORRENTD_TEST_LISTEN_DEVICE_NETNS";
+/// Set to `1` where skipping for want of a namespace is a failure.
+const REQUIRE_NETNS: &str = "TORRENTD_REQUIRE_NETNS";
 const TEST: &str = "a_vpn_session_listens_on_the_tunnel_device_where_a_lan_covers_its_address";
 
 #[test]
@@ -44,19 +49,21 @@ fn a_vpn_session_listens_on_the_tunnel_device_where_a_lan_covers_its_address() {
             "lo",
         ])
         .output();
-    match probe {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            eprintln!(
-                "skipped: cannot create a network namespace here: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            return;
-        }
-        Err(e) => {
-            eprintln!("skipped: cannot run unshare: {e}");
-            return;
-        }
+    let unavailable = match probe {
+        Ok(out) if out.status.success() => None,
+        Ok(out) => Some(format!(
+            "cannot create a network namespace here: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Some(format!("cannot run unshare: {e}")),
+    };
+    if let Some(why) = unavailable {
+        assert!(
+            std::env::var_os(REQUIRE_NETNS).is_none_or(|v| v != "1"),
+            "{REQUIRE_NETNS}=1, so this host must run the test: {why}"
+        );
+        eprintln!("skipped: {why}");
+        return;
     }
     let out = Command::new("unshare")
         .args(["--user", "--map-root-user", "--net", "--"])
