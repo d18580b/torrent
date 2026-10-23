@@ -94,6 +94,9 @@ jobs:
         with:
           system-deps: 'true'
           cache-prefix: cargo-msrv
+          # rust-version picks this job's compiler, so an MSRV bump must
+          # miss the cache rather than restore the old compiler's target/.
+          cache-key-file: Cargo.toml
 
       # `cargo check` still runs libtorrent-sys's build script, which under
       # the default `bundled` feature provisions the native prefix and

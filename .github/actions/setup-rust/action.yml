@@ -34,6 +34,15 @@ inputs:
       Empty disables the cache.
     required: false
     default: ''
+  cache-key-file:
+    description: >-
+      One more file pattern whose contents the cache key hashes, beside
+      Cargo.lock and rust-toolchain.toml, for a job whose compiler or build
+      those two do not determine (the msrv job's comes from Cargo.toml's
+      rust-version). An exact key hit is never re-saved, so whatever picks
+      the compiler has to be in the key.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -73,7 +82,7 @@ runs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', inputs.cache-key-file || 'rust-toolchain.toml') }}
         restore-keys: ${{ inputs.cache-prefix }}-${{ runner.os }}-
 
     # cargo-binstall lets mise fetch prebuilt convco and cargo-deny binaries
