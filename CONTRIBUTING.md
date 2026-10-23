@@ -167,13 +167,14 @@ Every test command is a mise task, and CI runs the same tasks:
 | `mise run test-lifecycle` | Layer 3, real libtorrent against real disk. No network. |
 | `mise run test-daemon` | Layer 3, spawns the built binary and drives it over HTTP |
 | `mise run test-torrentctl` | Layer 3, torrentctl's generated client against a spawned daemon (builds `torrentd` first) |
+| `mise run test-netns` | the VPN in a real kernel: the kill switch's nft rules, WireGuard's live links, the listen device, and the daemon end to end over a real tunnel, each in a private network namespace. Needs unprivileged user namespaces, `nft`, `wg`, `ip`, `unshare`, and the `wireguard`, `nf_tables` and `veth` modules loaded. |
 | `mise run test-alerts` | `promtool` checks `deploy/prometheus`'s alert rules and runs their fixtures. Needs podman or docker. |
-| `mise run test-all` | every row above except `deny`, in order |
+| `mise run test-all` | every row above except `deny`, in order, so it needs what `test-shim`, `test-netns` and `test-alerts` need |
 | `mise run bench -- <subcommand>` | Layer 4, manual: minutes and GBs of RAM |
 
 Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
 Layer 2 runs as its own CI job; the three Layer 3 suites share one, and
-`test-alerts` has its own.
+`test-netns` (the `vpn-netns` job) and `test-alerts` each have their own.
 
 Deploying it for real — packages, submodules, the service user, directories,
 config, auth bootstrap, ulimits, and the drills worth running once before you

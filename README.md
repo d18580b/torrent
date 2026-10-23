@@ -475,10 +475,11 @@ mise run test-shim       # Layer 2: the C ABI boundary
 mise run test-lifecycle  # Layer 3: real libtorrent against real disk
 mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
 mise run test-torrentctl # Layer 3: torrentctl's generated client against the daemon
+mise run test-netns      # kill switch, WireGuard and the daemon in private network namespaces (needs unprivileged user namespaces)
 mise run openapi         # regenerate docs/api/openapi.json after an API change
 mise run openapi-check   # fail if the committed document is stale
 mise run test-alerts     # promtool over deploy/prometheus (needs podman or docker)
-mise run test-all        # test and every test-* task above, in turn; not check, deny or openapi-check
+mise run test-all        # test and every test-* task above, in turn (so test-netns's namespaces too); not check, deny or openapi-check
 mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```
 
