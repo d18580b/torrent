@@ -626,7 +626,7 @@ async fn between_scan_batches(
     progress: &sd_notify::Progress,
     each_batch: impl FnOnce(),
 ) -> anyhow::Result<()> {
-    if i % SCAN_SHUTDOWN_CHECK_EVERY != 0 {
+    if !i.is_multiple_of(SCAN_SHUTDOWN_CHECK_EVERY) {
         return Ok(());
     }
     // A 100K-torrent scan runs for minutes; a SIGTERM during it is answered
