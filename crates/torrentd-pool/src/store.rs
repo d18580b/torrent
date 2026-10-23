@@ -2686,4 +2686,26 @@ mod tests {
         let failed = &store.plan_steps_page(id, Some(1), 1).unwrap()[0];
         assert_eq!(failed.error.as_deref(), Some("boom"));
     }
+
+    /// The plan journal's durability rests on these two pragmas: WAL so a
+    /// scan's long transaction does not block readers, and `synchronous=FULL`
+    /// so a power loss cannot drop a committed step outcome and re-drive a
+    /// destructive step at the next boot. Under NORMAL, or a rollback
+    /// journal, every other test here still passes.
+    #[test]
+    fn a_file_store_runs_wal_with_synchronous_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PoolStore::open(&dir.path().join("pool.db")).unwrap();
+        let mode: String = store
+            .conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        // 2 is FULL; 1 NORMAL, 0 OFF, 3 EXTRA.
+        let sync: i64 = store
+            .conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "synchronous must be FULL");
+    }
 }
