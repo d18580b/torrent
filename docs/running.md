@@ -1559,7 +1559,9 @@ is part of the compose stack.
   Grafana, **Dashboards → New → Import** and upload it, or drop it into a
   provisioned dashboards directory. It asks for no datasource at import; pick
   the Prometheus one from its `Prometheus` selector. Five rows — Fleet, Disk,
-  Durability, VPN, Pool — each filtered by the `Instance` and `Profile` selectors.
+  Durability, VPN, Pool — every panel filtered by the `Instance` selector, and
+  every panel on a per-profile series by the `Profile` selector too; the
+  Pool row's series are all daemon-wide.
   The VPN row is empty for a `host` profile, and its port-forward panels are
   empty for any profile without NAT-PMP.
 
