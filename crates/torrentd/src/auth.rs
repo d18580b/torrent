@@ -535,21 +535,16 @@ impl LoginThrottle {
         }
     }
 
-    /// The same throttle with a shorter penalty, so a test can observe the
-    /// idle sweep without sleeping for the production window. The
-    /// daemon-wide budget is lifted out of the way: these tests drive the
-    /// per-client buckets and never run the KDF.
+    /// The same throttle with a shorter penalty, on a clock only
+    /// [`advance`](Self::advance) moves, so a test can observe the idle sweep
+    /// without sleeping for the window. The daemon-wide budget is lifted out
+    /// of the way: these tests drive the per-client buckets and never run the
+    /// KDF.
     #[cfg(test)]
     fn with_penalty(penalty: Duration) -> Self {
-        Self {
-            penalty,
-            kdf: Mutex::new(KdfBudget::new(
-                u32::MAX,
-                Duration::from_nanos(1),
-                Instant::now(),
-            )),
-            ..Self::new()
-        }
+        let t = Self::with_fake_clock();
+        *t.kdf.lock() = KdfBudget::new(u32::MAX, Duration::from_nanos(1), t.clock.now());
+        Self { penalty, ..t }
     }
 
     /// The same throttle with a daemon-wide budget a test can exhaust and
@@ -971,6 +966,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert!(!s.is_valid(&token));
         assert_eq!(s.len(), 0);
+        // `len` counts only live entries; the store itself is swept of the
+        // expired one when the next session is minted.
+        assert_eq!(s.inner.lock().len(), 1, "the expired entry is still held");
+        let (next, _) = s.create();
+        assert_eq!(s.inner.lock().len(), 1, "the expired entry was swept");
+        assert!(s.inner.lock().contains_key(&digest(&next)));
     }
 
     #[test]
@@ -1198,12 +1199,45 @@ mod tests {
     fn idle_entries_are_swept_for_a_newcomer_even_after_a_consult() {
         let t = LoginThrottle::with_penalty(Duration::from_millis(50));
         fill(&t, 1);
-        std::thread::sleep(Duration::from_millis(150));
+        // A moment short of the idle window every entry is still live, so a
+        // newcomer is turned to the shared bucket.
+        t.advance(Duration::from_millis(49));
+        t.note_failure(ip(1));
+        assert!(!t.per_client.lock().contains_key(&ip(1).unwrap()));
+        t.advance(Duration::from_millis(1));
         for n in 0..MAX_TRACKED_CLIENTS {
             assert!(t.retry_after(Some(filler(n))).is_none());
         }
-        t.note_failure(ip(1));
-        assert!(t.per_client.lock().contains_key(&ip(1).unwrap()));
+        t.note_failure(ip(2));
+        assert!(t.per_client.lock().contains_key(&ip(2).unwrap()));
+    }
+
+    /// A lockout lasts exactly the penalty, and its end clears the count with
+    /// the lock: the client gets a whole burst again, not one attempt before
+    /// the next lockout. Per client and in the shared bucket alike.
+    #[test]
+    fn a_lockout_lasts_the_penalty_and_its_end_restores_the_whole_burst() {
+        for client in [ip(1), None] {
+            let t = LoginThrottle::with_fake_clock();
+            for _ in 0..5 {
+                t.note_failure(client);
+            }
+            assert_eq!(t.retry_after(client), Some(Duration::from_secs(30)));
+            t.advance(Duration::from_secs(29));
+            assert_eq!(t.retry_after(client), Some(Duration::from_secs(1)));
+            t.advance(Duration::from_secs(1));
+            assert_eq!(t.retry_after(client), None, "{client:?}: the window ended");
+            for n in 1..5 {
+                t.note_failure(client);
+                assert_eq!(
+                    t.retry_after(client),
+                    None,
+                    "{client:?}: failure {n} of a fresh burst must not lock out",
+                );
+            }
+            t.note_failure(client);
+            assert_eq!(t.retry_after(client), Some(Duration::from_secs(30)));
+        }
     }
 
     /// A success keeps or gains the client a slot of its own, so a full map's
