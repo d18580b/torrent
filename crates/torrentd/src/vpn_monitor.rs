@@ -5468,4 +5468,130 @@ mod tests {
         });
         assert!(ran);
     }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn secs() -> impl Strategy<Value = Duration> {
+            (0u64..600).prop_map(Duration::from_secs)
+        }
+
+        fn address() -> impl Strategy<Value = Address> {
+            prop_oneof![
+                (0u8..3).prop_map(held),
+                Just(Address::Absent),
+                Just(Address::Unknown),
+            ]
+        }
+
+        fn route() -> impl Strategy<Value = Option<RouteProbe>> {
+            prop_oneof![
+                Just(None),
+                Just(Some(RouteProbe::ViaTunnel)),
+                Just(Some(RouteProbe::Elsewhere("eth0".to_owned()))),
+            ]
+        }
+
+        fn handshake() -> impl Strategy<Value = Handshake> {
+            prop_oneof![
+                Just(Handshake::NoSignal),
+                Just(Handshake::Never),
+                secs().prop_map(Handshake::Age),
+            ]
+        }
+
+        /// Every observation one poll can make, over a handful of addresses
+        /// so that held and expected addresses both match and differ.
+        fn observation() -> impl Strategy<Value = Observation> {
+            (
+                address(),
+                prop::option::of((0u8..3).prop_map(|a| ip(a).unwrap())),
+                route(),
+                handshake(),
+                secs(),
+            )
+                .prop_map(|(current, expected, route, handshake, unanswered_for)| {
+                    Observation {
+                        current,
+                        expected,
+                        route,
+                        handshake,
+                        unanswered_for,
+                    }
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            /// A handshake that has aged further, and gone unanswered for
+            /// longer, never turns a fence into a pass, and never changes
+            /// why it fenced.
+            #[test]
+            fn more_age_never_lifts_a_fence(
+                obs in observation(),
+                max in secs(),
+                older in secs(),
+                longer in secs(),
+            ) {
+                let aged = Observation {
+                    handshake: match obs.handshake {
+                        Handshake::Age(a) => Handshake::Age(a + older),
+                        other => other,
+                    },
+                    unanswered_for: obs.unanswered_for + longer,
+                    ..obs.clone()
+                };
+                if let Err(reason) = evaluate(&obs, max) {
+                    prop_assert_eq!(evaluate(&aged, max), Err(reason), "{:?} aged to {:?}", obs, aged);
+                }
+            }
+
+            /// An address the probe could not read never reads as a lost
+            /// one while the session has an address to hold: the verdict is
+            /// whatever the same poll with the address intact would give.
+            /// (With no bound address there is nothing it could be holding,
+            /// and that is `IpLostOrChanged` whatever the probe said.)
+            #[test]
+            fn an_unknown_address_is_never_a_lost_one(obs in observation(), max in secs()) {
+                if let Some(expected) = obs.expected {
+                    let unknown = Observation { current: Address::Unknown, ..obs.clone() };
+                    let intact = Observation { current: Address::Held(expected), ..obs };
+                    prop_assert_ne!(evaluate(&unknown, max), Err(DownReason::IpLostOrChanged));
+                    prop_assert_eq!(evaluate(&unknown, max), evaluate(&intact, max));
+                }
+            }
+
+            /// The address is judged before the route, and the route before
+            /// the handshake: a failing earlier check is the reason whatever
+            /// the later ones say, and a later one is reached only when every
+            /// earlier one passes.
+            #[test]
+            fn the_address_outranks_the_route_which_outranks_the_handshake(
+                obs in observation(),
+                max in secs(),
+            ) {
+                let address_ok = match (obs.current, obs.expected) {
+                    (Address::Held(c), Some(x)) => c == x,
+                    (Address::Unknown, Some(_)) => true,
+                    _ => false,
+                };
+                let route_ok = !matches!(obs.route, Some(RouteProbe::Elsewhere(_)));
+                let verdict = evaluate(&obs, max);
+                if !address_ok {
+                    prop_assert_eq!(verdict, Err(DownReason::IpLostOrChanged));
+                } else if !route_ok {
+                    prop_assert_eq!(verdict, Err(DownReason::RouteMismatch));
+                } else {
+                    let handshake_only = matches!(
+                        verdict,
+                        Ok(()) | Err(DownReason::HandshakeStale) | Err(DownReason::NoHandshake)
+                    );
+                    prop_assert!(handshake_only, "{:?} gave {:?}", obs, verdict);
+                }
+            }
+        }
+    }
 }

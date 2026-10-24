@@ -742,4 +742,89 @@ mod tests {
         // One bit past the mapped /96 is half of IPv4, not all of it.
         assert!(TrustedProxies::parse(&["::ffff:0:0/97".to_string()]).is_ok());
     }
+
+    mod props {
+        use std::net::Ipv4Addr;
+        use std::net::Ipv6Addr;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Any peer a listener can see: IPv4, IPv6, or IPv4 in its mapped
+        /// IPv6 spelling, biased toward the blocks the trust sets name.
+        fn peer() -> impl Strategy<Value = IpAddr> {
+            let v4 = prop_oneof![
+                any::<u32>().prop_map(Ipv4Addr::from),
+                any::<u32>().prop_map(|n| Ipv4Addr::from(0x0a00_0000 | (n & 0x00ff_ffff))),
+                Just(Ipv4Addr::UNSPECIFIED),
+            ];
+            prop_oneof![
+                v4.clone().prop_map(IpAddr::V4),
+                v4.prop_map(|a| IpAddr::V6(a.to_ipv6_mapped())),
+                any::<u128>().prop_map(|n| IpAddr::V6(Ipv6Addr::from(n))),
+                any::<u64>().prop_map(|n| IpAddr::V6(Ipv6Addr::from(
+                    (0x2001_0db8u128 << 96) | u128::from(n)
+                ))),
+                Just(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            ]
+        }
+
+        fn trust() -> impl Strategy<Value = Vec<String>> {
+            prop::sample::subsequence(
+                vec![
+                    "10.0.0.0/8",
+                    "192.168.1.0/24",
+                    "127.0.0.1",
+                    "2001:db8::/32",
+                    "::ffff:172.16.0.0/108",
+                ],
+                0..=5,
+            )
+            .prop_map(|v| v.into_iter().map(str::to_owned).collect())
+        }
+
+        /// Forwarding headers a client could send through, forged or not.
+        fn headers() -> impl Strategy<Value = Vec<(&'static str, String)>> {
+            let name =
+                prop::sample::select(vec!["x-forwarded-for", "forwarded", "x-forwarded-proto"]);
+            let value = prop_oneof![
+                prop::sample::select(vec![
+                    "203.0.113.9",
+                    "for=203.0.113.9;proto=https",
+                    "for=\"[2001:db8::9]:443\"",
+                    "https",
+                    "127.0.0.1, 10.0.0.1",
+                    "",
+                    "unknown",
+                ])
+                .prop_map(str::to_owned),
+                "[ -~]{0,24}",
+            ];
+            prop::collection::vec((name, value), 0..4)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            /// A peer that is not a trusted proxy is its own socket address,
+            /// over plain HTTP, whatever forwarding headers it sends.
+            #[test]
+            fn an_untrusted_peer_is_its_socket_address_whatever_its_headers(
+                peer in peer(),
+                trust in trust(),
+                headers in headers(),
+            ) {
+                let trusted = TrustedProxies::parse(&trust).unwrap();
+                let host = unmap(peer);
+                prop_assume!(trusted.is_empty() || host.is_unspecified() || !trusted.trusts(host));
+                let mut map = HeaderMap::new();
+                for (name, value) in &headers {
+                    map.append(*name, HeaderValue::from_str(value).unwrap());
+                }
+                let client = super::super::resolve(Some(SocketAddr::new(peer, 4242)), &map, &trusted);
+                prop_assert_eq!(client, Client { ip: Some(host), secure: false });
+            }
+        }
+    }
 }
