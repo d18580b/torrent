@@ -409,8 +409,12 @@ mod tests {
         .shutdown_deadline(Duration::from_secs(1))
         .spawn();
 
+        // The overflow handler tracks the lost adds before it counts the
+        // overflow, so a full map alone can be read in between: wait for
+        // both, or a slow runner fails the guard below with the work done.
+        let overflowed = || metrics.count_for("alert_queue_overflows_total") > 0;
         let deadline = Instant::now() + Duration::from_secs(20);
-        while state.len() < ADDS as usize && Instant::now() < deadline {
+        while !(state.len() == ADDS as usize && overflowed()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -545,8 +549,16 @@ mod tests {
                 })
             })
         };
+        // The overflow handler refreshes the statuses before it counts them
+        // and the overflow, so `settled` alone can hold in between: wait for
+        // the counters too, or a slow runner fails the guards below with the
+        // work done.
+        let counted = || {
+            metrics.count_for("alert_queue_overflows_total") > 0
+                && metrics.count_for("statuses_refreshed_total") >= u64::from(PAUSED)
+        };
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !settled() && Instant::now() < deadline {
+        while !(settled() && counted()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
