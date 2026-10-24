@@ -880,3 +880,163 @@ impl StateMap {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Torrents 0..4 are tracked, the even ones in profile `p` and the odd
+    /// ones in `q`; 4 and 5 are not tracked at all.
+    const TORRENTS: u8 = 6;
+
+    fn ih(n: u8) -> InfoHash {
+        InfoHash([n; 20])
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Queue(u8, bool),
+        QueueNow(u8),
+        Dispatch(usize),
+        Settle(u8),
+        Requeue(bool, bool),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        let t = 0..TORRENTS;
+        prop_oneof![
+            (t.clone(), any::<bool>()).prop_map(|(t, c)| Op::Queue(t, c)),
+            t.clone().prop_map(Op::QueueNow),
+            (0usize..4).prop_map(Op::Dispatch),
+            t.prop_map(Op::Settle),
+            (any::<bool>(), any::<bool>()).prop_map(|(p, c)| Op::Requeue(p, c)),
+        ]
+    }
+
+    fn flags(conditional: bool) -> ResumeFlags {
+        if conditional {
+            ResumeFlags::ONLY_IF_MODIFIED
+        } else {
+            ResumeFlags::empty()
+        }
+    }
+
+    /// What the queue must hold, kept independently of it: the saves wanted
+    /// and not yet settled, which of them are in flight, which changed while
+    /// in flight, and which must go out unconditional when next dispatched.
+    #[derive(Default)]
+    struct Model {
+        wanted: HashSet<u8>,
+        in_flight: HashSet<u8>,
+        again: HashSet<u8>,
+        unconditional: HashSet<u8>,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Under any sequence of requests, dispatches, settles and
+        /// re-queues: no save is lost or doubled (every one wanted is queued
+        /// or in flight, never both, and queued once); the dispatcher never
+        /// fills past its cap and leaves nothing queued while it has room;
+        /// a re-queue takes back only its own profile's saves (and those of
+        /// torrents no longer tracked); a save that must be unconditional is
+        /// never dispatched `ONLY_IF_MODIFIED`; and the pending count is the
+        /// number of saves wanted.
+        #[test]
+        fn the_resume_queue_keeps_its_invariants(ops in prop::collection::vec(op(), 0..60)) {
+            let map = StateMap::new();
+            let now = Instant::now();
+            for n in 0..4u8 {
+                let profile = ProfileId::new(if n % 2 == 0 { "p" } else { "q" });
+                map.insert(ih(n), TorrentState::newly_added(TorrentHandle { id: u64::from(n), infohash: ih(n) }, profile, now));
+            }
+            let mut m = Model::default();
+            for op in ops {
+                match op {
+                    Op::Queue(t, conditional) => {
+                        let fresh = !m.wanted.contains(&t);
+                        prop_assert_eq!(map.queue_resume_save(ih(t), flags(conditional)), fresh, "{:?}", op);
+                        if fresh {
+                            m.wanted.insert(t);
+                            if !conditional {
+                                m.unconditional.insert(t);
+                            }
+                        }
+                    }
+                    Op::QueueNow(t) => {
+                        map.queue_resume_save_now(ih(t));
+                        if m.in_flight.contains(&t) {
+                            m.again.insert(t);
+                        } else {
+                            m.wanted.insert(t);
+                            m.unconditional.insert(t);
+                        }
+                    }
+                    Op::Dispatch(cap) => {
+                        let room = cap.saturating_sub(m.in_flight.len());
+                        let queued = m.wanted.len() - m.in_flight.len();
+                        let out = map.dispatch_resume_saves(cap);
+                        prop_assert_eq!(out.len(), room.min(queued), "{:?}", op);
+                        for (h, f) in out {
+                            let t = h.0[0];
+                            prop_assert!(m.wanted.contains(&t) && !m.in_flight.contains(&t), "{} was not queued", t);
+                            if m.unconditional.remove(&t) {
+                                prop_assert_eq!(f, ResumeFlags::empty(), "{} downgraded", t);
+                            }
+                            m.in_flight.insert(t);
+                        }
+                    }
+                    Op::Settle(t) => {
+                        let was = m.in_flight.remove(&t);
+                        prop_assert_eq!(map.note_resume_settled(&ih(t)), was, "{:?}", op);
+                        if was {
+                            if m.again.remove(&t) {
+                                m.unconditional.insert(t);
+                            } else {
+                                m.wanted.remove(&t);
+                                m.unconditional.remove(&t);
+                            }
+                        }
+                    }
+                    Op::Requeue(p, conditional) => {
+                        let profile = ProfileId::new(if p { "p" } else { "q" });
+                        let ours: Vec<u8> = m
+                            .in_flight
+                            .iter()
+                            .copied()
+                            .filter(|&t| t >= 4 || (t % 2 == 0) == p)
+                            .collect();
+                        prop_assert_eq!(map.requeue_in_flight_resume_saves(&profile, flags(conditional)), ours.len(), "{:?}", op);
+                        for t in ours {
+                            m.in_flight.remove(&t);
+                            if m.again.remove(&t) || !conditional {
+                                m.unconditional.insert(t);
+                            }
+                        }
+                    }
+                }
+
+                let s = map.saves.lock();
+                let queued: Vec<u8> = s.queued.iter().map(|(h, _)| h.0[0]).collect();
+                let queued_set: HashSet<u8> = queued.iter().copied().collect();
+                prop_assert_eq!(queued.len(), queued_set.len(), "queued twice: {:?}", queued);
+                prop_assert_eq!(&s.queued_set.iter().map(|h| h.0[0]).collect::<HashSet<_>>(), &queued_set);
+                prop_assert_eq!(&queued_set, &m.wanted.difference(&m.in_flight).copied().collect::<HashSet<_>>());
+                prop_assert_eq!(&s.in_flight.keys().map(|h| h.0[0]).collect::<HashSet<_>>(), &m.in_flight);
+                prop_assert_eq!(&s.again.iter().map(|h| h.0[0]).collect::<HashSet<_>>(), &m.again);
+                prop_assert!(m.again.is_subset(&m.in_flight));
+                for (h, f) in &s.queued {
+                    if m.unconditional.contains(&h.0[0]) {
+                        prop_assert_eq!(*f, ResumeFlags::empty(), "{} queued downgraded", h.0[0]);
+                    }
+                }
+                drop(s);
+                prop_assert_eq!(map.pending_resume_count(), m.wanted.len() as u64);
+                prop_assert_eq!(map.resume_saves_in_flight(), m.in_flight.len());
+            }
+        }
+    }
+}

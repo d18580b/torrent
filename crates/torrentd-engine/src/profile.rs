@@ -127,3 +127,130 @@ pub use config::ProfileNetwork;
 pub use id::ProfileId;
 pub use id::ID_CHARSET_RULE;
 pub use validate::ProfileConfigError;
+
+#[cfg(test)]
+mod props {
+    use std::path::PathBuf;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::port_forward::PortForwardMode;
+    use crate::vpn::VpnType;
+
+    /// One fault a profile can carry, alone or against its neighbours.
+    #[derive(Clone, Copy, Debug)]
+    enum Flaw {
+        None,
+        BadId,
+        SameId,
+        SamePort,
+        SameInterface,
+        NoPort,
+        ConfigMismatch,
+        NoFingerprint,
+        NoTrackers,
+        EmptyListen,
+        HugeRateLimit,
+    }
+
+    /// The `i`th profile of a set: a valid vpn or host profile whose id,
+    /// port, interface and identity are its own, unless `flaw` says
+    /// otherwise.
+    fn profile(i: usize, vpn: bool, flaw: Flaw) -> ProfileConfig {
+        let id = match flaw {
+            Flaw::BadId => "bad id".to_owned(),
+            Flaw::SameId => "p0".to_owned(),
+            _ => format!("p{i}"),
+        };
+        let port = if matches!(flaw, Flaw::SamePort) {
+            6881
+        } else {
+            6881 + i as u16
+        };
+        let iface = if matches!(flaw, Flaw::SameInterface) {
+            "wg0".to_owned()
+        } else {
+            format!("wg{i}")
+        };
+        let network = if vpn {
+            ProfileNetwork::Vpn {
+                vpn_type: VpnType::Wireguard,
+                vpn_config: PathBuf::from(format!(
+                    "{}/{}.conf",
+                    ProfileConfig::WG_CONFIG_DIR,
+                    if matches!(flaw, Flaw::ConfigMismatch) {
+                        "other"
+                    } else {
+                        &iface
+                    },
+                )),
+                vpn_interface: iface,
+                listen_port: (!matches!(flaw, Flaw::NoPort)).then_some(port),
+                port_forward: PortForwardMode::Static,
+                port_forward_gateway: None,
+            }
+        } else {
+            ProfileNetwork::Host {
+                listen_interfaces: if matches!(flaw, Flaw::EmptyListen) {
+                    String::new()
+                } else {
+                    format!("eth0:{port}")
+                },
+                dht: i.is_multiple_of(2),
+            }
+        };
+        ProfileConfig {
+            id: ProfileId::new(id),
+            network,
+            peer_fingerprint: (vpn && !matches!(flaw, Flaw::NoFingerprint))
+                .then(|| format!("-A{}1000-", (b'A' + i as u8) as char)),
+            user_agent: vpn.then(|| format!("qBittorrent/5.0.{i}")),
+            resume_dir: None,
+            torrent_dir: None,
+            allowed_tracker_domains: if vpn && !matches!(flaw, Flaw::NoTrackers) {
+                vec![format!("tracker-{i}.example.com")]
+            } else {
+                vec![]
+            },
+            allowed_tracker_urls: vec![],
+            upload_rate_limit: matches!(flaw, Flaw::HugeRateLimit).then_some(u32::MAX),
+        }
+    }
+
+    fn set_and_shuffle() -> impl Strategy<Value = (Vec<ProfileConfig>, Vec<ProfileConfig>)> {
+        let flaw = prop_oneof![
+            20 => Just(Flaw::None),
+            1 => Just(Flaw::BadId),
+            1 => Just(Flaw::SameId),
+            1 => Just(Flaw::SamePort),
+            1 => Just(Flaw::SameInterface),
+            1 => Just(Flaw::NoPort),
+            1 => Just(Flaw::ConfigMismatch),
+            1 => Just(Flaw::NoFingerprint),
+            1 => Just(Flaw::NoTrackers),
+            1 => Just(Flaw::EmptyListen),
+            1 => Just(Flaw::HugeRateLimit),
+        ];
+        prop::collection::vec((any::<bool>(), flaw), 1..5).prop_flat_map(|spec| {
+            let set: Vec<ProfileConfig> = spec
+                .into_iter()
+                .enumerate()
+                .map(|(i, (vpn, flaw))| profile(i, vpn, flaw))
+                .collect();
+            (Just(set.clone()), Just(set).prop_shuffle())
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        /// Whether a set of profiles is accepted does not depend on the
+        /// order the `[[profile]]` tables were written in.
+        #[test]
+        fn validate_set_is_order_independent((set, shuffled) in set_and_shuffle()) {
+            let (a, b) = (ProfileConfig::validate_set(&set), ProfileConfig::validate_set(&shuffled));
+            prop_assert_eq!(a.is_ok(), b.is_ok(), "{:?} vs {:?}", a, b);
+        }
+    }
+}
