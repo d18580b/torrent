@@ -65,8 +65,12 @@ runs:
       run: git submodule update --init --depth 1 vendor/libtorrent
 
     # Makes the hit/miss visible in the job log: four jobs printing identical
-    # stamps is the proof they share one prefix.
+    # stamps is the proof they share one prefix. The path reaches the script
+    # through the environment, never pasted into it, so no input value can
+    # become shell syntax.
     - shell: bash
+      env:
+        NATIVE_PATH: ${{ inputs.path }}
       run: |
-        cat "${{ inputs.path }}"/*/.stamp 2>/dev/null \
+        cat "$NATIVE_PATH"/*/.stamp 2>/dev/null \
           || echo "no native prefix restored; build.rs will provision one"

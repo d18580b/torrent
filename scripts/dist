@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Package an already-built release binary set as a release tarball, after
+# checking that what is packaged is what a release may ship.
+#
+#   scripts/dist gnu    # torrentd + torrentctl, x86_64-unknown-linux-gnu
+#   scripts/dist musl   # static torrentctl, x86_64-unknown-linux-musl
+#
+# Run as `mise run dist` or `mise run dist-musl`, which build the binaries
+# first; .github/workflows/release-plz.yml calls the same tasks. The tarball
+# lands in target/dist/ and its name is printed on stdout, last.
+#
+# Refuses, and exits 1, when:
+#   - a binary's `--version` is not the workspace version (torrentd's, which
+#     release-plz moves for every member at once);
+#   - RELEASE_TAG is set and is not `v` followed by that version, so a tag
+#     cannot ship binaries built from another version;
+#   - (gnu) `torrentd openapi` from the built binary differs from the
+#     committed docs/api/openapi.json. A `fault-injection` build adds
+#     `POST /v1/faults` to that document, so this is the shipped binary
+#     itself proving the feature is off, beside `mise run release-features`'
+#     check of the feature set the build resolves;
+#   - (musl) torrentctl is not statically linked.
+#
+# The archive is reproducible from the commit: entries sorted, owned by
+# 0:0, and stamped with the commit's time (SOURCE_DATE_EPOCH when set).
+set -euo pipefail
+
+usage() {
+  echo "usage: scripts/dist gnu|musl" >&2
+  exit 2
+}
+[ $# -eq 1 ] || usage
+flavour=$1
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+version=$(cargo metadata --format-version 1 --no-deps --locked \
+  | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "torrentd"))')
+if [ -n "${RELEASE_TAG:-}" ] && [ "$RELEASE_TAG" != "v$version" ]; then
+  echo "::error::RELEASE_TAG is $RELEASE_TAG, but the workspace version is $version"
+  exit 1
+fi
+
+# `<name> <version>` is what clap's `version` prints for both binaries.
+check_version() {
+  local bin=$1 name=$2 got
+  got=$("$bin" --version)
+  if [ "$got" != "$name $version" ]; then
+    echo "::error::$bin --version printed '$got', expected '$name $version'"
+    exit 1
+  fi
+  echo "$got"
+}
+
+case "$flavour" in
+  gnu)
+    triple=x86_64-unknown-linux-gnu
+    bindir=target/release
+    name=torrent-$version-$triple
+    check_version "$bindir/torrentd" torrentd
+    check_version "$bindir/torrentctl" torrentctl
+    mkdir -p target/dist
+    "$bindir/torrentd" openapi --out target/dist/openapi.json
+    if ! cmp -s target/dist/openapi.json docs/api/openapi.json; then
+      echo "::error::$bindir/torrentd serves a different OpenAPI document from docs/api/openapi.json; a fault-injection build, or a stale document"
+      exit 1
+    fi
+    files=(
+      "$bindir/torrentd"
+      "$bindir/torrentctl"
+      deploy/torrentd.sample.toml
+      deploy/torrentd.multi-account.sample.toml
+      deploy/torrentd.service
+      LICENSE
+      README.md
+      CHANGELOG.md
+    )
+    ;;
+  musl)
+    triple=x86_64-unknown-linux-musl
+    bindir=target/$triple/release
+    name=torrentctl-$version-$triple
+    check_version "$bindir/torrentctl" torrentctl
+    # A static-pie binary still has a dynamic section, so `file` and `ldd`
+    # disagree on what to call it; an ELF interpreter is the one thing a
+    # binary that needs a dynamic loader always carries.
+    if readelf --program-headers "$bindir/torrentctl" | grep -q INTERP; then
+      echo "::error::$bindir/torrentctl requests a dynamic loader; it is not static"
+      exit 1
+    fi
+    files=(
+      "$bindir/torrentctl"
+      LICENSE
+      README.md
+      CHANGELOG.md
+    )
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+out=target/dist
+stage=$out/$name
+rm -rf "$stage" "$out/$name.tar.gz"
+mkdir -p "$stage"
+# The binaries keep cargo's 0755 and the rest git's 0644; only the owner and
+# the time are normalised, below.
+for f in "${files[@]}"; do
+  cp -p "$f" "$stage/"
+done
+
+epoch=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
+tar --sort=name --owner=0 --group=0 --numeric-owner \
+  --mtime="@$epoch" --format=gnu \
+  -C "$out" -cf - "$name" \
+  | gzip -n -9 > "$out/$name.tar.gz"
+rm -rf "$stage"
+echo "$out/$name.tar.gz"

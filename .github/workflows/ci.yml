@@ -159,6 +159,20 @@ jobs:
           toolchain: ''
       - run: mise run lint-tracing
 
+  workflow-lint:
+    name: workflow lint (actionlint + zizmor)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # Reads .github/ only; mise provides both linters and shellcheck.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - run: mise run lint-workflows
+
   size-check:
     name: file-length gate
     runs-on: ubuntu-24.04
