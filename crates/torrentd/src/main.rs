@@ -21,6 +21,7 @@ compile_error!(
 
 mod api_socket;
 mod app_state;
+mod apply;
 mod auth;
 mod check_queue;
 mod cli;
@@ -28,12 +29,13 @@ mod config;
 mod fence;
 mod http;
 mod instance_lock;
+mod live_torrent;
 mod metrics_sink;
 mod net_cmd;
 mod pacing;
-mod pool_apply;
 mod pool_cmd;
 mod pool_service;
+mod pool_trash;
 mod port_forward_monitor;
 mod profile_registry;
 mod profile_state;
