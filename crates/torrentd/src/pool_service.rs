@@ -867,6 +867,106 @@ impl PoolService {
         })
     }
 
+    /// Stat every file a matched or adopted torrent claims, marking each
+    /// torrent with a changed or vanished file `drifted`
+    /// ([`torrentd_pool::drift::detect`]). On the writer: it waits out a scan.
+    pub fn drift_check(
+        &self,
+    ) -> Result<torrentd_pool::drift::DriftReport, torrentd_pool::PoolError> {
+        self.with_store_mut(|st| torrentd_pool::drift::detect(st, |id| self.root_path_of(id)))
+    }
+
+    /// What adopting the subtree `path` of root `root_id` would do to each
+    /// torrent under it ([`torrentd_pool::adopt::preview`]), read on the writer.
+    pub fn adopt_preview(
+        &self,
+        root_id: i64,
+        path: &str,
+    ) -> Result<torrentd_pool::AdoptPreview, torrentd_pool::PoolError> {
+        self.with_store(|st| {
+            torrentd_pool::adopt::preview(st, root_id, path, |id| self.root_path_of(id))
+        })
+    }
+
+    /// What adopting `infohash` would do ([`torrentd_pool::adopt::plan`]),
+    /// read on the writer.
+    pub fn adopt_plan(&self, infohash: &str) -> Result<AdoptPlan, torrentd_pool::PoolError> {
+        self.with_store(|st| torrentd_pool::adopt::plan(st, infohash, |id| self.root_path_of(id)))
+    }
+
+    /// Adopt `infohash` into `profile`: [`execute_adopt`] on this pool.
+    pub fn adopt(
+        &self,
+        source: &Arc<dyn AlertSource>,
+        profiles: &crate::profile_registry::ProfileRegistry,
+        infohash: &str,
+        profile: ProfileId,
+        dry_run: bool,
+    ) -> Result<Adopted, AdoptRefusal> {
+        execute_adopt(self, source, profiles, infohash, profile, dry_run)
+    }
+
+    /// The profile the pool index names as `infohash`'s owner, read on the
+    /// writer.
+    pub fn index_owner(&self, infohash: &str) -> Result<Option<String>, torrentd_pool::PoolError> {
+        self.with_store(|st| st.profile_of(infohash))
+    }
+
+    /// `infohash`'s total payload size in the index, read on the writer; 0
+    /// where the index holds no such torrent or cannot be read.
+    pub fn total_size(&self, infohash: &str) -> u64 {
+        self.with_store(|st| st.torrent(infohash).ok().flatten().map(|t| t.total_size))
+            .unwrap_or(0)
+    }
+
+    /// Build a plan for `spec` and record it, with its steps, as a draft;
+    /// nothing is applied. Returns its id, or the planner's refusal (overlap,
+    /// drift, an occupied destination) as `Ok(Err(_))`.
+    ///
+    /// The index checks run on the writer, which a scan holds; the disk
+    /// checks, a relocate's walk of its whole source directory among them,
+    /// once it is released.
+    pub fn create_plan(
+        &self,
+        spec: &torrentd_pool::PlanSpec,
+    ) -> anyhow::Result<Result<i64, torrentd_pool::plan::Refused>> {
+        let built = self
+            .with_store(|st| torrentd_pool::plan::prepare(st, spec, |id| self.root_path_of(id)))?
+            .and_then(torrentd_pool::plan::Prepared::finish);
+        let steps = match built {
+            Ok(steps) => steps,
+            Err(refused) => return Ok(Err(refused)),
+        };
+        let spec_json = serde_json::to_string(spec)?;
+        let id = self.with_store(|st| st.create_plan(spec.kind(), &spec_json, now_secs()))?;
+        self.with_store_mut(|st| st.add_plan_steps(id, &steps))?;
+        Ok(Ok(id))
+    }
+
+    /// Discard plan `id` in one conditional statement on the writer, so the
+    /// status that refuses a plan mid-apply is the one the delete acts on.
+    pub fn discard_plan(
+        &self,
+        id: i64,
+    ) -> Result<torrentd_pool::store::PlanDelete, torrentd_pool::PoolError> {
+        self.with_store_mut(|st| st.delete_plan(id))
+    }
+
+    /// The `confirm_token` applying plan `id` takes
+    /// ([`torrentd_pool::plan::confirm_token`]).
+    ///
+    /// Read on the writer, not the reader: during a scan the reader still
+    /// shows the previous index generation, so a token read there would match
+    /// and the plan would then run on the rescanned index. The writer waits
+    /// for the scan to commit and answers with the generation the executor
+    /// will see.
+    pub fn confirm_token(&self, id: i64) -> Result<String, torrentd_pool::PoolError> {
+        let (steps, generation) = self.with_store(|st| -> Result<_, torrentd_pool::PoolError> {
+            Ok((st.plan_steps(id)?, st.index_generation()?))
+        })?;
+        Ok(torrentd_pool::plan::confirm_token(id, generation, &steps))
+    }
+
     pub fn verify_queue(&self) -> &VerifyQueue {
         &self.verify
     }
@@ -1155,7 +1255,7 @@ pub(crate) fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
 /// index's info-hash, or the session rejects its add, the torrent is verified
 /// from its `.torrent` instead, unless the previous client renamed its files.
 /// The [`Adopted`] returned names the path actually taken, fallbacks included.
-pub fn execute_adopt(
+fn execute_adopt(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     profiles: &crate::profile_registry::ProfileRegistry,
@@ -1163,9 +1263,7 @@ pub fn execute_adopt(
     profile: ProfileId,
     dry_run: bool,
 ) -> Result<Adopted, AdoptRefusal> {
-    let plan = pool
-        .with_store(|s| torrentd_pool::adopt::plan(s, infohash, |id| pool.root_path_of(id)))
-        .map_err(|e| e.to_string())?;
+    let plan = pool.adopt_plan(infohash).map_err(|e| e.to_string())?;
 
     match plan {
         AdoptPlan::Refuse { reason } => Err(reason.to_string().into()),
@@ -1447,6 +1545,8 @@ pub(crate) fn enqueue_verify(
     Ok(Adopted::QueuedForVerification)
 }
 
+/// The wall clock in whole seconds since the Unix epoch, as the pool index
+/// records times; 0 for a clock set before it.
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
