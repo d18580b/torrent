@@ -4027,4 +4027,228 @@ library_dir = "{d}/library"
             "a changed connections_limit must still be applied",
         );
     }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// `key = value`, or nothing, with the value drawn from `values`:
+        /// sane settings beside the edges (zero, the type's maximum, empty,
+        /// relative, overlapping) a hand-edited file can hold. Every value
+        /// deserializes, so what varies is what `validate` is handed.
+        fn line(key: &'static str, values: &[&'static str]) -> impl Strategy<Value = String> {
+            prop::option::weighted(0.3, pick(key, values)).prop_map(Option::unwrap_or_default)
+        }
+
+        /// `key = value`, always present.
+        fn pick(key: &'static str, values: &[&'static str]) -> impl Strategy<Value = String> {
+            prop::sample::select(values.to_vec()).prop_map(move |v| format!("{key} = {v}\n"))
+        }
+
+        fn top_level() -> impl Strategy<Value = String> {
+            let path = &[
+                "\"/data/torrents\"",
+                "\"\"",
+                "\"relative/dir\"",
+                "\"/\"",
+                "\"/data/torrents/sub\"",
+            ];
+            let count = &["0", "1", "10000", "4294967295"];
+            let secs = &["0", "180", "9223372036854775807"];
+            (
+                (
+                    pick("default_save_path", path),
+                    pick("resume_dir", path),
+                    pick("torrent_dir", path),
+                    line(
+                        "http_listen",
+                        &[
+                            "\"127.0.0.1:8080\"",
+                            "\"0.0.0.0:8080\"",
+                            "\"[::1]:0\"",
+                            "\"unix:/run/t.sock\"",
+                        ],
+                    ),
+                    line("http_socket_mode", &["0", "432", "511", "4095", "65535"]),
+                    line("http_socket_group", &["\"torrentd\"", "\"\"", "\" \""]),
+                    line(
+                        "trusted_proxies",
+                        &[
+                            "[]",
+                            "[\"10.0.0.0/8\"]",
+                            "[\"0.0.0.0/0\"]",
+                            "[\"bogus\"]",
+                            "[\"::ffff:0:0/96\"]",
+                        ],
+                    ),
+                    pick("allow_unauthenticated", &["true", "true", "false"]),
+                ),
+                (
+                    line("allowed_hosts", &["[]", "[\"example.org\"]", "[\"\"]"]),
+                    line("log_level", &["\"info\"", "\"debug\"", "\"error\""]),
+                    line("registry_path", path),
+                    line("connections_limit", count),
+                    line("aio_threads", count),
+                    line("upload_rate_limit", count),
+                    line("enable_lsd", &["true", "false"]),
+                    line(
+                        "peer_fingerprint",
+                        &["\"-ZZ1000-\"", "\"-ZZ1000-\"", "\"\"", "\"-XX\""],
+                    ),
+                ),
+                (
+                    line("vpn_handshake_max_age_secs", secs),
+                    line("shutdown_drain_secs", secs),
+                    line("network_kill_switch", &["true", "false"]),
+                ),
+            )
+                .prop_map(|(a, b, c)| {
+                    [
+                        a.0, a.1, a.2, a.3, a.4, a.5, a.6, a.7, b.0, b.1, b.2, b.3, b.4, b.5, b.6,
+                        b.7, c.0, c.1, c.2,
+                    ]
+                    .concat()
+                })
+        }
+
+        /// One fault a profile table can carry, or none.
+        #[derive(Clone, Copy, Debug)]
+        enum Flaw {
+            None,
+            EmptyListen,
+            EmptyInterface,
+            NoFingerprint,
+            SameId,
+            SamePort,
+            OwnDirsUnderSave,
+        }
+
+        /// The `i`th profile table: a well-formed host or vpn profile whose
+        /// id and port are its own, unless `flaw` says otherwise.
+        fn profile_table(i: usize, vpn: bool, flaw: Flaw) -> String {
+            let id = if matches!(flaw, Flaw::SameId) {
+                "p0".to_owned()
+            } else {
+                format!("p{i}")
+            };
+            let port = if matches!(flaw, Flaw::SamePort) {
+                6881
+            } else {
+                6881 + i
+            };
+            let mut t = format!("[[profile]]\nid = \"{id}\"\n");
+            if vpn {
+                let iface = if matches!(flaw, Flaw::EmptyInterface) {
+                    String::new()
+                } else {
+                    format!("wg{i}")
+                };
+                t += &format!(
+                    "network = \"vpn\"\nvpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg{i}.conf\"\n\
+                     vpn_interface = \"{iface}\"\nlisten_port = {port}\nuser_agent = \"qBittorrent/5.0.{i}\"\n\
+                     allowed_tracker_domains = [\"t{i}.example\"]\n"
+                );
+                if !matches!(flaw, Flaw::NoFingerprint) {
+                    t += &format!("peer_fingerprint = \"-AA100{i}-\"\n");
+                }
+            } else {
+                let listen = if matches!(flaw, Flaw::EmptyListen) {
+                    String::new()
+                } else {
+                    format!("eth0:{port}")
+                };
+                t += &format!("network = \"host\"\nlisten_interfaces = \"{listen}\"\n");
+            }
+            if matches!(flaw, Flaw::OwnDirsUnderSave) {
+                t += "resume_dir = \"/data/torrents\"\n";
+            }
+            t + "\n"
+        }
+
+        fn profiles() -> impl Strategy<Value = String> {
+            let flaw = prop_oneof![
+                12 => Just(Flaw::None),
+                1 => Just(Flaw::EmptyListen),
+                1 => Just(Flaw::EmptyInterface),
+                1 => Just(Flaw::NoFingerprint),
+                1 => Just(Flaw::SameId),
+                1 => Just(Flaw::SamePort),
+                1 => Just(Flaw::OwnDirsUnderSave),
+            ];
+            prop::collection::vec((any::<bool>(), flaw), 1..4).prop_map(|ps| {
+                ps.into_iter()
+                    .enumerate()
+                    .map(|(i, (vpn, flaw))| profile_table(i, vpn, flaw))
+                    .collect()
+            })
+        }
+
+        fn tables() -> impl Strategy<Value = String> {
+            let pool = prop::sample::select(vec![
+                "",
+                "",
+                "",
+                "[pool]\nroots = []\nlibrary_dir = \"/var/lib/torrentd/library\"\n",
+                "[pool]\nroots = [\"/data/torrents\"]\nlibrary_dir = \"/var/lib/torrentd/library\"\n",
+                "[pool]\nroots = [\"/data\", \"/data/torrents\"]\nlibrary_dir = \"/data/torrents/library\"\n",
+                "[pool]\nroots = [\"rel\"]\nlibrary_dir = \"\"\n",
+            ]);
+            let auth = prop::sample::select(vec![
+                "",
+                "",
+                "",
+                "[auth]\npassword_hash = \"not-a-phc-string\"\n",
+                "[auth]\npassword_hash = \"\"\nsession_ttl_secs = 0\n",
+            ]);
+            (pool, auth).prop_map(|(pool, auth)| format!("{pool}\n{auth}"))
+        }
+
+        /// A config file as an operator might write one: some keys, some
+        /// profiles, maybe a pool and an auth table, many of them wrong.
+        fn document() -> impl Strategy<Value = String> {
+            (top_level(), profiles(), tables())
+                .prop_map(|(top, profiles, tables)| format!("{top}\n{profiles}\n{tables}"))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// A parsed config validates without panicking, either way, and
+            /// diffs against itself as no change at all.
+            #[test]
+            fn a_parsed_config_validates_without_panic_and_diffs_empty_against_itself(doc in document()) {
+                let cfg = toml::from_str::<Config>(&doc);
+                prop_assert!(cfg.is_ok(), "the generator's document did not parse: {:?}\n{}", cfg, doc);
+                let cfg = cfg.unwrap();
+                let _ = cfg.validate();
+                let _ = cfg.validate_without_auth_posture();
+                let d = Config::diff(&cfg, &cfg.clone());
+                prop_assert!(d.is_empty(), "{:?} for\n{}", d, doc);
+                prop_assert!(d.reloadable_deletions.is_empty());
+            }
+
+            /// A damaged file (cut short, or with a stray line spliced in)
+            /// neither panics the parser nor, where it still parses, the
+            /// validator.
+            #[test]
+            fn a_damaged_file_never_panics_parse_or_validate(
+                doc in document(),
+                cut in any::<prop::sample::Index>(),
+                at in any::<prop::sample::Index>(),
+                stray in "[ -~]{0,40}",
+            ) {
+                let ends: Vec<usize> = doc.char_indices().map(|(i, _)| i).chain([doc.len()]).collect();
+                let short = &doc[..*cut.get(&ends)];
+                let mut lines: Vec<&str> = doc.lines().collect();
+                lines.insert(at.index(lines.len() + 1), &stray);
+                for damaged in [short.to_owned(), lines.join("\n")] {
+                    if let Ok(cfg) = toml::from_str::<Config>(&damaged) {
+                        let _ = cfg.validate();
+                        prop_assert!(Config::diff(&cfg, &cfg).is_empty());
+                    }
+                }
+            }
+        }
+    }
 }

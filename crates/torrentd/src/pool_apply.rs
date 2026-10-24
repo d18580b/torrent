@@ -5706,4 +5706,177 @@ mod tests {
         assert!(delete_file(&pool, &f, 1, "1-0", &mut Default::default()).is_err());
         assert!(outside.join("victim.bin").exists());
     }
+
+    mod props {
+        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Every regular file under `dir`, root-relative, with its length.
+        fn files_under(dir: &Path, base: &Path, out: &mut BTreeMap<String, u64>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    files_under(&path, base, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    out.insert(rel, entry.metadata().unwrap().len());
+                }
+            }
+        }
+
+        /// The pool's files outside the trash, and the trash's files by
+        /// their root-relative path before they were trashed.
+        fn disk(root: &Path) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+            let mut all = BTreeMap::new();
+            files_under(root, root, &mut all);
+            let trash_prefix = format!("{}/", torrentd_pool::plan::TRASH_DIR);
+            let (trashed, live): (BTreeMap<_, _>, BTreeMap<_, _>) = all
+                .into_iter()
+                .partition(|(rel, _)| rel.starts_with(&trash_prefix));
+            let trashed = trashed
+                .into_iter()
+                .map(|(rel, len)| {
+                    // `.torrentd-trash/<bucket>/<original rel>`
+                    let rest = &rel[trash_prefix.len()..];
+                    (rest.split_once('/').unwrap().1.to_owned(), len)
+                })
+                .collect();
+            (live, trashed)
+        }
+
+        fn rescan(pool: &PoolService, root: &Path) {
+            pool.with_store_mut(|st| {
+                torrentd_pool::scan_root(st, root).unwrap();
+                torrentd_pool::match_all(st).unwrap();
+            });
+        }
+
+        /// A torrent `T<i>` with files of its own sizes, any of which may be
+        /// missing from disk, and loose files beside and among them, some the
+        /// size of a torrent's file.
+        #[allow(clippy::type_complexity)]
+        fn pool_layout() -> impl Strategy<Value = (Vec<Vec<bool>>, Vec<(String, u64)>, &'static str)>
+        {
+            (
+                prop::collection::vec(prop::collection::vec(prop::bool::weighted(0.9), 1..4), 0..3),
+                prop::collection::vec(
+                    (
+                        prop::sample::select(vec!["junk", "loose", "junk/deep", "T0", "T1/sub"]),
+                        "[a-c]{1,3}\\.bin",
+                        prop::sample::select(vec![7u64, 64, 1000, 4321]),
+                    )
+                        .prop_map(|(dir, name, size)| (format!("{dir}/{name}"), size)),
+                    0..7,
+                ),
+                prop::sample::select(vec!["", "junk", "loose", "T0", "junk/deep"]),
+            )
+        }
+
+        /// A torrent's `j`th file: its path and a size no loose file has,
+        /// except 1000, which the first file of `T1` shares with them.
+        fn torrent_file(i: usize, j: usize) -> (String, u64) {
+            let size = if (i, j) == (1, 0) {
+                1000
+            } else {
+                100 + 10 * i as u64 + j as u64
+            };
+            (format!("T{i}/f{j}.bin"), size)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// A delete plan that builds deletes exactly its steps, all of
+            /// them orphans under its prefix: each lands in the trash with
+            /// its length, no other file moves, and the orphans after a
+            /// rescan are those before less the ones deleted. Planning the
+            /// same delete again after that rescan has nothing to delete.
+            #[test]
+            fn a_delete_plan_conserves_orphans_and_planning_it_again_is_empty(
+                (torrents, loose, prefix) in pool_layout(),
+            ) {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join("pool");
+                std::fs::create_dir_all(&root).unwrap();
+                for (i, present) in torrents.iter().enumerate() {
+                    for (j, here) in present.iter().enumerate() {
+                        if *here {
+                            let (rel, size) = torrent_file(i, j);
+                            write(&root, &rel, size as usize);
+                        }
+                    }
+                }
+                for (rel, size) in &loose {
+                    if !root.join(rel).exists() {
+                        write(&root, rel, *size as usize);
+                    }
+                }
+
+                let pool = service(dir.path(), true);
+                pool.scan().unwrap();
+                for (i, present) in torrents.iter().enumerate() {
+                    let files: Vec<(String, u64)> = (0..present.len()).map(|j| torrent_file(i, j)).collect();
+                    let files: Vec<(&str, u64)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+                    add_and_rematch(&pool, &format!("{i:02x}"), &format!("T{i}"), None, &files);
+                }
+                let root_id = pool.roots()[0].0;
+                let spec = torrentd_pool::plan::PlanSpec::DeleteOrphans { root_id, prefix: prefix.to_owned() };
+                let build = || {
+                    pool.with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
+                        .unwrap()
+                };
+                let Ok(steps) = build() else {
+                    // Refused: nothing to delete, or a guard. Nothing to apply.
+                    return Ok(());
+                };
+                let orphans_before: BTreeSet<String> =
+                    pool.with_store(|st| st.orphan_files(root_id, prefix)).unwrap().into_iter().collect();
+                let claimed: BTreeSet<String> = (0..torrents.len())
+                    .flat_map(|i| pool.with_store(|st| st.claims_of(&format!("{i:02x}"))).unwrap())
+                    .map(|(_, rel)| rel)
+                    .collect();
+                let deleted: BTreeSet<String> = steps
+                    .iter()
+                    .map(|s| Path::new(&s.src).strip_prefix(&root).unwrap().to_string_lossy().into_owned())
+                    .collect();
+                prop_assert_eq!(deleted.len(), steps.len(), "a file is deleted twice: {:?}", steps);
+                prop_assert!(deleted.is_subset(&orphans_before), "{:?} not all orphans of {:?}", deleted, orphans_before);
+                prop_assert!(deleted.is_disjoint(&claimed), "{:?} deletes a claimed file of {:?}", deleted, claimed);
+
+                let (live_before, trash_before) = disk(&root);
+                prop_assert!(trash_before.is_empty());
+                let plan_id = pool.with_store(|st| st.create_plan("delete_orphans", "{}", 0)).unwrap();
+                pool.with_store_mut(|st| st.add_plan_steps(plan_id, &steps)).unwrap();
+                let (source, state) = engine_and_state();
+                let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+                prop_assert_eq!((out.done, out.status.as_str()), (steps.len(), "applied"), "{:?}", out);
+
+                let (live_after, trashed) = disk(&root);
+                let expect_trashed: BTreeMap<String, u64> =
+                    live_before.iter().filter(|(rel, _)| deleted.contains(*rel)).map(|(r, l)| (r.clone(), *l)).collect();
+                let expect_live: BTreeMap<String, u64> =
+                    live_before.into_iter().filter(|(rel, _)| !deleted.contains(rel)).collect();
+                prop_assert_eq!(trashed, expect_trashed);
+                prop_assert_eq!(live_after, expect_live);
+
+                rescan(&pool, &root);
+                let orphans_after: BTreeSet<String> =
+                    pool.with_store(|st| st.orphan_files(root_id, prefix)).unwrap().into_iter().collect();
+                prop_assert_eq!(&orphans_after, &orphans_before.difference(&deleted).cloned().collect::<BTreeSet<_>>());
+                match build() {
+                    Ok(again) => prop_assert!(again.is_empty(), "re-planned {:?}", again),
+                    Err(refused) => prop_assert!(refused.0.contains("no unclaimed file"), "{}", refused),
+                }
+            }
+        }
+    }
 }

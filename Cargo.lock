@@ -3604,6 +3604,7 @@ dependencies = [
  "libc",
  "libtorrent-safe",
  "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "sha1",
