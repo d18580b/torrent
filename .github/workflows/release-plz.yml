@@ -82,6 +82,12 @@ jobs:
       # release-plz reads `cargo metadata`, so it needs cargo; mise provides
       # release-plz at the version mise.toml pins.
       - uses: ./.github/actions/setup-rust
+      # Tags and releases go through the API, but release-plz works in a
+      # scratch copy of the repository on the way, where git wants an
+      # identity for anything it records.
+      - run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
       - id: release
         env:
           GITHUB_TOKEN: ${{ github.token }}
