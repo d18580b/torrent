@@ -16,6 +16,8 @@ path = "src/main.rs"
 clap = { workspace = true }
 # budgets.toml, compiled in.
 serde = { workspace = true }
+# `pool-adopt` reads the daemon's JSON responses.
+serde_json = { workspace = true }
 toml = { workspace = true }
 # The synthetic pool is built in a temporary directory removed afterwards.
 tempfile = { workspace = true }

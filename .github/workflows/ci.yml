@@ -327,6 +327,7 @@ jobs:
       - run: mise run bench -- pool-scan --size ci
       - run: mise run bench -- pool-match --size ci
       - run: mise run bench -- pool-adopt-preview --size ci
+      - run: mise run bench -- pool-adopt --size ci
 
   vpn-netns:
     name: VPN in a real kernel (netns)

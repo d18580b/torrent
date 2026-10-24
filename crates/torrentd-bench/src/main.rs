@@ -26,6 +26,11 @@
 //!     `.fastresume`), then time, with its peak RSS, the first scan of the
 //!     root and the library, the match over that index, or an adopt preview
 //!     of the whole root.
+//!   - `pool-adopt`: build the same pool, start the release `torrentd` beside
+//!     this binary on it (one host profile, real libtorrent), scan, and time
+//!     `POST /v1/pool/adoptions` of every torrent in batches of `--batch`:
+//!     the per-torrent cost and import rate an operator adopting a library
+//!     sees, the fast path's adds and the verify path's enqueues both.
 //!
 //! Run as `mise run bench -- <subcommand>`, e.g. `mise run bench -- pool-scan
 //! --size ci`.
@@ -93,6 +98,22 @@ enum Cmd {
     PoolMatch(PoolArgs),
     /// An adopt preview over a synthetic pool's whole matched root.
     PoolAdoptPreview(PoolArgs),
+    /// `POST /v1/pool/adoptions` of every torrent of a synthetic pool,
+    /// through a running release `torrentd`.
+    PoolAdopt(AdoptArgs),
+}
+
+#[derive(clap::Args)]
+struct AdoptArgs {
+    #[command(flatten)]
+    pool: PoolArgs,
+    /// Infohashes per request: 1 to 1000, the API's own bounds.
+    #[arg(long, default_value_t = 1_000)]
+    batch: usize,
+    /// The `torrentd` binary to run. The one beside this binary where unset,
+    /// which `mise run bench` builds in release first.
+    #[arg(long)]
+    torrentd: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -118,6 +139,7 @@ fn main() -> ExitCode {
         Cmd::PoolScan(args) => pool_bench(Phase::Scan, &args, &budgets),
         Cmd::PoolMatch(args) => pool_bench(Phase::Match, &args, &budgets),
         Cmd::PoolAdoptPreview(args) => pool_bench(Phase::AdoptPreview, &args, &budgets),
+        Cmd::PoolAdopt(args) => adopt_bench(&args, &budgets),
     };
     if verdict.0.is_empty() {
         return ExitCode::SUCCESS;
@@ -140,6 +162,14 @@ struct Budgets {
     pool_scan: BTreeMap<String, PhaseBudget>,
     pool_match: BTreeMap<String, PhaseBudget>,
     pool_adopt_preview: BTreeMap<String, PhaseBudget>,
+    pool_adopt: BTreeMap<String, AdoptBudget>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptBudget {
+    /// Wall milliseconds per adopted torrent, over every request.
+    max_ms_per_torrent: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -579,9 +609,15 @@ fn pool_torrent(name: &str, files: &[(String, u64)]) -> Vec<u8> {
     out
 }
 
-/// A `.fastresume` whose `pieces` bitfield marks all `pieces` had.
-fn complete_fastresume(pieces: u64) -> Vec<u8> {
-    let mut out = format!("d6:pieces{pieces}:").into_bytes();
+/// A `.fastresume` for the torrent keyed `ih` whose `pieces` bitfield marks
+/// all `pieces` had: libtorrent resume data the daemon's fast path adds as
+/// it stands, as it would a qBittorrent sidecar.
+fn complete_fastresume(ih: &InfoHash, pieces: u64) -> Vec<u8> {
+    // Keys in bencode (byte-lexicographic) order.
+    let mut out =
+        b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+    out.extend_from_slice(&ih.0);
+    out.extend_from_slice(format!("6:pieces{pieces}:").as_bytes());
     out.resize(out.len() + pieces as usize, 1);
     out.push(b'e');
     out
@@ -643,16 +679,16 @@ fn build_pool(size: &PoolSize, parent: Option<&Path>) -> Result<Pool, String> {
         for (file, len) in &files {
             sparse(dir.join(file), *len)?;
         }
-        std::fs::write(
-            library.join(format!("{name}.torrent")),
-            pool_torrent(&name, &files),
-        )?;
+        let torrent = pool_torrent(&name, &files);
         if i % 2 == 0 {
+            let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             std::fs::write(
                 library.join(format!("{name}.fastresume")),
-                complete_fastresume(piece_count(&files)),
+                complete_fastresume(&ih, piece_count(&files)),
             )?;
         }
+        std::fs::write(library.join(format!("{name}.torrent")), torrent)?;
         Ok(())
     })
     .map_err(|e| io("the payload and library", e))?;
@@ -767,6 +803,337 @@ fn run_pool_phase(
     Ok(m)
 }
 
+/// The most infohashes one `POST /v1/pool/adoptions` may name.
+const MAX_BATCH: usize = 1_000;
+
+fn adopt_bench(args: &AdoptArgs, budgets: &Budgets) -> Verdict {
+    let mut verdict = Verdict::default();
+    let size_name = &args.pool.size;
+    let (Some(size), Some(budget)) = (
+        budgets.sizes.get(size_name),
+        budgets.pool_adopt.get(size_name),
+    ) else {
+        verdict.fail(format!(
+            "budgets.toml has no size {size_name:?} with a pool-adopt budget; it has {:?}",
+            budgets.sizes.keys().collect::<Vec<_>>()
+        ));
+        return verdict;
+    };
+    if !(1..=MAX_BATCH).contains(&args.batch) {
+        verdict.fail(format!(
+            "--batch {} is outside the API's 1 to {MAX_BATCH}",
+            args.batch
+        ));
+        return verdict;
+    }
+    let torrentd = match &args.torrentd {
+        Some(p) => p.clone(),
+        None => match std::env::current_exe() {
+            Ok(exe) => exe.with_file_name("torrentd"),
+            Err(e) => {
+                verdict.fail(format!("pool-adopt: locating this binary: {e}"));
+                return verdict;
+            }
+        },
+    };
+    let label = format!("pool-adopt[{size_name}]");
+    match run_adopt(size, args.batch, &torrentd, args.pool.dir.as_deref()) {
+        Ok(a) => {
+            let ms = a.ms_per_torrent();
+            println!(
+                "{label}: {} torrents in {} requests of up to {}: {:.2}s, {ms:.2} ms per torrent \
+                 (budget {} ms), {:.0} torrents/s; slowest request {:.2}s; {} fast path, {} \
+                 queued for verification, {} refused",
+                a.torrents,
+                a.requests,
+                args.batch,
+                a.secs,
+                budget.max_ms_per_torrent,
+                a.per_sec(),
+                a.slowest_request_secs,
+                a.fast_path,
+                a.queued,
+                a.refused,
+            );
+            judge_adopt(&label, size, &a, budget)
+        }
+        Err(e) => {
+            verdict.fail(format!("{label}: {e}"));
+            verdict
+        }
+    }
+}
+
+/// What one `pool-adopt` run measured.
+#[derive(Debug, Default)]
+struct Adoption {
+    torrents: u64,
+    requests: u64,
+    secs: f64,
+    slowest_request_secs: f64,
+    fast_path: u64,
+    queued: u64,
+    refused: u64,
+    /// The first refusal's reason, for the report.
+    first_refusal: Option<String>,
+}
+
+impl Adoption {
+    fn ms_per_torrent(&self) -> f64 {
+        if self.torrents == 0 {
+            return 0.0;
+        }
+        self.secs * 1_000.0 / self.torrents as f64
+    }
+
+    fn per_sec(&self) -> f64 {
+        if self.secs == 0.0 {
+            return 0.0;
+        }
+        self.torrents as f64 / self.secs
+    }
+}
+
+/// Hold an adoption to its budget, and to what the pool was built to give:
+/// every torrent with a complete sidecar on the fast path, every other queued
+/// for verification, and none refused.
+fn judge_adopt(label: &str, size: &PoolSize, a: &Adoption, budget: &AdoptBudget) -> Verdict {
+    let mut verdict = Verdict::default();
+    let fast = size.torrents.div_ceil(2);
+    verdict.expect(&format!("{label}: fast path"), a.fast_path, fast);
+    verdict.expect(
+        &format!("{label}: queued for verification"),
+        a.queued,
+        size.torrents - fast,
+    );
+    verdict.expect(&format!("{label}: refused"), a.refused, 0);
+    if let Some(why) = &a.first_refusal {
+        verdict.fail(format!("{label}: the first refusal: {why}"));
+    }
+    verdict.at_most(
+        &format!("{label}: wall time per torrent"),
+        a.ms_per_torrent(),
+        budget.max_ms_per_torrent,
+        "ms",
+    );
+    verdict
+}
+
+/// A running `torrentd`, killed and reaped when dropped.
+struct Daemon {
+    child: std::process::Child,
+    log: PathBuf,
+}
+
+impl Daemon {
+    /// The last lines of the daemon's output, for a failure's report.
+    fn tail(&self) -> String {
+        let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A loopback port nothing listens on right now, for TCP and UDP.
+fn free_port() -> Result<u16, String> {
+    for _ in 0..100 {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    Err("no loopback port free for both TCP and UDP".into())
+}
+
+/// One HTTP/1.1 exchange with `Connection: close`, waiting up to `timeout`
+/// for the answer: its status and body.
+fn http(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<(u16, String)> {
+    use std::io::Read;
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(timeout))?;
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    let resp = String::from_utf8_lossy(&buf);
+    let status = resp
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    Ok((status, body))
+}
+
+/// Start `torrentd` on `pool` with one host profile, and wait for it to
+/// answer `/healthz`. Its state lives in the pool's directory, outside the
+/// root and the library, and goes with it.
+fn start_daemon(torrentd: &Path, pool: &Pool) -> Result<(Daemon, String), String> {
+    if !torrentd.is_file() {
+        return Err(format!(
+            "no torrentd at {}: build it with `cargo build --release -p torrentd`, or name \
+             one with --torrentd",
+            torrentd.display()
+        ));
+    }
+    let state = pool.dir.path().join("daemon");
+    for sub in ["data", "resume", "torrents"] {
+        std::fs::create_dir_all(state.join(sub)).map_err(|e| format!("{sub}: {e}"))?;
+    }
+    let addr = format!("127.0.0.1:{}", free_port()?);
+    let listen = free_port()?;
+    let cfg = state.join("torrentd.toml");
+    let text = format!(
+        "default_save_path = \"{d}/data\"\n\
+         resume_dir = \"{d}/resume\"\n\
+         torrent_dir = \"{d}/torrents\"\n\
+         http_listen = \"{addr}\"\n\
+         log_level = \"warn\"\n\
+         allow_unauthenticated = true\n\
+         enable_lsd = false\n\
+         \n\
+         [[profile]]\n\
+         id = \"bench\"\n\
+         network = \"host\"\n\
+         listen_interfaces = \"127.0.0.1:{listen}\"\n\
+         dht = false\n\
+         \n\
+         [pool]\n\
+         roots = [\"{root}\"]\n\
+         library_dir = \"{library}\"\n",
+        d = state.display(),
+        root = pool.root.display(),
+        library = pool.library.display(),
+    );
+    std::fs::write(&cfg, text).map_err(|e| format!("writing the config: {e}"))?;
+    let log = state.join("daemon.log");
+    let out = std::fs::File::create(&log).map_err(|e| format!("daemon.log: {e}"))?;
+    let err = out.try_clone().map_err(|e| format!("daemon.log: {e}"))?;
+    let child = std::process::Command::new(torrentd)
+        .arg("--config")
+        .arg(&cfg)
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+        .map_err(|e| format!("starting {}: {e}", torrentd.display()))?;
+    let mut daemon = Daemon { child, log };
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let short = std::time::Duration::from_secs(5);
+        if let Ok((200, _)) = http(&addr, "GET", "/healthz", "", short) {
+            return Ok((daemon, addr));
+        }
+        if let Ok(Some(status)) = daemon.child.try_wait() {
+            return Err(format!("torrentd exited {status}:\n{}", daemon.tail()));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "torrentd did not answer /healthz within 60s:\n{}",
+                daemon.tail()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Build the pool `size` describes, start `torrentd` on it, scan, and time
+/// adopting every torrent in requests of `batch`.
+fn run_adopt(
+    size: &PoolSize,
+    batch: usize,
+    torrentd: &Path,
+    parent: Option<&Path>,
+) -> Result<Adoption, String> {
+    let built = Instant::now();
+    let pool = build_pool(size, parent)?;
+    println!(
+        "pool-adopt: built {} files and {} torrents in {:.1}s under {}",
+        size.files,
+        size.torrents,
+        built.elapsed().as_secs_f64(),
+        pool.dir.path().display()
+    );
+    let infohashes = (0..size.torrents)
+        .map(|i| {
+            let (name, files) = torrent_files(i, size.files_per_torrent);
+            libtorrent_safe::info_hash_from_torrent(&pool_torrent(&name, &files))
+                .map(|ih| ih.to_hex())
+                .map_err(|e| format!("torrent {i}'s infohash: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (daemon, addr) = start_daemon(torrentd, &pool)?;
+    let failed = |what: &str, why: String| format!("{what}: {why}\n{}", daemon.tail());
+    // No deadline the work could reach: a request that never answers fails
+    // the bench by the CI job's own timeout instead.
+    let wait = std::time::Duration::from_secs(3_600);
+    let scanned = Instant::now();
+    match http(&addr, "POST", "/v1/pool/scan", "", wait) {
+        Ok((200, _)) => {}
+        Ok((status, body)) => return Err(failed("the scan", format!("{status}: {body}"))),
+        Err(e) => return Err(failed("the scan", e.to_string())),
+    }
+    println!(
+        "pool-adopt: scanned in {:.1}s",
+        scanned.elapsed().as_secs_f64()
+    );
+
+    let mut a = Adoption {
+        torrents: size.torrents,
+        ..Adoption::default()
+    };
+    let started = Instant::now();
+    for chunk in infohashes.chunks(batch) {
+        let list: Vec<String> = chunk.iter().map(|ih| format!("\"{ih}\"")).collect();
+        let body = format!(
+            "{{\"profile_id\":\"bench\",\"selector\":{{\"kind\":\"infohashes\",\
+             \"infohashes\":[{}]}}}}",
+            list.join(",")
+        );
+        let sent = Instant::now();
+        let (status, resp) = http(&addr, "POST", "/v1/pool/adoptions", &body, wait)
+            .map_err(|e| failed("an adoption", e.to_string()))?;
+        a.slowest_request_secs = a.slowest_request_secs.max(sent.elapsed().as_secs_f64());
+        a.requests += 1;
+        if status != 200 {
+            return Err(failed("an adoption", format!("{status}: {resp}")));
+        }
+        let v: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| failed("an adoption's response", format!("{e}: {resp}")))?;
+        let count = |key: &str| v[key].as_array().map_or(0, |l| l.len() as u64);
+        a.fast_path += count("fast_path");
+        a.queued += count("queued_for_verification");
+        a.refused += count("refused");
+        if a.first_refusal.is_none() {
+            a.first_refusal = v["refused"][0]["reason"].as_str().map(str::to_owned);
+        }
+    }
+    a.secs = started.elapsed().as_secs_f64();
+    Ok(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +1148,8 @@ mod tests {
             let names: Vec<_> = phase.budgets(&b).keys().collect();
             assert_eq!(names, b.sizes.keys().collect::<Vec<_>>(), "{phase:?}");
         }
+        let adopt: Vec<_> = b.pool_adopt.keys().collect();
+        assert_eq!(adopt, b.sizes.keys().collect::<Vec<_>>(), "pool-adopt");
     }
 
     /// The synthetic `.torrent` is the torrent libtorrent reads: its name,
@@ -867,6 +1236,61 @@ mod tests {
         assert_eq!(
             judge("p", &wrong, &budget).0,
             vec!["p: torrents matched: 1, expected 2".to_owned()]
+        );
+    }
+
+    /// An adoption over its per-torrent budget fails, and so does one whose
+    /// buckets are not what the pool was built to give; one within its budget
+    /// with every torrent where it belongs passes.
+    #[test]
+    fn an_adoption_over_budget_or_misplaced_fails() {
+        let size = PoolSize {
+            files: 10,
+            torrents: 5,
+            files_per_torrent: 1,
+        };
+        let budget = AdoptBudget {
+            max_ms_per_torrent: 10.0,
+        };
+        let right = Adoption {
+            torrents: 5,
+            requests: 1,
+            secs: 0.05,
+            fast_path: 3,
+            queued: 2,
+            ..Adoption::default()
+        };
+        assert_eq!(right.ms_per_torrent(), 10.0);
+        assert!(judge_adopt("a", &size, &right, &budget).0.is_empty());
+        let slow = Adoption {
+            secs: 0.051,
+            ..right
+        };
+        assert_eq!(judge_adopt("a", &size, &slow, &budget).0.len(), 1);
+        let fell_back = Adoption {
+            torrents: 5,
+            secs: 0.05,
+            fast_path: 2,
+            queued: 3,
+            ..Adoption::default()
+        };
+        assert_eq!(judge_adopt("a", &size, &fell_back, &budget).0.len(), 2);
+        let refused = Adoption {
+            torrents: 5,
+            secs: 0.05,
+            fast_path: 3,
+            queued: 1,
+            refused: 1,
+            first_refusal: Some("missing".into()),
+            ..Adoption::default()
+        };
+        assert_eq!(
+            judge_adopt("a", &size, &refused, &budget).0,
+            vec![
+                "a: queued for verification: 1, expected 2".to_owned(),
+                "a: refused: 1, expected 0".to_owned(),
+                "a: the first refusal: missing".to_owned(),
+            ]
         );
     }
 

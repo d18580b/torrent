@@ -3592,6 +3592,7 @@ dependencies = [
  "clap",
  "libtorrent-safe",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "torrentd-engine",
