@@ -1,4 +1,8 @@
+use std::path::Path;
+
 use super::*;
+use crate::model::PlanStep;
+use crate::model::PoolError;
 
 /// The daemon and a CLI `pool check` may write side by side; a CLI
 /// `pool scan` may not run beside either, and nothing opens beside it.
