@@ -43,6 +43,7 @@ mod reload;
 mod sd_notify;
 mod signals;
 mod startup;
+mod torrent_keys;
 mod tracing_init;
 mod vpn;
 mod vpn_cmd;
