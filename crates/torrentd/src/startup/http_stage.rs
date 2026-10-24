@@ -473,7 +473,7 @@ mod tests {
         let log = crate::tracing_init::Buf::default();
         let (_reload, subscriber) =
             crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
-        let code = tracing::subscriber::with_default(subscriber, || {
+        let code = torrentd_engine::testing::with_subscriber(subscriber, || {
             http_exit_code(accept_failure(libc::EINVAL))
         });
         assert_eq!(code, 70);

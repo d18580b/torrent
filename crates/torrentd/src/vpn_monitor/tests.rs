@@ -1756,7 +1756,7 @@ fn the_recovery_check_wants_the_bound_address_routed_by_the_tunnel() {
     let log = crate::tracing_init::Buf::default();
     let (_reload, subscriber) =
         crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
-    let refused = tracing::subscriber::with_default(subscriber, || {
+    let refused = torrentd_engine::testing::with_subscriber(subscriber, || {
         recovery_check(&entry, &addr_unavailable(Ok(stale)))
     });
     assert_eq!(

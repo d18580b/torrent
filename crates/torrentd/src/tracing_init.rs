@@ -222,7 +222,7 @@ mod tests {
     fn the_daemon_layer_holds_libtorrent_messages_to_the_host_only_rule() {
         let buf = Buf::default();
         let subscriber = tracing_subscriber::registry().with(fmt_layer(buf.clone()));
-        tracing::subscriber::with_default(subscriber, || {
+        torrentd_engine::testing::with_subscriber(subscriber, || {
             tracing::debug!(
                 target: "torrentd_engine::handler::log",
                 "==> TRACKER_REQUEST [ url: https://t.example/announce?uk=abc123 ]"
@@ -246,7 +246,7 @@ mod tests {
         let url = format!("https://t.example/{UUID}/announce");
         let buf = Buf::default();
         let subscriber = tracing_subscriber::registry().with(fmt_layer(buf.clone()));
-        tracing::subscriber::with_default(subscriber, || {
+        torrentd_engine::testing::with_subscriber(subscriber, || {
             tracing::debug!(
                 target: "torrentd_engine::handler::tracker",
                 infohash = "aa",
@@ -277,7 +277,7 @@ mod tests {
         let buf = Buf::default();
         let subscriber = tracing_subscriber::registry().with(fmt_layer(buf.clone()));
         let url = format!("https://t.example/announce?passkey={PASSKEY}");
-        tracing::subscriber::with_default(subscriber, || {
+        torrentd_engine::testing::with_subscriber(subscriber, || {
             let span = tracing::info_span!("announce", tracker = %url);
             let _enter = span.enter();
             tracing::info!(tracker = %url, "==> TRACKER_REQUEST [ url: {url} ]");
