@@ -1106,7 +1106,7 @@ async fn controls(h: &Harness, e: &Engines) {
     // A recheck is queued, `[pool]` or not: the check queue's tick starts
     // it, and a check that ends frees its slot for the next.
     let tick = || {
-        crate::pool_service::admit_tick_for_tests(
+        crate::check_queue::admit_tick_for_tests(
             &h.state.checks,
             None,
             &h.state.source,
@@ -1729,7 +1729,7 @@ async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
         for ih in &hashes {
             load(s, &e.p, *ih, "p", TorrentPhase::Seeding);
         }
-        s.checks = crate::pool_service::VerifyQueue::for_daemon(Some(&pool));
+        s.checks = crate::check_queue::VerifyQueue::for_daemon(Some(&pool));
         s.pool = Some(Arc::clone(&pool));
         engine = Some(e.p);
     });
@@ -1770,7 +1770,7 @@ async fn a_burst_of_rechecks_hashes_at_most_the_verify_limit_at_once() {
     assert_eq!(resp.json::<Value>()["verify_queue_depth"], 12);
 
     let tick = || {
-        crate::pool_service::admit_tick_for_tests(
+        crate::check_queue::admit_tick_for_tests(
             pool.verify_queue(),
             Some(&pool),
             &h.state.source,
@@ -1883,7 +1883,7 @@ async fn a_burst_of_torrent_adds_hashes_at_most_the_check_limit_at_once() {
     assert_eq!(q.holds().held(&p).len(), 12);
 
     let tick = || {
-        crate::pool_service::admit_tick_for_tests(
+        crate::check_queue::admit_tick_for_tests(
             q,
             None,
             &h.state.source,
@@ -1976,7 +1976,7 @@ async fn a_held_add_follows_the_operators_pause_and_resume() {
         "held until its check ends, so a restart before then queues it again"
     );
 
-    crate::pool_service::admit_tick_for_tests(
+    crate::check_queue::admit_tick_for_tests(
         q,
         None,
         &h.state.source,
@@ -2041,7 +2041,7 @@ async fn a_held_add_the_queue_resumed_follows_the_operators_pause() {
     };
     let q = &h.state.checks;
     let tick = || {
-        crate::pool_service::admit_tick_for_tests(
+        crate::check_queue::admit_tick_for_tests(
             q,
             None,
             &h.state.source,

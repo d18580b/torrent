@@ -42,7 +42,6 @@ use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
-use crate::pool_service::execute_adopt;
 use crate::pool_service::Adopted;
 use crate::pool_service::PoolService;
 use crate::registry::Claim;
@@ -495,9 +494,7 @@ pub async fn check_pool_drift(
     let guard = s.work.enter();
     let report = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        let roots: std::collections::HashMap<i64, std::path::PathBuf> =
-            pool.roots().iter().cloned().collect();
-        pool.with_store_mut(|st| torrentd_pool::drift::detect(st, |id| roots.get(&id).cloned()))
+        pool.drift_check()
     })
     .await
     .map_err(|e| PoolFailure::Internal {
@@ -1120,11 +1117,7 @@ fn adopt_each(
             if pool.root_path_of(*root_id).is_none() {
                 return Err(AdoptError::RootNotFound);
             }
-            let pv = pool
-                .with_store(|st| {
-                    torrentd_pool::adopt::preview(st, *root_id, path, |id| pool.root_path_of(id))
-                })
-                .map_err(fail)?;
+            let pv = pool.adopt_preview(*root_id, path).map_err(fail)?;
             pv.fast_path
                 .into_iter()
                 .chain(pv.verify)
@@ -1182,9 +1175,7 @@ fn adopt_each(
         // and loaded, and a failure here must leave the response saying
         // exactly which. The cause is logged; the reason says only that the
         // index could not be read for this torrent.
-        let plan = match pool
-            .with_store(|st| torrentd_pool::adopt::plan(st, &ih, |id| pool.root_path_of(id)))
-        {
+        let plan = match pool.adopt_plan(&ih) {
             Ok(plan) => plan,
             Err(e) => {
                 refuse(
@@ -1200,7 +1191,7 @@ fn adopt_each(
         // — and holding them in two branches is how they came to hold in
         // neither. Which bucket a torrent lands in is not the plan's to say: a
         // fast-path plan falls back to verification where its resume data
-        // will not do, so it is what `execute_adopt` did.
+        // will not do, so it is what `PoolService::adopt` did.
         if let torrentd_pool::AdoptPlan::Refuse { reason } = plan {
             refuse(&mut resp, reason.to_owned());
             continue;
@@ -1210,9 +1201,7 @@ fn adopt_each(
         let accept = |resp: &mut AdoptionResult, adopted: Adopted| {
             let verifies = adopted == Adopted::QueuedForVerification;
             if verifies {
-                resp.verify_bytes += pool
-                    .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
-                    .unwrap_or(0);
+                resp.verify_bytes += pool.total_size(&ih);
             }
             bucket(resp, verifies).push(infohash);
         };
@@ -1235,7 +1224,7 @@ fn adopt_each(
         if req.dry_run {
             // Everything up to the add, the account-isolation guard included,
             // so a dry run refuses what the adoption would.
-            match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), true) {
+            match pool.adopt(&s.source, &s.profiles, &ih, profile.clone(), true) {
                 Ok(adopted) => accept(&mut resp, adopted),
                 Err(r) => refuse(&mut resp, r.reason),
             }
@@ -1256,7 +1245,7 @@ fn adopt_each(
             refuse(&mut resp, reason);
             continue;
         }
-        match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), false) {
+        match pool.adopt(&s.source, &s.profiles, &ih, profile.clone(), false) {
             Ok(adopted) => accept(&mut resp, adopted),
             Err(r) => {
                 release_claim(s, infohash);
@@ -1335,7 +1324,7 @@ fn claim_in_registry(
 /// `DELETE /v1/torrents/{infohash}` clears the record, so it never outlasts
 /// the torrent it describes.
 fn check_index_owner(pool: &PoolService, ih: &str, profile: &ProfileId) -> Result<(), String> {
-    match pool.with_store(|st| st.profile_of(ih)) {
+    match pool.index_owner(ih) {
         Ok(Some(owner)) if owner != profile.as_str() => Err(format!(
             "the pool index assigns this torrent to profile {owner}"
         )),
@@ -2015,25 +2004,12 @@ fn create_plan_blocking(
         detail: internal("creating a plan", e),
     };
 
-    // The index checks under the store; the disk checks, a relocate's walk of
-    // its whole source directory among them, once it is released.
-    let built = pool
-        .with_store(|st| torrentd_pool::plan::prepare(st, &spec, |id| pool.root_path_of(id)))
-        .map_err(|e| fail(&e))?
-        .and_then(torrentd_pool::plan::Prepared::finish);
-    let steps = match built {
-        Ok(steps) => steps,
+    let id = match pool.create_plan(&spec).map_err(|e| fail(&e))? {
+        Ok(id) => id,
         // A refusal is the expected outcome for overlap, drift, or an occupied
         // destination — a 409 with the reason, not a 500.
         Err(refused) => return Err(CreatePlanError::PlanRefused(refused.to_string())),
     };
-
-    let spec_json = serde_json::to_string(&spec).map_err(|e| fail(&e))?;
-    let id = pool
-        .with_store(|st| st.create_plan(kind, &spec_json, now_secs()))
-        .map_err(|e| fail(&e))?;
-    pool.with_store_mut(|st| st.add_plan_steps(id, &steps))
-        .map_err(|e| fail(&e))?;
 
     let plan = load_plan(pool, id)
         .map_err(|detail| CreatePlanError::Internal { detail })?
@@ -2257,10 +2233,7 @@ pub async fn delete_plan(
     // claim the plan between a read and the delete.
     blocking(move || {
         use torrentd_pool::store::PlanDelete;
-        match pool
-            .with_store_mut(|st| st.delete_plan(p.plan_id))
-            .map_err(fail)?
-        {
+        match pool.discard_plan(p.plan_id).map_err(fail)? {
             PlanDelete::Deleted => Ok(NoContent),
             PlanDelete::NotFound => Err(DeletePlanError::PlanNotFound),
             PlanDelete::Applying => Err(DeletePlanError::PlanApplying),
@@ -2399,12 +2372,7 @@ pub async fn apply_plan(
         let writer = Arc::clone(&pool);
         let expected = blocking(move || {
             writer
-                .with_store(|st| -> Result<_, torrentd_pool::PoolError> {
-                    Ok((st.plan_steps(id)?, st.index_generation()?))
-                })
-                .map(|(steps, generation)| {
-                    torrentd_pool::plan::confirm_token(id, generation, &steps)
-                })
+                .confirm_token(id)
                 .map_err(|e| internal("reading a plan", e))
         })
         .await
@@ -2452,13 +2420,6 @@ pub async fn apply_plan(
             _ => Err(ApplyPlanError::ApplyFailed(reason)),
         },
     }
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Operations that take no request body.

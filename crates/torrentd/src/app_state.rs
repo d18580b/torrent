@@ -50,9 +50,9 @@ pub struct AppState {
     /// in which case every `/v1/pool` operation answers `pool-not-configured`.
     pub pool: Option<Arc<crate::pool_service::PoolService>>,
     /// The daemon's bound on hash checks, `[pool]` or not: the pool's verify
-    /// queue where there is one ([`crate::pool_service::VerifyQueue::for_daemon`]).
+    /// queue where there is one ([`crate::check_queue::VerifyQueue::for_daemon`]).
     /// A `.torrent` add holds its first check here, and a recheck queues.
-    pub checks: Arc<crate::pool_service::VerifyQueue>,
+    pub checks: Arc<crate::check_queue::VerifyQueue>,
     /// Alert-loop liveness stamp (Unix millis at its last iteration). Read by
     /// `/healthz` so a wedged loop makes the daemon report unready.
     pub alert_heartbeat: Arc<AtomicU64>,
@@ -311,7 +311,7 @@ pub(crate) fn build_test_state_with_sessions(
         metrics: Arc::new(PromSink::new()),
         auth: None,
         pool: None,
-        checks: crate::pool_service::VerifyQueue::for_daemon(None),
+        checks: crate::check_queue::VerifyQueue::for_daemon(None),
         alert_heartbeat: Arc::new(AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

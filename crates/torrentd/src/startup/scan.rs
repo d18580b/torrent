@@ -521,7 +521,7 @@ pub(super) struct ScanInputs<'a> {
     pub(super) metrics: &'a PromSink,
     pub(super) state: &'a StateMap,
     pub(super) pool: Option<&'a crate::pool_service::PoolService>,
-    pub(super) checks: &'a crate::pool_service::VerifyQueue,
+    pub(super) checks: &'a crate::check_queue::VerifyQueue,
     pub(super) checked_hold: &'a CheckedHold<'a>,
     pub(super) boot_progress: &'a sd_notify::Progress,
 }
@@ -551,7 +551,7 @@ pub(super) struct ScanTally {
     pub(super) removed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)>,
     /// Each info-hash the resume scan refused because its torrent's session key
     /// is another one, or cannot be read before the add
-    /// (`pool_service::resume_key_refusal`), and counted. The torrent-dir scan
+    /// (`torrent_keys::resume_key_refusal`), and counted. The torrent-dir scan
     /// finds the `.torrent` filed beside it under the same name, and counts it
     /// only once.
     pub(super) rekeyed_at_boot: HashSet<(ProfileId, libtorrent_safe::InfoHash)>,
@@ -751,8 +751,8 @@ pub(super) async fn resume_scan(
             // the operator to reconcile. So is one whose key no add can
             // know yet: resume data with no v1 hash and no metadata, which
             // hybrid metadata would rekey once it arrived.
-            if let Some(refusal) = crate::pool_service::resume_key_refusal(&params, &ih) {
-                use crate::pool_service::ResumeKeyRefusal;
+            if let Some(refusal) = crate::torrent_keys::resume_key_refusal(&params, &ih) {
+                use crate::torrent_keys::ResumeKeyRefusal;
                 match refusal {
                     ResumeKeyRefusal::Rekeyed(key) => warn!(
                         profile_id = %profile,
@@ -1182,7 +1182,7 @@ pub(super) async fn torrent_dir_scan(
                         checks.enqueue_add(
                             profile.clone(),
                             ih,
-                            crate::pool_service::CheckSource::TorrentDir,
+                            crate::check_queue::CheckSource::TorrentDir,
                         );
                     }
                     scan_fence.added(profile_registry, metrics, &profile, h);
@@ -1241,7 +1241,7 @@ pub(super) struct BootLoadFailures {
     /// A resume file that read but libtorrent refused to add, or whose
     /// torrent its session keys by another infohash than the one it is filed
     /// under, or by one hybrid metadata would change
-    /// (`pool_service::resume_key_refusal`).
+    /// (`torrent_keys::resume_key_refusal`).
     pub(super) resume_add: u64,
     /// A `.torrent` that could not be read to re-attach metadata.
     pub(super) torrent_read: u64,
@@ -1327,9 +1327,9 @@ mod tests {
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
 
-        use crate::pool_service::CheckSource;
-        use crate::pool_service::VerifyQueue;
-        use crate::pool_service::CHECK_HOLDS_FILE;
+        use crate::check_queue::CheckSource;
+        use crate::check_queue::VerifyQueue;
+        use crate::check_queue::CHECK_HOLDS_FILE;
         use crate::profile_state::PacedHolds;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1416,7 +1416,7 @@ mod tests {
                 .collect()
         };
         let tick = |q: &VerifyQueue| {
-            crate::pool_service::admit_tick_for_tests(
+            crate::check_queue::admit_tick_for_tests(
                 q, None, &source, &state, &profiles, &registry,
             );
         };

@@ -461,6 +461,23 @@ impl ProfileEntry {
         self.noted.lock().insert(h, running)
     }
 
+    /// Ready `h` for a pause of that one torrent: note it paused, leave it out
+    /// of every paced resume ([`ProfileEntry::exclude_from_resumes`]), and
+    /// note it paused again. Returns what was noted before, for
+    /// [`ProfileEntry::restore_noted`] should the engine refuse the pause.
+    ///
+    /// Noted first, so a kill-switch fence or a set-online that reads what is
+    /// running from here on, before a state update reports the pause, does
+    /// not resume it; the gates catch one that read before. Noted again once
+    /// the gates exclude it: a paced resume that took a gate between the two
+    /// noted it running, and that resume lands before this pause.
+    pub fn prepare_pause(&self, h: TorrentHandle) -> Option<bool> {
+        let before = self.note_running(h, false);
+        self.exclude_from_resumes(h);
+        self.note_running(h, false);
+        before
+    }
+
     /// [`ProfileEntry::note_running`] with `running` false, for every one of
     /// `handles`: a pause of the whole profile.
     pub fn note_paused(&self, handles: &[TorrentHandle]) {
