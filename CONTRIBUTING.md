@@ -207,9 +207,11 @@ cannot find for itself (mise.toml's mutants section says why). Results land in
 The files `mutants-netns` covers (mise.toml's `TORRENTD_MUTANTS_NETNS`) are left
 out of `mutants-diff` and `mutants-shard`, whose runs cannot reach their decisive
 tests. The `Mutants` workflow is advisory for now, so a missed mutant never fails
-a check: on a pull request it runs `mutants-diff` against the base, capped at 90
-minutes, and nightly it runs `mutants-shard` in eight shards and `mutants-netns`
-beside them. Each job uploads its `mutants.out` as an artifact.
+a check: on a pull request it runs `mutants-diff` against the base for as many
+mutants as fit in 12 minutes, inside a 28-minute job that always ends green (a
+native-cache miss skips the run rather than fetching the submodules), and nightly
+it runs `mutants-shard` in eight shards and `mutants-netns` beside them. Each job
+uploads its `mutants.out` as an artifact.
 
 Deploying it for real — packages, submodules, the service user, directories,
 config, auth bootstrap, ulimits, and the drills worth running once before you
