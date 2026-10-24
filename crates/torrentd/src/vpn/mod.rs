@@ -14,6 +14,7 @@ pub mod killswitch;
 mod natpmp;
 mod openvpn;
 pub mod route;
+mod shared_exit;
 mod wireguard;
 
 use std::path::Path;
@@ -27,9 +28,9 @@ pub use natpmp::NatpmpForwarder;
 pub use openvpn::config_refusal as openvpn_config_refusal;
 pub use openvpn::OpenvpnManager;
 pub use openvpn::Released as ReleasedOpenvpn;
+pub use shared_exit::warn_if_exits_are_shared;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
-pub use wireguard::endpoint_hosts as wireguard_endpoint_hosts;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::release_recorded as release_recorded_wireguard;
 pub use wireguard::sweep_raised_records;

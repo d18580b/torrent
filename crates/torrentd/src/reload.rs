@@ -161,7 +161,7 @@ fn warning_for(change: &ProfileChange) -> &'static str {
 /// Take a reloaded `connections_limit` the open-file limit cannot hold out of
 /// `diff`, and return the limit and what the change would need.
 ///
-/// The rule boot warns by (`startup::warn_if_descriptors_are_short`): every
+/// The rule boot warns by (`startup::limits::warn_if_descriptors_are_short`): every
 /// descriptor the daemon may hold at once against the soft `RLIMIT_NOFILE`
 /// `limit`. A raise that ends past it is refused here rather than applied,
 /// because applied it is a daemon that fails `accept` and `open` with

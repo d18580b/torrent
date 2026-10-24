@@ -334,7 +334,7 @@ impl Harness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(
-            // The server `startup::serve_once` runs, so the operation's own
+            // The server `startup::http_stage::serve_once` runs, so the operation's own
             // deadline answers a stalled body only where production lets it.
             crate::startup::http_server(service)
                 .listener(listener)

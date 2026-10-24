@@ -44,7 +44,7 @@ use anyhow::Context;
 use tracing::info;
 
 use crate::config::Config;
-use crate::startup::InstanceLock;
+use crate::instance_lock::InstanceLock;
 use crate::vpn;
 use crate::vpn::ReleasedOpenvpn;
 use crate::vpn::ReleasedWireguard;
