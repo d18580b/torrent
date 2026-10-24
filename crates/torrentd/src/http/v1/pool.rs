@@ -387,8 +387,9 @@ pub struct ScanSummary {
     pub shared: u64,
     /// Complete torrents still carrying drift no verification has cleared.
     pub drifted: u64,
-    /// Entries skipped because they could not be read; the daemon's log names
-    /// each, and `pool_scan_errors_total` counts them by kind.
+    /// Entries skipped because they could not be read, or because they are
+    /// symlinks under a root, which the scan does not follow; the daemon's
+    /// log names each, and `pool_scan_errors_total` counts them by kind.
     pub errors: u64,
 }
 

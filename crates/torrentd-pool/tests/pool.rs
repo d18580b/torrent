@@ -3500,6 +3500,56 @@ fn an_unlistable_subdirectory_is_a_walk_error() {
     });
 }
 
+/// The walk does not follow symlinks, so what one points at is never indexed.
+/// It used to drop them with `errors: 0`, leaving a torrent over a symlinked
+/// file `partial` or `missing` with nothing to say why.
+#[test]
+fn a_symlink_under_a_root_is_counted_and_not_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    write_file(&root, "a.bin", 1);
+    write_file(&outside, "real.bin", 4);
+    write_file(&outside, "d/inner.bin", 8);
+    std::os::unix::fs::symlink(outside.join("real.bin"), root.join("linked.bin")).unwrap();
+    std::os::unix::fs::symlink(outside.join("d"), root.join("linked_dir")).unwrap();
+    // One under the trash is a deleted entry, not a hidden one.
+    std::fs::create_dir_all(root.join(torrentd_pool::plan::TRASH_DIR)).unwrap();
+    std::os::unix::fs::symlink(
+        outside.join("real.bin"),
+        root.join(torrentd_pool::plan::TRASH_DIR).join("old.bin"),
+    )
+    .unwrap();
+    let mut store = PoolStore::open_in_memory().unwrap();
+
+    let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+
+    assert_eq!(stats.errors, 2, "{stats:?}");
+    assert_eq!(
+        stats.errors_by_kind,
+        std::collections::BTreeMap::from([("symlink", 2)]),
+    );
+    assert_eq!(stats.files_indexed, 1, "{stats:?}");
+    assert_eq!(store.file_count().unwrap(), 1, "only the regular file");
+}
+
+/// A symlinked root is what the operator configured, so it is walked, and
+/// not counted as a skipped symlink.
+#[test]
+fn a_symlinked_root_is_not_a_symlink_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    write_file(&real, "a.bin", 1);
+    let root = dir.path().join("root");
+    std::os::unix::fs::symlink(&real, &root).unwrap();
+    let mut store = PoolStore::open_in_memory().unwrap();
+
+    let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+
+    assert_eq!(stats.errors, 0, "{stats:?}");
+    assert_eq!(stats.files_indexed, 1, "{stats:?}");
+}
+
 /// A root that cannot be listed, or is gone, is a walk error and keeps the
 /// index it had: committing the empty walk would read every torrent over it
 /// as `missing`.

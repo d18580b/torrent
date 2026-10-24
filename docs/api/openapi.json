@@ -11244,7 +11244,7 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Entries skipped because they could not be read; the daemon's log names\neach, and `pool_scan_errors_total` counts them by kind."
+            "description": "Entries skipped because they could not be read, or because they are\nsymlinks under a root, which the scan does not follow; the daemon's\nlog names each, and `pool_scan_errors_total` counts them by kind."
           }
         },
         "type": "object",
