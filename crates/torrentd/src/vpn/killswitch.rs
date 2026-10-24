@@ -1,11 +1,13 @@
 //! Network-layer VPN kill switch (nftables) — defence-in-depth backstop.
 //!
-//! Multi-profile isolation's primary guard is that every profile's libtorrent sockets
-//! are source-bound to the tunnel IP (`startup.rs`), and [`crate::vpn_monitor`]
-//! pauses a profile on its next 30s poll after its tunnel's address goes, or
-//! once its WireGuard handshake is older than `vpn_handshake_max_age_secs`
-//! (default 180s) — up to that age plus a poll after the tunnel stops
-//! carrying. Both live at the application layer:
+//! Multi-profile isolation's primary guard is that every profile's libtorrent
+//! sockets are source-bound to the tunnel IP (`startup::profiles`), and
+//! [`crate::vpn_monitor`] fences a profile on its next 30s poll after its
+//! tunnel's address goes or its traffic stops routing by the tunnel, or once
+//! its WireGuard handshake has gone unanswered for longer than
+//! `vpn_handshake_max_age_secs` (default 180s) while the profile has traffic
+//! to carry — up to that age plus a poll after the tunnel stops carrying.
+//! Both live at the application layer:
 //! the "no bare-IP leak" guarantee ultimately rests on libtorrent honouring the
 //! bind and on the poll reacting in time.
 //!

@@ -635,10 +635,13 @@ pub async fn boot(
     );
 
     // Network-layer kill switch (defence-in-depth; multi-profile + opt-in).
-    // Installed once, after every profile's tunnel is up, so the ruleset covers all
-    // tunnel interfaces, each accepted only from the address its own link holds
-    // — the one that profile's sessions were just bound to. Fail-closed: if the operator asked for it and it can't
-    // be installed, abort rather than seed without the backstop.
+    // Installed here, after every profile's tunnel is up, so the ruleset
+    // covers all tunnel interfaces, each accepted only from the address its
+    // own link holds — the one that profile's sessions were just bound to.
+    // From then on the watch started below re-reads those addresses before
+    // each check and reinstalls a ruleset it finds lost. Fail-closed: if the
+    // operator asked for it and it cannot be installed, abort rather than
+    // seed without the backstop.
     //
     // That leaves a window: each profile's bring-up can take up to 30 s, so
     // the sessions built first exist, with their listen sockets open, before
