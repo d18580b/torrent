@@ -38,6 +38,7 @@ use tracing::warn;
 
 use crate::model::AdoptionState;
 use crate::model::PoolError;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 /// What adopting one torrent would do.
@@ -273,7 +274,11 @@ fn torrent_meta(path: &Path) -> Option<TorrentMeta> {
 
 /// Each file's path as the `.torrent` gives it, `/`-separated: where the
 /// scan places a file the previous client left where the `.torrent` says.
-fn torrent_paths(meta: &TorrentMeta) -> Vec<String> {
+///
+/// The one rewrite of a torrent's declared paths into the index's form: the
+/// scan writes its file rows from it, and adoption compares those rows with
+/// it.
+pub(crate) fn torrent_paths(meta: &TorrentMeta) -> Vec<String> {
     meta.files
         .iter()
         .map(|f| f.path.replace('\\', "/"))
@@ -365,16 +370,6 @@ fn fastresume_is_trustworthy(
         }
     }
     Ok(true)
-}
-
-fn join_rel(base: &str, rel: &str) -> String {
-    let base = base.trim_matches('/');
-    let rel = rel.trim_matches('/');
-    if base.is_empty() {
-        rel.to_string()
-    } else {
-        format!("{base}/{rel}")
-    }
 }
 
 /// Summary of what a bulk adopt over a subtree would do, without doing it.

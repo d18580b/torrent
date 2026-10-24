@@ -958,10 +958,7 @@ impl PoolStore {
         use std::os::unix::ffi::OsStrExt;
         let trackers = serde_json::to_string(&row.trackers)
             .map_err(|e| PoolError::Io(std::io::Error::other(e)))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = crate::now_secs();
         self.conn.execute(
             "INSERT INTO verify_queue
                  (infohash, profile, torrent_path, save_path, owner_recorded, trackers, enqueued_at)
@@ -2538,6 +2535,23 @@ pub struct TorrentListing {
 /// The directory a root-relative path sits in: `""` at the top of the root.
 pub fn parent_of(rel_path: &str) -> &str {
     rel_path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// `rel` under the directory `base`, both root-relative: the path the index
+/// keys that file by.
+///
+/// Both are already in the index's form, so the only normalisation is
+/// trimming the `/` at either end, which leaves an empty `base` naming the
+/// root itself. A backslash is kept: in an indexed path it is part of a file
+/// name, and a torrent's own declared paths had theirs rewritten to `/` when
+/// the library was scanned.
+pub(crate) fn join_rel(base: &str, rel: &str) -> String {
+    let (base, rel) = (base.trim_matches('/'), rel.trim_matches('/'));
+    if base.is_empty() {
+        rel.to_owned()
+    } else {
+        format!("{base}/{rel}")
+    }
 }
 
 /// Every directory `rel_path` (a file) sits under, from the root (`""`) down

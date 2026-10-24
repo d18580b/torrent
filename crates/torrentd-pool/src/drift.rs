@@ -15,14 +15,13 @@
 //! this pass, run over the adopt's selection first, is what sends a torrent
 //! whose files changed since down the verify path instead.
 
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-
 use tracing::info;
 use tracing::warn;
 
 use crate::model::AdoptionState;
 use crate::model::PoolError;
+use crate::now_secs;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -243,11 +242,7 @@ fn detect_among(
             if !f.is_on_disk() {
                 continue;
             }
-            let rel = if base_rel.is_empty() {
-                f.rel_path.clone()
-            } else {
-                format!("{}/{}", base_rel.trim_matches('/'), f.rel_path)
-            };
+            let rel = join_rel(&base_rel, &f.rel_path);
             let Some(indexed) = store.file(root_id, &rel)? else {
                 continue;
             };
@@ -352,13 +347,6 @@ fn detect_among(
 
 fn same_file(indexed: &crate::model::PoolFile, live: &std::fs::Metadata) -> bool {
     crate::scan::file_stamp(live) == (indexed.size, indexed.mtime_ns, indexed.ino, indexed.dev)
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

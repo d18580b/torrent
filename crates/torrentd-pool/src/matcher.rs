@@ -30,6 +30,7 @@ use tracing::info;
 use crate::model::AdoptionState;
 use crate::model::PoolError;
 use crate::model::TorrentFileRow;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -602,13 +603,14 @@ fn candidate_bases(
         .filter(|f| f.is_on_disk())
         .max_by_key(|f| f.size)
     {
-        let anchor_rel = normalize(&anchor.rel_path);
+        // Already in the index's form, as `evaluate_base` joins it.
+        let anchor_rel = anchor.rel_path.trim_matches('/');
         for candidate_path in store.files_with_size(root_id, anchor.size)? {
             // The base is whatever prefix remains after removing the
             // torrent-relative path from the on-disk path — at a component
             // boundary, or `x/foo.mkv` would yield the base `x/` for a
             // torrent file named `oo.mkv`.
-            if let Some(base) = candidate_path.strip_suffix(&anchor_rel) {
+            if let Some(base) = candidate_path.strip_suffix(anchor_rel) {
                 if base.is_empty() || base.ends_with('/') {
                     push(base.trim_end_matches('/').to_string());
                 }
@@ -673,17 +675,8 @@ fn evaluate_base(
     }))
 }
 
-fn join_rel(base: &str, rel: &str) -> String {
-    let base = base.trim_matches('/');
-    let rel = normalize(rel);
-    if base.is_empty() {
-        rel
-    } else {
-        format!("{base}/{rel}")
-    }
-}
-
-/// A path a torrent declares, in the index's form: its separators `/`.
+/// A name a torrent declares, in the index's form: its separators `/`, as
+/// the scan rewrites the torrent's file paths.
 fn normalize(p: &str) -> String {
     p.replace('\\', "/").trim_matches('/').to_string()
 }

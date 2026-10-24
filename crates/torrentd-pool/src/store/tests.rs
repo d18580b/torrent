@@ -189,3 +189,14 @@ fn a_file_store_runs_wal_with_synchronous_full() {
         .unwrap();
     assert_eq!(sync, 2, "synchronous must be FULL");
 }
+
+/// The matcher, drift, adoption and the planners all key a torrent's file
+/// by this one join, so a path one of them resolves is the path the others
+/// resolve: trimmed of `/` at either end, a backslash kept as part of a name.
+#[test]
+fn join_rel_trims_slashes_and_keeps_backslashes() {
+    assert_eq!(join_rel("", "a/b.bin"), "a/b.bin");
+    assert_eq!(join_rel("/", "/a/b.bin/"), "a/b.bin");
+    assert_eq!(join_rel("/x/y/", "b.bin"), "x/y/b.bin");
+    assert_eq!(join_rel("d\\e", "f\\g.bin"), "d\\e/f\\g.bin");
+}
