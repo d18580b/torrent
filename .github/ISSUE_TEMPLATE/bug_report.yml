@@ -53,9 +53,10 @@ body:
         Output of `git submodule status vendor/libtorrent`, run inside a source
         checkout. Paste the whole line, including any leading `-` or `+` — it
         says whether the submodule is checked out and whether it matches the
-        pin. If you have no checkout because you installed a distributed binary
-        or image, give that package or image version instead and say which it
-        is.
+        pin. If you have no checkout because you installed a release, give the
+        output of `torrentd --version` instead, and for the container image
+        its tag and digest (`podman image inspect --format '{{.Digest}}'
+        ghcr.io/d18580b/torrent:<tag>`): a release pins its libtorrent.
       placeholder: "-0123456789abcdef0123456789abcdef01234567 vendor/libtorrent"
     validations:
       required: true
@@ -66,9 +67,8 @@ body:
       label: Cargo version
       description: >-
         Output of `cargo --version`, run inside the same source checkout. If
-        you have no checkout because you installed a distributed binary or
-        image, give that package or image version instead and say which it
-        is — the same answer as the field above.
+        you have no checkout because you installed a release, give the same
+        answer as the field above: the release built its own binaries.
       placeholder: "cargo 1.90.0 (840b83a10 2025-07-30)"
     validations:
       required: true

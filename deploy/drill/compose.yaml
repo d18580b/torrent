@@ -1,8 +1,9 @@
 # Alert-delivery drill: torrentd, Prometheus with deploy/prometheus's rules,
 # Alertmanager, and a webhook sink that records what it is sent.
 #
-# Not a deployment, and the daemon here is not a release build: it is built
-# with the fault-injection feature, which adds POST /v1/faults, and runs only
+# Not a deployment, and the daemon here is neither a release's nor the
+# published ghcr.io image's: it is built locally with the fault-injection
+# feature, which adds POST /v1/faults, and runs only
 # because the service below sets TORRENTD_FAULT_INJECTION=1. run.sh writes
 # the daemon's config and faults into $DRILL_DIR, brings this up, injects
 # faults through the daemon's own API, and asserts each matching alert arrives

@@ -177,6 +177,7 @@ Every test command is a mise task, and CI runs the same tasks:
 | `mise run test-fault-injection` | torrentd's unit tests again in the alert drill's `fault-injection` build, where `POST /v1/faults` and `FaultEngine` exist |
 | `mise run deny` | not a test: `cargo deny check` against `deny.toml` (advisories, licenses, bans, sources) |
 | `mise run release-features` | not a test: fails if the release build resolves `fault-injection` or `test-support` on for `torrentd` or `torrentd-engine`. Reads `cargo metadata`; builds nothing. |
+| `mise run lint-workflows` | not a test: actionlint (with shellcheck) and zizmor over `.github/`. Reads files only. |
 | `mise run test-shim` | Layer 2, the C ABI boundary. Needs the `vendor/libtorrent` submodule for its `.torrent` fixtures. |
 | `mise run test-lifecycle` | Layer 3, real libtorrent against real disk. No network. |
 | `mise run test-daemon` | Layer 3, spawns the built binary and drives it over HTTP |
@@ -260,9 +261,29 @@ Levels: `error` needs an operator, `warn` is an anomaly the daemon handled,
 `info` is lifecycle, `debug` is per-alert detail. `RUST_LOG` overrides per
 crate, e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`.
 
+## Releasing
+
+Nobody tags or uploads a release by hand. Every push to `master` runs
+[`release-plz.yml`](.github/workflows/release-plz.yml), which keeps one pull
+request open that moves every crate to the next version (one version for the
+workspace, from the Conventional Commits since the last tag) and adds those
+commits to [`CHANGELOG.md`](CHANGELOG.md), grouped by
+[`cliff.toml`](cliff.toml). CI runs on it like any pull request. Merging it
+is the release: the workflow tags `vX.Y.Z`, builds the tarballs and the
+image, signs and attests them, and publishes the release.
+[`release-plz.toml`](release-plz.toml) holds the settings, and
+[README.md § *Install*](README.md#install) what a release carries.
+
+`mise run dist` and `mise run dist-musl` build the same tarballs locally into
+`target/dist/`, with the same checks: each binary's `--version` is the
+workspace version, the shipped `torrentd` serves exactly the committed
+OpenAPI document (which a `fault-injection` build does not), and the musl
+`torrentctl` is static.
+
 ## Reporting bugs
 
-Open a GitHub issue with: kernel version, libtorrent submodule SHA, `cargo --version`,
+Open a GitHub issue with: kernel version, libtorrent submodule SHA, `cargo --version`
+(for a release, `torrentd --version` in place of both),
 and the JSON log output, at `debug` if it reproduces.
 [`docs/running.md` §12](docs/running.md#12-capturing-a-log) says how to take it
 from the running service and raise the level with `log_level` and a reload

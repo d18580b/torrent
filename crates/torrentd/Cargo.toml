@@ -64,9 +64,10 @@ rusqlite = { workspace = true }
 [features]
 # The alert drill's build (deploy/drill): layers a MockEngine over every
 # session and mounts `POST /v1/faults` to queue alerts, stall the alert loop,
-# or panic a task. Never enable it for a deployment; no release image does,
-# and `mise run release-features` fails CI if the workspace's default build
-# ever resolves it on. A binary built with it exits 78 at startup unless
+# or panic a task. Never enable it for a deployment. No release tarball or
+# image is built with it: `mise run release-features` fails CI and the release
+# workflow if the workspace's default build ever resolves it on, and
+# scripts/dist refuses a torrentd whose OpenAPI document has its route. A binary built with it exits 78 at startup unless
 # TORRENTD_FAULT_INJECTION=1 (which deploy/drill sets), and exports
 # torrentd_build_fault_injection 1.
 fault-injection = ["torrentd-engine/test-support"]

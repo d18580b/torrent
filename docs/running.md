@@ -86,6 +86,10 @@ to re-pin.
 
 ## 3. Build
 
+A release tarball replaces this section, §2 and §1's build host: download
+and verify it as [README.md § *Install*](../README.md#install) shows, and
+take `torrentd` from it in step 4b. From source:
+
 ```bash
 cargo build --workspace --release
 ```
@@ -112,6 +116,7 @@ sudo useradd --system --home-dir /var/lib/torrentd --shell /usr/sbin/nologin tor
 
 # 4b. The unit's ExecStart hardcodes /usr/bin/torrentd. (The container image
 #     installs to /usr/local/bin instead; that path is the image's alone.)
+#     From a release tarball, install its torrentd instead of target/release's.
 sudo install -m0755 target/release/torrentd /usr/bin/torrentd
 
 # 4c. Directories.
@@ -477,8 +482,8 @@ Pool adoption also refuses a torrent the pool index assigns to another profile,
 even when no session holds it now; `DELETE /v1/torrents/{infohash}` clears the
 index's record along with the assignment.
 
-**Upgrading.** A configuration that loaded before this release can be refused
-by these rules. Add `allowed_tracker_domains` to each `vpn` profile, add
+**Upgrading.** A configuration that loaded on a build from before these rules
+can be refused by them. Add `allowed_tracker_domains` to each `vpn` profile, add
 `allowed_tracker_urls` to each of two profiles on one tracker, replace a
 host profile's wildcard `listen_interfaces` where `vpn` profiles sit beside it,
 and replace an `-LT` fingerprint with the prefix of the client the profile's
@@ -1988,7 +1993,7 @@ On a scratch pool, not your real one.
    the same socket, so it refuses while a daemon of that uid runs (`ss -xap |
    grep torrentd_ks` shows the holder). The socket goes with the process,
    however it ends. Give each daemon its own user. A table an earlier
-   release left under the shared
+   build left under the shared
    name `torrentd_ks` is removed by the daemon whose uid its rules confine,
    and by no other.
 
