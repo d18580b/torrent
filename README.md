@@ -473,7 +473,10 @@ it spells out nothing for itself. So do the field-name grep
 (`mise run lint-tracing`), the source file-length gate
 (`mise run size-check`), the container image build (`mise run container`),
 the release-build feature check that `fault-injection` and `test-support`
-resolve off (`mise run release-features`), and the `convco` check over a pull request's commit range
+resolve off (`mise run release-features`), the check that systemd accepts
+`deploy/torrentd.service` and that its `ExecStopPost=` cleanup, exit-78
+restart guard and empty capability set are still there
+(`mise run unit-check`), and the `convco` check over a pull request's commit range
 (`mise run commit-lint BASE..HEAD`). `RUSTFLAGS=-D warnings` comes from the
 same file, so a local `mise run` denies warnings exactly as CI does.
 
@@ -489,6 +492,7 @@ mise run test-torrentctl # Layer 3: torrentctl's generated client against the da
 mise run test-netns      # kill switch, WireGuard and the daemon in private network namespaces (host tools, kernel modules and /etc/wireguard it needs: CONTRIBUTING.md's test-netns row)
 mise run openapi         # regenerate docs/api/openapi.json after an API change
 mise run openapi-check   # fail if the committed document is stale
+mise run unit-check      # systemd-analyze verify deploy/torrentd.service and its safety directives
 mise run test-alerts     # promtool over deploy/prometheus (needs podman or docker)
 mise run test-all        # test and every test-* task above, in turn (so test-netns's namespaces too); not check, deny or openapi-check
 mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
