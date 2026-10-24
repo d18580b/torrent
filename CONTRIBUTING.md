@@ -63,6 +63,7 @@ Everyday tasks:
 | `mise run test-all`| every automated test layer, including the ignored ones (not `deny` or `bench`) |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
 | `mise run native-clean` | Delete every cached native prefix                   |
+| `mise run mutants <crate>` | Mutation testing, one crate (see Test, below)        |
 | `mise run vpn-check <config> [-- <flags>]` | Verify a real VPN configuration (see below) |
 
 Formatting requires **nightly rustfmt** (`imports_granularity`/`group_imports` are
@@ -186,6 +187,29 @@ Every test command is a mise task, and CI runs the same tasks:
 Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
 Layer 2 runs as its own CI job; the three Layer 3 suites share one, and
 `test-netns` (the `vpn-netns` job) and `test-alerts` each have their own.
+
+### Mutation testing
+
+[cargo-mutants](https://mutants.rs/) changes the code one mutant at a time and
+reports each mutant no test fails on as `missed`: code the tests execute without
+constraining. Run it through these tasks, never bare `cargo mutants`: each one
+hands cargo-mutants' copies of the tree the cached native prefix, which a copy
+cannot find for itself (mise.toml's mutants section says why). Results land in
+`target/mutants.out`; `.cargo/mutants.toml` holds the settings every run shares.
+
+| Task | Mutates |
+| --- | --- |
+| `mise run mutants <crate> [--file <glob>]... [-- <flags>]` | one crate, or the files in it each `--file` glob matches; flags after `--` go to cargo-mutants (`-- --list`, `-- --iterate`) |
+| `mise run mutants-diff [base]` | the Rust lines changed since `base` (default `origin/master`), uncommitted edits included |
+| `mise run mutants-shard <k/n>` | shard `k` (from 0) of `n` of every mutant in the workspace |
+| `mise run mutants-netns` | the kill switch and WireGuard, with their ignored real-kernel tests included, in a network namespace; needs what `test-netns` needs |
+
+The files `mutants-netns` covers (mise.toml's `TORRENTD_MUTANTS_NETNS`) are left
+out of `mutants-diff` and `mutants-shard`, whose runs cannot reach their decisive
+tests. The `Mutants` workflow is advisory for now, so a missed mutant never fails
+a check: on a pull request it runs `mutants-diff` against the base, capped at 90
+minutes, and nightly it runs `mutants-shard` in eight shards and `mutants-netns`
+beside them. Each job uploads its `mutants.out` as an artifact.
 
 Deploying it for real — packages, submodules, the service user, directories,
 config, auth bootstrap, ulimits, and the drills worth running once before you

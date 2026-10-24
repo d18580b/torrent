@@ -16,6 +16,8 @@
 #   mise run drill-ipv6-egress|drill-natpmp-fence
 #   mise run drill-route-fence <iface> [profile_id]
 #   mise run bench -- <subcommand>
+#   mise run mutants <crate> [--file <glob>]... [-- <cargo-mutants flags>]
+#   mise run mutants-diff [base]|mutants-shard <k/n>|mutants-netns
 
 # The oldest mise these tasks are run on: the version CI pins in
 # .github/actions/setup-rust. An older mise refuses this file rather than
@@ -30,6 +32,9 @@ hk = "1.48.0"
 # Supply-chain policy (deny.toml): advisories, licenses, bans, sources. The
 # cargo backend fetches the prebuilt binary through cargo-binstall.
 "cargo:cargo-deny" = "0.20.2"
+# Mutation testing (the mutants tasks below, .cargo/mutants.toml). Prebuilt
+# through cargo-binstall like the two above.
+"cargo:cargo-mutants" = "27.1.0"
 # pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
 # Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
 
@@ -55,6 +60,12 @@ RUSTFMT_TOOLCHAIN = "nightly-2026-10-22"
 # shell exports: one value means one build cache shared by every task, and a
 # developer's own codegen flags belong in a cargo config, not in RUSTFLAGS.
 RUSTFLAGS = "-D warnings"
+# The files whose decisive tests need a real kernel network stack (the
+# `#[ignore]`d nft and live-link tests test-netns runs). mutants-netns mutates
+# exactly these, inside a network namespace with the ignored tests included;
+# mutants-shard leaves them out, so no mutant is reported by two runs that
+# consulted different tests.
+TORRENTD_MUTANTS_NETNS = "crates/torrentd/src/vpn/killswitch.rs crates/torrentd/src/vpn/wireguard.rs"
 
 [tasks.fmt]
 description = "Check formatting (nightly rustfmt)"
@@ -271,6 +282,148 @@ run = [
 [tasks.bench]
 description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM). --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
 run = "cargo run --release -p torrentd-bench --"
+
+# Mutation testing: cargo-mutants changes the code one mutant at a time and
+# reports each one no test failed on (`missed`). It builds every mutant in a
+# copy of the tree outside this checkout, and in that copy libtorrent-sys's
+# build script cannot name the vendored libtorrent: the copy has no `.git`, so
+# it falls back to hashing marker files that are absent whenever the vendor
+# submodules are (CI on a native-cache hit), misses the cached prefix, and
+# tries to build libtorrent from sources that are not there. Every task below
+# therefore hands the copy LIBTORRENT_SYS_PREFIX (CONTRIBUTING.md, Build),
+# which skips that lookup and links the prefix this checkout already uses.
+# Settings every run shares are in .cargo/mutants.toml; results land in
+# target/mutants.out.
+#
+# The prefix variable wants libtorrent and Boost under one directory, and the
+# cache keeps them side by side (`lt-<key>/libtorrent`, `lt-<key>/boost`), so
+# this links the two into target/mutants-native/lt-<key> and writes that path
+# to target/mutants-native/prefix. The prefix is whichever one
+# `cargo build -p libtorrent-sys` resolves here, provisioning it if need be;
+# its link-search line names it. A LIBTORRENT_SYS_PREFIX already in the
+# environment (a system libtorrent) is used as it is.
+[tasks.mutants-native]
+description = "Link the cached libtorrent prefix where the mutants tasks hand it to cargo-mutants' copies"
+hide = true
+run = '''
+set -eu
+out="$PWD/target/mutants-native"
+mkdir -p "$out"
+if [ -n "${LIBTORRENT_SYS_PREFIX:-}" ]; then
+  printf '%s\n' "$LIBTORRENT_SYS_PREFIX" > "$out/prefix"
+  exit 0
+fi
+libdir=$(cargo build -p libtorrent-sys --message-format=json-render-diagnostics \
+  | grep -o '"native=[^"]*/lt-[0-9a-f]*/libtorrent/lib[0-9]*"' | head -n 1 | tr -d '"')
+libdir=${libdir#native=}
+if [ -z "$libdir" ]; then
+  echo "::error::cargo build -p libtorrent-sys named no lt-<key> prefix"
+  exit 1
+fi
+lt=${libdir%/libtorrent/*}
+prefix="$out/$(basename "$lt")"
+rm -rf "$prefix"
+mkdir -p "$prefix/include"
+ln -s "$lt/libtorrent/include/libtorrent" "$prefix/include/libtorrent"
+ln -s "$lt/boost/include/boost" "$prefix/include/boost"
+ln -s "$libdir" "$prefix/$(basename "$libdir")"
+printf '%s\n' "$prefix" > "$out/prefix"
+'''
+
+# One crate, or the files in it that --file names. Flags after `--` go to
+# cargo-mutants, e.g. `-- --list`, `-- --shard 0/8` or `-- --iterate`; mise
+# consumes one `--` itself, so arguments for cargo test or the test binary go
+# through cargo-mutants' own --cargo-test-arg rather than a further `--`.
+#
+#   mise run mutants torrentd --file crates/torrentd/src/auth.rs
+#   mise run mutants torrentd-pool -- --list
+[tasks.mutants]
+description = "cargo-mutants over one crate, or the files in it --file names"
+depends = ["mutants-native"]
+usage = '''
+arg "<crate>" help="The workspace package whose code is mutated, e.g. torrentd"
+flag "-f --file <glob>" var=#true help="Mutate only files this glob matches (repeatable); a glob containing a slash matches the whole path"
+arg "[flags]" var=#true required=#false help="Further cargo-mutants flags, after --"
+'''
+run = '''
+set -eu
+# mise shell-quotes each value (vpn-check says why `eval set --` is the
+# form that round-trips it); each glob becomes a `--file GLOB` pair.
+eval "set -- ${usage_file:-}"
+n=$#
+for glob do
+  set -- "$@" --file "$glob"
+done
+shift "$n"
+eval "set -- \"\$@\" ${usage_flags:-}"
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) \
+  cargo mutants --package "$usage_crate" --output target "$@"
+'''
+
+# The mutants in the Rust lines a branch changes, across the workspace: what
+# the pull-request job runs. The diff runs from the merge base to the working
+# tree, so uncommitted edits count. With no Rust line changed it builds
+# nothing and exits 0.
+[tasks.mutants-diff]
+description = "cargo-mutants over the Rust lines changed since a base ref, less the netns files"
+usage = '''
+arg "[base]" default="origin/master" help="The ref the change is measured from (its merge base with the working tree)"
+'''
+run = '''
+set -eu
+mkdir -p target
+git diff --merge-base "$usage_base" -- '*.rs' > target/mutants.diff
+if [ ! -s target/mutants.diff ]; then
+  echo "no Rust line changed since $usage_base; nothing to mutate"
+  exit 0
+fi
+mise run mutants-native
+set --
+for f in $TORRENTD_MUTANTS_NETNS; do
+  set -- "$@" --exclude "$f"
+done
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) \
+  cargo mutants --workspace --in-diff target/mutants.diff --output target "$@"
+'''
+
+# One shard of every mutant in the workspace: the nightly job's unit.
+[tasks.mutants-shard]
+description = "One shard (k/n, k from 0) of cargo-mutants over the whole workspace, less the netns files"
+depends = ["mutants-native"]
+usage = '''
+arg "<shard>" help="k/n: shard k, counted from 0, of n, e.g. 0/8"
+'''
+run = '''
+set -eu
+set --
+for f in $TORRENTD_MUTANTS_NETNS; do
+  set -- "$@" --exclude "$f"
+done
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) \
+  cargo mutants --workspace --shard "$usage_shard" --output target "$@"
+'''
+
+# The netns files, each mutant tested by the binary's tests in their modules
+# with the ignored ones included, inside a user and network namespace as
+# test-netns's first namespace runs them: same host needs, and the same skip
+# of the live-link test that has to run as a uid other than 0. Crates are
+# fetched before entering the namespace, which has no network.
+[tasks.mutants-netns]
+description = "cargo-mutants over the kill switch and WireGuard, with their real-kernel tests, in a network namespace"
+depends = ["mutants-native"]
+run = '''
+set -eu
+cargo fetch --locked
+set --
+for f in $TORRENTD_MUTANTS_NETNS; do
+  set -- "$@" --file "$f"
+done
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) CARGO_NET_OFFLINE=true \
+  unshare --user --map-root-user --net -- \
+  cargo mutants --package torrentd --output target "$@" \
+  -- --bin torrentd -- --include-ignored --test-threads=1 \
+  --skip live_link_the_kill_switch killswitch:: wireguard::
+'''
 
 # The HTTP API's OpenAPI document, derived from the handlers by kynos and
 # committed so a change to the contract shows up in review. `openapi-check` is

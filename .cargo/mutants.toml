@@ -1,0 +1,9 @@
+# cargo-mutants settings every run shares. Run it through mise.toml's mutants
+# tasks rather than bare `cargo mutants`: they hand each copy of the tree the
+# cached libtorrent prefix, without which the copy tries to build libtorrent
+# from vendor sources it does not have (mise.toml says why).
+
+# mise.toml's RUSTFLAGS denies warnings, and a mutant that replaces a function
+# body routinely leaves a parameter or import unused. Uncapped, every such
+# mutant fails to build and is reported unviable instead of being tested.
+cap_lints = true
