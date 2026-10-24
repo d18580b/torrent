@@ -52,6 +52,23 @@ git_tag_name = "v{{ version }}"
 git_release_enable = true
 git_release_name = "v{{ version }}"
 git_release_latest = true
+git_release_body = """
+{{ changelog }}
+
+### Assets
+
+- `torrent-{{ version }}-x86_64-unknown-linux-gnu.tar.gz`: `torrentd` and \
+`torrentctl` for x86_64 glibc Linux, with the sample configs, the systemd \
+unit, LICENSE, README.md and CHANGELOG.md.
+- `torrentctl-{{ version }}-x86_64-unknown-linux-musl.tar.gz`: a static \
+`torrentctl` for any x86_64 Linux.
+- `SHA256SUMS`, a `.sigstore.json` Sigstore bundle per file, and an SPDX SBOM.
+- The image `ghcr.io/d18580b/torrent:{{ version }}`.
+
+Every file and the image are signed by this repository's release workflow \
+and carry a build-provenance attestation. README.md § *Install* says how to \
+verify them before you run anything.
+"""
 
 [[package]]
 name = "torrentctl"
