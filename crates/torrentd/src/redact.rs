@@ -378,15 +378,23 @@ fn redact_url(url: &str, scheme_len: usize, depth: usize, mode: Mode) -> Option<
     ))
 }
 
+/// Fixtures the redactor's tests and the log layer's share.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A 32-hex tracker passkey, a credential shape `redact_urls` knows.
+    pub(crate) const PASSKEY: &str = "0123456789abcdef0123456789abcdef";
+
+    /// `s` as the log redactor writes it.
+    pub(crate) fn redacted(s: &str) -> String {
+        super::redact_urls(s).into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::redacted;
+    use super::test_support::PASSKEY;
     use super::*;
-
-    const PASSKEY: &str = "0123456789abcdef0123456789abcdef";
-
-    fn redacted(s: &str) -> String {
-        redact_urls(s).into_owned()
-    }
 
     #[test]
     fn a_url_shown_by_the_api_never_carries_its_credential() {

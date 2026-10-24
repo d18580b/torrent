@@ -215,12 +215,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const PASSKEY: &str = "0123456789abcdef0123456789abcdef";
-
-    fn redacted(s: &str) -> String {
-        redact_urls(s).into_owned()
-    }
+    use crate::redact::test_support::redacted;
+    use crate::redact::test_support::PASSKEY;
 
     #[test]
     fn the_daemon_layer_holds_libtorrent_messages_to_the_host_only_rule() {
