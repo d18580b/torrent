@@ -23,6 +23,7 @@ use torrentd_engine::ProfileId;
 use tracing::info;
 
 use crate::app_state::AppState;
+use crate::bulk_adopt::in_parallel;
 use crate::http::page::page;
 use crate::http::page::paginate;
 use crate::http::page::InvalidCursor;
@@ -1099,7 +1100,8 @@ pub async fn adopt_pool_torrents(
 const UNCHECKED_PAYLOAD: &str = "payload could not be checked for changes since the scan: its root or disk is unreadable or unmounted, or a file could not be stated (the log names it); make it readable, then adopt again";
 
 /// [`adopt_pool_torrents`] past its up-front checks: resolve the targets and
-/// adopt, or refuse, each in turn.
+/// adopt, or refuse, each ([`adopt_one`]), several at once
+/// ([`crate::bulk_adopt`]).
 fn adopt_each(
     s: &AppState,
     pool: &PoolService,
@@ -1162,98 +1164,25 @@ fn adopt_each(
         refused: Vec::new(),
         verify_bytes: 0,
     };
-
-    for (ih, infohash) in targets {
-        let refuse = |resp: &mut AdoptionResult, reason: String| {
-            resp.refused.push(RefusedTorrent { infohash, reason });
-        };
-        if unchecked.contains(ih.as_str()) {
-            refuse(&mut resp, UNCHECKED_PAYLOAD.to_owned());
-            continue;
-        }
-        // Refused, not a 500: by now earlier targets may already be claimed
-        // and loaded, and a failure here must leave the response saying
-        // exactly which. The cause is logged; the reason says only that the
-        // index could not be read for this torrent.
-        let plan = match pool.adopt_plan(&ih) {
-            Ok(plan) => plan,
-            Err(e) => {
-                refuse(
-                    &mut resp,
-                    internal("reading the pool index for this torrent", e),
-                );
-                continue;
+    let outcomes = in_parallel(
+        &targets,
+        |(ih, _)| ih.as_str(),
+        |(ih, infohash)| {
+            if unchecked.contains(ih.as_str()) {
+                return Outcome::Refused(UNCHECKED_PAYLOAD.to_owned());
             }
-        };
-
-        // The plan is read here only to refuse before the registry claim: the
-        // two adoptable plans take the same steps below — the claim above all
-        // — and holding them in two branches is how they came to hold in
-        // neither. Which bucket a torrent lands in is not the plan's to say: a
-        // fast-path plan falls back to verification where its resume data
-        // will not do, so it is what `PoolService::adopt` did.
-        if let torrentd_pool::AdoptPlan::Refuse { reason } = plan {
-            refuse(&mut resp, reason.to_owned());
-            continue;
-        }
-
-        // Counted only once it is taken, so a refused torrent's bytes are not.
-        let accept = |resp: &mut AdoptionResult, adopted: Adopted| {
-            let verifies = adopted == Adopted::QueuedForVerification;
-            if verifies {
-                resp.verify_bytes += pool.total_size(&ih);
+            adopt_one(s, pool, req, profile, ih, *infohash)
+        },
+    );
+    // In the order the targets were named, whichever finished first.
+    for ((_, infohash), outcome) in targets.into_iter().zip(outcomes) {
+        match outcome {
+            Outcome::FastPath => resp.fast_path.push(infohash),
+            Outcome::Queued { bytes } => {
+                resp.verify_bytes += bytes;
+                resp.queued_for_verification.push(infohash);
             }
-            bucket(resp, verifies).push(infohash);
-        };
-        // Refusals that keep one account's torrent out of another are counted
-        // where every add path counts them — by the adoption, not its dry run,
-        // which changes nothing.
-        let isolation_refused = || {
-            if !req.dry_run {
-                s.metrics.inc_counter(
-                    "profile_assignment_registry_errors_total",
-                    &[("profile_id", profile.as_str())],
-                );
-            }
-        };
-        if let Err(reason) = check_index_owner(pool, &ih, profile) {
-            isolation_refused();
-            refuse(&mut resp, reason);
-            continue;
-        }
-        if req.dry_run {
-            // Everything up to the add, the account-isolation guard included,
-            // so a dry run refuses what the adoption would.
-            match pool.adopt(&s.source, &s.profiles, &ih, profile.clone(), true) {
-                Ok(adopted) => accept(&mut resp, adopted),
-                Err(r) => refuse(&mut resp, r.reason),
-            }
-            continue;
-        }
-
-        // Safety Rules 3 and 4, in the order they are written: the registry is
-        // the authority on which profile owns an info-hash, and it is consulted
-        // *before* any session receives the torrent.
-        //
-        // Claiming afterwards could not enforce anything. libtorrent refuses a
-        // duplicate within one session, but a profile is a whole separate
-        // session by construction, so an info-hash already seeding in profile A
-        // was free to be adopted into profile B and start announcing from a
-        // second account — the permanent-ban case Rule 3 exists for — while the
-        // conflict was recorded as a warning after the fact.
-        if let Err(reason) = claim_in_registry(s, infohash, profile) {
-            refuse(&mut resp, reason);
-            continue;
-        }
-        match pool.adopt(&s.source, &s.profiles, &ih, profile.clone(), false) {
-            Ok(adopted) => accept(&mut resp, adopted),
-            Err(r) => {
-                release_claim(s, infohash);
-                if r.isolation {
-                    isolation_refused();
-                }
-                refuse(&mut resp, r.reason);
-            }
+            Outcome::Refused(reason) => resp.refused.push(RefusedTorrent { infohash, reason }),
         }
     }
 
@@ -1270,12 +1199,101 @@ fn adopt_each(
     Ok(resp)
 }
 
-/// Which result bucket an adopted torrent belongs in.
-fn bucket(resp: &mut AdoptionResult, verifies: bool) -> &mut Vec<InfoHashHex> {
-    if verifies {
-        &mut resp.queued_for_verification
-    } else {
-        &mut resp.fast_path
+/// What [`adopt_one`] did with one target, and so where the response lists it.
+#[derive(Debug)]
+enum Outcome {
+    FastPath,
+    /// Queued to be hashed: `bytes` is what verifying it reads.
+    Queued {
+        bytes: u64,
+    },
+    Refused(String),
+}
+
+/// Adopt, or refuse, one target past the drift check: the steps
+/// `POST /v1/pool/adoptions` takes for each torrent, in order.
+fn adopt_one(
+    s: &AppState,
+    pool: &PoolService,
+    req: &AdoptRequest,
+    profile: &ProfileId,
+    ih: &str,
+    infohash: InfoHashHex,
+) -> Outcome {
+    // Refused, not a 500: by now other targets may already be claimed and
+    // loaded, and a failure here must leave the response saying exactly
+    // which. The cause is logged; the reason says only that the index could
+    // not be read for this torrent.
+    let plan = match pool.adopt_plan(ih) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return Outcome::Refused(internal("reading the pool index for this torrent", e));
+        }
+    };
+
+    // The plan is read here only to refuse before the registry claim: the
+    // two adoptable plans take the same steps below — the claim above all
+    // — and holding them in two branches is how they came to hold in
+    // neither. Which bucket a torrent lands in is not the plan's to say: a
+    // fast-path plan falls back to verification where its resume data
+    // will not do, so it is what `PoolService::adopt` did.
+    if let torrentd_pool::AdoptPlan::Refuse { reason } = plan {
+        return Outcome::Refused(reason.to_owned());
+    }
+
+    // Counted only once it is taken, so a refused torrent's bytes are not.
+    let accept = |adopted: Adopted| match adopted {
+        Adopted::FastPath => Outcome::FastPath,
+        Adopted::QueuedForVerification => Outcome::Queued {
+            bytes: pool.total_size(ih),
+        },
+    };
+    // Refusals that keep one account's torrent out of another are counted
+    // where every add path counts them — by the adoption, not its dry run,
+    // which changes nothing.
+    let isolation_refused = || {
+        if !req.dry_run {
+            s.metrics.inc_counter(
+                "profile_assignment_registry_errors_total",
+                &[("profile_id", profile.as_str())],
+            );
+        }
+    };
+    if let Err(reason) = check_index_owner(pool, ih, profile) {
+        isolation_refused();
+        return Outcome::Refused(reason);
+    }
+    if req.dry_run {
+        // Everything up to the add, the account-isolation guard included,
+        // so a dry run refuses what the adoption would.
+        return match pool.adopt(&s.source, &s.profiles, ih, profile.clone(), true) {
+            Ok(adopted) => accept(adopted),
+            Err(r) => Outcome::Refused(r.reason),
+        };
+    }
+
+    // Safety Rules 3 and 4, in the order they are written: the registry is
+    // the authority on which profile owns an info-hash, and it is consulted
+    // *before* any session receives the torrent.
+    //
+    // Claiming afterwards could not enforce anything. libtorrent refuses a
+    // duplicate within one session, but a profile is a whole separate
+    // session by construction, so an info-hash already seeding in profile A
+    // was free to be adopted into profile B and start announcing from a
+    // second account — the permanent-ban case Rule 3 exists for — while the
+    // conflict was recorded as a warning after the fact.
+    if let Err(reason) = claim_in_registry(s, infohash, profile) {
+        return Outcome::Refused(reason);
+    }
+    match pool.adopt(&s.source, &s.profiles, ih, profile.clone(), false) {
+        Ok(adopted) => accept(adopted),
+        Err(r) => {
+            release_claim(s, infohash);
+            if r.isolation {
+                isolation_refused();
+            }
+            Outcome::Refused(r.reason)
+        }
     }
 }
 

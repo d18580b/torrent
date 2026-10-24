@@ -23,6 +23,7 @@ mod api_socket;
 mod app_state;
 mod apply;
 mod auth;
+mod bulk_adopt;
 mod check_queue;
 mod cli;
 mod config;

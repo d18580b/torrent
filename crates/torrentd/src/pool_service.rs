@@ -43,6 +43,9 @@ pub struct PoolService {
     /// held, applied by whoever takes the writer next: see
     /// [`PoolService::release_owner_soon`].
     deferred_releases: Mutex<Vec<DeferredRelease>>,
+    /// Adoptions' index writes, committed together: see
+    /// [`PoolService::with_store_grouped`].
+    group: crate::bulk_adopt::GroupCommit,
     /// Root id → absolute path, resolved once at startup from config.
     roots: Vec<(i64, PathBuf)>,
     library_dir: PathBuf,
@@ -135,6 +138,7 @@ impl PoolService {
             store: Mutex::new(store),
             reader: Mutex::new(reader),
             deferred_releases: Mutex::new(Vec::new()),
+            group: crate::bulk_adopt::GroupCommit::default(),
             roots,
             library_dir: pool_cfg.library_dir.clone(),
             verify: Arc::new(VerifyQueue::new(pool_cfg.max_concurrent_verify)),
@@ -679,6 +683,19 @@ impl PoolService {
     /// [`PoolService::with_store`], mutably.
     pub fn with_store_mut<T>(&self, f: impl FnOnce(&mut PoolStore) -> T) -> T {
         off_worker(|| f(&mut self.lock_writer()))
+    }
+
+    /// [`PoolService::with_store_mut`] in a transaction shared with the other
+    /// writes queued for the writer meanwhile, so the adoptions of one bulk
+    /// request share commits, and so fsyncs
+    /// ([`crate::bulk_adopt::GroupCommit`]). Returns once `f`'s writes are
+    /// committed; `Err` is the transaction's own failure, after which none
+    /// of them are in the index.
+    pub(crate) fn with_store_grouped<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut PoolStore) -> T + Send + 'static,
+    ) -> Result<T, String> {
+        off_worker(|| self.group.run(|| self.lock_writer(), f))
     }
 
     /// Take the writer, first applying every owner release
@@ -1435,10 +1452,14 @@ fn execute_adopt(
                 }
             }
 
-            let (adoption, owner) = pool.with_store(|s| {
-                let base = s.adoption_base(infohash).ok().flatten();
+            // Both records in one transaction, shared with the other targets'
+            // in flight: the index is synchronous=FULL, so every commit waits
+            // on its own fsync, and a bulk adopt waited on each in turn.
+            let (ih, owner) = (infohash.to_owned(), profile.as_str().to_owned());
+            let recorded = pool.with_store_grouped(move |s| {
+                let base = s.adoption_base(&ih).ok().flatten();
                 let adoption = s.set_adoption(
-                    infohash,
+                    &ih,
                     AdoptionState::Adopted,
                     base.as_ref().map(|(r, _)| *r),
                     base.as_ref().map(|(_, b)| b.as_str()),
@@ -1446,13 +1467,22 @@ fn execute_adopt(
                     None,
                     None,
                 );
-                (adoption, s.set_profile(infohash, Some(profile.as_str())))
+                (adoption, s.set_profile(&ih, Some(&owner)))
             });
-            if let Err(e) = adoption {
-                pool.note_store_error("set_adoption", &e);
-            }
-            if let Err(e) = owner {
-                pool.note_store_error("set_profile", &e);
+            match recorded {
+                Ok((adoption, owner)) => {
+                    if let Err(e) = adoption {
+                        pool.note_store_error("set_adoption", &e);
+                    }
+                    if let Err(e) = owner {
+                        pool.note_store_error("set_profile", &e);
+                    }
+                }
+                // Neither record reached the index.
+                Err(e) => {
+                    pool.note_store_error("set_adoption", &e);
+                    pool.note_store_error("set_profile", &e);
+                }
             }
             Ok(Adopted::FastPath)
         }
@@ -1515,31 +1545,53 @@ pub(crate) fn enqueue_verify(
     if dry_run {
         return Ok(Adopted::QueuedForVerification);
     }
-    // An owner record that already names this profile is not the enqueue's,
-    // so a drop leaves it; one the enqueue writes goes with the item.
-    let recorded = pool.with_store(|s| match s.profile_of(infohash) {
-        Ok(Some(owner)) if owner == profile.as_str() => Ok(false),
-        _ => s
-            .set_profile(infohash, Some(profile.as_str()))
-            .map(|()| true),
-    });
-    let owner_recorded = recorded.unwrap_or_else(|e| {
-        pool.note_store_error("set_profile", &e);
-        false
-    });
-    let item = PendingVerify {
+    let mut item = PendingVerify {
         infohash: infohash.to_string(),
         torrent_path,
         save_path,
         profile,
-        owner_recorded,
+        owner_recorded: false,
         trackers,
     };
-    // Kept in `pool.db` too, so a restart queues it again rather than leave
-    // the adoption's claim with nothing to load it. A failed write still
-    // queues it: it is lost only if the daemon stops before the queue adds it.
-    if let Err(e) = pool.with_store(|s| s.enqueue_verify(&item.to_row())) {
-        pool.note_store_error("enqueue_verify", &e);
+    // The owner record and the queue's row in one transaction, shared with
+    // the other targets' in flight, as the fast path writes its two.
+    let row = item.to_row();
+    let written = pool.with_store_grouped(move |s| {
+        // An owner record that already names this profile is not the
+        // enqueue's, so a drop leaves it; one the enqueue writes goes with
+        // the item.
+        let recorded = match s.profile_of(&row.infohash) {
+            Ok(Some(owner)) if owner == row.profile => Ok(false),
+            _ => s
+                .set_profile(&row.infohash, Some(&row.profile))
+                .map(|()| true),
+        };
+        // Kept in `pool.db` too, so a restart queues it again rather than
+        // leave the adoption's claim with nothing to load it. A failed write
+        // still queues it: it is lost only if the daemon stops before the
+        // queue adds it.
+        let row = torrentd_pool::VerifyQueueRow {
+            owner_recorded: matches!(recorded, Ok(true)),
+            ..row
+        };
+        (recorded, s.enqueue_verify(&row))
+    });
+    match written {
+        Ok((recorded, row)) => {
+            item.owner_recorded = matches!(recorded, Ok(true));
+            if let Err(e) = recorded {
+                pool.note_store_error("set_profile", &e);
+            }
+            if let Err(e) = row {
+                pool.note_store_error("enqueue_verify", &e);
+            }
+        }
+        // Neither record reached the index, so there is no owner record for
+        // a drop to clear.
+        Err(e) => {
+            pool.note_store_error("set_profile", &e);
+            pool.note_store_error("enqueue_verify", &e);
+        }
     }
     pool.verify_queue().enqueue(item);
     Ok(Adopted::QueuedForVerification)
@@ -2396,7 +2448,7 @@ pub(crate) mod tests {
     /// A library over `dir` whose one torrent's `.torrent` and `.fastresume`
     /// the scan indexed and paired for a fast-path adopt into `p`, with the
     /// engine that adopt adds to.
-    fn fast_path_library(
+    pub(crate) fn fast_path_library(
         dir: &std::path::Path,
     ) -> (
         std::sync::Arc<super::PoolService>,
