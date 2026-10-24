@@ -1119,8 +1119,11 @@ fn next_page(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
 
 /// After a page: select the torrent being restored when it has arrived,
 /// or page on towards it while it may still come (the list is ordered by
-/// infohash); otherwise keep the selection in range.
+/// infohash). The selection is in range on every path, paging on included:
+/// a reload can show fewer rows than were selectable before it, and the
+/// page it pages on for may never arrive.
 fn settle(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
+    state.selected = state.selected.min(visible(state).len().saturating_sub(1));
     if let Some(want) = state.restore.clone() {
         let rows = visible(state);
         if let Some(at) = rows
@@ -1141,7 +1144,6 @@ fn settle(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
             state.restore = None;
         }
     }
-    state.selected = state.selected.min(visible(state).len().saturating_sub(1));
     load_more(state, ctx)
 }
 
@@ -2098,6 +2100,61 @@ mod tests {
             let msg = page_msg(&state, true, Ok(page(1..4, None)));
             update(&mut state, msg, ctx);
             assert_eq!(state.selected, 2);
+            assert!(state.restore.is_none());
+        });
+    }
+
+    /// The `/` filter shows 11 of rows 3..34; `G` selects the last, row 33.
+    /// A refresh then remembers it, and its first page, rows 1..32, shows
+    /// only 10 under the filter while it pages on towards row 33.
+    fn chasing_past_the_filtered_rows(state: &mut State, ctx: &Ctx<'_>) {
+        update(state, Msg::StartFilter, ctx);
+        keys(state, ctx, "acct_b");
+        update(state, Msg::FilterKey(testing::key(KeyCode::Enter)), ctx);
+        assert_eq!(visible(state).len(), 11);
+        update(state, Msg::Move(Move::Bottom), ctx);
+        assert_eq!(selected_summary(state).unwrap().infohash, hash(33));
+        assert!(state.list.loading, "near the end: the next page");
+        let msg = page_msg(state, false, Ok(page(34..34, None)));
+        update(state, msg, ctx);
+
+        refresh(state, ctx);
+        assert_eq!(state.restore.as_deref(), Some(hash(33).as_str()));
+        let msg = page_msg(state, true, Ok(page(1..32, Some("c32"))));
+        assert_eq!(update(state, msg, ctx).len(), 1, "it pages on towards 33");
+        assert_eq!(visible(state).len(), 10);
+        assert!(
+            selected_summary(state).is_some(),
+            "selected {} of {} rows while paging on",
+            state.selected,
+            visible(state).len()
+        );
+    }
+
+    #[test]
+    fn a_reload_paging_towards_its_torrent_keeps_the_selection_in_range() {
+        let mut state = loaded(3..34, Some("c34"));
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            chasing_past_the_filtered_rows(&mut state, ctx);
+            let msg = page_msg(&state, false, Err(failure(500, "internal", "engine gone")));
+            update(&mut state, msg, ctx);
+            assert!(state.restore.is_none(), "the failed reload will not settle");
+            assert_eq!(state.selected, 9, "the last row shown, not past it");
+            assert_eq!(selected_summary(&state).unwrap().infohash, hash(30));
+        });
+
+        let mut state = loaded(3..34, Some("c34"));
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            chasing_past_the_filtered_rows(&mut state, ctx);
+            let msg = page_msg(&state, false, Ok(page(32..35, None)));
+            update(&mut state, msg, ctx);
+            assert_eq!(
+                selected_summary(&state).unwrap().infohash,
+                hash(33),
+                "the torrent paged towards is selected once it arrives"
+            );
             assert!(state.restore.is_none());
         });
     }
