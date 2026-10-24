@@ -1,0 +1,71 @@
+# What every torrentd-bench subcommand is held to. Compiled into the bench
+# (include_str!), so a run is measured against this file as it stands in the
+# tree it was built from, and a breach exits the bench non-zero.
+#
+# Each budget is a measured run plus headroom, the run named beside it. A
+# budget may only tighten: raising one needs, in the same change, the
+# measured run that shows why the work got slower or bigger.
+
+[alert-throughput]
+# State-map updates per second, at least.
+min_updates_per_sec = 100_000
+
+[memory-scaling]
+# Resident KiB per seeding torrent over the empty session's baseline, at most.
+max_kib_per_torrent = 200
+
+# The synthetic pool `pool-scan`, `pool-match` and `pool-adopt-preview` build,
+# chosen with `--size`. `files` counts every file under the one managed root:
+# `torrents` x `files_per_torrent` sparse payload files the library's
+# torrents match by (path, size), every one a distinct size of 1 MiB or more,
+# and the rest small files nothing claims. Every other torrent carries a
+# `.fastresume` marking every piece had, so the preview takes both paths.
+[sizes.full]
+files = 1_000_000
+torrents = 5_000
+files_per_torrent = 10
+
+# What CI runs on every push.
+[sizes.ci]
+files = 100_000
+torrents = 500
+files_per_torrent = 10
+
+# Per size: the timed phase's wall seconds, and the process's peak resident
+# MiB while it ran (the peak is reset just before it, after the pool is built
+# and any phase it builds on has run).
+#
+# Measured 2026-10-24 on an AMD Ryzen 7 7800X3D (8 cores / 16 threads), the
+# pool on btrfs over NVMe, release build. Wall time is budgeted at about 4x
+# that run, and never under a second, so a slower CI runner passes; peak RSS
+# at about 2x.
+
+# The first scan of the root and the library, from an empty index.
+# Measured: full 14.28 s, 185 MiB; ci 1.16 s, 32 MiB.
+[pool-scan.full]
+max_secs = 60.0
+max_peak_rss_mib = 384
+
+[pool-scan.ci]
+max_secs = 5.0
+max_peak_rss_mib = 64
+
+# Matching the whole library against that index.
+# Measured: full 2.42 s, 33 MiB; ci 0.30 s, 21 MiB.
+[pool-match.full]
+max_secs = 10.0
+max_peak_rss_mib = 64
+
+[pool-match.ci]
+max_secs = 2.0
+max_peak_rss_mib = 48
+
+# Planning an adopt of every matched torrent under the root.
+# Measured: full 3.18 s, 31 MiB; ci 0.08 s, 21 MiB.
+[pool-adopt-preview.full]
+max_secs = 13.0
+max_peak_rss_mib = 64
+
+[pool-adopt-preview.ci]
+max_secs = 1.0
+max_peak_rss_mib = 48
