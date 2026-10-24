@@ -5,7 +5,8 @@ use tracing::Dispatch;
 use tracing::Subscriber;
 
 /// Runs `f` with `subscriber` as this thread's default, so the events `f`
-/// emits reach it however parallel tests touched the same callsites first.
+/// emits reach it even when a parallel test registered the same callsites
+/// first, apart from the narrow window described below.
 ///
 /// `tracing::subscriber::with_default` alone is not enough for a test that
 /// counts or reads events. While a single dispatcher is registered
@@ -17,6 +18,13 @@ use tracing::Subscriber;
 /// dispatcher, `subscriber` included. Creating it, and `subscriber`'s
 /// dispatcher after it, also rebuilds the interest of every callsite already
 /// registered, so one cached as never before this call is corrected too.
+///
+/// One window remains. tracing-core adds a callsite to its registry only
+/// after computing its interest, so a thread with no subscriber that starts
+/// registering a callsite just before `_pin` is created can still compute
+/// that interest from its own default alone, miss the rebuild, and leave
+/// never cached. This narrows the race to that registration instant rather
+/// than closing it.
 pub fn with_subscriber<S, T>(subscriber: S, f: impl FnOnce() -> T) -> T
 where
     S: Subscriber + Send + Sync + 'static,
