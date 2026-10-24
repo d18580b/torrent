@@ -6,7 +6,6 @@
 # change. Never add a line.
 crates/torrentctl/src/screens/torrents.rs
 crates/torrentd-pool/tests/pool.rs
-crates/torrentd/src/config.rs
 crates/torrentd/src/http/tests/torrents.rs
 crates/torrentd/src/http/v1/torrents.rs
 crates/torrentd/src/pool_apply.rs

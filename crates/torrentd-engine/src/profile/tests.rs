@@ -311,7 +311,7 @@ fn ordinary_profile_ids_are_accepted() {
 // profile's fingerprint or user agent, spelled explicitly or inherited
 // from the top-level default — is `Config::validate`'s rule now, because
 // the inherited spelling is not decidable from `&[ProfileConfig]` alone.
-// The tests live beside it, in `crates/torrentd/src/config.rs`.
+// The tests live beside it, in `crates/torrentd/src/config/tests.rs`.
 
 #[test]
 fn a_host_profiles_fingerprint_is_shape_checked_like_any_other() {
