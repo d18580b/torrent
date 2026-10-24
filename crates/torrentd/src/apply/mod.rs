@@ -5,7 +5,7 @@
 //!
 //! * **The journal is written before the action.** Every step is marked in the
 //!   database, attempted, then marked again, a batch of up to
-//!   [`JOURNAL_BATCH`] delete steps per commit. A stop between batches leaves
+//!   [`JOURNAL_BATCH`](executor::JOURNAL_BATCH) delete steps per commit. A stop between batches leaves
 //!   a plan in `applying` with a known last-completed step, which startup
 //!   re-drives; a crash inside a batch leaves its steps `in_progress`.
 //! * **Adopted payload moves through libtorrent.** `move_storage` keeps the

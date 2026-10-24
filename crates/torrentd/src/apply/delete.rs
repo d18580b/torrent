@@ -22,7 +22,7 @@ mod tests;
 ///
 /// 1. No torrent claims the file *now*, not when the plan was drafted.
 /// 2. The index is a complete account of what is protected — checked once per
-///    apply in [`apply`], since it is a property of the whole plan rather than
+///    apply in [`apply`](super::apply), since it is a property of the whole plan rather than
 ///    of one file.
 /// 3. The file on disk is still the file that was indexed. A `(size, mtime,
 ///    inode, device)` match is the same evidence `drift` trusts; anything

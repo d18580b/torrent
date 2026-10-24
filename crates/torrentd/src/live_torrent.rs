@@ -39,7 +39,8 @@ pub fn read_live_torrent(
     })
 }
 
-/// Another torrent a session holds, as [`TorrentPayload::shared_with`]
+/// Another torrent a session holds, as
+/// [`TorrentPayload::shared_with`](crate::pool_trash::TorrentPayload::shared_with)
 /// compares it: where its session says its payload lies.
 #[derive(Debug)]
 pub struct LiveTorrent {
@@ -53,8 +54,9 @@ pub struct LiveTorrent {
 impl LiveTorrent {
     /// The first path at which this torrent serves a file from under `dir`,
     /// or `None` when it serves none from there: the directory-level
-    /// counterpart of [`TorrentPayload::shared_with`], for a move that
-    /// renames `dir` whole.
+    /// counterpart of
+    /// [`TorrentPayload::shared_with`](crate::pool_trash::TorrentPayload::shared_with),
+    /// for a move that renames `dir` whole.
     ///
     /// Paths are compared as the session spells them and with their
     /// symlinks resolved, on both sides, so a save path reaching `dir`
