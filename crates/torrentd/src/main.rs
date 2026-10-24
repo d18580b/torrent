@@ -25,6 +25,7 @@ mod auth;
 mod cli;
 mod config;
 mod http;
+mod instance_lock;
 mod metrics_sink;
 mod net_cmd;
 mod pacing;
