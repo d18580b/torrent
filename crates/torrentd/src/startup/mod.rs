@@ -197,7 +197,7 @@ pub struct DaemonHandle {
     metrics: Arc<PromSink>,
     pool: Option<Arc<crate::pool_service::PoolService>>,
     /// The daemon's bound on hash checks, the pool's queue where there is one.
-    checks: Arc<crate::pool_service::VerifyQueue>,
+    checks: Arc<crate::check_queue::VerifyQueue>,
     registry: Arc<AssignmentRegistry>,
     profile_registry: Arc<ProfileRegistry>,
     /// The kill-switch watch's fence, where the nftables kill switch was
@@ -755,12 +755,12 @@ pub async fn boot(
     // The daemon's one bound on hash checks, and the record of the
     // `.torrent`s it held paused for a slot when the daemon stopped: the
     // scans load each paused, and it queues them again.
-    let checks = crate::pool_service::VerifyQueue::for_daemon(pool.as_deref());
+    let checks = crate::check_queue::VerifyQueue::for_daemon(pool.as_deref());
     checks.set_metrics(metrics.clone());
     {
         let path = cfg
             .profile_state_path()
-            .with_file_name(crate::pool_service::CHECK_HOLDS_FILE);
+            .with_file_name(crate::check_queue::CHECK_HOLDS_FILE);
         let shown = path.display().to_string();
         let (holds, unreadable) =
             tokio::task::spawn_blocking(move || crate::profile_state::PacedHolds::load(path))
@@ -1112,7 +1112,7 @@ impl DaemonHandle {
         spawn_supervised(
             "verify_queue",
             metrics.clone(),
-            crate::pool_service::run_verify_queue(
+            crate::check_queue::run_verify_queue(
                 Arc::clone(&checks),
                 pool.clone(),
                 source.clone(),

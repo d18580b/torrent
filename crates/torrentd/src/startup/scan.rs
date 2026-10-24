@@ -521,7 +521,7 @@ pub(super) struct ScanInputs<'a> {
     pub(super) metrics: &'a PromSink,
     pub(super) state: &'a StateMap,
     pub(super) pool: Option<&'a crate::pool_service::PoolService>,
-    pub(super) checks: &'a crate::pool_service::VerifyQueue,
+    pub(super) checks: &'a crate::check_queue::VerifyQueue,
     pub(super) checked_hold: &'a CheckedHold<'a>,
     pub(super) boot_progress: &'a sd_notify::Progress,
 }
@@ -1182,7 +1182,7 @@ pub(super) async fn torrent_dir_scan(
                         checks.enqueue_add(
                             profile.clone(),
                             ih,
-                            crate::pool_service::CheckSource::TorrentDir,
+                            crate::check_queue::CheckSource::TorrentDir,
                         );
                     }
                     scan_fence.added(profile_registry, metrics, &profile, h);
@@ -1327,9 +1327,9 @@ mod tests {
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
 
-        use crate::pool_service::CheckSource;
-        use crate::pool_service::VerifyQueue;
-        use crate::pool_service::CHECK_HOLDS_FILE;
+        use crate::check_queue::CheckSource;
+        use crate::check_queue::VerifyQueue;
+        use crate::check_queue::CHECK_HOLDS_FILE;
         use crate::profile_state::PacedHolds;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1416,7 +1416,7 @@ mod tests {
                 .collect()
         };
         let tick = |q: &VerifyQueue| {
-            crate::pool_service::admit_tick_for_tests(
+            crate::check_queue::admit_tick_for_tests(
                 q, None, &source, &state, &profiles, &registry,
             );
         };

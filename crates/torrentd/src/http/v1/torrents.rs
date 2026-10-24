@@ -1047,7 +1047,7 @@ fn add_and_settle(
         s.checks.enqueue_add(
             profile_id.clone(),
             infohash,
-            crate::pool_service::CheckSource::Add,
+            crate::check_queue::CheckSource::Add,
         );
     }
     // `unfenced_engine` let this add through, but a fence can have landed
@@ -2203,11 +2203,7 @@ pub async fn recheck_torrent(
     }
     let state = Arc::clone(&s);
     blocking(move || {
-        crate::pool_service::force_recheck_marking_checking(
-            engine.as_ref(),
-            &state.state,
-            st.handle,
-        )
+        crate::check_queue::force_recheck_marking_checking(engine.as_ref(), &state.state, st.handle)
     })
     .await
     .map_err(|e| UnfencedControlError::Internal {
