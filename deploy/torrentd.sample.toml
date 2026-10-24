@@ -357,7 +357,9 @@ dht               = true
 # Point torrentd at the directories it should own and at a directory of
 # `.torrent` files to match them against. It indexes both and reports, per
 # path, what is adopted, matched, partial, missing, orphaned, or claimed by
-# two torrents at once — which is what makes a multi-terabyte library legible.
+# two torrents at once — which is what makes a large library legible. A million
+# files and 5,000 torrents index in 14 s and match in 2.4 s on an 8-core
+# desktop over NVMe (`mise run bench -- pool-scan`; crates/torrentd-bench).
 #
 # Migrating from another client is not a special mode: set `library_dir` to
 # that client's state directory and scan. qBittorrent's BT_backup holds both
@@ -376,8 +378,8 @@ dht               = true
 #
 # Every root and library_dir must exist and, under the packaged unit, be
 # listed in ReadWritePaths= (a drop-in: `systemctl edit torrentd`). [pool] is
-# not reloadable: adding or changing it takes a restart. The import runbook,
-# multi-terabyte libraries included, is docs/import.md.
+# not reloadable: adding or changing it takes a restart. The import runbook is
+# docs/import.md.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest

@@ -11,7 +11,12 @@ which torrents point at data that moved or vanished.
 
 ## Features
 
-- [x] **Seeds torrents whose payload already exists on disk**, at library scale
+- [x] **Seeds torrents whose payload already exists on disk**, at library
+      scale: a million files under one root and 5,000 torrents over 5.2 TB
+      of payload index in 14 s, match in 2.4 s and preview an adopt in 3.2 s
+      (`mise run bench -- pool-scan`, `pool-match`, `pool-adopt-preview` on
+      an 8-core desktop over NVMe; CI holds a tenth of that size to
+      `crates/torrentd-bench/budgets.toml`)
 - [x] **Never downloads payload.** Every add carries libtorrent's `upload_mode`
       — "will not make any piece requests" — so the guarantee survives magnets,
       hash failures and rechecks. Magnet *metadata* still arrives.
@@ -104,8 +109,7 @@ torrentd --config … pool orphans   # unclaimed bytes, 40 entries per root
 torrentd --config … pool orphans --limit 200   # more of them
 ```
 
-The step-by-step migration, multi-terabyte libraries included, is
-[`docs/import.md`](docs/import.md).
+The step-by-step migration is [`docs/import.md`](docs/import.md).
 
 Adoption is tiered too: if the previous client's `.fastresume` says the
 torrent was complete and every file still matches the index, it is added in
@@ -495,7 +499,8 @@ mise run openapi-check   # fail if the committed document is stale
 mise run unit-check      # systemd-analyze verify deploy/torrentd.service and its safety directives
 mise run test-alerts     # promtool over deploy/prometheus (needs podman or docker)
 mise run test-all        # test and every test-* task above, in turn (so test-netns's namespaces too); not check, deny or openapi-check
-mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
+mise run bench -- memory-scaling --count 50000   # Layer 4: each subcommand fails on a breach of crates/torrentd-bench/budgets.toml
+mise run bench -- pool-scan --size ci            # the pool at the size CI runs; the default, full, takes minutes
 ```
 
 `mise run vpn-check <config> [-- <flags>]` runs `vpn check` (see

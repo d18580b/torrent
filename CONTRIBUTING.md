@@ -1,6 +1,8 @@
 # Contributing to torrentd
 
-`torrentd` is a headless petabyte-scale torrent seeding daemon. The full architecture and
+`torrentd` is a headless torrent seeding daemon for libraries already on disk; how large a
+library it has been measured at is what `mise run bench` reports, against
+[`crates/torrentd-bench/budgets.toml`](./crates/torrentd-bench/budgets.toml). The full architecture and
 non-goals are spelled out in [`README.md`](./README.md) and
 [`docs/running.md`](./docs/running.md). Read them before starting.
 
@@ -182,7 +184,7 @@ Every test command is a mise task, and CI runs the same tasks:
 | `mise run test-netns` | the VPN in a real kernel: the kill switch's nft rules, WireGuard's live links, the listen device, and the daemon end to end over a real tunnel, each in a private network namespace. Needs unprivileged user namespaces, `nft`, `wg`, `ip`, `unshare` and `nsenter` (util-linux 2.38 or later, for `unshare --map-user`), an `/etc/wireguard` directory (`wireguard-tools` ships one), and the `wireguard`, `nf_tables` and `veth` modules loaded. |
 | `mise run test-alerts` | `promtool` checks `deploy/prometheus`'s alert rules and runs their fixtures. Needs podman or docker. |
 | `mise run test-all` | every row above except `deny` and `release-features`, in order, so it needs what `test-shim`, `test-netns` and `test-alerts` need |
-| `mise run bench -- <subcommand>` | Layer 4, manual: minutes and GBs of RAM |
+| `mise run bench -- <subcommand>` | Layer 4: alert throughput, memory per torrent, startup time, and the pool's scan, match and adopt preview over a synthetic pool. Each subcommand exits non-zero on a breach of [`crates/torrentd-bench/budgets.toml`](./crates/torrentd-bench/budgets.toml), or where the work it timed failed. CI's `bench` job runs the pool at `--size ci`; the default, `--size full` (a million files, 5,000 torrents), takes minutes and is where the README's figures come from. A budget may only tighten: raising one needs the measured run that shows why. |
 
 Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
 Layer 2 runs as its own CI job; the three Layer 3 suites share one, and
