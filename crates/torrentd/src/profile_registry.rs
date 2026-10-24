@@ -49,7 +49,7 @@ pub struct ProfileHealth {
     /// Number of torrents the fence paused when the tunnel went down: the
     /// monitor's walk of the state map and the boot scans' `ScanFence`. A
     /// torrent added into an already-fenced profile and paused by the add
-    /// handler or `vpn_monitor::hold_if_fenced` is not counted, because both
+    /// handler or `fence::hold_if_fenced` is not counted, because both
     /// of those (and the walk) can pause the same torrent.
     ///
     /// Both writers add to it through [`Self::count_paused_for_vpn`], so a
@@ -62,7 +62,7 @@ pub struct ProfileHealth {
     /// count.
     pub counted_for_vpn: Arc<HashSet<InfoHash>>,
     /// How many times the profile has been fenced: bumped by every fence
-    /// (`vpn_monitor::fence`, which the monitor and the kill-switch watch's
+    /// (`fence::fence`, which the monitor and the kill-switch watch's
     /// `fence_all` both run) in the same update that marks it `vpn_down` and
     /// starts `paused_for_vpn` over, and reset by no lift. The boot scans'
     /// `ScanFence` reads a value it has not seen as a new fence, under which
@@ -198,7 +198,7 @@ impl ResumeGate {
 }
 
 /// A paced resume a fence's lift started in one profile
-/// (`vpn_monitor::spawn_lift`): every torrent it was asked to resume, whether
+/// (`fence::spawn_lift`): every torrent it was asked to resume, whether
 /// it has been told to stop, and what the operator paused while it ran.
 #[derive(Debug)]
 pub struct PacedResume {
@@ -367,7 +367,7 @@ impl ProfileEntry {
     /// the entry, so a kill-switch fence does not take it back and the next
     /// lift does not resume what the operator paused. A kill-switch fence
     /// standing over the profile holds a gate of its own from the moment it
-    /// fenced (`vpn_monitor::KillSwitchFence`), which this halts too, so its
+    /// fenced (`fence::KillSwitchFence`), which this halts too, so its
     /// lift resumes nothing.
     ///
     /// What a paced set-online still holds ([`PacedHolds`]) is released too:
@@ -388,7 +388,7 @@ impl ProfileEntry {
     /// Leave `h` out of every paced resume running in this profile, before a
     /// pause of that one torrent. Once this returns none of them resumes it,
     /// nor does the lift of a kill-switch fence standing over the profile,
-    /// whose gate opened when it fenced (`vpn_monitor::KillSwitchFence`), and
+    /// whose gate opened when it fenced (`fence::KillSwitchFence`), and
     /// the next boot does not load it unpaused ([`PacedHolds`]).
     pub fn exclude_from_resumes(&self, h: TorrentHandle) {
         for gate in self.live_gates() {
@@ -625,7 +625,7 @@ pub enum Refusal {
 ///
 /// A session-level resume starts every torrent whose own paused flag is clear
 /// at once, so going online pauses each of those first and hands them to
-/// [`OnlinePacing::start`] (`vpn_monitor::OnlinePace` in the daemon).
+/// [`OnlinePacing::start`] (`fence::OnlinePace` in the daemon).
 pub trait OnlinePacing {
     /// Every torrent `id` holds, each with whether its own paused flag is
     /// clear, so the session resuming would start it.

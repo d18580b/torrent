@@ -193,7 +193,7 @@ pub const PACED_HOLDS_FILE: &str = "paced_holds.json";
 /// resumed yet.
 ///
 /// Setting an offline profile online resumes its torrents a batch at a time
-/// (`vpn_monitor::OnlinePace`): every torrent that was running is paused
+/// (`fence::OnlinePace`): every torrent that was running is paused
 /// before the session resumes, then resumed in batches. Those pauses are
 /// saved in resume data like any other, and the boot does not clear a saved
 /// pause, since it cannot tell an operator's from this one. This record is

@@ -1052,7 +1052,7 @@ fn add_and_settle(
     }
     // `unfenced_engine` let this add through, but a fence can have landed
     // between that check and the add.
-    crate::vpn_monitor::hold_if_fenced(
+    crate::fence::hold_if_fenced(
         &s.profiles,
         s.kill_switch.as_deref(),
         profile_id,
@@ -2106,7 +2106,7 @@ pub async fn resume_torrent(
     let state = Arc::clone(&s);
     let resumed = blocking(move || {
         let resume = || {
-            crate::vpn_monitor::resume_unless_fenced(
+            crate::fence::resume_unless_fenced(
                 &state.profiles,
                 &st.profile_id,
                 engine.as_ref(),
@@ -2123,7 +2123,7 @@ pub async fn resume_torrent(
         // pause cannot part.
         let resumed = match state.profiles.resolve(&st.profile_id).active() {
             Some(entry) => entry.resume_by_hand(st.handle, resume, |r| {
-                *r == crate::vpn_monitor::SingleResume::Resumed
+                *r == crate::fence::SingleResume::Resumed
             }),
             None => resume(),
         };
@@ -2131,7 +2131,7 @@ pub async fn resume_torrent(
         // now, by the operator's hand: it takes its slot at once, over the
         // limit if it must, so the queue counts it and admits nothing beside
         // it until it ends.
-        if matches!(resumed, Ok(crate::vpn_monitor::SingleResume::Resumed)) {
+        if matches!(resumed, Ok(crate::fence::SingleResume::Resumed)) {
             state.checks.start_held_add_now(st.handle.infohash);
         }
         resumed
@@ -2140,7 +2140,7 @@ pub async fn resume_torrent(
     .map_err(|e| UnfencedControlError::Internal {
         detail: internal("resuming the torrent", e),
     })?;
-    if resumed == crate::vpn_monitor::SingleResume::Resumed {
+    if resumed == crate::fence::SingleResume::Resumed {
         return Ok(NoContent);
     }
     let ProfileProblem::Unavailable { reason, detail } = ProfileProblem::vpn_down() else {
@@ -2590,10 +2590,10 @@ impl FilesFailure {
 /// the front of a scheme, is the tracker's own words and is returned as it
 /// is.
 fn display_message(message: &str) -> String {
-    use crate::tracing_init::display_announce_url;
-    use crate::tracing_init::is_scheme_char;
-    use crate::tracing_init::is_url_terminator;
-    use crate::tracing_init::trim_trailing_punctuation;
+    use crate::redact::display_announce_url;
+    use crate::redact::is_scheme_char;
+    use crate::redact::is_url_terminator;
+    use crate::redact::trim_trailing_punctuation;
 
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
@@ -2695,7 +2695,7 @@ impl From<torrentd_engine::TrackerEntry> for Tracker {
     fn from(t: torrentd_engine::TrackerEntry) -> Self {
         let status = TrackerStatus::of(&t);
         let message = t.last_error.or(t.message).map(|m| display_message(&m));
-        let shown = crate::tracing_init::display_announce_url(&t.url);
+        let shown = crate::redact::display_announce_url(&t.url);
         Self {
             tier: t.tier,
             host: shown.host,
@@ -2952,7 +2952,7 @@ mod tests {
         // The marker is the one the url field shows for the same URL.
         let raw = "https://t.example/announce?pk=abc123";
         assert!(
-            display_message(raw) == crate::tracing_init::display_announce_url(raw).url,
+            display_message(raw) == crate::redact::display_announce_url(raw).url,
             "{}",
             display_message(raw)
         );

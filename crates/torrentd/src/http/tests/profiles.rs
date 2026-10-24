@@ -653,12 +653,12 @@ async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
             .resolve(&ProfileId::new("acct_a"))
             .active()
             .unwrap();
-        let run = crate::vpn_monitor::spawn_lift(
+        let run = crate::fence::spawn_lift(
             &h.state.profiles,
             &h.state.metrics,
             entry,
             handles,
-            crate::vpn_monitor::Lift::SetOnline,
+            crate::fence::Lift::SetOnline,
         );
         tokio::time::sleep(REANNOUNCE_PACE / 2).await;
         let resumed = |only: Option<TorrentHandle>| {

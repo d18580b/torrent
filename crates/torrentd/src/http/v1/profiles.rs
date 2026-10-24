@@ -549,7 +549,7 @@ fn set_state(
 /// before the fence. Pause it again after.
 ///
 /// The resumes are paced, a batch a second, by a task that goes on after the
-/// request is answered ([`crate::vpn_monitor::spawn_lift`]).
+/// request is answered ([`crate::fence::spawn_run`]).
 fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     let profile_id = entry.id();
     let handles = s.state.handles_for_profile(profile_id);
@@ -572,19 +572,19 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
         "fence lifted: the tunnel checked healthy and the profile was set online; resuming \
          its torrents a batch at a time",
     );
-    crate::vpn_monitor::spawn_run(
+    crate::fence::spawn_run(
         &s.profiles,
         &s.metrics,
         entry,
         run,
-        crate::vpn_monitor::Lift::SetOnline,
+        crate::fence::Lift::SetOnline,
     );
 }
 
 /// How a profile going online has its torrents resumed: a batch a second,
 /// from a task that goes on after the request is answered.
-fn online_pace(s: &AppState) -> crate::vpn_monitor::OnlinePace<'_> {
-    crate::vpn_monitor::OnlinePace {
+fn online_pace(s: &AppState) -> crate::fence::OnlinePace<'_> {
+    crate::fence::OnlinePace {
         profiles: &s.profiles,
         state: &s.state,
         metrics: &s.metrics,
@@ -793,7 +793,7 @@ fn pause_and_save(
 }
 
 /// Resume every torrent `profile_id` holds, through the shared pacer
-/// ([`crate::vpn_monitor::resume_paced`]), and add what it reached to `out`.
+/// ([`crate::fence::resume_paced`]), and add what it reached to `out`.
 /// A profile fenced before the last batch is added to `skipped_profiles` with
 /// how many it did not reach.
 ///
@@ -824,7 +824,7 @@ async fn resume_each(
             failed_count: 0,
             failed: Vec::new(),
         };
-        let resumed = crate::vpn_monitor::resume_paced(
+        let resumed = crate::fence::resume_paced(
             profiles,
             id,
             &handles,
