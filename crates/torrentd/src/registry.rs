@@ -783,3 +783,103 @@ fn move_aside(file: &Path) -> Result<PathBuf, RegistryError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Assign(u8, u8),
+        Remove(u8),
+        Reopen,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            4 => (0u8..5, 0u8..3).prop_map(|(t, p)| Op::Assign(t, p)),
+            2 => (0u8..5).prop_map(Op::Remove),
+            1 => Just(Op::Reopen),
+        ]
+    }
+
+    fn profile(p: u8) -> ProfileId {
+        ProfileId::new(["a", "b", "c"][usize::from(p)])
+    }
+
+    proptest! {
+        // Each step is a durable database write; 64 runs of up to 40 keep
+        // this within a few seconds.
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The registry is a map from info-hash to profile in which the
+        /// first assignment wins: assigning a free info-hash claims it,
+        /// assigning it to its own profile again changes nothing, and
+        /// assigning it to another is refused naming the holder; a remove
+        /// returns what it held. Every read (lookup, len, entries,
+        /// for_profile) agrees with that map after every step, the
+        /// generation moves exactly when an entry comes or goes, and
+        /// reopening the database reads the same map back.
+        #[test]
+        fn the_registry_behaves_like_a_first_writer_wins_map(ops in prop::collection::vec(op(), 0..40)) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("assignments.db");
+            let mut reg = AssignmentRegistry::new_empty(&path);
+            let mut model: BTreeMap<u8, ProfileId> = BTreeMap::new();
+            for op in ops {
+                let before = reg.generation();
+                let changed = match op {
+                    Op::Assign(t, p) => {
+                        let got = reg.assign(InfoHash([t; 20]), profile(p));
+                        match model.get(&t) {
+                            None => {
+                                prop_assert!(matches!(got, Ok(Claim::New)), "{:?}: {:?}", op, got);
+                                model.insert(t, profile(p));
+                                true
+                            }
+                            Some(held) if *held == profile(p) => {
+                                prop_assert!(matches!(got, Ok(Claim::AlreadyOurs)), "{:?}: {:?}", op, got);
+                                false
+                            }
+                            Some(held) => {
+                                let refused = matches!(&got, Err(RegistryError::Conflict { existing, .. }) if existing == held);
+                                prop_assert!(refused, "{:?}: {:?}", op, got);
+                                false
+                            }
+                        }
+                    }
+                    Op::Remove(t) => {
+                        let got = reg.remove(&InfoHash([t; 20])).unwrap();
+                        let held = model.remove(&t);
+                        prop_assert_eq!(&got, &held, "{:?}", op);
+                        held.is_some()
+                    }
+                    Op::Reopen => {
+                        drop(reg);
+                        reg = AssignmentRegistry::new_empty(&path);
+                        false
+                    }
+                };
+                if !matches!(op, Op::Reopen) {
+                    prop_assert_eq!(reg.generation() > before, changed, "{:?}", op);
+                }
+                prop_assert_eq!(reg.len(), model.len());
+                for t in 0u8..5 {
+                    prop_assert_eq!(reg.lookup(&InfoHash([t; 20])), model.get(&t).cloned());
+                }
+                let mut expect: Vec<(InfoHash, ProfileId)> =
+                    model.iter().map(|(t, p)| (InfoHash([*t; 20]), p.clone())).collect();
+                expect.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()).then(a.0 .0.cmp(&b.0 .0)));
+                prop_assert_eq!(reg.entries(), expect);
+                for p in 0u8..3 {
+                    let mut got: Vec<u8> = reg.for_profile(&profile(p)).iter().map(|ih| ih.0[0]).collect();
+                    got.sort_unstable();
+                    let want: Vec<u8> = model.iter().filter(|(_, q)| **q == profile(p)).map(|(t, _)| *t).collect();
+                    prop_assert_eq!(got, want);
+                }
+            }
+        }
+    }
+}
