@@ -586,17 +586,98 @@ async fn a_session_does_not_survive_a_daemon_restart() {
     }
 }
 
+/// What `torrentctl` left behind, run under a pty until it exited.
+struct PtyRun {
+    status: std::process::ExitStatus,
+    /// Everything it wrote to the terminal.
+    output: String,
+    /// The pty's local modes once it had exited.
+    lflag: libc::tcflag_t,
+}
+
+impl PtyRun {
+    /// Asserts it exited non-zero having entered the alternate screen and
+    /// left it ahead of `report`, shown the cursor again, and left the pty
+    /// out of raw mode. Returns where `report` starts in the output.
+    fn assert_terminal_handed_back(&self, report: &str) -> usize {
+        let output = &self.output;
+        assert!(
+            !self.status.success(),
+            "a panic is a failure exit: {output:?}"
+        );
+
+        const ENTER_ALTERNATE: &str = "\x1b[?1049h";
+        const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
+        const SHOW_CURSOR: &str = "\x1b[?25h";
+        let entered = output
+            .find(ENTER_ALTERNATE)
+            .unwrap_or_else(|| panic!("never entered the alternate screen: {output:?}"));
+        let left = output[entered..]
+            .find(LEAVE_ALTERNATE)
+            .map(|at| entered + at)
+            .unwrap_or_else(|| panic!("never left the alternate screen: {output:?}"));
+        let at = output
+            .find(report)
+            .unwrap_or_else(|| panic!("no panic report: {output:?}"));
+        assert!(
+            left < at,
+            "the alternate screen is left before the report prints, so it \
+             stays on the operator's screen: {output:?}"
+        );
+        // The cursor comes back as the unwinding drops the terminal, after
+        // the report.
+        assert!(
+            output[entered..].contains(SHOW_CURSOR),
+            "the cursor is shown again: {output:?}"
+        );
+        // And the pty is out of raw mode: line editing and echo are back.
+        assert_ne!(self.lflag & libc::ICANON, 0, "canonical mode restored");
+        assert_ne!(self.lflag & libc::ECHO, 0, "echo restored");
+        at
+    }
+}
+
 /// A panic inside the loop hands the terminal back: run under a pty, the
 /// binary enters the alternate screen, leaves it ahead of the panic report,
 /// shows the cursor again, and leaves the pty out of raw mode. Needs no
 /// daemon, so it is not ignored.
 #[test]
 fn a_panic_hands_the_terminal_back() {
+    run_under_pty(runtime::PANIC_AFTER_DRAW)
+        .assert_terminal_handed_back("TORRENTCTL_TEST_PANIC is set");
+}
+
+/// A panic on a background task stops the loop too: the binary exits
+/// non-zero with the terminal handed back, and says why after the report,
+/// on the restored screen. Without that, tokio swallows the panic and the
+/// loop keeps drawing over a terminal the panic hook already restored, until
+/// the deadline kills it.
+#[test]
+fn a_panic_on_a_background_task_exits_with_the_terminal_handed_back() {
+    let run = run_under_pty(runtime::PANIC_IN_TASK);
+    let report = run.assert_terminal_handed_back("TORRENTCTL_TEST_PANIC_IN_TASK is set");
+    let stopped = "torrentctl stopped: a request panicked: TORRENTCTL_TEST_PANIC_IN_TASK is set";
+    assert!(
+        run.output[report..].contains(stopped),
+        "no exit message after the report: {:?}",
+        run.output
+    );
+}
+
+/// Run `torrentctl` against a closed port under a pty, with `env` set to
+/// make it panic, until it exits or [`STEP`] passes.
+fn run_under_pty(env: &str) -> PtyRun {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     use std::os::fd::FromRawFd as _;
     use std::os::fd::OwnedFd;
     use std::os::unix::process::CommandExt as _;
+
+    // One pty run at a time: a child forked by another test before this
+    // one's descriptors are close-on-exec would hold its pty open, and a
+    // binary that hangs would then fail the other run too.
+    static PTY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = PTY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let (master, slave) = {
         let mut master = -1;
@@ -619,6 +700,14 @@ fn a_panic_hands_the_terminal_back() {
             )
         };
         assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // openpty opens both without close-on-exec, so every child another
+        // test spawns would inherit them: only the child's 0, 1 and 2, which
+        // the spawn dups in, are meant to.
+        for fd in [master, slave] {
+            // SAFETY: fcntl on a descriptor just opened and owned here.
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            assert_eq!(rc, 0, "fcntl: {}", std::io::Error::last_os_error());
+        }
         // SAFETY: both descriptors were just opened and are owned here.
         unsafe {
             (
@@ -639,7 +728,7 @@ fn a_panic_hands_the_terminal_back() {
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("TERM", "xterm-256color")
         .env("RUST_BACKTRACE", "0")
-        .env(torrentctl::runtime::PANIC_AFTER_DRAW, "1")
+        .env(env, "1")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
@@ -686,34 +775,7 @@ fn a_panic_hands_the_terminal_back() {
         }
     };
     let status = child.wait().unwrap();
-    let output = String::from_utf8_lossy(&output);
-    assert!(!status.success(), "a panic is a failure exit: {output:?}");
-
-    const ENTER_ALTERNATE: &str = "\x1b[?1049h";
-    const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
-    const SHOW_CURSOR: &str = "\x1b[?25h";
-    let entered = output
-        .find(ENTER_ALTERNATE)
-        .unwrap_or_else(|| panic!("never entered the alternate screen: {output:?}"));
-    let left = output[entered..]
-        .find(LEAVE_ALTERNATE)
-        .map(|at| entered + at)
-        .unwrap_or_else(|| panic!("never left the alternate screen: {output:?}"));
-    let report = output
-        .find("TORRENTCTL_TEST_PANIC is set")
-        .unwrap_or_else(|| panic!("no panic report: {output:?}"));
-    assert!(
-        left < report,
-        "the alternate screen is left before the report prints, so it stays \
-         on the operator's screen: {output:?}"
-    );
-    // The cursor comes back as the unwinding drops the terminal, after the
-    // report.
-    assert!(
-        output[entered..].contains(SHOW_CURSOR),
-        "the cursor is shown again: {output:?}"
-    );
-    // And the pty is out of raw mode: line editing and echo are back.
+    let output = String::from_utf8_lossy(&output).into_owned();
     // SAFETY: `termios` is plain data, filled in by tcgetattr on a
     // descriptor this test owns.
     let lflag = unsafe {
@@ -726,8 +788,11 @@ fn a_panic_hands_the_terminal_back() {
         );
         termios.c_lflag
     };
-    assert_ne!(lflag & libc::ICANON, 0, "canonical mode restored");
-    assert_ne!(lflag & libc::ECHO, 0, "echo restored");
+    PtyRun {
+        status,
+        output,
+        lflag,
+    }
 }
 
 /// A token no request could carry stops the binary before it takes the

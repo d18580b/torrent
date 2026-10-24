@@ -63,7 +63,8 @@ fn main() -> color_eyre::Result<()> {
         .build()
         .wrap_err("start the async runtime")?;
     // `ratatui::init` puts the terminal in raw mode on the alternate screen
-    // and installs a panic hook that restores it first.
+    // and installs a panic hook that restores it first. A panic on a
+    // background task ends `run` with `runtime::Error::Fatal`.
     let mut terminal = ratatui::init();
     let result = runtime.block_on(runtime::run(model, &mut terminal));
     ratatui::restore();
@@ -71,7 +72,7 @@ fn main() -> color_eyre::Result<()> {
     if let Ok(Some(notice)) = &result {
         eprintln!("{notice}");
     }
-    result.map(drop).wrap_err("the terminal failed")
+    Ok(result.map(drop)?)
 }
 
 /// Log to a file in the XDG state directory, never to the terminal the UI
