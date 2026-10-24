@@ -136,9 +136,18 @@ jobs:
         with:
           system-deps: 'true'
           cache-prefix: cargo
+      # Restore only. The key is computed from this checkout of `master`, but
+      # torrentd is built from the release branch, whose bumped
+      # crates/libtorrent-sys/Cargo.toml names a different prefix: saving
+      # would store, under `master`'s exact key, a cache lacking the prefix
+      # that key names, and every later job would take it as a hit and skip
+      # the vendor fetch. For the same reason a hit here proves nothing about
+      # the release branch, so the regeneration step below fetches the
+      # submodules itself, whatever this restored.
       - uses: ./.github/actions/native-cache
         with:
           path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
+          save: 'false'
       # release-plz commits through the API, but stashes and checks out in a
       # scratch copy of the repository on the way, which git refuses to do
       # without an identity.
@@ -170,6 +179,9 @@ jobs:
           git fetch --no-tags origin "refs/heads/$BRANCH"
           head=$(git rev-parse FETCH_HEAD)
           git checkout --detach "$head"
+          # The release branch's gitlinks, unconditionally: build.rs rebuilds
+          # the prefix whenever its stamp differs from what was restored.
+          mise run native-fetch
           mise run openapi
           if git diff --quiet -- docs/api/openapi.json; then
             echo "docs/api/openapi.json is current on $BRANCH"
@@ -432,10 +444,14 @@ jobs:
             cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
           done
       # Every asset onto the draft, then publish it: the release becomes
-      # immutable, assets and tag, from that moment.
+      # immutable, assets and tag, from that moment. `--clobber` so a re-run
+      # of this job, after an earlier attempt uploaded some assets and then
+      # failed, replaces them on the still-draft release instead of failing
+      # on the names already there. Immutable releases (above) freeze a
+      # published release's assets, so this cannot replace a released one.
       - working-directory: ${{ runner.temp }}/assets
         run: |
           set -euo pipefail
-          gh release upload "$TAG" -- *.tar.gz *.spdx.json SHA256SUMS *.sigstore.json
+          gh release upload "$TAG" --clobber -- *.tar.gz *.spdx.json SHA256SUMS *.sigstore.json
           gh release edit "$TAG" --draft=false --latest
           gh release view "$TAG" --json url,isDraft,assets --jq '{url, isDraft, assets: [.assets[].name]}'
