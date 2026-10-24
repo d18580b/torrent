@@ -2,7 +2,7 @@
 //! `<infohash>.fastresume` pairs, with each torrent's payload written under a
 //! managed root where the pair says it is.
 //!
-//! Shared by the pool's tests (`tests/pool.rs`) and the daemon's
+//! Shared by the pool's tests (`tests/pool/adopt.rs`) and the daemon's
 //! (`crates/torrentd/tests/daemon.rs`, through `#[path]`), so the import both
 //! layers are held to is the same one. Every torrent is two files under one
 //! 16 KiB piece, so its single piece hash is the SHA-1 of both files' bytes
