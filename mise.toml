@@ -10,6 +10,7 @@
 #   mise run test-shim|test-shim-asan|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|release-features|deny
 #   mise run lint-tracing|size-check|container|commit-lint <file-or-range>
+#   mise run unit-check [unit]
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
 #   mise run drill-alerts|drill-udp-transport|drill-listener-replies
@@ -128,6 +129,20 @@ fi
 [tasks.size-check]
 description = "Fail on source files over 2689 lines not in .size-baseline, and on stale baseline entries"
 run = "scripts/size-check"
+
+# deploy/torrentd.service: systemd parses it, it keeps the ExecStopPost=
+# net-cleanup, RestartPreventExitStatus=78 and capability lines its safety
+# rests on, and the built torrentd accepts the subcommand ExecStopPost= runs.
+# Needs systemd-analyze. deploy/check-unit.sh lists every refusal.
+[tasks.unit-check]
+description = "Verify deploy/torrentd.service (or the unit given) and its directives against the built torrentd"
+usage = '''
+arg "[unit]" default="deploy/torrentd.service" help="The unit file to check"
+'''
+run = [
+  "cargo build -p torrentd",
+  'deploy/check-unit.sh "$usage_unit"',
+]
 
 # Conventional Commits, checked by the convco [tools] pins. The commit-msg hook
 # passes the message file git wrote; CI passes a pull request's BASE..HEAD

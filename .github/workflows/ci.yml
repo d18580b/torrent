@@ -82,6 +82,11 @@ jobs:
       # the tests rather than `cargo check`ing them, nothing executed its tests.
       - run: mise run test-fault-injection
 
+      # deploy/torrentd.service parses, keeps its crash cleanup, restart
+      # policy and capability lines, and runs a subcommand this torrentd has.
+      # Here because it builds torrentd, reusing this job's build cache.
+      - run: mise run unit-check
+
   msrv:
     name: builds on the MSRV
     runs-on: ubuntu-24.04
