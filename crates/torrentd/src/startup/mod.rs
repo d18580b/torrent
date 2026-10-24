@@ -203,11 +203,11 @@ pub struct DaemonHandle {
     /// The kill-switch watch's fence, where the nftables kill switch was
     /// installed: graceful shutdown tears the table down, and the API's adds
     /// record what they pause with the fence. `boot` started its watch.
-    kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
+    kill_switch: Option<Arc<crate::fence::KillSwitchFence>>,
     /// Stops the VPN monitor and the kill-switch watch, which `boot`
     /// started: fired just before the teardown closes the sessions, so both
     /// fence through the drain before it.
-    fencing: crate::vpn_monitor::FencingStop,
+    fencing: crate::fence::FencingStop,
     /// The kill-switch watch, aborted after `fencing` in case it outran the
     /// stop's bound: left running, it would install the table again once
     /// the teardown removes it.
@@ -621,7 +621,7 @@ pub async fn boot(
     // It and the kill-switch watch stop on `fencing`, not on the shutdown
     // broadcast: the shutdown fires it just before it closes the sessions,
     // so both keep fencing through the drain while the sessions still seed.
-    let fencing = crate::vpn_monitor::FencingStop::new();
+    let fencing = crate::fence::FencingStop::new();
     spawn_supervised(
         "vpn_monitor",
         metrics.clone(),
@@ -700,7 +700,7 @@ pub async fn boot(
         // pause under it themselves (`ScanFence`). A failed boot stops it
         // before its guard removes the table, which it would otherwise
         // install again.
-        let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+        let fence = Arc::new(crate::fence::KillSwitchFence::new(
             profile_registry.clone(),
             state.clone(),
             metrics.clone(),
@@ -972,7 +972,7 @@ pub async fn boot(
     // recorded, and its walk of the state map misses a torrent whose add
     // alert lands after it: the add handler's pause of that torrent is
     // recorded with the fence, under its lock, so the lift resumes it too.
-    .fence_hold(crate::vpn_monitor::fence_hold(kill_switch.clone()))
+    .fence_hold(crate::fence::fence_hold(kill_switch.clone()))
     // The disk-error retry starts checks on the loop's own schedule: each
     // takes a slot in the daemon's check limit first, or waits for one.
     .check_slots(Arc::clone(&checks) as Arc<dyn torrentd_engine::CheckSlots>)

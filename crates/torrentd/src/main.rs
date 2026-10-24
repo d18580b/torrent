@@ -24,6 +24,7 @@ mod app_state;
 mod auth;
 mod cli;
 mod config;
+mod fence;
 mod http;
 mod instance_lock;
 mod metrics_sink;

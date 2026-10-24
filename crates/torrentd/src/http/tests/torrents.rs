@@ -2553,7 +2553,7 @@ async fn an_add_the_kill_switch_fences_mid_add_is_resumed_by_the_fences_lift() {
                 route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
                 handshake: None,
             });
-        let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+        let fence = Arc::new(crate::fence::KillSwitchFence::new(
             s.profiles.clone(),
             s.state.clone(),
             s.metrics.clone(),

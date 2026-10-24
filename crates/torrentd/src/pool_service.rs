@@ -99,7 +99,7 @@ pub struct PoolService {
     /// The kill-switch watch's fence, where the kill switch is on. Set once
     /// by the daemon. An adoption that finds its profile fenced as it adds
     /// records what it paused with the fence, so the fence's lift resumes it.
-    kill_switch: std::sync::OnceLock<Arc<crate::vpn_monitor::KillSwitchFence>>,
+    kill_switch: std::sync::OnceLock<Arc<crate::fence::KillSwitchFence>>,
 }
 
 /// An owner release waiting for the writer: [`PoolStore::release_owner`]'s
@@ -175,7 +175,7 @@ impl PoolService {
     /// The kill-switch watch's fence, which records what an adoption pauses
     /// into a profile it fenced. The daemon sets this once after opening,
     /// where the kill switch is on; a second call is ignored.
-    pub(crate) fn set_kill_switch(&self, fence: Arc<crate::vpn_monitor::KillSwitchFence>) {
+    pub(crate) fn set_kill_switch(&self, fence: Arc<crate::fence::KillSwitchFence>) {
         let _ = self.kill_switch.set(fence);
     }
 
@@ -2359,14 +2359,14 @@ fn admit_held_add(
     // Resumed whatever the phase reads: a torrent added paused reads `idle`
     // until its first status update, and resuming one something else
     // resumed already changes nothing.
-    let resumed = crate::vpn_monitor::resume_unless_fenced(
+    let resumed = crate::fence::resume_unless_fenced(
         profiles,
         &st.profile_id,
         engine.as_ref(),
         st.handle,
         metrics,
     );
-    if !matches!(resumed, Ok(crate::vpn_monitor::SingleResume::Resumed)) {
+    if !matches!(resumed, Ok(crate::fence::SingleResume::Resumed)) {
         q.checking.lock().retain(|(r, _)| r.infohash != hex);
         warn!(
             target: "torrentd::pool",
@@ -2482,7 +2482,7 @@ fn admit_adoption(
         Ok(handle) => {
             // The tunnel was up when this was admitted above, and
             // can have dropped since.
-            crate::vpn_monitor::hold_if_fenced(
+            crate::fence::hold_if_fenced(
                 profiles,
                 pool.kill_switch.get().map(Arc::as_ref),
                 &item.profile,
@@ -3399,7 +3399,7 @@ pub fn execute_adopt(
                     let noop = torrentd_engine::NoopSink;
                     let metrics: &dyn MetricsSink =
                         pool.metrics.get().map_or(&noop, |m| m.as_ref());
-                    crate::vpn_monitor::hold_if_fenced(
+                    crate::fence::hold_if_fenced(
                         profiles,
                         pool.kill_switch.get().map(Arc::as_ref),
                         &profile,
@@ -5580,11 +5580,11 @@ mod tests {
         use torrentd_engine::RecordedCall;
         use torrentd_engine::StateMap;
 
+        use crate::fence::KillSwitchFence;
         use crate::profile_registry::ProfileEntry;
         use crate::profile_registry::ProfileRegistry;
         use crate::vpn::killswitch::Fence;
         use crate::vpn::route::RouteProbe;
-        use crate::vpn_monitor::KillSwitchFence;
         use crate::vpn_monitor::TunnelProbes;
 
         let failed = TorrentHandle {

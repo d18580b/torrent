@@ -34,13 +34,13 @@ const FENCING_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(1
 /// The abort cannot cancel a check already on the blocking pool, and that
 /// check would read the teardown's removal of the table as a flush. What
 /// keeps it from installing the table again, or fencing the closing
-/// sessions, is the stop's gate (`vpn_monitor::FencingGate`): the stop
+/// sessions, is the stop's gate (`fence::FencingGate`): the stop
 /// closes it within the bound, after any fence or install inside it ends,
 /// and the check's later ones are refused. Only a fence or install that
 /// itself outlasts the bound can still land after the teardown, which the
 /// warning below reports.
 pub(super) async fn stop_fencing(
-    fencing: crate::vpn_monitor::FencingStop,
+    fencing: crate::fence::FencingStop,
     kill_switch_watch: Option<&tokio::task::AbortHandle>,
 ) {
     if !fencing.stop(FENCING_STOP_BOUND).await {
@@ -161,7 +161,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_fencing_stops_at_stop_fencing_and_a_stuck_watch_is_aborted() {
         let (tx, _keep) = broadcast::channel(8);
-        let fencing = crate::vpn_monitor::FencingStop::new();
+        let fencing = crate::fence::FencingStop::new();
         let mut stopped = fencing.subscribe();
         let monitor = tokio::spawn(async move { stopped.stopped().await });
         // A watch stuck in a check: it holds its stop and never reads it.

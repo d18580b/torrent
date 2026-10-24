@@ -35,7 +35,7 @@ use crate::profile_registry::ProfileStatus;
 pub(super) struct ScanFence {
     profiles: std::collections::HashMap<ProfileId, ScanFenced>,
     /// The kill-switch watch's fence, where the kill switch is on.
-    kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
+    kill_switch: Option<Arc<crate::fence::KillSwitchFence>>,
 }
 
 #[derive(Default)]
@@ -55,7 +55,7 @@ struct ScanFenced {
 impl ScanFence {
     /// A fence over the scans, recording what it pauses under the kill-switch
     /// watch's fence `kill_switch` where the kill switch is on.
-    pub(super) fn new(kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>) -> Self {
+    pub(super) fn new(kill_switch: Option<Arc<crate::fence::KillSwitchFence>>) -> Self {
         Self {
             profiles: Default::default(),
             kill_switch,
@@ -149,7 +149,7 @@ impl ScanFence {
     fn enforce(
         profiles: &ProfileRegistry,
         metrics: &PromSink,
-        kill_switch: Option<&crate::vpn_monitor::KillSwitchFence>,
+        kill_switch: Option<&crate::fence::KillSwitchFence>,
         profile: &ProfileId,
         fenced: &mut ScanFenced,
     ) {
@@ -169,7 +169,7 @@ impl ScanFence {
         metrics: &PromSink,
         profile: &ProfileId,
         fenced: &mut ScanFenced,
-        record: Option<&mut crate::vpn_monitor::FenceRecord>,
+        record: Option<&mut crate::fence::FenceRecord>,
     ) {
         let Some(entry) = profiles.resolve(profile).active() else {
             return;
@@ -248,7 +248,7 @@ impl ScanFence {
             }
         }
         fenced.paused = fenced.handles.len();
-        // The monitor's fence (`vpn_monitor::fence`) marks the profile
+        // The monitor's fence (`fence::fence`) marks the profile
         // `VpnDown` before it walks the state map and adds what it paused to
         // the count afterwards, so this can run in between: what the scans
         // held is added, never assigned. Each writer sets the gauge from the
@@ -542,7 +542,7 @@ mod tests {
                 route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
                 handshake: Some(Ok(None)),
             });
-        let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+        let fence = Arc::new(crate::fence::KillSwitchFence::new(
             profiles.clone(),
             Arc::new(StateMap::new()),
             metrics.clone(),
@@ -623,7 +623,7 @@ mod tests {
         engine: Arc<torrentd_engine::MockEngine>,
         profiles: Arc<ProfileRegistry>,
         metrics: Arc<PromSink>,
-        fence: Arc<crate::vpn_monitor::KillSwitchFence>,
+        fence: Arc<crate::fence::KillSwitchFence>,
         a: ProfileId,
     }
 
@@ -660,7 +660,7 @@ mod tests {
                     handshake: Some(Ok(None)),
                 }
             });
-            let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+            let fence = Arc::new(crate::fence::KillSwitchFence::new(
                 profiles.clone(),
                 Arc::new(StateMap::new()),
                 metrics.clone(),
@@ -841,7 +841,7 @@ mod tests {
         // its walk of an empty state map pauses nothing.
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        let walked = crate::vpn_monitor::fence(
+        let walked = crate::fence::fence(
             entry,
             &StateMap::new(),
             None,
@@ -893,7 +893,7 @@ mod tests {
         scan.track_all(&state, &t.source());
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        let walked = crate::vpn_monitor::fence(
+        let walked = crate::fence::fence(
             entry,
             &state,
             None,
@@ -930,7 +930,7 @@ mod tests {
         scan.track_all(&state, &t.source());
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        let walked = crate::vpn_monitor::fence(
+        let walked = crate::fence::fence(
             entry,
             &state,
             None,
@@ -960,9 +960,9 @@ mod tests {
         }
         let resolved = t.profiles.resolve(&t.a);
         let entry = resolved.active().unwrap();
-        crate::vpn_monitor::mark_fenced(entry, None, "ip_lost_or_changed", t.metrics.as_ref());
+        crate::fence::mark_fenced(entry, None, "ip_lost_or_changed", t.metrics.as_ref());
         scan.track_all(&state, &t.source());
-        let walked = crate::vpn_monitor::walk_fenced(entry, &state, t.metrics.as_ref());
+        let walked = crate::fence::walk_fenced(entry, &state, t.metrics.as_ref());
         assert_eq!(walked, 3, "the walk finds the tracked torrents");
 
         scan.enforce_all(&t.profiles, &t.metrics);

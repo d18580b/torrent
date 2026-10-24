@@ -1186,7 +1186,7 @@ fn list_table_json(name: &str) -> io::Result<String> {
 
 /// What [`watch`] does to the vpn profiles while the kill switch is not in
 /// force as installed. Implemented over the profile registry by
-/// `vpn_monitor::KillSwitchFence`; a trait so the watch's decisions are
+/// `fence::KillSwitchFence`; a trait so the watch's decisions are
 /// reachable by a test with no sessions.
 pub(crate) trait Fence: Send + Sync {
     /// Fence every vpn profile that is not fenced already, as the VPN monitor
@@ -1274,14 +1274,14 @@ enum Watch {
 /// sessions still seed; past that point it would read the removal as a
 /// flush and install the table again. A check already on the blocking pool
 /// when the stop comes runs on, but its fences, lifts and installs pass the
-/// stop's [`FencingGate`](crate::vpn_monitor::FencingGate), which the stop
+/// stop's [`FencingGate`](crate::fence::FencingGate), which the stop
 /// closes before the teardown once any of them inside it has ended, so none
 /// lands after the teardown unless that one outlasts the stop's bound.
 pub(crate) async fn watch(
     installed: Installed,
     fence: std::sync::Arc<dyn Fence>,
     metrics: std::sync::Arc<crate::metrics_sink::PromSink>,
-    mut stop: crate::vpn_monitor::FencingStopped,
+    mut stop: crate::fence::FencingStopped,
 ) {
     use torrentd_engine::MetricsSink;
     // Installed moments ago by `enable`, and verified by the boot.
@@ -1353,7 +1353,7 @@ pub(crate) async fn watch(
 /// is about to remove the table, or already has, and installing it then
 /// would outlive the daemon.
 fn gated_apply<'a>(
-    gate: &'a crate::vpn_monitor::FencingGate,
+    gate: &'a crate::fence::FencingGate,
     apply: impl Fn(&str) -> io::Result<()> + 'a,
 ) -> impl Fn(&str) -> io::Result<()> + 'a {
     move |script| {
@@ -1369,7 +1369,7 @@ fn gated_apply<'a>(
 /// has closed `gate`: past it the sessions are closing.
 struct Gated<'a> {
     fence: &'a dyn Fence,
-    gate: &'a crate::vpn_monitor::FencingGate,
+    gate: &'a crate::fence::FencingGate,
 }
 
 impl Fence for Gated<'_> {

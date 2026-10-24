@@ -1520,7 +1520,7 @@ impl Recorded {
 /// does not end with the shutdown broadcast that starts the drain.
 #[tokio::test(start_paused = true)]
 async fn the_watch_runs_until_its_stop_and_returns_at_it() {
-    let stop = crate::vpn_monitor::FencingStop::new();
+    let stop = crate::fence::FencingStop::new();
     let fence = std::sync::Arc::new(Recorded::default());
     let task = tokio::spawn(watch(
         installed(),
@@ -1544,7 +1544,7 @@ async fn the_watch_runs_until_its_stop_and_returns_at_it() {
 /// before the stop the same check does both.
 #[tokio::test]
 async fn a_check_past_the_stop_neither_reinstalls_nor_fences() {
-    let stop = crate::vpn_monitor::FencingStop::new();
+    let stop = crate::fence::FencingStop::new();
     let gate = stop.subscribe().gate();
     let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
     let applied = std::sync::Mutex::new(0);

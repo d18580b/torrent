@@ -106,7 +106,7 @@ pub struct AppState {
     /// The kill-switch watch's fence, where `network_kill_switch` is on. An
     /// add that finds its profile fenced records what it paused with it, so
     /// the fence's lift resumes that too.
-    pub kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
+    pub kill_switch: Option<Arc<crate::fence::KillSwitchFence>>,
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
