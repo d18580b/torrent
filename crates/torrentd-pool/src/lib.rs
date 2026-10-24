@@ -2,9 +2,12 @@
 //! adopted.
 //!
 //! torrentd's original model was "the operator hands me torrents". That does not
-//! survive contact with a multi-terabyte library already sitting on disk, where
-//! the real questions are which files are protected by a torrent, which are
-//! not, and which torrents reference data that has moved or vanished.
+//! survive contact with a library already sitting on disk, where the real
+//! questions are which files are protected by a torrent, which are not, and
+//! which torrents reference data that has moved or vanished. The scale this
+//! crate is measured at — a million files, 5,000 torrents — is what
+//! `torrentd-bench`'s `pool-scan`, `pool-match` and `pool-adopt-preview` time,
+//! held to `crates/torrentd-bench/budgets.toml`.
 //!
 //! The pool answers those. It indexes **managed roots** (directories the daemon
 //! owns) and a **torrent library** (a directory of `.torrent` files, which for a
@@ -15,7 +18,7 @@
 //!
 //! ## Change detection is tiered
 //!
-//! Hashing a petabyte is days of I/O, so it cannot be the routine check:
+//! Hashing reads every byte of the pool, so it cannot be the routine check:
 //!
 //! 1. **Cheap sweep** — `(size, mtime, inode, device)` against the recorded
 //!    snapshot. Catches essentially every real change and runs over a large

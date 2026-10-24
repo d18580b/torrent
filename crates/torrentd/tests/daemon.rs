@@ -1825,11 +1825,28 @@ fn a_plain_delete_of_a_torrent_whose_resume_add_failed_keeps_its_resume_file() {
 
 /// [`http`] with a read timeout of `timeout`, for a request that runs long.
 fn http_within(addr: &str, method: &str, path: &str, timeout: Duration) -> (u16, String) {
+    http_body_within(addr, method, path, "", timeout)
+}
+
+/// [`http_within`], sending `body` as JSON.
+fn http_body_within(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    timeout: Duration,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream.set_read_timeout(Some(timeout)).unwrap();
+    let json = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         Content-Length: 0\r\n\r\n"
+         {json}Content-Length: {}\r\n\r\n{body}",
+        body.len()
     );
     stream.write_all(req.as_bytes()).unwrap();
     let mut buf = Vec::new();
@@ -2042,6 +2059,164 @@ fn a_million_file_scan_leaves_the_daemon_responsive() {
     assert_exits_zero(&mut child.0, Duration::from_secs(60));
     listening.store(false, std::sync::atomic::Ordering::Relaxed);
     listener.join().unwrap();
+}
+
+/// Issue #432: a bulk adopt of ten thousand torrents never has more than
+/// `[pool] max_concurrent_verify` of them verifying at once. `GET /v1/pool`
+/// is sampled from when the adopt request is sent, through the request
+/// adding every torrent, until the queue drains or fifteen seconds of
+/// verification have been watched after it answered: `verify_in_flight`
+/// never exceeds the limit, the queue never holds more than was adopted, and
+/// checks keep completing.
+///
+/// `TORRENTD_SCALE_ADOPT` sets the torrent count; ten thousand when unset.
+/// At ten thousand the test takes minutes in a debug build, nearly all of it
+/// the adopt request itself.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent and adopts ten thousand torrents; run with --ignored"]
+fn a_bulk_adopt_verifies_at_most_the_verify_limit_at_once() {
+    use sha1::Digest;
+
+    const LIMIT: u64 = 4;
+    const WATCH: Duration = Duration::from_secs(15);
+    let count: u64 = std::env::var("TORRENTD_SCALE_ADOPT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    // One one-byte payload file per torrent, and a `.torrent` whose piece
+    // hash it matches, so every verification passes.
+    let piece = sha1::Sha1::digest(b"x");
+    for i in 0..count {
+        let name = format!("p{i}");
+        std::fs::write(root.join(&name), b"x").unwrap();
+        let mut t = format!(
+            "d4:infod6:lengthi1e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+            name.len()
+        )
+        .into_bytes();
+        t.extend_from_slice(&piece);
+        t.extend_from_slice(b"ee");
+        std::fs::write(library.join(format!("{name}.torrent")), t).unwrap();
+    }
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\nmax_concurrent_verify = {LIMIT}\n",
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+
+    // Killed if an assertion below panics, rather than left running.
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let log = DaemonLog::new(p);
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .stdout(log.stdio())
+            .stderr(log.stdio())
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy_within(addr, Duration::from_secs(120));
+
+    let (code, body) = http_within(addr, "POST", "/v1/pool/scan", Duration::from_secs(600));
+    assert_eq!(code, 200, "{body}");
+    let scan: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(scan["torrents"], count, "{body}");
+    assert_eq!(scan["matched"], count, "{body}");
+    let (code, body) = http(addr, "GET", "/v1/pool", None);
+    assert_eq!(code, 200, "{body}");
+    let pool: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let root_id = pool["roots"][0]["root_id"].as_i64().unwrap();
+
+    let adopt = {
+        let addr = addr.clone();
+        let req = format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"selector\":{{\"kind\":\"subtree\",\
+             \"root_id\":{root_id},\"path\":\"\"}}}}"
+        );
+        std::thread::spawn(move || {
+            http_body_within(
+                &addr,
+                "POST",
+                "/v1/pool/adoptions",
+                &req,
+                Duration::from_secs(1800),
+            )
+        })
+    };
+
+    let mut samples = 0u64;
+    let mut widest = 0u64;
+    let mut adopted: Option<Instant> = None;
+    // Fewest torrents seen waiting or verifying since the adopt answered.
+    let mut least_left = count;
+    loop {
+        let (code, body) = http(addr, "GET", "/v1/pool", None);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let in_flight = v["verify_in_flight"].as_u64().unwrap();
+        let depth = v["verify_queue_depth"].as_u64().unwrap();
+        assert!(
+            in_flight <= LIMIT,
+            "{in_flight} verifying at once, over max_concurrent_verify = {LIMIT}: {body}",
+        );
+        assert!(
+            depth + in_flight <= count,
+            "{depth} waiting and {in_flight} verifying, of {count} adopted: {body}",
+        );
+        widest = widest.max(in_flight);
+        samples += 1;
+        if adopted.is_none() && adopt.is_finished() {
+            adopted = Some(Instant::now());
+        }
+        if let Some(at) = adopted {
+            least_left = least_left.min(depth + in_flight);
+            if depth + in_flight == 0 || at.elapsed() >= WATCH {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (code, body) = adopt.join().unwrap();
+    assert_eq!(code, 200, "{body}");
+    let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        result["queued_for_verification"].as_array().map(Vec::len),
+        Some(count as usize),
+        "every torrent goes down the verify path: {}",
+        &body[..body.len().min(500)],
+    );
+    // The bound was met under load, not merely never approached: the queue
+    // filled every slot, and enough checks finished for several rounds of
+    // admission to have been watched.
+    assert_eq!(widest, LIMIT.min(count), "never saw every slot in use");
+    let done = count - least_left;
+    assert!(
+        done >= (3 * LIMIT).min(count),
+        "only {done} of {count} verifications finished in {WATCH:?}",
+    );
+    eprintln!("{count} adopted; {samples} samples, at most {widest} verifying; {done} verified");
+
+    sigterm(&child.0);
+    assert_exits_zero(&mut child.0, Duration::from_secs(120));
 }
 
 /// Poll `GET /v1/torrents/{ih}` until its session reports a name, returning
