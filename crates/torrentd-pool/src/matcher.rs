@@ -695,11 +695,6 @@ fn trim_base(p: &str) -> String {
     p.trim_matches('/').to_string()
 }
 
-/// Per-state counts for reporting.
-pub fn state_summary(store: &PoolStore) -> Result<HashMap<AdoptionState, u64>, PoolError> {
-    store.counts_by_state()
-}
-
 #[cfg(test)]
 mod tests {
     mod props {

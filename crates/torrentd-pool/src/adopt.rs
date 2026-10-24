@@ -451,12 +451,6 @@ pub fn torrent_path(store: &PoolStore, infohash: &str) -> Result<Option<PathBuf>
     Ok(store.torrent(infohash)?.map(|t| t.source_path))
 }
 
-/// The `.torrent` bytes, read from the library, or an error where the file
-/// is larger than the library's read cap.
-pub fn torrent_bytes(path: &Path) -> Result<Vec<u8>, PoolError> {
-    Ok(crate::scan::read_capped(path)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,7 +469,6 @@ mod tests {
         let at = dir.path().join("t.torrent");
         std::fs::write(&at, &fixture).unwrap();
         assert!(torrent_meta(&at).is_some());
-        assert_eq!(torrent_bytes(&at).unwrap(), fixture);
 
         // An unknown top-level key holding a cap's worth of bytes.
         let pad = MAX_LIBRARY_FILE_BYTES as usize;
@@ -489,9 +482,5 @@ mod tests {
         std::fs::write(&at, &big).unwrap();
 
         assert!(torrent_meta(&at).is_none());
-        match torrent_bytes(&at) {
-            Err(PoolError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::FileTooLarge),
-            other => panic!("{:?}", other.map(|b| b.len())),
-        }
     }
 }

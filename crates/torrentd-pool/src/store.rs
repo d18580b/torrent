@@ -1048,11 +1048,15 @@ impl PoolStore {
     // -- roots -------------------------------------------------------------
 
     /// Register a managed root, returning its id. Idempotent.
+    ///
+    /// `root.enabled` is left at its default of 1 and never read: a root is
+    /// in the index exactly while it is configured, and
+    /// [`PoolStore::retain_roots`] drops the rest. The column stays so the
+    /// schema does not change for it.
     pub fn upsert_root(&self, path: &Path) -> Result<i64, PoolError> {
         let p = path.to_string_lossy();
         self.conn.execute(
-            "INSERT INTO root(path, enabled) VALUES (?1, 1)
-             ON CONFLICT(path) DO UPDATE SET enabled = 1",
+            "INSERT INTO root(path) VALUES (?1) ON CONFLICT(path) DO NOTHING",
             params![p],
         )?;
         let id: i64 =
@@ -1153,7 +1157,7 @@ impl PoolStore {
     pub fn roots(&self) -> Result<Vec<(i64, PathBuf)>, PoolError> {
         let mut st = self
             .conn
-            .prepare("SELECT id, path FROM root WHERE enabled = 1 ORDER BY path")?;
+            .prepare("SELECT id, path FROM root ORDER BY path")?;
         let rows = st.query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, PathBuf::from(r.get::<_, String>(1)?)))
         })?;
