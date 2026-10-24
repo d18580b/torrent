@@ -689,7 +689,7 @@ fn apply_inner(
         }
     }
 
-    let now = now_secs();
+    let now = crate::pool_service::now_secs();
     pool.with_store(|s| s.set_plan_status(plan_id, &out.status, Some(now)))
         .map_err(|e| e.to_string())?;
     info!(
@@ -2312,13 +2312,6 @@ pub fn resume_unfinished(
             }
         }
     }
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
