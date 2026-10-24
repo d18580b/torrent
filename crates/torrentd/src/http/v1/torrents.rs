@@ -2036,17 +2036,7 @@ pub async fn pause_torrent(
 ) -> Result<NoContent, PauseTorrentError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
     let entry = s.profiles.resolve(&st.profile_id).active();
-    // Noted paused first, so a kill-switch fence or a set-online that reads
-    // what is running from here on, before a state update reports the pause,
-    // does not resume it; the gates catch one that read before. Noted again
-    // once the gates exclude it: a paced resume that took a gate between the
-    // two noted it running, and that resume lands before this pause.
-    let before = entry.map(|e| {
-        let before = e.note_running(st.handle, false);
-        e.exclude_from_resumes(st.handle);
-        e.note_running(st.handle, false);
-        before
-    });
+    let before = entry.map(|e| e.prepare_pause(st.handle));
     let paused = blocking(move || engine.pause_torrent(st.handle)).await;
     if let (Err(_), Some(e), Some(before)) = (&paused, entry, before) {
         e.restore_noted(st.handle, before);

@@ -1017,22 +1017,12 @@ pub(super) fn record_verify_outcome(
                 "verification did not leave the torrent seeding; pausing it",
             );
             if let Some(st) = state.get(hash) {
-                // Left out first, as the operator's pause does: a paced
+                // Readied as the operator's pause readies one: a paced
                 // resume running in the profile, or a kill-switch fence's
                 // lift, would otherwise resume it, and a paced set-online's
-                // hold would load it unpaused at the next boot. Noted paused
-                // around the exclusion, as that pause notes it too: a
-                // kill-switch fence or a set-online that reads what is
-                // running before a state update reports this pause would
-                // otherwise read it as running, and its lift or pace resume
-                // it.
+                // hold would load it unpaused at the next boot.
                 let entry = profiles.resolve(&st.profile_id).active();
-                let before = entry.map(|e| {
-                    let before = e.note_running(st.handle, false);
-                    e.exclude_from_resumes(st.handle);
-                    e.note_running(st.handle, false);
-                    before
-                });
+                let before = entry.map(|e| e.prepare_pause(st.handle));
                 let paused = source
                     .engine_for(&st.profile_id)
                     .map(|e| e.pause_torrent(st.handle));
