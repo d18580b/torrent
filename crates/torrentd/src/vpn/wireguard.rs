@@ -706,10 +706,11 @@ impl From<Ownership> for Adoption {
 /// [`Ownership::Unestablished`], which exempts it from every teardown:
 ///
 /// * the live link carries the public key the profile's config derives; or
-/// * the profile carries no key (`PostUp = wg set %i private-key …` keeps it
-///   out of the `.conf`) and `raised_here`: a record written on this boot of
-///   this host names this interface *and* the key the live link carries now
-///   (see [`RaisedInterfaces::recorded`]). The key is what tells the link
+/// * the profile carries no key this boot can derive (no `PrivateKey` line, or
+///   a config it cannot read; the hooks that once kept the key out of the
+///   `.conf` are refused by [`native::parse`]) and `raised_here`: a record
+///   written on this boot of this host names this interface *and* the key
+///   the live link carries now (see [`RaisedInterfaces::recorded`]). The key is what tells the link
 ///   this daemon raised from one that took the name after it was freed.
 ///
 /// The record decides only the keyless case. Two readable keys settle it

@@ -27,11 +27,11 @@ services:
     # nothing reaps an orphaned child.
     init: true
     # How long `stop` waits between SIGTERM and SIGKILL. The default is 10s;
-    # a graceful shutdown flushes resume data for every torrent and removes
-    # the kill switch, which at tens of thousands of torrents takes longer.
-    # A SIGKILL mid-drain leaves resume saves unwritten
-    # (torrentd_last_shutdown_unsaved_resumes on the next boot), and with the
-    # kill switch on, the nftables table installed.
+    # a graceful shutdown flushes resume data for every torrent, which at tens
+    # of thousands of torrents takes longer. A SIGKILL mid-drain leaves resume
+    # saves unwritten (torrentd_last_shutdown_unsaved_resumes on the next
+    # boot). The kill switch cannot run in this container (below), so there
+    # is no nftables table here for a SIGKILL to leave behind.
     stop_grace_period: 180s
     # Only a `network = "vpn"` profile needs these: bringing up WireGuard
     # tunnels, and installing the nftables table when
