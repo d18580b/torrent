@@ -10,7 +10,7 @@ use clap::Subcommand;
     name = "torrentd",
     version,
     about = "Headless torrent seeding daemon for libraries already on disk, benched at a million files and 5,000 torrents under one root",
-    long_about = "Setup and operation: docs/running.md. Annotated config: deploy/torrentd.sample.toml."
+    long_about = "Headless torrent seeding daemon for libraries already on disk, benched at a million files and 5,000 torrents under one root (mise run bench, held to crates/torrentd-bench/budgets.toml).\n\nSetup and operation: docs/running.md. Annotated config: deploy/torrentd.sample.toml."
 )]
 pub struct Cli {
     /// Path to the daemon's TOML configuration file. Required for everything
