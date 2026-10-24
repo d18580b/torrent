@@ -78,9 +78,8 @@ pub(crate) fn nofile_soft_limit() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use torrentd_engine::ProfileStatus;
-
     use super::*;
+    use crate::profile_registry::ProfileStatus;
 
     #[test]
     fn the_descriptor_budget_counts_every_session_and_the_api() {

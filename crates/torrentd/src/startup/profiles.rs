@@ -1174,7 +1174,7 @@ mod profile_construction_tests {
                 |r| {
                     r.set(
                         &ProfileId::new("acct_b"),
-                        torrentd_engine::DesiredState::Offline,
+                        crate::profile_state::DesiredState::Offline,
                     )
                 },
                 |_| (),

@@ -8,7 +8,6 @@ use anyhow::Context;
 use tokio::sync::broadcast;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertSource;
-use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
@@ -27,6 +26,7 @@ use super::shutdown_requested;
 use crate::config::Config;
 use crate::metrics_sink::PromSink;
 use crate::profile_registry::ProfileRegistry;
+use crate::registry::AssignmentRegistry;
 use crate::sd_notify;
 
 /// How many entries a boot scan adds between looks at the shutdown receiver,
@@ -103,14 +103,14 @@ fn honour_tombstones(
             }
             continue;
         }
-        let left = torrentd_engine::handlers::add::delete_removed_files(
+        let left = torrentd_engine::removal::delete_removed_files(
             resume,
             torrents,
             metrics,
             profile,
             &ih,
             false,
-            torrentd_engine::handlers::add::Tombstone::Settle,
+            torrentd_engine::removal::Tombstone::Settle,
         );
         info!(profile_id = %profile, infohash = %ih, files_left = left.files_left(),
               "finished the delete of a removed torrent; not loading it");
@@ -1261,9 +1261,9 @@ mod tests {
     use torrentd_engine::FsTorrentStore;
     use torrentd_engine::MockEngine;
     use torrentd_engine::ProfileSource;
-    use torrentd_engine::ProfileStatus;
 
     use super::*;
+    use crate::profile_registry::ProfileStatus;
     use crate::startup::test_support::cfg_with;
     use crate::startup::test_support::counted;
     use crate::startup::test_support::host;

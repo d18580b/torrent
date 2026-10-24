@@ -8,7 +8,7 @@
 //! (`apply_settings` → `reopen_listen_sockets`), waits for the alert loop to
 //! relay the session's `listen_succeeded` for the new endpoint, and only then
 //! records the port and reannounces every torrent in the profile — paced,
-//! [`torrentd_engine::port_forward::REANNOUNCE_BATCH`] at a time — so
+//! [`crate::pacing::REANNOUNCE_BATCH`] at a time — so
 //! trackers learn the new port within seconds to minutes rather than at their next scheduled announce, and never
 //! all at once. A `listen_failed` for it, or no outcome within
 //! [`torrentd_engine::port_forward::LISTEN_CONFIRM_TIMEOUT`], is a `rebind`
@@ -37,22 +37,18 @@ use libtorrent_safe::TorrentHandle;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use torrentd_engine::port_forward::reannounce_batch;
 use torrentd_engine::port_forward::renew_after;
 use torrentd_engine::port_forward::ListenEvents;
-use torrentd_engine::port_forward::Pacer;
 use torrentd_engine::port_forward::Reannounce;
 use torrentd_engine::port_forward::RebindFailure;
 use torrentd_engine::port_forward::RebindTarget;
 use torrentd_engine::port_forward::LISTEN_CONFIRM_TIMEOUT;
-use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::renew_and_rebind;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RenewOutcome;
 use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
@@ -60,8 +56,12 @@ use tracing::info;
 use tracing::warn;
 
 use crate::metrics_sink::PromSink;
+use crate::pacing::reannounce_batch;
+use crate::pacing::Pacer;
+use crate::pacing::REANNOUNCE_PACE;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 use crate::vpn::NatpmpForwarder;
 
 /// NAT-PMP lease lifetime we request (seconds). Also used by startup for the
@@ -362,7 +362,7 @@ impl Next {
     }
 }
 
-/// Reannounce `handles` [`torrentd_engine::port_forward::REANNOUNCE_BATCH`]
+/// Reannounce `handles` [`crate::pacing::REANNOUNCE_BATCH`]
 /// at a time, `pace` apart, through the shared [`Pacer`], then record how
 /// long the whole reannounce took from `detected` and what the session
 /// refused.
@@ -866,7 +866,6 @@ mod tests {
 
     use libtorrent_safe::InfoHash;
     use torrentd_engine::metrics::MetricCall;
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
     use torrentd_engine::MockEngine;
     use torrentd_engine::MockForwarder;
     use torrentd_engine::PortForwardError;
@@ -876,6 +875,7 @@ mod tests {
     use torrentd_engine::TorrentState;
 
     use super::*;
+    use crate::pacing::REANNOUNCE_BATCH;
     use crate::profile_registry::test_vpn_entry;
 
     const TUNNEL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));

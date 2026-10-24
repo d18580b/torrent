@@ -788,12 +788,12 @@ pub async fn reload_config(
 mod tests {
     use torrentd_engine::InfoHash;
     use torrentd_engine::ProfileId;
-    use torrentd_engine::ProfileStatus;
     use torrentd_engine::TorrentHandle;
     use torrentd_engine::TorrentPhase;
     use torrentd_engine::TorrentState;
 
     use super::*;
+    use crate::profile_registry::ProfileStatus;
 
     /// A test state whose heartbeat age reads zero on every tick, so two
     /// fingerprints differ only where the state they hash does.
@@ -882,7 +882,7 @@ mod tests {
         // changes the record alone: its session is already paused.
         assert_moves(&s, "session paused", || p.engine.pause_session().unwrap());
         assert_moves(&s, "desired offline", || {
-            change(&|r| r.set(&id, torrentd_engine::DesiredState::Offline))
+            change(&|r| r.set(&id, crate::profile_state::DesiredState::Offline))
         });
         assert!(p.engine.session_paused().unwrap());
         assert_moves(&s, "offline_all", || change(&|r| r.offline_all = true));

@@ -25,13 +25,11 @@ use libtorrent_safe::AddParams;
 use libtorrent_safe::InfoHash;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::handlers::add::delete_removed_files;
-use torrentd_engine::handlers::add::Tombstone;
-use torrentd_engine::Claim;
+use torrentd_engine::removal::delete_removed_files;
+use torrentd_engine::removal::Tombstone;
 use torrentd_engine::EngineError;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
-use torrentd_engine::RegistryError;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -59,6 +57,8 @@ use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
+use crate::registry::Claim;
+use crate::registry::RegistryError;
 
 /// Upper bound on a `.torrent`, read from the daemon's own filesystem or
 /// decoded from a request.
@@ -430,7 +430,7 @@ pub async fn list_torrents(
 /// of a hundred. The caller asks for one more than a page, so the page
 /// knows whether another follows.
 fn first_after(
-    registry: &torrentd_engine::AssignmentRegistry,
+    registry: &crate::registry::AssignmentRegistry,
     after: Option<InfoHash>,
     take: usize,
     mut keep: impl FnMut(&InfoHash, &ProfileId) -> bool,
@@ -2810,7 +2810,7 @@ mod tests {
         // Against the obvious implementation this replaced: copy, filter,
         // sort, skip, take.
         let dir = tempfile::tempdir().unwrap();
-        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("r.json"));
+        let reg = crate::registry::AssignmentRegistry::new_empty(dir.path().join("r.json"));
         let mut all = Vec::new();
         for n in 0..60u8 {
             // Scrambled, so insertion order says nothing about sort order.

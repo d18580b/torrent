@@ -7,7 +7,6 @@ use std::sync::Arc;
 use torrentd_engine::AlertSource;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use tracing::error;
@@ -15,6 +14,7 @@ use tracing::warn;
 
 use crate::metrics_sink::PromSink;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 
 /// The torrents the boot scans hand each profile's session, held so the VPN
 /// monitor's fence reaches them.

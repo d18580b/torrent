@@ -280,11 +280,11 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use torrentd_engine::AlertLoopBuilder;
-    use torrentd_engine::ProfileStatus;
     use torrentd_engine::SystemClock;
     use torrentd_engine::TorrentEngine;
 
     use super::*;
+    use crate::profile_registry::ProfileStatus;
     use crate::sd_notify;
     use crate::startup::scan::between_scan_batches;
 
