@@ -56,6 +56,8 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 # Layer 3 integration fixtures: real SHA-1 piece hashes for generated .torrents.
 sha1 = { workspace = true }
+# Property tests: the state map's resume queue, the profile set validator.
+proptest = { workspace = true }
 
 [lints]
 workspace = true

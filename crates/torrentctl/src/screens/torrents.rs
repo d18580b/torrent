@@ -3139,4 +3139,154 @@ mod tests {
         });
         snapshot("delete_confirm", &state, &[(80, 24)], true);
     }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Rows `from..from + n`, in infohash order, every third in
+        /// `acct_b`, so a `/b` filter shows some rows and hides others.
+        fn rows(from: usize, n: usize, next: Option<&str>) -> types::TorrentPage {
+            let items: Vec<_> = (from..from + n)
+                .map(|i| {
+                    let mut row =
+                        summary(1, if i % 3 == 0 { "acct_b" } else { "acct_a" }, "seeding");
+                    row["infohash"] = json!(format!("{i:040x}"));
+                    row
+                })
+                .collect();
+            testing::from_json(json!({"items": items, "next_cursor": next}))
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Key(KeyCode),
+            /// The daemon answers the request in flight, if there is one,
+            /// with `n` rows and more to come or not. A first page of a
+            /// reload starts the daemon's rows at `shift`: what it lists can
+            /// change between reloads.
+            Page {
+                shift: usize,
+                n: usize,
+                more: bool,
+            },
+            PageFailed,
+            Refresh,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            let key = prop::sample::select(vec![
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+                KeyCode::Char('g'),
+                KeyCode::Char('G'),
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::Home,
+                KeyCode::End,
+                KeyCode::PageUp,
+                KeyCode::PageDown,
+                KeyCode::Char('/'),
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::Backspace,
+                KeyCode::Char('0'),
+                KeyCode::Char('1'),
+                KeyCode::Char('b'),
+                KeyCode::Char('e'),
+                KeyCode::Char('f'),
+                KeyCode::Char('F'),
+            ]);
+            prop_oneof![
+                6 => key.prop_map(Op::Key),
+                3 => (0usize..30, 0usize..40, any::<bool>()).prop_map(|(shift, n, more)| Op::Page { shift, n, more }),
+                1 => Just(Op::PageFailed),
+                1 => Just(Op::Refresh),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Whatever keys are pressed and whatever the daemon answers,
+            /// failed or short, filtered or not, the list's selection is a
+            /// row it shows, or 0 when it shows none.
+            ///
+            /// The daemon is faithful to the protocol: it answers only the
+            /// request in flight, a reload's with a first page, a cursor's
+            /// with the rows from that cursor on.
+            #[test]
+            fn the_selection_stays_within_the_visible_rows(ops in prop::collection::vec(op(), 0..80)) {
+                let mut state = State::default();
+                testing::with_ctx(None, |ctx| -> Result<(), TestCaseError> {
+                    // The request in flight: `None` for a reload's first
+                    // page, else the row its cursor resumes at. A cursor is
+                    // `k<row>`.
+                    let mut in_flight: Option<Option<usize>> = None;
+                    let cursor_row = |c: &Option<String>| -> Option<usize> {
+                        c.as_deref().and_then(|c| c.strip_prefix('k')).and_then(|n| n.parse().ok())
+                    };
+                    let (mut generation, mut loading) = (state.list.generation, false);
+                    let _ = update(&mut state, Msg::Profiles(Ok(profiles())), ctx);
+                    let _ = refresh(&mut state, ctx);
+                    for op in std::iter::once(None).chain(ops.into_iter().map(Some)) {
+                        // The row after the page just sent: where the next
+                        // request, a reload's or for more, resumes.
+                        let mut resume_at = None;
+                        let msg = match &op {
+                            None => None,
+                            Some(Op::Key(code)) => on_key(&state, testing::key(*code)),
+                            Some(Op::Page { .. } | Op::PageFailed) if in_flight.is_none() => None,
+                            Some(Op::Page { shift, n, more }) => {
+                                let request = in_flight.take().unwrap();
+                                let from = request.unwrap_or(*shift);
+                                let next = more.then(|| format!("k{}", from + n));
+                                resume_at = Some(from + n);
+                                let page = rows(from, *n, next.as_deref());
+                                Some(page_msg(&state, request.is_none(), Ok(page)))
+                            }
+                            Some(Op::PageFailed) => {
+                                in_flight = None;
+                                Some(page_msg(&state, false, Err(failure(500, "internal", "boom"))))
+                            }
+                            Some(Op::Refresh) => {
+                                let _ = refresh(&mut state, ctx);
+                                None
+                            }
+                        };
+                        if let Some(msg) = msg {
+                            let _ = update(&mut state, msg, ctx);
+                        }
+                        // What the client asked for since: a reload, or a
+                        // page from its cursor (a reload's next page, or more
+                        // rows near the end).
+                        if state.list.generation != generation {
+                            in_flight = Some(None);
+                        } else if let (true, Some(at)) = (state.list.loading, resume_at) {
+                            in_flight = Some(Some(at));
+                        } else if state.list.loading && !loading {
+                            in_flight = Some(cursor_row(&state.list.next_cursor));
+                        }
+                        if !state.list.loading {
+                            in_flight = None;
+                        }
+                        (generation, loading) = (state.list.generation, state.list.loading);
+                        let op = op.unwrap_or(Op::Refresh);
+                        if state.detail.is_none() {
+                            let shown = visible(&state).len();
+                            prop_assert!(
+                                state.selected < shown.max(1),
+                                "after {:?}: selected {} of {} shown",
+                                op,
+                                state.selected,
+                                shown,
+                            );
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }
