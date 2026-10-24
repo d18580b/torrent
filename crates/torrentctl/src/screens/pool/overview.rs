@@ -650,3 +650,96 @@ fn result_lines<'a>(state: &State, ctx: &Ctx<'_>, wide: bool) -> Vec<Line<'a>> {
     }
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    mod props {
+        use proptest::prelude::*;
+        use serde_json::json;
+
+        use super::super::*;
+        use crate::testing;
+
+        /// An overview with `n` roots.
+        fn pool(n: usize) -> types::PoolOverview {
+            let roots: Vec<_> = (0..n)
+                .map(|i| {
+                    json!({"root_id": i, "path": format!("/srv/pool/{i}"), "bytes_total": 100,
+                           "bytes_adopted": 0, "bytes_matched": 0, "bytes_orphan": 0,
+                           "files_total": 1, "files_orphan": 0})
+                })
+                .collect();
+            testing::from_json(json!({
+                "library_dir": "/srv/library", "torrents": 0, "files": 0,
+                "states": {"missing": 0, "partial": 0, "matched": 0, "adopted": 0,
+                           "drifted": 0, "overlap": 0, "shared": 0},
+                "verify_queue_depth": 0, "verify_in_flight": 0, "roots": roots,
+            }))
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Move(Motion),
+            /// The load in flight answers with this many roots, or fails.
+            Loaded(Option<usize>),
+            /// An answer to a load since superseded.
+            StaleLoaded(usize),
+            Refresh,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            let motion = prop::sample::select(vec![
+                Motion::Up,
+                Motion::Down,
+                Motion::Top,
+                Motion::Bottom,
+                Motion::PageUp,
+                Motion::PageDown,
+            ]);
+            prop_oneof![
+                4 => motion.prop_map(Op::Move),
+                2 => prop::option::weighted(0.9, 0usize..25).prop_map(Op::Loaded),
+                1 => (0usize..25).prop_map(Op::StaleLoaded),
+                1 => Just(Op::Refresh),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Whatever moves are made and however many roots each load
+            /// returns, the selected root is one the overview lists, or 0
+            /// when it lists none.
+            #[test]
+            fn the_selected_root_stays_within_the_roots(ops in prop::collection::vec(op(), 0..60)) {
+                let mut state = State::default();
+                testing::with_ctx(None, |ctx| -> Result<(), TestCaseError> {
+                    let _ = refresh(&mut state, ctx);
+                    for op in ops {
+                        let generation = state.generation;
+                        match op.clone() {
+                            Op::Move(m) => drop(update(&mut state, Msg::Move(m), ctx)),
+                            Op::Loaded(Some(n)) => drop(update(&mut state, Msg::Loaded(generation, Ok(pool(n))), ctx)),
+                            Op::Loaded(None) => drop(update(
+                                &mut state,
+                                Msg::Loaded(generation, Err(Failure { status: Some(500), ..Default::default() })),
+                                ctx,
+                            )),
+                            Op::StaleLoaded(n) => drop(update(&mut state, Msg::Loaded(generation.wrapping_sub(1), Ok(pool(n))), ctx)),
+                            Op::Refresh => drop(load(&mut state, ctx)),
+                        }
+                        let roots = state.pool.as_ref().map_or(0, |p| p.roots.len());
+                        prop_assert!(
+                            state.selected < roots.max(1),
+                            "after {:?}: selected {} of {} roots",
+                            op,
+                            state.selected,
+                            roots,
+                        );
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+    }
+}
