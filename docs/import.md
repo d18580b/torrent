@@ -238,12 +238,19 @@ The second sees exactly what the sandboxed daemon sees (§2). `$TOKEN` is any
 
 Before trusting the counts:
 
-- **`errors` above 0.** Entries the scan could not read; the log names each.
-  Usually a permissions problem (§2), and it hides payload.
+- **`errors` above 0.** Entries the scan could not read, or symlinks it did
+  not follow (below); the log names each. Usually a permissions problem (§2),
+  and it hides payload.
 - **`partial` or `missing` you did not expect.** Payload outside every root,
   a file renamed in the old client (Deluge, Transmission, rTorrent), or a
   torrent the old client never finished. torrentd never downloads, so a
   `partial` torrent is not adopted.
+- **Symlinks under a root.** The scan does not follow them, so nothing a
+  symlink points at is indexed, whether a file or a directory, and a torrent
+  over it reads `partial` or `missing`. Each one counts in `errors`, as
+  `torrentd_pool_scan_errors_total{kind="symlink"}`, and the log names its
+  path. Add the symlink's target as a root of its own, or replace the
+  symlink with the real file or directory, then rescan.
 - **`overlap`.** Two torrents disagree about the same bytes. Neither adopts,
   and no plan touches those files, until one torrent leaves the library.
 

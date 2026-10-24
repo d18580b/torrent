@@ -32,8 +32,10 @@ pub struct ScanStats {
     /// `errors`, by kind: `walk` (the walk could not read an entry, or list a
     /// directory), `stat`,
     /// `path` (not UTF-8), `read` (a `.torrent` that could not be read, or is
-    /// larger than [`MAX_LIBRARY_FILE_BYTES`]) and
-    /// `parse` (one that is not a torrent, or names no info-hash). A kind that
+    /// larger than [`MAX_LIBRARY_FILE_BYTES`]),
+    /// `parse` (one that is not a torrent, or names no info-hash) and
+    /// `symlink` (a symlink under a managed root, which the walk does not
+    /// follow, so nothing behind it is indexed). A kind that
     /// never happened is absent. The daemon exports each as its own series, so
     /// an unreadable root and a library of corrupt files alert differently.
     pub errors_by_kind: std::collections::BTreeMap<&'static str, u64>,
@@ -52,7 +54,8 @@ pub const MAX_LIBRARY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl ScanStats {
     /// Every value `errors_by_kind` can hold as a key.
-    pub const ERROR_KINDS: &'static [&'static str] = &["walk", "stat", "path", "read", "parse"];
+    pub const ERROR_KINDS: &'static [&'static str] =
+        &["walk", "stat", "path", "read", "parse", "symlink"];
 
     fn note_error(&mut self, kind: &'static str) {
         debug_assert!(Self::ERROR_KINDS.contains(&kind), "{kind}");
@@ -65,7 +68,10 @@ impl ScanStats {
 ///
 /// Symlinks are not followed. A pool assembled with symlinks into other roots
 /// would otherwise index the same bytes under two paths and every torrent over
-/// them would be reported as an overlap.
+/// them would be reported as an overlap. Each symlink below the root, to a
+/// file or a directory, is logged with its path and counted a `symlink`
+/// error: what it points at is absent from the index, so a torrent over it
+/// reads `partial` or `missing`, and a count of 0 would hide why.
 ///
 /// The walk streams into a staging table [`STAGE_BATCH`] rows at a time, and
 /// the root's index is swapped for it only once the walk is done: memory is
@@ -114,6 +120,19 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             } else {
                 unseen.extend(rel_of(&entry.path(), root_path));
             }
+        }
+        // Not followed (see above), but not silent either. The root itself
+        // is what the operator configured, so only entries below it count.
+        if entry.depth > 0 && entry.file_type().is_symlink() {
+            let path = entry.path();
+            let in_trash = path
+                .strip_prefix(root_path)
+                .is_ok_and(|rel| rel.starts_with(crate::plan::TRASH_DIR));
+            if !in_trash {
+                warn!(target: "torrentd_pool::scan", path = %path.display(), "skipping symlink; nothing behind it is indexed");
+                stats.note_error("symlink");
+            }
+            continue;
         }
         if !entry.file_type().is_file() {
             continue;
