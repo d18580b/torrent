@@ -47,10 +47,16 @@ if ! systemd-analyze verify --man=no --recursive-errors=no "$tmp/torrentd.servic
   error "systemd-analyze verify rejects the unit"
 fi
 
-# The line that sets KEY=, exactly once; comments are not settings.
+# A line that sets KEY: systemd allows whitespace around the `=`. Comments are
+# not settings.
+key_re() {
+  printf '^[[:space:]]*%s[[:space:]]*=' "$1"
+}
+
+# The value of the line that sets KEY, exactly once, trimmed as systemd trims it.
 setting() {
-  local lines
-  lines=$(grep -E "^[[:space:]]*$1=" "$unit" || true)
+  local lines value
+  lines=$(grep -E "$(key_re "$1")" "$unit" || true)
   if [ -z "$lines" ]; then
     error "$1= is missing"
     return 1
@@ -59,7 +65,10 @@ setting() {
     error "$1= is set more than once"
     return 1
   fi
-  printf '%s\n' "${lines#*=}"
+  value=${lines#*=}
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s\n' "$value"
 }
 
 # A line that must appear as written, and the line number it is on.
@@ -101,10 +110,13 @@ fi
 if bounding=$(setting CapabilityBoundingSet); then
   [ -z "$bounding" ] || error "CapabilityBoundingSet= must be empty, not: $bounding"
 fi
-if grep -qE '^[[:space:]]*AmbientCapabilities=' "$unit"; then
+if grep -qE "$(key_re AmbientCapabilities)" "$unit"; then
   error "AmbientCapabilities= must stay commented out"
 fi
-if empty=$(line_of 'CapabilityBoundingSet=') &&
+# The empty set's line, however it is spaced; setting above has already
+# required that it is the only one.
+if empty=$(grep -nE "$(key_re CapabilityBoundingSet)" "$unit" | head -n 1 | cut -d: -f1) &&
+  [ -n "$empty" ] &&
   ambient=$(line_of '# AmbientCapabilities=CAP_NET_ADMIN') &&
   net_admin=$(line_of '# CapabilityBoundingSet=CAP_NET_ADMIN'); then
   # Uncommented, the pair must come after the empty set to replace it.
