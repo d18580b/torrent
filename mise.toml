@@ -295,7 +295,7 @@ run = [
 ]
 
 [tasks.bench]
-description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM). --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
+description = "Layer 4: alert throughput, memory per torrent, startup time, and the pool's scan, match and adopt preview; every budgeted one fails on a breach of crates/torrentd-bench/budgets.toml. CI's bench job runs it at --size ci; the default pool size, full, takes minutes. --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
 run = "cargo run --release -p torrentd-bench --"
 
 # Mutation testing: cargo-mutants changes the code one mutant at a time and
