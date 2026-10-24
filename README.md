@@ -85,13 +85,16 @@ Change detection is tiered, a cheap stat sweep routinely and libtorrent's own
 piece hashing on drift and on adopt, as the
 [`torrentd-pool` crate documentation](crates/torrentd-pool/src/lib.rs) sets out.
 
-**Migrating from qBittorrent, or another libtorrent-based client, is just the
-first scan** — point `library_dir` at its state directory (qBittorrent's
-`BT_backup`). Their `.fastresume` sidecars supply the save path, renamed files
-and completion; a client whose state directory is not `.torrent` files beside
-libtorrent resume data gets matching only, and every torrent is verified. The details are in
-[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml) next to the key
-you set.
+**Migrating from another client is just the first scan** — point
+`library_dir` at its state directory (qBittorrent's `BT_backup`). Only a
+client that keeps one `.fastresume` beside each `.torrent` (`foo.torrent` and
+`foo.fastresume`, as qBittorrent does) gets the fast path: that sidecar
+supplies the save path, renamed files and completion. Every other client gets
+matching only, and every torrent is verified. That includes Deluge, whose
+resume data is a single `torrents.fastresume` that pairs with no `.torrent`
+and is not read. Each client's layout is in
+[`docs/import.md`](docs/import.md#3-per-client), and the key you set is in
+[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml).
 
 ```bash
 torrentd --config … pool scan      # index + match
@@ -248,7 +251,9 @@ token_file = "/home/me/.config/torrentctl/token"
 `info`. `TORRENTCTL_LOG` takes a `tracing` filter
 (`TORRENTCTL_LOG=debug`, or `torrentctl=debug`) for more.
 
-**Keys.** `?` lists the keys on every screen, `1`–`4` switch screens, and `:`
+**Keys.** `?` lists the keys on every screen, `1` to `n` (or `Tab`) switch
+screens (Dashboard, Torrents, Profiles, then Pool, which appears only when the
+daemon has `[pool]`), and `:`
 opens a command line (`:dashboard`, `:torrents`, `:profiles`, `:pool`,
 `:add`, `:reload`, `:help`, `:quit`).
 
