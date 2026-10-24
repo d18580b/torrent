@@ -397,8 +397,14 @@ set --
 for f in $TORRENTD_MUTANTS_NETNS; do
   set -- "$@" --exclude "$f"
 done
+# The pull-request job gives this 12 minutes, so a mutant that hangs the
+# tests is cut off at twice the baseline's test time (at least 30 seconds)
+# rather than cargo-mutants' default five times, and the rest still run.
+# --timeout would set one fixed cap instead, but it caps the unmutated
+# baseline's tests too and fails the whole run when they outlast it.
 LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) \
-  cargo mutants --workspace --in-diff target/mutants.diff --output target "$@"
+  cargo mutants --workspace --in-diff target/mutants.diff --output target \
+  --timeout-multiplier 2 --minimum-test-timeout 30 "$@"
 '''
 
 # One shard of every mutant in the workspace: the nightly job's unit.

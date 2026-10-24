@@ -6,7 +6,8 @@ name: Mutants
 # What each run found is in its annotations and its `mutants.out` artifact.
 #
 # - in-diff: on a pull request, the mutants in the Rust lines it changes,
-#   capped at 90 minutes.
+#   as many as fit in 12 minutes. The job's header says why it always
+#   ends green inside its 28-minute cap.
 # - shard: nightly, every mutant in the workspace in eight shards.
 # - netns: nightly, the kill switch and WireGuard, whose decisive tests need
 #   a real kernel network stack, in a network namespace.
@@ -43,13 +44,27 @@ env:
   INSTA_UPDATE: 'no'
 
 jobs:
+  # A pull request's check stays pending for as long as this runs, so it is
+  # bounded to end green in under 30 minutes. Every step has a cap and
+  # `continue-on-error`, so a step that fails or times out marks only itself;
+  # each step after setup runs only when the steps it needs succeeded, and
+  # otherwise is skipped. The step caps sum to 26 minutes (checkout 3, diff 1,
+  # setup-rust 6, native-cache 3, cargo mutants 12, upload 1), under the
+  # job's 28, so a step always times out before the job does: a job-level
+  # timeout is the one end `continue-on-error` cannot turn green. The two
+  # minutes left are for the runner's set-up and the actions' post steps.
+  # A native-cache miss needs ~4 minutes to fetch the vendor submodules, so
+  # it times out at 3 and the run is skipped; the nightly jobs fill the cache.
   in-diff:
     name: mutants in the diff (advisory)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 28
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        continue-on-error: true
+        timeout-minutes: 3
         with:
           submodules: false
           # The diff is taken from the merge base, so the base's history
@@ -60,6 +75,9 @@ jobs:
       # A pull request that changes no Rust line has no mutant to test, so
       # it skips the toolchain and native prefix as well as the run.
       - id: diff
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -70,26 +88,34 @@ jobs:
             echo "rust=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - if: steps.diff.outputs.rust == 'true'
+      - id: setup-rust
+        if: steps.diff.outcome == 'success' && steps.diff.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
+        continue-on-error: true
+        timeout-minutes: 6
         with:
           system-deps: 'true'
 
-      - if: steps.diff.outputs.rust == 'true'
+      - id: native-cache
+        if: steps.setup-rust.outcome == 'success'
         uses: ./.github/actions/native-cache
+        continue-on-error: true
+        timeout-minutes: 3
         with:
           path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
 
-      - if: steps.diff.outputs.rust == 'true'
+      - if: steps.native-cache.outcome == 'success'
         name: cargo mutants --in-diff
         continue-on-error: true
-        timeout-minutes: 90
+        timeout-minutes: 12
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: mise run mutants-diff "$BASE"
 
       - if: always() && steps.diff.outputs.rust == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        continue-on-error: true
+        timeout-minutes: 1
         with:
           name: mutants-in-diff
           path: target/mutants.out
