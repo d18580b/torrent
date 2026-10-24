@@ -1426,7 +1426,7 @@ pub async fn delete_torrent(
                     return report_unfinished_cleanup(&ih, resurrects);
                 };
                 let bucket = format!("torrent-{}-{}", ih.to_hex(), unix_now());
-                let outcome = crate::pool_apply::trash_torrent_payload(&payload, &bucket);
+                let outcome = crate::pool_trash::trash_torrent_payload(&payload, &bucket);
                 // The session no longer holds it, so the assignment is
                 // cleared whatever the move did: left in place it would answer
                 // every later delete `409 torrent-adding`.
@@ -1494,7 +1494,7 @@ fn payload_to_trash(
     engine: &Arc<dyn TorrentEngine>,
     ih: &InfoHash,
     h: TorrentHandle,
-) -> Result<crate::pool_apply::TorrentPayload, DeleteTorrentError> {
+) -> Result<crate::pool_trash::TorrentPayload, DeleteTorrentError> {
     let Some(pool) = s.pool.as_ref() else {
         // Checked by the handler already; a pool is what holds the trash.
         return Err(DeleteTorrentError::MutationsDisabled);
@@ -1515,17 +1515,17 @@ fn payload_to_trash(
     // in the same read of the committed index as the claims and rows it
     // rests on. It reads the read connection, so it never waits out a scan
     // still holding the writer.
-    let payload = match crate::pool_apply::torrent_payload(
+    let payload = match crate::pool_trash::torrent_payload(
         pool,
         &ih.to_hex(),
         FsPath::new(&details.save_path),
         &files,
     ) {
         Ok(payload) => payload,
-        Err(crate::pool_apply::PayloadRefusal::Shared(others)) => {
+        Err(crate::pool_trash::PayloadRefusal::Shared(others)) => {
             return Err(payload_shared(&others));
         }
-        Err(crate::pool_apply::PayloadRefusal::Unproven(why)) => {
+        Err(crate::pool_trash::PayloadRefusal::Unproven(why)) => {
             return Err(DeleteTorrentError::PayloadUntrashable {
                 detail: format!(
                     "{why}. Nothing was changed; the torrent is still in its session. Retry \
@@ -1578,7 +1578,7 @@ fn payload_shared(others: &[String]) -> DeleteTorrentError {
 fn refuse_live_overlap(
     s: &AppState,
     ih: &InfoHash,
-    payload: &crate::pool_apply::TorrentPayload,
+    payload: &crate::pool_trash::TorrentPayload,
 ) -> Result<(), DeleteTorrentError> {
     let mut others: Vec<InfoHash> = s
         .registry
@@ -1604,12 +1604,12 @@ fn refuse_live_overlap(
                 "is assigned to a profile but no session holds it".to_owned(),
             ));
         };
-        let live = crate::pool_apply::read_live_torrent(&s.source, &st).map_err(|e| match e {
-            crate::pool_apply::LiveReadError::NoSession => unprovable(
+        let live = crate::live_torrent::read_live_torrent(&s.source, &st).map_err(|e| match e {
+            crate::live_torrent::LiveReadError::NoSession => unprovable(
                 other,
                 format!("is held by profile {}, which has no session", st.profile_id),
             ),
-            crate::pool_apply::LiveReadError::Engine(e) => {
+            crate::live_torrent::LiveReadError::Engine(e) => {
                 unprovable(other, format!("could not be read from its session ({e})"))
             }
         })?;

@@ -2393,7 +2393,7 @@ pub async fn apply_plan(
     let guard = work.enter();
     let outcome = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        crate::pool_apply::apply(&worker, &source, &state, id, &|| work.is_cancelled())
+        crate::apply::apply(&worker, &source, &state, id, &|| work.is_cancelled())
     })
     .await
     .map_err(|e| ApplyPlanError::Internal {
