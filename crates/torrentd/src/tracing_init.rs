@@ -18,12 +18,11 @@
 //! carrying a tracker credential never reaches the log, whichever field,
 //! span, crate, or libtorrent log message it arrived in. A URL is
 //! credential-carrying when it has userinfo (`user:pass@`), a query parameter
-//! named in [`CREDENTIAL_KEYS`](crate::redact::CREDENTIAL_KEYS), or a path
-//! segment of 32 or more ASCII alphanumerics (the shape of a passkey embedded
-//! in the path), or when a URL nested unencoded after its host is itself
-//! credential-carrying, or when it nests URLs more than
-//! [`MAX_URL_NESTING`](crate::redact::MAX_URL_NESTING) deep. Keys are compared
-//! after percent-decoding, and a URL percent-encoded once or twice (`https%3A%2F%2F…`,
+//! named in `redact::CREDENTIAL_KEYS`, or a path segment of 32 or more ASCII
+//! alphanumerics (the shape of a passkey embedded in the path), or when a URL
+//! nested unencoded after its host is itself credential-carrying, or when it
+//! nests URLs more than `redact::MAX_URL_NESTING` deep. Keys are compared after
+//! percent-decoding, and a URL percent-encoded once or twice (`https%3A%2F%2F…`,
 //! alone or nested in another URL) is judged by what it decodes to. Such a URL
 //! is replaced by its scheme and host plus a marker holding a short hash of
 //! the whole URL:
