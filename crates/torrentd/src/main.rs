@@ -35,6 +35,7 @@ mod pool_service;
 mod port_forward_monitor;
 mod profile_registry;
 mod profile_state;
+mod redact;
 mod registry;
 mod reload;
 mod sd_notify;

@@ -2590,10 +2590,10 @@ impl FilesFailure {
 /// the front of a scheme, is the tracker's own words and is returned as it
 /// is.
 fn display_message(message: &str) -> String {
-    use crate::tracing_init::display_announce_url;
-    use crate::tracing_init::is_scheme_char;
-    use crate::tracing_init::is_url_terminator;
-    use crate::tracing_init::trim_trailing_punctuation;
+    use crate::redact::display_announce_url;
+    use crate::redact::is_scheme_char;
+    use crate::redact::is_url_terminator;
+    use crate::redact::trim_trailing_punctuation;
 
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
@@ -2695,7 +2695,7 @@ impl From<torrentd_engine::TrackerEntry> for Tracker {
     fn from(t: torrentd_engine::TrackerEntry) -> Self {
         let status = TrackerStatus::of(&t);
         let message = t.last_error.or(t.message).map(|m| display_message(&m));
-        let shown = crate::tracing_init::display_announce_url(&t.url);
+        let shown = crate::redact::display_announce_url(&t.url);
         Self {
             tier: t.tier,
             host: shown.host,
@@ -2952,7 +2952,7 @@ mod tests {
         // The marker is the one the url field shows for the same URL.
         let raw = "https://t.example/announce?pk=abc123";
         assert!(
-            display_message(raw) == crate::tracing_init::display_announce_url(raw).url,
+            display_message(raw) == crate::redact::display_announce_url(raw).url,
             "{}",
             display_message(raw)
         );
