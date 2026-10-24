@@ -4,6 +4,11 @@
 # Compiles vendored Boost + libtorrent + the shim + the daemon.
 # Stage 2 (runtime): Fedora minimal plus the runtime tools listed below.
 #
+# Each release publishes this image as ghcr.io/d18580b/torrent:X.Y.Z, built
+# by .github/workflows/release-plz.yml from the tagged commit with no build
+# cache, checked to carry that release's torrentd, then signed and attested
+# (README.md § Install says how to verify it).
+#
 # Both base images are pinned by the digest of their multi-arch index, not by
 # tag alone: `fedora:43` is re-pushed with every update, so a tag names a
 # different image from one build to the next and nothing records which one a
@@ -67,8 +72,9 @@ COPY . /src
 # here and identifies the vendored trees by hashing marker files instead. That
 # is deterministic across builds, which is what makes the mount worth having.
 #
-# Note this helps local iteration only: the CI `container` job runs on a fresh
-# VM, where a build cache mount starts empty.
+# Note this helps local iteration only: the CI `container` job and the release
+# workflow's `image` job run on a fresh VM, where a build cache mount starts
+# empty.
 ENV LIBTORRENT_SYS_CACHE_DIR=/root/.cache/torrentd/native
 
 # Extra cargo features, empty for every image but the alert drill's, which

@@ -117,8 +117,11 @@ pub fn document_json() -> anyhow::Result<String> {
     Ok(json)
 }
 
+/// The document's `info`. Its `version` is the crate's, the one release-plz
+/// moves and the release tag names, so a published document says which
+/// release it describes; the API's own compatibility line is the `/v1` prefix.
 fn info() -> Info {
-    Info::new("torrentd", "1.0.0")
+    Info::new("torrentd", env!("CARGO_PKG_VERSION"))
         .with_summary("Control plane of a headless, multi-account torrent seeding daemon.")
         .with_description(
             "The `/v1` HTTP API of `torrentd`. Conventions — authentication, pagination, \

@@ -1,0 +1,9 @@
+# zizmor's configuration, read by `mise run lint-workflows` (zizmor finds it
+# here on its own).
+rules:
+  # It asks for `$/...` in place of `./...` for this repository's own
+  # composite actions. Both name the same action at the same commit, so this
+  # is a spelling preference rather than a hazard; the workflows keep the
+  # spelling every runner and actionlint understand.
+  self-repository:
+    disable: true

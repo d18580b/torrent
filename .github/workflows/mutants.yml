@@ -103,6 +103,11 @@ jobs:
         timeout-minutes: 3
         with:
           path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
+          # Restore only. This job ends green when the fetch or the run times
+          # out, so a save here would store the restored prefixes under the
+          # new key without the one it names, and every later job would hit
+          # it, skip the vendor fetch, and fail in libtorrent-sys's build.rs.
+          save: 'false'
 
       - if: steps.native-cache.outcome == 'success'
         name: cargo mutants --in-diff

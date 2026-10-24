@@ -9,7 +9,8 @@
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check|msrv|rustfmt-toolchain
 #   mise run test-shim|test-shim-asan|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|release-features|deny
-#   mise run lint-tracing|size-check|container|commit-lint <file-or-range>
+#   mise run lint-tracing|lint-workflows|size-check|container|commit-lint <file-or-range>
+#   mise run dist|dist-musl
 #   mise run unit-check [unit]
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
@@ -36,6 +37,15 @@ hk = "1.48.0"
 # Mutation testing (the mutants tasks below, .cargo/mutants.toml). Prebuilt
 # through cargo-binstall like the two above.
 "cargo:cargo-mutants" = "27.1.0"
+# Releases (release-plz.toml, .github/workflows/release-plz.yml). The release
+# workflow runs this exact release, and so does a local `release-plz update`.
+"aqua:release-plz/release-plz" = "0.4.1"
+# The workflow lint (`lint-workflows`): actionlint checks every workflow and
+# runs shellcheck over each `run:` script, and zizmor audits them for
+# injection, credential and permission mistakes.
+"aqua:rhysd/actionlint" = "1.7.12"
+"aqua:koalaman/shellcheck" = "0.11.0"
+"aqua:zizmorcore/zizmor" = "1.31.1"
 # pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
 # Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
 
@@ -496,6 +506,39 @@ printf '%s\n' "$tree" | grep -E '^torrentd(-engine)? v' | sort -u
 [tasks.deny]
 description = "cargo-deny: advisories, licenses, bans and sources (deny.toml)"
 run = "cargo deny check"
+
+# The release tarballs .github/workflows/release-plz.yml publishes, built the
+# same way locally. `dist` is the glibc build of both binaries, by the command
+# release-features models (no extra features, the whole workspace's feature
+# set unified), so that check runs first; `dist-musl` is a static torrentctl
+# and needs musl-gcc (Debian/Ubuntu `musl-tools`, Fedora `musl-gcc`) for
+# ring's C. scripts/dist checks each binary's version, against RELEASE_TAG
+# too when that is set, and packages it into target/dist/.
+[tasks.dist]
+description = "Build and package the x86_64 glibc release tarball (torrentd + torrentctl) into target/dist/"
+run = [
+  "mise run release-features",
+  "cargo build --release --locked --workspace --bin torrentd --bin torrentctl",
+  "scripts/dist gnu",
+]
+
+[tasks.dist-musl]
+description = "Build and package the static x86_64 musl torrentctl tarball into target/dist/ (needs musl-gcc)"
+run = [
+  "rustup target add x86_64-unknown-linux-musl",
+  "cargo build --release --locked -p torrentctl --target x86_64-unknown-linux-musl",
+  "scripts/dist musl",
+]
+
+# Every workflow and composite action: actionlint (with shellcheck over each
+# `run:` script) and zizmor's offline audits, configured by
+# .github/zizmor.yml. Offline, so it needs no token and reads nothing remote.
+[tasks.lint-workflows]
+description = "actionlint and zizmor over .github/"
+run = [
+  "actionlint",
+  "zizmor --offline .github",
+]
 
 # Live verification against real VPN credentials. Deliberately separate from
 # every `test` task: it needs a real host with real tunnels, it is the one

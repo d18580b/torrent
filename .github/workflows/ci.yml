@@ -145,6 +145,26 @@ jobs:
       # leave `fault-injection` and the engine's `test-support` off.
       - run: mise run release-features
 
+  dist-musl:
+    name: static torrentctl builds (musl)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # Every release ships this tarball (release-plz.yml's dist-musl job).
+      # Built here too, so a dependency that cannot build for musl, or that
+      # makes torrentctl dynamic, fails its own pull request rather than the
+      # next release. musl-tools brings musl-gcc for ring's C; torrentctl
+      # links no libtorrent, so nothing native is cached or fetched.
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-deps: 'true'
+          extra-packages: musl-tools
+          cache-prefix: cargo-musl
+      - run: mise run dist-musl
+
   tracing-lint:
     name: tracing field-name lint
     runs-on: ubuntu-24.04
@@ -158,6 +178,20 @@ jobs:
         with:
           toolchain: ''
       - run: mise run lint-tracing
+
+  workflow-lint:
+    name: workflow lint (actionlint + zizmor)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # Reads .github/ only; mise provides both linters and shellcheck.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - run: mise run lint-workflows
 
   size-check:
     name: file-length gate

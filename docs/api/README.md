@@ -42,8 +42,9 @@ A client must ignore response fields it does not know. Requests are closed in
 the other direction: every request body refuses unknown members with a `422`,
 so a misspelt field fails loudly instead of being silently dropped.
 
-`info.version` is the document's own version. The daemon's version is
-reported by `GET /v1/server`.
+`info.version` is the release the document describes: the daemon's version,
+the one `GET /v1/server` reports and the release tag names. The API's own
+compatibility line is the `/v1` prefix above, not that number.
 
 ## Authentication
 

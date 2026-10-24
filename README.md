@@ -48,7 +48,74 @@ which torrents point at data that moved or vanished.
 
 Linux x86-64 only.
 
+## Install
+
+Each [release](https://github.com/d18580b/torrent/releases) carries:
+
+| Asset | What it is |
+| --- | --- |
+| `torrent-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `torrentd` and `torrentctl`, the sample configs, the systemd unit, `LICENSE`, this README and `CHANGELOG.md` |
+| `torrentctl-X.Y.Z-x86_64-unknown-linux-musl.tar.gz` | a static `torrentctl`, for any x86_64 Linux, e.g. an operator's laptop |
+| `torrent-X.Y.Z.spdx.json` | the SPDX SBOM of the crates both binaries are built from |
+| `SHA256SUMS` | the SHA-256 of each file above |
+| `*.sigstore.json` | a Sigstore bundle signing each file above, `SHA256SUMS` included |
+| `ghcr.io/d18580b/torrent:X.Y.Z` | the container image of [`deploy/Containerfile`](deploy/Containerfile), also tagged `X.Y` and `latest` |
+
+The glibc tarball is built on Ubuntu 24.04, against its glibc 2.39; a host
+with an older glibc may refuse to load it. `torrentd` links OpenSSL 3
+(`libssl.so.3`, `libcrypto.so.3`), the GCC C++ runtime (`libstdc++.so.6`)
+and zlib dynamically, and shells out to the tools
+[`docs/running.md` § *1. Packages*](docs/running.md#1-packages) lists;
+`torrentctl` needs nothing past glibc. aarch64 and other architectures are not built:
+open an issue if you need one. Install the binary where the systemd unit
+expects it, as [`docs/running.md` § *4*](docs/running.md#4-service-user-binary-directories)
+shows, and follow that runbook from there.
+
+**Verify before you run anything.** A release is cut only by merging the
+release pull request on `master`: the workflow
+[`release-plz.yml`](.github/workflows/release-plz.yml) creates the tag,
+builds every asset and the image from the tagged commit, signs them with
+[Sigstore](https://www.sigstore.dev) as itself, records a build-provenance
+and an SBOM attestation for each, and only then publishes the release, which
+GitHub then keeps immutable. No person holds a signing key. Check any of the
+three below; the first needs only `gh`, the second only `cosign`:
+
+```bash
+v=X.Y.Z
+f=torrent-$v-x86_64-unknown-linux-gnu.tar.gz
+gh release download "v$v" --repo d18580b/torrent
+
+# The release workflow of this repository built it, from that tag's commit.
+gh attestation verify "$f" --repo d18580b/torrent \
+  --signer-workflow d18580b/torrent/.github/workflows/release-plz.yml
+
+# The same workflow signed it.
+cosign verify-blob "$f" --bundle "$f.sigstore.json" \
+  --certificate-identity https://github.com/d18580b/torrent/.github/workflows/release-plz.yml@refs/heads/master \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# It is an unmodified asset of the immutable release, and matches SHA256SUMS.
+gh release verify-asset "v$v" "$f" --repo d18580b/torrent
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The image, by the same two routes:
+
+```bash
+gh attestation verify oci://ghcr.io/d18580b/torrent:X.Y.Z --repo d18580b/torrent \
+  --signer-workflow d18580b/torrent/.github/workflows/release-plz.yml
+cosign verify ghcr.io/d18580b/torrent:X.Y.Z \
+  --certificate-identity https://github.com/d18580b/torrent/.github/workflows/release-plz.yml@refs/heads/master \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+`torrentd --version` and `torrentctl --version` print the release's version,
+and the release workflow refuses to publish binaries that print another.
+Every change is in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Quick start
+
+From source, for development or a build of your own:
 
 ```bash
 mise install && mise run native                     # submodules + libtorrent, 5–15 min, once
@@ -450,7 +517,9 @@ read only series it holds.
 
 `deploy/` has a hardened systemd unit (`Type=notify`,
 `RestartPreventExitStatus=78`, resource limits), a multi-stage `Containerfile`, and a
-`compose.yaml`. Run torrentd as its own user. Setup is
+`compose.yaml`, which builds the image from source; each release publishes
+the same image, signed, as `ghcr.io/d18580b/torrent` ([Install](#install)).
+Run torrentd as its own user. Setup is
 [`docs/running.md`](docs/running.md), whose §8 also brings up the compose
 stack, and §9 has the day-one runbook for WireGuard behind the kill switch.
 

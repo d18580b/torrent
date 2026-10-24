@@ -57,6 +57,14 @@ fn the_document_is_openapi_3_2_and_uses_no_unchecked_route() {
     );
 }
 
+/// The document names the release it describes: the crate version, which
+/// `GET /v1/server` reports and the release tag carries, not a number of its
+/// own that no release ever moves.
+#[test]
+fn the_document_version_is_the_crate_version() {
+    assert_eq!(doc()["info"]["version"], env!("CARGO_PKG_VERSION"));
+}
+
 #[test]
 fn every_operation_is_summarised_described_and_tagged() {
     let doc = doc();
