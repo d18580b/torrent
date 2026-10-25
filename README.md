@@ -149,7 +149,7 @@ them, and reports per path:
 | `matched` | Every file resolved on disk; not yet loaded. |
 | `partial` | Only some files present. Adoption is refused — seeding it would advertise pieces the daemon cannot serve. |
 | `missing` | No payload found under any root. |
-| `drifted` | A claimed file's size, mtime, inode or device changed since the last scan. Stays so across rescans until a verification clears it. |
+| `drifted` | A claimed file's size or mtime changed since the last scan. Stays so across rescans until a verification clears it. |
 | `overlap` | Two torrents claim some of the same files, but not the same set. Blocks adoption and any mutation touching those bytes. |
 | `shared` | Another torrent claims exactly the same files — a cross-seed. Adoptable, each into its own profile; never moved or deleted for one of them. |
 
