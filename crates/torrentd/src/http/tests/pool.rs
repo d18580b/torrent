@@ -32,6 +32,8 @@ use crate::profile_registry::ProfileStatus;
 const IH_A: &str = "161198fb49b44a081ed02da0b8f4f036e5cab471";
 /// Partial, based under `movies/`, claiming nothing.
 const IH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+/// The note the match left on [`IH_B`].
+const IH_B_NOTE: &str = "0 of 1 files present";
 /// In the library, never matched.
 const IH_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
@@ -125,7 +127,7 @@ fn fixture(dir: &Path, allow_mutations: bool) -> (Arc<PoolService>, i64) {
             Some("movies"),
             None,
             None,
-            None,
+            Some(IH_B_NOTE),
         )
         .unwrap();
         st.replace_claims(
@@ -370,6 +372,10 @@ async fn reads(cov: &Arc<Coverage>) {
     assert_eq!(all["items"][0]["state"], "matched");
     assert_eq!(all["items"][0]["base_rel"], "movies");
     assert_eq!(all["items"][0]["num_files"], 2);
+    // The note the match left, and `null` where it left none.
+    assert_eq!(all["items"][0]["note"], Value::Null);
+    assert_eq!(all["items"][1]["note"], IH_B_NOTE);
+    assert_eq!(all["items"][2]["note"], Value::Null);
     assert_eq!(all["items"][2]["state"], Value::Null);
     let matched: Value = h.read("/v1/pool/torrents?state=matched").await.json();
     assert_eq!(items(&matched).len(), 1);

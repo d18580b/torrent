@@ -88,6 +88,7 @@ fn torrents(n: u8, next: Option<&str>) -> types::PoolTorrentPage {
                 "infohash": hash(i + 1), "name": format!("Some.Linux.Distro.{i}.x86_64.iso"),
                 "total_size": (i as i64 + 1) * 3_000_000_000_i64, "num_files": i as i64 * 7 + 1,
                 "state": state, "base_rel": null,
+                "note": if state == Some("partial") { Some("1 of 2 files present") } else { None },
                 "profile_id": if state == Some("adopted") { Some("acct_a") } else { None },
                 "category": null, "tags": [], "has_fastresume": i % 2 == 0,
             })
