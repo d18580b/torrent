@@ -299,6 +299,7 @@ fn moving_a_directory_never_replaces_the_destination() {
     let e = failed(move_directory(
         &dir.path().join("src"),
         &dir.path().join("dst"),
+        dir.path(),
     ));
     assert!(e.contains("already exists"), "{e}");
     assert!(src_file.exists());
@@ -306,6 +307,61 @@ fn moving_a_directory_never_replaces_the_destination() {
         std::fs::read_dir(dir.path().join("dst")).unwrap().count(),
         0
     );
+}
+
+/// Every directory that gains an entry when the destination's missing
+/// ancestors are made is fsynced before the move returns, as are the two
+/// the rename changed: otherwise a crash can lose the path to the payload
+/// while the journal says the step is done.
+#[test]
+fn moving_a_directory_fsyncs_every_directory_that_gained_an_entry() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "old/T/a.bin", 3);
+    let dst = dir.path().join("x/y/z/T");
+    fsat::FSYNCED.with_borrow_mut(Vec::clear);
+    move_directory(&dir.path().join("old/T"), &dst, dir.path()).unwrap();
+    let synced = fsat::FSYNCED.take();
+    for d in ["", "old", "x", "x/y", "x/y/z"] {
+        let d = dir.path().join(d);
+        let md = std::fs::metadata(&d).unwrap();
+        assert!(
+            synced.contains(&(md.dev(), md.ino())),
+            "{} gained an entry but was not fsynced",
+            d.display(),
+        );
+    }
+    assert!(dst.join("a.bin").exists());
+}
+
+/// A destination ancestor inside the root that already exists is fsynced
+/// too, since a concurrent step may have just made it and not fsynced it
+/// yet; one above the root that this move made nothing in is left alone.
+#[test]
+fn moving_a_directory_fsyncs_existing_directories_on_the_way_within_the_root() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    write(&root, "old/T/a.bin", 3);
+    std::fs::create_dir_all(root.join("x/y")).unwrap();
+    let dst = root.join("x/y/z/T");
+    fsat::FSYNCED.with_borrow_mut(Vec::clear);
+    move_directory(&root.join("old/T"), &dst, &root).unwrap();
+    let synced = fsat::FSYNCED.take();
+    let id = |d: &Path| {
+        let md = std::fs::metadata(d).unwrap();
+        (md.dev(), md.ino())
+    };
+    for d in ["", "x", "x/y", "x/y/z"] {
+        let d = root.join(d);
+        assert!(
+            synced.contains(&id(&d)),
+            "{} is on the way to the destination but was not fsynced",
+            d.display(),
+        );
+    }
+    assert!(!synced.contains(&id(dir.path())));
+    assert!(dst.join("a.bin").exists());
 }
 
 /// An fsync that fails after the rename is not a step that did not

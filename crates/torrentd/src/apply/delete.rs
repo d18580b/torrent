@@ -146,9 +146,11 @@ pub(super) fn plan_trash_bucket(plan_id: i64, created_at: i64) -> String {
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, the file is examined and moved through its parent's
 /// descriptor, the move is `renameat2(RENAME_NOREPLACE)`, and both
-/// directories are fsynced so it survives a crash. A failed fsync comes after
-/// the file moved, so it is [`StepFailure::Unknown`]: `failed` would say the
-/// file is still where it was.
+/// directories are fsynced so it survives a crash, along with every directory
+/// on the trash walk's way, made here or found, so the path to it does too.
+/// A failed fsync comes after the file moved, so it is
+/// [`StepFailure::Unknown`]: `failed` would say the file is still where it
+/// was.
 pub(crate) fn move_into_trash(
     root: &Path,
     path: &Path,
@@ -163,7 +165,8 @@ pub(crate) fn move_into_trash(
     let root_dir =
         std::fs::File::open(root).map_err(|e| format!("open {}: {e}", root.display()))?;
     let parent = fsat::walk(&root_dir, &dirs, false)
-        .map_err(|e| format!("{}: {e}; refusing to follow it", path.display()))?;
+        .map_err(|e| format!("{}: {e}; refusing to follow it", path.display()))?
+        .dir;
     let parent = parent.as_ref().unwrap_or(&root_dir);
 
     let md =
@@ -181,9 +184,9 @@ pub(crate) fn move_into_trash(
 
     let mut trash_dirs = vec![torrentd_pool::plan::TRASH_DIR, bucket];
     trash_dirs.extend(dirs.iter().copied());
-    let trash = fsat::walk(&root_dir, &trash_dirs, true)
-        .map_err(|e| format!("trash for {}: {e}", path.display()))?
-        .expect("a non-empty walk yields a directory");
+    let walked = fsat::walk(&root_dir, &trash_dirs, true)
+        .map_err(|e| format!("trash for {}: {e}", path.display()))?;
+    let trash = walked.dir.expect("a non-empty walk yields a directory");
     fsat::rename_noreplace(parent, name, &trash, name).map_err(|e| {
         format!(
             "move {} into {}/{bucket}: {e}",
@@ -191,10 +194,21 @@ pub(crate) fn move_into_trash(
             torrentd_pool::plan::TRASH_DIR,
         )
     })?;
-    // Both directory entries changed; without these the rename can be lost
-    // to a crash and the file reappear where the journal says it is gone.
+    // Both directory entries changed. Every directory on the way to the
+    // trash is fsynced too, whether this walk made the entry in it or found
+    // it there: a concurrent delete or apply may have just made it and not
+    // fsynced it yet. Without these the rename, or the chain of directories
+    // leading to it, can be lost to a crash and the file reappear where the
+    // journal says it is gone, or be unreachable by path.
     let trash_path = root.join(torrentd_pool::plan::TRASH_DIR).join(bucket);
-    for (dir, what) in [(parent, "its directory"), (&trash, "the trash")] {
+    let on_the_way = walked
+        .crossed
+        .iter()
+        .map(|d| (d, "a directory on the way to the trash"));
+    for (dir, what) in [(parent, "its directory"), (&trash, "the trash")]
+        .into_iter()
+        .chain(on_the_way)
+    {
         fsat::fsync(dir).map_err(|e| {
             StepFailure::Unknown(format!(
                 "outcome unknown: {} was moved into {}, but fsync of {what} failed ({e}), so \
