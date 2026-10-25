@@ -873,6 +873,62 @@ mod tests {
         assert_eq!(metrics.count_for("removals_reconciled_total"), 0);
     }
 
+    /// The warning counts as unrecorded only an entry still tracked under
+    /// the handle the session lost: not one whose entry went, or moved to
+    /// another handle, between the listing and the settling.
+    #[test]
+    fn only_an_entry_still_tracked_under_the_lost_handle_counts_as_unrecorded() {
+        let mock = Arc::new(MockEngine::new());
+        let (state, resume, torrents) = (
+            StateMap::new(),
+            MemoryResumeStore::new(),
+            MemoryTorrentStore::new(),
+        );
+        let metrics = RecordingSink::new();
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let p = ProfileId::new("p");
+        let now = std::time::Instant::now();
+        // Lost with no removal recorded, and still tracked under its handle.
+        let lost = mock.register_handle(InfoHash([10; 20]));
+        assert!(state.track_added(lost, &p, true, now));
+        // Listed under a handle the map has since replaced.
+        let stale = mock.register_handle(InfoHash([11; 20]));
+        let current = mock.register_handle(InfoHash([11; 20]));
+        assert!(state.track_added(current, &p, true, now));
+        // Listed, and gone from the map since.
+        let gone = mock.register_handle(InfoHash([12; 20]));
+        let ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            fence_hold: None,
+            profile_id: p.clone(),
+            span: tracing::info_span!("test"),
+        };
+
+        let fields = Arc::new(WarnFields::default());
+        crate::testing::with_subscriber(Arc::clone(&fields), || {
+            reconcile_removals(&ctx, vec![lost, stale, gone], &[current]);
+        });
+        let fields = fields.0.lock().clone();
+        let field = |name: &str| -> Vec<u64> {
+            fields
+                .iter()
+                .filter(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .collect()
+        };
+        assert_eq!(field("unrecorded_count"), vec![1], "{fields:?}");
+        assert_eq!(field("torrent_count"), vec![0], "{fields:?}");
+        assert!(state.contains(&lost.infohash));
+        assert_eq!(state.get(&current.infohash).unwrap().handle, current);
+    }
+
     #[test]
     fn a_session_that_cannot_be_listed_leaves_the_map_as_it_was() {
         let mock = Arc::new(MockEngine::new());
