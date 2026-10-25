@@ -105,7 +105,8 @@ pub struct AppState {
     pub tunnel_probe: crate::vpn_monitor::Prober,
     /// The kill-switch watch's fence, where `network_kill_switch` is on. An
     /// add that finds its profile fenced records what it paused with it, so
-    /// the fence's lift resumes that too.
+    /// the fence's lift resumes that too. Setting a fenced profile online
+    /// refuses while it says the kill switch did not last check in force.
     pub kill_switch: Option<Arc<crate::fence::KillSwitchFence>>,
 }
 

@@ -226,6 +226,34 @@ fn sorted_ids(handles: &[TorrentHandle]) -> Vec<u64> {
     ids
 }
 
+/// The kill switch reads in force from boot, out of force from either
+/// fence of the watch's — whether or not it marks a profile — and in force
+/// again from its lift, whatever the lift then finds of each tunnel.
+#[tokio::test]
+async fn the_kill_switch_reads_in_force_from_each_lift_to_the_next_fence() {
+    use vpn::killswitch::Fence;
+    use vpn::killswitch::FenceCause;
+    // Fenced already by the monitor: the watch's fence marks nothing.
+    let (fence, _engine) = kill_switch_fence(ProfileStatus::VpnDown, false);
+    assert!(fence.in_force(), "verified at boot");
+    fence.fence_all_for(FenceCause::Unverifiable);
+    assert!(!fence.in_force(), "unverifiable, though nothing was marked");
+    fence.lift();
+    assert!(fence.in_force());
+
+    let (fence, _engine) = kill_switch_fence(ProfileStatus::Active, false);
+    fence.fence_all();
+    assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+    assert!(!fence.in_force(), "the table found gone or changed");
+    fence.lift();
+    assert_eq!(
+        status_of(&fence),
+        ProfileStatus::VpnDown,
+        "its tunnel fails the check, so the profile stays fenced",
+    );
+    assert!(fence.in_force(), "the table itself checked in force");
+}
+
 /// A lift over more torrents than a batch resumes a batch at once and
 /// the next only a pace later, so no second of it sends more than a
 /// batch of `started` announces; the fence's pauses are not paced.

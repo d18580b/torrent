@@ -167,10 +167,26 @@ member says why:
   It stays fenced until the operator sets it online
   (`PATCH /v1/profiles/{profile_id}` with `{"state": "online"}`) and its
   tunnel passes the check that request runs; nothing else un-quarantines it.
-  That request answers this problem too, when the tunnel still fails.
+  That request answers this problem too, when the tunnel still fails, and
+  [`kill-switch-not-in-force`](#kill-switch-not-in-force) while the kill
+  switch is not in force.
 - **`offline`**: the operator set the profile offline, or every profile with
   `POST /v1/profiles/offline-all`. Adds, adoptions and resumes are refused
   until it is set online.
+
+## `kill-switch-not-in-force`
+
+**409**, from `PATCH /v1/profiles/{profile_id}` with `{"state": "online"}` on a
+fenced (`vpn_down`) profile, where `network_kill_switch` is on. The kill
+switch's watch has every vpn profile fenced, because a check found its
+nftables table gone or changed, or because too many checks in a row could not
+run, and no check has found the table in force since. Lifting the fence then
+would put the profile back on the network with nothing confining its egress,
+so the profile stays fenced and its state is unchanged; the tunnel is not
+checked. Restore the table (a daemon restart installs it again), or whatever
+keeps `nft` from running, and retry once a check finds the table in force,
+which the daemon logs as lifting the fence it put on the vpn profiles: from
+then on the request checks the tunnel and lifts the fence as before.
 
 ## `torrent-exists`
 

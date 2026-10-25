@@ -441,6 +441,12 @@ pub enum SetProfileStateError {
         #[problem(extension)]
         profile_status: &'static str,
     },
+    /// The profile is fenced (`vpn_down`) and the network kill switch did
+    /// not last check in force, so the fence stays and its state is
+    /// unchanged.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The network kill switch is not in force")]
+    KillSwitchNotInForce { detail: String },
     /// The state could not be recorded, or a session refused it.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
@@ -469,7 +475,12 @@ pub enum SetProfileStateError {
 /// route by the tunnel. If it passes, the VPN monitor watches the profile
 /// again, handshake included, and the fence's pauses are undone 100 torrents
 /// a second, going on after the response, since each torrent resumed
-/// announces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting
+/// announces to its trackers; if it fails, `409` and nothing changes. Where
+/// `network_kill_switch` is on, the fence stays unless the kill switch last
+/// checked in force: while its watch has the vpn profiles fenced, for a table
+/// found gone or changed or for checks that could not run, setting a fenced
+/// profile online answers `409 kill-switch-not-in-force` and nothing changes,
+/// before its tunnel is checked. A profile that never came up keeps the setting
 /// for its next boot. `offline_all`, while on, keeps every profile offline
 /// whatever this sets.
 #[kynos::patch("/profiles/{profile_id}", tag = Profiles)]
@@ -507,6 +518,23 @@ fn set_state(
         .filter(|e| e.health().status == ObservedStatus::VpnDown);
     let lift = match (desired, fenced) {
         (DesiredState::Online, Some(entry)) => {
+            // A healthy tunnel is not enough: lifted now, the profile seeds
+            // with nothing but its source bind between it and the bare
+            // interface until the watch's next check fences it again.
+            if s.kill_switch.as_ref().is_some_and(|ks| !ks.in_force()) {
+                warn!(
+                    profile_id = %profile_id,
+                    "profile set online while fenced; the network kill switch is not in force, \
+                     so it stays fenced",
+                );
+                return Err(SetProfileStateError::KillSwitchNotInForce {
+                    detail: "profile vpn_down: the network kill switch did not last check in \
+                             force, so the profile stays fenced and its state is unchanged. \
+                             Restore the kill switch's nftables table (restarting the daemon \
+                             installs it again), then retry once a check finds it in force."
+                        .to_string(),
+                });
+            }
             if let Err(reason) = crate::vpn_monitor::recovery_check(entry, &s.tunnel_probe) {
                 warn!(
                     profile_id = %profile_id,

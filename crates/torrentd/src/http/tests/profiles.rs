@@ -591,6 +591,81 @@ async fn profiles_behave_as_documented() {
     scenarios(&Coverage::new()).await;
 }
 
+/// Setting a fenced profile online while the kill switch's watch has the
+/// vpn profiles fenced is refused before its tunnel is probed, and changes
+/// nothing; once a check finds the table in force again, the same request
+/// lifts the fence.
+#[tokio::test]
+async fn a_fenced_profile_stays_fenced_while_the_kill_switch_is_not_in_force() {
+    use crate::vpn::killswitch::Fence;
+    let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+    let healthy = Arc::new(AtomicBool::new(true));
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe: crate::vpn_monitor::Prober = {
+        let (inner, probes) = (switchable_probe(&healthy), probes.clone());
+        Arc::new(move |iface: &str, wg: bool| {
+            probes.fetch_add(1, Ordering::SeqCst);
+            inner(iface, wg)
+        })
+    };
+    let mut wired = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        install(s, vec![b], vec![]);
+        s.tunnel_probe = probe.clone();
+        let fence = Arc::new(crate::fence::KillSwitchFence::new(
+            s.profiles.clone(),
+            s.state.clone(),
+            s.metrics.clone(),
+            probe.clone(),
+        ));
+        s.kill_switch = Some(fence.clone());
+        wired = Some(fence);
+    });
+    let fence = wired.unwrap();
+    load(&h.state, 2, "acct_b");
+    let online = || {
+        let token = h.tokens.write.clone();
+        let h = &h;
+        async move {
+            h.send(
+                "PATCH",
+                "/v1/profiles/acct_b",
+                Some(&token),
+                Some(json!({ "state": "online" })),
+            )
+            .await
+        }
+    };
+
+    // Checks that could not run, PROBE_FAILURES_TO_FENCE in a row.
+    fence.fence_all_for(crate::vpn::killswitch::FenceCause::Unverifiable);
+    let resp = online().await;
+    assert_problem(&resp, 409, "kill-switch-not-in-force");
+    assert!(
+        resp.json::<Value>()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("kill switch"),
+        "{}",
+        resp.text()
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 0, "the tunnel is not probed");
+    let detail: Value = h.read("/v1/profiles/acct_b").await.json();
+    assert_eq!(detail["status"], "vpn_down", "still fenced");
+    assert_eq!(
+        calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+        0
+    );
+
+    // A check finds the table in force: the profile was the monitor's to
+    // fence, so the watch's lift leaves it, and setting it online lifts it.
+    fence.lift();
+    let resp = online().await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["status"], "active");
+    assert!(probes.load(Ordering::SeqCst) > 0, "the tunnel was checked");
+}
+
 #[tokio::test]
 async fn bulk_operations_count_what_the_engine_refused() {
     let (a, eng_a) = live("acct_a", ProfileStatus::Active);
