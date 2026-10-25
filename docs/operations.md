@@ -22,6 +22,7 @@ The small state files are described in full in
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
 | `library/` (`[pool] library_dir`; the sample config puts it here, though it can sit anywhere outside a managed root) | The `.torrent` files the pool index is built from: each scan indexes every torrent in it and matches it against the roots. | The pool's metainfo, including the only remaining copy of a pool torrent whose `torrents/<profile>/` file is gone. A scan of a missing `library_dir` logs `torrent library directory does not exist` and changes nothing; a scan of an empty one drops from the index every torrent no session is serving. | Nothing. Whatever filled it: you, or the client whose state directory it was copied from. |
 | `torrents/<profile>/<infohash>.save_path` (beside the `.torrent`) | The save path a torrent was added at through `POST /v1/torrents` or adopted at from the pool, as UTF-8 text. | Where a torrent with no resume file is re-added: without it, `default_save_path`. | Nothing. Each API add and each adoption writes it, and a pool relocation of a loaded torrent rewrites it. |
+| `torrents/<profile>/<infohash>.trackers` (beside the `.torrent`) | The trackers an adoption announces to in place of the `.torrent`'s own, taken from the previous client's resume data (qBittorrent 4.4 and later may write a `.torrent` with none): one announce URL per line, a blank line between tiers. | A torrent with no resume file is re-added with its `.torrent`'s own trackers: for a tracker-less one, none, so a profile with `allowed_tracker_domains` refuses it and any other never announces. | Nothing. Each adoption with such trackers writes it, and one without removes it. It is read only where no resume file loaded the torrent, and deleted with the `.torrent`. |
 | `torrents/<profile>/<infohash>.magnet` (beside the `.torrent`) | The magnet URI a torrent was added from through `POST /v1/torrents`, as UTF-8 text. | A magnet stopped before its metadata arrived and before its first resume save: the boot has nothing to re-add it from, and its claim stays as an unloaded claim. | Nothing. Each magnet add writes it. It is read only where no resume file loaded the torrent and no `.torrent` is filed beside it, and deleted with the `.torrent`. |
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
 | `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
@@ -32,14 +33,14 @@ The small state files are described in full in
 | `openvpn-<iface>.pid` | The pid of that profile's `openvpn` process. It is the teardown's only handle on it. | The `openvpn` process keeps running past the next shutdown, and you must stop it by hand. | Every OpenVPN bring-up. |
 | `openvpn-<iface>.table` | The routing table that profile's source-address `ip rule` entries point at. | If that `openvpn` process dies on its own, its `ip rule` entries stay behind, and you must delete them by hand. | Every OpenVPN bring-up. |
 
-The `<infohash>` in a `.resume`, `.torrent`, `.save_path` or `.magnet` name is
-the info-hash in exactly 40 lower-case hex digits, the spelling the daemon
-writes. A boot skips a `.resume`, `.torrent` or `.magnet` named any other way,
+The `<infohash>` in a `.resume`, `.torrent`, `.save_path`, `.trackers` or
+`.magnet` name is the info-hash in exactly 40 lower-case hex digits, the
+spelling the daemon writes. A boot skips a `.resume`, `.torrent` or `.magnet` named any other way,
 `ABCD….torrent` for `abcd….torrent` included, logging `skipping torrent file
 whose name is not a lower-case hex info-hash` (`resume file` for a `.resume`,
-`magnet file` for a `.magnet`), and loads nothing from it. A `.save_path` is
-only ever read under the lower-case name, so one spelled otherwise is never
-found. Rename such a file to the lower-case spelling
+`magnet file` for a `.magnet`), and loads nothing from it. A `.save_path` or
+`.trackers` is only ever read under the lower-case name, so one spelled
+otherwise is never found. Rename such a file to the lower-case spelling
 before you restart.
 
 The plan journal is the one record here that a rescan cannot reconstruct.

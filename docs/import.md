@@ -157,7 +157,10 @@ identified by the info-hash parsed from its contents.
 - the tracker list (`trackers`). qBittorrent 4.4 and later may write the
   `.torrent` without trackers and keep them only here. Both adoption paths
   announce to this list in place of the `.torrent`'s, so a tracker-less
-  `.torrent` still adopts.
+  `.torrent` still adopts. The list is kept beside the adopted torrent's
+  `.torrent` in the profile's `torrent_dir`, so a restart that finds no
+  resume file for it (a crash before its first resume save) still re-adds
+  it with these trackers.
 
 A `.fastresume` that cannot be read, or is not bencode (a copy cut short, for
 example), is logged and counted as a scan error of kind `read` or `parse`.
@@ -618,14 +621,19 @@ can still leave with nothing behind it.
 **Keep `library_dir`.** Each torrent's `source_path` in the index points into
 it, and the verify queue reads each `.torrent` from it when the torrent's turn
 comes. Once a torrent is adopted, the profile's `torrent_dir` holds its own
-copy of the `.torrent` and the save path it was adopted at.
+copy of the `.torrent`, the save path it was adopted at, and the trackers
+taken from the previous client's resume data, where it had any.
 
 **A restart keeps adopted torrents.** Adoption writes each torrent's `.torrent`
 into the profile's `torrent_dir`, so it comes back from a restart with its
-metadata, at the path it was adopted at. A torrent adopted by an earlier build
-that did not write it is repaired at boot from the library `.torrent` the
-index names, which is then copied into the store. Restart once after the queue
-drains, and confirm every adopted torrent comes back seeding:
+metadata, at the path it was adopted at, announcing to the trackers it was
+adopted with. A torrent whose `.torrent` is not in the store (adopted by an
+earlier build that did not write it), or whose stored `.torrent` cannot be
+read, is repaired at boot from the library `.torrent` the index names, which
+is then copied into the store; the unreadable read is still logged and
+counted under `torrentd_boot_torrent_load_failures{source="torrent_read"}`.
+Restart once after the queue drains, and confirm every adopted torrent comes
+back seeding:
 
 ```bash
 curl -s localhost:8080/v1/pool -H "Authorization: Bearer $TOKEN" \
