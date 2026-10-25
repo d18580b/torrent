@@ -147,6 +147,18 @@ impl TorrentMeta {
 }
 
 /// Parse a `.torrent` buffer.
+///
+/// - An empty buffer is [`Error::InvalidInput`], refused before the shim.
+/// - A buffer libtorrent cannot parse, or a manifest past the shim's bounds
+///   (more than `LT_MAX_TORRENT_FILES` files, or names and paths together
+///   over `LT_MAX_TORRENT_PATH_BYTES`), is [`Error::Shim`] carrying the
+///   shim's message, cut to 511 bytes.
+/// - Names and paths are never truncated. A name or path that is not UTF-8
+///   comes back with each invalid sequence replaced by U+FFFD, so it may no
+///   longer match the bytes on disk.
+/// - `files` lists BEP 47 padding files alongside the real ones, flagged by
+///   [`TorrentMetaFile::pad_file`]; a caller looking for files on disk skips
+///   them.
 pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
     if bytes.is_empty() {
         return Err(Error::InvalidInput("empty .torrent buffer"));
