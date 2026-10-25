@@ -33,6 +33,10 @@ mod tests;
 /// among the plan's orphans, and no scan would ever give it claims, so it
 /// does not block the plan. One no session can report on still refuses:
 /// where its files are is unknown.
+///
+/// A claimed torrent accounts for its payload only where its session saves
+/// it at its placement; one saving elsewhere is compared with `scope` the
+/// same way ([`check_claimed_torrents_save_where_placed`]).
 pub(super) fn check_index_accounts_for_live_state(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
@@ -43,6 +47,7 @@ pub(super) fn check_index_accounts_for_live_state(
     let unindexed = pool
         .with_store(|st| st.loaded_without_claims(&owned))
         .map_err(|e| e.to_string())?;
+    check_claimed_torrents_save_where_placed(pool, source, state, scope, &owned, &unindexed)?;
     if unindexed.is_empty() {
         return Ok(());
     }
@@ -78,6 +83,129 @@ pub(super) fn check_index_accounts_for_live_state(
              remove it. A torrent no session holds keeps refusing until its profile loads \
              it or it is removed. A torrent none of whose files lies under this plan's \
              root, as spelled, through a symlink, or as a hard link, never blocks it.",
+            blocking.len(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether every claimed torrent a session holds saves where the index
+/// places it.
+///
+/// A claim accounts for the copy the matcher placed, and the matcher
+/// prefers a complete copy to an incomplete one: a torrent still
+/// downloading into one directory while a complete copy of its files lies
+/// elsewhere under the roots is placed at that complete copy, and the
+/// files its session is writing read as orphans. So a claimed torrent whose
+/// session save path is not its placement, compared as spelled and with
+/// symlinks resolved on both sides, is compared with `scope` as an
+/// unclaimed one is, and refuses where it may hold a file the plan deletes.
+///
+/// Costs one session read per claimed torrent a session holds, and a file
+/// listing only for one saving away from its placement. A torrent no
+/// session holds is writing nothing and is skipped; one whose session
+/// cannot be read refuses, since where it writes is then unknown.
+fn check_claimed_torrents_save_where_placed(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    scope: &DeleteScope,
+    owned: &[String],
+    unindexed: &[String],
+) -> Result<(), String> {
+    let unindexed: std::collections::HashSet<&String> = unindexed.iter().collect();
+    let held: Vec<(&String, torrentd_engine::TorrentState)> = owned
+        .iter()
+        .filter(|ih| !unindexed.contains(ih))
+        .filter_map(|ih| {
+            let st = libtorrent_safe::InfoHash::from_hex(ih).and_then(|h| state.get(&h))?;
+            Some((ih, st))
+        })
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    let placements: Vec<Option<std::path::PathBuf>> = pool
+        .with_store(|st| {
+            held.iter()
+                .map(|(ih, _)| st.adoption_base(ih))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|base| {
+            let (root_id, base) = base?;
+            let root = pool.root_path_of(root_id)?;
+            let base = base.trim_matches('/');
+            Some(if base.is_empty() {
+                root
+            } else {
+                root.join(base)
+            })
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let mut away = 0usize;
+    let mut blocking: Vec<String> = Vec::new();
+    for ((ih, st), placed) in held.iter().zip(&placements) {
+        let Some(engine) = source.engine_for(&st.profile_id) else {
+            continue;
+        };
+        let save_path: std::path::PathBuf = match engine.torrent_details(st.handle) {
+            Ok(d) => d.save_path.into(),
+            Err(e) => {
+                blocking.push(format!(
+                    "torrent {ih}, which the daemon owns, could not be read from its session \
+                     ({e}), so whether it saves where the index places it is unknown"
+                ));
+                continue;
+            }
+        };
+        let placed_paths: Vec<std::path::PathBuf> = placed
+            .iter()
+            .flat_map(|p| std::iter::once(p.clone()).chain(std::fs::canonicalize(p).ok()))
+            .collect();
+        let saving: Vec<std::path::PathBuf> = std::iter::once(save_path.clone())
+            .chain(std::fs::canonicalize(&save_path).ok())
+            .collect();
+        if saving.iter().any(|s| placed_paths.contains(s)) {
+            continue;
+        }
+        away += 1;
+        let placed_at = placed.as_ref().map_or_else(
+            || "no recorded placement".to_owned(),
+            |p| p.display().to_string(),
+        );
+        let why = match read_live_torrent(source, st) {
+            Err(LiveReadError::NoSession) => continue,
+            Err(LiveReadError::Engine(e)) => Some(format!(
+                "could not be read from its session ({e}), so where its files lie is unknown"
+            )),
+            Ok(live) => scope.reached_by(&live),
+        };
+        if let Some(why) = why {
+            blocking.push(format!(
+                "torrent {ih}, which the daemon owns, is placed in the index at {placed_at}, \
+                 but its session saves it at {}, and {why}",
+                save_path.display(),
+            ));
+        }
+    }
+    info!(
+        target: "torrentd::pool::apply",
+        claimed = held.len(),
+        away_from_placement = away,
+        blocking = blocking.len(),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "compared where the claimed torrents the daemon owns are saved with their placements",
+    );
+    if let Some(first) = blocking.first() {
+        return Err(format!(
+            "{} torrent(s) the daemon owns are saved somewhere other than where the index \
+             places them and may hold files under this plan's root: the files their sessions \
+             write read as orphans, so this plan cannot prove what is unclaimed. The first is \
+             {first}. Move its session to its placement, remove the torrent, or remove the copy \
+             you do not want by hand and rescan, then rebuild this plan.",
             blocking.len(),
         ));
     }

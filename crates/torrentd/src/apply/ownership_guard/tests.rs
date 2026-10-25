@@ -6,6 +6,7 @@ use torrentd_pool::model::step_status;
 
 use super::*;
 use crate::apply::apply;
+use crate::apply::test_support::add_and_rematch;
 use crate::apply::test_support::assign;
 use crate::apply::test_support::delete_plan;
 use crate::apply::test_support::engine_and_state;
@@ -597,4 +598,63 @@ fn applying_refuses_while_a_queued_adoption_is_absent_from_the_index() {
     let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
     assert!(e.contains(&ih), "got {e}");
     assert!(victim.exists(), "a queued adoption's payload was trashed");
+}
+
+/// A claimed torrent is accounted for only where its session writes it.
+/// The matcher prefers a complete copy, so a torrent still downloading into
+/// one root while a complete copy of its files sits under another is
+/// claimed at the complete copy, and the copy its session is writing reads
+/// as orphans. A delete plan over that root refuses, naming the torrent;
+/// the same torrent saving at its placement does not block it.
+#[test]
+fn a_claimed_torrent_saving_away_from_its_placement_blocks_a_delete_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("pool");
+    let second = dir.path().join("second");
+    // The session's partial download, and a complete copy elsewhere.
+    let partial = write(&first, "T/a.bin", 32);
+    write(&second, "T/a.bin", 64);
+
+    let mut cfg = Config::minimal_for_tests(dir.path(), true);
+    cfg.pool.as_mut().unwrap().roots.push(second.clone());
+    let pool = PoolService::open(&cfg).unwrap().unwrap();
+    pool.scan().unwrap();
+    let ih = "ee".repeat(20);
+    add_and_rematch(&pool, &ih, "T", None, &[("T/a.bin", 64)]);
+    let second_id = pool.roots()[1].0;
+    assert_eq!(
+        pool.with_store(|st| st.adoption_base(&ih)).unwrap(),
+        Some((second_id, String::new())),
+        "the matcher placed the torrent at the complete copy",
+    );
+    let plan_id = delete_plan(&pool);
+    let scope = scope_of(&pool, plan_id);
+    assert_eq!(
+        scope.targets,
+        std::slice::from_ref(&partial),
+        "the session copy is an orphan"
+    );
+
+    // Saving at its placement, it is accounted for.
+    let (source, state) = unclaimed_loaded(&second, Some(&["T/a.bin"]));
+    check_index_accounts_for_live_state(&pool, &source, &state, &scope)
+        .unwrap_or_else(|e| panic!("refused a torrent saving at its placement: {e}"));
+
+    // Saving into the plan's root, it is not, with or without metadata.
+    for files in [Some(&["T/a.bin"][..]), None] {
+        let (source, state) = unclaimed_loaded(&first, files);
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(
+            e.contains(&ih)
+                && e.contains("its session saves it at")
+                && e.contains(&first.display().to_string()),
+            "{files:?}: {e}"
+        );
+    }
+    assert!(
+        partial.exists(),
+        "the live torrent's session copy was trashed"
+    );
+    let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+    assert_eq!(plan.status, plan_status::DRAFT);
 }
