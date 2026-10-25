@@ -260,12 +260,26 @@ selected before it plans any of them. It re-stats each file a `matched` or
 since the scan `drifted`, which the adopt then hashes instead of trusting. A
 qBittorrent torrent rewritten at the same size between the scan and the adopt
 is therefore queued for verification, not fast-pathed. A file counts as
+changed when its size or its mtime differs from the scan's, to the
+nanosecond. Its device and inode numbers are not compared: a reboot or a
+remount renumbers them on many storage layouts (disk enumeration order, md
+and dm, btrfs and zfs subvolumes, NFS, mergerfs and other FUSE layers)
+without touching a byte, so a reboot between the scan and the adopt, or
+before a `pool check`, drifts nothing. The cost is that a file replaced
+at the same size by something that copies the old mtime onto the new file
+to the nanosecond reads as unchanged; the adopt's fast path then trusts
+the previous client's completion claim for it. A file counts as
 vanished only when it is not found under a root that is present, listable and
 not empty; a root that is missing, unreadable, or empty (an unmounted mount
 point) is logged as unreadable and no torrent over it changes state. A file not
 found whose nearest remaining directory is on another filesystem than the scan
 recorded the file on (a disk mounted inside a root, now unmounted) is logged
-the same way and is not drift, and a file that cannot be stated for another
+the same way and is not drift. A reboot that renumbered the filesystem is
+told apart from an unmounted disk by the files the check found unchanged
+beside it, which show what the recorded device reads as now; a file
+deleted after such a reboot, from a filesystem on which the check found no
+unchanged claimed file at all, cannot be told apart and is logged as under
+an unmounted directory rather than counted as drift. A file that cannot be stated for another
 reason (permission, I/O) is logged and is not drift. The adopt refuses a
 torrent the check could not see for any of these reasons, rather than trust
 payload nobody looked at. To check the whole pool,
