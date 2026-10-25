@@ -41,12 +41,32 @@ pub const PANIC_AFTER_DRAW: &str = "TORRENTCTL_TEST_PANIC";
 /// enough that a SIGTERM is not answered with a SIGKILL first.
 pub const FINISH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long after the signal that ended the loop the same signal again is
+/// taken for a repeat of it rather than a second ask to leave at once. When a
+/// terminal closes, the foreground job usually gets two SIGHUPs within
+/// milliseconds: the one the shell resends to its jobs, and the one the
+/// kernel sends to the foreground group when the shell exits.
+pub const REPEAT_GRACE: Duration = Duration::from_secs(1);
+
 /// How the loop ended: the model as it was left (its
 /// [`Model::exit_notice`] is what to tell the user once the terminal is
-/// theirs again), and whether the terminal failed.
+/// theirs again), whether the terminal failed, and the signal that ended
+/// it, if one did.
 pub struct Ended {
     pub model: Model,
     pub result: std::io::Result<()>,
+    pub signal: Option<&'static str>,
+}
+
+/// The exit status a process ended by `signal` reports by convention:
+/// 128 plus the signal's number, as a shell reports one the signal killed.
+pub fn signal_exit_status(signal: &str) -> u8 {
+    let kind = match signal {
+        "SIGHUP" => SignalKind::hangup(),
+        "SIGINT" => SignalKind::interrupt(),
+        _ => SignalKind::terminate(),
+    };
+    128 + u8::try_from(kind.as_raw_value()).expect("a signal number below 128")
 }
 
 /// SIGHUP (the terminal went away), SIGINT and SIGTERM, caught so that they
@@ -99,6 +119,7 @@ pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
             return Ended {
                 model,
                 result: Err(e),
+                signal: None,
             };
         }
     };
@@ -147,11 +168,19 @@ where
     ))
     .catch_unwind()
     .await;
+    let signal = match &looped {
+        Ok(Ok(signal)) => *signal,
+        _ => None,
+    };
     if !model.quit {
-        finish(&mut model, &tx, &mut rx, &mut signals).await;
+        finish(&mut model, &tx, &mut rx, &mut signals, signal).await;
     }
     match looped {
-        Ok(result) => Ended { model, result },
+        Ok(result) => Ended {
+            model,
+            result: result.map(drop),
+            signal,
+        },
         Err(panic) => {
             // The panic hook has handed the terminal back already, so this
             // stays on the operator's screen.
@@ -164,7 +193,7 @@ where
 }
 
 /// The loop itself: until the model quits, the input ends or fails, a draw
-/// fails, or a signal arrives.
+/// fails, or a signal arrives; returns the signal's name in that last case.
 async fn drive<K, S>(
     model: &mut Model,
     mut draw: impl FnMut(&Model) -> std::io::Result<()>,
@@ -173,7 +202,7 @@ async fn drive<K, S>(
     tx: &mpsc::UnboundedSender<Msg>,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     api_tx: &watch::Sender<Api>,
-) -> std::io::Result<()>
+) -> std::io::Result<Option<&'static str>>
 where
     K: Stream<Item = std::io::Result<Event>> + Unpin,
     S: Stream<Item = &'static str> + Unpin,
@@ -193,12 +222,12 @@ where
                 Some(Err(e)) => return Err(e),
                 None => {
                     tracing::info!(target: "torrentctl::runtime", "the terminal input ended");
-                    return Ok(());
+                    return Ok(None);
                 }
             },
             Some(name) = signals.next() => {
                 tracing::info!(target: "torrentctl::runtime", signal = name, "signalled to leave");
-                return Ok(());
+                return Ok(Some(name));
             }
             _ = tick.tick() => Msg::Tick,
             Some(msg) = rx.recv() => msg,
@@ -214,18 +243,21 @@ where
         });
         spawn(tx, effects);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Finish an exit the user did not ask for as a quit would: revoke a minted
 /// token, or wait for an in-flight sign-in to answer and revoke what it
 /// mints — without drawing, since the terminal may be gone. Bounded by
-/// [`FINISH_TIMEOUT`]; a second signal leaves at once.
+/// [`FINISH_TIMEOUT`]. A second signal leaves at once, unless it is the
+/// `cause` (the signal that ended the loop) again within [`REPEAT_GRACE`],
+/// which is a repeat of it.
 async fn finish<S>(
     model: &mut Model,
     tx: &mpsc::UnboundedSender<Msg>,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     signals: &mut S,
+    cause: Option<&'static str>,
 ) where
     S: Stream<Item = &'static str> + Unpin,
 {
@@ -235,26 +267,46 @@ async fn finish<S>(
         let effects = app::update(model, Msg::Quit);
         spawn(tx, effects);
     }
-    let deadline = tokio::time::Instant::now() + FINISH_TIMEOUT;
+    let started = tokio::time::Instant::now();
+    let deadline = started + FINISH_TIMEOUT;
+    // Whether a session token is known to exist: one in use that this client
+    // minted, or one a sign-in answered with while quitting, whose
+    // revocation is in flight.
+    let mut token = model.minted;
     while !model.quit {
         let msg = tokio::select! {
             Some(msg) = rx.recv() => msg,
             () = tokio::time::sleep_until(deadline) => {
-                tracing::warn!(target: "torrentctl::runtime", "the session token was not revoked within {FINISH_TIMEOUT:?}");
-                model.exit_notice.get_or_insert_with(|| {
+                let secs = FINISH_TIMEOUT.as_secs();
+                let notice = if token || model.minted {
+                    tracing::warn!(target: "torrentctl::runtime", "the session token was not revoked within {FINISH_TIMEOUT:?}");
                     format!(
-                        "torrentctl: the session token was not revoked within {}s; it stays \
-                         valid on the daemon until it expires",
-                        FINISH_TIMEOUT.as_secs()
+                        "torrentctl: the session token was not revoked within {secs}s; it \
+                         stays valid on the daemon until it expires"
                     )
-                });
+                } else {
+                    tracing::warn!(target: "torrentctl::runtime", "the sign-in did not answer within {FINISH_TIMEOUT:?}");
+                    format!(
+                        "torrentctl: the sign-in had not answered within {secs}s; if the \
+                         daemon mints a session token for it, that token stays valid on the \
+                         daemon until it expires"
+                    )
+                };
+                model.exit_notice.get_or_insert(notice);
                 return;
             }
             Some(name) = signals.next() => {
+                if Some(name) == cause && started.elapsed() < REPEAT_GRACE {
+                    tracing::debug!(target: "torrentctl::runtime", signal = name, "the same signal again at once: a repeat, not a second ask");
+                    continue;
+                }
                 tracing::warn!(target: "torrentctl::runtime", signal = name, "signalled again: leaving without revoking");
                 return;
             }
         };
+        if matches!(msg, Msg::Login(crate::screens::login::Msg::Answered(Ok(_)))) {
+            token = true;
+        }
         let effects = app::update(model, msg);
         spawn(tx, effects);
     }
@@ -561,6 +613,7 @@ mod tests {
         .await;
         assert!(ended.result.is_ok());
         assert!(ended.model.quit);
+        assert_eq!(ended.signal, None);
         assert!(revoked(&daemon), "{:?}", daemon.requests());
         assert_eq!(ended.model.exit_notice, None, "revoked: nothing to say");
     }
@@ -604,6 +657,7 @@ mod tests {
             ))
             .await;
             assert!(ended.result.is_ok(), "{name}");
+            assert_eq!(ended.signal, Some(name));
             assert!(ended.model.quit, "{name}");
             assert!(revoked(&daemon), "{name}: {:?}", daemon.requests());
         }
@@ -639,7 +693,7 @@ mod tests {
             model,
             |_| Ok(()),
             no_input(),
-            futures_util::stream::iter(["SIGTERM", "SIGTERM"]),
+            futures_util::stream::iter(["SIGHUP", "SIGTERM"]),
         ))
         .await;
         assert!(
@@ -648,7 +702,94 @@ mod tests {
             started.elapsed()
         );
         assert!(ended.model.quitting && !ended.model.quit);
+        assert_eq!(
+            ended.signal,
+            Some("SIGHUP"),
+            "the signal that ended the loop"
+        );
         drop(wedged);
+    }
+
+    /// A closing terminal sends the foreground job SIGHUP twice at once (the
+    /// shell's and the kernel's): the repeat is not a second ask, and the
+    /// revocation still happens.
+    #[tokio::test]
+    async fn a_repeat_of_the_signal_that_ended_the_loop_still_revokes() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let ended = bounded(run_with(
+            minted(&daemon),
+            |_| Ok(()),
+            no_input(),
+            futures_util::stream::iter(["SIGHUP", "SIGHUP"]),
+        ))
+        .await;
+        assert!(ended.model.quit, "the revocation completed");
+        assert!(revoked(&daemon), "{:?}", daemon.requests());
+        assert_eq!(ended.signal, Some("SIGHUP"));
+    }
+
+    /// The same signal once [`REPEAT_GRACE`] has passed is a second ask: it
+    /// leaves without waiting for the revocation.
+    #[tokio::test]
+    async fn the_same_signal_after_the_grace_leaves_without_waiting() {
+        let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", wedged.local_addr().expect("an address"));
+        let api = Api::new(&url, Some("tds_minted")).expect("a valid URL");
+        let mut model = Model::new(api, crate::testing::theme());
+        model.minted = true;
+        let signals = futures_util::stream::once(async { "SIGTERM" }).chain(
+            futures_util::stream::once(async {
+                tokio::time::sleep(REPEAT_GRACE + Duration::from_millis(200)).await;
+                "SIGTERM"
+            }),
+        );
+        let started = Instant::now();
+        let ended = bounded(run_with(model, |_| Ok(()), no_input(), Box::pin(signals))).await;
+        let left = started.elapsed();
+        assert!(
+            left >= REPEAT_GRACE && left < crate::app::REVOKE_TIMEOUT,
+            "left after {left:?}"
+        );
+        assert!(ended.model.quitting && !ended.model.quit);
+        drop(wedged);
+    }
+
+    /// A sign-in the daemon never answers holds the exit for
+    /// [`FINISH_TIMEOUT`], and the notice says no token is known to exist.
+    #[tokio::test]
+    async fn an_unanswered_sign_in_gives_up_after_the_finish_timeout() {
+        let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", wedged.local_addr().expect("an address"));
+        let api = Api::new(&url, Some(crate::api::ANONYMOUS)).expect("a valid URL");
+        let mut model = Model::new(api, crate::testing::theme());
+        model.login.busy = true;
+        let started = Instant::now();
+        let ended = bounded(run_with(
+            model,
+            |_| Ok(()),
+            no_input(),
+            futures_util::stream::iter(["SIGTERM"]),
+        ))
+        .await;
+        let left = started.elapsed();
+        assert!(
+            left >= FINISH_TIMEOUT && left < FINISH_TIMEOUT + SLACK,
+            "left after {left:?}"
+        );
+        let notice = ended.model.exit_notice.expect("a notice");
+        assert!(
+            notice.contains("sign-in had not answered within 5s"),
+            "{notice}"
+        );
+        assert!(!notice.contains("was not revoked"), "{notice}");
+        drop(wedged);
+    }
+
+    #[test]
+    fn a_signalled_exit_reports_128_plus_the_signal_number() {
+        assert_eq!(signal_exit_status("SIGHUP"), 129);
+        assert_eq!(signal_exit_status("SIGINT"), 130);
+        assert_eq!(signal_exit_status("SIGTERM"), 143);
     }
 
     /// A quit already waiting on its revocation is not quit a second time

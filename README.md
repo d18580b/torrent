@@ -311,8 +311,11 @@ revoking it however the client exits: a quit, the terminal closing
 (`SIGHUP`), `SIGINT` or `SIGTERM`, an error reading the terminal or drawing
 to it, the end of its input, or a panic. A sign-in still in flight is waited
 for and its token revoked too. Outside a quit, the revocation is given five
-seconds and a second signal skips it; a token that could not be revoked is
-reported once the terminal is restored, and stays valid until it expires.
+seconds and a second signal skips it (the same signal again within a second,
+such as the second `SIGHUP` a closing terminal sends, does not); a token that
+could not be revoked is reported once the terminal is restored, and stays
+valid until it expires. An exit a signal caused reports 128 plus the signal's
+number, as a shell does for a process the signal killed.
 
 **Config file.** `$XDG_CONFIG_HOME/torrentctl/config.toml`, or the file
 `--config` names, which must then exist. It takes `url` and `token_file`, and

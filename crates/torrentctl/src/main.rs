@@ -37,7 +37,7 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<std::process::ExitCode> {
     color_eyre::install()?;
     let cli = Cli::parse();
     let cfg = config::resolve(config::Overrides {
@@ -73,7 +73,14 @@ fn main() -> color_eyre::Result<()> {
     if let Some(notice) = &ended.model.exit_notice {
         eprintln!("{notice}");
     }
-    ended.result.wrap_err("the terminal failed")
+    ended.result.wrap_err("the terminal failed")?;
+    // A signal ended it: report that as a shell would for a process the
+    // signal killed, not as a clean exit.
+    Ok(ended
+        .signal
+        .map_or(std::process::ExitCode::SUCCESS, |signal| {
+            runtime::signal_exit_status(signal).into()
+        }))
 }
 
 /// Log to a file in the XDG state directory, never to the terminal the UI
