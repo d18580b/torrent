@@ -1467,6 +1467,12 @@ fn execute_adopt(
                     None,
                     None,
                 );
+                // A transaction SQLite rolled back fails the whole group
+                // with `Err`, so this value is never read; writing on would
+                // autocommit an owner the caller is told never landed.
+                if !s.in_open_transaction() {
+                    return (adoption, Ok(()));
+                }
                 (adoption, s.set_profile(&ih, Some(&owner)))
             });
             match recorded {
@@ -1574,6 +1580,12 @@ pub(crate) fn enqueue_verify(
             owner_recorded: matches!(recorded, Ok(true)),
             ..row
         };
+        // As on the fast path: the group fails with `Err` once SQLite has
+        // rolled back its transaction, so this value is never read, and a
+        // queue row written now would autocommit.
+        if !s.in_open_transaction() {
+            return (recorded, Ok(()));
+        }
         (recorded, s.enqueue_verify(&row))
     });
     match written {

@@ -111,7 +111,11 @@ impl GroupCommit {
     ///
     /// `Err` is the transaction's failure to begin or commit, after which
     /// none of `f`'s writes are in the index. A failed statement inside `f`
-    /// is `f`'s own to report: it fails that statement and no other job's.
+    /// is `f`'s own to report: it fails that statement and no other job's,
+    /// unless SQLite rolled back the whole transaction for it, which fails
+    /// the group with `Err`. So `f` checks
+    /// [`PoolStore::in_open_transaction`] before each write after its first,
+    /// or that write would autocommit while `Err` says it never landed.
     pub(crate) fn run<T, G>(
         &self,
         lock: impl FnOnce() -> G,
@@ -146,14 +150,34 @@ impl GroupCommit {
     }
 }
 
+/// Why a group's transaction did not commit.
+struct Failed(String);
+
+impl From<PoolError> for Failed {
+    fn from(e: PoolError) -> Self {
+        Failed(e.to_string())
+    }
+}
+
 /// Run `jobs` in one transaction and answer each.
-fn commit_all(store: &mut PoolStore, mut jobs: Vec<Job>) {
+///
+/// A job's statement can make SQLite roll back the whole transaction
+/// (`SQLITE_FULL`, `SQLITE_IOERR`, `SQLITE_NOMEM`), and every statement
+/// after it would then autocommit. So no job runs once the transaction is
+/// gone, and the group fails: the jobs that ran were rolled back with it.
+fn commit_all(store: &mut PoolStore, jobs: Vec<Job>) {
     let mut ran = Vec::with_capacity(jobs.len());
+    let mut jobs = jobs.into_iter();
     let committed = store.in_transaction(|st| {
-        for job in jobs.drain(..) {
+        for job in jobs.by_ref() {
             ran.push(((job.run)(st), job.done));
+            if !st.in_open_transaction() {
+                return Err(Failed(
+                    "a failed statement rolled back the shared transaction".to_owned(),
+                ));
+            }
         }
-        Ok::<_, PoolError>(())
+        Ok::<_, Failed>(())
     });
     match committed {
         Ok(()) => {
@@ -161,15 +185,10 @@ fn commit_all(store: &mut PoolStore, mut jobs: Vec<Job>) {
                 let _ = done.send(Ok(value));
             }
         }
-        Err(e) => {
-            let why = e.to_string();
+        Err(Failed(why)) => {
             // What ran was rolled back with the rest; what did not run, the
-            // transaction never began for.
-            for done in ran
-                .into_iter()
-                .map(|(_, d)| d)
-                .chain(jobs.into_iter().map(|j| j.done))
-            {
+            // transaction never began for or was gone before.
+            for done in ran.into_iter().map(|(_, d)| d).chain(jobs.map(|j| j.done)) {
                 let _ = done.send(Err(why.clone()));
             }
         }
@@ -336,5 +355,62 @@ mod tests {
             .unwrap();
         assert!(got.is_err(), "{got:?}");
         assert!(store.lock().roots().unwrap().is_empty());
+    }
+
+    /// A statement that makes SQLite roll back the whole transaction fails
+    /// every job in the group, and nothing after it lands as an autocommit:
+    /// neither the failing job's own later write nor a later job's. A
+    /// `RAISE(ROLLBACK)` trigger stands in for `SQLITE_FULL`/`SQLITE_IOERR`.
+    #[test]
+    fn a_statement_that_rolls_back_the_transaction_fails_the_group() {
+        let (dir, store) = store();
+        rusqlite::Connection::open(dir.path().join("pool.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON root WHEN NEW.path = '/boom'
+                 BEGIN SELECT RAISE(ROLLBACK, 'boom'); END;",
+            )
+            .unwrap();
+        let group = Arc::new(GroupCommit::default());
+        let held = store.lock();
+        let roots: [&[&str]; 3] = [&["/before"], &["/boom", "/same-job"], &["/after"]];
+        let mut handles = Vec::new();
+        for (n, paths) in roots.into_iter().enumerate() {
+            let (writer, queue) = (store.clone(), group.clone());
+            handles.push(std::thread::spawn(move || {
+                queue.run(
+                    || writer.lock(),
+                    move |st| {
+                        // As an adopt's job does: a check before each write
+                        // after its first.
+                        for (i, p) in paths.iter().enumerate() {
+                            if i > 0 && !st.in_open_transaction() {
+                                break;
+                            }
+                            let _ = st.upsert_root(std::path::Path::new(p));
+                        }
+                    },
+                )
+            }));
+            // Queued in this order, so the jobs run in it.
+            while group.queue.lock().len() <= n {
+                std::thread::yield_now();
+            }
+        }
+        drop(held);
+        for h in handles {
+            let got = h.join().unwrap();
+            assert!(got.is_err(), "{got:?}");
+        }
+        let roots = store.lock().roots().unwrap();
+        assert!(roots.is_empty(), "{roots:?}");
+        // The connection is usable again.
+        group
+            .run(
+                || store.lock(),
+                |st| st.upsert_root(std::path::Path::new("/r")),
+            )
+            .unwrap()
+            .unwrap();
     }
 }

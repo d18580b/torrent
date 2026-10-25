@@ -558,6 +558,17 @@ impl PoolStore {
         }
     }
 
+    /// Whether the connection is inside a transaction.
+    ///
+    /// A statement that fails with `SQLITE_FULL`, `SQLITE_IOERR` or
+    /// `SQLITE_NOMEM` can make SQLite roll back the whole transaction on its
+    /// own, and every statement after that autocommits. Code that runs
+    /// several writes inside one [`PoolStore::in_transaction`] checks this
+    /// before each further write, so none lands outside the transaction.
+    pub fn in_open_transaction(&self) -> bool {
+        !self.conn.is_autocommit()
+    }
+
     /// Run `f` with the whole store inside one write transaction.
     ///
     /// Every multi-statement rebuild must go through this. The claim table is
