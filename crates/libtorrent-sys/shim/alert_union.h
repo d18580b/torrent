@@ -6,9 +6,10 @@
  * string a variant carries is an lt_str on the heap, sized to its text, so
  * the union itself stays small: the shim queues a whole libtorrent pop of
  * these by value, and fixed-size buffers made each one ~3.2 KB whatever it
- * held. Each lt_str field is capped by the LT_*_MAX its comment names
- * (LT_PATH_MAX, LT_MSG_MAX, LT_OP_MAX, LT_ADDR_MAX, trailing NUL included) —
- * a longer source string is cut at the last whole UTF-8 sequence that fits.
+ * held. Each lt_str field is capped by the capacity lt_str's comment below
+ * names for it (LT_PATH_MAX, LT_MSG_MAX, LT_OP_MAX or LT_ADDR_MAX, trailing
+ * NUL included) — a longer source string is cut at the last whole UTF-8
+ * sequence that fits.
  * Variants that carry bulk data (resume buffers, metadata, stats counter
  * arrays, torrent_status arrays) or a path a decision rests on (the
  * storage_moved save path, never cut) hold heap-allocated pointers too. The
@@ -89,7 +90,7 @@ struct lt_alert_resume_failed {
     int32_t  error_code;
     uint8_t  not_modified;          /* 1 iff the failure was 'resume_data_not_modified' */
     uint8_t  _pad[3];
-    struct lt_str    message;
+    struct lt_str message;
 };
 
 /* ------------------------------------------------------------------ */
