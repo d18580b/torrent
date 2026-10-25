@@ -1437,33 +1437,8 @@ fn execute_adopt(
             if dry_run {
                 return Ok(Adopted::FastPath);
             }
-            match engine.add_torrent(params) {
-                Ok(handle) => {
-                    // The caller checked the tunnel before adopting; a bulk
-                    // adopt runs long enough for it to drop since.
-                    let noop = torrentd_engine::NoopSink;
-                    let metrics: &dyn MetricsSink =
-                        pool.metrics.get().map_or(&noop, |m| m.as_ref());
-                    crate::fence::hold_if_fenced(
-                        profiles,
-                        pool.kill_switch(),
-                        &profile,
-                        engine.as_ref(),
-                        handle,
-                        metrics,
-                    );
-                    // Unreadable, there is nothing to keep; the resume scan
-                    // looks in the library for it instead.
-                    if let Some(bytes) = &torrent {
-                        pool.persist_torrent(
-                            &profile,
-                            infohash,
-                            bytes,
-                            &save_path.to_string_lossy(),
-                            &trackers,
-                        );
-                    }
-                }
+            let handle = match engine.add_torrent(params) {
+                Ok(handle) => handle,
                 Err(e) => {
                     // Resume data another client wrote can be truncated, from
                     // an incompatible version, or simply not libtorrent's
@@ -1481,50 +1456,75 @@ fn execute_adopt(
                     );
                     return verify(torrent_path, save_path, profile);
                 }
-            }
+            };
+            // The caller checked the tunnel before adopting; a bulk adopt
+            // runs long enough for it to drop since.
+            let noop = torrentd_engine::NoopSink;
+            let metrics: &dyn MetricsSink = pool.metrics.get().map_or(&noop, |m| m.as_ref());
+            crate::fence::hold_if_fenced(
+                profiles,
+                pool.kill_switch(),
+                &profile,
+                engine.as_ref(),
+                handle,
+                metrics,
+            );
 
             // Both records in one transaction, shared with the other targets'
             // in flight: the index is synchronous=FULL, so every commit waits
             // on its own fsync, and a bulk adopt waited on each in turn.
             let (ih, owner) = (infohash.to_owned(), profile.as_str().to_owned());
             let recorded = pool.with_store_grouped(move |s| {
-                let base = s.adoption_base(&ih).ok().flatten();
-                // A transaction SQLite rolled back fails the whole group
-                // with `Err`, so this value is never read; a read can roll
-                // it back as a write can, and a write now would autocommit
-                // records the caller is told never landed.
-                if !s.in_open_transaction() {
-                    return (Ok(()), Ok(()));
-                }
-                let adoption = s.set_adoption(
-                    &ih,
-                    AdoptionState::Adopted,
-                    base.as_ref().map(|(r, _)| *r),
-                    base.as_ref().map(|(_, b)| b.as_str()),
-                    Some(now_secs()),
-                    None,
-                    None,
-                );
-                // Again after the first write, which can roll it back too.
-                if !s.in_open_transaction() {
-                    return (adoption, Ok(()));
-                }
-                (adoption, s.set_profile(&ih, Some(&owner)))
+                // In a savepoint of their own, so a failed write leaves
+                // neither record behind in the shared transaction.
+                s.in_transaction(|s| -> Result<(), torrentd_pool::PoolError> {
+                    let base = s.adoption_base(&ih).ok().flatten();
+                    // A transaction SQLite rolled back fails the whole group
+                    // with `Err`, so this value is never read; a read can
+                    // roll it back as a write can, and a write now would
+                    // autocommit records the caller is told never landed.
+                    if !s.in_open_transaction() {
+                        return Ok(());
+                    }
+                    s.set_adoption(
+                        &ih,
+                        AdoptionState::Adopted,
+                        base.as_ref().map(|(r, _)| *r),
+                        base.as_ref().map(|(_, b)| b.as_str()),
+                        Some(now_secs()),
+                        None,
+                        None,
+                    )?;
+                    s.set_profile(&ih, Some(&owner))
+                })
             });
-            match recorded {
-                Ok((adoption, owner)) => {
-                    if let Err(e) = adoption {
-                        pool.note_store_error("set_adoption", &e);
-                    }
-                    if let Err(e) = owner {
-                        pool.note_store_error("set_profile", &e);
-                    }
-                }
-                // Neither record reached the index.
-                Err(e) => {
-                    pool.note_store_error("set_adoption", &e);
-                    pool.note_store_error("set_profile", &e);
-                }
+            let failed = match recorded {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(e) => Some(e),
+            };
+            if let Some(cause) = failed {
+                return unload_unrecorded(
+                    pool,
+                    engine.as_ref(),
+                    &profile,
+                    handle,
+                    infohash,
+                    &cause,
+                );
+            }
+            // After the records, so a torrent taken back out above leaves no
+            // files behind for a restart to load. Unreadable, there is
+            // nothing to keep; the resume scan looks in the library for it
+            // instead.
+            if let Some(bytes) = &torrent {
+                pool.persist_torrent(
+                    &profile,
+                    infohash,
+                    bytes,
+                    &save_path.to_string_lossy(),
+                    &trackers,
+                );
             }
             Ok(Adopted::FastPath)
         }
@@ -1599,54 +1599,104 @@ pub(crate) fn enqueue_verify(
     // the other targets' in flight, as the fast path writes its two.
     let row = item.to_row();
     let written = pool.with_store_grouped(move |s| {
-        // An owner record that already names this profile is not the
-        // enqueue's, so a drop leaves it; one the enqueue writes goes with
-        // the item.
-        let recorded = match s.profile_of(&row.infohash) {
-            Ok(Some(owner)) if owner == row.profile => Ok(false),
-            // As on the fast path: a read that rolled back the transaction
-            // fails the group with `Err`, so this value is never read, and
-            // an owner written now would autocommit.
-            _ if !s.in_open_transaction() => Ok(false),
-            _ => s
-                .set_profile(&row.infohash, Some(&row.profile))
-                .map(|()| true),
-        };
-        // Kept in `pool.db` too, so a restart queues it again rather than
-        // leave the adoption's claim with nothing to load it. A failed write
-        // still queues it: it is lost only if the daemon stops before the
-        // queue adds it.
-        let row = torrentd_pool::VerifyQueueRow {
-            owner_recorded: matches!(recorded, Ok(true)),
-            ..row
-        };
-        // As on the fast path: the group fails with `Err` once SQLite has
-        // rolled back its transaction, so this value is never read, and a
-        // queue row written now would autocommit.
-        if !s.in_open_transaction() {
-            return (recorded, Ok(()));
-        }
-        (recorded, s.enqueue_verify(&row))
+        // In a savepoint of their own, as on the fast path: a failed write
+        // leaves neither record behind in the shared transaction.
+        s.in_transaction(|s| -> Result<bool, torrentd_pool::PoolError> {
+            // An owner record that already names this profile is not the
+            // enqueue's, so a drop leaves it; one the enqueue writes goes
+            // with the item.
+            let recorded = match s.profile_of(&row.infohash) {
+                Ok(Some(owner)) if owner == row.profile => false,
+                // As on the fast path: a read that rolled back the
+                // transaction fails the group with `Err`, so this value is
+                // never read, and an owner written now would autocommit.
+                _ if !s.in_open_transaction() => return Ok(false),
+                _ => {
+                    s.set_profile(&row.infohash, Some(&row.profile))?;
+                    true
+                }
+            };
+            // Kept in `pool.db` too, so a restart queues it again rather
+            // than leave the adoption's claim with nothing to load it.
+            s.enqueue_verify(&torrentd_pool::VerifyQueueRow {
+                owner_recorded: recorded,
+                ..row
+            })?;
+            Ok(recorded)
+        })
     });
-    match written {
-        Ok((recorded, row)) => {
-            item.owner_recorded = matches!(recorded, Ok(true));
-            if let Err(e) = recorded {
-                pool.note_store_error("set_profile", &e);
-            }
-            if let Err(e) = row {
-                pool.note_store_error("enqueue_verify", &e);
-            }
-        }
-        // Neither record reached the index, so there is no owner record for
-        // a drop to clear.
-        Err(e) => {
-            pool.note_store_error("set_profile", &e);
-            pool.note_store_error("enqueue_verify", &e);
-        }
-    }
+    // Neither record reached the index, so the item is not queued in memory
+    // either: one the index does not hold is lost to a restart while the
+    // caller would be told it was queued.
+    item.owner_recorded = match written {
+        Ok(Ok(recorded)) => recorded,
+        Ok(Err(e)) => return Err(unrecorded(pool, infohash, &e)),
+        Err(e) => return Err(unrecorded(pool, infohash, &e)),
+    };
     pool.verify_queue().enqueue(item);
     Ok(Adopted::QueuedForVerification)
+}
+
+/// The refusal of a target whose pool-index records did not commit, logged
+/// and counted as every failed index write is. None of its records are in
+/// the index, so the caller releases its registry claim as for any refusal.
+fn unrecorded(pool: &PoolService, infohash: &str, cause: &dyn std::fmt::Display) -> AdoptRefusal {
+    warn!(
+        target: "torrentd::pool",
+        infohash = %infohash,
+        error.cause = %cause,
+        "pool index could not record an adoption; the torrent is refused",
+    );
+    pool.count("store_write_errors_total", &[("store", "pool_index")]);
+    format!("the pool index could not record the adoption: {cause}").into()
+}
+
+/// Take `profile`'s fast-path torrent `handle`, which its session accepted
+/// but whose pool-index records did not commit, back out of the session,
+/// keeping its files, and refuse it ([`unrecorded`]).
+///
+/// The removal is recorded first (`StateMap::begin_removal`), as `DELETE`
+/// records its own, so an add of the same info-hash accepted before the
+/// removal's alert is handled keeps the files it wrote. That alert's handler
+/// deletes what the add's own alert wrote; the adoption has written nothing
+/// else to the profile's stores yet.
+///
+/// Where the session refuses the removal, the torrent stays in it under the
+/// registry claim the caller took, and is reported adopted: refusing it
+/// would have the caller release that claim and leave the torrent seeding
+/// with no owner. Its index records are missing, as before this was a
+/// refusal; the failure is logged and counted.
+fn unload_unrecorded(
+    pool: &PoolService,
+    engine: &dyn torrentd_engine::TorrentEngine,
+    profile: &ProfileId,
+    handle: torrentd_engine::TorrentHandle,
+    infohash: &str,
+    cause: &str,
+) -> Result<Adopted, AdoptRefusal> {
+    let state = pool.loaded.get();
+    if let Some(state) = state {
+        state.begin_removal(profile, handle);
+    }
+    match engine.remove_torrent(handle, false) {
+        Ok(()) => Err(unrecorded(pool, infohash, &cause)),
+        Err(e) => {
+            if let Some(state) = state {
+                state.abandon_removal(profile, handle);
+            }
+            warn!(
+                target: "torrentd::pool",
+                profile_id = %profile,
+                infohash = %infohash,
+                error.cause = %e,
+                index_error = %cause,
+                "pool index could not record a fast-path adoption, and the session refused to \
+                 remove the torrent; it stays adopted without its pool index records",
+            );
+            pool.count("store_write_errors_total", &[("store", "pool_index")]);
+            Ok(Adopted::FastPath)
+        }
+    }
 }
 
 /// The wall clock in whole seconds since the Unix epoch, as the pool index
