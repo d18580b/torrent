@@ -855,6 +855,57 @@ fn a_landed_storage_move_whose_fsync_fails_is_an_unknown_outcome() {
     assert!(dir.path().join("pool/new/T/a.bin").exists());
 }
 
+/// A payload spread over sibling subdirectories fsyncs each file, then each
+/// directory from the files' own up to the root exactly once, every child
+/// before its parent, so no directory entry is made durable before the
+/// entries beneath it, and nothing above the root is touched.
+#[test]
+fn a_multi_file_move_fsyncs_each_directory_once_children_before_parents() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    let dst = root.join("new");
+    let files = ["T/x/a.bin", "T/y/b.bin", "T/x/c.bin", "T/d.bin"];
+    for f in files {
+        write(&dst, f, 10);
+    }
+    let present: Vec<String> = files.iter().map(|f| (*f).to_owned()).collect();
+    let id = |p: &Path| {
+        let md = std::fs::metadata(p).unwrap();
+        (md.dev(), md.ino())
+    };
+
+    fsat::FSYNCED.with_borrow_mut(Vec::clear);
+    make_durable(&present, &root.join("old"), &dst, &root).unwrap();
+    let synced = fsat::FSYNCED.take();
+
+    let file_ids: Vec<_> = files.iter().map(|f| id(&dst.join(f))).collect();
+    assert_eq!(synced[..files.len()], file_ids[..], "files come first");
+    let dirs = ["new/T/x", "new/T/y", "new/T", "new", ""].map(|d| root.join(d));
+    let pos = |p: &Path| {
+        let want = id(p);
+        let hits: Vec<usize> = (0..synced.len()).filter(|&i| synced[i] == want).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "{} fsynced {} times",
+            p.display(),
+            hits.len()
+        );
+        hits[0]
+    };
+    for (child, parent) in [(0, 2), (1, 2), (2, 3), (3, 4)] {
+        assert!(
+            pos(&dirs[child]) < pos(&dirs[parent]),
+            "{} was fsynced after its parent {}",
+            dirs[child].display(),
+            dirs[parent].display(),
+        );
+    }
+    assert_eq!(synced.len(), files.len() + dirs.len(), "{synced:?}");
+    assert!(!synced.contains(&id(dir.path())));
+}
+
 /// A session at the source with none of the payload there has nothing to
 /// move, and libtorrent would report that nothing as done.
 #[test]
