@@ -169,6 +169,19 @@ pub(crate) fn admit_tick_for_tests(
     );
 }
 
+/// One verify-queue tick's retirement of its finished re-hashes, as
+/// [`run_verify_queue`] makes it, for tests that read the recorded verdict
+/// through the HTTP API.
+#[cfg(test)]
+pub(crate) fn retire_rechecks_for_tests(
+    pool: &PoolService,
+    source: &dyn AlertSource,
+    state: &StateMap,
+    profiles: &crate::profile_registry::ProfileRegistry,
+) {
+    retire_rechecks(pool, Writer::Wait, source, state, profiles);
+}
+
 /// What one admission attempt did.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum Admission {

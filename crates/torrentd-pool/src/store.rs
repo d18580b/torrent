@@ -93,6 +93,10 @@ pub struct TorrentListing {
     pub state: Option<AdoptionState>,
     /// The directory, relative to its root, the payload was matched at.
     pub base_rel: Option<String>,
+    /// What the last match had to say about the torrent, for example how many
+    /// of its files are present or that it has more than one complete copy.
+    /// `None` when the verdict needs no explanation.
+    pub note: Option<String>,
 }
 
 /// The directory a root-relative path sits in: `""` at the top of the root.
