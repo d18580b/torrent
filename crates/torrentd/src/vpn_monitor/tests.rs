@@ -1077,6 +1077,14 @@ async fn the_poll_loop_fences_on_the_route_probe_and_reports_whether_it_ran() {
         "{exported}"
     );
     assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
+    assert_eq!(
+        exported.counter(
+            "profile_vpn_tunnel_ip_changes_total",
+            &[("profile_id", "acct_a")]
+        ),
+        0,
+        "a route fence is not an address change: {exported}"
+    );
 
     let unavailable = Some(Err(vpn::route::RouteProbeUnavailable::NoTool));
     let (status, exported) =
@@ -1184,6 +1192,14 @@ async fn the_poll_loop_does_not_fence_on_an_address_probe_that_could_not_run() {
     assert!(
         fenced_once_for(&exported, "ip_lost_or_changed"),
         "{exported}"
+    );
+    assert_eq!(
+        exported.counter(
+            "profile_vpn_tunnel_ip_changes_total",
+            &[("profile_id", "acct_a")]
+        ),
+        1,
+        "an address lost is counted as a change: {exported}"
     );
     assert!(
         exported.gauge("profile_vpn_addr_probe_ok") == Some(1.0),
