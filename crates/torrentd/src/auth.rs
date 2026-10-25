@@ -1014,6 +1014,12 @@ mod tests {
             c.session_ttl_secs = good;
             assert!(c.validate().is_ok(), "ttl {good} must be accepted");
         }
+        // The bound the docs quote: 30 days, to the second.
+        let thirty_days = 30 * 86_400;
+        c.session_ttl_secs = thirty_days;
+        assert!(c.validate().is_ok(), "30 days must be accepted");
+        c.session_ttl_secs = thirty_days + 1;
+        assert!(c.validate().is_err(), "past 30 days must be refused");
     }
 
     #[test]
