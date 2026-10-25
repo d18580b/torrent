@@ -1539,6 +1539,24 @@ fn a_record_marked_after_the_lifts_check_stays_for_the_next_lift() {
     );
 }
 
+/// Each fence's record carries a mark no earlier fence's did, so a lift
+/// can tell the fence it checked from one that landed after it.
+#[tokio::test(start_paused = true)]
+async fn each_kill_switch_fence_marks_its_record_anew() {
+    use vpn::killswitch::Fence;
+    let (fence, _engine) = kill_switch_fence_over(1);
+    let id = ProfileId::new("acct_a");
+    let mark = |fence: &KillSwitchFence| fence.with_record(&id, |r| r.map(|r| r.mark));
+    fence.fence_all();
+    let first = mark(&fence).expect("fenced");
+    fence.lift();
+    settle(&fence).await;
+    assert_eq!(mark(&fence), None, "lifted");
+    fence.fence_all();
+    let second = mark(&fence).expect("fenced again");
+    assert!(second > first, "{first} then {second}");
+}
+
 /// A profile set online and fenced again by the monitor while the lift
 /// checks the tunnels is not lifted on the verdict taken before: the
 /// record's mark is unchanged and the profile reads `vpn_down` as it did,
