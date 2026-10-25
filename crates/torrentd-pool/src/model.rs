@@ -172,11 +172,6 @@ impl AdoptionState {
             _ => return None,
         })
     }
-
-    /// Whether a torrent in this state may be handed to a session.
-    pub fn is_adoptable(self) -> bool {
-        matches!(self, AdoptionState::Matched | AdoptionState::Shared)
-    }
 }
 
 /// One file observed under a managed root.
@@ -216,12 +211,6 @@ pub struct PoolTorrent {
     pub tags: Vec<String>,
     /// Which profile owns it. Absorbs the old `profile_assignments.json`.
     pub profile: Option<String>,
-}
-
-impl PoolTorrent {
-    pub fn has_v2(&self) -> bool {
-        self.infohash_v2.is_some()
-    }
 }
 
 /// One entry of a torrent's file list.

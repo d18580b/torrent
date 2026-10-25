@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Headless petabyte-scale torrent seeding daemon."
+description = "Headless torrent seeding daemon for libraries already on disk, benched at a million files and 5,000 torrents under one root."
 publish = false
 
 [[bin]]

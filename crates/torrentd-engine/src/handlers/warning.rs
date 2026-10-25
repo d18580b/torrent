@@ -428,7 +428,7 @@ mod tests {
         };
         let mut failures = TrackerFailureLog::default();
         let counter = Arc::new(WarnCounter::default());
-        tracing::subscriber::with_default(Arc::clone(&counter), || {
+        crate::testing::with_subscriber(Arc::clone(&counter), || {
             handle(&alert, &mut ctx, &mut failures);
         });
         let warns = counter.warns.load(Ordering::Relaxed);
@@ -517,7 +517,7 @@ mod tests {
             span: tracing::info_span!("test"),
         };
 
-        tracing::subscriber::with_default(Arc::clone(&counter), || {
+        crate::testing::with_subscriber(Arc::clone(&counter), || {
             for i in 0..10_000u32 {
                 handle(
                     &first_failure((i % 251) as u8),
@@ -533,7 +533,7 @@ mod tests {
 
         // Before the window ends, another alert closes nothing.
         clock.advance(TRACKER_FAILURE_WINDOW - Duration::from_secs(1));
-        tracing::subscriber::with_default(Arc::clone(&counter), || {
+        crate::testing::with_subscriber(Arc::clone(&counter), || {
             close_failure_window(&ctx_for(), &mut failures);
         });
         assert_eq!(counter.warns.load(Ordering::Relaxed), total);
@@ -541,7 +541,7 @@ mod tests {
         // The first alert after it closes the window with one summary
         // counting what was held back.
         clock.advance(Duration::from_secs(1));
-        tracing::subscriber::with_default(Arc::clone(&counter), || {
+        crate::testing::with_subscriber(Arc::clone(&counter), || {
             close_failure_window(&ctx_for(), &mut failures);
             close_failure_window(&ctx_for(), &mut failures);
         });
@@ -552,7 +552,7 @@ mod tests {
         );
 
         // A new window warns again.
-        tracing::subscriber::with_default(Arc::clone(&counter), || {
+        crate::testing::with_subscriber(Arc::clone(&counter), || {
             handle(&first_failure(1), &mut ctx_for(), &mut failures);
         });
         assert_eq!(counter.warns.load(Ordering::Relaxed), total + 2);
@@ -755,7 +755,7 @@ mod tests {
                 span: tracing::info_span!("test"),
             };
             let counter = Arc::new(WarnCounter::default());
-            tracing::subscriber::with_default(Arc::clone(&counter), || {
+            crate::testing::with_subscriber(Arc::clone(&counter), || {
                 handle(alert, &mut ctx, &mut TrackerFailureLog::default());
             });
             (metrics.calls(), counter.warns.load(Ordering::Relaxed))

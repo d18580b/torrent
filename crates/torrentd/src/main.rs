@@ -1,4 +1,7 @@
-//! `torrentd` — headless petabyte-scale torrent seeding daemon.
+//! `torrentd` — headless torrent seeding daemon for libraries already on
+//! disk. The scale it is measured at is what `mise run bench` reports against
+//! `crates/torrentd-bench/budgets.toml`: a million files and 5,000 torrents
+//! under one root.
 //!
 //! This binary wires together the
 //! torrentd-engine layer (TorrentEngine, alert loop, registry) with

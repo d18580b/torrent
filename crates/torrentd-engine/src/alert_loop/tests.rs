@@ -1026,7 +1026,7 @@ fn translate_errors_publish_each_profiles_rise_once_and_warn_with_it() {
     let mut published = TranslateErrors::default();
     let warns = Arc::new(WarnCounter::default());
 
-    tracing::subscriber::with_default(Arc::clone(&warns), || {
+    crate::testing::with_subscriber(Arc::clone(&warns), || {
         // Nothing lost: nothing published, nothing warned.
         published.publish(&source, &metrics);
         a.set_alert_translate_errors(3);
