@@ -453,12 +453,23 @@ impl PoolService {
     /// and without it at `default_save_path`, away from its payload. Written
     /// before the `.torrent`, the scan never finds the one without the other.
     /// A failed write is counted as the `.torrent` write's is.
+    ///
+    /// `trackers`, the previous client's list the session announces to in
+    /// place of the `.torrent`'s ([`previous_trackers`]), is recorded beside
+    /// it too, before it, for the same reason: a `.torrent` qBittorrent 4.4
+    /// or later wrote may carry none, and until the session's first resume
+    /// save lands a crash leaves the `.torrent` the only thing a restart can
+    /// re-add from. Re-added without them, the torrent announced to nothing
+    /// or, on a profile with `allowed_tracker_domains`, was refused. An empty
+    /// list clears any record an earlier adoption left. A failed write is
+    /// counted as the `.torrent` write's is.
     pub(crate) fn persist_torrent(
         &self,
         profile: &ProfileId,
         infohash: &str,
         bytes: &[u8],
         save_path: &str,
+        trackers: &[Vec<String>],
     ) {
         let Some(store) = self.torrents.get() else {
             return;
@@ -480,6 +491,20 @@ impl PoolService {
                 error.cause = %e,
                 "failed to record an adopted torrent's save path; if its resume file is \
                  lost, a restart re-adds it at default_save_path",
+            );
+            self.count(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile.as_str()), ("source", "api")],
+            );
+        }
+        if let Err(e) = off_worker(|| store.write_trackers(profile, &ih, trackers)) {
+            warn!(
+                target: "torrentd::pool",
+                profile_id = %profile,
+                infohash = %infohash,
+                error.cause = %e,
+                "failed to record an adopted torrent's trackers; if its resume file is \
+                 lost, a restart re-adds it with the .torrent's own",
             );
             self.count(
                 "torrent_file_persist_errors_total",
@@ -1342,6 +1367,11 @@ fn execute_adopt(
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
             let torrent = torrentd_pool::scan::read_capped(&torrent_path).ok();
+            // The list libtorrent applies from the resume data, kept beside
+            // the `.torrent` once the add lands (`persist_torrent`).
+            let trackers = torrentd_pool::fastresume::parse_hints(&resume)
+                .map(|h| h.trackers)
+                .unwrap_or_default();
             let params = adoption_resume_params(
                 profile_cfg,
                 resume,
@@ -1430,6 +1460,7 @@ fn execute_adopt(
                             infohash,
                             bytes,
                             &save_path.to_string_lossy(),
+                            &trackers,
                         );
                     }
                 }
@@ -2538,8 +2569,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Persisting an adopted torrent writes its save path, then its
-    /// `.torrent`; a store that refuses both counts each failure.
+    /// Persisting an adopted torrent writes its save path and trackers, then
+    /// its `.torrent`; a store that refuses all three counts each failure.
     #[test]
     fn persisting_an_adopted_torrent_counts_each_failed_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -2555,11 +2586,17 @@ pub(crate) mod tests {
         pool.set_torrent_store(std::sync::Arc::new(torrentd_engine::FsTorrentStore::new(
             dir.path().join("blocker"),
         )));
-        pool.persist_torrent(&p, &hash.to_hex(), b"d4:infode", "/pool/lib");
+        pool.persist_torrent(
+            &p,
+            &hash.to_hex(),
+            b"d4:infode",
+            "/pool/lib",
+            &[vec!["https://t.example/announce".into()]],
+        );
         let text = String::from_utf8(metrics.render()).unwrap();
         assert!(
             text.contains(
-                "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 2"
+                "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 3"
             ),
             "{text}"
         );

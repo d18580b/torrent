@@ -713,6 +713,7 @@ pub(super) fn admit_adoption(
                 &item.infohash,
                 &bytes,
                 &item.save_path.to_string_lossy(),
+                &item.trackers,
             );
             // A session holds it now, and a restart loads it from
             // the `.torrent` just written. Its persisted entry stays

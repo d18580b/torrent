@@ -922,6 +922,34 @@ fn an_adoption_whose_torrent_is_past_the_cap_is_dropped_unread() {
     assert_eq!((q.failed(), q.depth(), q.in_flight()), (1, 0, 0));
 }
 
+/// Issue #653: an adoption the verify worker adds records the trackers it
+/// announces to in place of the `.torrent`'s beside the `.torrent` it
+/// persists, so a restart before the session's first resume save re-adds it
+/// with them.
+#[test]
+fn an_admitted_adoption_records_its_trackers_beside_its_torrent() {
+    use torrentd_engine::TorrentStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+    let store = Arc::new(torrentd_engine::MemoryTorrentStore::new());
+    pool.set_torrent_store(store.clone());
+    let w = Worker::new(dir.path());
+    let (path, ih) = library_torrent(dir.path(), "tracked");
+    let trackers = vec![vec!["https://t.example/announce".to_owned()]];
+    pool.verify_queue().enqueue(super::PendingVerify {
+        torrent_path: path,
+        save_path: dir.path().to_path_buf(),
+        trackers: trackers.clone(),
+        ..pending(ih, "p")
+    });
+
+    w.tick(&pool);
+    let p = ProfileId::new("p");
+    assert!(store.exists(&p, &ih), "{:?}", w.engine.calls());
+    assert_eq!(store.read_trackers(&p, &ih).unwrap(), trackers);
+}
+
 /// Issue #612: an adoption whose library `.torrent` was replaced by another
 /// torrent's after it was queued is dropped at admission as a failed verify,
 /// its registry claim released. Before, the other torrent was added under
