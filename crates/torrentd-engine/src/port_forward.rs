@@ -3,10 +3,13 @@
 //! Some VPN providers (ProtonVPN, PIA, …) don't hand out a static forwarded
 //! port — the port is negotiated at runtime against the tunnel gateway (over
 //! NAT-PMP), is ephemeral, and its lease must be renewed continuously. This
-//! module declares the provider-agnostic `PortForwarder` trait plus a
-//! `MockForwarder` test double. The real NAT-PMP client lives in the `torrentd`
-//! binary so this crate stays free of socket/OS behaviour — mirroring the
-//! `vpn` module split.
+//! module declares the provider-agnostic `PortForwarder` trait, the renewal
+//! core below, the [`ListenEvents`] the renewal waits on, and a
+//! `MockForwarder` test double (compiled only for tests and the
+//! `test-support` feature). The real NAT-PMP client (`vpn::natpmp`) and the
+//! renewal loop that drives this core (`port_forward_monitor`) live in the
+//! `torrentd` binary, so nothing here opens a socket — the same split as
+//! this crate's `vpn` module.
 //!
 //! The `renew_and_rebind` helper is the testable core of the renewal loop: it
 //! renews a mapping and, if the port changed, rebinds the live libtorrent
@@ -545,9 +548,28 @@ pub struct Reannounce {
 /// both rebound onto one port before either saw the other are reported on
 /// the next renewal instead of standing unseen.
 ///
+/// The checks run in this order once the gateway answers: `port_taken`, then
+/// whether the port changed, then `target.fenced`, then whether listen
+/// outcomes are published. So a taken port is [`RenewOutcome::PortTaken`]
+/// even when it is the port already bound, and a fenced or unobserved
+/// profile with an unchanged port is still [`RenewOutcome::Unchanged`].
+///
+/// Edge cases of an unconfirmed rebind:
+///
+/// - The session refusing the new `listen_interfaces`
+///   ([`RebindFailure::Apply`]) changed nothing, so nothing is reverted.
+/// - The revert is best effort, and its outcome is not part of the result:
+///   a revert the session refuses, or whose outcome does not arrive within
+///   `target.timeout`, still returns `RebindFailed` with the rebind's own
+///   reason. The session may then be listening on neither port: only a
+///   later renewal handed a port other than `previous_port` applies one
+///   again, and one handed `previous_port` is `Unchanged` and applies
+///   nothing.
+///
 /// A gateway reboot (epoch regression vs `previous_epoch`) needs no special
-/// recovery here: the `map` call above already re-created the dropped mapping,
-/// so we only surface `rebooted` for the monitor to count and log.
+/// recovery here: the `map` call that observed it already re-created the
+/// dropped mapping, so we only surface `rebooted` for the monitor to count
+/// and log.
 pub fn renew_and_rebind(
     forwarder: &dyn PortForwarder,
     engine: &dyn TorrentEngine,

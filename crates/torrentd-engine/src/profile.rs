@@ -3,9 +3,10 @@
 //! `ProfileId` is the cheap-to-clone key used in StateMap, registry, and
 //! every `(profile_id, alert)` pair. `ProfileConfig` is the operator-supplied
 //! shape parsed from TOML; validation cross-checks live here so SIGHUP
-//! reload and startup share one path. `Profile` bundles the config with the
-//! runtime engine so the daemon's HTTP handlers can answer
-//! `/profiles/{profile_id}` queries.
+//! reload and startup share one path. Nothing here holds a profile's
+//! engine: the daemon pairs each `ProfileId` with its engine (as
+//! [`ProfileSource`](crate::source::ProfileSource)'s entries do), and its
+//! HTTP handlers answer the profile endpoints from that pairing.
 //!
 //! # Why a profile is a whole separate session
 //!

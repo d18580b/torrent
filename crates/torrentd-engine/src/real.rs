@@ -1,15 +1,19 @@
-//! `RealEngine` — delegates to a `libtorrent_safe::Session` 1:1.
+//! `RealEngine` — implements `TorrentEngine` over a `libtorrent_safe::Session`.
 //!
-//! No business logic here; that lives in the alert loop and handlers.
-//! `RealEngine` exists only to satisfy `TorrentEngine` so production code
-//! can swap in `MockEngine` for tests.
+//! Each call delegates to the session; the business logic lives in the
+//! alert loop and handlers. Beyond the session it keeps only what the
+//! session cannot answer itself: the torrents it holds (`held`), the last
+//! alert translation failure count, and whether `close` has destroyed it.
+//! Tests swap in `MockEngine` through the same trait.
 //!
-//! Concurrency: `libtorrent_safe::Session` is `!Send + !Sync`. We park it
-//! behind a `parking_lot::Mutex` and route every call through that lock.
-//! libtorrent's session is internally thread-safe but the C shim's per-
-//! session handle map is mutex-guarded already, so the contention overhead
-//! is small for the shape of work torrentd does (one engine call per
-//! second per torrent, max).
+//! Concurrency: `libtorrent_safe::Session` is `Send` but not `Sync`, and
+//! `TorrentEngine` must be both. The session is parked behind a
+//! `parking_lot::Mutex` and every call goes through that lock, which is what
+//! makes `RealEngine` `Sync`: the shim allows one caller per session at a
+//! time (its alert pop takes no lock), so the mutex is required for
+//! soundness, not only for ordering. Every engine call, the HTTP handlers'
+//! included, waits on that one lock, which is why `pop_alerts` converts at
+//! most [`MAX_ALERTS_PER_POP`] alerts per acquisition.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
