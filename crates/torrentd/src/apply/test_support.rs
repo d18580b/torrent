@@ -26,6 +26,58 @@ pub(crate) fn write(dir: &Path, rel: &str, len: usize) -> PathBuf {
     p
 }
 
+/// Re-index the first root's files `rels` — which must be every file it
+/// holds, since the swap drops the rest — under another device and inode
+/// number, with size and mtime unchanged: what a reboot or remount that
+/// renumbers the filesystem leaves the index saying about its files.
+pub(crate) fn renumber(pool: &PoolService, rels: &[&str]) {
+    renumber_in(pool, pool.roots()[0].0, rels);
+}
+
+/// [`renumber`], for the files `rels` of the root `root_id`.
+pub(crate) fn renumber_in(pool: &PoolService, root_id: i64, rels: &[&str]) {
+    pool.with_store_mut(|st| {
+        let files: Vec<_> = rels
+            .iter()
+            .map(|rel| {
+                let f = st.file(root_id, rel)?.expect("indexed");
+                Ok(torrentd_pool::PoolFile {
+                    dev: f.dev.wrapping_add(1),
+                    ino: f.ino.wrapping_add(1_000_000),
+                    ..f
+                })
+            })
+            .collect::<Result<_, torrentd_pool::PoolError>>()?;
+        st.begin_staging()?;
+        st.stage_files(&files)?;
+        st.swap_staged_root(root_id, 0)
+    })
+    .unwrap();
+}
+
+/// Overwrite `rel` under `root` at `len` bytes, then restore the mtime it
+/// had: a change only the size shows.
+pub(crate) fn resize_keeping_mtime(root: &Path, rel: &str, len: u64) {
+    let p = root.join(rel);
+    let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    f.set_len(len).unwrap();
+    f.set_modified(mtime).unwrap();
+}
+
+/// Set `rel` under `root`'s mtime one second later, its bytes untouched:
+/// a change only the mtime shows.
+pub(crate) fn touch_later(root: &Path, rel: &str) {
+    let p = root.join(rel);
+    let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_modified(mtime + std::time::Duration::from_secs(1))
+        .unwrap();
+}
+
 /// Build a `delete_orphans` plan over the whole root.
 pub(crate) fn delete_plan(pool: &PoolService) -> i64 {
     let root_id = pool.roots()[0].0;

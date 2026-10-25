@@ -1,6 +1,7 @@
 //! The delete step: a file re-proven unclaimed and unchanged, then moved
 //! into its root's trash through directory descriptors, never unlinked.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use tracing::info;
@@ -24,20 +25,31 @@ mod tests;
 /// 2. The index is a complete account of what is protected — checked once per
 ///    apply in [`apply`](super::apply), since it is a property of the whole plan rather than
 ///    of one file.
-/// 3. The file on disk is still the file that was indexed. A `(size, mtime,
-///    inode, device)` match is the same evidence `drift` trusts; anything
-///    else means the bytes changed after the scan decided they were
-///    expendable.
+/// 3. The file on disk still holds what was indexed. A `(size, mtime)`
+///    match is the same evidence `drift` trusts; anything else means the
+///    bytes changed after the scan decided they were expendable. Device and
+///    inode are not compared, as `drift` does not compare them: a reboot or
+///    a remount renumbers them, and comparing them refused every delete
+///    after one.
 /// 4. No torrent the index *now* holds as partial, missing or overlapping
 ///    expects its payload where the file is, or is missing a file of its
 ///    size — the planner's guards ([`torrentd_pool::plan::DeleteGuard`]),
 ///    re-read whenever the index generation moves, since a rescan after the
 ///    plan was built can make a torrent partial over these very files.
-/// 5. The file is not another path to a claimed file: its indexed `(device,
-///    inode)` is no claimed file's, under any root. Claims are by path, so a
-///    hard link, or a root that aliases another through a bind mount, reads
-///    as unclaimed while renaming it moves claimed bytes. The stamp check in
-///    (3) ties that indexed identity to the file actually moved.
+/// 5. The file is not another path to a claimed file: neither its indexed
+///    nor its live `(device, inode)` is a claimed file's indexed one, under
+///    any root. Claims are by path, so a hard link, or a root that aliases
+///    another through a bind mount, reads as unclaimed while renaming it
+///    moves claimed bytes. The index is not one snapshot of identities: a
+///    rescan carries a row forward unchanged for a root it could not open, a
+///    subtree it could not list, or a file it could not stat, so after a
+///    reboot renumbers the disk the index can hold the old identity for one
+///    file and the new one for another. Comparing both of this file's
+///    identities catches the alias whichever of its rows is the stale one,
+///    when the claimed file's row is current. It misses an alias of a
+///    claimed file whose own row was carried from before a renumbering,
+///    which no comparison against the index can catch; check 3 missed it
+///    too when it still compared device and inode.
 ///
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, so a directory swapped for a symlink after planning stops the
@@ -55,7 +67,8 @@ pub(super) fn delete_file(
     guards: &mut DeleteGuards,
 ) -> Result<(), StepFailure> {
     let (root, rel, stamp) = sanctioned_delete(pool, path, guards)?;
-    move_into_trash(&root, path, &rel, stamp, bucket).map_err(|e| match e {
+    let claimed = guards.claimed_identities(pool)?;
+    move_into_trash(&root, path, &rel, stamp, Some(claimed), bucket).map_err(|e| match e {
         StepFailure::Unknown(e) => StepFailure::Unknown(format!(
             "{e} {}",
             unknown_outcome_remedy(&path.display().to_string(), None)
@@ -72,11 +85,12 @@ pub(super) fn delete_file(
     Ok(())
 }
 
-/// A file's indexed `(size, mtime, inode, device)`.
-type FileStamp = (u64, i64, u64, u64);
+/// A file's indexed `(size, mtime)`, as [`torrentd_pool::scan::content_stamp`]
+/// computes it.
+type FileStamp = (u64, i64);
 
 /// Checks 1 and 3 to 5 of [`delete_file`] for `path`, whose root, path
-/// relative to it, and indexed `(size, mtime, inode, device)` it returns,
+/// relative to it, and indexed `(size, mtime)` it returns,
 /// or why the delete is refused.
 fn sanctioned_delete(
     pool: &PoolService,
@@ -122,7 +136,7 @@ fn sanctioned_delete(
         ));
     }
 
-    Ok((root, rel, (row.size, row.mtime_ns, row.ino, row.dev)))
+    Ok((root, rel, (row.size, row.mtime_ns)))
 }
 
 /// The directory under `<root>/.torrentd-trash/` a delete plan's files go
@@ -140,8 +154,16 @@ pub(super) fn plan_trash_bucket(plan_id: i64, created_at: i64) -> String {
 
 /// Move the file at `rel` under `root` (`path` is the two joined, for
 /// messages) into `<root>/.torrentd-trash/<bucket>/`, keeping its
-/// root-relative directories, once its `(size, mtime, inode, device)` is
-/// still `stamp` — the scan's record of it.
+/// root-relative directories, once its `(size, mtime)` is still `stamp` —
+/// the scan's record of it. Device and inode are not compared: a reboot or
+/// a remount renumbers them without touching a byte
+/// ([`torrentd_pool::scan::content_stamp`]), and the walk below, not the
+/// stamp, is what keeps the move on the file under `root`.
+///
+/// With `claimed`, the file's live `(dev, ino)` must not be in it either:
+/// check 5 of [`delete_file`], for a file whose indexed identity is older
+/// than the claimed file's. The `delete_files` proof passes `None`, since it
+/// compares live identities itself.
 ///
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, the file is examined and moved through its parent's
@@ -156,6 +178,7 @@ pub(crate) fn move_into_trash(
     path: &Path,
     rel: &str,
     stamp: FileStamp,
+    claimed: Option<&std::collections::HashSet<(u64, u64)>>,
     bucket: &str,
 ) -> Result<(), StepFailure> {
     let (dirs, name) = match rel.rsplit_once('/') {
@@ -174,10 +197,21 @@ pub(crate) fn move_into_trash(
     if !md.is_file() {
         return Err(format!("{} is not a regular file", path.display()).into());
     }
-    if torrentd_pool::file_stamp(&md) != stamp {
+    if torrentd_pool::scan::content_stamp(&md) != stamp {
         return Err(format!(
             "{} changed since the scan that indexed it; rescan before deleting",
             path.display(),
+        )
+        .into());
+    }
+    let live = (md.dev(), md.ino());
+    if claimed.is_some_and(|c| c.contains(&live)) {
+        return Err(format!(
+            "{} is the same file (device {}, inode {}) as one a torrent claims: a hard \
+             link, or the claimed file seen through another root",
+            path.display(),
+            live.0,
+            live.1,
         )
         .into());
     }
@@ -255,17 +289,23 @@ impl DeleteGuards {
         dev: u64,
         ino: u64,
     ) -> Result<bool, String> {
+        Ok(self.claimed_identities(pool)?.contains(&(dev, ino)))
+    }
+
+    /// The indexed `(dev, ino)` of every claimed file, under any root, as of
+    /// the current index generation.
+    fn claimed_identities(
+        &mut self,
+        pool: &PoolService,
+    ) -> Result<&std::collections::HashSet<(u64, u64)>, String> {
         self.refresh(pool)?;
-        if self.claimed.is_none() {
-            let claimed = pool
+        let claimed = match self.claimed.take() {
+            Some(claimed) => claimed,
+            None => pool
                 .with_store(|s| s.claimed_identities())
-                .map_err(|e| e.to_string())?;
-            self.claimed = Some(claimed);
-        }
-        Ok(self
-            .claimed
-            .as_ref()
-            .is_some_and(|c| c.contains(&(dev, ino))))
+                .map_err(|e| e.to_string())?,
+        };
+        Ok(self.claimed.insert(claimed))
     }
 
     fn refusal(

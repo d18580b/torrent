@@ -294,7 +294,11 @@ told apart from an unmounted disk by the files the check found unchanged
 beside it, which show what the recorded device reads as now; a file
 deleted after such a reboot, from a filesystem on which the check found no
 unchanged claimed file at all, cannot be told apart and is logged as under
-an unmounted directory rather than counted as drift. A file that cannot be stated for another
+an unmounted directory rather than counted as drift. The last-moment check
+before a delete plan's step or `DELETE … ?delete_files=true` moves a file
+into the trash compares the same two fields, so a reboot that renumbered the
+disk does not refuse a delete either, and needs no rescan first; a file whose
+size or mtime changed is still refused. A file that cannot be stated for another
 reason (permission, I/O) is logged and is not drift. The adopt refuses a
 torrent the check could not see for any of these reasons, rather than trust
 payload nobody looked at. To check the whole pool,

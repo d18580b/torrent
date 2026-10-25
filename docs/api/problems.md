@@ -226,7 +226,8 @@ there. `detail` names the first file and which of these failed:
 - it lies outside every managed root, so there is no trash to move it to;
 - the pool index does not record it, or does not record this torrent
   claiming it, so the co-claimant check cannot see it;
-- it changed since the scan that indexed it (size, mtime, inode or device).
+- it changed since the scan that indexed it (size or mtime; a reboot or
+  remount that renumbered its inode or device does not count).
 
 Nothing was changed: the torrent is still in its session. Rescan
 (`POST /v1/pool/scan`) and retry, or retry without `delete_files` to remove
