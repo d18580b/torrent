@@ -1047,6 +1047,10 @@ pub(super) fn release_dropped_claim(
 /// first ([`crate::profile_registry::ProfileEntry::exclude_from_resumes`]), so
 /// no lift resumes it after.
 ///
+/// Either verdict queues an immediate resume save: `Verified` so the pieces
+/// the check found reach disk before the next sweep, `Failed` (once paused)
+/// so the pause does.
+///
 /// Either verdict forgets the info-hash's persisted verify-queue entry: an
 /// adoption keeps it until here, so a restart before the verdict is recorded
 /// waits for the boot's check rather than lose it.
@@ -1067,6 +1071,11 @@ pub(super) fn record_verify_outcome(
         VerifyOutcome::Verified => {
             q.completed.fetch_add(1, Ordering::Relaxed);
             info!(target: "torrentd::pool", infohash = %ih, "verified and seeding");
+            // Saved now, before the row is dequeued: on disk is only the
+            // add-time resume file with no pieces, so a crash before the
+            // next sweep would re-hash the whole payload at boot, outside
+            // the check limit.
+            state.queue_resume_save_now(*hash);
             (AdoptionState::Adopted, Some(now_secs()), None, None)
         }
         VerifyOutcome::Failed(reason) => {
