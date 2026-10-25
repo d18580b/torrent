@@ -511,6 +511,16 @@ async fn follow_once(
         let event = match item {
             Ok(Some(Ok(event))) => event,
             Ok(Some(Err(e))) => {
+                // `v1` may add event kinds; one this build does not know is
+                // not a broken stream, and the stream goes on after it.
+                if let Some(kind) = unknown_kind(&e) {
+                    tracing::debug!(
+                        target: "torrentctl::events",
+                        kind,
+                        "ignored an event of a kind this build does not know"
+                    );
+                    continue;
+                }
                 return Down::Failed {
                     reason: format!("stream error: {e}"),
                     refused: false,
@@ -541,6 +551,24 @@ async fn follow_once(
         if tx.send(Msg::Changed(event.fingerprint)).is_err() {
             return Down::Closed;
         }
+    }
+}
+
+/// The `kind` of an event that failed to decode only because this build
+/// does not know its kind: a JSON object whose `kind` is a string that is
+/// not a [`ServerEventkind`](crate::api::types::ServerEventkind). Anything
+/// else that fails to decode, a known kind included, is `None`: a stream
+/// sending that is broken.
+fn unknown_kind<E>(e: &crate::api::generated::Error<E>) -> Option<String> {
+    let crate::api::generated::Error::Decode { body, .. } = e else {
+        return None;
+    };
+    let event: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let kind = event.as_object()?.get("kind")?;
+    let known = serde_json::from_value::<crate::api::types::ServerEventkind>(kind.clone()).is_ok();
+    match kind {
+        serde_json::Value::String(kind) if !known => Some(kind.clone()),
+        _ => None,
     }
 }
 
@@ -956,6 +984,45 @@ mod tests {
         stream.tick("00000000000000bb", "").await;
         assert_eq!(next_live(&mut rx).await, Live::Streaming);
         assert_eq!(next_changed(&mut rx).await, "00000000000000bb");
+    }
+
+    /// `v1` may add event kinds: one this build does not know neither
+    /// brings the stream up nor takes it down, and what follows it arrives.
+    #[tokio::test]
+    async fn an_unknown_event_kind_is_ignored_and_the_stream_stays_live() {
+        let mut server = EventServer::start().await;
+        let (_api_tx, mut rx) = follow(&server, "tdp_a", FAST);
+        let mut stream = server.next(PATIENCE).await;
+        stream.open().await;
+        stream
+            .event("rename", r#"{"kind":"rename","to":"x"}"#)
+            .await;
+        stream.tick("00000000000000aa", "").await;
+        assert_eq!(next_live(&mut rx).await, Live::Streaming);
+        assert_eq!(next_changed(&mut rx).await, "00000000000000aa");
+
+        stream.event("rename", r#"{"kind":"rename"}"#).await;
+        stream.tick("00000000000000bb", "").await;
+        assert_eq!(next_changed(&mut rx).await, "00000000000000bb");
+        drop(stream);
+    }
+
+    /// A known kind that does not decode is a broken stream, not a new kind.
+    #[tokio::test]
+    async fn a_malformed_tick_still_takes_the_stream_down() {
+        let mut server = EventServer::start().await;
+        let (_api_tx, mut rx) = follow(&server, "tdp_a", FAST);
+        let mut stream = server.next(PATIENCE).await;
+        stream.open().await;
+        stream.tick("00000000000000aa", "").await;
+        assert_eq!(next_live(&mut rx).await, Live::Streaming);
+        next_changed(&mut rx).await;
+
+        stream.event("tick", r#"{"kind":"tick"}"#).await;
+        let reason = reason(next_live(&mut rx).await);
+        assert!(reason.contains("stream error"), "{reason}");
+        server.next(PATIENCE).await;
+        drop(stream);
     }
 
     #[tokio::test]

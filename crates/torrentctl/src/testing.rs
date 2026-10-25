@@ -291,6 +291,12 @@ impl EventConnection {
         .await;
     }
 
+    /// An event named `kind` whose data is `data`, as sent.
+    pub async fn event(&mut self, kind: &str, data: &str) {
+        self.write(&format!("event: {kind}\ndata: {data}\n\n"))
+            .await;
+    }
+
     async fn write(&mut self, text: &str) {
         use tokio::io::AsyncWriteExt as _;
         self.socket
