@@ -7,7 +7,9 @@
 //! `metadata_received` handler writes the fetched metadata for magnet adds.
 //! A magnet add records its URI beside where that `.torrent` will go, so a
 //! magnet whose daemon stops before its first resume save and before its
-//! metadata arrives is re-added from it rather than lost.
+//! metadata arrives is re-added from it rather than lost. An adoption records
+//! the trackers the previous client's resume data announced to beside the
+//! `.torrent`, so a re-add from the `.torrent` alone announces to them too.
 
 use std::fs;
 use std::path::PathBuf;
@@ -73,8 +75,8 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     /// Return once every batched write accepted so far is durable.
     fn flush(&self) {}
 
-    /// Delete the `.torrent` file for `(profile, ih)`, and the magnet URI and
-    /// save path recorded beside it, before returning, then `fsync` the directory: a
+    /// Delete the `.torrent` file for `(profile, ih)`, and the magnet URI,
+    /// trackers and save path recorded beside it, before returning, then `fsync` the directory: a
     /// crash after this returns does not bring them back, and a power loss
     /// can only where that `fsync` failed ([`crate::resume_store`]'s
     /// Durability section). Missing files are not an error.
@@ -123,6 +125,32 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
         ih: &InfoHash,
     ) -> Result<Option<String>, TorrentStoreError>;
 
+    /// Atomically record, durably before returning (as
+    /// [`crate::resume_store`]'s Durability section defines it), the announce
+    /// URLs by tier that `(profile, ih)` was added with in place of its
+    /// `.torrent`'s own, beside its `.torrent`. An empty list removes the
+    /// record, so the `.torrent`'s own trackers apply again.
+    ///
+    /// An adoption from a client that keeps a torrent's trackers only in its
+    /// resume data (qBittorrent 4.4 and later) adds a `.torrent` that may
+    /// carry none. Once the session saves resume data of its own, that holds
+    /// them; a daemon stopped before then would otherwise re-add the torrent
+    /// from its `.torrent` announcing to nothing.
+    fn write_trackers(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        trackers: &[Vec<String>],
+    ) -> Result<(), TorrentStoreError>;
+
+    /// The trackers recorded for `(profile, ih)` by
+    /// [`TorrentStore::write_trackers`], or an empty list if none were.
+    fn read_trackers(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Vec<Vec<String>>, TorrentStoreError>;
+
     /// The info-hash of every magnet URI recorded for `profile`, by name and
     /// with no file read, after removing the temp files an interrupted
     /// [`TorrentStore::write_magnet`] left.
@@ -156,14 +184,16 @@ pub enum TorrentStoreError {
 
 /// `<infohash>.torrent` files, each with an optional `<infohash>.save_path`
 /// sidecar in the same directory holding the UTF-8 save path it was added at,
-/// and, for a magnet add, an `<infohash>.magnet` sidecar holding its URI.
-/// The `.torrent` scan reads only its own suffix, so the sidecars never show
+/// and, for a magnet add, an `<infohash>.magnet` sidecar holding its URI,
+/// and, for an adoption that announces to its previous client's trackers, an
+/// `<infohash>.trackers` sidecar holding them. The `.torrent` scan reads only its own suffix, so the sidecars never show
 /// up as entries.
 #[derive(Debug)]
 pub struct FsTorrentStore {
     torrents: PartitionedDir,
     save_paths: PartitionedDir,
     magnets: PartitionedDir,
+    trackers: PartitionedDir,
 }
 
 impl FsTorrentStore {
@@ -172,7 +202,8 @@ impl FsTorrentStore {
         Self {
             torrents: PartitionedDir::new(base.clone(), ".torrent", "torrent"),
             save_paths: PartitionedDir::new(base.clone(), SAVE_PATH_SUFFIX, "save path"),
-            magnets: PartitionedDir::new(base, MAGNET_SUFFIX, "magnet"),
+            magnets: PartitionedDir::new(base.clone(), MAGNET_SUFFIX, "magnet"),
+            trackers: PartitionedDir::new(base, TRACKERS_SUFFIX, "trackers"),
         }
     }
 
@@ -189,7 +220,8 @@ impl FsTorrentStore {
         let dir = dir.into();
         self.torrents.pin(profile.clone(), dir.clone());
         self.save_paths.pin(profile.clone(), dir.clone());
-        self.magnets.pin(profile, dir);
+        self.magnets.pin(profile.clone(), dir.clone());
+        self.trackers.pin(profile, dir);
         self
     }
 
@@ -206,6 +238,11 @@ impl FsTorrentStore {
     pub fn magnet_path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
         self.magnets.path_for(profile, ih)
     }
+
+    /// Where the trackers sidecar for `(profile, ih)` lives.
+    pub fn trackers_path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
+        self.trackers.path_for(profile, ih)
+    }
 }
 
 /// The save-path sidecar's suffix, beside `<infohash>.torrent`.
@@ -213,6 +250,40 @@ const SAVE_PATH_SUFFIX: &str = ".save_path";
 
 /// The magnet sidecar's suffix, beside `<infohash>.torrent`.
 const MAGNET_SUFFIX: &str = ".magnet";
+
+/// The trackers sidecar's suffix, beside `<infohash>.torrent`.
+const TRACKERS_SUFFIX: &str = ".trackers";
+
+/// The trackers sidecar's text: one announce URL per line, a blank line
+/// between tiers. A URL holding a line break, which no tracker's does, could
+/// not be read back as itself, so it is left out, and so is a tier left empty.
+fn encode_trackers(trackers: &[Vec<String>]) -> String {
+    trackers
+        .iter()
+        .map(|tier| {
+            tier.iter()
+                .filter(|url| !url.is_empty() && !url.contains(['\n', '\r']))
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|tier| !tier.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// [`encode_trackers`]' inverse.
+fn decode_trackers(text: &str) -> Vec<Vec<String>> {
+    text.split("\n\n")
+        .map(|tier| {
+            tier.lines()
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|tier| !tier.is_empty())
+        .collect()
+}
 
 /// A UTF-8 sidecar's text, or `None` where there is none.
 fn read_text(path: &std::path::Path) -> Result<Option<String>, TorrentStoreError> {
@@ -230,12 +301,14 @@ impl TorrentStore for FsTorrentStore {
         // The sidecars are written through a temp file too.
         self.save_paths.remove_stale_temps(profile)?;
         self.magnets.remove_stale_temps(profile)?;
+        self.trackers.remove_stale_temps(profile)?;
         Ok(self.torrents.scan(profile)?)
     }
 
     fn list(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
         self.save_paths.remove_stale_temps(profile)?;
         self.magnets.remove_stale_temps(profile)?;
+        self.trackers.remove_stale_temps(profile)?;
         Ok(self.torrents.list(profile)?)
     }
 
@@ -263,10 +336,11 @@ impl TorrentStore for FsTorrentStore {
 
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError> {
         // The `.torrent` and the magnet first, the two the boot re-adds a
-        // torrent from: a save path left behind by a failure after them is
-        // never read, since nothing is left to re-add at it.
+        // torrent from: trackers or a save path left behind by a failure
+        // after them are never read, since nothing is left to re-add.
         self.torrents.delete(profile, ih)?;
         self.magnets.delete(profile, ih)?;
+        self.trackers.delete(profile, ih)?;
         Ok(self.save_paths.delete(profile, ih)?)
     }
 
@@ -309,6 +383,30 @@ impl TorrentStore for FsTorrentStore {
         read_text(&self.magnet_path_for(profile, ih))
     }
 
+    fn write_trackers(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        trackers: &[Vec<String>],
+    ) -> Result<(), TorrentStoreError> {
+        let text = encode_trackers(trackers);
+        if text.is_empty() {
+            return Ok(self.trackers.delete(profile, ih)?);
+        }
+        Ok(self.trackers.write(profile, ih, text.as_bytes())?)
+    }
+
+    fn read_trackers(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Vec<Vec<String>>, TorrentStoreError> {
+        Ok(read_text(&self.trackers_path_for(profile, ih))?
+            .as_deref()
+            .map(decode_trackers)
+            .unwrap_or_default())
+    }
+
     fn list_magnets(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
         Ok(self.magnets.list(profile)?)
     }
@@ -332,6 +430,7 @@ pub struct MemoryTorrentStore {
     inner: DashMap<(ProfileId, InfoHash), Vec<u8>>,
     save_paths: DashMap<(ProfileId, InfoHash), String>,
     magnets: DashMap<(ProfileId, InfoHash), String>,
+    trackers: DashMap<(ProfileId, InfoHash), Vec<Vec<String>>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -388,6 +487,7 @@ impl TorrentStore for MemoryTorrentStore {
         self.inner.remove(&(profile.clone(), *ih));
         self.save_paths.remove(&(profile.clone(), *ih));
         self.magnets.remove(&(profile.clone(), *ih));
+        self.trackers.remove(&(profile.clone(), *ih));
         Ok(())
     }
 
@@ -447,6 +547,35 @@ impl TorrentStore for MemoryTorrentStore {
             .magnets
             .get(&(profile.clone(), *ih))
             .map(|e| e.value().clone()))
+    }
+
+    fn write_trackers(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        trackers: &[Vec<String>],
+    ) -> Result<(), TorrentStoreError> {
+        // Through the file's own encoding, so the fixture reads back exactly
+        // what the file store would.
+        let kept = decode_trackers(&encode_trackers(trackers));
+        if kept.is_empty() {
+            self.trackers.remove(&(profile.clone(), *ih));
+        } else {
+            self.trackers.insert((profile.clone(), *ih), kept);
+        }
+        Ok(())
+    }
+
+    fn read_trackers(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Vec<Vec<String>>, TorrentStoreError> {
+        Ok(self
+            .trackers
+            .get(&(profile.clone(), *ih))
+            .map(|e| e.value().clone())
+            .unwrap_or_default())
     }
 
     fn list_magnets(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
@@ -550,6 +679,45 @@ mod tests {
             fs_store.magnet_path_for(&profile, &ih),
             dir.path().join("p").join(format!("{}.magnet", ih.to_hex())),
         );
+    }
+
+    #[test]
+    fn the_trackers_sidecar_round_trips_by_tier_and_goes_with_the_torrent() {
+        let dir = tempdir().unwrap();
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0x5eu8; 20]);
+        let tiers = vec![
+            vec![
+                "https://a.example/announce?passkey=1".to_owned(),
+                "udp://b.example:80".to_owned(),
+            ],
+            // Left out whole: a tier with nothing that can be read back.
+            vec!["".to_owned(), "https://x.example/\nannounce".to_owned()],
+            vec!["https://c.example/announce".to_owned()],
+        ];
+        let kept = vec![tiers[0].clone(), tiers[2].clone()];
+        let fs_store = FsTorrentStore::new(dir.path());
+        let memory = MemoryTorrentStore::new();
+        for store in [&fs_store as &dyn TorrentStore, &memory] {
+            assert!(store.read_trackers(&profile, &ih).unwrap().is_empty());
+            store.write_trackers(&profile, &ih, &tiers).unwrap();
+            assert_eq!(store.read_trackers(&profile, &ih).unwrap(), kept);
+            assert!(store.scan(&profile).unwrap().entries.is_empty());
+            // An empty list clears the record rather than writing one.
+            store.write_trackers(&profile, &ih, &[]).unwrap();
+            assert!(store.read_trackers(&profile, &ih).unwrap().is_empty());
+            store.write_trackers(&profile, &ih, &tiers).unwrap();
+            store.delete(&profile, &ih).unwrap();
+            assert!(store.read_trackers(&profile, &ih).unwrap().is_empty());
+        }
+        let path = fs_store.trackers_path_for(&profile, &ih);
+        assert_eq!(
+            path,
+            dir.path()
+                .join("p")
+                .join(format!("{}.trackers", ih.to_hex())),
+        );
+        assert!(!path.exists());
     }
 
     #[test]
