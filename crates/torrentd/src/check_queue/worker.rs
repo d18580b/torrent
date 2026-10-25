@@ -696,8 +696,8 @@ pub(super) fn admit_adoption(
 ///
 /// Hashing is over once [`verify_outcome`] decides it, or, where its
 /// `torrent_checked_alert` was lost, once [`lost_check_outcome`] does: one
-/// showing a finished check's phase unstamped, or one waiting past
-/// [`RECHECK_EXPIRY`], is recorded failed, so no adoption holds its slot for
+/// showing a finished check's phase unstamped, or one showing no running or
+/// held check for [`RECHECK_EXPIRY`], is recorded failed, so no adoption holds its slot for
 /// the life of the process.
 ///
 /// A removed torrent leaves the state map, and with no entry its outcome
@@ -746,7 +746,7 @@ pub(super) fn retire_in_flight(
             outcome = lost_check_outcome(
                 entry.as_ref(),
                 &mut f.ended_unchecked,
-                f.started.elapsed(),
+                &mut f.waiting_since,
                 VERIFY_SETTLE,
                 RECHECK_EXPIRY,
             );
@@ -1152,17 +1152,24 @@ pub(super) fn verify_outcome(
 /// when that began across ticks; any other phase resets it, so a healthy
 /// check passing through on its way to `Seeding` is not condemned.
 ///
-/// Whatever it shows, one waiting `expiry` or longer is failed: its check, or
-/// the report its verdict waits for, was lost - a paused adoption whose resume
-/// never came, one never seen in the state map - and it would otherwise hold
-/// a verify slot for the life of the process.
+/// One showing neither a running check (`Checking`) nor a held one
+/// (`Paused`) for `expiry` or longer is failed: its check, or the report its
+/// verdict waits for, was lost - one never seen in the state map, one stuck
+/// in a phase no check leads to - and it would otherwise hold a verify slot
+/// for the life of the process. `waiting_since` carries when that began
+/// across ticks, and either of those phases resets it, so a hash running
+/// longer than `expiry`, or an adoption held paused behind the held-add
+/// queue, keeps waiting as it always did.
 pub(super) fn lost_check_outcome(
     entry: Option<&torrentd_engine::TorrentState>,
     ended_unchecked: &mut Option<std::time::Instant>,
-    age: Duration,
+    waiting_since: &mut std::time::Instant,
     settle: Duration,
     expiry: Duration,
 ) -> VerifyOutcome {
+    if entry.is_some_and(|st| matches!(st.phase, TorrentPhase::Checking | TorrentPhase::Paused)) {
+        *waiting_since = std::time::Instant::now();
+    }
     let over = entry.is_some_and(|st| {
         st.checked_at.is_none() && matches!(st.phase, TorrentPhase::Incomplete | TorrentPhase::Idle)
     });
@@ -1179,7 +1186,7 @@ pub(super) fn lost_check_outcome(
     } else {
         *ended_unchecked = None;
     }
-    if age >= expiry {
+    if waiting_since.elapsed() >= expiry {
         return VerifyOutcome::Failed("no verification verdict within the check expiry");
     }
     VerifyOutcome::Waiting

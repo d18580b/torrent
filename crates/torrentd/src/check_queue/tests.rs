@@ -506,12 +506,15 @@ fn an_adoption_whose_checked_alert_was_lost_frees_its_slot_as_failed() {
         );
     };
 
-    // Hashing: it keeps its slot however long it has run, short of the expiry.
-    state.insert(hash, st(TorrentPhase::Checking, None));
-    retire();
-    q.age_in_flight(SETTLE);
-    retire();
-    assert!(q.is_in_flight(&hash.to_hex()));
+    // Hashing, or held paused: it keeps its slot however long that lasts,
+    // past the expiry too.
+    for phase in [TorrentPhase::Checking, TorrentPhase::Paused] {
+        state.insert(hash, st(phase, None));
+        retire();
+        q.age_in_flight(super::RECHECK_EXPIRY);
+        retire();
+        assert!(q.is_in_flight(&hash.to_hex()));
+    }
 
     // The check ends failed and its alert is lost. Just seen, it is given
     // the settle.
@@ -536,8 +539,8 @@ fn an_adoption_whose_checked_alert_was_lost_frees_its_slot_as_failed() {
 
 /// The decision behind the test above, and its backstop: a finished check's
 /// phase shown unstamped is failed only once held for the settle, any other
-/// phase between resets it, and whatever is shown, one waiting past the
-/// expiry is failed.
+/// phase between resets it, and one showing neither a running nor a held
+/// check past the expiry is failed, while one showing either never is.
 #[test]
 fn an_adoption_with_no_verdict_is_failed_after_the_settle_or_the_expiry() {
     use super::worker::lost_check_outcome;
@@ -547,14 +550,15 @@ fn an_adoption_with_no_verdict_is_failed_after_the_settle_or_the_expiry() {
     for phase in [TorrentPhase::Incomplete, TorrentPhase::Idle] {
         let s = st(phase, None);
         let mut since = None;
+        let mut waiting = Instant::now() - young;
         assert_eq!(
-            lost_check_outcome(Some(&s), &mut since, young, SETTLE, RECHECK_EXPIRY),
+            lost_check_outcome(Some(&s), &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
             VerifyOutcome::Waiting,
         );
         assert!(since.is_some());
         since = since.map(|t| t - SETTLE);
         assert!(matches!(
-            lost_check_outcome(Some(&s), &mut since, young, SETTLE, RECHECK_EXPIRY),
+            lost_check_outcome(Some(&s), &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
             VerifyOutcome::Failed(_),
         ));
     }
@@ -567,11 +571,12 @@ fn an_adoption_with_no_verdict_is_failed_after_the_settle_or_the_expiry() {
         TorrentPhase::DiskError,
     ] {
         let mut since = Some(Instant::now() - SETTLE);
+        let mut waiting = Instant::now() - young;
         assert_eq!(
             lost_check_outcome(
                 Some(&st(phase, None)),
                 &mut since,
-                young,
+                &mut waiting,
                 SETTLE,
                 RECHECK_EXPIRY,
             ),
@@ -582,33 +587,50 @@ fn an_adoption_with_no_verdict_is_failed_after_the_settle_or_the_expiry() {
 
     // A stamped check is `verify_outcome`'s to decide, not this.
     let mut since = None;
+    let mut waiting = Instant::now() - young;
     assert_eq!(
         lost_check_outcome(
             Some(&st(TorrentPhase::Incomplete, Some(Duration::ZERO))),
             &mut since,
-            young,
+            &mut waiting,
             SETTLE,
             RECHECK_EXPIRY,
         ),
         VerifyOutcome::Waiting,
     );
 
-    // Past the expiry: paused, still checking, or never in the state map.
-    let paused = st(TorrentPhase::Paused, None);
-    for entry in [Some(&paused), None] {
+    // A running or held check is never expired, however long it has waited:
+    // a multi-terabyte hash past a day, or an adoption held paused behind the
+    // held-add queue. Showing either restarts the clock.
+    for phase in [TorrentPhase::Checking, TorrentPhase::Paused] {
         let mut since = None;
+        let mut waiting = Instant::now() - RECHECK_EXPIRY - young;
         assert_eq!(
             lost_check_outcome(
-                entry,
+                Some(&st(phase, None)),
                 &mut since,
-                RECHECK_EXPIRY - young,
+                &mut waiting,
                 SETTLE,
                 RECHECK_EXPIRY,
             ),
             VerifyOutcome::Waiting,
         );
+        assert!(waiting.elapsed() < young);
+    }
+
+    // Past the expiry showing neither: never in the state map, or stuck in
+    // a phase no check leads to.
+    let stuck = st(TorrentPhase::DiskError, None);
+    for entry in [Some(&stuck), None] {
+        let mut since = None;
+        let mut waiting = Instant::now() - (RECHECK_EXPIRY - young);
         assert_eq!(
-            lost_check_outcome(entry, &mut since, RECHECK_EXPIRY, SETTLE, RECHECK_EXPIRY),
+            lost_check_outcome(entry, &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Waiting,
+        );
+        waiting -= young;
+        assert_eq!(
+            lost_check_outcome(entry, &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
             VerifyOutcome::Failed("no verification verdict within the check expiry"),
         );
     }
