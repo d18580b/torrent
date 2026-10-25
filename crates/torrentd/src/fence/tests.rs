@@ -367,6 +367,36 @@ async fn a_batch_that_panics_panics_its_paced_resume() {
     assert!(failed.is_panic(), "{failed}");
 }
 
+/// A paced resume counts what the session refused apart from what it
+/// resumed, and hands each refusal to its caller.
+#[tokio::test]
+async fn a_paced_resume_counts_and_reports_each_refusal() {
+    let (entry, engine) = mock_entry(ProfileStatus::Active);
+    engine.inject_error("resume_torrent", torrentd_engine::EngineError::Shutdown);
+    let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+    let mut reported = Vec::new();
+    let resumed = resume_paced(
+        profiles,
+        ProfileId::new("acct_a"),
+        &[handle(1), handle(2)],
+        REANNOUNCE_PACE,
+        || false,
+        Arc::new(ResumeGate::default()),
+        Arc::new(PromSink::new()),
+        |h, _| reported.push(h),
+    )
+    .await;
+    assert_eq!(
+        resumed,
+        Resumed {
+            resumed: 1,
+            refused: 1,
+            ..Resumed::default()
+        },
+    );
+    assert_eq!(reported, [handle(1)], "the refusal is handed back");
+}
+
 /// A run that passed its cancel check while the profile was fenced, and
 /// whose batch reaches the session only after a lift replaced it and
 /// marked the profile active, resumes nothing: the lift's own run
