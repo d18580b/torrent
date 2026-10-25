@@ -1303,10 +1303,20 @@ the same arguments as `podman compose`.
    if a Prometheus will scrape through the proxy:
 
    ```bash
-   podman compose -f deploy/compose.yaml build
+   BUILDAH_FORMAT=docker podman compose -f deploy/compose.yaml build
    podman compose -f deploy/compose.yaml run --rm torrentd hash-password
    podman compose -f deploy/compose.yaml run --rm torrentd new-token --name prometheus --scopes metrics
    ```
+
+   `BUILDAH_FORMAT=docker` keeps the image's health check. It is the
+   `HEALTHCHECK` in `deploy/Containerfile`, which curls
+   `localhost:8080/healthz` every 30 s, and it lives only in a Docker-format
+   image: podman builds the OCI format by default, which has no field for it,
+   and drops it with the warning `HEALTHCHECK is not supported for OCI image
+   format`. `mise run container` builds Docker format for the same reason;
+   `docker compose build` and the published release image keep it already.
+   An image built without it has no health status at all, so nothing marks
+   the container unhealthy.
 
 5. **Start it**, and check it from inside the container (§9):
 
@@ -2377,6 +2387,7 @@ run it by hand instead, start the service again afterwards:
 | --- | --- |
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
+| Container reports no health status at all | The image was built in podman's default OCI format, which drops the `HEALTHCHECK`; rebuild it with `mise run container` or `BUILDAH_FORMAT=docker` (§8, "On the compose stack"). |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, then recover each fenced profile as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes; fenced profiles do not resume themselves by design. A profile counted by `profiles_failed` (`status: "failed"`) never came up and has no session for `PATCH` to lift: bring its tunnel back, then restart. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
