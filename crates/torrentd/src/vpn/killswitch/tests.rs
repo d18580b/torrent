@@ -948,18 +948,31 @@ fn a_legacy_failure_after_the_own_table_is_removed_is_a_warning() {
     let listing = || Ok(format!("table inet torrentd_ks\ntable inet {TABLE}\n"));
 
     let deleted = std::cell::RefCell::new(Vec::new());
-    let removed = disable_with(
-        998,
-        listing,
-        |_| Err(io::Error::other("nft -j list table exited 1")),
-        |name| {
-            deleted.borrow_mut().push(name.to_string());
-            Ok(())
-        },
-    )
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let removed = torrentd_engine::testing::with_subscriber(subscriber, || {
+        disable_with(
+            998,
+            listing,
+            |_| Err(io::Error::other("nft -j list table exited 1")),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+    })
     .expect("the own table is gone, so the call succeeds");
     assert!(removed);
     assert_eq!(*deleted.borrow(), [TABLE], "only the own table is deleted");
+    // The warning is the only place the failure is reported, and it says how
+    // to remove the table by hand.
+    let log = log.text();
+    assert!(
+        log.contains("nft -j list table exited 1")
+            && log.contains("nft delete table inet torrentd_ks"),
+        "{log}"
+    );
 
     let deleted = std::cell::RefCell::new(Vec::new());
     let removed = disable_with(
