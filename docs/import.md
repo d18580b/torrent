@@ -170,6 +170,15 @@ one is indexed from its `.torrent` alone. Adopting it hashes it, or, where
 the index holds its files anywhere but the `.torrent`'s own paths, is
 refused until the sidecar is recopied and the library rescanned.
 
+A magnet-only entry is not imported. qBittorrent keeps a torrent added from a
+magnet link whose metadata never arrived as a `<hash>.fastresume` with no
+`<hash>.torrent`, and without the `.torrent` nothing names the torrent's
+files. The scan logs each `.fastresume` it finds with no `.torrent` beside it
+at info, with its path, and counts it (`unpaired_fastresume` in the scan's
+stats, and `unpaired_fastresume_count` on the `library scan complete` line);
+it is not an error. Let qBittorrent fetch the metadata first, or add the
+magnet to torrentd yourself, if you want the torrent.
+
 Check that `BT_backup` actually holds `.fastresume` files before you count on
 the fast path (`GET /v1/pool/torrents` shows `has_fastresume` per torrent).
 Where there are none, for example because qBittorrent keeps its resume data
@@ -177,7 +186,7 @@ somewhere else, every torrent is hashed.
 
 **Deluge.** `state/` holds one `<hash>.torrent` per torrent. Its resume data
 is a single file, `torrents.fastresume`, which pairs with no `.torrent` and is
-not read. Every torrent is hashed, matching has no save-path hint, and a file
+not read; the scan logs and counts it as an unpaired `.fastresume`, as above. Every torrent is hashed, matching has no save-path hint, and a file
 renamed inside Deluge is looked for at its original name.
 
 **Transmission.** `torrents/` holds the `.torrent` files. The resume files in
