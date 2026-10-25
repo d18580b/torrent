@@ -10,8 +10,10 @@ use crate::config::Config;
 ///
 /// Each session may open `connections_limit` peer sockets and keep
 /// `file_pool_size` payload files open, and the API accepts up to
-/// [`HTTP_MAX_CONNECTIONS`]. A soft limit below their sum is a daemon that seeds until
-/// the pool grows and then fails `accept` and `open` with `EMFILE` — in
+/// [`HTTP_MAX_CONNECTIONS`]; each session and the process itself hold more
+/// beside those ([`descriptors_needed`]). A soft limit below the sum is a
+/// daemon that seeds until the pool grows and then fails `accept` and `open`
+/// with `EMFILE` — in
 /// libtorrent's logs, as disk and peer errors, far from the cause. The values
 /// are the effective ones: `Settings::server_seed_overrides` sets both, and
 /// the config's keys override that.

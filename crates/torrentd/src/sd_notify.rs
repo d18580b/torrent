@@ -3,8 +3,8 @@
 //! `deploy/torrentd.service` runs the daemon as `Type=notify` with
 //! `WatchdogSec=`, which is a contract: systemd holds the unit in `activating`
 //! until it receives `READY=1`, and kills it if a `WATCHDOG=1` keepalive stops
-//! arriving. Nothing else in the tree speaks that protocol, so the packaged
-//! unit could never have started.
+//! arriving. This module is the only speaker of that protocol in the daemon:
+//! without its `READY=1` the packaged unit never leaves `activating`.
 //!
 //! The protocol is one `AF_UNIX` datagram of newline-separated `KEY=VALUE`
 //! pairs sent to `$NOTIFY_SOCKET`, so it needs no dependency. A leading `@` in

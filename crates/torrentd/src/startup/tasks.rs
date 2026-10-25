@@ -11,12 +11,13 @@ use crate::metrics_sink::PromSink;
 /// Spawn a long-running task under `task_up{task}`: 1 from now, 0 once the
 /// task returns or panics.
 ///
-/// Every background task was spawned with its handle discarded, so a monitor
-/// that panicked left the daemon healthy by every signal it has — `/healthz`
-/// reads the alert loop only — with its tunnels unwatched. A task that returns
-/// is also logged: each of these returns only on shutdown, and at shutdown
-/// the gauge going to 0 is harmless. The handle returned stops the task, for
-/// a failed boot to stop what it started.
+/// A task spawned with its handle discarded that panicked would leave the
+/// daemon healthy by every signal it has — `/healthz` reads the alert loop
+/// only — with its tunnels unwatched; here a panic is logged at `error` and
+/// the gauge drops to 0. A task that returns, or is stopped, is logged at
+/// `info`: each of these returns only on shutdown, and at shutdown the gauge
+/// going to 0 is harmless. The handle returned stops the task, for a failed
+/// boot to stop what it started.
 pub(super) fn spawn_supervised<F>(
     task: &'static str,
     metrics: Arc<PromSink>,
