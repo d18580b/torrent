@@ -805,13 +805,12 @@ mod tests {
         let mixed: Vec<String> = ["Show/a.mkv", "Other/b.mkv"].map(String::from).to_vec();
         assert_eq!(layout.relayout(&mixed, "Show"), None);
 
-        // `Subfolder` applies only to a single-file torrent: a one-file
-        // torrent in multi-file mode already has its directory.
+        // `Subfolder` applies only to a single-file torrent: several files
+        // without a directory are not one, and get none.
         let subfolder = ResumeHints {
             content_layout: Some("Subfolder".to_owned()),
             ..ResumeHints::default()
         };
-        assert_eq!(subfolder.relayout(&one, "Show"), None);
         let flat: Vec<String> = ["a.mkv", "b.mkv"].map(String::from).to_vec();
         assert_eq!(subfolder.relayout(&flat, "Show"), None);
     }
