@@ -622,11 +622,17 @@ fn an_error_paused_adoption_is_failed_and_frees_its_slot() {
         "the paused adoption still holds the only slot"
     );
 
-    // Its check fails on a disk read error, which pauses it with the error.
+    // Its check fails on a disk read error, which pauses it with the error
+    // and arms the disk-error retry.
     let mut errored = st(TorrentPhase::Paused, None);
     errored.has_error = true;
+    errored.retry = Some(torrentd_engine::RetryState::first(Instant::now()));
     state.insert(adopting, errored);
     tick();
+    assert!(
+        state.get(&adopting).unwrap().retry.is_none(),
+        "the retry would resume the torrent the failure paused"
+    );
     assert!(!q.is_in_flight(&adopting.to_hex()));
     assert_eq!(q.failed(), 1);
     assert!(engine
@@ -640,6 +646,63 @@ fn an_error_paused_adoption_is_failed_and_frees_its_slot() {
     assert_eq!(drifted[0].torrent.infohash, adopting.to_hex());
     assert_eq!(drifted[0].note.as_deref(), Some(ERROR_PAUSED_REASON));
     assert!(rechecked(), "the freed slot went to the queued re-hash");
+}
+
+/// The failure path disarms the disk-error retry only for a torrent it
+/// paused: where the pause fails, the retry is re-armed as it was, the one
+/// thing left that recovers the error-paused torrent.
+#[test]
+fn a_failed_verify_whose_pause_fails_keeps_its_disk_error_retry() {
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RetryState;
+    use torrentd_engine::StateMap;
+
+    use crate::profile_registry::test_host_entry;
+    use crate::profile_registry::ProfileRegistry;
+
+    let hash = InfoHash([0x67; 20]);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+    let pool = crate::pool_service::PoolService::open(&cfg)
+        .unwrap()
+        .unwrap();
+    let engine = Arc::new(MockEngine::new());
+    let source = torrentd_engine::ProfileSource::new(vec![(
+        ProfileId::new("p"),
+        engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+    )]);
+    let profiles = ProfileRegistry::new(vec![test_host_entry("p")]);
+    let state = StateMap::new();
+    let armed = RetryState::first(Instant::now());
+    let mut errored = st(TorrentPhase::Paused, None);
+    errored.has_error = true;
+    errored.retry = Some(armed.clone());
+    state.insert(hash, errored);
+    engine.inject_error("pause_torrent", torrentd_engine::EngineError::Shutdown);
+    super::worker::record_verify_outcome(
+        &pool,
+        super::worker::Writer::Wait,
+        &source,
+        &state,
+        &profiles,
+        &hash,
+        &hash.to_hex(),
+        VerifyOutcome::Failed(super::worker::ERROR_PAUSED_REASON),
+    );
+    let kept = state
+        .get(&hash)
+        .unwrap()
+        .retry
+        .expect("the retry is re-armed");
+    assert_eq!(
+        (kept.next_attempt, kept.attempts),
+        (armed.next_attempt, armed.attempts)
+    );
+    assert_eq!(
+        state.retries_due(armed.next_attempt).len(),
+        1,
+        "the re-armed retry is scheduled again",
+    );
 }
 
 /// The decision behind the test above, and its backstop: a finished check's

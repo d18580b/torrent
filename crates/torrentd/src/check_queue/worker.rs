@@ -1067,6 +1067,16 @@ pub(super) fn record_verify_outcome(
                 // hold would load it unpaused at the next boot.
                 let entry = profiles.resolve(&st.profile_id).active();
                 let before = entry.map(|e| e.prepare_pause(st.handle));
+                // So would the disk-error retry. A check that fails on a
+                // disk read error arms it (`file_error`), and libtorrent's
+                // pause keeps the error, so a due retry would resume the
+                // torrent this pauses: re-checked and seeding, while its
+                // record stays drifted and no verdict follows. Disarmed
+                // before the pause, so a retry coming due in between finds
+                // nothing to do, and re-armed as it was if the pause fails,
+                // leaving the error-paused torrent with its one way back.
+                let mut retry = None;
+                state.update(hash, |s| retry = s.retry.take());
                 let paused = source
                     .engine_for(&st.profile_id)
                     .map(|e| e.pause_torrent(st.handle));
@@ -1079,6 +1089,13 @@ pub(super) fn record_verify_outcome(
                     // Its flag did not change, so the note goes back.
                     if let (Some(e), Some(before)) = (entry, before) {
                         e.restore_noted(st.handle, before);
+                    }
+                    if retry.is_some() {
+                        state.update(hash, |s| {
+                            if s.retry.is_none() {
+                                s.retry = retry;
+                            }
+                        });
                     }
                     warn!(
                         target: "torrentd::pool",
@@ -1197,8 +1214,10 @@ pub(super) const ERROR_PAUSED_REASON: &str =
 ///
 /// Except one paused on an error ([`error_paused`]), as a disk read error
 /// during the check leaves it: that check is over, with no
-/// `torrent_checked`, and a disk-error retry that resumes the torrent takes
-/// a slot of its own. It is failed at once; held as paused, it would reset the expiry on every tick and keep
+/// `torrent_checked`. It is failed at once, and [`record_verify_outcome`]
+/// disarms the disk-error retry its `file_error` armed, which would
+/// otherwise resume the torrent it pauses. Held as paused, it would reset
+/// the expiry on every tick and keep
 /// its slot for the life of the process, and `max_concurrent_verify` of them
 /// would stall every adoption, re-hash and held add.
 pub(super) fn lost_check_outcome(

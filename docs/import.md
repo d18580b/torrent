@@ -528,7 +528,9 @@ as `verify_queue_depth` and `verify_in_flight`.
   - `libtorrent paused the torrent on an error before its check finished`:
     the check hit an error, most often a disk read error, and libtorrent
     paused the torrent with it before any verdict. Recorded at once, so the
-    adoption gives up its verify slot.
+    adoption gives up its verify slot. Any failed verification disarms the
+    disk-error retry the error armed, which would otherwise resume the
+    torrent this pause left paused.
   - `no verification verdict within the check expiry`: for 24 hours the
     adoption showed neither a running check (`checking`) nor a held one
     (`paused`), and no verdict came. Either it never appeared in the session,
