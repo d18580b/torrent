@@ -447,13 +447,7 @@ fn an_accept_out_of_descriptors_is_warned_once_per_streak_and_counted_every_time
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
     let mut failures = ListenFailures::default();
     let warns = Arc::new(WarnCounter::default());
-    // While only one dispatcher is registered, tracing-core caches a new
-    // callsite's interest from the registering thread's default alone: a
-    // parallel test that first reaches the `warn!` under no subscriber
-    // would cache it as never for this thread too. A second live one
-    // makes every registration ask each, this test's counter included.
-    let _pin = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-    tracing::subscriber::with_default(Arc::clone(&warns), || {
+    crate::testing::with_subscriber(Arc::clone(&warns), || {
         let mut ctx = HandlerCtx {
             state: &state,
             resume: &resume,

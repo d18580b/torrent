@@ -25,6 +25,8 @@ pub mod removal;
 pub mod resume_store;
 pub mod source;
 pub mod state;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub mod torrent_store;
 pub mod vpn;
 
