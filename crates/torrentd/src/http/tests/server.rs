@@ -11,7 +11,9 @@ use super::support::Harness;
 pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     events(cov).await;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    // The queue the daemon builds, not one sized here, so the 409 below
+    // holds for the capacity the daemon runs with.
+    let (tx, mut rx) = crate::http::v1::server::reload_queue();
     let h = Harness::authed(cov, |s| s.reload_tx = Some(tx));
 
     // Identity.
@@ -30,13 +32,19 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     assert_eq!(status["torrents_total"], 0);
     assert_eq!(status["profile_count"], 1);
 
-    // Reload: accepted, then pending while the first is unconsumed, then
-    // unavailable once nothing is listening.
+    // Reload: accepted, then pending while the first is queued, accepted
+    // again once the reload task has taken it, then unavailable once nothing
+    // is listening.
     h.write("POST", "/v1/config/reload")
         .await
         .assert_status(kynos::http::StatusCode::ACCEPTED);
     let pending = h.write("POST", "/v1/config/reload").await;
     assert_problem(&pending, 409, "reload-pending");
+    assert_eq!(rx.try_recv(), Ok(()), "the first request was queued");
+    h.write("POST", "/v1/config/reload")
+        .await
+        .assert_status(kynos::http::StatusCode::ACCEPTED);
+    assert_eq!(rx.try_recv(), Ok(()), "the third request was queued");
     rx.close();
     let _ = rx.recv().await;
     let gone = h.write("POST", "/v1/config/reload").await;

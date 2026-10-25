@@ -1250,7 +1250,7 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/v1/config/relo
 | Status | Meaning |
 | --- | --- |
 | `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. It is also the answer when every change in the file needs a restart, and a reload never applies a restart-only key — among them `[auth]` (including a removed `[[auth.token]]`), `allow_unauthenticated`, `http_listen`, `trusted_proxies` and `allowed_hosts`. |
-| `409` | `reload-pending`: the reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run; they read the same file. |
+| `409` | `reload-pending`: a reload is already queued and has not started. The queue, which `SIGHUP` shares, holds one reload, and the queued one reads the file as it stands when it runs, so this request adds nothing to it; a `SIGHUP` sent then is likewise folded into it. |
 | `503` | `reload-unavailable`: the daemon is shutting down, or was built without the reload channel wired up. |
 
 It needs a token with the `write` scope — a session token has it — where
