@@ -343,6 +343,109 @@ async fn a_batch_resumed_as_the_profile_is_fenced_is_paused_again() {
     assert_eq!(pauses(&engine), [handle(1), handle(2)], "both paused again");
 }
 
+/// A batch that panics on the blocking pool takes the paced resume down
+/// with it, rather than reading as a run stopped short of its torrents.
+#[tokio::test]
+async fn a_batch_that_panics_panics_its_paced_resume() {
+    let (entry, engine) = mock_entry(ProfileStatus::Active);
+    engine.inject_panic("resume_torrent");
+    let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+    let run = tokio::spawn(async move {
+        resume_paced(
+            profiles,
+            ProfileId::new("acct_a"),
+            &[handle(1)],
+            REANNOUNCE_PACE,
+            || false,
+            Arc::new(ResumeGate::default()),
+            Arc::new(PromSink::new()),
+            |_, _| {},
+        )
+        .await
+    });
+    let failed = run.await.expect_err("the batch's panic reaches the run");
+    assert!(failed.is_panic(), "{failed}");
+}
+
+/// A pause of the whole profile that lands between two resumes of one
+/// batch stops the run there: what the batch had left and every later
+/// batch count as not reached.
+#[tokio::test]
+async fn a_pause_all_inside_a_batch_counts_the_rest_of_the_run_not_reached() {
+    let id = ProfileId::new("acct_mid_batch");
+    let engine = Arc::new(torrentd_engine::MockEngine::new());
+    let profiles = Arc::new(ProfileRegistry::new(vec![ProfileEntry::new(
+        crate::profile_registry::test_vpn_entry(id.as_str(), ProfileStatus::Active).config,
+        engine.clone(),
+        ip(2),
+        None,
+        0,
+    )]));
+    let gate = profiles.iter().next().unwrap().open_gate();
+    let n = REANNOUNCE_BATCH as u64 + 5;
+    let handles: Vec<TorrentHandle> = (1..=n).map(handle).collect();
+    *super::lift::BEFORE_GATED_RESUME.lock().unwrap() = Some((id.clone(), {
+        let profiles = profiles.clone();
+        Box::new(move |i| {
+            if i == 1 {
+                profiles.iter().next().unwrap().halt_resumes();
+            }
+        })
+    }));
+    let resumed = resume_paced(
+        profiles,
+        id,
+        &handles,
+        REANNOUNCE_PACE,
+        || false,
+        gate,
+        Arc::new(PromSink::new()),
+        |_, _| {},
+    )
+    .await;
+    *super::lift::BEFORE_GATED_RESUME.lock().unwrap() = None;
+    assert_eq!(
+        resumed,
+        Resumed {
+            resumed: 1,
+            not_reached: n as usize - 1,
+            halted: true,
+            ..Resumed::default()
+        },
+    );
+    assert_eq!(resumes(&engine), [handle(1)], "nothing after the pause");
+}
+
+/// A paced resume counts what the session refused apart from what it
+/// resumed, and hands each refusal to its caller.
+#[tokio::test]
+async fn a_paced_resume_counts_and_reports_each_refusal() {
+    let (entry, engine) = mock_entry(ProfileStatus::Active);
+    engine.inject_error("resume_torrent", torrentd_engine::EngineError::Shutdown);
+    let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+    let mut reported = Vec::new();
+    let resumed = resume_paced(
+        profiles,
+        ProfileId::new("acct_a"),
+        &[handle(1), handle(2)],
+        REANNOUNCE_PACE,
+        || false,
+        Arc::new(ResumeGate::default()),
+        Arc::new(PromSink::new()),
+        |h, _| reported.push(h),
+    )
+    .await;
+    assert_eq!(
+        resumed,
+        Resumed {
+            resumed: 1,
+            refused: 1,
+            ..Resumed::default()
+        },
+    );
+    assert_eq!(reported, [handle(1)], "the refusal is handed back");
+}
+
 /// A run that passed its cancel check while the profile was fenced, and
 /// whose batch reaches the session only after a lift replaced it and
 /// marked the profile active, resumes nothing: the lift's own run
@@ -1436,6 +1539,24 @@ fn a_record_marked_after_the_lifts_check_stays_for_the_next_lift() {
     );
 }
 
+/// Each fence's record carries a mark no earlier fence's did, so a lift
+/// can tell the fence it checked from one that landed after it.
+#[tokio::test(start_paused = true)]
+async fn each_kill_switch_fence_marks_its_record_anew() {
+    use vpn::killswitch::Fence;
+    let (fence, _engine) = kill_switch_fence_over(1);
+    let id = ProfileId::new("acct_a");
+    let mark = |fence: &KillSwitchFence| fence.with_record(&id, |r| r.map(|r| r.mark));
+    fence.fence_all();
+    let first = mark(&fence).expect("fenced");
+    fence.lift();
+    settle(&fence).await;
+    assert_eq!(mark(&fence), None, "lifted");
+    fence.fence_all();
+    let second = mark(&fence).expect("fenced again");
+    assert!(second > first, "{first} then {second}");
+}
+
 /// A profile set online and fenced again by the monitor while the lift
 /// checks the tunnels is not lifted on the verdict taken before: the
 /// record's mark is unchanged and the profile reads `vpn_down` as it did,
@@ -1500,4 +1621,53 @@ fn the_add_handlers_hold_without_a_kill_switch_still_runs() {
         true
     });
     assert!(ran);
+}
+
+/// Each lift names the pause it undid in its log, so an operator reading
+/// why a profile's torrents came back can tell a kill-switch lift from a
+/// set-online and from the end of an offline.
+#[tokio::test(start_paused = true)]
+async fn each_lift_names_the_pause_it_undid_in_its_log() {
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+    let (fence, _engine) = kill_switch_fence_over(1);
+    let entry = fence.profiles.iter().next().unwrap();
+    for lift in [Lift::KillSwitch, Lift::SetOnline, Lift::Offline] {
+        spawn_lift(
+            &fence.profiles,
+            &fence.metrics,
+            entry,
+            vec![handle(1)],
+            lift,
+        )
+        .await
+        .unwrap();
+    }
+    let log = log.text();
+    let named: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("finished resuming the torrents of a lifted fence"))
+        .filter_map(|l| {
+            ["kill_switch", "set_online", "offline"]
+                .into_iter()
+                .find(|label| l.contains(&format!("\"lift\":\"{label}\"")))
+        })
+        .collect();
+    assert_eq!(named, ["kill_switch", "set_online", "offline"], "{log}");
+}
+
+/// With nothing inside its gate and no fencing task left, the stop closes
+/// the gate there and then, so it reports success even with no time to
+/// wait in.
+#[tokio::test]
+async fn a_stop_with_nothing_to_wait_for_succeeds_with_a_zero_bound() {
+    let stop = FencingStop::new();
+    let gate = stop.subscribe().gate();
+    assert!(
+        stop.stop(Duration::ZERO).await,
+        "the gate closed, and no task was left running"
+    );
+    assert_eq!(gate.run(|| 1), None, "the stop refuses every later act");
 }
