@@ -848,7 +848,7 @@ listen_interfaces = "0.0.0.0:6881"
 
         let log = crate::tracing_init::Buf::default();
         let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
 
         let (tx, rx) = tokio::sync::mpsc::channel(3);
         for _ in 0..3 {
@@ -955,7 +955,7 @@ listen_interfaces = "0.0.0.0:6881"
 
         let log = crate::tracing_init::Buf::default();
         let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
 
         // One pump across both reloads, so the second is diffed against
         // whatever the first left running. Each reload's body runs to the
@@ -1095,7 +1095,7 @@ listen_interfaces = "0.0.0.0:6882"
 
         let log = crate::tracing_init::Buf::default();
         let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
 
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         for _ in 0..2 {
@@ -1203,7 +1203,7 @@ listen_interfaces = "0.0.0.0:6882"
 
         let log = crate::tracing_init::Buf::default();
         let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(()).unwrap();

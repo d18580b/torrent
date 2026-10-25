@@ -394,7 +394,7 @@ mod tests {
         let log = crate::tracing_init::Buf::default();
         let (_handle, subscriber) =
             crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
         let (_, read) = scripted_sockets(Ok(vec![
             socket("tcp", Some("wg-acct_a")),
             socket("udp", None),
