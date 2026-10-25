@@ -206,23 +206,10 @@ impl TableLock {
         let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
         match UnixDatagram::bind_addr(&addr) {
             Ok(socket) => Ok(Self { _socket: socket }),
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                let who = match socket_holder(name) {
-                    Some((pid, comm)) => format!("{comm} (pid {pid})"),
-                    None => "another process".to_string(),
-                };
-                Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "{who} holds the abstract unix socket @{name}, which a torrentd holds for \
-                         its life: the nftables table `inet {name}` is that daemon's kill switch \
-                         and would be this one's too, since the table is per uid, not per state \
-                         directory. Refusing before touching it. Stop that daemon first, or run \
-                         this one under a user of its own (docs/running.md §11, \"Two daemons in \
-                         one network namespace need separate uids\").",
-                    ),
-                ))
-            }
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                refusal_message(name, socket_holder(name)),
+            )),
             Err(e) => Err(io::Error::new(
                 e.kind(),
                 format!("bind the abstract unix socket @{name}: {e}"),
@@ -236,10 +223,48 @@ impl TableLock {
 /// `/proc/net/unix` (this network namespace's), then the `/proc/<pid>/fd`
 /// entry linking to it. Best effort, for the refusal's message only: a holder
 /// in another pid namespace, or owned by another uid, is not found.
+///
+/// This process is asked first. A process forking a child (to exec `nft` or
+/// `openvpn`) shares the socket with that child until its exec closes it, so
+/// for that window two processes hold it; the parent is the one that took the
+/// lock, and a walk of `/proc` in pid order would name whichever comes first.
+/// A lookup that finds nothing is retried a few times, a few milliseconds
+/// apart, so an entry that a concurrent fork or exit hid for an instant does
+/// not turn the message into "another process".
 fn socket_holder(name: &str) -> Option<(u32, String)> {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..=ATTEMPTS {
+        if let Some(holder) = find_socket_holder(name) {
+            return Some(holder);
+        }
+        if attempt < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    None
+}
+
+/// One pass of [`socket_holder`]: this process's descriptors, then every
+/// other process's.
+fn find_socket_holder(name: &str) -> Option<(u32, String)> {
     let table = std::fs::read_to_string("/proc/net/unix").ok()?;
     let inode = unix_socket_inode(&table, name)?;
     let target = std::ffi::OsString::from(format!("socket:[{inode}]"));
+    let own = std::process::id();
+    let holds = |dir: &std::path::Path| {
+        std::fs::read_dir(dir.join("fd")).is_ok_and(|fds| {
+            fds.flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == target))
+        })
+    };
+    let comm = |dir: &std::path::Path| {
+        std::fs::read_to_string(dir.join("comm"))
+            .map_or_else(|_| "a process".to_string(), |c| c.trim().to_string())
+    };
+    let own_dir = std::path::Path::new("/proc/self");
+    if holds(own_dir) {
+        return Some((own, comm(own_dir)));
+    }
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -248,19 +273,27 @@ fn socket_holder(name: &str) -> Option<(u32, String)> {
         else {
             continue;
         };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
-            continue;
-        };
-        let holds = fds
-            .flatten()
-            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == target));
-        if holds {
-            let comm = std::fs::read_to_string(entry.path().join("comm"))
-                .map_or_else(|_| "a process".to_string(), |c| c.trim().to_string());
-            return Some((pid, comm));
+        if pid != own && holds(&entry.path()) {
+            return Some((pid, comm(&entry.path())));
         }
     }
     None
+}
+
+/// The refusal [`TableLock::acquire_named`] returns for `@name`, naming
+/// `holder` (its pid and command name) where [`socket_holder`] found one.
+fn refusal_message(name: &str, holder: Option<(u32, String)>) -> String {
+    let who = match holder {
+        Some((pid, comm)) => format!("{comm} (pid {pid})"),
+        None => "another process".to_string(),
+    };
+    format!(
+        "{who} holds the abstract unix socket @{name}, which a torrentd holds for its life: the \
+         nftables table `inet {name}` is that daemon's kill switch and would be this one's too, \
+         since the table is per uid, not per state directory. Refusing before touching it. Stop \
+         that daemon first, or run this one under a user of its own (docs/running.md §11, \"Two \
+         daemons in one network namespace need separate uids\").",
+    )
 }
 
 /// The inode `/proc/net/unix`'s `table` lists for the abstract socket

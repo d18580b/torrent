@@ -31,6 +31,37 @@ fn a_second_table_lock_refuses_and_names_the_holder() {
     reacquire_after_drop(&name).expect("the lock is free once the holder is gone");
 }
 
+/// The refusal names the holder it is given by its command name and pid,
+/// and the socket and table either way; with no holder found it says
+/// "another process" and names no pid.
+#[test]
+fn the_refusal_names_an_injected_holder() {
+    let named = refusal_message("torrentd_ks_1000", Some((4242, "torrentd".to_string())));
+    assert!(
+        named.starts_with("torrentd (pid 4242) holds the abstract unix socket @torrentd_ks_1000,"),
+        "{named}"
+    );
+    assert!(named.contains("`inet torrentd_ks_1000`"), "{named}");
+    let unknown = refusal_message("torrentd_ks_1000", None);
+    assert!(
+        unknown.starts_with("another process holds the abstract unix socket @torrentd_ks_1000,"),
+        "{unknown}"
+    );
+    assert!(!unknown.contains("(pid "), "{unknown}");
+    assert!(unknown.contains("`inet torrentd_ks_1000`"), "{unknown}");
+}
+
+/// A lock this process holds is found in this process, whatever other
+/// process `/proc` lists first: the holder's pid is this one's.
+#[test]
+fn the_holder_of_this_processs_lock_is_this_process() {
+    let name = lock_name("holder");
+    let _held = TableLock::acquire_named(&name).expect("lock");
+    let (pid, comm) = socket_holder(&name).expect("this process's lock is found");
+    assert_eq!(pid, std::process::id());
+    assert!(!comm.is_empty());
+}
+
 /// Take the lock on `name` just after its holder was dropped. Another test
 /// in this binary that spawns a process forks a child holding a copy of
 /// every descriptor, the socket included, until that child execs and
