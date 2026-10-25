@@ -9,7 +9,8 @@
 //!
 //! * **Fast path** — the previous client left a `.fastresume` saying the
 //!   torrent was complete — a `pieces` bitfield with one entry for each of
-//!   the `.torrent`'s pieces, every one had — and every file is still in the
+//!   the `.torrent`'s pieces, every one had, from resume data not in
+//!   libtorrent's `seed_mode` — and every file is still in the
 //!   index at the size the torrent declares, at a placement that is
 //!   unambiguous: the save path the sidecar declares, or the only complete
 //!   copy under the managed roots. Payload rewritten in place at the same size is caught
@@ -328,7 +329,9 @@ fn files_follow_the_torrent(
 ///
 /// Three conditions, all necessary. The sidecar has to say the torrent was
 /// complete — a bitfield with one entry per piece of the `.torrent`, every
-/// one had; an incomplete or mis-sized one has nothing useful to assert —
+/// one had, outside `seed_mode` (see
+/// [`ResumeHints::is_complete`](crate::fastresume::ResumeHints::is_complete));
+/// an incomplete or mis-sized one has nothing useful to assert —
 /// every file has to still be present in the index at the size the torrent
 /// declares, and the placement at `save_path` has to be the one the sidecar
 /// is about.

@@ -180,7 +180,9 @@ The step-by-step migration is [`docs/import.md`](docs/import.md).
 
 Adoption is tiered too: if the previous client's `.fastresume` says the
 torrent was complete and every file still matches the index, it is added in
-seed mode and seeds immediately; otherwise libtorrent hashes it first.
+seed mode and seeds immediately; otherwise libtorrent hashes it first. A
+torrent the previous client added with its hash check skipped (libtorrent's
+`seed_mode`) never counts as complete, and is hashed.
 Verifications are admitted a bounded number at a time so a bulk adopt cannot
 starve what is already seeding.
 

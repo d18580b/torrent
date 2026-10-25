@@ -135,7 +135,7 @@ identified by the info-hash parsed from its contents.
 
 | Client | Point `library_dir` at | What torrentd reads | Adoption |
 | --- | --- | --- | --- |
-| qBittorrent | `BT_backup/` (under qBittorrent's data directory) | `<hash>.torrent` and `<hash>.fastresume` | Fast path where the resume data marks every piece had; otherwise hashed |
+| qBittorrent | `BT_backup/` (under qBittorrent's data directory) | `<hash>.torrent` and `<hash>.fastresume` | Fast path where the resume data marks every piece had and is not in `seed_mode` (skip hash check); otherwise hashed |
 | Deluge | `state/` (under Deluge's config directory) | `<hash>.torrent` only | Every torrent hashed |
 | Transmission | `torrents/` (under Transmission's config directory) | the `.torrent` files only | Every torrent hashed |
 | rTorrent | the session directory (`session.path`) | `<HASH>.torrent` only | Every torrent hashed |
@@ -147,7 +147,10 @@ identified by the info-hash parsed from its contents.
   `GET /v1/pool/torrents` and nothing else;
 - completion, from the `pieces` bitfield: one entry for each of the
   `.torrent`'s pieces, every one had, or not. A bitfield of any other length
-  claims nothing, and its torrent is hashed;
+  claims nothing, and its torrent is hashed. So is a torrent whose resume
+  data has `seed_mode` set, whatever its bitfield says: qBittorrent's "Skip
+  hash check" adds a torrent that way, and libtorrent then writes every piece
+  as had before checking any;
 - renamed files (`mapped_files`) and the content layout
   (`qBt-contentLayout`), so payload qBittorrent renamed or laid out without
   its top folder is matched where it actually is;

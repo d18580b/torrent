@@ -1050,9 +1050,9 @@ fn fastresume(torrent: &[u8], tracker: Option<&str>) -> Vec<u8> {
         b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
     r.extend_from_slice(&ih.0);
     // Completion is the `pieces` bitfield with every piece had: `metainfo`
-    // has one piece.
+    // has one piece. `seed_mode 0`: libtorrent checked it (issue #652).
     r.extend_from_slice(b"6:pieces1:\x01");
-    r.extend_from_slice(b"9:seed_modei1e");
+    r.extend_from_slice(b"9:seed_modei0e");
     if let Some(url) = tracker {
         r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
     }
@@ -1098,7 +1098,7 @@ async fn resume_data_keyed_otherwise_than_the_index_is_verified_instead() {
     r.extend_from_slice(info);
     r.extend_from_slice(b"9:info-hash20:");
     r.extend_from_slice(&other_ih.0);
-    r.extend_from_slice(b"6:pieces1:\x019:seed_modei1e");
+    r.extend_from_slice(b"6:pieces1:\x019:seed_modei0e");
     r.extend_from_slice(b"8:trackersll31:http://tracker.example/announceeee");
     let read = libtorrent_safe::add_info_hashes(&torrentd_engine::AddParams::resume(r.clone()))
         .expect("the resume data reads");
