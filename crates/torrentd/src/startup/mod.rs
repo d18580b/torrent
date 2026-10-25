@@ -148,8 +148,8 @@ fn boot_shutdown_receivers(
 /// ([`between_scan_batches`](scan::between_scan_batches)).
 const BOOT_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// The resume store's batch-writer error hook: count the failure as the
-/// handler used to, and mark the torrent's file stale. The handler has
+/// The resume store's batch-writer error hook: count the failure under
+/// `resume_write_errors_total`, and mark the torrent's file stale. The handler has
 /// already cleared `needs_save_resume` by then, and libtorrent its modified
 /// bit, so without the mark no `ONLY_IF_MODIFIED` save, the shutdown drain's
 /// included, would ever rewrite it.
@@ -1499,7 +1499,7 @@ mod tests {
         }
     }
 
-    /// The signal seam that used to have 400 lines in it.
+    /// A shutdown raised during boot reaches both of `boot`'s receivers.
     ///
     /// `subscribe()` sets a new receiver's cursor to the channel's current
     /// tail, so a receiver created after a send provably cannot see it. Both
