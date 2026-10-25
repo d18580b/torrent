@@ -37,7 +37,7 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<std::process::ExitCode> {
     color_eyre::install()?;
     let cli = Cli::parse();
     let cfg = config::resolve(config::Overrides {
@@ -65,13 +65,22 @@ fn main() -> color_eyre::Result<()> {
     // `ratatui::init` puts the terminal in raw mode on the alternate screen
     // and installs a panic hook that restores it first.
     let mut terminal = ratatui::init();
-    let result = runtime.block_on(runtime::run(model, &mut terminal));
+    // However the loop ends, a session token minted from the password is
+    // revoked before `run` returns (or resumes a panic in the loop).
+    let ended = runtime.block_on(runtime::run(model, &mut terminal));
     ratatui::restore();
     // Printed only now: on the alternate screen it would vanish with it.
-    if let Ok(Some(notice)) = &result {
+    if let Some(notice) = &ended.model.exit_notice {
         eprintln!("{notice}");
     }
-    result.map(drop).wrap_err("the terminal failed")
+    ended.result.wrap_err("the terminal failed")?;
+    // A signal ended it: report that as a shell would for a process the
+    // signal killed, not as a clean exit.
+    Ok(ended
+        .signal
+        .map_or(std::process::ExitCode::SUCCESS, |signal| {
+            runtime::signal_exit_status(signal).into()
+        }))
 }
 
 /// Log to a file in the XDG state directory, never to the terminal the UI

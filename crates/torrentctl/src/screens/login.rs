@@ -2,7 +2,7 @@
 //!
 //! Shown when there is no token, or when the daemon refused the one in use.
 //! The session token `POST /v1/sessions` returns is held in memory only and
-//! revoked on quit.
+//! revoked however the client exits (see `runtime`).
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -78,11 +78,13 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             })]
         }
         Msg::Answered(Ok(token)) => {
-            state.busy = false;
             state.password.reset();
             match ctx.api.with_token(&token) {
+                // Still busy until `SignedIn` lands and clears it: a quit in
+                // between must know a token is on its way, to revoke it.
                 Ok(api) => vec![Effect::now(crate::app::Msg::SignedIn(api))],
                 Err(e) => {
+                    state.busy = false;
                     state.error = Some(e);
                     Vec::new()
                 }
@@ -285,6 +287,7 @@ mod tests {
     fn a_granted_token_signs_the_app_in() {
         let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = typed("pw");
+        state.busy = true;
         let effects = testing::with_api(&daemon.api(), None, |ctx| {
             update(&mut state, Msg::Answered(Ok("tds_abc".into())), ctx)
         });
@@ -292,6 +295,7 @@ mod tests {
             state.password.value().is_empty(),
             "the password is not kept"
         );
+        assert!(state.busy, "busy until SignedIn lands and clears it");
         let msgs = testing::run(effects);
         let [crate::app::Msg::SignedIn(api)] = &msgs[..] else {
             panic!("SignedIn with the new credential: {msgs:?}");

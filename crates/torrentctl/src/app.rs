@@ -200,7 +200,7 @@ pub struct Model {
     pub tab: Tab,
     pub session: Session,
     /// Whether the credential in use is a session token this client minted
-    /// from the password, and so revokes on quit.
+    /// from the password, and so revokes on the way out.
     pub minted: bool,
     /// The user asked to quit and the client is finishing up first: revoking
     /// a minted token, or waiting for an in-flight sign-in to answer so the
@@ -449,6 +449,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             model.api = api;
             model.minted = true;
+            model.login.busy = false;
+            if model.quitting {
+                // The quit came after the daemon answered but before this
+                // landed: the token is live and owed a revocation, then the
+                // exit the quit asked for.
+                effects.push(revoke(&model.api, true));
+                return effects;
+            }
             model.session = Session::Checking;
             effects.push(check_session(&model.api));
             effects
@@ -1537,6 +1545,41 @@ mod tests {
         update(&mut m, Msg::Quit);
         update(&mut m, Msg::Quit);
         assert!(m.quit);
+    }
+
+    #[test]
+    fn quitting_between_the_sign_in_answer_and_signed_in_revokes_the_new_token() {
+        let daemon = testing::Recorder::start("204 No Content", "");
+        let mut m = model_at(&daemon);
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        m.login.busy = true;
+        // The daemon answered; `SignedIn` is on its way but not yet applied.
+        let msgs = testing::run(update(
+            &mut m,
+            Msg::Login(screens::login::Msg::Answered(Ok("tds_gap".into()))),
+        ));
+        let [Msg::SignedIn(api)] = &msgs[..] else {
+            panic!("SignedIn on its way: {msgs:?}");
+        };
+        assert!(m.login.busy, "a token is on its way");
+
+        let effects = update(&mut m, Msg::Quit);
+        assert!(!m.quit, "waits for the token on its way");
+        testing::run(effects);
+        let msgs = testing::run(update(&mut m, Msg::SignedIn(api.clone())));
+        assert_eq!(
+            daemon.requests(),
+            [testing::Request {
+                line: REVOKE.to_owned(),
+                bearer: Some("tds_gap".to_owned()),
+            }],
+            "revokes the new token and describes nothing"
+        );
+        assert!(
+            matches!(msgs[..], [Msg::Exit(None)]),
+            "then leaves: {msgs:?}"
+        );
+        assert!(!m.login.busy);
     }
 
     #[test]
