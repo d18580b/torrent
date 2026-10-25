@@ -981,6 +981,59 @@ mod tests {
         }
     }
 
+    /// A destination file that cannot be examined, here for want of search
+    /// permission on its directory, is reported as in the way: nothing shows
+    /// the way is clear.
+    #[test]
+    fn a_destination_that_cannot_be_examined_is_in_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(dest.join("T")).unwrap();
+        let mut store = crate::PoolStore::open_in_memory().unwrap();
+        store
+            .upsert_torrent(
+                &crate::model::PoolTorrent {
+                    infohash: "aa".into(),
+                    infohash_v1: Some("aa".into()),
+                    infohash_v2: None,
+                    name: "T".into(),
+                    total_size: 64,
+                    num_files: 1,
+                    source_path: PathBuf::from("/library/aa.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+            .unwrap();
+        store
+            .replace_torrent_files(
+                "aa",
+                &[crate::model::TorrentFileRow {
+                    infohash: "aa".into(),
+                    idx: 0,
+                    rel_path: "T/a.bin".into(),
+                    size: 64,
+                    pieces_root: None,
+                    pad_file: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            super::existing_destination_file(&store, "aa", &dest).unwrap(),
+            None
+        );
+        crate::scan::with_unlistable(&dest.join("T"), || {
+            assert_eq!(
+                super::existing_destination_file(&store, "aa", &dest).unwrap(),
+                Some("T/a.bin".to_string())
+            );
+        });
+    }
+
     /// Plans that differ only in where one field ends and the next begins, or
     /// in a `dst` that is absent rather than empty, are different plans and
     /// get different tokens. Each pair here hashed the same bytes before the
