@@ -1,0 +1,22 @@
+---
+source: crates/torrentctl/src/screens/login.rs
+expression: screen
+---
+
+
+
+
+
+
+
+           ╭ torrentd ──────────────────────────────────────────────╮
+           │                   http://127.0.0.1:9                   │
+           │                                                        │
+           │✖ Forbidden: host not allowed                           │
+           │                                                        │
+           │add this host to the daemon's allowed_hosts; not retried│
+           │                                                        │
+           │                  r retry now  Esc quit                 │
+           │                                                        │
+           │                                                        │
+           ╰────────────────────────────────────────────────────────╯

@@ -19,6 +19,7 @@ use crate::api::types;
 use crate::api::Failure;
 use crate::app::Ctx;
 use crate::app::Effect;
+use crate::app::Refusal;
 use crate::app::Session;
 use crate::theme::Tone;
 use crate::ui::widgets::centered;
@@ -125,7 +126,7 @@ pub fn view(state: &State, session: &Session, ctx: &Ctx<'_>, frame: &mut Frame, 
         Session::Unreachable {
             reason,
             since,
-            retry,
+            refused,
         } => {
             let wait = crate::app::RETRY_INTERVAL.saturating_sub(since.elapsed());
             lines.push(Line::from(Span::styled(
@@ -133,10 +134,12 @@ pub fn view(state: &State, session: &Session, ctx: &Ctx<'_>, frame: &mut Frame, 
                 theme.fg(Tone::Bad),
             )));
             lines.push(Line::from(""));
-            let note = if *retry {
-                format!("retrying in {}s", wait.as_secs() + 1)
-            } else {
-                "this token lacks the read scope; not retried".to_owned()
+            let note = match refused {
+                None => format!("retrying in {}s", wait.as_secs() + 1),
+                Some(Refusal::Scope) => "this token lacks the read scope; not retried".to_owned(),
+                Some(Refusal::Forbidden) => {
+                    "add this host to the daemon's allowed_hosts; not retried".to_owned()
+                }
             };
             lines.push(Line::from(Span::styled(note, theme.fg(Tone::Muted))).centered());
             lines.push(Line::from(""));
@@ -199,6 +202,49 @@ mod tests {
             assert!(!screen.contains("hunter2"), "the password never renders");
             assert!(screen.contains("•••••••"));
             insta::assert_snapshot!(format!("login_{w}x{h}"), screen);
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_its_cause_and_only_a_scope_denial_blames_the_token() {
+        let scope = "this token lacks the read scope";
+        let hosts = "allowed_hosts";
+        for (name, refusal, title, detail, shows, hides) in [
+            (
+                "scope",
+                Refusal::Scope,
+                "Insufficient scope",
+                "the token lacks a required scope",
+                scope,
+                hosts,
+            ),
+            (
+                "forbidden",
+                Refusal::Forbidden,
+                "Forbidden",
+                "host not allowed",
+                hosts,
+                scope,
+            ),
+        ] {
+            let failure = Failure {
+                status: Some(403),
+                ..Failure::local(title, Some(detail.to_owned()))
+            };
+            let session = Session::Unreachable {
+                reason: failure.message(),
+                since: std::time::Instant::now(),
+                refused: Some(refusal),
+            };
+            let screen = testing::render(80, 24, None, |ctx, frame, area| {
+                view(&State::default(), &session, ctx, frame, area)
+            });
+            assert!(screen.contains(title), "{name}: the daemon's title");
+            assert!(screen.contains(detail), "{name}: the daemon's detail");
+            assert!(screen.contains(shows), "{name}");
+            assert!(!screen.contains(hides), "{name}");
+            assert!(!screen.contains("retrying"), "{name}: not retried");
+            insta::assert_snapshot!(format!("login_refused_{name}"), screen);
         }
     }
 
