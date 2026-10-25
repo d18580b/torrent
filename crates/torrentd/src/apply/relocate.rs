@@ -170,7 +170,7 @@ pub(super) fn move_torrent(
 
 /// Whether two spellings name the same directory: component-wise equal, or
 /// resolving to the same place once symlinks are followed.
-fn same_directory(a: &Path, b: &Path) -> bool {
+pub(super) fn same_directory(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
             (std::fs::canonicalize(a), std::fs::canonicalize(b)),

@@ -10,6 +10,7 @@ use torrentd_pool::model::ops;
 use torrentd_pool::model::PlanStepRow;
 use tracing::info;
 
+use super::relocate::same_directory;
 use crate::live_torrent::read_live_torrent;
 use crate::live_torrent::LiveReadError;
 use crate::live_torrent::LiveTorrent;
@@ -96,13 +97,18 @@ pub(super) fn check_index_accounts_for_live_state(
 /// prefers a complete copy to an incomplete one: a torrent still
 /// downloading into one directory while a complete copy of its files lies
 /// elsewhere under the roots is placed at that complete copy, and the
-/// files its session is writing read as orphans. So a claimed torrent whose
-/// session save path is not its placement, compared as spelled and with
-/// symlinks resolved on both sides, is compared with `scope` as an
-/// unclaimed one is, and refuses where it may hold a file the plan deletes.
+/// files its session is writing read as orphans. The placement is where its
+/// claims sit, not its adoption base: a held `adopted` torrent that reads as
+/// partial keeps the base it is served from while its claims follow the
+/// best partial copy, which may be elsewhere. So a claimed torrent whose
+/// session save path is not the directory every one of its claims lies
+/// under, compared as spelled and with symlinks resolved
+/// ([`same_directory`]), is compared with `scope` as an unclaimed one is,
+/// and refuses where it may hold a file the plan deletes.
 ///
-/// Costs one session read per claimed torrent a session holds, and a file
-/// listing only for one saving away from its placement. A torrent no
+/// Costs one index read of its claims and files and one session read per
+/// claimed torrent a session holds, and a file listing only for one saving
+/// away from its placement. A torrent no
 /// session holds is writing nothing and is skipped; one whose session
 /// cannot be read refuses, since where it writes is then unknown.
 fn check_claimed_torrents_save_where_placed(
@@ -125,25 +131,13 @@ fn check_claimed_torrents_save_where_placed(
     if held.is_empty() {
         return Ok(());
     }
-    let placements: Vec<Option<std::path::PathBuf>> = pool
+    let placements: Vec<ClaimSites> = pool
         .with_store(|st| {
             held.iter()
-                .map(|(ih, _)| st.adoption_base(ih))
+                .map(|(ih, _)| claim_sites(st, ih, |id| pool.root_path_of(id)))
                 .collect::<Result<Vec<_>, _>>()
         })
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|base| {
-            let (root_id, base) = base?;
-            let root = pool.root_path_of(root_id)?;
-            let base = base.trim_matches('/');
-            Some(if base.is_empty() {
-                root
-            } else {
-                root.join(base)
-            })
-        })
-        .collect();
+        .map_err(|e| e.to_string())?;
     let started = std::time::Instant::now();
     let mut away = 0usize;
     let mut blocking: Vec<String> = Vec::new();
@@ -161,21 +155,11 @@ fn check_claimed_torrents_save_where_placed(
                 continue;
             }
         };
-        let placed_paths: Vec<std::path::PathBuf> = placed
-            .iter()
-            .flat_map(|p| std::iter::once(p.clone()).chain(std::fs::canonicalize(p).ok()))
-            .collect();
-        let saving: Vec<std::path::PathBuf> = std::iter::once(save_path.clone())
-            .chain(std::fs::canonicalize(&save_path).ok())
-            .collect();
-        if saving.iter().any(|s| placed_paths.contains(s)) {
+        if placed.all_under(&save_path) {
             continue;
         }
         away += 1;
-        let placed_at = placed.as_ref().map_or_else(
-            || "no recorded placement".to_owned(),
-            |p| p.display().to_string(),
-        );
+        let placed_at = placed.describe();
         let why = match read_live_torrent(source, st) {
             Err(LiveReadError::NoSession) => continue,
             Err(LiveReadError::Engine(e)) => Some(format!(
@@ -204,12 +188,93 @@ fn check_claimed_torrents_save_where_placed(
             "{} torrent(s) the daemon owns are saved somewhere other than where the index \
              places them and may hold files under this plan's root: the files their sessions \
              write read as orphans, so this plan cannot prove what is unclaimed. The first is \
-             {first}. Move its session to its placement, remove the torrent, or remove the copy \
-             you do not want by hand and rescan, then rebuild this plan.",
+             {first}. Remove it with DELETE /v1/torrents/{{infohash}} without delete_files and \
+             add it again with its placement as save_path, or remove the copy you do not want \
+             by hand and rescan, then rebuild this plan.",
             blocking.len(),
         ));
     }
     Ok(())
+}
+
+/// Where a torrent's claims sit: for each file it claims, every directory
+/// that file lies at as one of the torrent's files, since a claim records the
+/// root-relative path and not the base it was resolved under.
+struct ClaimSites {
+    per_claim: Vec<Vec<std::path::PathBuf>>,
+}
+
+impl ClaimSites {
+    /// Whether every claim lies under `save_path` as one of the torrent's
+    /// files, which is where its session writes it. No claims at all is not
+    /// a placement.
+    fn all_under(&self, save_path: &Path) -> bool {
+        let mut seen: std::collections::HashMap<&Path, bool> = std::collections::HashMap::new();
+        !self.per_claim.is_empty()
+            && self.per_claim.iter().all(|bases| {
+                bases.iter().any(|b| {
+                    *seen
+                        .entry(b.as_path())
+                        .or_insert_with(|| same_directory(b, save_path))
+                })
+            })
+    }
+
+    /// The directory every claim shares, or each one's where they differ.
+    fn describe(&self) -> String {
+        let Some((first, rest)) = self.per_claim.split_first() else {
+            return "no claims".to_owned();
+        };
+        if let Some(common) = first
+            .iter()
+            .find(|b| rest.iter().all(|other| other.contains(b)))
+        {
+            return common.display().to_string();
+        }
+        let mut all: Vec<String> = self
+            .per_claim
+            .iter()
+            .flatten()
+            .map(|b| b.display().to_string())
+            .collect();
+        all.sort();
+        all.dedup();
+        all.join(", ")
+    }
+}
+
+/// [`ClaimSites`] for `infohash`, its roots resolved with `root_path_of`.
+fn claim_sites(
+    st: &torrentd_pool::PoolStore,
+    infohash: &str,
+    root_path_of: impl Fn(i64) -> Option<std::path::PathBuf>,
+) -> Result<ClaimSites, torrentd_pool::PoolError> {
+    let files = st.torrent_files(infohash)?;
+    let per_claim = st
+        .claims_of(infohash)?
+        .into_iter()
+        .map(|(root_id, rel)| {
+            let Some(root) = root_path_of(root_id) else {
+                return Vec::new();
+            };
+            files
+                .iter()
+                .filter(|f| f.is_on_disk())
+                .filter_map(|f| {
+                    let base = rel.strip_suffix(f.rel_path.trim_matches('/'))?;
+                    (base.is_empty() || base.ends_with('/')).then(|| {
+                        let base = base.trim_matches('/');
+                        if base.is_empty() {
+                            root.clone()
+                        } else {
+                            root.join(base)
+                        }
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    Ok(ClaimSites { per_claim })
 }
 
 /// Why the unclaimed torrent `infohash` may hold a file in `scope`, or
