@@ -1022,6 +1022,13 @@ mod tests {
         assert!(c.validate().is_err(), "past 30 days must be refused");
     }
 
+    /// A config that names no `session_ttl_secs` gets the documented 12 hours.
+    #[test]
+    fn an_unset_session_ttl_is_twelve_hours() {
+        let c: AuthConfig = toml::from_str("password_hash = \"x\"").unwrap();
+        assert_eq!(c.session_ttl_secs, 12 * 3600);
+    }
+
     #[test]
     fn a_ttl_too_long_to_represent_never_panics_the_login_route() {
         // `Instant + Duration` panics on overflow; the store is built from
