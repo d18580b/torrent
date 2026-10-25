@@ -134,8 +134,12 @@ pub struct Dialog {
     pub save_path: Input,
     /// The chosen profile; only an `active` one may be chosen.
     pub profile: Option<String>,
-    /// A request is in flight.
-    pub submitting: bool,
+    /// The id of the request in flight, which its [`Msg::Added`] carries
+    /// back: a result for any other id belongs to an add this dialog did
+    /// not send.
+    ///
+    /// [`Msg::Added`]: super::Msg::Added
+    pub submitting: Option<u64>,
     pub errors: FieldErrors,
 }
 
@@ -199,7 +203,7 @@ impl Dialog {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, active: &[String]) -> Outcome {
-        if self.submitting {
+        if self.submitting.is_some() {
             // Nothing to edit while the daemon decides; Esc still leaves.
             return if key.code == KeyCode::Esc {
                 Outcome::Cancel
@@ -306,7 +310,7 @@ impl Dialog {
 
     /// Show a failed add against the field at fault.
     pub fn show_failure(&mut self, failure: AddFailure) {
-        self.submitting = false;
+        self.submitting = None;
         let mut errors = FieldErrors::default();
         match failure {
             AddFailure::Local { field, message } => errors.set(field, message),
@@ -574,7 +578,7 @@ pub fn view(
 ) {
     let rect = centered(area, 76, 14);
     frame.render_widget(Clear, rect);
-    let title = if dialog.submitting {
+    let title = if dialog.submitting.is_some() {
         format!(" Add a torrent {} ", spinner(tick))
     } else {
         " Add a torrent ".to_owned()
@@ -741,7 +745,7 @@ pub fn view(
         Field::SavePath => Some((save_row, &dialog.save_path)),
         Field::Kind | Field::Profile => None,
     };
-    if let (Some((row, input)), false) = (cursor, dialog.submitting) {
+    if let (Some((row, input)), false) = (cursor, dialog.submitting.is_some()) {
         let col = input
             .visual_cursor()
             .saturating_sub(input.visual_scroll(width)) as u16;

@@ -6,6 +6,8 @@ mod add;
 mod detail;
 
 use std::cell::Cell;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -61,6 +63,11 @@ const PHASES: [types::Phase; 10] = [
     types::Phase::Removed,
     types::Phase::Unknown,
 ];
+
+/// The id the last add request was sent with; each one takes the next.
+/// Process-wide rather than in [`State`], which a sign-out resets while an
+/// add sent before it may still answer.
+static ADD_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 pub struct State {
@@ -222,7 +229,11 @@ pub enum Msg {
     /// `Enter` on the actions tab.
     RunEntry,
     AddKey(KeyEvent),
-    Added(Result<types::Torrent, add::AddFailure>),
+    /// The answer to the add sent with id `request`.
+    Added {
+        request: u64,
+        result: Result<types::Torrent, add::AddFailure>,
+    },
 }
 
 /// The keys, list first, then the detail view's (the help overlay shows
@@ -903,17 +914,41 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 add::Outcome::Submit => match dialog.validate(&active) {
                     None => Vec::new(),
                     Some(request) => {
-                        dialog.submitting = true;
+                        let id = ADD_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+                        dialog.submitting = Some(id);
                         let api = ctx.api.clone();
                         vec![Effect::new(async move {
-                            crate::app::Msg::Torrents(Msg::Added(add::submit(api, request).await))
+                            crate::app::Msg::Torrents(Msg::Added {
+                                request: id,
+                                result: add::submit(api, request).await,
+                            })
                         })]
                     }
                 },
             }
         }
-        Msg::Added(Ok(torrent)) => {
-            state.add = None;
+        Msg::Added { request, result } => {
+            // Only the dialog that sent this request may be closed or shown
+            // its failure; a cancelled or superseded add's answer leaves a
+            // newer dialog alone.
+            let current = state
+                .add
+                .as_ref()
+                .is_some_and(|d| d.submitting == Some(request));
+            added(state, current, result, ctx)
+        }
+    }
+}
+
+/// The answer to an add, `current` when the open dialog sent it.
+fn added(
+    state: &mut State,
+    current: bool,
+    result: Result<types::Torrent, add::AddFailure>,
+    ctx: &Ctx<'_>,
+) -> Vec<Effect> {
+    match result {
+        Ok(torrent) => {
             let name = torrent
                 .session
                 .as_ref()
@@ -924,23 +959,31 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 fmt::short_hash(&torrent.infohash),
                 torrent.profile_id
             );
-            state.detail = None;
-            state.restore = Some(torrent.infohash);
+            // The torrent exists either way, so the list reloads; only the
+            // add still on screen moves the view to it.
+            if current {
+                state.add = None;
+                state.detail = None;
+                state.restore = Some(torrent.infohash);
+            }
             let mut effects = vec![Effect::toast(Toast::success(text))];
             effects.extend(load_list(state, ctx));
             effects
         }
-        Msg::Added(Err(failure)) => {
+        Err(failure) => {
             if let add::AddFailure::Api { failure, .. } = &failure {
                 if failure.is_unauthenticated() {
-                    state.add = None;
+                    if current {
+                        state.add = None;
+                    }
                     return vec![Effect::now(failed("adding a torrent", failure.clone()))];
                 }
             }
             match state.add.as_mut() {
-                Some(dialog) => dialog.show_failure(failure),
-                // The dialog was closed while the request was in flight.
-                None => {
+                Some(dialog) if current => dialog.show_failure(failure),
+                // The dialog that sent it was closed while the request was
+                // in flight, and perhaps another opened since.
+                _ => {
                     if let add::AddFailure::Api { failure, .. } = failure {
                         return vec![Effect::now(failed("adding a torrent", failure))];
                     }
@@ -2849,7 +2892,7 @@ mod tests {
             let effects = update(&mut state, Msg::AddKey(testing::key(KeyCode::Enter)), ctx);
             assert_eq!(effects.len(), 1, "one POST");
             let add = state.add.as_ref().unwrap();
-            assert!(add.submitting && add.errors.is_empty());
+            assert!(add.submitting.is_some() && add.errors.is_empty());
             assert!(
                 update(&mut state, Msg::AddKey(testing::key(KeyCode::Enter)), ctx).is_empty(),
                 "sent once"
@@ -2894,11 +2937,15 @@ mod tests {
             let add = state.add.as_mut().unwrap();
             add.kind = kind;
             add.save_path = Input::new(save_path.into());
-            add.submitting = true;
-            assert!(update(&mut state, Msg::Added(Err(failure)), ctx).is_empty());
+            add.submitting = Some(1);
+            let msg = Msg::Added {
+                request: 1,
+                result: Err(failure),
+            };
+            assert!(update(&mut state, msg, ctx).is_empty());
         });
         let add = state.add.unwrap();
-        assert!(!add.submitting);
+        assert_eq!(add.submitting, None);
         add.errors
     }
 
@@ -2983,13 +3030,60 @@ mod tests {
         let mut state = loaded(1..4, None);
         testing::with_ctx(None, |ctx| {
             update(&mut state, Msg::OpenAdd, ctx);
-            let effects = update(&mut state, Msg::Added(Ok(torrent(2, true))), ctx);
+            state.add.as_mut().unwrap().submitting = Some(1);
+            let msg = Msg::Added {
+                request: 1,
+                result: Ok(torrent(2, true)),
+            };
+            let effects = update(&mut state, msg, ctx);
             assert_eq!(effects.len(), 2, "a toast and the reload");
             assert!(state.add.is_none());
             assert_eq!(state.restore.as_deref(), Some(hash(2).as_str()));
             let msg = page_msg(&state, true, Ok(page(1..4, None)));
             update(&mut state, msg, ctx);
             assert_eq!(selected_summary(&state).unwrap().infohash, hash(2));
+        });
+    }
+
+    /// An add cancelled while in flight answers after a newer dialog has
+    /// opened, and sent its own: the answer leaves that dialog alone.
+    #[test]
+    fn a_stale_add_result_does_not_touch_a_newer_dialog() {
+        let mut state = loaded(1..4, None);
+        testing::with_ctx(None, |ctx| {
+            update(&mut state, Msg::OpenAdd, ctx);
+            state.add.as_mut().unwrap().submitting = Some(1);
+            update(&mut state, Msg::AddKey(testing::key(KeyCode::Esc)), ctx);
+            assert!(state.add.is_none(), "cancelled in flight");
+            update(&mut state, Msg::OpenAdd, ctx);
+            let newer = state.add.as_mut().unwrap();
+            newer.source = Input::new("magnet:?xt=urn:btih:abc".into());
+            newer.submitting = Some(2);
+
+            let msg = Msg::Added {
+                request: 1,
+                result: Ok(torrent(2, true)),
+            };
+            let effects = update(&mut state, msg, ctx);
+            assert_eq!(effects.len(), 2, "the success still toasts and reloads");
+            assert_ne!(
+                state.restore.as_deref(),
+                Some(hash(2).as_str()),
+                "the selection is not moved to it"
+            );
+            let newer = state.add.as_ref().expect("the newer dialog stays open");
+            assert_eq!(newer.submitting, Some(2));
+
+            let msg = Msg::Added {
+                request: 1,
+                result: Err(api("torrent-exists", "assigned to acct_b")),
+            };
+            let effects = update(&mut state, msg, ctx);
+            assert_eq!(effects.len(), 1, "the failure is toasted");
+            let newer = state.add.as_ref().expect("the newer dialog stays open");
+            assert_eq!(newer.submitting, Some(2), "still waiting on its own");
+            assert!(newer.errors.is_empty(), "{:?}", newer.errors);
+            assert_eq!(newer.source.value(), "magnet:?xt=urn:btih:abc");
         });
     }
 
@@ -3174,12 +3268,16 @@ mod tests {
             add.kind = add::SourceKind::ServerPath;
             add.source = Input::new("/home/op/x.torrent".into());
             add.save_path = Input::new("/srv/seed/acct_a".into());
+            add.submitting = Some(1);
             update(
                 &mut state,
-                Msg::Added(Err(api(
-                    "path-not-confined",
-                    "the server_path must be inside the daemon's torrent directory",
-                ))),
+                Msg::Added {
+                    request: 1,
+                    result: Err(api(
+                        "path-not-confined",
+                        "the server_path must be inside the daemon's torrent directory",
+                    )),
+                },
                 ctx,
             );
         });
