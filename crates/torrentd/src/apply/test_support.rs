@@ -31,7 +31,11 @@ pub(crate) fn write(dir: &Path, rel: &str, len: usize) -> PathBuf {
 /// number, with size and mtime unchanged: what a reboot or remount that
 /// renumbers the filesystem leaves the index saying about its files.
 pub(crate) fn renumber(pool: &PoolService, rels: &[&str]) {
-    let root_id = pool.roots()[0].0;
+    renumber_in(pool, pool.roots()[0].0, rels);
+}
+
+/// [`renumber`], for the files `rels` of the root `root_id`.
+pub(crate) fn renumber_in(pool: &PoolService, root_id: i64, rels: &[&str]) {
     pool.with_store_mut(|st| {
         let files: Vec<_> = rels
             .iter()

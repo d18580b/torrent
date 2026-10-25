@@ -320,7 +320,7 @@ pub fn trash_torrent_payload(payload: &TorrentPayload, bucket: &str) -> TrashOut
         failed: None,
     };
     for f in &payload.files {
-        let moved = move_into_trash(&f.root, &f.path, &f.rel, f.stamp, bucket);
+        let moved = move_into_trash(&f.root, &f.path, &f.rel, f.stamp, None, bucket);
         if let Err(StepFailure::Failed(e)) = moved {
             out.failed = Some((f.path.clone(), e));
             break;

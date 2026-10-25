@@ -14,6 +14,7 @@ use crate::apply::test_support::engine_and_state;
 use crate::apply::test_support::failed;
 use crate::apply::test_support::one_orphan_delete_plan;
 use crate::apply::test_support::renumber;
+use crate::apply::test_support::renumber_in;
 use crate::apply::test_support::resize_keeping_mtime;
 use crate::apply::test_support::service;
 use crate::apply::test_support::touch_later;
@@ -74,7 +75,7 @@ fn a_delete_fsyncs_every_directory_on_the_way_to_the_trash() {
         }
         let stamp = torrentd_pool::scan::content_stamp(&std::fs::symlink_metadata(&file).unwrap());
         fsat::FSYNCED.with_borrow_mut(Vec::clear);
-        move_into_trash(&root, &file, "a/b/f.bin", stamp, "bucket").unwrap();
+        move_into_trash(&root, &file, "a/b/f.bin", stamp, None, "bucket").unwrap();
         let synced = fsat::FSYNCED.take();
         for d in [
             root.clone(),
@@ -310,6 +311,54 @@ fn deleting_refuses_a_file_that_is_a_claimed_file_under_another_root() {
     assert_eq!(srcs, vec![orphan.clone()], "only the unrelated orphan");
 
     // The executor still refuses it, for a plan built before the claim.
+    let mut guards = DeleteGuards::default();
+    let e = failed(delete_file(&pool, &alias, 1, "1-0", &mut guards));
+    assert!(
+        e.contains("same file") && e.contains("a torrent claims"),
+        "got {e}"
+    );
+    assert!(alias.exists() && claimed_file.exists());
+
+    delete_file(&pool, &orphan, 1, "1-0", &mut guards).expect("an unrelated orphan is deleted");
+    assert!(!orphan.exists());
+}
+
+/// A rescan carries a row it could not re-read forward unchanged, so after
+/// a reboot renumbers the disk the index can hold an alias's identity from
+/// before it and the claimed file's from after it. Indexed identities then
+/// differ, and the delete step still refuses the alias by its live identity.
+#[test]
+fn deleting_refuses_an_alias_whose_indexed_identity_predates_the_claimed_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("pool");
+    let second = dir.path().join("alias");
+    let claimed_file = write(&first, "T/a.bin", 16);
+    std::fs::create_dir_all(second.join("T")).unwrap();
+    let alias = second.join("T/a.bin");
+    std::fs::hard_link(&claimed_file, &alias).unwrap();
+    let orphan = write(&second, "T/extra.bin", 8);
+
+    let mut cfg = Config::minimal_for_tests(dir.path(), true);
+    cfg.pool.as_mut().unwrap().roots.push(second.clone());
+    let pool = PoolService::open(&cfg).unwrap().unwrap();
+    pool.scan().unwrap();
+    let second_id = pool.roots().iter().find(|(_, r)| r == &second).unwrap().0;
+    claimed(&pool, dir.path(), &"ab".repeat(20), "T/a.bin");
+    renumber_in(&pool, second_id, &["T/a.bin", "T/extra.bin"]);
+    let (claimed_ids, alias_row) = pool
+        .with_store(|s| {
+            Ok::<_, torrentd_pool::model::PoolError>((
+                s.claimed_identities()?,
+                s.file(second_id, "T/a.bin")?,
+            ))
+        })
+        .unwrap();
+    let alias_row = alias_row.unwrap();
+    assert!(
+        !claimed_ids.contains(&(alias_row.dev, alias_row.ino)),
+        "the indexed identities no longer match"
+    );
+
     let mut guards = DeleteGuards::default();
     let e = failed(delete_file(&pool, &alias, 1, "1-0", &mut guards));
     assert!(
