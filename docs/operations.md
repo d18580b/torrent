@@ -684,12 +684,27 @@ network throughout.
         -d '{"state": "online"}'
    ```
 
-   The request re-runs two checks first: the tunnel interface holds the
+   With `network_kill_switch` on, the request first asks whether the kill
+   switch is in force. While the kill switch's watch has the vpn profiles
+   fenced, because a check found its nftables table gone or changed, or too
+   many checks in a row could not run, and no check has found the table in
+   force since, the answer is `409 kill-switch-not-in-force`: the profile
+   stays fenced with its state unchanged, and the tunnel is not checked.
+   Restore the table, or whatever keeps `nft` from running, and send the
+   request again once a check finds the table in force, which the daemon
+   logs at `warn` as `the network kill switch is in force as installed
+   again; lifting the fence it put on the vpn profiles` (or `reinstalled
+   the network kill switch and verified it; lifting the fence`). A restart
+   also installs the table again, with the costs the last paragraph of this
+   section describes.
+
+   The request then re-runs two checks: the tunnel interface holds the
    session's address, and a packet from that address routes by the tunnel.
    The handshake is not checked, because a fenced profile sends nothing. If
    either check fails, the answer is `409 profile-unavailable` naming the
    check, and the profile stays fenced with its state unchanged. Fix that
-   and send the request again. If both pass, the fence is lifted, every
+   and send the request again. If both pass, and the kill switch is in
+   force or off, the fence is lifted, every
    torrent in the profile is resumed, and the monitor watches the profile
    again from its next poll, handshake included. A handshake that never
    follows fences it again.
