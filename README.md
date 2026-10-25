@@ -97,6 +97,9 @@ cosign verify-blob "$f" --bundle "$f.sigstore.json" \
 # It is an unmodified asset of the immutable release, and matches SHA256SUMS.
 gh release verify-asset "v$v" "$f" --repo d18580b/torrent
 sha256sum --check --ignore-missing SHA256SUMS
+
+# The tag is a lightweight tag on the merge commit GitHub signed: prints true.
+gh api "repos/d18580b/torrent/commits/v$v" --jq .commit.verification.verified
 ```
 
 The image, by the same two routes:

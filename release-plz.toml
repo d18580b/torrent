@@ -1,6 +1,8 @@
-# release-plz: how a release is cut. Merging the pull request release-plz
-# opens on `master` is the whole act; .github/workflows/release-plz.yml runs
-# both halves and says what each job does.
+# release-plz: how a release is cut. Merging the release pull request, from
+# the branch `release-plz-next`, on `master` is the whole act;
+# .github/workflows/release-plz.yml runs both halves and says what each job
+# does. The workflow runs `release-plz update` and opens the pull request
+# itself, so release-plz's own pull request settings (`pr_*`) are unused.
 #
 # One version for the whole workspace and one `vX.Y.Z` tag. Nothing is
 # published to crates.io: every crate is `publish = false`, and the git tags
@@ -24,15 +26,14 @@ git_tag_name = "v{{ version }}"
 # release's assets once it is published, so the workflow uploads and signs
 # every asset first and publishes it last.
 git_release_draft = true
-# Release only on the merge of a release pull request, never on an ordinary
-# push to `master`.
+# Release only on the merge of a release pull request (one whose head branch
+# starts with `release-plz-`), never on an ordinary push to `master`. The
+# workflow also requires that branch to be this repository's, not a fork's.
 release_always = false
 # Only the workspace's own versions move in the release pull request;
 # dependency updates are pull requests of their own.
 dependencies_update = false
 semver_check = false
-pr_labels = ["release"]
-pr_name = "chore: release v{{ version }}"
 
 [[package]]
 name = "torrentd"
@@ -47,6 +48,9 @@ changelog_include = [
   "torrentd-bench",
   "torrentctl",
 ]
+# release-plz creates the tag as an annotated tag object nobody signs; the
+# workflow then moves it to a lightweight tag on the merge commit GitHub
+# signed, so GitHub verifies it.
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
