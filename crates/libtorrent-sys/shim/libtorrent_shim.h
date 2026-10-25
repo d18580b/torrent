@@ -82,12 +82,15 @@ typedef uintptr_t lt_handle;
 #define LT_TF_STOP_WHEN_READY     (1u << 11)
 
 /* ------------------------------------------------------------------ */
-/* save_resume_data flags                                              */
+/* Buffer capacities and bounds                                        */
 /* ------------------------------------------------------------------ */
 
-/* Per-variant string capacity (incl. trailing NUL). Defined here rather than
- * in alert_union.h because both that header and the metadata structs below
- * need them, and alert_union.h is the one that includes this file. */
+/* Fixed string capacities, trailing NUL included, of the alert payloads in
+ * alert_union.h and of lt_tracker_entry below. A longer string is cut at the
+ * last whole UTF-8 sequence that fits. Defined here rather than in
+ * alert_union.h because lt_tracker_entry needs them too, and alert_union.h is
+ * the one that includes this file. The metadata, file-list and details
+ * structs below do not use them: their names and paths are never truncated. */
 #define LT_PATH_MAX 1024
 
 /* Upper bound on the file count `lt_torrent_metadata` and
@@ -116,6 +119,10 @@ typedef uintptr_t lt_handle;
 #define LT_MOVE_ALWAYS_REPLACE_FILES 0u
 #define LT_MOVE_FAIL_IF_EXIST        1u
 #define LT_MOVE_DONT_REPLACE         2u
+
+/* ------------------------------------------------------------------ */
+/* save_resume_data flags (bit field passed to lt_save_resume_data)    */
+/* ------------------------------------------------------------------ */
 
 #define LT_RD_FLUSH_DISK_CACHE     (1u << 0)
 #define LT_RD_SAVE_INFO_DICT       (1u << 1)
@@ -188,8 +195,16 @@ lt_session* lt_session_create_with_state(const char* settings_json,
                                          const uint8_t* state_buf, size_t state_len,
                                          char* err_out, int err_len);
 
+/* Free every alert payload still queued, then destroy the session, which
+ * blocks while libtorrent shuts it down. A no-op on NULL. `s` is invalid
+ * afterwards, and so is every lt_handle it issued. */
 void        lt_session_destroy(lt_session* s);
 
+/* Apply `settings_json` (the same flat object lt_session_create takes) on
+ * top of the session's current settings; a key it does not name keeps its
+ * value. libtorrent applies the pack on its own thread, after this returns.
+ * LT_OK, or LT_ERR (err_out populated) for a null session or JSON the
+ * parser refuses, in which case nothing is applied. */
 int         lt_session_apply_settings(lt_session* s,
                                       const char* settings_json,
                                       char* err_out, int err_len);
@@ -245,6 +260,12 @@ lt_handle   lt_add_torrent_file(lt_session* s,
                                 uint8_t* infohash_out,
                                 char* err_out, int err_len);
 
+/* Add a torrent from a magnet URI. save_path, flags and infohash_out are as
+ * for lt_add_torrent_file; the torrent's trackers are the URI's `tr=`
+ * parameters. Until its metadata arrives from peers the torrent has no name
+ * (unless the URI carries `dn=`), no files and no size.
+ * Returns the lt_handle, or 0 on failure (err_out populated), including a
+ * URI libtorrent cannot parse. */
 lt_handle   lt_add_torrent_magnet(lt_session* s,
                                   const char* uri,
                                   const char* save_path, uint32_t flags,
@@ -273,6 +294,11 @@ lt_handle   lt_add_torrent_resume_ex(lt_session* s,
                                      uint8_t* infohash_out,
                                      char* err_out, int err_len);
 
+/* Remove torrent `h` from the session and forget its handle; `h` names
+ * nothing afterwards. With `delete_files` non-zero libtorrent also deletes the
+ * torrent's payload from its save path. Asynchronous: the removal completes
+ * as LT_ALERT_TORRENT_REMOVED. LT_OK, or LT_ERR for a null session, an unknown
+ * handle, or a libtorrent failure; no err_out. */
 int         lt_remove_torrent(lt_session* s, lt_handle h, int delete_files);
 
 /* Re-hash a torrent's payload against its piece hashes (v1 SHA-1 / v2 SHA-256
@@ -311,6 +337,22 @@ int         lt_torrent_enforce_no_download(lt_session* s, lt_handle h);
 int         lt_torrent_move_storage(lt_session* s, lt_handle h,
                                     const char* new_path, uint32_t flags);
 
+/* The per-torrent commands below share one contract: each is queued to the
+ * session's thread and returns before it takes effect, and each returns
+ * LT_OK, or LT_ERR for a null session, an unknown handle, or a libtorrent
+ * failure, with no err_out.
+ *
+ * lt_torrent_pause / lt_torrent_resume set and clear the torrent's own
+ * paused flag (see lt_session_pause for how it combines with the session's).
+ * Resuming does not lift upload mode.
+ *
+ * lt_torrent_set_upload_limit passes `bytes_per_sec` to
+ * torrent_handle::set_upload_limit unchanged (libtorrent reads 0 or -1 as
+ * unlimited).
+ *
+ * lt_torrent_set_file_priority passes file `file_idx` and `priority` (a
+ * libtorrent download_priority_t, 0 = do not download, 1..7) to
+ * torrent_handle::file_priority unchanged; the shim checks neither. */
 int         lt_torrent_pause(lt_session* s, lt_handle h);
 int         lt_torrent_resume(lt_session* s, lt_handle h);
 int         lt_torrent_set_upload_limit(lt_session* s, lt_handle h, int bytes_per_sec);
@@ -631,6 +673,11 @@ void        lt_tracker_list_free(struct lt_tracker_list* l);
 /* Status & alerts                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Ask the session to post an alert, which lt_pop_alert returns later:
+ * lt_post_torrent_updates an LT_ALERT_STATE_UPDATE with the status of every
+ * torrent whose status changed since the last one, lt_post_session_stats an
+ * LT_ALERT_SESSION_STATS with every counter. Asynchronous, and a no-op on a
+ * null session. */
 void        lt_post_torrent_updates(lt_session* s);
 void        lt_post_session_stats(lt_session* s);
 

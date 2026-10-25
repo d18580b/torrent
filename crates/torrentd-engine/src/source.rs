@@ -18,9 +18,12 @@ use crate::profile::ProfileId;
 use crate::real::MAX_ALERTS_PER_POP;
 
 pub trait AlertSource: Send + Sync + std::fmt::Debug {
-    /// Drain all queued alerts from every engine in this source.
-    /// `(profile_id, alert)` pairs preserve provenance so handlers can route
-    /// to the correct profile's resume store, retry timer, etc.
+    /// One bounded batch of alerts from every engine in this source: each
+    /// engine's pop yields at most [`MAX_ALERTS_PER_POP`], and whatever is
+    /// left stays queued for the next call, so an empty result is the only
+    /// sign that every queue was empty. `(profile_id, alert)` pairs preserve
+    /// provenance so handlers can route to the correct profile's resume
+    /// store, retry timer, etc.
     fn drain(&self) -> Vec<(ProfileId, Alert)>;
 
     /// All profiles represented by this source. Stable ordering for
@@ -32,7 +35,8 @@ pub trait AlertSource: Send + Sync + std::fmt::Debug {
     fn engine_for(&self, profile: &ProfileId) -> Option<Arc<dyn TorrentEngine>>;
 
     /// Convenience: trigger `post_torrent_updates` on every engine. Used
-    /// by the alert-loop's 1-second tick.
+    /// by the alert loop every
+    /// [`POST_UPDATES_INTERVAL`](crate::POST_UPDATES_INTERVAL).
     fn post_updates_all(&self) {
         for profile in self.profiles() {
             if let Some(eng) = self.engine_for(&profile) {

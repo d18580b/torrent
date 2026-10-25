@@ -734,14 +734,19 @@ impl StateMap {
 
     // --- resume saves ---------------------------------------------------------
 
-    /// Ask for a resume save of `ih`. Returns `false` when one is already
-    /// queued or in flight: libtorrent answers each request with its own alert,
-    /// so a second request for the same torrent is a second alert for nothing.
+    /// Queue a resume save of `ih` with `flags`, for a later
+    /// [`StateMap::dispatch_resume_saves`] to hand to libtorrent. Returns
+    /// `false`, and changes nothing, when one is already queued or in flight:
+    /// libtorrent answers each request with its own alert, so a second
+    /// request for the same torrent is a second alert for nothing.
     ///
-    /// The refused request's flags are dropped with it, and a queued
-    /// unconditional save is never downgraded to `ONLY_IF_MODIFIED`: each one
-    /// queued is a torrent whose modified bit cannot be trusted, either its
-    /// first save (no resume file yet) or a re-ask after a lost answer.
+    /// The refused request's flags are dropped with it, both ways: a queued
+    /// unconditional save is never downgraded to `ONLY_IF_MODIFIED`, and a
+    /// queued `ONLY_IF_MODIFIED` save is not raised to unconditional either.
+    /// A save in flight may hold the state from before a change made since;
+    /// a caller whose change a crash must not lose, or whose request must be
+    /// unconditional whatever is queued, uses
+    /// [`StateMap::queue_resume_save_now`] instead.
     pub fn queue_resume_save(&self, ih: InfoHash, flags: ResumeFlags) -> bool {
         let mut s = self.saves.lock();
         if s.in_flight.contains_key(&ih) || !s.queued_set.insert(ih) {

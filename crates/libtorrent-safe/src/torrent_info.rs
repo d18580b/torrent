@@ -63,6 +63,9 @@ pub struct FilePage {
 /// activity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackerEntry {
+    /// The announce URL, cut to at most 1023 bytes (the shim's fixed
+    /// `LT_PATH_MAX` buffer) at a UTF-8 boundary. A longer URL is reported
+    /// shortened, so it may not equal the URL the torrent announces to.
     pub url: String,
     pub tier: u8,
     /// Whether the tracker has responded to an announce with a valid reply.

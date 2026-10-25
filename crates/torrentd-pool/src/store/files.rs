@@ -88,6 +88,14 @@ impl PoolStore {
     /// `drifted` are kept even where the caller cannot say what is loaded,
     /// because only a torrent that was adopted reaches either. `loaded` is
     /// hex info-hashes, as the index keys them.
+    ///
+    /// Every other torrent missing from `seen` goes, whatever its state,
+    /// one with no adoption row included, and its file list, adoption row
+    /// and claims go with it (they cascade). A kept `adopted` or `drifted`
+    /// torrent is logged at warn, on every call that keeps it. All of it is
+    /// one savepoint: an error drops nothing. The caller is the one that
+    /// knows `seen` is complete; an empty `seen` drops every torrent this
+    /// keeps no reason for.
     pub fn retain_torrents(
         &mut self,
         seen: &std::collections::HashSet<String>,
@@ -288,8 +296,10 @@ impl PoolStore {
         )? as u64)
     }
 
-    /// Every file in a root whose size matches, used as the matcher's anchor
-    /// lookup. Returns `(rel_path, size)`.
+    /// The root-relative path of every indexed file in `root_id` whose size
+    /// is exactly `size`, used as the matcher's anchor lookup. Paths only:
+    /// every one has the size asked for. In no particular order, and empty
+    /// for an unknown root or a size nothing has.
     pub fn files_with_size(&self, root_id: i64, size: u64) -> Result<Vec<String>, PoolError> {
         let mut st = self
             .conn

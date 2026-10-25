@@ -1,16 +1,17 @@
 //! `Session` — RAII handle around a libtorrent session.
 //!
 //! The struct is `Send` but not `Sync`: its raw pointer field would make it
-//! neither, and `Send` is asserted below on the shim's own locking. The
-//! engine layer owns it behind a `Mutex` (`torrentd-engine`'s `RealEngine`),
-//! so calls from several threads are ordered.
+//! neither, and `Send` is asserted below on the shim having no thread
+//! affinity. Not being `Sync` is what keeps two threads from calling into
+//! one session at once, which the shim forbids (not every entry point takes
+//! a lock). The engine layer owns it behind a `Mutex` (`torrentd-engine`'s
+//! `RealEngine`), so calls from several threads are ordered.
 //!
 //! Methods return `Result<…, Error>`, never panic on shim failures, and
 //! never expose raw pointers.
 
 use std::cell::Cell;
 use std::ffi::CString;
-use std::marker::PhantomData;
 
 use libtorrent_sys as ffi;
 use tracing::debug;
@@ -104,13 +105,29 @@ pub const FORBIDDEN_TORRENT_FLAGS: TorrentFlags = TorrentFlags::AUTO_MANAGED
     .union(TorrentFlags::SEQUENTIAL_DOWNLOAD)
     .union(TorrentFlags::STOP_WHEN_READY);
 
+/// A libtorrent session (see the module docs for its threading).
+///
+/// # Errors from per-torrent commands
+///
+/// The commands that act on one torrent (`remove_torrent`, `pause_torrent`,
+/// `resume_torrent`, `set_upload_limit`, `set_file_priority`,
+/// `force_recheck`, `force_reannounce`, `unset_flags` once its flags pass,
+/// `enforce_no_download`, `move_storage` once its path converts, and
+/// `save_resume_data`) report every `LT_ERR` from the shim as
+/// [`Error::TorrentNotFound`]. Those shim calls return no message, so an
+/// unknown or removed handle and a C++ exception libtorrent threw look the
+/// same here; the first is the case that occurs in practice, and the error
+/// can mean either. The queries (`torrent_details`, `torrent_files*`,
+/// `torrent_trackers`) do tell them apart: only the shim's unknown-handle
+/// message is `TorrentNotFound`, and any other failure is [`Error::Shim`].
+/// A command `Ok` only means libtorrent queued it; most complete later, as
+/// an alert.
 pub struct Session {
     ptr: *mut ffi::lt_session,
     /// Alerts [`Session::pop_alert`] popped and skipped because their kind is
     /// none this crate translates. Counted into
     /// [`Session::alert_translate_errors`].
     unknown_alerts: Cell<u64>,
-    _marker: PhantomData<()>,
 }
 
 impl std::fmt::Debug for Session {
@@ -119,14 +136,18 @@ impl std::fmt::Debug for Session {
     }
 }
 
-// Safety: the C shim's `lt_session` is internally thread-safe — every shim
-// function takes the per-session handle mutex before touching state. The
-// underlying `lt::session` from libtorrent is documented thread-safe.
-// `Session` is thus Send (ownership can move across threads). We deliberately
-// do NOT implement Sync; engine layers that share a `Session` between threads
-// place it behind a `Mutex` so calls are ordered, which keeps the FFI surface
-// linearizable even though libtorrent would technically tolerate concurrent
-// calls.
+// SAFETY: `Send` lets the session's ownership move to another thread; it
+// never lets two threads call into it at once, because `Session` is not
+// `Sync` (the `Cell` field already makes it `!Sync`, and the raw pointer
+// would too), so every shim call on one session is made through a `&Session`
+// or `&mut Session` that a single thread holds at a time. That serialization
+// is what the shim requires: its header's thread model allows one caller per
+// session at a time, and not every entry point is internally locked —
+// `lt_pop_alert` pops and translates libtorrent's alert queue outside any
+// mutex. What moving needs is that nothing is tied to the creating thread:
+// the shim keeps no thread-local state, and `lt::session` runs its work on
+// its own network thread and accepts calls from any thread, so the session
+// may be used, and dropped, on a thread other than the one that created it.
 unsafe impl Send for Session {}
 
 impl Session {
@@ -144,7 +165,6 @@ impl Session {
         Ok(Self {
             ptr,
             unknown_alerts: Cell::new(0),
-            _marker: PhantomData,
         })
     }
 
@@ -171,7 +191,6 @@ impl Session {
         Ok(Self {
             ptr,
             unknown_alerts: Cell::new(0),
-            _marker: PhantomData,
         })
     }
 
@@ -503,6 +522,12 @@ impl Session {
 
     /// The torrent's files in index order, or `None` while its metadata has
     /// not arrived yet (a magnet still fetching it).
+    ///
+    /// The whole list in one page, so the shim's page bounds apply to the
+    /// whole torrent: one of more than `LT_MAX_TORRENT_FILES` files, or whose
+    /// paths together exceed `LT_MAX_TORRENT_PATH_BYTES`, is an
+    /// [`Error::Shim`], never a truncated list. Paths are never truncated.
+    /// A handle the session no longer holds is [`Error::TorrentNotFound`].
     pub fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>> {
         self.torrent_files_raw(h, 0, usize::MAX)
             .map(RawFileList::into_files)
@@ -574,7 +599,10 @@ impl Session {
         Ok(list.entries().iter().map(TrackerEntry::from_raw).collect())
     }
 
-    /// Triggers a `state_update_alert` covering all subscribed torrents.
+    /// Asks libtorrent to post a `state_update_alert` carrying every torrent
+    /// whose status changed since the last one; a torrent whose status did
+    /// not change is left out (see [`Session::torrent_statuses`]).
+    /// Asynchronous: the alert arrives through [`Session::pop_alert`].
     pub fn post_torrent_updates(&self) {
         unsafe { ffi::lt_post_torrent_updates(self.ptr) }
     }
@@ -604,8 +632,13 @@ impl Session {
         unsafe { ffi::lt_post_session_stats(self.ptr) }
     }
 
-    /// Drain one alert from the queue. Returns `None` if empty (after one
-    /// pop_alerts inside the shim has already drained the libtorrent side).
+    /// The next alert this crate translates, or `None` once there is none.
+    ///
+    /// Each call that finds the shim's own queue empty first pops and
+    /// translates whatever libtorrent has queued, so `None` means a fresh
+    /// libtorrent pop added nothing. An alert whose kind this crate does not
+    /// translate is freed, counted into [`Session::alert_translate_errors`],
+    /// and skipped in favour of the next one, so it never ends the queue.
     pub fn pop_alert(&self) -> Option<Alert> {
         skip_unknown(&self.unknown_alerts, || {
             let mut raw: ffi::lt_alert_union = unsafe { std::mem::zeroed() };
@@ -668,17 +701,21 @@ impl Session {
         }
     }
 
-    /// Drain *all* alerts currently queued (after a single shim drain).
+    /// Every alert, popped until [`Session::pop_alert`] returns `None`.
     ///
-    /// Convenience for the engine's poll thread; equivalent to calling
-    /// `pop_alert` in a loop until it returns None.
+    /// Unbounded: since each empty shim queue triggers another libtorrent
+    /// pop, alerts libtorrent posts while this runs are returned too, and it
+    /// ends only at a pop that finds nothing. Tests and the bench use it; the
+    /// engine's poll loop calls [`Session::drain_alerts_up_to`] instead, so
+    /// that a burst cannot hold its session lock for the whole burst.
     pub fn drain_alerts(&self) -> Vec<Alert> {
         self.drain_alerts_up_to(usize::MAX)
     }
 
-    /// Drain at most `max` queued alerts. Whatever is left stays queued for
-    /// the next call, so a caller holding a lock across this bounds how long
-    /// it holds it.
+    /// At most `max` alerts, popped as [`Session::pop_alert`] pops them.
+    /// Whatever is left stays queued for the next call, so a caller holding
+    /// a lock across this bounds how long it holds it. `max` 0 pops nothing,
+    /// libtorrent's queue included.
     pub fn drain_alerts_up_to(&self, max: usize) -> Vec<Alert> {
         let mut out = Vec::new();
         while out.len() < max {
@@ -795,6 +832,12 @@ impl TrackerOverride {
     }
 }
 
+/// Destroys the session: frees every alert payload still queued in the shim,
+/// then blocks while libtorrent shuts the session down, for as long as that
+/// takes under libtorrent's own timeouts (`stop_tracker_timeout` bounds the
+/// tracker `stopped` announces). Every
+/// [`TorrentHandle`] the session issued names nothing afterwards. Alerts
+/// already popped own their payloads and outlive it.
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
