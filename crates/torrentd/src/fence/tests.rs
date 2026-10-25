@@ -1501,3 +1501,52 @@ fn the_add_handlers_hold_without_a_kill_switch_still_runs() {
     });
     assert!(ran);
 }
+
+/// Each lift names the pause it undid in its log, so an operator reading
+/// why a profile's torrents came back can tell a kill-switch lift from a
+/// set-online and from the end of an offline.
+#[tokio::test(start_paused = true)]
+async fn each_lift_names_the_pause_it_undid_in_its_log() {
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+    let (fence, _engine) = kill_switch_fence_over(1);
+    let entry = fence.profiles.iter().next().unwrap();
+    for lift in [Lift::KillSwitch, Lift::SetOnline, Lift::Offline] {
+        spawn_lift(
+            &fence.profiles,
+            &fence.metrics,
+            entry,
+            vec![handle(1)],
+            lift,
+        )
+        .await
+        .unwrap();
+    }
+    let log = log.text();
+    let named: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("finished resuming the torrents of a lifted fence"))
+        .filter_map(|l| {
+            ["kill_switch", "set_online", "offline"]
+                .into_iter()
+                .find(|label| l.contains(&format!("\"lift\":\"{label}\"")))
+        })
+        .collect();
+    assert_eq!(named, ["kill_switch", "set_online", "offline"], "{log}");
+}
+
+/// With nothing inside its gate and no fencing task left, the stop closes
+/// the gate there and then, so it reports success even with no time to
+/// wait in.
+#[tokio::test]
+async fn a_stop_with_nothing_to_wait_for_succeeds_with_a_zero_bound() {
+    let stop = FencingStop::new();
+    let gate = stop.subscribe().gate();
+    assert!(
+        stop.stop(Duration::ZERO).await,
+        "the gate closed, and no task was left running"
+    );
+    assert_eq!(gate.run(|| 1), None, "the stop refuses every later act");
+}
