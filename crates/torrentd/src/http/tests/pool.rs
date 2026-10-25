@@ -1601,6 +1601,12 @@ async fn an_adoption_whose_records_fail_to_commit_is_refused_and_leaves_nothing(
                     "CREATE TRIGGER boom {trigger} BEGIN SELECT RAISE({raise}, 'disk full'); END;"
                 ))
                 .unwrap();
+            // The profile's torrent_dir, which a restart's torrent-dir scan
+            // re-adds from: a refused torrent must leave nothing in it.
+            let torrents = Arc::new(torrentd_engine::FsTorrentStore::new(
+                dir.path().join("torrents"),
+            ));
+            pool.set_torrent_store(torrents.clone());
             let engine = Arc::new(torrentd_engine::MockEngine::new());
             let h = Harness::authed(&Coverage::new(), |s| {
                 let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
@@ -1608,6 +1614,7 @@ async fn an_adoption_whose_records_fail_to_commit_is_refused_and_leaves_nothing(
                     ProfileStatus::Active,
                 )]));
                 *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p"]);
+                pool.set_state(Arc::clone(&s.state));
                 s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
                     torrentd_engine::ProfileId::new("p"),
                     engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
@@ -1668,6 +1675,20 @@ async fn an_adoption_whose_records_fail_to_commit_is_refused_and_leaves_nothing(
                 )
             });
             assert_eq!(removed, fast_path, "{what}: {calls:?}");
+            // That removal was recorded in the state map before the session
+            // was asked, so its alert keeps what a re-add writes: settling
+            // it reports the re-add only where a removal was pending.
+            let p = torrentd_engine::ProfileId::new("p");
+            h.state.state.note_readded(&p, &hash);
+            let settled = h.state.state.settle_removal(&p, &hash, |_| {});
+            assert_eq!(settled.readded, fast_path, "{what}");
+            for path in [
+                torrents.path_for(&p, &hash),
+                torrents.save_path_path_for(&p, &hash),
+                torrents.trackers_path_for(&p, &hash),
+            ] {
+                assert!(!path.exists(), "{what}: {} was written", path.display());
+            }
         }
     }
 }
