@@ -1013,8 +1013,13 @@ async fn adoption_refuses_payload_the_drift_check_could_not_see() {
                 .contains("could not be checked"),
             "{r}"
         );
+        // After each response, so a claim names the request that took it.
+        let claims = h.state.registry.entries();
+        assert!(
+            claims.is_empty(),
+            "nothing was claimed (dry_run: {dry_run}), yet {claims:?}: {r}"
+        );
     }
-    assert_eq!(h.state.registry.len(), 0, "nothing was claimed");
 }
 
 /// A one-file `.torrent` announcing to `announce`.

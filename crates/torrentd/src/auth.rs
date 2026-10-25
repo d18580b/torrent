@@ -934,10 +934,12 @@ mod tests {
             "the prefix and 256 bits of hex"
         );
         assert_eq!(s.expiry(&a), Some(a_expires));
+        assert_eq!(s.len(), 2);
         s.revoke(&a);
         assert!(!s.is_valid(&a), "revoking must actually invalidate");
         assert!(s.is_valid(&b));
         assert!(!s.is_valid("nonsense"));
+        assert_eq!(s.len(), 1, "only the live session counts");
     }
 
     #[test]
@@ -1014,6 +1016,19 @@ mod tests {
             c.session_ttl_secs = good;
             assert!(c.validate().is_ok(), "ttl {good} must be accepted");
         }
+        // The bound the docs quote: 30 days, to the second.
+        let thirty_days = 30 * 86_400;
+        c.session_ttl_secs = thirty_days;
+        assert!(c.validate().is_ok(), "30 days must be accepted");
+        c.session_ttl_secs = thirty_days + 1;
+        assert!(c.validate().is_err(), "past 30 days must be refused");
+    }
+
+    /// A config that names no `session_ttl_secs` gets the documented 12 hours.
+    #[test]
+    fn an_unset_session_ttl_is_twelve_hours() {
+        let c: AuthConfig = toml::from_str("password_hash = \"x\"").unwrap();
+        assert_eq!(c.session_ttl_secs, 12 * 3600);
     }
 
     #[test]

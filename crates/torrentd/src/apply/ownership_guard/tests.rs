@@ -6,6 +6,7 @@ use torrentd_pool::model::step_status;
 
 use super::*;
 use crate::apply::apply;
+use crate::apply::test_support::add_and_rematch;
 use crate::apply::test_support::assign;
 use crate::apply::test_support::delete_plan;
 use crate::apply::test_support::engine_and_state;
@@ -597,4 +598,172 @@ fn applying_refuses_while_a_queued_adoption_is_absent_from_the_index() {
     let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
     assert!(e.contains(&ih), "got {e}");
     assert!(victim.exists(), "a queued adoption's payload was trashed");
+}
+
+/// A claimed torrent is accounted for only where its session writes it.
+/// The matcher prefers a complete copy, so a torrent still downloading into
+/// one root while a complete copy of its files sits under another is
+/// claimed at the complete copy, and the copy its session is writing reads
+/// as orphans. A delete plan over that root refuses, naming the torrent;
+/// the same torrent saving at its placement does not block it.
+#[test]
+fn a_claimed_torrent_saving_away_from_its_placement_blocks_a_delete_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("pool");
+    let second = dir.path().join("second");
+    // The session's partial download, and a complete copy elsewhere.
+    let partial = write(&first, "T/a.bin", 32);
+    write(&second, "T/a.bin", 64);
+
+    let mut cfg = Config::minimal_for_tests(dir.path(), true);
+    cfg.pool.as_mut().unwrap().roots.push(second.clone());
+    let pool = PoolService::open(&cfg).unwrap().unwrap();
+    pool.scan().unwrap();
+    let ih = "ee".repeat(20);
+    add_and_rematch(&pool, &ih, "T", None, &[("T/a.bin", 64)]);
+    let second_id = pool.roots()[1].0;
+    assert_eq!(
+        pool.with_store(|st| st.adoption_base(&ih)).unwrap(),
+        Some((second_id, String::new())),
+        "the matcher placed the torrent at the complete copy",
+    );
+    let plan_id = delete_plan(&pool);
+    let scope = scope_of(&pool, plan_id);
+    assert_eq!(
+        scope.targets,
+        std::slice::from_ref(&partial),
+        "the session copy is an orphan"
+    );
+
+    // Saving at its placement, it is accounted for.
+    let (source, state) = unclaimed_loaded(&second, Some(&["T/a.bin"]));
+    check_index_accounts_for_live_state(&pool, &source, &state, &scope)
+        .unwrap_or_else(|e| panic!("refused a torrent saving at its placement: {e}"));
+    // Nor through a symlink to it, which names the same directory.
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&second, &link).unwrap();
+    let (source, state) = unclaimed_loaded(&link, Some(&["T/a.bin"]));
+    check_index_accounts_for_live_state(&pool, &source, &state, &scope)
+        .unwrap_or_else(|e| panic!("refused a torrent saving at a symlink to its placement: {e}"));
+
+    // Held by profile `q`, which has no session, it is writing nothing.
+    let (source, _) = engine_and_state();
+    let state = StateMap::new();
+    let hash = libtorrent_safe::InfoHash([0xee; 20]);
+    state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(
+            torrentd_engine::TorrentHandle {
+                id: 1,
+                infohash: hash,
+            },
+            torrentd_engine::ProfileId::new("q"),
+            std::time::Instant::now(),
+        ),
+    );
+    check_index_accounts_for_live_state(&pool, &source, &state, &scope)
+        .unwrap_or_else(|e| panic!("refused a claimed torrent no session holds: {e}"));
+
+    // Whose session cannot be read, where it saves is unknown: refused,
+    // though the session would have reported its placement.
+    let mock = Arc::new(torrentd_engine::MockEngine::new());
+    let (source, state) = unclaimed_loaded_on(mock.clone(), &second, Some(&["T/a.bin"]));
+    mock.inject_error("torrent_details", torrentd_engine::EngineError::Shutdown);
+    let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+    assert!(
+        e.contains(&ih)
+            && e.contains("could not be read from its session")
+            && e.contains("whether it saves where the index places it is unknown"),
+        "{e}"
+    );
+
+    // Saving into the plan's root, it is not, with or without metadata.
+    for files in [Some(&["T/a.bin"][..]), None] {
+        let (source, state) = unclaimed_loaded(&first, files);
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(
+            e.contains(&ih)
+                && e.contains("its session saves it at")
+                && e.contains(&first.display().to_string()),
+            "{files:?}: {e}"
+        );
+    }
+    assert!(
+        partial.exists(),
+        "the live torrent's session copy was trashed"
+    );
+    let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+    assert_eq!(plan.status, plan_status::DRAFT);
+}
+
+/// A held `adopted` torrent that now reads as partial keeps the base it is
+/// served from, while its claims follow the best partial copy. Where that
+/// copy is elsewhere, the files its session writes at its base read as
+/// orphans although the session saves at its adoption base, so the guard
+/// compares the save path with where the claims sit.
+#[test]
+fn a_held_partial_adoption_claimed_elsewhere_blocks_a_delete_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("pool");
+    let second = dir.path().join("second");
+    // The session's partial download, and a better partial copy elsewhere.
+    let partial = write(&first, "T/a.bin", 32);
+    write(&second, "T/a.bin", 64);
+
+    let mut cfg = Config::minimal_for_tests(dir.path(), true);
+    cfg.pool.as_mut().unwrap().roots.push(second.clone());
+    let pool = PoolService::open(&cfg).unwrap().unwrap();
+    pool.scan().unwrap();
+    // Built before the torrent is indexed, so the planner's own guard over
+    // an incomplete torrent's expected payload has not refused it; the
+    // apply re-runs that guard, so the ownership guard is called directly.
+    let plan_id = delete_plan(&pool);
+    let scope = scope_of(&pool, plan_id);
+    assert_eq!(
+        scope.targets,
+        std::slice::from_ref(&partial),
+        "the session copy is an orphan"
+    );
+    let ih = "ee".repeat(20);
+    add_and_rematch(&pool, &ih, "T", None, &[("T/a.bin", 64), ("T/b.bin", 64)]);
+    let first_id = pool.roots()[0].0;
+    let second_id = pool.roots()[1].0;
+    // Adopted at the first root, then rematched while held.
+    pool.with_store_mut(|st| {
+        st.set_adoption(
+            &ih,
+            torrentd_pool::AdoptionState::Adopted,
+            Some(first_id),
+            Some(""),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        torrentd_pool::match_all(st).unwrap();
+    });
+    assert_eq!(
+        pool.with_store(|st| st.adoption_base(&ih)).unwrap(),
+        Some((first_id, String::new())),
+        "the held adoption keeps its base",
+    );
+    assert_eq!(
+        pool.with_store(|st| st.claims_of(&ih)).unwrap(),
+        vec![(second_id, "T/a.bin".to_owned())],
+        "its claims follow the better partial copy",
+    );
+
+    let (source, state) = unclaimed_loaded(&first, Some(&["T/a.bin", "T/b.bin"]));
+    let e = check_index_accounts_for_live_state(&pool, &source, &state, &scope).unwrap_err();
+    assert!(
+        e.contains(&ih)
+            && e.contains(&format!("placed in the index at {}", second.display()))
+            && e.contains(&format!("its session saves it at {}", first.display())),
+        "{e}"
+    );
+    apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+    assert!(
+        partial.exists(),
+        "the live torrent's session copy was trashed"
+    );
 }
