@@ -1301,6 +1301,47 @@ mod tests {
         assert!(!t.per_client.lock().contains_key(&filler(7)));
     }
 
+    /// A lockout that ends at this very instant protects no one, so the
+    /// sweep for a newcomer reclaims it, as it does an idle entry.
+    #[test]
+    fn a_lockout_ending_this_instant_is_swept_for_a_newcomer() {
+        let penalty = Duration::from_millis(50);
+        let t = LoginThrottle::with_penalty(penalty);
+        fill(&t, 5);
+        t.advance(penalty);
+        t.note_failure(ip(1));
+        assert!(
+            t.per_client.lock().contains_key(&ip(1).unwrap()),
+            "the ended lockouts made room for the newcomer",
+        );
+    }
+
+    /// A client's failures do not decay while the map has room: only a full
+    /// map's sweep reclaims an idle entry, so neither another client's
+    /// failure nor another client's success clears them.
+    #[test]
+    fn failures_outlast_idleness_while_the_map_has_room() {
+        let penalty = Duration::from_millis(50);
+        for other_succeeds in [false, true] {
+            let t = LoginThrottle::with_penalty(penalty);
+            for _ in 0..4 {
+                t.note_failure(ip(1));
+            }
+            t.advance(penalty * 2);
+            if other_succeeds {
+                t.note_success(ip(2));
+            } else {
+                t.note_failure(ip(2));
+            }
+            t.note_failure(ip(1));
+            assert_eq!(
+                t.retry_after(ip(1)),
+                Some(penalty),
+                "the fifth failure locks out (other succeeded: {other_succeeds})",
+            );
+        }
+    }
+
     #[test]
     fn success_clears_only_that_client() {
         let t = LoginThrottle::new();
