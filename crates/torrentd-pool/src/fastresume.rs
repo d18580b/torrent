@@ -781,6 +781,11 @@ mod tests {
         assert_eq!(layout("Original").relayout(&multi, "Show"), None);
         assert_eq!(layout("NoSubfolder").relayout(&single, "Film"), None);
         assert_eq!(ResumeHints::default().relayout(&multi, "Show"), None);
+        // A torrent whose files already sit in a top directory gets no
+        // second one: qBittorrent adds a subfolder only where there is none.
+        assert_eq!(layout("Subfolder").relayout(&multi, "Show"), None);
+        let one_in_dir = vec!["Show/a.mkv".to_owned()];
+        assert_eq!(layout("Subfolder").relayout(&one_in_dir, "Show"), None);
     }
 
     #[test]
