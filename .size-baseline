@@ -5,16 +5,3 @@
 # when a split brings a file under the limit, delete its line in the same
 # change. Never add a line.
 crates/torrentctl/src/screens/torrents.rs
-crates/torrentd-engine/src/alert_loop.rs
-crates/torrentd-pool/tests/pool.rs
-crates/torrentd/src/config.rs
-crates/torrentd/src/http/tests/torrents.rs
-crates/torrentd/src/http/v1/torrents.rs
-crates/torrentd/src/pool_apply.rs
-crates/torrentd/src/pool_service.rs
-crates/torrentd/src/startup.rs
-crates/torrentd/src/vpn/killswitch.rs
-crates/torrentd/src/vpn/wireguard.rs
-crates/torrentd/src/vpn_cmd.rs
-crates/torrentd/src/vpn_monitor.rs
-crates/torrentd/tests/daemon.rs

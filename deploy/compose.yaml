@@ -1,3 +1,20 @@
+# torrentd behind Caddy. Bringing it up, in order (docs/running.md §8, "On
+# the compose stack", has each step and why):
+#
+#   1. cp deploy/torrentd.sample.toml deploy/torrentd.toml, then in it set
+#      http_listen = "0.0.0.0:8080", uncomment trusted_proxies = ["172.28.0.2"]
+#      and delete allow_unauthenticated. The file must exist before any
+#      `compose run`: a bind mount of a missing file mounts a directory.
+#   2. In deploy/Caddyfile, replace torrentd.example.com with your host name.
+#   3. Create /data/torrents owned by uid 1000 (docs/running.md §4).
+#   4. BUILDAH_FORMAT=docker podman compose -f deploy/compose.yaml build
+#      (podman's default OCI format drops the image's HEALTHCHECK)
+#      podman compose -f deploy/compose.yaml run --rm torrentd hash-password
+#      and paste the hash into an [auth] section of deploy/torrentd.toml.
+#   5. podman compose -f deploy/compose.yaml up -d
+#
+# `docker compose` takes the same arguments.
+
 services:
   torrentd:
     build:
@@ -11,11 +28,11 @@ services:
     # nothing reaps an orphaned child.
     init: true
     # How long `stop` waits between SIGTERM and SIGKILL. The default is 10s;
-    # a graceful shutdown flushes resume data for every torrent and removes
-    # the kill switch, which at tens of thousands of torrents takes longer.
-    # A SIGKILL mid-drain leaves resume saves unwritten
-    # (torrentd_last_shutdown_unsaved_resumes on the next boot), and with the
-    # kill switch on, the nftables table installed.
+    # a graceful shutdown flushes resume data for every torrent, which at tens
+    # of thousands of torrents takes longer. A SIGKILL mid-drain leaves resume
+    # saves unwritten (torrentd_last_shutdown_unsaved_resumes on the next
+    # boot). The kill switch cannot run in this container (below), so there
+    # is no nftables table here for a SIGKILL to leave behind.
     stop_grace_period: 180s
     # Only a `network = "vpn"` profile needs these: bringing up WireGuard
     # tunnels, and installing the nftables table when
@@ -117,7 +134,11 @@ services:
   # trusted proxy can claim to be any client. What getting it wrong costs is in
   # docs/running.md §6a.
   proxy:
-    image: caddy:2-alpine
+    # Pinned by the digest of its multi-arch index, as deploy/Containerfile's
+    # base images are: `2-alpine` is a moving tag, and this is the process
+    # that terminates TLS and holds the certificates. Move the pin with
+    #   skopeo inspect --raw docker://docker.io/library/caddy:2-alpine | sha256sum
+    image: docker.io/library/caddy:2-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
     restart: unless-stopped
     depends_on:
       - torrentd

@@ -1,0 +1,22 @@
+---
+source: crates/torrentctl/src/screens/login.rs
+expression: screen
+---
+
+
+
+
+
+
+
+           ╭ torrentd ──────────────────────────────────────────────╮
+           │                   http://127.0.0.1:9                   │
+           │                                                        │
+           │✖ Insufficient scope: the token lacks a required scope  │
+           │                                                        │
+           │      this token lacks the read scope; not retried      │
+           │                                                        │
+           │                  r retry now  Esc quit                 │
+           │                                                        │
+           │                                                        │
+           ╰────────────────────────────────────────────────────────╯

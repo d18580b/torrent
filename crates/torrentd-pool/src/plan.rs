@@ -33,6 +33,7 @@ use crate::model::ops;
 use crate::model::AdoptionState;
 use crate::model::PlanStep;
 use crate::model::PoolError;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 /// What the operator asked for. Persisted with the plan so a resumed apply can
@@ -67,12 +68,33 @@ pub struct Refused(pub String);
 
 pub type BuildResult = Result<Vec<PlanStep>, Refused>;
 
-/// Compute the steps for `spec` without touching anything.
+/// Compute the steps for `spec` without touching anything: [`prepare`] and
+/// then [`Prepared::finish`], both against `store`.
+///
+/// This runs the disk walk with `store` borrowed. A caller that borrows it
+/// under the pool's writer lock calls the two halves itself, finishing once
+/// the lock is released.
 pub fn build(
     store: &PoolStore,
     spec: &PlanSpec,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
 ) -> Result<BuildResult, PoolError> {
+    Ok(prepare(store, spec, root_path_of)?.and_then(Prepared::finish))
+}
+
+/// Every check [`build`] makes of the index, with the steps they admit and
+/// the disk checks still to run.
+///
+/// The index is read here; [`Prepared::finish`] reads only the disk, so it
+/// runs without the store. A relocate's walk of its source directory is the
+/// one disk check whose cost grows with the directory, and holding the
+/// writer lock across it would stall every scan and every other plan for as
+/// long as it takes.
+pub fn prepare(
+    store: &PoolStore,
+    spec: &PlanSpec,
+    root_path_of: impl Fn(i64) -> Option<PathBuf>,
+) -> Result<Result<Prepared, Refused>, PoolError> {
     Ok(match spec {
         PlanSpec::Relocate {
             infohash,
@@ -81,8 +103,36 @@ pub fn build(
         } => build_relocate(store, infohash, *dest_root_id, dest_rel, root_path_of)?,
         PlanSpec::DeleteOrphans { root_id, prefix } => {
             build_delete_orphans(store, *root_id, prefix, root_path_of)?
+                .map(|steps| Prepared { steps, walk: None })
         }
     })
+}
+
+/// A plan whose index checks passed, from [`prepare`].
+#[derive(Debug)]
+pub struct Prepared {
+    steps: Vec<PlanStep>,
+    /// A relocate's source directory, its root-relative path, and what the
+    /// index lists there as this torrent's, as of [`prepare`].
+    walk: Option<(PathBuf, String, Listed)>,
+}
+
+impl Prepared {
+    /// Run the disk checks [`prepare`] left, needing no store, and return
+    /// the plan's steps or the refusal.
+    pub fn finish(self) -> BuildResult {
+        // The index is a snapshot and the move is of the directory itself,
+        // so the index checks see only what the last scan listed. The disk
+        // is asked too.
+        if let Some((src_dir, src_base, listed)) = &self.walk {
+            if let Some(entry) = unlisted_entry(src_dir, src_base, listed) {
+                return Err(Refused(format!(
+                    "{src_base} holds {entry}; moving the directory would take it too"
+                )));
+            }
+        }
+        Ok(self.steps)
+    }
 }
 
 fn build_relocate(
@@ -91,7 +141,7 @@ fn build_relocate(
     dest_root_id: i64,
     dest_rel: &str,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
-) -> Result<BuildResult, PoolError> {
+) -> Result<Result<Prepared, Refused>, PoolError> {
     let Some(torrent) = store.torrent(infohash)? else {
         return Ok(Err(Refused("torrent is not in the library".into())));
     };
@@ -196,11 +246,15 @@ fn build_relocate(
     // back is how a seeding torrent starts serving from a path that no longer
     // exists.
     let _ = torrent;
-    Ok(Ok(vec![PlanStep {
-        op: ops::MOVE_TORRENT.to_string(),
-        src: src_dir.to_string_lossy().into_owned(),
-        dst: Some(dest_dir.to_string_lossy().into_owned()),
-    }]))
+    let listed = listed_under(store, infohash, src_root_id, &src_base)?;
+    Ok(Ok(Prepared {
+        steps: vec![PlanStep {
+            op: ops::MOVE_TORRENT.to_string(),
+            src: src_dir.to_string_lossy().into_owned(),
+            dst: Some(dest_dir.to_string_lossy().into_owned()),
+        }],
+        walk: Some((src_dir, src_base, listed)),
+    }))
 }
 
 /// The first of `infohash`'s files that already has an entry under
@@ -537,13 +591,103 @@ fn prefixes_overlap(prefix: &str, area: &str) -> bool {
         || p.starts_with(&format!("{a}/"))
 }
 
-fn join_rel(base: &str, rel: &str) -> String {
-    let (base, rel) = (base.trim_matches('/'), rel.trim_matches('/'));
-    if base.is_empty() {
-        rel.to_owned()
-    } else {
-        format!("{base}/{rel}")
+/// The root-relative paths a torrent's payload occupies under one root, as
+/// [`listed_under`] reads them from the index.
+#[derive(Clone, Debug, Default)]
+pub struct Listed {
+    /// The paths the torrent claims.
+    pub claimed: HashSet<String>,
+    /// The paths of the torrent's declared empty files under its base. The
+    /// matcher claims no file without bytes, so these are the torrent's own
+    /// as long as they are still empty.
+    pub empty: HashSet<String>,
+}
+
+/// What `infohash` occupies under root `root_id`, whose payload is based at
+/// the root-relative `base`.
+pub fn listed_under(
+    store: &PoolStore,
+    infohash: &str,
+    root_id: i64,
+    base: &str,
+) -> Result<Listed, PoolError> {
+    let claimed = store
+        .claims_of(infohash)?
+        .into_iter()
+        .filter(|(r, _)| *r == root_id)
+        .map(|(_, rel)| rel)
+        .collect();
+    let empty = store
+        .torrent_files(infohash)?
+        .into_iter()
+        .filter(|f| f.size == 0 && !f.pad_file)
+        .map(|f| join_rel(base, &f.rel_path))
+        .collect();
+    Ok(Listed { claimed, empty })
+}
+
+/// The first entry under `dir` (whose root-relative path is `base`) that a
+/// relocate would carry without the plan showing it, described for a refusal;
+/// `None` when every entry is a directory or one of `listed`'s.
+///
+/// A relocate renames the whole directory, and the index lists only what the
+/// last scan saw. So the directory is walked with `symlink_metadata` and
+/// every entry has to be accounted for: a regular file in `listed.claimed`,
+/// an empty regular file in `listed.empty`, or a directory whose own entries
+/// are. A symlink, a name that is not UTF-8, a FIFO, socket or device, a file
+/// the scan never saw or this torrent does not claim, and a directory that
+/// cannot be listed all refuse, since none of them can be shown to belong to
+/// the payload being moved.
+pub fn unlisted_entry(dir: &Path, base: &str, listed: &Listed) -> Option<String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_dir() => {}
+        Ok(_) => {
+            return Some(format!(
+                "{} itself, which is not a directory",
+                dir.display()
+            ))
+        }
+        Err(e) => return Some(format!("{}, which cannot be examined ({e})", dir.display())),
     }
+    let mut pending = vec![(dir.to_path_buf(), base.trim_matches('/').to_owned())];
+    while let Some((path, rel)) = pending.pop() {
+        let unlistable =
+            |e: std::io::Error| format!("{}, which cannot be listed ({e})", path.display());
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(e) => return Some(unlistable(e)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return Some(unlistable(e)),
+            };
+            let child = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Some(format!("{}, whose name is not UTF-8", child.display()));
+            };
+            let child_rel = join_rel(&rel, &name);
+            let md = match std::fs::symlink_metadata(&child) {
+                Ok(md) => md,
+                Err(e) => return Some(format!("{child_rel}, which cannot be examined ({e})")),
+            };
+            let kind = md.file_type();
+            if kind.is_dir() {
+                pending.push((child, child_rel));
+            } else if kind.is_symlink() {
+                return Some(format!("{child_rel}, a symlink"));
+            } else if !kind.is_file() {
+                return Some(format!("{child_rel}, which is not a regular file"));
+            } else if !listed.claimed.contains(&child_rel)
+                && !(md.len() == 0 && listed.empty.contains(&child_rel))
+            {
+                return Some(format!(
+                    "{child_rel}, which the index does not list as this torrent's"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a root-relative path, refusing anything that escapes its root.
@@ -663,22 +807,46 @@ pub fn contains(root: &Path, candidate: &Path) -> bool {
 /// that a newer scan may since have placed.
 pub fn confirm_token(plan_id: i64, generation: i64, steps: &[crate::model::PlanStepRow]) -> String {
     let mut acc: u64 = 1469598103934665603; // FNV-1a offset basis
-    let mut mix = |b: &[u8]| {
+    confirm_preimage(plan_id, generation, steps, &mut |b| {
         for byte in b {
             acc ^= u64::from(*byte);
             acc = acc.wrapping_mul(1099511628211);
         }
-    };
-    mix(&plan_id.to_le_bytes());
-    mix(&generation.to_le_bytes());
+    });
+    format!("{acc:016x}")
+}
+
+/// Feeds `emit` the bytes [`confirm_token`] hashes: one encoding per plan, and
+/// a different one for any plan that differs. Streamed rather than collected,
+/// so a plan of millions of steps costs no buffer the size of its paths.
+///
+/// Every variable-length field is prefixed with its length, and `dst` with a
+/// tag telling `None` from `Some("")`. Concatenating the fields bare made
+/// `("ab", "c")` and `("a", "bc")` the same plan, and so the same token.
+fn confirm_preimage(
+    plan_id: i64,
+    generation: i64,
+    steps: &[crate::model::PlanStepRow],
+    emit: &mut dyn FnMut(&[u8]),
+) {
+    fn field(emit: &mut dyn FnMut(&[u8]), s: &str) {
+        emit(&(s.len() as u64).to_le_bytes());
+        emit(s.as_bytes());
+    }
+    emit(&plan_id.to_le_bytes());
+    emit(&generation.to_le_bytes());
+    emit(&(steps.len() as u64).to_le_bytes());
     for s in steps {
-        mix(s.op.as_bytes());
-        mix(s.src.as_bytes());
-        if let Some(d) = &s.dst {
-            mix(d.as_bytes());
+        field(emit, &s.op);
+        field(emit, &s.src);
+        match &s.dst {
+            None => emit(&[0]),
+            Some(d) => {
+                emit(&[1]);
+                field(emit, d);
+            }
         }
     }
-    format!("{acc:016x}")
 }
 
 /// Whether a plan kind destroys data and therefore needs the confirm token.
@@ -734,27 +902,34 @@ mod tests {
     /// `starts_with` alone cannot express that — it is lexical, so
     /// `/data/pool/../escape` satisfies it. The absence of a `ParentDir`
     /// component is what makes the prefix meaningful, so both are asserted.
+    /// Each input states whether it is accepted, so a resolver that refused
+    /// everything, or accepted a traversal, fails here rather than passing
+    /// vacuously.
     #[test]
     fn anything_accepted_is_inside_the_root() {
-        for input in [
-            "",
-            "shows/S01",
-            "/etc/cron.d",
-            "./here",
-            "..hidden",
-            "../escape",
-            "a/../../../b",
-            "/../../etc",
+        for (input, accepted) in [
+            ("", true),
+            ("shows/S01", true),
+            ("/etc/cron.d", true),
+            ("./here", true),
+            ("..hidden", true),
+            ("../escape", false),
+            ("a/../../../b", false),
+            ("/../../etc", false),
         ] {
-            if let Ok(p) = resolve_under(&root(), input) {
-                assert!(
-                    p.starts_with(root()),
-                    "{input:?} resolved to {p:?}, outside the root",
-                );
-                assert!(
-                    !p.components().any(|c| c == std::path::Component::ParentDir),
-                    "{input:?} resolved to {p:?}, which walks back out",
-                );
+            match resolve_under(&root(), input) {
+                Ok(p) => {
+                    assert!(accepted, "{input:?} was accepted as {p:?}");
+                    assert!(
+                        p.starts_with(root()),
+                        "{input:?} resolved to {p:?}, outside the root",
+                    );
+                    assert!(
+                        !p.components().any(|c| c == std::path::Component::ParentDir),
+                        "{input:?} resolved to {p:?}, which walks back out",
+                    );
+                }
+                Err(e) => assert!(!accepted, "{input:?} was refused: {e:?}"),
             }
         }
     }
@@ -795,6 +970,147 @@ mod tests {
         assert!(super::contains(&root, &root.join("..hidden/x")));
     }
 
+    fn step(op: &str, src: &str, dst: Option<&str>) -> crate::model::PlanStepRow {
+        crate::model::PlanStepRow {
+            seq: 0,
+            op: op.into(),
+            src: src.into(),
+            dst: dst.map(Into::into),
+            status: "pending".into(),
+            error: None,
+        }
+    }
+
+    /// A destination file that cannot be examined, here for want of search
+    /// permission on its directory, is reported as in the way: nothing shows
+    /// the way is clear.
+    #[test]
+    fn a_destination_that_cannot_be_examined_is_in_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(dest.join("T")).unwrap();
+        let mut store = crate::PoolStore::open_in_memory().unwrap();
+        store
+            .upsert_torrent(
+                &crate::model::PoolTorrent {
+                    infohash: "aa".into(),
+                    infohash_v1: Some("aa".into()),
+                    infohash_v2: None,
+                    name: "T".into(),
+                    total_size: 64,
+                    num_files: 1,
+                    source_path: PathBuf::from("/library/aa.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+            .unwrap();
+        store
+            .replace_torrent_files(
+                "aa",
+                &[crate::model::TorrentFileRow {
+                    infohash: "aa".into(),
+                    idx: 0,
+                    rel_path: "T/a.bin".into(),
+                    size: 64,
+                    pieces_root: None,
+                    pad_file: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            super::existing_destination_file(&store, "aa", &dest).unwrap(),
+            None
+        );
+        crate::scan::with_unlistable(&dest.join("T"), || {
+            assert_eq!(
+                super::existing_destination_file(&store, "aa", &dest).unwrap(),
+                Some("T/a.bin".to_string())
+            );
+        });
+    }
+
+    /// Plans that differ only in where one field ends and the next begins, or
+    /// in a `dst` that is absent rather than empty, are different plans and
+    /// get different tokens. Each pair here hashed the same bytes before the
+    /// fields were length-prefixed.
+    #[test]
+    fn a_token_tells_apart_plans_that_concatenate_alike() {
+        use super::confirm_token;
+        let pairs = [
+            (
+                vec![step("move", "ab", Some("c"))],
+                vec![step("move", "a", Some("bc"))],
+            ),
+            (
+                vec![step("delete_file", "x", None)],
+                vec![step("delete_file", "x", Some(""))],
+            ),
+            (
+                vec![
+                    step("delete_file", "a", None),
+                    step("delete_file", "b", None),
+                ],
+                vec![
+                    step("delete_file", "a", Some("delete_file")),
+                    step("b", "", None),
+                ],
+            ),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                confirm_token(1, 1, &a),
+                confirm_token(1, 1, &b),
+                "{a:?} and {b:?} share a token"
+            );
+        }
+    }
+
+    /// The encoding the token hashes is injective: over every plan of up to
+    /// two steps built from a small alphabet of fields, chosen so field
+    /// boundaries can shift (`""`, `"a"`, `"aa"`) and `dst` can be absent or
+    /// empty, no two distinct plans encode the same.
+    #[test]
+    fn the_token_preimage_is_injective() {
+        let texts = ["", "a", "aa", "b"];
+        let dsts = [None, Some(""), Some("a"), Some("aa")];
+        let mut one = Vec::new();
+        for op in texts {
+            for src in texts {
+                for dst in dsts {
+                    one.push(step(op, src, dst));
+                }
+            }
+        }
+        let mut plans: Vec<Vec<crate::model::PlanStepRow>> = vec![Vec::new()];
+        plans.extend(one.iter().map(|s| vec![s.clone()]));
+        for a in &one {
+            for b in &one {
+                plans.push(vec![a.clone(), b.clone()]);
+            }
+        }
+        let mut seen = std::collections::HashMap::new();
+        for (plan_id, generation) in [(1, 1), (1, 2), (2, 1)] {
+            for steps in &plans {
+                let mut bytes = Vec::new();
+                super::confirm_preimage(plan_id, generation, steps, &mut |b| {
+                    bytes.extend_from_slice(b)
+                });
+                if let Some(prev) = seen.insert(bytes, (plan_id, generation, steps)) {
+                    panic!(
+                        "{prev:?} and {:?} encode alike",
+                        (plan_id, generation, steps)
+                    );
+                }
+            }
+        }
+        assert_eq!(seen.len(), 3 * plans.len());
+    }
+
     #[test]
     fn a_dotdot_inside_a_name_is_not_a_traversal() {
         // `..foo` and `foo..bar` are ordinary filenames, not parent refs.
@@ -802,5 +1118,100 @@ mod tests {
             resolve_under(&root(), "..hidden/foo..bar").unwrap(),
             Path::new("/data/pool/..hidden/foo..bar"),
         );
+    }
+
+    mod props {
+        use std::path::Component;
+
+        use proptest::prelude::*;
+
+        use super::super::contains;
+        use super::super::prefixes_overlap;
+        use super::*;
+
+        /// A root-relative path as the API may send one: plain names,
+        /// names that merely contain dots, traversals, empties and roots.
+        fn rel() -> impl Strategy<Value = String> {
+            (
+                any::<bool>(),
+                prop::collection::vec(
+                    prop::sample::select(vec!["a", "shows", "..hidden", "x..y", "..", ".", ""]),
+                    0..6,
+                ),
+            )
+                .prop_map(|(lead, parts)| {
+                    format!("{}{}", if lead { "/" } else { "" }, parts.join("/"))
+                })
+        }
+
+        fn has_parent(p: &str) -> bool {
+            Path::new(p).components().any(|c| c == Component::ParentDir)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// What comes back is inside the root and never walks back out;
+            /// a path with a `..` in it never comes back at all.
+            #[test]
+            fn a_resolved_path_is_inside_the_root(rel in rel()) {
+                match resolve_under(&root(), &rel) {
+                    Ok(p) => {
+                        prop_assert!(!has_parent(&rel), "{:?} was accepted as {:?}", rel, p);
+                        prop_assert!(p.starts_with(root()), "{:?} resolved to {:?}", rel, p);
+                        prop_assert!(!p.components().any(|c| c == Component::ParentDir));
+                    }
+                    Err(_) => prop_assert!(has_parent(&rel), "{:?} was refused", rel),
+                }
+            }
+
+            /// `contains` refuses any candidate holding a `..` or a leading
+            /// `.`, whether the root exists or not. The leading-`.` case is
+            /// rooted at `.` itself, where the candidate does resolve under
+            /// the root, so only the component guard can refuse it.
+            #[test]
+            fn a_traversal_is_never_contained(rel in rel()) {
+                let dir = tempfile::tempdir().unwrap();
+                let candidate = PathBuf::from(format!("{}/{rel}", dir.path().display()));
+                if has_parent(&rel) {
+                    prop_assert!(!contains(dir.path(), &candidate), "{:?}", candidate);
+                    prop_assert!(!contains(&root(), &root().join(rel.trim_start_matches('/'))));
+                }
+                prop_assert!(!contains(Path::new("."), &Path::new(".").join(rel.trim_start_matches('/'))));
+            }
+
+            /// A path under a symlink that leaves the root resolves outside
+            /// it, and is refused; the same path under a real directory is
+            /// not.
+            #[test]
+            fn a_symlink_out_of_the_root_is_refused(
+                via_link in any::<bool>(),
+                rest in prop::collection::vec("[a-z]{1,6}", 0..4),
+            ) {
+                let dir = tempfile::tempdir().unwrap();
+                let (root, outside) = (dir.path().join("root"), dir.path().join("outside"));
+                std::fs::create_dir_all(root.join("in")).unwrap();
+                std::fs::create_dir(&outside).unwrap();
+                std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+                let top = if via_link { "out" } else { "in" };
+                let rel = [vec![top.to_owned()], rest].concat().join("/");
+                prop_assert_eq!(resolve_under(&root, &rel).is_ok(), !via_link, "{}", rel);
+            }
+
+            /// Whether two delete areas overlap does not depend on which is
+            /// asked about first, and an area always overlaps itself and
+            /// anything under it.
+            #[test]
+            fn overlap_is_symmetric_and_covers_descendants(
+                a in "(/?[a-z]{1,3}){0,3}/?",
+                b in "(/?[a-z]{1,3}){0,3}/?",
+                below in "[a-z]{1,3}",
+            ) {
+                prop_assert_eq!(prefixes_overlap(&a, &b), prefixes_overlap(&b, &a));
+                prop_assert!(prefixes_overlap(&a, &a));
+                let under = format!("{}/{below}", a.trim_end_matches('/'));
+                prop_assert!(prefixes_overlap(&a, &under), "{:?} under {:?}", under, a);
+            }
+        }
     }
 }

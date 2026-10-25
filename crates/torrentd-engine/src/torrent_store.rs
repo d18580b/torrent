@@ -5,16 +5,21 @@
 //! is added from a buffer / file so the startup
 //! inventory scan can re-add it if its resume file is ever lost, and the
 //! `metadata_received` handler writes the fetched metadata for magnet adds.
+//! A magnet add records its URI beside where that `.torrent` will go, so a
+//! magnet whose daemon stops before its first resume save and before its
+//! metadata arrives is re-added from it rather than lost.
 
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(any(test, feature = "test-support"))]
 use dashmap::DashMap;
 use libtorrent_safe::InfoHash;
 use thiserror::Error;
 
 use crate::batch_writer::WriteErrorHook;
 use crate::profile::ProfileId;
+use crate::resume_store::Listing;
 use crate::resume_store::PartitionedDir;
 use crate::resume_store::Scan;
 
@@ -30,8 +35,21 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
         self.scan(profile).map(|s| s.entries)
     }
 
+    /// The info-hash of every `.torrent` file owned by `profile`, by name,
+    /// with the housekeeping [`TorrentStore::scan`] does first and no file
+    /// read: the boot's torrent-dir scan, which reads with
+    /// [`TorrentStore::read`] only what it has not already loaded.
+    ///
+    /// The default reads every file through `scan`; a store that can list
+    /// without reading overrides it.
+    fn list(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        self.scan(profile).map(Listing::from)
+    }
+
     /// Atomically replace the `.torrent` file for `(profile, ih)` with `data`,
-    /// durably, before returning.
+    /// durably before returning in the sense
+    /// [`crate::resume_store`]'s Durability section gives: the data always,
+    /// the new name as far as a directory `fsync` can make it.
     fn write(
         &self,
         profile: &ProfileId,
@@ -55,12 +73,15 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     /// Return once every batched write accepted so far is durable.
     fn flush(&self) {}
 
-    /// Delete the `.torrent` file for `(profile, ih)`, and the save path
-    /// recorded beside it, durably before returning: a crash after this
-    /// returns does not bring them back. Missing files are not an error.
+    /// Delete the `.torrent` file for `(profile, ih)`, and the magnet URI and
+    /// save path recorded beside it, before returning, then `fsync` the directory: a
+    /// crash after this returns does not bring them back, and a power loss
+    /// can only where that `fsync` failed ([`crate::resume_store`]'s
+    /// Durability section). Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError>;
 
-    /// Atomically record, durably before returning, the save path
+    /// Atomically record, durably before returning (as
+    /// [`crate::resume_store`]'s Durability section defines it), the save path
     /// `(profile, ih)` was added at, beside its `.torrent`.
     ///
     /// The torrent-dir scan re-adds a `.torrent` whose resume file is gone;
@@ -79,6 +100,33 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
         profile: &ProfileId,
         ih: &InfoHash,
     ) -> Result<Option<String>, TorrentStoreError>;
+
+    /// Atomically record, durably before returning (as
+    /// [`crate::resume_store`]'s Durability section defines it), the magnet
+    /// URI `(profile, ih)` was added from, beside where its `.torrent` goes.
+    ///
+    /// A magnet has no `.torrent` until its metadata arrives and no resume
+    /// file until its first save lands; a daemon stopped before both would
+    /// otherwise leave nothing the boot can re-add it from.
+    fn write_magnet(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        uri: &str,
+    ) -> Result<(), TorrentStoreError>;
+
+    /// The magnet URI recorded for `(profile, ih)` by
+    /// [`TorrentStore::write_magnet`], or `None` if none was.
+    fn read_magnet(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<String>, TorrentStoreError>;
+
+    /// The info-hash of every magnet URI recorded for `profile`, by name and
+    /// with no file read, after removing the temp files an interrupted
+    /// [`TorrentStore::write_magnet`] left.
+    fn list_magnets(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError>;
 
     /// Whether a `.torrent` file already exists for `(profile, ih)`.
     fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> bool;
@@ -107,13 +155,15 @@ pub enum TorrentStoreError {
 // ---------------------------------------------------------------------------
 
 /// `<infohash>.torrent` files, each with an optional `<infohash>.save_path`
-/// sidecar in the same directory holding the UTF-8 save path it was added at.
+/// sidecar in the same directory holding the UTF-8 save path it was added at,
+/// and, for a magnet add, an `<infohash>.magnet` sidecar holding its URI.
 /// The `.torrent` scan reads only its own suffix, so the sidecars never show
 /// up as entries.
 #[derive(Debug)]
 pub struct FsTorrentStore {
     torrents: PartitionedDir,
     save_paths: PartitionedDir,
+    magnets: PartitionedDir,
 }
 
 impl FsTorrentStore {
@@ -121,7 +171,8 @@ impl FsTorrentStore {
         let base = base.into();
         Self {
             torrents: PartitionedDir::new(base.clone(), ".torrent", "torrent"),
-            save_paths: PartitionedDir::new(base, SAVE_PATH_SUFFIX, "save path"),
+            save_paths: PartitionedDir::new(base.clone(), SAVE_PATH_SUFFIX, "save path"),
+            magnets: PartitionedDir::new(base, MAGNET_SUFFIX, "magnet"),
         }
     }
 
@@ -137,7 +188,8 @@ impl FsTorrentStore {
     pub fn with_profile_dir(mut self, profile: ProfileId, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         self.torrents.pin(profile.clone(), dir.clone());
-        self.save_paths.pin(profile, dir);
+        self.save_paths.pin(profile.clone(), dir.clone());
+        self.magnets.pin(profile, dir);
         self
     }
 
@@ -149,14 +201,42 @@ impl FsTorrentStore {
     pub fn save_path_path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
         self.save_paths.path_for(profile, ih)
     }
+
+    /// Where the magnet sidecar for `(profile, ih)` lives.
+    pub fn magnet_path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
+        self.magnets.path_for(profile, ih)
+    }
 }
 
-/// The sidecar's suffix, beside `<infohash>.torrent`.
+/// The save-path sidecar's suffix, beside `<infohash>.torrent`.
 const SAVE_PATH_SUFFIX: &str = ".save_path";
+
+/// The magnet sidecar's suffix, beside `<infohash>.torrent`.
+const MAGNET_SUFFIX: &str = ".magnet";
+
+/// A UTF-8 sidecar's text, or `None` where there is none.
+fn read_text(path: &std::path::Path) -> Result<Option<String>, TorrentStoreError> {
+    match fs::read(path) {
+        Ok(b) => String::from_utf8(b).map(Some).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()).into()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
 
 impl TorrentStore for FsTorrentStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
+        // The sidecars are written through a temp file too.
+        self.save_paths.remove_stale_temps(profile)?;
+        self.magnets.remove_stale_temps(profile)?;
         Ok(self.torrents.scan(profile)?)
+    }
+
+    fn list(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        self.save_paths.remove_stale_temps(profile)?;
+        self.magnets.remove_stale_temps(profile)?;
+        Ok(self.torrents.list(profile)?)
     }
 
     fn write(
@@ -182,9 +262,11 @@ impl TorrentStore for FsTorrentStore {
     }
 
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError> {
-        // The `.torrent` first: a sidecar left behind by a failure between
-        // the two is never read, since the scan only finds `.torrent` files.
+        // The `.torrent` and the magnet first, the two the boot re-adds a
+        // torrent from: a save path left behind by a failure after them is
+        // never read, since nothing is left to re-add at it.
         self.torrents.delete(profile, ih)?;
+        self.magnets.delete(profile, ih)?;
         Ok(self.save_paths.delete(profile, ih)?)
     }
 
@@ -207,13 +289,28 @@ impl TorrentStore for FsTorrentStore {
         profile: &ProfileId,
         ih: &InfoHash,
     ) -> Result<Option<String>, TorrentStoreError> {
-        match fs::read(self.save_path_path_for(profile, ih)) {
-            Ok(b) => String::from_utf8(b).map(Some).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()).into()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        read_text(&self.save_path_path_for(profile, ih))
+    }
+
+    fn write_magnet(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        uri: &str,
+    ) -> Result<(), TorrentStoreError> {
+        Ok(self.magnets.write(profile, ih, uri.as_bytes())?)
+    }
+
+    fn read_magnet(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<String>, TorrentStoreError> {
+        read_text(&self.magnet_path_for(profile, ih))
+    }
+
+    fn list_magnets(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        Ok(self.magnets.list(profile)?)
     }
 
     fn read(
@@ -221,15 +318,7 @@ impl TorrentStore for FsTorrentStore {
         profile: &ProfileId,
         ih: &InfoHash,
     ) -> Result<Option<Vec<u8>>, TorrentStoreError> {
-        let path = self.path_for(profile, ih);
-        if let Some(queued) = self.torrents.pending(&path) {
-            return Ok(Some(queued.to_vec()));
-        }
-        match fs::read(&path) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self.torrents.read(profile, ih)?)
     }
 }
 
@@ -237,12 +326,15 @@ impl TorrentStore for FsTorrentStore {
 // MemoryTorrentStore (test fixture)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct MemoryTorrentStore {
     inner: DashMap<(ProfileId, InfoHash), Vec<u8>>,
     save_paths: DashMap<(ProfileId, InfoHash), String>,
+    magnets: DashMap<(ProfileId, InfoHash), String>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MemoryTorrentStore {
     pub fn new() -> Self {
         Self::default()
@@ -256,6 +348,7 @@ impl MemoryTorrentStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl TorrentStore for MemoryTorrentStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
         Ok(Scan {
@@ -264,6 +357,18 @@ impl TorrentStore for MemoryTorrentStore {
                 .iter()
                 .filter(|e| e.key().0 == *profile)
                 .map(|e| (e.key().1, e.value().clone()))
+                .collect(),
+            unreadable: 0,
+        })
+    }
+
+    fn list(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        Ok(Listing {
+            names: self
+                .inner
+                .iter()
+                .filter(|e| e.key().0 == *profile)
+                .map(|e| e.key().1)
                 .collect(),
             unreadable: 0,
         })
@@ -282,6 +387,7 @@ impl TorrentStore for MemoryTorrentStore {
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError> {
         self.inner.remove(&(profile.clone(), *ih));
         self.save_paths.remove(&(profile.clone(), *ih));
+        self.magnets.remove(&(profile.clone(), *ih));
         Ok(())
     }
 
@@ -320,6 +426,39 @@ impl TorrentStore for MemoryTorrentStore {
             .save_paths
             .get(&(profile.clone(), *ih))
             .map(|e| e.value().clone()))
+    }
+
+    fn write_magnet(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        uri: &str,
+    ) -> Result<(), TorrentStoreError> {
+        self.magnets.insert((profile.clone(), *ih), uri.to_owned());
+        Ok(())
+    }
+
+    fn read_magnet(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<String>, TorrentStoreError> {
+        Ok(self
+            .magnets
+            .get(&(profile.clone(), *ih))
+            .map(|e| e.value().clone()))
+    }
+
+    fn list_magnets(&self, profile: &ProfileId) -> Result<Listing, TorrentStoreError> {
+        Ok(Listing {
+            names: self
+                .magnets
+                .iter()
+                .filter(|e| e.key().0 == *profile)
+                .map(|e| e.key().1)
+                .collect(),
+            unreadable: 0,
+        })
     }
 }
 
@@ -379,6 +518,40 @@ mod tests {
         assert_eq!(store.read_save_path(&profile, &ih).unwrap(), None);
     }
 
+    /// Issue #627: a magnet's URI is kept beside where its `.torrent` goes,
+    /// listed by name, kept out of the `.torrent` scan, and deleted with it.
+    #[test]
+    fn the_magnet_sidecar_round_trips_lists_and_goes_with_the_torrent() {
+        let dir = tempdir().unwrap();
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0x5du8; 20]);
+        let uri = "magnet:?xt=urn:btih:5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d";
+        let fs_store = FsTorrentStore::new(dir.path());
+        let memory = MemoryTorrentStore::new();
+        for store in [&fs_store as &dyn TorrentStore, &memory] {
+            assert_eq!(store.read_magnet(&profile, &ih).unwrap(), None);
+            store.write_magnet(&profile, &ih, uri).unwrap();
+            assert_eq!(
+                store.read_magnet(&profile, &ih).unwrap().as_deref(),
+                Some(uri)
+            );
+            assert_eq!(store.list_magnets(&profile).unwrap().names, vec![ih]);
+            assert!(store
+                .list_magnets(&ProfileId::new("q"))
+                .unwrap()
+                .names
+                .is_empty());
+            assert!(store.scan(&profile).unwrap().entries.is_empty());
+            store.delete(&profile, &ih).unwrap();
+            assert_eq!(store.read_magnet(&profile, &ih).unwrap(), None);
+            assert!(store.list_magnets(&profile).unwrap().names.is_empty());
+        }
+        assert_eq!(
+            fs_store.magnet_path_for(&profile, &ih),
+            dir.path().join("p").join(format!("{}.magnet", ih.to_hex())),
+        );
+    }
+
     #[test]
     fn a_pinned_profile_keeps_its_sidecar_beside_its_torrent() {
         let dir = tempdir().unwrap();
@@ -434,6 +607,92 @@ mod tests {
         let scan = store.scan(&profile).unwrap();
         assert_eq!(scan.unreadable, 1);
         assert_eq!(scan.entries, vec![(good, b"t".to_vec())]);
+    }
+
+    /// The torrent-dir scan lists by name and reads only what no resume file
+    /// loaded, so the listing reads nothing: a file that cannot be read is
+    /// listed, and fails its own read alone. It removes the temp files the
+    /// scan removes, the sidecar's included.
+    #[test]
+    fn a_listing_reads_no_file_and_removes_the_scans_temp_files() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let good = InfoHash([0x01u8; 20]);
+        let bad = InfoHash([0x02u8; 20]);
+        store.write(&profile, &good, b"t").unwrap();
+        std::fs::create_dir(store.path_for(&profile, &bad)).unwrap();
+        let mut tmp = store.save_path_path_for(&profile, &good).into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, b"torn").unwrap();
+
+        let listing = store.list(&profile).unwrap();
+        let mut names = listing.names.clone();
+        names.sort_by_key(|ih| ih.0);
+        assert_eq!(names, vec![good, bad]);
+        assert_eq!(listing.unreadable, 0);
+        assert!(!tmp.exists(), "the listing left {}", tmp.display());
+        assert_eq!(
+            store.read(&profile, &good).unwrap().as_deref(),
+            Some(&b"t"[..])
+        );
+        assert!(store.read(&profile, &bad).is_err());
+
+        let memory = MemoryTorrentStore::new();
+        memory.write(&profile, &good, b"t").unwrap();
+        assert_eq!(memory.list(&profile).unwrap().names, vec![good]);
+        assert!(memory.list(&ProfileId::new("q")).unwrap().names.is_empty());
+    }
+
+    /// A write killed between its temp file and its rename leaves the temp
+    /// file behind, and a torrent never written again keeps it forever. The
+    /// boot scan removes the `.torrent`'s and the sidecar's.
+    #[test]
+    fn the_scan_removes_temp_files_left_by_interrupted_writes() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0x5bu8; 20]);
+        let torrent = store.path_for(&profile, &ih);
+        std::fs::create_dir_all(torrent.parent().unwrap()).unwrap();
+        let sidecar = store.save_path_path_for(&profile, &ih);
+        let leftovers: Vec<PathBuf> = [".tmp", ".now.tmp"]
+            .iter()
+            .flat_map(|ext| {
+                [&torrent, &sidecar].map(|p| {
+                    let mut s = p.as_os_str().to_owned();
+                    s.push(ext);
+                    PathBuf::from(s)
+                })
+            })
+            .collect();
+        for tmp in &leftovers {
+            std::fs::write(tmp, b"torn").unwrap();
+        }
+        let scan = store.scan(&profile).unwrap();
+        assert!(scan.entries.is_empty());
+        assert_eq!(scan.unreadable, 0);
+        for tmp in &leftovers {
+            assert!(!tmp.exists(), "the boot scan left {}", tmp.display());
+        }
+    }
+
+    /// `delete` removes the lower-case name only, so an upper-case `.torrent`
+    /// the scan loaded would bring the torrent back at every boot.
+    #[test]
+    fn an_upper_case_torrent_file_is_not_loaded() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path());
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0xcdu8; 20]);
+        let path = store.path_for(&profile, &ih);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let upper = path.with_file_name(format!("{}.torrent", ih.to_hex().to_uppercase()));
+        std::fs::write(&upper, b"t").unwrap();
+        let scan = store.scan(&profile).unwrap();
+        assert!(scan.entries.is_empty(), "{:?}", scan.entries);
+        assert_eq!(scan.unreadable, 0);
     }
 
     #[test]

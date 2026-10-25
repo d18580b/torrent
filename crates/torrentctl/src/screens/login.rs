@@ -2,7 +2,7 @@
 //!
 //! Shown when there is no token, or when the daemon refused the one in use.
 //! The session token `POST /v1/sessions` returns is held in memory only and
-//! revoked on quit.
+//! revoked however the client exits (see `runtime`).
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -19,6 +19,7 @@ use crate::api::types;
 use crate::api::Failure;
 use crate::app::Ctx;
 use crate::app::Effect;
+use crate::app::Refusal;
 use crate::app::Session;
 use crate::theme::Tone;
 use crate::ui::widgets::centered;
@@ -77,11 +78,13 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             })]
         }
         Msg::Answered(Ok(token)) => {
-            state.busy = false;
             state.password.reset();
             match ctx.api.with_token(&token) {
+                // Still busy until `SignedIn` lands and clears it: a quit in
+                // between must know a token is on its way, to revoke it.
                 Ok(api) => vec![Effect::now(crate::app::Msg::SignedIn(api))],
                 Err(e) => {
+                    state.busy = false;
                     state.error = Some(e);
                     Vec::new()
                 }
@@ -125,7 +128,7 @@ pub fn view(state: &State, session: &Session, ctx: &Ctx<'_>, frame: &mut Frame, 
         Session::Unreachable {
             reason,
             since,
-            retry,
+            refused,
         } => {
             let wait = crate::app::RETRY_INTERVAL.saturating_sub(since.elapsed());
             lines.push(Line::from(Span::styled(
@@ -133,10 +136,12 @@ pub fn view(state: &State, session: &Session, ctx: &Ctx<'_>, frame: &mut Frame, 
                 theme.fg(Tone::Bad),
             )));
             lines.push(Line::from(""));
-            let note = if *retry {
-                format!("retrying in {}s", wait.as_secs() + 1)
-            } else {
-                "this token lacks the read scope; not retried".to_owned()
+            let note = match refused {
+                None => format!("retrying in {}s", wait.as_secs() + 1),
+                Some(Refusal::Scope) => "this token lacks the read scope; not retried".to_owned(),
+                Some(Refusal::Forbidden) => {
+                    "add this host to the daemon's allowed_hosts; not retried".to_owned()
+                }
             };
             lines.push(Line::from(Span::styled(note, theme.fg(Tone::Muted))).centered());
             lines.push(Line::from(""));
@@ -203,6 +208,49 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_names_its_cause_and_only_a_scope_denial_blames_the_token() {
+        let scope = "this token lacks the read scope";
+        let hosts = "allowed_hosts";
+        for (name, refusal, title, detail, shows, hides) in [
+            (
+                "scope",
+                Refusal::Scope,
+                "Insufficient scope",
+                "the token lacks a required scope",
+                scope,
+                hosts,
+            ),
+            (
+                "forbidden",
+                Refusal::Forbidden,
+                "Forbidden",
+                "host not allowed",
+                hosts,
+                scope,
+            ),
+        ] {
+            let failure = Failure {
+                status: Some(403),
+                ..Failure::local(title, Some(detail.to_owned()))
+            };
+            let session = Session::Unreachable {
+                reason: failure.message(),
+                since: std::time::Instant::now(),
+                refused: Some(refusal),
+            };
+            let screen = testing::render(80, 24, None, |ctx, frame, area| {
+                view(&State::default(), &session, ctx, frame, area)
+            });
+            assert!(screen.contains(title), "{name}: the daemon's title");
+            assert!(screen.contains(detail), "{name}: the daemon's detail");
+            assert!(screen.contains(shows), "{name}");
+            assert!(!screen.contains(hides), "{name}");
+            assert!(!screen.contains("retrying"), "{name}: not retried");
+            insta::assert_snapshot!(format!("login_refused_{name}"), screen);
+        }
+    }
+
+    #[test]
     fn submitting_sends_once_and_ignores_keys_until_answered() {
         let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = typed("pw");
@@ -239,6 +287,7 @@ mod tests {
     fn a_granted_token_signs_the_app_in() {
         let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = typed("pw");
+        state.busy = true;
         let effects = testing::with_api(&daemon.api(), None, |ctx| {
             update(&mut state, Msg::Answered(Ok("tds_abc".into())), ctx)
         });
@@ -246,6 +295,7 @@ mod tests {
             state.password.value().is_empty(),
             "the password is not kept"
         );
+        assert!(state.busy, "busy until SignedIn lands and clears it");
         let msgs = testing::run(effects);
         let [crate::app::Msg::SignedIn(api)] = &msgs[..] else {
             panic!("SignedIn with the new credential: {msgs:?}");

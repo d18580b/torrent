@@ -127,6 +127,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
          boot deletes what a tombstone names rather than loading it.";
     "torrent_add_errors_total" Counter Profile Zero => "Adds libtorrent rejected after accepting the call.";
     "torrents_finished_total" Counter Profile Zero => "Torrents that finished downloading.";
+    "upload_mode_reasserts_total" Counter Profile Zero =>
+        "Status updates that showed a torrent out of upload mode or carrying a flag that can \
+         lift it; each one re-asserts upload mode on the torrent. Any rise means the \
+         no-download invariant lapsed on a live torrent.";
     "torrent_errors_total" Counter Profile Zero => "Torrents that entered libtorrent's error state.";
     "disk_errors_total" Counter Profile ("op": &[]) OnFirstEvent =>
         "File errors, by libtorrent operation; the torrent enters the disk-error phase.";
@@ -311,10 +315,12 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "profile_vpn_tunnel_ip_changes_total" Counter VpnProfile Owner("live vpn profiles") =>
         "Tunnel address losses or changes.";
     "profile_vpn_fenced_total" Counter VpnProfile
-        ("reason": &["ip_lost_or_changed", "route_mismatch", "handshake_stale", "no_handshake", "kill_switch"])
+        ("reason": &["ip_lost_or_changed", "route_mismatch", "handshake_stale", "no_handshake", "probe_unavailable", "kill_switch"])
         Owner("live vpn profiles") =>
-        "Times the VPN monitor fenced the profile, by reason; kill_switch when the kill-switch \
-         watch fenced it because the nftables table was missing or drifted.";
+        "Times the VPN monitor fenced the profile, by reason; probe_unavailable when its \
+         address or route probe, its handshake probe while it had traffic to carry, or the \
+         kill-switch watch's check, could not run 3 times in a row; kill_switch when the kill-switch watch fenced it because the nftables \
+         table was missing or drifted.";
     "profile_vpn_handshake_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
         "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or \
          unprivileged).";
@@ -377,11 +383,12 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "kill_switch_probe_errors_total" Counter Daemon Zero =>
         "Runtime kill-switch checks that could not run: nft could not list the nftables tables \
          or the kill switch's table as JSON, its output could not be read, or the check task \
-         itself failed (it panicked or was cancelled).";
+         itself failed (it panicked or was cancelled). 3 checks in a row that nft could not \
+         answer fence every vpn profile (profile_vpn_fenced_total reason probe_unavailable).";
     "kill_switch_lost_total" Counter Daemon ("outcome": &["reinstalled", "lost"]) Zero =>
         "Times a runtime check found the kill switch's nftables table missing or drifted, by \
-         whether the one reinstall checked intact (reinstalled) or not (lost). Each loss counts \
-         once; the checks that repeat while it stays lost do not.";
+         whether its first reinstall checked intact (reinstalled) or not (lost). Each loss counts \
+         once; the checks that repeat while it stays lost, and the reinstalls they retry, do not.";
     // the previous run's shutdown
     "last_shutdown_unsaved_resumes" Gauge Daemon Owner("always") =>
         "Resume saves the previous run's shutdown drain left unsaved; 0 if unknown.";
@@ -406,9 +413,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Pool plans that stopped: a step failed, the index stopped accounting for what is \
          loaded, re-driving an interrupted plan failed, or the boot re-drive gave up waiting \
          for the loaded torrents to reach the state map and left interrupted plans applying.";
-    "pool_scan_errors_total" Counter Daemon ("kind": &["walk", "stat", "path", "read", "parse"]) Zero =>
+    "pool_scan_errors_total" Counter Daemon ("kind": torrentd_pool::ScanStats::ERROR_KINDS) Zero =>
         "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or \
-         unparseable .torrent files and .fastresume sidecars.";
+         unparseable .torrent files and .fastresume sidecars, and symlinks under a root, \
+         which the scan does not follow.";
     "pool_verify_completed_total" Counter Daemon Zero => "Adopted torrents that verified and are seeding.";
     "pool_verify_failed_total" Counter Daemon Zero => "Adopted torrents whose verification failed or was dropped.";
     "pool_recheck_dropped_total" Counter Daemon
@@ -439,6 +447,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "metrics_dropped_samples_total" Counter Daemon ("reason": &["registration", "labels"]) Zero =>
         "Samples the exporter dropped: a series that could not be registered, or an emission \
          whose labels differ from the series' first use.";
+    // the build
+    "build_fault_injection" Gauge Daemon Owner("always") =>
+        "1 if this binary was built with the fault-injection feature, which mounts \
+         POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a \
+         deployment.";
 };
 
 /// The `kind` values of `session_alerts_total` that `TorrentdSessionErrors`
@@ -678,6 +691,7 @@ pub struct PromSink {
 
 const DROPPED: &str = "metrics_dropped_samples_total";
 const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
+const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
 
 impl PromSink {
     pub fn new() -> Self {
@@ -693,7 +707,7 @@ impl PromSink {
                 dropped.with_label_values(&[reason]);
             }
         }
-        Self {
+        let sink = Self {
             registry,
             counters: Mutex::new(HashMap::from([(DROPPED.to_string(), dropped.clone())])),
             gauges: Mutex::new(HashMap::new()),
@@ -701,7 +715,18 @@ impl PromSink {
             dropped,
             dir_fsync_exported: Mutex::new(0),
             boot_counts: Once::new(),
-        }
+        };
+        // A property of the binary, so it is known before anything else is.
+        sink.set_gauge(
+            BUILD_FAULT_INJECTION,
+            if cfg!(feature = "fault-injection") {
+                1.0
+            } else {
+                0.0
+            },
+            &[],
+        );
+        sink
     }
 
     /// Write every [`Seed::Zero`] series at zero, for each profile in
@@ -1525,6 +1550,23 @@ mod tests {
             sample(&later, "profile_assignment_registry_errors_total", a).as_deref(),
             Some("7"),
             "{later}"
+        );
+    }
+
+    #[test]
+    fn the_sink_exports_whether_this_is_a_fault_injection_build() {
+        // Run in both builds: `mise run test` sees 0, `mise run
+        // test-fault-injection` sees 1.
+        let text = String::from_utf8(PromSink::new().render()).unwrap();
+        let expected = if cfg!(feature = "fault-injection") {
+            "1"
+        } else {
+            "0"
+        };
+        assert_eq!(
+            sample(&text, "build_fault_injection", "").as_deref(),
+            Some(expected),
+            "{text}"
         );
     }
 

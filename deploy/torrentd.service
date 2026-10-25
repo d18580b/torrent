@@ -114,7 +114,7 @@ RuntimeDirectoryMode=0750
 # granted for nothing. `CapabilityBoundingSet=` is a ceiling, so commenting it
 # out grants rather than withholds — it replaces a bounding set of exactly
 # CAP_NET_ADMIN with systemd's full default set, and every binary the daemon
-# execs (`nft`, `ip`, `wg`, `pkill`) can then acquire whatever file
+# execs (`nft`, `ip`, `wg`, `kill`) can then acquire whatever file
 # capabilities it carries. It is therefore active and empty below: nothing this
 # unit runs can hold any capability at all.
 #

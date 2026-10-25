@@ -8,7 +8,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "1.0.0"
+    "version": "0.2.0"
   },
   "paths": {
     "/healthz": {
@@ -647,7 +647,7 @@
           "server"
         ],
         "summary": "Re-read the configuration file.",
-        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
+        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. One reload is queued at a time: a request made\nwhile one is queued and has not started is `409 reload-pending`, since the\nqueued reload will read the same file, and one made while a reload is\nrunning is queued behind it. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
         "operationId": "reload_config",
         "responses": {
           "401": {
@@ -3882,7 +3882,7 @@
           "profiles"
         ],
         "summary": "Set one profile online or offline.",
-        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says: those that were running are started again 100\na second, going on after the response, since each one started announces\nto its trackers. Setting it offline meanwhile stops that, and the next\n`online` starts the rest; a restart starts them at boot. The setting is\nwritten to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
+        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says: those that were running are started again 100\na second, going on after the response, since each one started announces\nto its trackers. Setting it offline meanwhile stops that, and the next\n`online` starts the rest; a restart starts them at boot. The setting is\nwritten to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. Where\n`network_kill_switch` is on, the fence stays unless the kill switch last\nchecked in force: while its watch has the vpn profiles fenced, for a table\nfound gone or changed or for checks that could not run, setting a fenced\nprofile online answers `409 kill-switch-not-in-force` and nothing changes,\nbefore its tunnel is checked. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
         "operationId": "set_profile_state",
         "parameters": [
           {
@@ -4121,21 +4121,42 @@
             }
           },
           "409": {
-            "description": "The profile is unavailable",
+            "description": "The profile is unavailable; The network kill switch is not in force",
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "allOf": [
+                  "oneOf": [
                     {
-                      "$ref": "#/components/schemas/Problem"
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The profile is unavailable"
                     },
                     {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#kill-switch-not-in-force"
+                            }
+                          }
                         }
-                      }
+                      ],
+                      "title": "The network kill switch is not in force"
                     }
                   ]
                 }
@@ -7342,7 +7363,7 @@
           "pool"
         ],
         "summary": "Discard a mutation plan.",
-        "description": "Removes the plan and its steps, whatever it did. Nothing on disk changes:\ndiscarding an applied plan does not undo it. A plan mid-apply is refused —\nstartup resumes it rather than losing track of half a change.",
+        "description": "Removes the plan and its steps, whatever it did. Nothing on disk changes:\ndiscarding an applied plan does not undo it. A plan in `applying` is\nrefused with `409`, decided in the same statement as the delete, so no\napply can claim the plan in between: an apply is running it now, or a\ncrash left it, and the next boot re-drives it to `applied`, or to `failed`\nwhen the re-drive refuses it. Either can then be discarded. With\n`[pool] allow_mutations` off at boot the re-drive does not run, and the\nplan stays `applying` until it is turned back on.",
         "operationId": "delete_plan",
         "parameters": [
           {
@@ -9107,7 +9128,7 @@
           "pool"
         ],
         "summary": "Adopt existing payload.",
-        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.\n\nThe work has no deadline and the request answers once every target is\nadopted or refused: a large subtree, or a running scan holding the index,\nkeeps it open for as long as that takes. Only the body has one: a body\nthat has not arrived within 30 seconds is answered `408`.",
+        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Each is listed under the path it\ntook: one planned for the fast path whose resume data turns out unusable,\nor whose add the session rejects, is verified instead and listed under\n`queued_for_verification`. Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.\n\nThe work has no deadline and the request answers once every target is\nadopted or refused: a large subtree, or a running scan holding the index,\nkeeps it open for as long as that takes. Only the body has one: a body\nthat has not arrived within 30 seconds is answered `408`.",
         "operationId": "adopt_pool_torrents",
         "requestBody": {
           "content": {
@@ -10670,6 +10691,13 @@
               "null"
             ],
             "description": "Why the profile has no session. Set only when `status` is `failed`."
+          },
+          "fence_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the profile is fenced, as the `reason` label of\n`torrentd_profile_vpn_fenced_total` names it: `ip_lost_or_changed`,\n`route_mismatch`, `handshake_stale`, `no_handshake`,\n`probe_unavailable` (its tunnel's checks, or the kill switch's, could\nnot run several times in a row), or `kill_switch` (the nftables kill\nswitch was not in force). Set only when `status` is `vpn_down`."
           }
         },
         "type": "object",
@@ -11117,6 +11145,13 @@
             ],
             "description": "The directory, relative to its root, the payload was matched at;\n`null` when unmatched."
           },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why its state is what it is, where the state alone does not say,\nfrom whichever last set it: a scan's match (for example how many of\nits files are present, that its on-disk stats changed since it was\nverified, that another torrent claims the same files, or that it has\nmore than one complete copy, which makes a delete plan refuse to\ntouch any of them), or a verification that failed (why its payload\ndid not check out). `null` when there is nothing to add."
+          },
           "profile_id": {
             "type": [
               "string",
@@ -11237,7 +11272,7 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Entries skipped because they could not be read; the daemon's log names\neach, and `pool_scan_errors_total` counts them by kind."
+            "description": "Entries skipped because they could not be read, or because they are\nsymlinks under a root, which the scan does not follow; the daemon's\nlog names each, and `pool_scan_errors_total` counts them by kind."
           }
         },
         "type": "object",
@@ -11274,14 +11309,45 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Claimed files that are gone."
+            "description": "Claimed files that are gone from a root that is present and readable."
+          },
+          "files_unreadable": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Claimed files whose stat failed for a reason other than not-found (a\npermission or I/O error). Not evidence of change, so not drift."
+          },
+          "unreadable_roots": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "description": "Roots, as absolute paths on the daemon's host, that were missing, not\nlistable, or empty though the index holds files under them: what an\nunmounted root looks like. A file not found under one is not counted\nas vanished, so `drifted` says nothing about the payload there."
+          },
+          "unmounted_dirs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "description": "Directories inside a readable root that a claimed file was not found\nunder and that are on another filesystem than the index recorded: the\nmount point of a disk unmounted inside the root. A file not found\nunder one is not counted as vanished."
+          },
+          "unchecked": {
+            "items": {
+              "$ref": "#/components/schemas/InfoHashHex"
+            },
+            "type": "array",
+            "description": "Torrents this check could not vouch for and found no change in: over\nan unreadable root, under an unmounted directory, or with a file that\ncould not be stated. Their state is left alone, so they are neither\n`drifted` nor known unchanged."
           }
         },
         "type": "object",
         "required": [
           "drifted",
           "files_changed",
-          "files_vanished"
+          "files_vanished",
+          "files_unreadable",
+          "unreadable_roots",
+          "unmounted_dirs",
+          "unchecked"
         ],
         "description": "What a drift check found."
       },
@@ -11959,7 +12025,7 @@
           },
           "status": {
             "$ref": "#/components/schemas/PlanStatus",
-            "description": "Where the plan stands now: `applied`, or `failed` when a step failed —\nthe plan's steps then show which, and why."
+            "description": "Where the plan stands now: `applied`; `failed` when a step failed —\nthe plan's steps then show which, and why; or `applying` when a\ndaemon shutdown stopped the apply between steps, which the next boot\nre-drives."
           }
         },
         "type": "object",

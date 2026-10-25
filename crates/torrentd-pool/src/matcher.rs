@@ -30,6 +30,7 @@ use tracing::info;
 use crate::model::AdoptionState;
 use crate::model::PoolError;
 use crate::model::TorrentFileRow;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -120,7 +121,7 @@ pub fn match_all_serving(
 fn base_under_roots(roots: &[(i64, PathBuf)], save_path: &Path) -> Option<(i64, String)> {
     roots.iter().find_map(|(id, root)| {
         let rel = save_path.strip_prefix(root).ok()?;
-        Some((*id, normalize(&rel.to_string_lossy())))
+        Some((*id, trim_base(&rel.to_string_lossy())))
     })
 }
 
@@ -477,9 +478,11 @@ struct Search {
 /// Try every candidate base across every root.
 ///
 /// `preferred` is tried first, in order, and the first of it that is complete
-/// wins. Every candidate is tried even after a complete one is found, because
-/// a second complete copy is something a delete plan has to know about: which
-/// of two identical copies a session reads from is not in the index.
+/// wins; then the declared save path, on whichever root holds it; then each
+/// root's other candidates. Every candidate is tried even after a complete
+/// one is found, because a second complete copy is something a delete plan
+/// has to know about: which of two identical copies a session reads from is
+/// not in the index.
 fn search_placements(
     store: &PoolStore,
     roots: &[(i64, PathBuf)],
@@ -493,18 +496,18 @@ fn search_placements(
         // A base recorded against a root no longer configured resolves
         // nothing; leave it out rather than look it up.
         if roots.iter().any(|(id, _)| *id == root_id) {
-            candidates.push((root_id, normalize(base)));
+            candidates.push((root_id, trim_base(base)));
         }
     }
-    for (root_id, root_path) in roots {
-        for base in candidate_bases(
-            store,
-            *root_id,
-            root_path,
-            declared_save_path,
-            torrent_name,
-            files,
-        )? {
+    // Ahead of every root's own candidates, not among them: tried root by
+    // root, a size-anchor copy on a root sorting first beat the declared
+    // path complete on a later one.
+    if let Some(declared) = declared_save_path.and_then(|sp| base_under_roots(roots, Path::new(sp)))
+    {
+        candidates.push(declared);
+    }
+    for (root_id, _) in roots {
+        for base in candidate_bases(store, *root_id, torrent_name, files)? {
             candidates.push((*root_id, base));
         }
     }
@@ -566,12 +569,12 @@ pub(crate) fn complete_copies(
     .complete)
 }
 
-/// Candidate base directories, relative to the root, in cost order.
+/// Candidate base directories on one root, relative to it, in cost order:
+/// every candidate but (1), the declared save path, which
+/// [`search_placements`] tries ahead of every root's.
 fn candidate_bases(
     store: &PoolStore,
     root_id: i64,
-    root_path: &Path,
-    declared_save_path: Option<&str>,
     torrent_name: &str,
     files: &[TorrentFileRow],
 ) -> Result<Vec<String>, PoolError> {
@@ -585,13 +588,6 @@ fn candidate_bases(
             out.push(c);
         }
     };
-
-    // (1) The previous client's save path, if it points inside this root.
-    if let Some(sp) = declared_save_path {
-        if let Ok(rel) = Path::new(sp).strip_prefix(root_path) {
-            push(normalize(&rel.to_string_lossy()));
-        }
-    }
 
     // (2) The root itself, and a directory named after the torrent. Which one
     //     is right depends on whether the torrent's own paths already include
@@ -607,13 +603,14 @@ fn candidate_bases(
         .filter(|f| f.is_on_disk())
         .max_by_key(|f| f.size)
     {
-        let anchor_rel = normalize(&anchor.rel_path);
+        // Already in the index's form, as `evaluate_base` joins it.
+        let anchor_rel = anchor.rel_path.trim_matches('/');
         for candidate_path in store.files_with_size(root_id, anchor.size)? {
             // The base is whatever prefix remains after removing the
             // torrent-relative path from the on-disk path — at a component
             // boundary, or `x/foo.mkv` would yield the base `x/` for a
             // torrent file named `oo.mkv`.
-            if let Some(base) = candidate_path.strip_suffix(&anchor_rel) {
+            if let Some(base) = candidate_path.strip_suffix(anchor_rel) {
                 if base.is_empty() || base.ends_with('/') {
                     push(base.trim_end_matches('/').to_string());
                 }
@@ -678,21 +675,327 @@ fn evaluate_base(
     }))
 }
 
-fn join_rel(base: &str, rel: &str) -> String {
-    let base = base.trim_matches('/');
-    let rel = normalize(rel);
-    if base.is_empty() {
-        rel
-    } else {
-        format!("{base}/{rel}")
-    }
-}
-
+/// A name a torrent declares, in the index's form: its separators `/`, as
+/// the scan rewrites the torrent's file paths.
 fn normalize(p: &str) -> String {
     p.replace('\\', "/").trim_matches('/').to_string()
 }
 
-/// Per-state counts for reporting.
-pub fn state_summary(store: &PoolStore) -> Result<HashMap<AdoptionState, u64>, PoolError> {
-    store.counts_by_state()
+/// A base found on disk, in the index's form. A backslash in it is part of a
+/// file name, as the scan indexed it, and is kept: rewritten to `/`, it names
+/// another directory.
+fn trim_base(p: &str) -> String {
+    p.trim_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    mod props {
+        use std::collections::BTreeMap;
+
+        use proptest::prelude::*;
+
+        use super::super::*;
+        use crate::model::PoolFile;
+        use crate::model::PoolTorrent;
+
+        const ROOTS: [&str; 3] = ["/pool/a", "/pool/b", "/pool/c"];
+        const SIZES: [u64; 3] = [100, 200, 300];
+        const BASES: [&str; 3] = ["", "moved", "x/y"];
+
+        /// One torrent: its name, its files' sizes, where (if anywhere) the
+        /// previous client said it lives, and where its payload is on disk:
+        /// `(root, base, which of its files are there)`, any number of
+        /// times, so a torrent can be partial, complete, or in several
+        /// copies.
+        #[derive(Clone, Debug)]
+        struct Spec {
+            name: &'static str,
+            sizes: Vec<u64>,
+            declared: Option<(usize, usize)>,
+            copies: Vec<(usize, usize, Vec<bool>)>,
+        }
+
+        impl Spec {
+            fn rel(&self, j: usize) -> String {
+                format!("{}/f{j}.bin", self.name)
+            }
+        }
+
+        fn spec() -> impl Strategy<Value = Spec> {
+            (
+                prop::sample::select(vec!["Show", "Film"]),
+                prop::collection::vec(prop::sample::select(SIZES.to_vec()), 1..4),
+                prop::option::of((0..ROOTS.len(), 0..BASES.len())),
+            )
+                .prop_flat_map(|(name, sizes, declared)| {
+                    let n = sizes.len();
+                    let copy = (
+                        0..ROOTS.len(),
+                        0..BASES.len(),
+                        prop::collection::vec(prop::bool::weighted(0.8), n),
+                    );
+                    prop::collection::vec(copy, 0..3).prop_map(move |copies| Spec {
+                        name,
+                        sizes: sizes.clone(),
+                        declared,
+                        copies,
+                    })
+                })
+        }
+
+        /// A library, the files on disk (its payload plus same-sized
+        /// decoys), and the orders the roots, each root's files and the
+        /// torrents are handed to the store in.
+        #[allow(clippy::type_complexity)]
+        fn world() -> impl Strategy<
+            Value = (
+                Vec<Spec>,
+                BTreeMap<(usize, String), u64>,
+                [Vec<usize>; 2],
+                [Vec<usize>; 2],
+                u64,
+            ),
+        > {
+            (
+                prop::collection::vec(spec(), 1..4),
+                prop::collection::vec(
+                    (
+                        0..ROOTS.len(),
+                        "[a-c]{1,2}(/[a-c]{1,2})?\\.bin",
+                        prop::sample::select(SIZES.to_vec()),
+                    ),
+                    0..5,
+                ),
+            )
+                .prop_flat_map(|(specs, decoys)| {
+                    let mut disk = payload(&specs);
+                    for (root, rel, size) in decoys {
+                        disk.entry((root, rel)).or_insert(size);
+                    }
+                    let roots: Vec<usize> = (0..ROOTS.len()).collect();
+                    let torrents: Vec<usize> = (0..specs.len()).collect();
+                    (
+                        Just(specs),
+                        Just(disk),
+                        [
+                            Just(roots.clone()).prop_shuffle(),
+                            Just(roots).prop_shuffle(),
+                        ],
+                        [
+                            Just(torrents.clone()).prop_shuffle(),
+                            Just(torrents).prop_shuffle(),
+                        ],
+                        any::<u64>(),
+                    )
+                })
+        }
+
+        /// The files each spec's copies put on disk, keyed by root and
+        /// root-relative path.
+        fn payload(specs: &[Spec]) -> BTreeMap<(usize, String), u64> {
+            let mut disk = BTreeMap::new();
+            for s in specs {
+                for (root, base, present) in &s.copies {
+                    for (j, here) in present.iter().enumerate() {
+                        if *here {
+                            let rel = s.rel(j);
+                            let path = if BASES[*base].is_empty() {
+                                rel
+                            } else {
+                                format!("{}/{rel}", BASES[*base])
+                            };
+                            disk.entry((*root, path)).or_insert(s.sizes[j]);
+                        }
+                    }
+                }
+            }
+            disk
+        }
+
+        /// Build the store, handing it roots, files and torrents in the
+        /// given orders; each root's files are shuffled by `seed`.
+        fn build(
+            specs: &[Spec],
+            disk: &BTreeMap<(usize, String), u64>,
+            root_order: &[usize],
+            torrent_order: &[usize],
+            seed: u64,
+        ) -> PoolStore {
+            let mut store = PoolStore::open_in_memory().unwrap();
+            for &r in root_order {
+                let id = store.upsert_root(Path::new(ROOTS[r])).unwrap();
+                let mut files: Vec<PoolFile> = disk
+                    .iter()
+                    .filter(|((root, _), _)| *root == r)
+                    .enumerate()
+                    .map(|(i, ((_, rel), size))| PoolFile {
+                        root_id: id,
+                        rel_path: rel.clone(),
+                        size: *size,
+                        mtime_ns: 0,
+                        ino: (r * 1000 + i) as u64,
+                        dev: 1,
+                        v2_root: None,
+                    })
+                    .collect();
+                // A seeded rotation and reversal: enough to vary the order
+                // two builds stage the same rows in.
+                if !files.is_empty() {
+                    let k = (seed as usize) % files.len();
+                    files.rotate_left(k);
+                    if seed & (1 << 63) != 0 {
+                        files.reverse();
+                    }
+                }
+                store.replace_root_files(id, &files, 0).unwrap();
+            }
+            for &t in torrent_order {
+                let s = &specs[t];
+                let ih = format!("{t:02x}");
+                store
+                    .upsert_torrent(
+                        &PoolTorrent {
+                            infohash: ih.clone(),
+                            infohash_v1: Some(ih.clone()),
+                            infohash_v2: None,
+                            name: s.name.to_owned(),
+                            total_size: s.sizes.iter().sum(),
+                            num_files: s.sizes.len(),
+                            source_path: PathBuf::from(format!("/library/{ih}.torrent")),
+                            fastresume_path: None,
+                            declared_save_path: s
+                                .declared
+                                .map(|(r, b)| format!("{}/{}", ROOTS[r], BASES[b])),
+                            category: None,
+                            tags: vec![],
+                            profile: None,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                let rows: Vec<TorrentFileRow> = s
+                    .sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(j, size)| TorrentFileRow {
+                        infohash: ih.clone(),
+                        idx: j as i64,
+                        rel_path: s.rel(j),
+                        size: *size,
+                        pieces_root: None,
+                        pad_file: false,
+                    })
+                    .collect();
+                store.replace_torrent_files(&ih, &rows).unwrap();
+            }
+            store
+        }
+
+        type Verdict = (
+            Option<AdoptionState>,
+            Option<(PathBuf, String)>,
+            Vec<(PathBuf, String)>,
+        );
+
+        /// Every torrent's verdict, base and claims, with roots named by
+        /// path rather than by the id their insertion order gave them.
+        fn verdicts(store: &PoolStore, n: usize) -> Vec<Verdict> {
+            let roots: HashMap<i64, PathBuf> = store.roots().unwrap().into_iter().collect();
+            (0..n)
+                .map(|t| {
+                    let ih = format!("{t:02x}");
+                    let mut claims: Vec<(PathBuf, String)> = store
+                        .claims_of(&ih)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(r, p)| (roots[&r].clone(), p))
+                        .collect();
+                    claims.sort();
+                    (
+                        store.adoption_state(&ih).unwrap(),
+                        store
+                            .adoption_base(&ih)
+                            .unwrap()
+                            .map(|(r, b)| (roots[&r].clone(), b)),
+                        claims,
+                    )
+                })
+                .collect()
+        }
+
+        /// Each torrent's note after one match of a pool holding `specs`, as
+        /// the library listing reports it, in infohash order.
+        fn notes_after_match(specs: &[Spec]) -> Vec<Option<String>> {
+            let order: Vec<usize> = (0..specs.len()).collect();
+            let mut store = build(specs, &payload(specs), &[0, 1, 2], &order, 0);
+            match_all(&mut store).unwrap();
+            store
+                .torrents_page(None, None, specs.len())
+                .unwrap()
+                .into_iter()
+                .map(|l| l.note)
+                .collect()
+        }
+
+        /// A torrent whose files sit at `copies`, each `(root, base, which
+        /// files are there)`.
+        fn show(copies: Vec<(usize, usize, Vec<bool>)>) -> Spec {
+            Spec {
+                name: "Show",
+                sizes: vec![100, 200],
+                declared: None,
+                copies,
+            }
+        }
+
+        /// The note is how an operator learns why a delete plan refuses a
+        /// torrent's payload: it says so for two complete copies, and says
+        /// nothing for one.
+        #[test]
+        fn a_second_complete_copy_is_noted_and_a_single_copy_is_not() {
+            let both = vec![true, true];
+            assert_eq!(
+                notes_after_match(&[show(vec![(0, 0, both.clone())])]),
+                [None]
+            );
+            assert_eq!(
+                notes_after_match(&[show(vec![(0, 0, both.clone()), (1, 0, both)])]),
+                [Some(
+                    "2 complete copies under the managed roots; delete plans refuse to touch \
+                     any of them until only one is left"
+                        .to_owned()
+                )],
+            );
+        }
+
+        /// A partial torrent's note counts the files that resolved.
+        #[test]
+        fn a_partial_torrent_notes_how_many_files_are_present() {
+            let notes = notes_after_match(&[show(vec![(0, 0, vec![true, false])])]);
+            assert_eq!(notes, [Some("1 of 2 files present".to_owned())]);
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Which torrent owns which bytes does not depend on the order
+            /// the roots were configured in, the order a walk listed each
+            /// root's files in, or the order the library was read in: two
+            /// builds of the same pool match to the same verdicts, bases,
+            /// claims and counts, on the first match and on a rematch.
+            #[test]
+            fn matching_is_invariant_under_root_and_file_order(
+                (specs, disk, roots, torrents, seed) in world(),
+            ) {
+                let mut a = build(&specs, &disk, &roots[0], &torrents[0], seed);
+                let mut b = build(&specs, &disk, &roots[1], &torrents[1], seed.rotate_left(17) ^ (1 << 63));
+                for round in 0..2 {
+                    let (sa, sb) = (match_all(&mut a).unwrap(), match_all(&mut b).unwrap());
+                    prop_assert_eq!(&sa, &sb, "round {}", round);
+                    prop_assert_eq!(verdicts(&a, specs.len()), verdicts(&b, specs.len()), "round {}", round);
+                }
+            }
+        }
+    }
 }

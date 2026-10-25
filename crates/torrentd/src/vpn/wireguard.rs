@@ -58,6 +58,13 @@ pub enum ProbeUnavailable {
     Refused,
     /// `wg` produced output this code could not parse.
     Unparseable,
+    /// The VPN monitor's probes of the tunnel, `wg` among them, did not
+    /// return within its timeout: whether `wg` itself would have answered is
+    /// not known.
+    TimedOut,
+    /// The VPN monitor's probe task failed (it panicked or was cancelled)
+    /// before `wg` answered: a daemon fault, not the tool's.
+    TaskFailed,
 }
 
 impl ProbeUnavailable {
@@ -66,6 +73,8 @@ impl ProbeUnavailable {
             ProbeUnavailable::NoTool => "no_tool",
             ProbeUnavailable::Refused => "refused",
             ProbeUnavailable::Unparseable => "unparseable",
+            ProbeUnavailable::TimedOut => "timed_out",
+            ProbeUnavailable::TaskFailed => "task_failed",
         }
     }
 }
@@ -97,7 +106,53 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
     if !out.status.success() {
         return Err(ProbeUnavailable::Refused);
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
+    match parse_latest_handshake(&String::from_utf8_lossy(&out.stdout), now)? {
+        Handshake::Never => Ok(None),
+        Handshake::Age(age) => Ok(Some(age)),
+        Handshake::Ahead { skew_secs } => {
+            // The handshake is stamped in our future, so one of the two clocks
+            // has moved. Treating that as an enormous age is the dangerous
+            // reading: it would fence a healthy profile permanently, and
+            // fencing requires an operator to undo. Report it as fresh and say
+            // why.
+            warn!(
+                target: "torrentd::vpn::wireguard",
+                vpn_iface = %iface,
+                skew_secs,
+                "latest handshake is in the future; treating the tunnel as fresh \
+                 (check clock sync on this host)",
+            );
+            Ok(Some(Duration::ZERO))
+        }
+    }
+}
+
+/// The freshest handshake `wg show <iface> latest-handshakes` reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Handshake {
+    /// No peer has handshaked, or the link has no peers.
+    Never,
+    /// The freshest peer handshaked this long ago.
+    Age(Duration),
+    /// The freshest handshake is stamped `skew_secs` past `now`.
+    Ahead { skew_secs: u64 },
+}
+
+/// [`latest_handshake_age`]'s reading of `wg show <iface> latest-handshakes`,
+/// which prints `<pubkey>\t<unix_secs>` per peer, `0` for a peer that never
+/// handshaked. The freshest across peers is taken, and a line whose time does
+/// not read is passed over; output in which no line reads at all is
+/// [`ProbeUnavailable::Unparseable`], which an empty output, a link with no
+/// peers, is not.
+///
+/// `now` is the host's clock in seconds since the epoch, `None` where it
+/// cannot be read: a handshake then has no age to give, and is
+/// `Unparseable` too.
+fn parse_latest_handshake(text: &str, now: Option<u64>) -> Result<Handshake, ProbeUnavailable> {
     let Some(latest) = text
         .lines()
         .filter_map(|l| l.split_whitespace().nth(1))
@@ -107,33 +162,22 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
         // Output we could not read at all is not the same as a tunnel with no
         // peers, which prints a line per peer with a 0.
         return if text.trim().is_empty() {
-            Ok(None)
+            Ok(Handshake::Never)
         } else {
             Err(ProbeUnavailable::Unparseable)
         };
     };
     if latest == 0 {
-        return Ok(None); // never handshaked → no liveness signal yet
+        return Ok(Handshake::Never); // never handshaked → no liveness signal yet
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ProbeUnavailable::Unparseable)?
-        .as_secs();
-    if latest > now {
-        // The handshake is stamped in our future, so one of the two clocks has
-        // moved. Treating that as an enormous age is the dangerous reading: it
-        // would fence a healthy profile permanently, and fencing requires an
-        // operator to undo. Report it as fresh and say why.
-        warn!(
-            target: "torrentd::vpn::wireguard",
-            vpn_iface = %iface,
-            skew_secs = latest - now,
-            "latest handshake is in the future; treating the tunnel as fresh \
-             (check clock sync on this host)",
-        );
-        return Ok(Some(Duration::ZERO));
-    }
-    Ok(Some(Duration::from_secs(now - latest)))
+    let now = now.ok_or(ProbeUnavailable::Unparseable)?;
+    Ok(if latest > now {
+        Handshake::Ahead {
+            skew_secs: latest - now,
+        }
+    } else {
+        Handshake::Age(Duration::from_secs(now - latest))
+    })
 }
 
 /// A WireGuard link's byte counters, summed across its peers.
@@ -662,10 +706,11 @@ impl From<Ownership> for Adoption {
 /// [`Ownership::Unestablished`], which exempts it from every teardown:
 ///
 /// * the live link carries the public key the profile's config derives; or
-/// * the profile carries no key (`PostUp = wg set %i private-key …` keeps it
-///   out of the `.conf`) and `raised_here`: a record written on this boot of
-///   this host names this interface *and* the key the live link carries now
-///   (see [`RaisedInterfaces::recorded`]). The key is what tells the link
+/// * the profile carries no key this boot can derive (no `PrivateKey` line, or
+///   a config it cannot read; the hooks that once kept the key out of the
+///   `.conf` are refused by [`native::parse`]) and `raised_here`: a record
+///   written on this boot of this host names this interface *and* the key
+///   the live link carries now (see [`RaisedInterfaces::recorded`]). The key is what tells the link
 ///   this daemon raised from one that took the name after it was freed.
 ///
 /// The record decides only the keyless case. Two readable keys settle it
@@ -962,11 +1007,14 @@ impl WireguardManager {
 ///    `Table = off` skips this step, as it does for `wg-quick`. The rules and
 ///    table are `vpn::route`'s, shared with OpenVPN.
 /// 5. **The health monitor's route probe, once.** `ip route get 1.1.1.1 from
-///    <address>` must leave by the link, or the profile would be fenced
-///    `route_mismatch` on its first poll. Asked after routing for every
-///    config, so it also catches a `Table = off` link that nothing of the
-///    operator's routes through the tunnel. A split `AllowedIPs` that does not
-///    cover `1.1.1.1` is refused at parse time, before anything is created.
+///    <address>` must leave by the link, and so must
+///    `ip route get 2606:4700:4700::1111 from <address>` from each global
+///    IPv6 `Address`, or the profile would be fenced `route_mismatch` on its
+///    first poll. Asked after routing for every config, so it also catches a
+///    `Table = off` link that nothing of the operator's routes through the
+///    tunnel. A split `AllowedIPs` that does not cover `1.1.1.1`, or (with a
+///    global IPv6 `Address`) `2606:4700:4700::1111`, is refused at parse
+///    time, before anything is created.
 ///
 /// Any failure after step 1 removes what this call made — the rules and the
 /// link — the same way `wg-quick`'s own exit trap does. A failure in step 4
@@ -988,6 +1036,7 @@ impl WireguardManager {
 mod native {
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
     use std::path::Path;
 
     use tracing::warn;
@@ -998,6 +1047,7 @@ mod native {
     use super::super::route::RouteProbe;
     use super::super::route::RouteProbeUnavailable;
     use super::super::route::PROBE_DEST;
+    use super::super::route::PROBE_DEST_V6;
 
     /// Why [`up`] did not leave a link up.
     #[derive(Debug, PartialEq, Eq)]
@@ -1020,21 +1070,28 @@ mod native {
         }
     }
 
-    /// Whether the IPv4 prefix `prefix` (`a.b.c.d[/len]`) holds `addr`. A
-    /// prefix that does not parse holds nothing.
-    fn covers(prefix: &str, addr: Ipv4Addr) -> bool {
+    /// Whether the prefix `prefix` (`a.b.c.d[/len]` or `x:y::z[/len]`) holds
+    /// `addr`. A prefix that does not parse, or is of the other address
+    /// family, holds nothing.
+    fn covers(prefix: &str, addr: IpAddr) -> bool {
         let (net, len) = match prefix.split_once('/') {
             Some((net, len)) => (net, len.parse::<u32>().ok()),
-            None => (prefix, Some(32)),
+            None => (prefix, None),
         };
-        let (Ok(net), Some(len)) = (net.trim().parse::<Ipv4Addr>(), len) else {
-            return false;
+        let (bits, net, addr) = match (net.trim().parse::<IpAddr>(), addr) {
+            (Ok(IpAddr::V4(net)), IpAddr::V4(addr)) => {
+                (32, u128::from(u32::from(net)), u128::from(u32::from(addr)))
+            }
+            (Ok(IpAddr::V6(net)), IpAddr::V6(addr)) => (128, u128::from(net), u128::from(addr)),
+            _ => return false,
         };
-        if len > 32 {
+        let len = len.unwrap_or(bits);
+        if len > bits {
             return false;
         }
-        let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
-        u32::from(net) & mask == u32::from(addr) & mask
+        // The bits the prefix fixes are the top `len` of `bits`; a shift of
+        // the whole width (`/0`) leaves nothing to differ.
+        (net ^ addr).checked_shr(bits - len).unwrap_or(0) == 0
     }
 
     /// The first IPv4 `Address`, without its prefix length: the address the
@@ -1043,6 +1100,25 @@ mod native {
         addresses
             .iter()
             .find_map(|a| a.split('/').next().unwrap_or(a).trim().parse().ok())
+    }
+
+    /// The IPv6 `Address`es the health monitor probes from besides the IPv4
+    /// one, without their prefix lengths: those the kernel gives global
+    /// scope, which are the ones `ip -6 addr show scope global` lists
+    /// (`route::v6_sources`). That is every unicast address but loopback,
+    /// link-local (`fe80::/10`) and the deprecated site-local `fec0::/10`.
+    fn probed_v6(addresses: &[String]) -> Vec<Ipv6Addr> {
+        addresses
+            .iter()
+            .filter_map(|a| a.split('/').next().unwrap_or(a).trim().parse().ok())
+            .filter(|a: &Ipv6Addr| {
+                !a.is_unspecified()
+                    && !a.is_loopback()
+                    && !a.is_multicast()
+                    && !a.is_unicast_link_local()
+                    && a.segments()[0] & 0xffc0 != 0xfec0
+            })
+            .collect()
     }
 
     /// `wg-quick`'s MTU for a 1500-byte path, used when the config sets none.
@@ -1269,7 +1345,10 @@ mod native {
         // one, and a link without one never finishes coming up.
         if p.route
             && first_v4(&p.addresses).is_some()
-            && !p.allowed_ips.iter().any(|a| covers(a, PROBE_DEST))
+            && !p
+                .allowed_ips
+                .iter()
+                .any(|a| covers(a, IpAddr::V4(PROBE_DEST)))
         {
             return Err(format!(
                 "AllowedIPs = {} does not cover {PROBE_DEST}: the daemon routes only AllowedIPs \
@@ -1279,6 +1358,30 @@ mod native {
                  (AllowedIPs = 0.0.0.0/0, plus ::/0 for IPv6)",
                 p.allowed_ips.join(", "),
             ));
+        }
+        // The monitor asks the same of each global IPv6 address, toward
+        // `PROBE_DEST_V6`: a session listens on the device and so sends from
+        // each of them. An IPv6 address whose `AllowedIPs` route no IPv6 to
+        // the internet is routed by the main table, and fenced the same way.
+        // Beside an IPv4 address only, as the monitor asks it.
+        if p.route
+            && first_v4(&p.addresses).is_some()
+            && !p
+                .allowed_ips
+                .iter()
+                .any(|a| covers(a, IpAddr::V6(PROBE_DEST_V6)))
+        {
+            if let Some(src) = probed_v6(&p.addresses).first() {
+                return Err(format!(
+                    "AllowedIPs = {} does not cover {PROBE_DEST_V6}: the health monitor also \
+                     asks where a packet from each IPv6 Address to {PROBE_DEST_V6} would go, \
+                     and the daemon routes only AllowedIPs through the tunnel, so with Address \
+                     {src} this profile would be fenced as route_mismatch on its first poll. \
+                     Route the full IPv6 range (add ::/0 to AllowedIPs), or remove the IPv6 \
+                     Address",
+                    p.allowed_ips.join(", "),
+                ));
+            }
         }
         Ok(p)
     }
@@ -1329,7 +1432,7 @@ mod native {
             |iface, addresses, prefixes| {
                 route::install(iface, addresses, prefixes).map_err(|e| e.to_string())
             },
-            |iface, src| route::probe(iface, src, IpAddr::V4(PROBE_DEST)),
+            |iface, src| route::probe(iface, src, route::probe_dest(src)),
         )
     }
 
@@ -1374,7 +1477,7 @@ mod native {
         p: &Parsed,
         mut run: impl FnMut(&str, &[&str], Option<&str>) -> Result<(), String>,
         install: impl FnOnce(&str, &[String], &[String]) -> Result<(), String>,
-        probe: impl FnOnce(&str, IpAddr) -> Result<RouteProbe, RouteProbeUnavailable>,
+        mut probe: impl FnMut(&str, IpAddr) -> Result<RouteProbe, RouteProbeUnavailable>,
     ) -> Result<(), UpFailure> {
         run("wg", &["setconf", iface, "/dev/stdin"], Some(&p.wg_conf))
             .map_err(|e| UpFailure::Refused(redact_echo(&e)))?;
@@ -1396,31 +1499,47 @@ mod native {
         if p.route {
             install(iface, &p.addresses, &p.allowed_ips).map_err(UpFailure::Unrouted)?;
         }
-        // The health monitor's first question, asked now. A probe that cannot
-        // run is the monitor's to report (`profile_vpn_route_probe_ok`), and
-        // it does not fence on one, so neither does this.
-        let Some(src) = first_v4(&p.addresses) else {
+        // The health monitor's first question, asked now, in the monitor's
+        // order: from the IPv4 address, then from each global IPv6 one,
+        // toward the destination of the source's family. The first answer
+        // that is not "by the tunnel" is the answer, as it is there. A probe
+        // that cannot run is the monitor's to report
+        // (`profile_vpn_route_probe_ok`), and it does not fence on one, so
+        // neither does this.
+        let Some(v4) = first_v4(&p.addresses) else {
             return Ok(());
         };
-        match probe(iface, IpAddr::V4(src)) {
-            Ok(RouteProbe::ViaTunnel) | Err(_) => Ok(()),
-            Ok(RouteProbe::Elsewhere(why)) if p.route => Err(UpFailure::Unrouted(format!(
-                "routing was installed, yet a packet from {src} to {PROBE_DEST} does not leave \
-                 by {iface} ({why}); another rule outranks the tunnel's"
-            ))),
-            // A link this call raised has no route of anyone else's naming
-            // it, since such a route can only be added once the link exists,
-            // so under `Table = off` this is what is answered for every link
-            // the daemon raises itself. It is still asked rather than assumed:
-            // the answer is the monitor's, whatever the reason.
-            Ok(RouteProbe::Elsewhere(why)) => Err(UpFailure::Unrouted(format!(
-                "Table = off, and nothing routes the tunnel's traffic through it: a packet from \
-                 {src} to {PROBE_DEST} does not leave by {iface} ({why}). The health monitor \
-                 asks exactly this each poll and would fence the profile as route_mismatch. \
-                 Use Table = auto, or raise the link with your own routing before the daemon \
-                 starts, which the daemon then adopts"
-            ))),
+        let sources = std::iter::once(IpAddr::V4(v4))
+            .chain(probed_v6(&p.addresses).into_iter().map(IpAddr::V6));
+        for src in sources {
+            let dest = route::probe_dest(src);
+            let why = match probe(iface, src) {
+                Ok(RouteProbe::ViaTunnel) => continue,
+                Err(_) => return Ok(()),
+                Ok(RouteProbe::Elsewhere(why)) => why,
+            };
+            return Err(UpFailure::Unrouted(if p.route {
+                format!(
+                    "routing was installed, yet a packet from {src} to {dest} does not leave \
+                     by {iface} ({why}); another rule outranks the tunnel's"
+                )
+            } else {
+                // A link this call raised has no route of anyone else's
+                // naming it, since such a route can only be added once the
+                // link exists, so under `Table = off` this is what is
+                // answered for every link the daemon raises itself. It is
+                // still asked rather than assumed: the answer is the
+                // monitor's, whatever the reason.
+                format!(
+                    "Table = off, and nothing routes the tunnel's traffic through it: a packet \
+                     from {src} to {dest} does not leave by {iface} ({why}). The health \
+                     monitor asks exactly this each poll and would fence the profile as \
+                     route_mismatch. Use Table = auto, or raise the link with your own routing \
+                     before the daemon starts, which the daemon then adopts"
+                )
+            }));
         }
+        Ok(())
     }
 
     /// Remove the link, then the rules this module added for it. Routes in
@@ -1457,1507 +1576,4 @@ mod native {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::process::Command;
-
-    use super::*;
-
-    #[test]
-    fn native_teardown_removes_the_link_before_its_rules() {
-        // Rules first left the tunnel's source address routed by the main
-        // table for as long as the link teardown took: a leak out of the
-        // host's own interface.
-        let mut seen: Vec<String> = Vec::new();
-        let mut rules_left = 2;
-        native::down_with("wg-a", Some(51_820), |args| {
-            seen.push(args.join(" "));
-            if args.get(2) == Some(&"rule") {
-                if rules_left == 0 {
-                    return Err("no such rule".into());
-                }
-                rules_left -= 1;
-            }
-            Ok(())
-        });
-        assert_eq!(
-            seen[0], "ip link delete dev wg-a",
-            "the link goes first: {seen:?}"
-        );
-        assert!(
-            seen[1..]
-                .iter()
-                .all(|c| c.contains(" rule del table 51820")),
-            "then only the rules: {seen:?}",
-        );
-        assert_eq!(
-            seen.iter().filter(|c| c.contains(" rule del ")).count(),
-            4,
-            "rules are deleted until none is left, in each family: {seen:?}",
-        );
-    }
-
-    #[test]
-    fn a_missing_interface_is_a_probe_failure_not_a_missing_handshake() {
-        // The distinction this enum exists for: an operator reading
-        // "no handshake yet" would wait, where the truth is that half the
-        // liveness check is not running.
-        let r = latest_handshake_age("torrentd-nonexistent-iface");
-        assert!(
-            matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
-            "got {r:?}",
-        );
-        let r = transfer("torrentd-nonexistent-iface");
-        assert!(
-            matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
-            "got {r:?}",
-        );
-    }
-
-    /// The counters are summed across peers; a link with no peers reads
-    /// zero, and a line that cannot be read fails the probe rather than
-    /// dropping that peer's traffic from the sum.
-    #[test]
-    fn transfer_sums_every_peer_and_refuses_a_line_it_cannot_read() {
-        assert_eq!(parse_transfer(""), Ok(Transfer::default()));
-        assert_eq!(
-            parse_transfer("pkA=\t100\t2000\npkB=\t5\t7\n"),
-            Ok(Transfer { rx: 105, tx: 2007 }),
-        );
-        for bad in ["pkA=\t100\n", "pkA=\tlots\t7\n", "pkA=\t1\t2\npkB=\n"] {
-            assert_eq!(
-                parse_transfer(bad),
-                Err(ProbeUnavailable::Unparseable),
-                "{bad:?}"
-            );
-        }
-    }
-
-    /// [`ownership`]'s truth table, and what each answer means to the
-    /// teardown path: only `Foreign` is exempt from it.
-    #[test]
-    fn ownership_is_decided_by_the_keys_then_the_record() {
-        use Adoption::Foreign;
-        use Adoption::No;
-        use Ownership::Absent;
-        use Ownership::Ours;
-        use Ownership::Unestablished;
-        #[rustfmt::skip]
-        let cases = [
-            // exists, raised_here, live key, profile key
-            ((false, false, None, None), Absent, No),
-            // A record for a link that is gone establishes nothing.
-            ((false, true, None, None), Absent, No),
-            ((true, false, Some("same"), Some("same")), Ours, No),
-            ((true, true, Some("same"), Some("same")), Ours, No),
-            ((true, false, Some("theirs"), Some("ours")), Unestablished, Foreign),
-            // A record does not outrank two keys that disagree.
-            ((true, true, Some("live"), Some("rotated")), Unestablished, Foreign),
-            // A keyless profile: the record decides.
-            ((true, false, Some("live"), None), Unestablished, Foreign),
-            ((true, true, Some("live"), None), Ours, No),
-            // A link whose own key will not read: not a WireGuard device this
-            // boot can identify, record or no record.
-            ((true, false, None, None), Unestablished, Foreign),
-            ((true, false, None, Some("expected")), Unestablished, Foreign),
-            ((true, true, None, None), Unestablished, Foreign),
-            ((true, true, None, Some("expected")), Unestablished, Foreign),
-        ];
-        for ((exists, raised, live, profile), owner, adoption) in cases {
-            let case = (exists, raised, live, profile);
-            assert_eq!(ownership(exists, raised, live, profile), owner, "{case:?}");
-            assert_eq!(
-                Adoption::from(ownership(exists, raised, live, profile)),
-                adoption,
-                "{case:?}",
-            );
-        }
-    }
-
-    /// The probe the exemption needs and `interface_public_key` cannot give
-    /// it: "no such link" told apart from "a link I cannot identify".
-    #[test]
-    fn the_existence_probe_answers_from_the_kernels_own_link_list() {
-        assert!(
-            !link_standing("torrentd-nonexistent-iface"),
-            "a name no link carries does not exist",
-        );
-        assert!(
-            link_standing("lo"),
-            "loopback always does, and it is not a WireGuard device — which \
-             is the pair of answers the keys alone conflate",
-        );
-    }
-
-    fn raised_in(dir: &std::path::Path, boot_id: &str) -> RaisedInterfaces {
-        RaisedInterfaces::with_boot_id(dir.to_path_buf(), Some(boot_id.to_string()))
-    }
-
-    /// The public key the live link carries when a record is written — the
-    /// second of the record's two witnesses. Base64 like a real one, because
-    /// nothing here parses it and everything here compares it.
-    const LIVE_KEY: &str = "SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=";
-
-    /// What something *else* is carrying after it takes the freed name.
-    const STRANGER_KEY: &str = "9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=";
-
-    /// The two-boot recovery, at the seam that carries it.
-    ///
-    /// Boot 1 raises `wg-a` and is SIGKILLed, so nothing tears it down. Boot 2
-    /// is a *different process* — everything boot 1 held in memory is gone —
-    /// and `wg-quick up` fails because the link exists. The record under
-    /// `Config::state_dir()` is what survives that, and it is what turns
-    /// `Unestablished` into `Ours` so `Adoption::Adopt` becomes reachable for
-    /// the one configuration for which it never was.
-    #[test]
-    fn a_boot_that_died_leaves_the_next_one_able_to_establish_ownership() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot_one = raised_in(dir.path(), "boot-id-of-this-host");
-        boot_one
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        drop(boot_one); // SIGKILL: no teardown, no `forget`.
-
-        let boot_two = raised_in(dir.path(), "boot-id-of-this-host");
-        assert!(
-            boot_two.recorded("wg-a", Some(LIVE_KEY)),
-            "the record outlives the process that wrote it, which is the \
-             point of putting it in the state directory — and the link it \
-             named is still carrying the key it was written from",
-        );
-        assert_eq!(
-            ownership(
-                true,
-                boot_two.recorded("wg-a", Some(LIVE_KEY)),
-                Some(LIVE_KEY),
-                None
-            ),
-            Ownership::Ours,
-        );
-    }
-
-    /// And the bound on that trust: a WireGuard link cannot outlive a reboot
-    /// of the host, but a file under `/var/lib` can.
-    ///
-    /// Without the boot-id scope, a record left by a daemon that died before a
-    /// reboot would vouch for any interface that took the same name
-    /// afterwards — the daemon tearing down a stranger's tunnel over a name
-    /// collision, which is exactly what the key-based exemption exists to
-    /// stop. Write the record without its boot id and this fails.
-    #[test]
-    fn a_record_from_an_earlier_boot_of_the_host_is_not_trusted() {
-        let dir = tempfile::tempdir().unwrap();
-        raised_in(dir.path(), "the-boot-that-raised-it")
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-
-        let after_reboot = raised_in(dir.path(), "a-different-boot-entirely");
-        assert!(
-            !after_reboot.recorded("wg-a", Some(LIVE_KEY)),
-            "a link this kernel never saw raised is not this daemon's to \
-             claim, even if the name and the key both happen to match",
-        );
-        assert_eq!(
-            ownership(
-                true,
-                after_reboot.recorded("wg-a", Some(LIVE_KEY)),
-                Some(LIVE_KEY),
-                None
-            ),
-            Ownership::Unestablished,
-            "so it falls back to the keys, and is left standing",
-        );
-    }
-
-    /// **The retaken name.** A record whose link was removed and whose name
-    /// something else then took, inside one host boot, establishes nothing.
-    #[test]
-    fn a_record_whose_name_was_retaken_inside_one_boot_establishes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot-throughout");
-        raised
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-
-        // The operator deletes the link; something else takes the name. Same
-        // kernel, same boot id, same interface name — a different link.
-        assert!(
-            !raised.recorded("wg-a", Some(STRANGER_KEY)),
-            "the record names a link by the key it carried, not a name; a \
-             link carrying someone else's key is not the one this boot raised",
-        );
-        assert_eq!(
-            ownership(
-                true,
-                raised.recorded("wg-a", Some(STRANGER_KEY)),
-                Some(STRANGER_KEY),
-                None,
-            ),
-            Ownership::Unestablished,
-            "so the keyless profile meets a link it cannot identify, and \
-             `Unestablished` is what stops it being adopted",
-        );
-        assert_eq!(
-            Adoption::from(ownership(
-                true,
-                raised.recorded("wg-a", Some(STRANGER_KEY)),
-                Some(STRANGER_KEY),
-                None,
-            )),
-            Adoption::Foreign,
-            "the profile fences and the stranger's tunnel is left exactly as it \
-             was found — never adopted, never torn down",
-        );
-        assert!(
-            raised.recorded("wg-a", Some(LIVE_KEY)),
-            "and the record still answers for the link it was written from, \
-             or this would close the hole by disabling the recovery",
-        );
-    }
-
-    /// A link whose key will not read is claimed by nobody, and neither is one
-    /// recorded by a boot that could not read a key to record.
-    ///
-    /// Both are the absent-witness case, and both must answer "no": a record
-    /// that matches when there is nothing to compare it against is the
-    /// name-only claim the key witness exists to remove. A record written
-    /// before this change carries an empty key line and reads the same way.
-    #[test]
-    fn a_record_with_no_key_to_compare_establishes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-
-        raised
-            .record("wg-blind", None)
-            .expect("a temporary directory accepts a write");
-        assert!(
-            raised.path("wg-blind").exists(),
-            "the record is written — the boot id is readable",
-        );
-        assert!(
-            !raised.recorded("wg-blind", Some(LIVE_KEY)),
-            "but a record with no key in it names no link",
-        );
-
-        raised
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        assert!(
-            !raised.recorded("wg-a", None),
-            "and a link whose own key will not read cannot be matched against \
-             one",
-        );
-
-        // The on-disk shape a boot before this change left behind.
-        std::fs::write(raised.path("wg-old"), "one-boot\n").unwrap();
-        assert!(
-            !raised.recorded("wg-old", Some(LIVE_KEY)),
-            "a record in the old boot-id-only shape claims nothing, which is \
-             the safe direction across an upgrade",
-        );
-    }
-
-    /// A host that cannot answer what boot it is on never claims anything —
-    /// the conservative direction, and the behaviour before the record
-    /// existed.
-    #[test]
-    fn an_unreadable_boot_id_writes_no_claim_and_believes_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let blind = RaisedInterfaces::with_boot_id(dir.path().to_path_buf(), None);
-        blind
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        assert!(
-            !blind.path("wg-a").exists(),
-            "a claim with nothing to scope it is not written",
-        );
-        assert!(!blind.recorded("wg-a", Some(LIVE_KEY)));
-    }
-
-    /// Teardown drops the claim with the interface, or the next boot vouches
-    /// for a link this one removed.
-    #[test]
-    fn tearing_the_interface_down_drops_the_claim() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        raised
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        assert!(raised.recorded("wg-a", Some(LIVE_KEY)));
-        raised.forget("wg-a");
-        assert!(!raised.recorded("wg-a", Some(LIVE_KEY)));
-        assert!(!raised.path("wg-a").exists());
-    }
-
-    /// **A teardown that left the link standing keeps the record.**
-    #[test]
-    fn a_teardown_that_left_the_link_standing_keeps_the_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        raised
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        let mgr = WireguardManager::with_raised(raised.clone());
-
-        // The teardown ran and the link is still there.
-        mgr.drop_record_if_gone("wg-a", |_| true);
-        assert!(
-            raised.recorded("wg-a", Some(LIVE_KEY)),
-            "the link is still standing and still ours, so the one thing that \
-             can still adopt it stays on disk",
-        );
-
-        // And the ordinary teardown, where the link really did go.
-        mgr.drop_record_if_gone("wg-a", |_| false);
-        assert!(
-            !raised.recorded("wg-a", Some(LIVE_KEY)),
-            "a claim over a link that is gone would vouch for whatever takes \
-             the name next",
-        );
-        assert!(!raised.path("wg-a").exists());
-    }
-
-    /// A record whose interface is not standing is swept before any bring-up
-    /// can consult it, and the file is gone.
-    #[test]
-    fn a_record_whose_interface_is_gone_is_swept_before_anything_reads_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        raised
-            .record("wg-gone", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        raised
-            .record("wg-still-here", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        // A file that is not a record of ours shares the directory — the
-        // OpenVPN pid file is the neighbour this must not touch.
-        std::fs::write(dir.path().join("openvpn-tun0.pid"), "123\n").unwrap();
-
-        let dropped = raised
-            .sweep_with(|iface| iface == "wg-still-here")
-            .expect("a readable state directory");
-
-        assert_eq!(dropped, vec!["wg-gone".to_string()]);
-        assert!(
-            !raised.path("wg-gone").exists(),
-            "a record for a link that is not standing is spent, and the file \
-             is what a later boot would believe",
-        );
-        assert!(
-            raised.path("wg-still-here").exists(),
-            "and a record for a link that is standing is left alone",
-        );
-        assert!(
-            dir.path().join("openvpn-tun0.pid").exists(),
-            "the sweep owns `wireguard-<iface>.raised` and nothing else in \
-             the directory it shares",
-        );
-
-        // And the entry point `boot` calls, against the kernel's own link
-        // list rather than a predicate.
-        let at_boot = tempfile::tempdir().unwrap();
-        let gone = at_boot
-            .path()
-            .join("wireguard-torrentd-nonexistent-iface.raised");
-        let standing = at_boot.path().join("wireguard-lo.raised");
-        std::fs::write(&gone, "any-boot\n").unwrap();
-        std::fs::write(&standing, "any-boot\n").unwrap();
-
-        sweep_raised_records(at_boot.path());
-
-        assert!(!gone.exists(), "swept before any `bring_up` can consult it");
-        assert!(
-            standing.exists(),
-            "loopback is standing, so its record stays"
-        );
-
-        // A state directory that does not exist yet is not an error to sweep.
-        sweep_raised_records(&at_boot.path().join("not-created-yet"));
-    }
-
-    /// The scenario in #105: an earlier run raised `wg-old` and died, and the
-    /// profile was then removed from the config. The record still names the
-    /// link by this boot and its key, so the link and its rules go, and the
-    /// record with them.
-    #[test]
-    fn a_link_the_record_vouches_for_is_released_and_its_record_spent() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        raised.record("wg-old", Some(LIVE_KEY)).unwrap();
-        let mgr = WireguardManager::with_raised(raised.clone());
-
-        let standing = std::cell::Cell::new(true);
-        let downed = std::cell::RefCell::new(Vec::<String>::new());
-        let outcome = mgr.release_with(
-            "wg-old",
-            |_| standing.get(),
-            |_| Some(LIVE_KEY.to_string()),
-            |iface| {
-                downed.borrow_mut().push(iface.to_string());
-                standing.set(false);
-            },
-        );
-        assert_eq!(outcome, Released::Removed);
-        assert_eq!(*downed.borrow(), ["wg-old"], "the native teardown ran");
-        assert!(
-            !raised.path("wg-old").exists(),
-            "and the record went with it"
-        );
-    }
-
-    /// A record that does not name the link standing now (a stranger took
-    /// the name, or the key will not read) never tears it down. The record is
-    /// spent either way, as adoption spends it.
-    #[test]
-    fn a_link_the_record_does_not_vouch_for_is_left_alone() {
-        for live in [Some(STRANGER_KEY.to_string()), None] {
-            let dir = tempfile::tempdir().unwrap();
-            let raised = raised_in(dir.path(), "one-boot");
-            raised.record("wg-old", Some(LIVE_KEY)).unwrap();
-            let mgr = WireguardManager::with_raised(raised.clone());
-
-            let outcome = mgr.release_with(
-                "wg-old",
-                |_| true,
-                |_| live.clone(),
-                |_| panic!("a link the record does not vouch for is not torn down ({live:?})"),
-            );
-            assert_eq!(outcome, Released::NotOurs, "{live:?}");
-            assert!(!raised.path("wg-old").exists(), "{live:?}");
-        }
-
-        // A record from an earlier boot of the host vouches for nothing.
-        let dir = tempfile::tempdir().unwrap();
-        raised_in(dir.path(), "an-earlier-boot")
-            .record("wg-old", Some(LIVE_KEY))
-            .unwrap();
-        let mgr = WireguardManager::with_raised(raised_in(dir.path(), "this-boot"));
-        let outcome = mgr.release_with(
-            "wg-old",
-            |_| true,
-            |_| Some(LIVE_KEY.to_string()),
-            |_| panic!("not this boot's link"),
-        );
-        assert_eq!(outcome, Released::NotOurs);
-    }
-
-    /// A teardown that left the link standing keeps the record, as
-    /// `bring_down` does, and a record whose link is gone is dropped without
-    /// a teardown.
-    #[test]
-    fn a_release_that_leaves_the_link_keeps_the_record_and_a_gone_link_drops_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        raised.record("wg-stuck", Some(LIVE_KEY)).unwrap();
-        raised.record("wg-gone", Some(LIVE_KEY)).unwrap();
-        let mgr = WireguardManager::with_raised(raised.clone());
-
-        let outcome =
-            mgr.release_with("wg-stuck", |_| true, |_| Some(LIVE_KEY.to_string()), |_| {});
-        assert_eq!(outcome, Released::LeftStanding);
-        assert!(raised.recorded("wg-stuck", Some(LIVE_KEY)));
-
-        let outcome = mgr.release_with(
-            "wg-gone",
-            |_| false,
-            |_| panic!("no link, so no key to read"),
-            |_| panic!("no link, so nothing to tear down"),
-        );
-        assert_eq!(outcome, Released::Gone);
-        assert!(!raised.path("wg-gone").exists());
-    }
-
-    /// `release_recorded` looks only at interfaces `keep` does not name, and
-    /// only at this module's records in the directory it shares.
-    #[test]
-    fn release_recorded_skips_what_keep_names_and_files_that_are_not_records() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in [
-            "wireguard-torrentd-nx-a.raised",
-            "wireguard-torrentd-nx-b.raised",
-            "wireguard-.raised",
-            "openvpn-tun0.pid",
-        ] {
-            std::fs::write(dir.path().join(name), "any-boot\n").unwrap();
-        }
-        let released =
-            release_recorded(dir.path(), |iface| iface == "torrentd-nx-b").expect("readable");
-        assert_eq!(
-            released,
-            [("torrentd-nx-a".to_string(), Released::Gone)],
-            "the kept interface is not looked at, and neither is a file that is not a record",
-        );
-        assert!(dir.path().join("wireguard-torrentd-nx-b.raised").exists());
-        assert!(dir.path().join("openvpn-tun0.pid").exists());
-
-        assert!(
-            release_recorded(&dir.path().join("never-created"), |_| false)
-                .unwrap()
-                .is_empty(),
-            "no state directory is no records",
-        );
-    }
-
-    /// An unreadable state directory is **reported**, not read as "no
-    /// records"; a missing one is no records.
-    #[test]
-    fn a_state_directory_that_cannot_be_read_is_reported_rather_than_read_as_empty() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let missing = dir.path().join("never-created");
-        assert!(raised_in(&missing, "one-boot")
-            .sweep_with(|_| false)
-            .expect("a directory that is not there is no records to sweep")
-            .is_empty(),);
-
-        // A *file* where the state directory should be cannot be read as one,
-        // and that is a failure rather than an emptiness.
-        let blocked = dir.path().join("a-file");
-        std::fs::write(&blocked, "").unwrap();
-        let err = raised_in(&blocked, "one-boot")
-            .sweep_with(|_| false)
-            .expect_err("a state directory that cannot be read is reported");
-        assert_ne!(
-            err.kind(),
-            std::io::ErrorKind::NotFound,
-            "and it is told apart from the tolerated-missing case, or the \
-             report is back to being a swallow with extra steps",
-        );
-    }
-
-    /// `record` creates the state directory it writes into, and says so when
-    /// it cannot.
-    #[test]
-    fn a_record_creates_the_state_directory_it_writes_into() {
-        let dir = tempfile::tempdir().unwrap();
-        let absent = dir.path().join("relocated").join("state");
-        assert!(!absent.exists(), "the directory does not exist yet");
-
-        let raised = raised_in(&absent, "one-boot");
-        raised
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a missing state directory is created, not reported");
-
-        assert!(
-            raised.recorded("wg-a", Some(LIVE_KEY)),
-            "and the record is readable back",
-        );
-
-        // And a failure is returned rather than swallowed: a *file* where the
-        // directory should be cannot be created into.
-        let blocked = dir.path().join("a-file");
-        std::fs::write(&blocked, "").unwrap();
-        let err = raised_in(&blocked.join("state"), "one-boot")
-            .record("wg-a", Some(LIVE_KEY))
-            .expect_err("a state directory that cannot exist is reported");
-        assert!(
-            !err.to_string().is_empty(),
-            "the caller has something to log against the path",
-        );
-    }
-
-    /// Any outcome that is not an adoption spends the record — and the probes
-    /// run even when there is one.
-    ///
-    /// `lo` always exists, is never a WireGuard device, and has an address: a
-    /// record for it must not get it adopted.
-    #[test]
-    fn a_link_this_boot_cannot_identify_is_refused_and_its_record_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        raised
-            .record("lo", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        assert!(
-            raised.path("lo").exists(),
-            "the record is in place to be believed",
-        );
-
-        let mgr = WireguardManager::with_raised(raised.clone());
-        let profile = VpnTunnel {
-            r#type: torrentd_engine::VpnType::Wireguard,
-            interface: "lo".to_string(),
-            // No such file, so `profile_public_key` reads `None` — the keyless
-            // profile the record exists for.
-            config_path: dir.path().join("no-such-profile.conf"),
-        };
-
-        assert_eq!(
-            mgr.adoptable(&profile),
-            Adoption::Foreign,
-            "`wg show lo public-key` answers nothing, so no key identifies \
-             this link as ours and no record may stand in for one",
-        );
-        assert!(
-            !raised.path("lo").exists(),
-            "and the record that pointed at it is spent, or the next boot \
-             makes the same claim again",
-        );
-    }
-
-    /// The destructive branch, shut.
-    ///
-    /// A non-adoption over a link that was **already standing** when the
-    /// bring-up started is `ForeignInterface`, never `Spawn`, which the caller
-    /// tears down; one over a name that was free is `Spawn`.
-    #[test]
-    fn a_link_that_was_standing_before_the_attempt_is_never_torn_down() {
-        let spawn_text = "wg-quick up exited with exit status: 1";
-
-        assert!(
-            matches!(
-                refusal("wg-a", true, Adoption::No, spawn_text),
-                Err(VpnError::ForeignInterface { .. })
-            ),
-            "a refusal over a link this attempt did not create fences the \
-             profile; `Spawn` here is what reached the teardown arm",
-        );
-        assert!(
-            matches!(
-                refusal("wg-a", true, Adoption::Foreign, spawn_text),
-                Err(VpnError::ForeignInterface { .. })
-            ),
-            "and the key-based refusal is unchanged",
-        );
-        assert!(
-            matches!(
-                refusal("wg-a", false, Adoption::No, spawn_text),
-                Err(VpnError::Spawn(_))
-            ),
-            "while a bring-up that found the name free owns whatever \
-             `wg-quick up` half-created, and that is the one failure the \
-             teardown arm exists for",
-        );
-        assert!(
-            matches!(
-                refusal("wg-a", false, Adoption::Foreign, spawn_text),
-                Err(VpnError::ForeignInterface { .. })
-            ),
-            "a link that appeared mid-attempt and is not ours is still not \
-             ours to remove",
-        );
-        assert_eq!(
-            refusal(
-                "wg-a",
-                true,
-                Adoption::Adopt(
-                    IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 2)),
-                    Ground::RaisedThisBoot,
-                ),
-                spawn_text,
-            )
-            .expect("an adoption is a bring-up that succeeded"),
-            IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 2)),
-            "and the recovery path decision 44 exists to reach is untouched",
-        );
-    }
-
-    /// The adoption log line names the ground it was granted on, as a token an
-    /// operator can filter a log on.
-    ///
-    /// Two things, and the first is why this test exists at all. The warn used
-    /// to assert "the existing tunnel of the same public key" on **every**
-    /// adoption, including the ones granted on the record with no key read on
-    /// either side — the operator told the opposite of what happened. So the
-    /// ground has to reach the field, and the two grounds have to be
-    /// distinguishable in it.
-    ///
-    /// The second is the representation. This is a structured tracing field
-    /// value, where `ProbeUnavailable::as_str` one screen up emits `no_tool`
-    /// and `refused` and `DownReason::as_str` emits a Prometheus label, and it
-    /// emitted an English clause with spaces and an apostrophe in it. A field
-    /// nobody can write a filter against is not a field. Put a sentence back
-    /// and the token assertions fail.
-    #[test]
-    fn the_two_grounds_for_adoption_are_told_apart() {
-        assert_eq!(Ground::MatchingKey.as_str(), "matching_key");
-        assert_eq!(Ground::RaisedThisBoot.as_str(), "raised_this_boot");
-        for ground in [Ground::MatchingKey, Ground::RaisedThisBoot] {
-            let token = ground.as_str();
-            assert!(
-                !token.is_empty()
-                    && token
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
-                "a structured field value is a token an operator filters on, \
-                 as `ProbeUnavailable::as_str` and `DownReason::as_str` emit \
-                 one screen away; got {token:?}",
-            );
-        }
-    }
-
-    /// The record is per interface, beside the OpenVPN pid file and named so
-    /// the two cannot collide in the one directory they share.
-    #[test]
-    fn each_interfaces_claim_is_its_own_file_in_the_state_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        raised
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        assert!(raised.recorded("wg-a", Some(LIVE_KEY)));
-        assert!(
-            !raised.recorded("wg-b", Some(LIVE_KEY)),
-            "raising one interface claims one interface, whatever key another \
-             link of another name happens to carry",
-        );
-        assert_eq!(
-            raised.path("wg-a"),
-            dir.path().join("wireguard-wg-a.raised"),
-            "openvpn-<iface>.pid is the neighbour this must not collide with",
-        );
-    }
-
-    /// The manager refuses a hooked config, which only `wg-quick` would run,
-    /// before anything reaches the host.
-    #[test]
-    fn a_hooked_config_is_refused_before_bring_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let hooked = dir.path().join("tdnx-hook.conf");
-        std::fs::write(
-            &hooked,
-            PROVIDER_CONF.replace("DNS = 10.2.0.1", "PostUp = wg set %i private-key /k"),
-        )
-        .unwrap();
-        let mgr = WireguardManager::new(dir.path().join("state"));
-        let refused = mgr
-            .raise(&VpnTunnel {
-                r#type: torrentd_engine::VpnType::Wireguard,
-                interface: "tdnx-hook".to_string(),
-                config_path: hooked,
-            })
-            .expect("a refusal is not an I/O error")
-            .expect_err("the native parser refuses the hook");
-        assert!(refused.to_string().contains("PostUp"), "got {refused}");
-    }
-
-    const PROVIDER_CONF: &str = "\
-# a provider's config
-[Interface]
-PrivateKey = SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=
-Address = 10.2.0.2/32, fd00::2/128
-DNS = 10.2.0.1
-mtu = 1380
-
-[Peer]
-PublicKey = 9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=
-AllowedIPs = 0.0.0.0/0,::/0
-Endpoint = 203.0.113.7:51820 # the exit
-";
-
-    /// The `wg-quick` keys come out, everything `wg setconf` reads stays in,
-    /// and `DNS` is reported as ignored rather than dropped silently.
-    #[test]
-    fn a_provider_config_is_split_into_what_wg_takes_and_what_ip_does() {
-        let p = native::parse(PROVIDER_CONF).expect("a plain provider config parses");
-        assert_eq!(p.addresses, ["10.2.0.2/32", "fd00::2/128"]);
-        assert_eq!(p.allowed_ips, ["0.0.0.0/0", "::/0"]);
-        assert_eq!(p.mtu, Some(1380), "keys match case-insensitively");
-        assert!(p.route);
-        assert_eq!(p.ignored, ["DNS"]);
-        for gone in ["Address", "DNS", "mtu"] {
-            assert!(
-                !p.wg_conf.contains(gone),
-                "{gone} is a wg-quick key and `wg setconf` rejects it:\n{}",
-                p.wg_conf,
-            );
-        }
-        for kept in [
-            "[Interface]",
-            "PrivateKey = ",
-            "[Peer]",
-            "PublicKey = ",
-            "AllowedIPs = ",
-            "Endpoint = ",
-        ] {
-            assert!(p.wg_conf.contains(kept), "{kept} is for wg:\n{}", p.wg_conf);
-        }
-    }
-
-    /// The exit a tracker sees is the `[Peer]`'s `Endpoint` host: the port
-    /// and an IPv6 literal's brackets come off, a comment is not part of it,
-    /// case does not tell two hosts apart, and nothing outside `[Peer]`
-    /// counts.
-    #[test]
-    fn the_endpoint_host_is_read_from_each_peer_without_its_port() {
-        assert_eq!(super::endpoint_hosts(PROVIDER_CONF), ["203.0.113.7"]);
-        let two_peers = "\
-[Interface]
-Endpoint = 198.51.100.1:1
-[peer]
-endpoint = NL-FREE-7.Example.net:51820
-[Peer]
-Endpoint = [2001:DB8::1]:51820
-[Peer]
-Endpoint = nl-free-7.example.net:443
-[Peer]
-PublicKey = x
-";
-        assert_eq!(
-            super::endpoint_hosts(two_peers),
-            ["nl-free-7.example.net", "2001:db8::1"],
-        );
-        assert!(super::endpoint_hosts("[Interface]\nAddress = 10.0.0.2/32\n").is_empty());
-    }
-
-    /// Hooks are refused by name rather than skipped: the documented
-    /// `PostUp = wg set %i private-key …` would otherwise leave a link with
-    /// no key, which comes up and never handshakes.
-    #[test]
-    fn hooks_and_a_named_table_are_refused_and_table_off_is_honoured() {
-        let with = |line: &str| PROVIDER_CONF.replace("DNS = 10.2.0.1", line);
-        let e = native::parse(&with("PostUp = wg set %i private-key /etc/wireguard/k"))
-            .expect_err("a hook is not run under the daemon's uid");
-        assert!(e.contains("PostUp"), "got {e}");
-        let e = native::parse(&with("Table = 1234")).expect_err("a numeric table");
-        assert!(e.contains("Table"), "got {e}");
-        let p = native::parse(&with("Table = off")).unwrap();
-        assert!(!p.route, "Table = off adds no routes and no rules");
-        let e = native::parse(&PROVIDER_CONF.replace("Address = 10.2.0.2/32, fd00::2/128", ""))
-            .expect_err("no Address, nothing to bind a profile to");
-        assert!(e.contains("Address"), "got {e}");
-    }
-
-    /// The private key in [`PROVIDER_CONF`], whose every malformed spelling
-    /// below must be refused without the refusal carrying it.
-    const KEY: &str = "SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=";
-
-    /// A secret key `wg` cannot read is refused at parse, by name and line,
-    /// never by value: handed on, `wg setconf` echoes it on stderr into the
-    /// profile's failure reason. A misspelt key, a line outside a section
-    /// and a line with no `=` are refused the same way, since `wg` echoes the
-    /// whole line for those.
-    #[test]
-    fn a_key_wg_cannot_read_is_refused_without_its_value() {
-        let private = |line: &str| PROVIDER_CONF.replace(&format!("PrivateKey = {KEY}"), line);
-        for (line, names) in [
-            (format!("PrivateKey = \"{KEY}\""), "line 3: PrivateKey"),
-            (format!("privatekey = {KEY}x"), "line 3: privatekey"),
-            (format!("PrivateKey = {KEY};"), "line 3: PrivateKey"),
-            (format!("PrivateKey = {}", &KEY[..43]), "line 3: PrivateKey"),
-            // `wg` refuses a key whose last character leaves bits set past
-            // the 32 bytes: `...rD3BEQ=` reads, `...rD3BER=` does not.
-            (
-                format!("PrivateKey = {}R=", &KEY[..42]),
-                "line 3: PrivateKey",
-            ),
-            // `wg` reads `Private Key` as `PrivateKey`, so its value is held
-            // to the same check.
-            (format!("Private Key = \"{KEY}\""), "line 3: PrivateKey"),
-            ("PrivateKey =".to_string(), "line 3: PrivateKey"),
-            (format!("PrivteKey = {KEY}"), "line 3: PrivteKey"),
-            (format!("PrivateKey: {KEY}"), "line 3"),
-            (format!("PrivateKey {KEY}"), "line 3"),
-            (format!("PrivateKey\t{}", &KEY[..43]), "line 3 is neither"),
-            // `wg` strips only ASCII whitespace, so it reads
-            // `Private<U+00A0>Key` as a key it does not know and would echo
-            // the line; the name is not letters only, so it is not shown.
-            (format!("Private\u{a0}Key = {KEY}"), "line 3 is not a key"),
-            (
-                format!("Private\u{2003}Key = \"{KEY}\""),
-                "line 3 is not a key",
-            ),
-            // `wg` keeps a Unicode space around a value, so the key fails
-            // its base64 read and the line is echoed.
-            (format!("PrivateKey = \u{a0}{KEY}"), "line 3: PrivateKey"),
-            (format!("PrivateKey = {KEY}\u{2003}"), "line 3: PrivateKey"),
-            // A line of nothing but a Unicode space is not blank to `wg`.
-            (format!("PrivateKey = {KEY}\n\u{a0}"), "line 4 is neither"),
-        ] {
-            let e = native::parse(&private(&line)).expect_err(&line);
-            assert!(!e.contains(&KEY[..43]), "{line:?} leaked the key: {e}");
-            assert!(e.contains(names), "{line:?} should name {names:?}: {e}");
-        }
-        let e = native::parse(&format!("PrivateKey = \"{KEY}\"\n{PROVIDER_CONF}"))
-            .expect_err("a key before any section");
-        assert!(
-            e.contains("line 1: PrivateKey") && !e.contains(&KEY[..43]),
-            "got {e}"
-        );
-
-        let psk = PROVIDER_CONF.replace(
-            "AllowedIPs = 0.0.0.0/0,::/0",
-            &format!("AllowedIPs = 0.0.0.0/0,::/0\nPresharedKey = '{KEY}'"),
-        );
-        let e = native::parse(&psk).expect_err("a quoted preshared key");
-        assert!(
-            e.contains("PresharedKey") && !e.contains(&KEY[..43]),
-            "got {e}"
-        );
-
-        // What `wg` does accept still parses: a preshared key, the other keys
-        // it reads, whitespace inside the value, the key name and the
-        // section header, and sections in any case.
-        let full = PROVIDER_CONF
-            .replace("[Interface]", "[ interface ]")
-            .replace("[Peer]", "[ Pe er ]")
-            .replace(
-                &format!("PrivateKey = {KEY}"),
-                // `\v` is whitespace to `wg`'s `isspace`, though not to
-                // Rust's `is_ascii_whitespace`.
-                &format!(
-                    "Private\x0bKey = {}\x0b {}\nListen Port = 51820\nFwMark = 0x1\n\x0b",
-                    &KEY[..20],
-                    &KEY[20..]
-                ),
-            )
-            .replace(
-                "AllowedIPs = 0.0.0.0/0,::/0",
-                &format!(
-                    "AllowedIPs = 0.0.0.0/0,::/0\nPresharedKey = {KEY}\nPersistentKeepalive = 25"
-                ),
-            );
-        native::parse(&full).unwrap_or_else(|e| panic!("{e}\n{full}"));
-    }
-
-    /// The second guard: whatever `wg setconf` echoes of its input is cut
-    /// out of the refusal. This is `wg`'s own stderr for a quoted key, as
-    /// `exec::run_ok` reports it.
-    #[test]
-    fn what_wg_setconf_echoes_never_reaches_the_refusal() {
-        let echoed = format!(
-            "`wg setconf wg-a /dev/stdin` exited exit status: 1: Key is not the correct length \
-             or format: `\"{KEY}\"'\nConfiguration parsing error"
-        );
-        let refused = native::configure_with(
-            "wg-a",
-            &parsed(false),
-            |p: &str, _: &[&str], _: Option<&str>| {
-                if p == "wg" {
-                    Err(echoed.clone())
-                } else {
-                    Ok(())
-                }
-            },
-            |_, _, _| Ok(()),
-            |_, _| Ok(super::super::route::RouteProbe::ViaTunnel),
-        );
-        let Err(native::UpFailure::Refused(why)) = refused else {
-            panic!("a wg setconf failure is a refusal: {refused:?}");
-        };
-        assert!(!why.contains(&KEY[..43]), "leaked the key: {why}");
-        assert_eq!(
-            why,
-            "`wg setconf wg-a /dev/stdin` exited exit status: 1: Key is not the correct length \
-             or format: `<redacted>'\nConfiguration parsing error",
-        );
-
-        for (stderr, want) in [
-            (
-                format!("Line unrecognized: `PrivateKey={KEY}'"),
-                "Line unrecognized: `<redacted>'",
-            ),
-            // A key holding an apostrophe or a backtick is cut through the
-            // last apostrophe on its line, so no part of it is left behind.
-            (format!("bad: `ab'c{KEY}' tail"), "bad: `<redacted>' tail"),
-            (format!("bad: `a`b{KEY}"), "bad: `<redacted>'"),
-            ("no quotes here".to_string(), "no quotes here"),
-        ] {
-            assert_eq!(native::redact_echo(&stderr), want);
-        }
-    }
-
-    /// A split `AllowedIPs` is refused before anything is created: the
-    /// daemon routes only `AllowedIPs` through the tunnel, so the health
-    /// monitor's probe to 1.1.1.1 would fall through to the main table and
-    /// fence the profile on its first poll. Drop the check from `parse` and
-    /// the first assertion fails.
-    #[test]
-    fn allowed_ips_the_route_probe_cannot_validate_are_refused_at_parse() {
-        let with = |allowed: &str| {
-            PROVIDER_CONF.replace(
-                "AllowedIPs = 0.0.0.0/0,::/0",
-                &format!("AllowedIPs = {allowed}"),
-            )
-        };
-        let e = native::parse(&with("10.0.0.0/8, 192.168.0.0/16"))
-            .expect_err("a split tunnel that does not hold 1.1.1.1");
-        assert!(
-            e.contains("does not cover 1.1.1.1") && e.contains("route_mismatch"),
-            "got {e}"
-        );
-        native::parse(&with("::/0")).expect_err("no IPv4 route at all, but an IPv4 address");
-        for covering in [
-            "0.0.0.0/0",
-            "1.0.0.0/8, 10.0.0.0/8",
-            "1.1.1.1/32",
-            "1.1.1.1",
-        ] {
-            native::parse(&with(covering)).unwrap_or_else(|e| panic!("{covering}: {e}"));
-        }
-        let off = with("10.0.0.0/8").replace("DNS = 10.2.0.1", "Table = off");
-        native::parse(&off).expect("Table = off routes nothing; the bring-up probe judges it");
-    }
-
-    fn parsed(table_off: bool) -> native::Parsed {
-        let text = if table_off {
-            PROVIDER_CONF.replace("DNS = 10.2.0.1", "Table = off")
-        } else {
-            PROVIDER_CONF.to_string()
-        };
-        native::parse(&text).unwrap()
-    }
-
-    fn elsewhere(
-    ) -> Result<super::super::route::RouteProbe, super::super::route::RouteProbeUnavailable> {
-        Ok(super::super::route::RouteProbe::Elsewhere(
-            "leaves by eth0: 1.1.1.1 from 10.2.0.2 via 192.168.1.1 dev eth0".into(),
-        ))
-    }
-
-    /// Which failure of the configure step is which: the route install
-    /// failing, the kernel still routing elsewhere after it, and a
-    /// `Table = off` link that nothing routes through the tunnel are all
-    /// `Unrouted` — reported as `RoutingFailed`, since the link did come up —
-    /// and a failure before routing is a refusal. A probe that could not run
-    /// is not a failure, as it is not for the health monitor.
-    #[test]
-    fn the_configure_step_tells_a_routing_failure_from_a_refusal() {
-        let ok_run = |_: &str, _: &[&str], _: Option<&str>| Ok(());
-        let via = |_: &str, _: IpAddr| Ok(super::super::route::RouteProbe::ViaTunnel);
-
-        assert_eq!(
-            native::configure_with("wg-a", &parsed(false), ok_run, |_, _, _| Ok(()), via),
-            Ok(())
-        );
-        assert!(matches!(
-            native::configure_with(
-                "wg-a",
-                &parsed(false),
-                ok_run,
-                |_, _, _| Err("ip rule add: Operation not permitted".to_string()),
-                via,
-            ),
-            Err(native::UpFailure::Unrouted(cause)) if cause.contains("Operation not permitted")
-        ));
-        assert!(matches!(
-            native::configure_with(
-                "wg-a",
-                &parsed(false),
-                ok_run,
-                |_, _, _| Ok(()),
-                |_, _| { elsewhere() }
-            ),
-            Err(native::UpFailure::Unrouted(_))
-        ));
-
-        let mut installed = false;
-        let refused = native::configure_with(
-            "wg-a",
-            &parsed(true),
-            ok_run,
-            |_, _, _| {
-                installed = true;
-                Ok(())
-            },
-            |_, src| {
-                assert_eq!(src, IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 2)));
-                elsewhere()
-            },
-        );
-        assert!(!installed, "Table = off installs nothing");
-        assert!(
-            matches!(&refused, Err(native::UpFailure::Unrouted(why))
-                if why.contains("Table = off") && why.contains("route_mismatch")),
-            "the link came up, so it is reported as lowered for want of routing: {refused:?}"
-        );
-        assert_eq!(
-            native::configure_with("wg-a", &parsed(true), ok_run, |_, _, _| Ok(()), via),
-            Ok(()),
-            "Table = off with the operator's own routing through the tunnel"
-        );
-        assert_eq!(
-            native::configure_with(
-                "wg-a",
-                &parsed(true),
-                ok_run,
-                |_, _, _| Ok(()),
-                |_, _| { Err(super::super::route::RouteProbeUnavailable::NoTool) }
-            ),
-            Ok(())
-        );
-        assert!(matches!(
-            native::configure_with(
-                "wg-a",
-                &parsed(false),
-                |p: &str, _: &[&str], _: Option<&str>| if p == "wg" {
-                    Err("wg setconf: Invalid argument".to_string())
-                } else {
-                    Ok(())
-                },
-                |_, _, _| Ok(()),
-                via,
-            ),
-            Err(native::UpFailure::Refused(_))
-        ));
-    }
-
-    /// A link that came up and was lowered for want of routing is
-    /// `RoutingFailed`, as OpenVPN reports it, so `vpn check --bring-up`
-    /// says it came up. It was reported as `Spawn` through the adoption
-    /// path, which read as a link that never appeared.
-    #[test]
-    fn a_link_lowered_for_want_of_routing_is_reported_as_routing_failed() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = WireguardManager::with_raised(raised_in(dir.path(), "one-boot"));
-        let profile = VpnTunnel {
-            r#type: torrentd_engine::VpnType::Wireguard,
-            interface: "tdnx-absent".to_string(),
-            config_path: dir.path().join("tdnx-absent.conf"),
-        };
-        let r = mgr.raise_failed(
-            &profile,
-            false,
-            native::UpFailure::Unrouted("ip rule add: Operation not permitted".to_string()),
-        );
-        assert!(
-            matches!(&r, Err(VpnError::RoutingFailed { iface, cause })
-                if iface == "tdnx-absent" && cause.contains("Operation not permitted")),
-            "{r:?}"
-        );
-        assert!(matches!(
-            mgr.raise_failed(&profile, false, native::UpFailure::Refused("no".into())),
-            Err(VpnError::Spawn(_))
-        ));
-    }
-
-    fn native_manager(raised: RaisedInterfaces) -> WireguardManager {
-        WireguardManager::with_raised(raised)
-    }
-
-    /// A native bring-up that is refused — a config it will not apply, or
-    /// `ip link add` on a name that is taken — is a refusal and not an I/O
-    /// error, so it reaches `adoptable` and `refusal` exactly as a failed
-    /// `wg-quick up` does. Return the refusal as `Err` from `raise` and the
-    /// first assertion fails; the link is then never considered for adoption.
-    #[test]
-    fn a_refused_native_bring_up_goes_through_adoption_like_wg_quick() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = native_manager(raised_in(dir.path(), "one-boot"));
-        let hooked = dir.path().join("tdnx-absent.conf");
-        std::fs::write(
-            &hooked,
-            PROVIDER_CONF.replace("DNS = 10.2.0.1", "PostUp = wg set %i private-key /k"),
-        )
-        .unwrap();
-
-        // A parse refusal, over a name that is free: nothing was created, so
-        // this is the ordinary bring-up failure.
-        let profile = VpnTunnel {
-            r#type: torrentd_engine::VpnType::Wireguard,
-            interface: "tdnx-absent".to_string(),
-            config_path: hooked.clone(),
-        };
-        let native::UpFailure::Refused(refused) = mgr
-            .raise(&profile)
-            .expect("a refusal is not an I/O error")
-            .expect_err("a hook is refused before anything is run")
-        else {
-            panic!("a parse refusal is a refusal");
-        };
-        assert!(refused.contains("PostUp"), "got {refused}");
-        assert_eq!(mgr.adoptable(&profile), Adoption::No);
-        assert!(matches!(
-            refusal(&profile.interface, false, mgr.adoptable(&profile), &refused),
-            Err(VpnError::Spawn(_))
-        ));
-
-        // `ip link add` on a taken name (`lo`, which is no WireGuard link):
-        // refused, then declined by `adoptable` and fenced, never torn down.
-        let plain = dir.path().join("lo.conf");
-        std::fs::write(&plain, PROVIDER_CONF).unwrap();
-        let profile = VpnTunnel {
-            r#type: torrentd_engine::VpnType::Wireguard,
-            interface: "lo".to_string(),
-            config_path: plain,
-        };
-        let native::UpFailure::Refused(refused) = mgr
-            .raise(&profile)
-            .expect("a refusal is not an I/O error")
-            .expect_err("`lo` exists, so `ip link add` fails")
-        else {
-            panic!("`ip link add` failing is a refusal");
-        };
-        assert!(matches!(
-            refusal(&profile.interface, true, mgr.adoptable(&profile), &refused),
-            Err(VpnError::ForeignInterface { .. })
-        ));
-    }
-
-    /// The native teardown removes only a link this boot's record names by
-    /// the key it carries. A link root raised and the daemon adopted has no
-    /// record, and `ip link delete` on it would leave a hooked config with
-    /// nothing to raise or adopt at the next start. Make the check always
-    /// true and the first assertion fails.
-    #[test]
-    fn the_native_teardown_spares_a_link_this_boot_did_not_raise() {
-        let dir = tempfile::tempdir().unwrap();
-        let raised = raised_in(dir.path(), "one-boot");
-        let mgr = native_manager(raised.clone());
-        assert!(
-            !mgr.native_teardown_permitted("wg-a", Some(LIVE_KEY)),
-            "no record: root raised it, or it was adopted",
-        );
-        raised
-            .record("wg-a", Some(LIVE_KEY))
-            .expect("a temporary directory accepts a write");
-        assert!(
-            mgr.native_teardown_permitted("wg-a", Some(LIVE_KEY)),
-            "the daemon's own link",
-        );
-        assert!(
-            !mgr.native_teardown_permitted("wg-a", Some(STRANGER_KEY)),
-            "a name retaken by another link",
-        );
-        assert!(!mgr.native_teardown_permitted("wg-a", None));
-    }
-
-    /// The kill switch against a live WireGuard link the daemon raised itself,
-    /// as a non-root uid: the shape #42 was about. Asserts, in order, that
-    ///
-    /// 1. the link comes up through `WireguardManager::bring_up` on the
-    ///    `ip`/`wg` path, because the uid is not 0;
-    /// 2. under the ruleset **without** the transport exemption, traffic sent
-    ///    into the tunnel never completes a handshake (the negative control);
-    /// 3. under the ruleset `killswitch::enable` installs, it does;
-    /// 4. the same uid's traffic on the bare interface is still dropped;
-    /// 5. `bring_down` removes the link and every rule it added.
-    ///
-    /// It needs a non-root uid holding `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` in
-    /// a private network namespace, `ip`, `wg`, `nft`, `unshare` and
-    /// `nsenter`, so it is ignored by default. `mise run test-netns` runs it
-    /// this way, beside every other real-kernel test (the `vpn-netns` CI job
-    /// does, on every pull request). Unprivileged:
-    ///
-    /// ```text
-    /// cargo test -p torrentd --bin torrentd --no-run
-    /// unshare --user --map-user=998 --map-group=998 --net --keep-caps \
-    ///     target/debug/deps/torrentd-<hash> live_link -- --ignored
-    /// ```
-    #[test]
-    #[ignore = "needs a non-root uid with CAP_NET_ADMIN in a private network namespace"]
-    fn live_link_the_kill_switch_carries_a_link_the_daemon_raised_and_drops_the_bare_interface() {
-        use std::net::UdpSocket;
-
-        use super::super::killswitch;
-
-        let uid = killswitch::current_uid().expect("uid");
-        assert_ne!(uid, 0, "run as a non-root uid; uid 0 is refused outright");
-        let sh = |cmd: &str| {
-            let out = Command::new("sh").arg("-c").arg(cmd).output().unwrap();
-            assert!(
-                out.status.success(),
-                "`{cmd}`: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let path = |name: &str| dir.path().join(name).display().to_string();
-        let ours_key = sh("wg genkey");
-        let peer_key = sh("wg genkey");
-        std::fs::write(path("peer.key"), &peer_key).unwrap();
-        let ours_pub = sh(&format!("echo {ours_key} | wg pubkey"));
-        let peer_pub = sh(&format!("echo {peer_key} | wg pubkey"));
-
-        // The peer lives in a network namespace of its own, one veth away, so
-        // the tunnel's transport has to leave by a non-loopback interface.
-        let mut peer = Command::new("unshare")
-            .args(["-n", "sleep", "60"])
-            .spawn()
-            .unwrap();
-        let pid = peer.id();
-        let ours_ns = std::fs::read_link("/proc/self/ns/net").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::read_link(format!("/proc/{pid}/ns/net"))
-            .ok()
-            .as_ref()
-            == Some(&ours_ns)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the peer namespace never appeared"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-        sh("ip link set lo up");
-        sh(&format!(
-            "ip link add veth-ks type veth peer name veth-peer netns {pid}"
-        ));
-        sh("ip addr add 10.9.0.1/24 dev veth-ks && ip link set veth-ks up");
-        sh(&format!(
-            "nsenter -t {pid} -n sh -ec 'ip link set lo up; \
-             ip addr add 10.9.0.2/24 dev veth-peer; ip link set veth-peer up; \
-             ip link add wg-peer type wireguard; \
-             wg set wg-peer private-key {} listen-port 51820 \
-                 peer {ours_pub} allowed-ips 10.200.0.1/32; \
-             ip addr add 10.200.0.2/24 dev wg-peer; ip link set wg-peer up'",
-            path("peer.key"),
-        ));
-
-        // A provider-shaped config: full-tunnel AllowedIPs and a DNS line.
-        let iface = "wg-ks";
-        std::fs::write(
-            path("wg-ks.conf"),
-            format!(
-                "[Interface]\nPrivateKey = {ours_key}\nAddress = 10.200.0.1/32\n\
-                 DNS = 10.200.0.2\n\n[Peer]\nPublicKey = {peer_pub}\n\
-                 Endpoint = 10.9.0.2:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n"
-            ),
-        )
-        .unwrap();
-        let manager = WireguardManager::new(dir.path().join("state"));
-        let ip = manager
-            .bring_up(&VpnTunnel {
-                r#type: torrentd_engine::VpnType::Wireguard,
-                config_path: dir.path().join("wg-ks.conf"),
-                interface: iface.to_string(),
-            })
-            .expect("the daemon raises its own link without wg-quick");
-        assert_eq!(ip.to_string(), "10.200.0.1");
-        let table = super::super::route::table_for(iface).unwrap();
-
-        // What arrives is counted on the peer's side of the tunnel: packets
-        // the peer's link decrypted and delivered. Handshakes are not among
-        // them, and they have to be excluded: they are built by the kernel
-        // with no socket attached, so no `meta skuid` rule ever matches them
-        // and they complete with or without the exemption. It is the
-        // encrypted *data* that carries the sending socket — the daemon's —
-        // out of the physical interface, and that the drop takes.
-        let delivered = || -> u64 {
-            let json = sh(&format!(
-                "nsenter -t {pid} -n ip -j -s link show dev wg-peer"
-            ));
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            v[0]["stats64"]["rx"]["packets"].as_u64().unwrap()
-        };
-        let delivered_within = |before: u64, bound: Duration| {
-            let deadline = Instant::now() + bound;
-            loop {
-                if delivered() > before {
-                    return true;
-                }
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        };
-        // Kept open for the whole test: a packet whose socket has closed no
-        // longer has a uid to match.
-        let tunnel = UdpSocket::bind("10.200.0.1:0").unwrap();
-        let send_into_tunnel = || {
-            tunnel
-                .send_to(b"x", "10.200.0.2:9")
-                .expect("the tunnel interface is accepted");
-        };
-
-        // A session first, with no ruleset at all. A packet sent while the
-        // handshake is still pending is queued and leaves once it completes,
-        // and that one was observed to pass even an unexempted ruleset; a
-        // packet sent over an established session is the steady state, and
-        // the one the drop takes.
-        send_into_tunnel();
-        assert!(
-            delivered_within(0, Duration::from_secs(10)),
-            "the tunnel carries before any ruleset",
-        );
-
-        // Negative control: the ruleset as it was before the exemption.
-        let paired = killswitch::Tunnel::new(iface, std::net::Ipv4Addr::new(10, 200, 0, 1));
-        killswitch::apply(&killswitch::render_ruleset(uid, &[paired]).unwrap())
-            .expect("install the unexempted ruleset");
-        let before = delivered();
-        send_into_tunnel();
-        assert!(
-            !delivered_within(before, Duration::from_secs(2)),
-            "without the exemption the tunnel's encrypted traffic is dropped",
-        );
-
-        let installed = killswitch::enable(&[iface.to_string()]).expect("enable");
-        assert_eq!(installed.uid, uid);
-        let before = delivered();
-        send_into_tunnel();
-        assert!(
-            delivered_within(before, Duration::from_secs(10)),
-            "with the listen port exempted the tunnel carries",
-        );
-
-        let bare = UdpSocket::bind("10.9.0.1:0").unwrap();
-        let e = bare
-            .send_to(b"x", "10.9.0.2:9")
-            .expect_err("the daemon's own traffic on the bare interface is dropped");
-        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "got {e}");
-
-        manager.bring_down(iface);
-        assert!(
-            super::super::route::table_for(iface).is_err(),
-            "the link is gone (asked of `ip`: /sys/class/net is the host's here)",
-        );
-        assert!(
-            !sh("ip -4 rule show; ip -6 rule show").contains(&format!("lookup {table}")),
-            "and so is every rule it added",
-        );
-        killswitch::disable().expect("disable");
-        let _ = peer.kill();
-        let _ = peer.wait();
-    }
-
-    /// Against live links, in a private network namespace:
-    ///
-    /// 1. `native::up` whose configuration fails after `ip link add` created
-    ///    the link (an `Address` `ip` rejects) removes the link again;
-    /// 2. the native `bring_down` leaves standing a link no record names — one
-    ///    raised by hand, as root would before the daemon starts;
-    /// 3. and removes it once this boot's record names it by its key.
-    ///
-    /// Needs `CAP_NET_ADMIN` in a private network namespace, `ip` and `wg`;
-    /// ignored by default. `unshare -rn target/debug/deps/torrentd-<hash>
-    /// live_link --ignored`, or the uid-998 command above.
-    #[test]
-    #[ignore = "needs CAP_NET_ADMIN in a private network namespace"]
-    fn live_link_a_native_failure_rolls_back_and_teardown_spares_links_it_did_not_raise() {
-        let dir = tempfile::tempdir().unwrap();
-        let gone = |iface: &str| super::super::route::table_for(iface).is_err();
-
-        // 1. `ip address add` fails after the link exists.
-        let conf = dir.path().join("wg-rb.conf");
-        std::fs::write(
-            &conf,
-            PROVIDER_CONF.replace(
-                "Address = 10.2.0.2/32, fd00::2/128",
-                "Address = 300.1.1.1/32",
-            ),
-        )
-        .unwrap();
-        let e = native::up("wg-rb", &conf).expect_err("ip rejects the address");
-        assert!(
-            e.to_string().contains("address add"),
-            "failed at configure: {e}"
-        );
-        assert!(gone("wg-rb"), "the half-configured link is removed");
-
-        // 2. A link raised outside the daemon, carrying a key.
-        let key = dir.path().join("k");
-        std::fs::write(&key, LIVE_KEY).unwrap();
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "ip link add wg-root type wireguard && wg set wg-root private-key {}",
-                key.display()
-            ))
-            .status()
-            .unwrap();
-        assert!(out.success());
-        let raised = raised_in(dir.path(), "one-boot");
-        let mgr = native_manager(raised.clone());
-        mgr.bring_down("wg-root");
-        assert!(!gone("wg-root"), "no record names it, so it stays");
-
-        // 3. Once recorded, it is the daemon's to remove.
-        raised
-            .record("wg-root", interface_public_key("wg-root").as_deref())
-            .unwrap();
-        mgr.bring_down("wg-root");
-        assert!(gone("wg-root"), "a recorded link is removed");
-    }
-}
+mod tests;

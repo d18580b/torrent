@@ -1,0 +1,60 @@
+# git-cliff configuration for CHANGELOG.md, read by release-plz
+# (release-plz.toml's `changelog_config`) when it writes the release pull
+# request. The groups are the Conventional Commit types the commit-msg hook
+# and CI's `conventional commits` check accept (CONTRIBUTING.md); a commit
+# whose type matches none of them is left out.
+
+[changelog]
+header = """
+# Changelog
+
+Every release of torrentd and torrentctl, newest first. Both binaries share
+one version and one `vX.Y.Z` tag; README.md § *Install* says how to download
+a release and verify what you downloaded.
+"""
+body = """
+{% macro commit_line(commit) -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
+  {% if commit.breaking %}[**breaking**] {% endif %}\
+  {{ commit.message | upper_first | trim }}
+{%- endmacro %}
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}]\
+{%- if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+
+{% for commit in commits %}{{ self::commit_line(commit=commit) }}
+{% endfor %}{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = true
+# The `(#N)` a squash merge appends becomes a link to that pull request. Done
+# here rather than from the forge's commit metadata, which would cost one API
+# request per commit of every release pull request.
+commit_preprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/d18580b/torrent/pull/${1}))" },
+]
+# The `<!-- N -->` prefixes order the groups; `striptags` removes them.
+commit_parsers = [
+  { message = "^chore: release", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^fix", group = "<!-- 1 -->Fixed" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactored" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Tests" },
+  { message = "^build", group = "<!-- 6 -->Build" },
+  { message = "^ci", group = "<!-- 7 -->CI" },
+  { message = "^style", group = "<!-- 8 -->Style" },
+  { message = "^chore", group = "<!-- 9 -->Chores" },
+]
+sort_commits = "oldest"

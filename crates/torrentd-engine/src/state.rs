@@ -10,6 +10,8 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -77,6 +79,23 @@ impl TorrentPhase {
             TorrentPhase::DiskError => "disk_error",
             TorrentPhase::Errored => "errored",
             TorrentPhase::Removed => "removed",
+        }
+    }
+
+    /// What a torrent the session has just added is doing, before its first
+    /// state update says more: the phase that update maps libtorrent's
+    /// starting state to.
+    ///
+    /// libtorrent builds every torrent in `checking_resume_data`, which
+    /// [`TorrentPhase::Checking`] covers, and moves one without metadata to
+    /// `downloading_metadata` as it starts it. Not `Idle`:
+    /// that says the torrent has metadata, and that nothing is in its way
+    /// but peers, which is not known of any torrent until its check is over.
+    pub fn on_add(has_metadata: bool) -> Self {
+        if has_metadata {
+            TorrentPhase::Checking
+        } else {
+            TorrentPhase::AwaitingMetadata
         }
     }
 }
@@ -202,6 +221,11 @@ pub struct TorrentState {
 }
 
 impl TorrentState {
+    /// An entry for `handle` with nothing reported yet, in phase `Idle`
+    /// whatever the torrent is doing: for a caller that sets the phase it
+    /// needs. A torrent a session adds is tracked through
+    /// [`StateMap::track_added`], which starts it in the phase its add
+    /// implies ([`TorrentPhase::on_add`]).
     pub fn newly_added(handle: TorrentHandle, profile: ProfileId, now: Instant) -> Self {
         Self {
             handle,
@@ -302,6 +326,9 @@ pub struct RemovalSettled {
 #[derive(Debug)]
 pub struct StateMap {
     inner: DashMap<InfoHash, TorrentState>,
+    /// Bumped after every change to which torrents `inner` holds: each
+    /// insert, each replaced entry, each remove. See [`Self::generation`].
+    generation: AtomicU64,
     saves: Mutex<ResumeSaves>,
     /// `(next_attempt, infohash)` for every retry ever armed, earliest first.
     /// Entries go stale when a retry is re-armed or retired; `retries_due`
@@ -323,6 +350,7 @@ impl Default for StateMap {
     fn default() -> Self {
         Self {
             inner: DashMap::new(),
+            generation: AtomicU64::new(0),
             saves: Mutex::new(ResumeSaves::default()),
             retry_heap: Mutex::new(BinaryHeap::new()),
             removals: Mutex::new(HashMap::new()),
@@ -343,6 +371,22 @@ impl StateMap {
         self.inner.is_empty()
     }
 
+    /// A counter that moves on every insert, replacement, and removal of an
+    /// entry, and never moves back. O(1).
+    ///
+    /// Two equal readings mean no torrent was added, replaced, or removed in
+    /// between, which [`Self::len`] cannot say: one removal and one add leave
+    /// the length as it was. The bump follows the change, so a caller that
+    /// reads the counter and then reads the map sees at least every change
+    /// that counter reading counts.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Every info-hash currently loaded into a session.
     ///
     /// This is the authoritative answer to "what is this daemon serving right
@@ -356,14 +400,30 @@ impl StateMap {
     pub fn insert(&self, ih: InfoHash, state: TorrentState) {
         let armed = state.retry.as_ref().map(|r| r.next_attempt);
         self.inner.insert(ih, state);
+        self.changed();
         if let Some(at) = armed {
             self.retry_heap.lock().push(Reverse((at, ih.0)));
         }
     }
 
+    /// Whether the map tracks `handle` for `profile`: an entry under that
+    /// info-hash, for that very torrent, of that profile.
+    pub fn tracks(&self, handle: TorrentHandle, profile: &ProfileId) -> bool {
+        self.inner
+            .get(&handle.infohash)
+            .is_some_and(|st| st.handle == handle && st.profile_id == *profile)
+    }
+
     /// Track `handle`, a torrent `profile`'s session holds, unless the map
     /// already tracks that very torrent for that profile. Returns whether it
     /// inserted a fresh entry.
+    ///
+    /// A fresh entry starts in the phase the add implies
+    /// ([`TorrentPhase::on_add`]): `has_metadata` is whether the session
+    /// holds the torrent's metadata. Until its first state update that is all
+    /// the daemon knows of what it is doing, and a listing in between must
+    /// not show a magnet still fetching its metadata, or a torrent not yet
+    /// checked, as `Idle`.
     ///
     /// Every path that learns of a torrent goes through this: the boot scans
     /// with the handle `add_torrent` returned, the `add_torrent_alert`
@@ -372,21 +432,35 @@ impl StateMap {
     /// must not reset what the earlier one's entry has gathered since. An
     /// entry under another handle or profile is a torrent the info-hash has
     /// outlived, and is replaced, as an add has always replaced it.
-    pub fn track_added(&self, handle: TorrentHandle, profile: &ProfileId, now: Instant) -> bool {
+    pub fn track_added(
+        &self,
+        handle: TorrentHandle,
+        profile: &ProfileId,
+        has_metadata: bool,
+        now: Instant,
+    ) -> bool {
         use dashmap::mapref::entry::Entry;
-        match self.inner.entry(handle.infohash) {
+        let fresh = || TorrentState {
+            phase: TorrentPhase::on_add(has_metadata),
+            ..TorrentState::newly_added(handle, profile.clone(), now)
+        };
+        let inserted = match self.inner.entry(handle.infohash) {
             Entry::Occupied(e) if e.get().handle == handle && e.get().profile_id == *profile => {
                 false
             }
             Entry::Occupied(mut e) => {
-                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                e.insert(fresh());
                 true
             }
             Entry::Vacant(e) => {
-                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                e.insert(fresh());
                 true
             }
+        };
+        if inserted {
+            self.changed();
         }
+        inserted
     }
 
     /// Remove `ih`'s entry if it is `profile`'s and, where `handle` is given,
@@ -402,11 +476,16 @@ impl StateMap {
         profile: &ProfileId,
         handle: Option<TorrentHandle>,
     ) -> Option<TorrentState> {
-        self.inner
+        let removed = self
+            .inner
             .remove_if(ih, |_, st| {
                 st.profile_id == *profile && handle.is_none_or(|h| h == st.handle)
             })
-            .map(|(_, v)| v)
+            .map(|(_, v)| v);
+        if removed.is_some() {
+            self.changed();
+        }
+        removed
     }
 
     /// Record that the session is being asked to remove `profile`'s torrent
@@ -655,14 +734,19 @@ impl StateMap {
 
     // --- resume saves ---------------------------------------------------------
 
-    /// Ask for a resume save of `ih`. Returns `false` when one is already
-    /// queued or in flight: libtorrent answers each request with its own alert,
-    /// so a second request for the same torrent is a second alert for nothing.
+    /// Queue a resume save of `ih` with `flags`, for a later
+    /// [`StateMap::dispatch_resume_saves`] to hand to libtorrent. Returns
+    /// `false`, and changes nothing, when one is already queued or in flight:
+    /// libtorrent answers each request with its own alert, so a second
+    /// request for the same torrent is a second alert for nothing.
     ///
-    /// The refused request's flags are dropped with it, and a queued
-    /// unconditional save is never downgraded to `ONLY_IF_MODIFIED`: each one
-    /// queued is a torrent whose modified bit cannot be trusted, either its
-    /// first save (no resume file yet) or a re-ask after a lost answer.
+    /// The refused request's flags are dropped with it, both ways: a queued
+    /// unconditional save is never downgraded to `ONLY_IF_MODIFIED`, and a
+    /// queued `ONLY_IF_MODIFIED` save is not raised to unconditional either.
+    /// A save in flight may hold the state from before a change made since;
+    /// a caller whose change a crash must not lose, or whose request must be
+    /// unconditional whatever is queued, uses
+    /// [`StateMap::queue_resume_save_now`] instead.
     pub fn queue_resume_save(&self, ih: InfoHash, flags: ResumeFlags) -> bool {
         let mut s = self.saves.lock();
         if s.in_flight.contains_key(&ih) || !s.queued_set.insert(ih) {
@@ -800,400 +884,164 @@ impl StateMap {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests;
+
+#[cfg(test)]
+mod props {
+    use proptest::prelude::*;
+
     use super::*;
 
-    fn ih(byte: u8) -> InfoHash {
-        InfoHash([byte; 20])
+    /// Torrents 0..4 are tracked, the even ones in profile `p` and the odd
+    /// ones in `q`; 4 and 5 are not tracked at all.
+    const TORRENTS: u8 = 6;
+
+    fn ih(n: u8) -> InfoHash {
+        InfoHash([n; 20])
     }
-    fn handle(id: u64, byte: u8) -> TorrentHandle {
-        TorrentHandle {
-            id,
-            infohash: ih(byte),
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Queue(u8, bool),
+        QueueNow(u8),
+        Dispatch(usize),
+        Settle(u8),
+        Requeue(bool, bool),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        let t = 0..TORRENTS;
+        prop_oneof![
+            (t.clone(), any::<bool>()).prop_map(|(t, c)| Op::Queue(t, c)),
+            t.clone().prop_map(Op::QueueNow),
+            (0usize..4).prop_map(Op::Dispatch),
+            t.prop_map(Op::Settle),
+            (any::<bool>(), any::<bool>()).prop_map(|(p, c)| Op::Requeue(p, c)),
+        ]
+    }
+
+    fn flags(conditional: bool) -> ResumeFlags {
+        if conditional {
+            ResumeFlags::ONLY_IF_MODIFIED
+        } else {
+            ResumeFlags::empty()
         }
     }
 
-    #[test]
-    fn retries_due_returns_only_expired() {
-        let m = StateMap::new();
-        let now = Instant::now();
-        let h1 = handle(1, 1);
-        let h2 = handle(2, 2);
-        let mut s1 = TorrentState::newly_added(h1, ProfileId::new("p"), now);
-        s1.retry = Some(RetryState {
-            next_attempt: now - Duration::from_secs(1),
-            attempts: 1,
-        });
-        let mut s2 = TorrentState::newly_added(h2, ProfileId::new("p"), now);
-        s2.retry = Some(RetryState {
-            next_attempt: now + Duration::from_secs(60),
-            attempts: 1,
-        });
-        m.insert(s1.handle.infohash, s1);
-        m.insert(s2.handle.infohash, s2);
-        let due = m.retries_due(now);
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0], h1);
+    /// What the queue must hold, kept independently of it: the saves wanted
+    /// and not yet settled, which of them are in flight, which changed while
+    /// in flight, and which must go out unconditional when next dispatched.
+    #[derive(Default)]
+    struct Model {
+        wanted: HashSet<u8>,
+        in_flight: HashSet<u8>,
+        again: HashSet<u8>,
+        unconditional: HashSet<u8>,
     }
 
-    #[test]
-    fn a_settle_for_a_torrent_nobody_asked_about_changes_nothing() {
-        // The global counter this replaced was decremented by any settle, so
-        // a stray one for torrent B released the drain while torrent A's save
-        // was still outstanding.
-        let m = StateMap::new();
-        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
-        assert_eq!(m.dispatch_resume_saves(10).len(), 1);
-        assert!(!m.note_resume_settled(&ih(2)));
-        assert_eq!(m.pending_resume_count(), 1);
-        assert!(m.note_resume_settled(&ih(1)));
-        assert_eq!(m.pending_resume_count(), 0);
-    }
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
 
-    #[test]
-    fn one_torrent_is_asked_for_once_however_often_it_is_queued() {
-        let m = StateMap::new();
-        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
-        assert!(!m.queue_resume_save(ih(1), ResumeFlags::empty()));
-        assert_eq!(m.dispatch_resume_saves(10).len(), 1);
-        // In flight counts as asked for, too.
-        assert!(!m.queue_resume_save(ih(1), ResumeFlags::empty()));
-        assert_eq!(m.pending_resume_count(), 1);
-    }
-
-    #[test]
-    fn a_later_only_if_modified_request_keeps_a_queued_unconditional_save() {
-        // The shutdown drain asks `ONLY_IF_MODIFIED` for every torrent; one
-        // still waiting on its first save has no file for "not modified" to
-        // leave in place.
-        let m = StateMap::new();
-        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
-        assert!(!m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
-        assert_eq!(
-            m.dispatch_resume_saves(10),
-            vec![(ih(1), ResumeFlags::empty())]
-        );
-    }
-
-    #[test]
-    fn a_save_now_is_unconditional_and_raises_a_queued_sweep_save() {
-        let m = StateMap::new();
-        m.queue_resume_save_now(ih(1));
-        assert!(m.queue_resume_save(ih(2), ResumeFlags::ONLY_IF_MODIFIED));
-        m.queue_resume_save_now(ih(2));
-        assert_eq!(
-            m.dispatch_resume_saves(10),
-            vec![(ih(1), ResumeFlags::empty()), (ih(2), ResumeFlags::empty())],
-            "one request each, both unconditional",
-        );
-    }
-
-    #[test]
-    fn a_save_now_during_an_in_flight_save_asks_once_more_when_it_settles() {
-        // The answer on its way may have been taken before the change.
-        let m = StateMap::new();
-        assert!(m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
-        assert_eq!(m.dispatch_resume_saves(10).len(), 1);
-        m.queue_resume_save_now(ih(1));
-        m.queue_resume_save_now(ih(1));
-        assert_eq!(m.dispatch_resume_saves(10), vec![], "not doubled in flight");
-        assert!(m.note_resume_settled(&ih(1)));
-        assert_eq!(m.pending_resume_count(), 1);
-        assert_eq!(
-            m.dispatch_resume_saves(10),
-            vec![(ih(1), ResumeFlags::empty())]
-        );
-        assert!(m.note_resume_settled(&ih(1)));
-        assert_eq!(m.pending_resume_count(), 0, "asked again once, not forever");
-    }
-
-    #[test]
-    fn a_lost_save_that_changed_in_flight_is_asked_for_unconditionally() {
-        let m = StateMap::new();
-        assert!(m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
-        m.dispatch_resume_saves(10);
-        m.queue_resume_save_now(ih(1));
-        assert_eq!(
-            m.requeue_in_flight_resume_saves(&ProfileId::new("p"), ResumeFlags::ONLY_IF_MODIFIED),
-            1
-        );
-        assert_eq!(
-            m.dispatch_resume_saves(10),
-            vec![(ih(1), ResumeFlags::empty())]
-        );
-        assert!(m.note_resume_settled(&ih(1)));
-        assert_eq!(
-            m.pending_resume_count(),
-            0,
-            "the re-ask answered the change"
-        );
-    }
-
-    #[test]
-    fn dispatch_never_puts_more_than_the_cap_in_flight() {
-        let m = StateMap::new();
-        for b in 0..10 {
-            m.queue_resume_save(ih(b), ResumeFlags::empty());
-        }
-        assert_eq!(m.dispatch_resume_saves(4).len(), 4);
-        assert_eq!(
-            m.dispatch_resume_saves(4).len(),
-            0,
-            "the cap is already full"
-        );
-        m.note_resume_settled(&ih(0));
-        m.note_resume_settled(&ih(1));
-        assert_eq!(
-            m.dispatch_resume_saves(4).len(),
-            2,
-            "topped up as saves settle"
-        );
-        assert_eq!(m.resume_saves_in_flight(), 4);
-        assert_eq!(m.pending_resume_count(), 8);
-    }
-
-    #[test]
-    fn lost_saves_are_asked_for_again_first_with_the_new_flags() {
-        let m = StateMap::new();
-        for b in 0..3 {
-            m.queue_resume_save(ih(b), ResumeFlags::ONLY_IF_MODIFIED);
-        }
-        m.dispatch_resume_saves(2);
-        assert_eq!(
-            m.requeue_in_flight_resume_saves(&ProfileId::new("p"), ResumeFlags::empty()),
-            2
-        );
-        assert_eq!(m.resume_saves_in_flight(), 0);
-        assert_eq!(m.pending_resume_count(), 3);
-        let again = m.dispatch_resume_saves(2);
-        let mut got: Vec<u8> = again.iter().map(|(h, _)| h.0[0]).collect();
-        got.sort();
-        assert_eq!(got, vec![0, 1], "the lost ones go ahead of the queue");
-        assert!(again.iter().all(|(_, f)| f.is_empty()));
-    }
-
-    #[test]
-    fn an_overflow_requeues_only_the_saves_in_flight_to_its_own_profile() {
-        let m = StateMap::new();
-        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
-        let now = Instant::now();
-        // 1 and 2 are p's, 3 is q's, 4 is no longer tracked by anyone.
-        assert!(m.track_added(handle(1, 1), &p, now));
-        assert!(m.track_added(handle(2, 2), &p, now));
-        assert!(m.track_added(handle(3, 3), &q, now));
-        for b in 1..=4 {
-            m.queue_resume_save(ih(b), ResumeFlags::ONLY_IF_MODIFIED);
-        }
-        assert_eq!(m.dispatch_resume_saves(10).len(), 4);
-        assert_eq!(
-            m.requeue_in_flight_resume_saves(&p, ResumeFlags::empty()),
-            3
-        );
-        assert_eq!(m.resume_saves_in_flight(), 1, "q's answer is still owed");
-        let mut again: Vec<u8> = m
-            .dispatch_resume_saves(10)
-            .into_iter()
-            .map(|(h, _)| h.0[0])
-            .collect();
-        again.sort();
-        assert_eq!(again, vec![1, 2, 4]);
-        // q's own answer settles its save, once.
-        assert!(m.note_resume_settled(&ih(3)));
-        assert!(!m.note_resume_settled(&ih(3)));
-    }
-
-    #[test]
-    fn a_rearmed_retry_fires_at_its_new_deadline_only() {
-        let m = StateMap::new();
-        let now = Instant::now();
-        let h = handle(1, 1);
-        let mut s = TorrentState::newly_added(h, ProfileId::new("p"), now);
-        s.retry = Some(RetryState {
-            next_attempt: now,
-            attempts: 1,
-        });
-        m.insert(h.infohash, s);
-        // Re-armed further out before it came due: the old entry is stale.
-        m.update(&h.infohash, |s| {
-            s.retry = Some(RetryState {
-                next_attempt: now + Duration::from_secs(60),
-                attempts: 2,
-            })
-        });
-        assert!(m.retries_due(now).is_empty(), "the stale deadline fired");
-        assert_eq!(
-            m.retries_due(now + Duration::from_secs(60)),
-            vec![h],
-            "the live deadline did not"
-        );
-        assert_eq!(m.retry_schedule_len(), 0, "popped entries are gone");
-    }
-
-    #[test]
-    fn a_retired_or_removed_retry_never_fires() {
-        let m = StateMap::new();
-        let now = Instant::now();
-        for (id, b) in [(1, 1u8), (2, 2)] {
-            let h = handle(id, b);
-            let mut s = TorrentState::newly_added(h, ProfileId::new("p"), now);
-            s.retry = Some(RetryState::first(now));
-            m.insert(h.infohash, s);
-        }
-        m.update(&ih(1), |s| s.retry = None);
-        assert!(m.remove(&ih(2), &ProfileId::new("p"), None).is_some());
-        assert!(m.retries_due(now + RetryState::MAX_DELAY).is_empty());
-    }
-
-    #[test]
-    fn a_remove_leaves_an_entry_another_profile_or_torrent_holds() {
-        let m = StateMap::new();
-        let now = Instant::now();
-        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
-        let old = handle(1, 1);
-        let new = handle(2, 1);
-        m.insert(ih(1), TorrentState::newly_added(new, q.clone(), now));
-        assert!(m.remove(&ih(1), &p, None).is_none(), "q's entry, not p's");
-        assert!(
-            m.remove(&ih(1), &q, Some(old)).is_none(),
-            "not that torrent"
-        );
-        assert_eq!(m.get(&ih(1)).map(|s| s.handle), Some(new));
-        assert!(m.remove(&ih(1), &q, Some(new)).is_some());
-        assert!(!m.contains(&ih(1)));
-    }
-
-    #[test]
-    fn a_removal_settles_with_whether_its_profile_added_the_infohash_again() {
-        let m = StateMap::new();
-        let now = Instant::now();
-        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
-        let old = handle(1, 1);
-        m.insert(ih(1), TorrentState::newly_added(old, p.clone(), now));
-        m.begin_removal(&p, old);
-        // Another profile's add is not this removal's re-add.
-        m.note_readded(&q, &ih(1));
-        let mut seen = None;
-        let settled = m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(false));
-        assert_eq!(
-            settled,
-            RemovalSettled {
-                entry_released: true,
-                readded: false,
+        /// Under any sequence of requests, dispatches, settles and
+        /// re-queues: no save is lost or doubled (every one wanted is queued
+        /// or in flight, never both, and queued once); the dispatcher never
+        /// fills past its cap and leaves nothing queued while it has room;
+        /// a re-queue takes back only its own profile's saves (and those of
+        /// torrents no longer tracked); a save that must be unconditional is
+        /// never dispatched `ONLY_IF_MODIFIED`; and the pending count is the
+        /// number of saves wanted.
+        #[test]
+        fn the_resume_queue_keeps_its_invariants(ops in prop::collection::vec(op(), 0..60)) {
+            let map = StateMap::new();
+            let now = Instant::now();
+            for n in 0..4u8 {
+                let profile = ProfileId::new(if n % 2 == 0 { "p" } else { "q" });
+                map.insert(ih(n), TorrentState::newly_added(TorrentHandle { id: u64::from(n), infohash: ih(n) }, profile, now));
             }
-        );
+            let mut m = Model::default();
+            for op in ops {
+                match op {
+                    Op::Queue(t, conditional) => {
+                        let fresh = !m.wanted.contains(&t);
+                        prop_assert_eq!(map.queue_resume_save(ih(t), flags(conditional)), fresh, "{:?}", op);
+                        if fresh {
+                            m.wanted.insert(t);
+                            if !conditional {
+                                m.unconditional.insert(t);
+                            }
+                        }
+                    }
+                    Op::QueueNow(t) => {
+                        map.queue_resume_save_now(ih(t));
+                        if m.in_flight.contains(&t) {
+                            m.again.insert(t);
+                        } else {
+                            m.wanted.insert(t);
+                            m.unconditional.insert(t);
+                        }
+                    }
+                    Op::Dispatch(cap) => {
+                        let room = cap.saturating_sub(m.in_flight.len());
+                        let queued = m.wanted.len() - m.in_flight.len();
+                        let out = map.dispatch_resume_saves(cap);
+                        prop_assert_eq!(out.len(), room.min(queued), "{:?}", op);
+                        for (h, f) in out {
+                            let t = h.0[0];
+                            prop_assert!(m.wanted.contains(&t) && !m.in_flight.contains(&t), "{} was not queued", t);
+                            if m.unconditional.remove(&t) {
+                                prop_assert_eq!(f, ResumeFlags::empty(), "{} downgraded", t);
+                            }
+                            m.in_flight.insert(t);
+                        }
+                    }
+                    Op::Settle(t) => {
+                        let was = m.in_flight.remove(&t);
+                        prop_assert_eq!(map.note_resume_settled(&ih(t)), was, "{:?}", op);
+                        if was {
+                            if m.again.remove(&t) {
+                                m.unconditional.insert(t);
+                            } else {
+                                m.wanted.remove(&t);
+                                m.unconditional.remove(&t);
+                            }
+                        }
+                    }
+                    Op::Requeue(p, conditional) => {
+                        let profile = ProfileId::new(if p { "p" } else { "q" });
+                        let ours: Vec<u8> = m
+                            .in_flight
+                            .iter()
+                            .copied()
+                            .filter(|&t| t >= 4 || (t % 2 == 0) == p)
+                            .collect();
+                        prop_assert_eq!(map.requeue_in_flight_resume_saves(&profile, flags(conditional)), ours.len(), "{:?}", op);
+                        for t in ours {
+                            m.in_flight.remove(&t);
+                            if m.again.remove(&t) || !conditional {
+                                m.unconditional.insert(t);
+                            }
+                        }
+                    }
+                }
 
-        m.insert(ih(1), TorrentState::newly_added(old, p.clone(), now));
-        m.begin_removal(&p, old);
-        m.note_readded(&p, &ih(1));
-        let settled = m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(true));
-        assert!(settled.readded);
-        // Consumed: a later removal of the re-added torrent deletes.
-        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(false));
-    }
-
-    #[test]
-    fn a_reconciled_removal_settles_only_a_recorded_torrent_and_keeps_its_record() {
-        let m = StateMap::new();
-        let now = Instant::now();
-        let p = ProfileId::new("p");
-        let (old, new) = (handle(1, 1), handle(2, 1));
-        m.insert(ih(1), TorrentState::newly_added(old, p.clone(), now));
-        // Nobody asked for its removal: left alone, nothing deleted.
-        assert_eq!(m.reconcile_removal(&p, old, |_| panic!("deleted")), None);
-        assert!(m.contains(&ih(1)));
-
-        m.begin_removal(&p, old);
-        // Not that torrent.
-        assert_eq!(m.reconcile_removal(&p, new, |_| panic!("deleted")), None);
-        let mut seen = None;
-        let settled = m.reconcile_removal(&p, old, |readded| seen = Some(readded));
-        assert_eq!(seen, Some(false));
-        assert_eq!(
-            settled,
-            Some(RemovalSettled {
-                entry_released: true,
-                readded: false,
-            })
-        );
-        assert!(!m.contains(&ih(1)));
-        // Once settled, a second reconcile finds no entry and runs nothing.
-        assert_eq!(m.reconcile_removal(&p, old, |_| panic!("deleted")), None);
-
-        // The alert was only late: the profile re-added the info-hash, and
-        // the alert then settles by the kept record, leaving the new entry
-        // and its files.
-        m.note_readded(&p, &ih(1));
-        m.insert(ih(1), TorrentState::newly_added(new, p.clone(), now));
-        let settled = m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(true));
-        assert!(!settled.entry_released);
-        assert_eq!(m.get(&ih(1)).map(|s| s.handle), Some(new));
-    }
-
-    #[test]
-    fn an_abandoned_removal_is_forgotten_once_every_request_for_it_was_refused() {
-        let m = StateMap::new();
-        let p = ProfileId::new("p");
-        let old = handle(1, 1);
-        let mut seen = None;
-
-        m.begin_removal(&p, old);
-        m.abandon_removal(&p, old);
-        m.note_readded(&p, &ih(1));
-        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(false), "nothing pending to mark");
-
-        m.begin_removal(&p, old);
-        m.note_readded(&p, &ih(1));
-        // A second request for the same torrent, refused, keeps the mark.
-        m.begin_removal(&p, old);
-        m.abandon_removal(&p, old);
-        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(true));
-
-        // Two requests alongside each other: the first's is accepted, the
-        // second's refused once the torrent is gone. The refusal leaves the
-        // record the first's alert is owed, unmarked, for a re-add to mark.
-        m.begin_removal(&p, old);
-        m.begin_removal(&p, old);
-        m.abandon_removal(&p, old);
-        m.note_readded(&p, &ih(1));
-        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(true), "the accepted request's record survives");
-
-        // Every request refused: no alert is owed, and the record goes.
-        m.begin_removal(&p, old);
-        m.begin_removal(&p, old);
-        m.abandon_removal(&p, old);
-        m.abandon_removal(&p, old);
-        m.note_readded(&p, &ih(1));
-        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
-        assert_eq!(seen, Some(false), "nothing pending to mark");
-    }
-
-    #[test]
-    fn an_update_that_leaves_the_retry_alone_schedules_nothing() {
-        let m = StateMap::new();
-        let now = Instant::now();
-        let h = handle(1, 1);
-        let mut s = TorrentState::newly_added(h, ProfileId::new("p"), now);
-        s.retry = Some(RetryState::first(now));
-        m.insert(h.infohash, s);
-        for _ in 0..100 {
-            m.update(&h.infohash, |s| s.num_peers += 1);
+                let s = map.saves.lock();
+                let queued: Vec<u8> = s.queued.iter().map(|(h, _)| h.0[0]).collect();
+                let queued_set: HashSet<u8> = queued.iter().copied().collect();
+                prop_assert_eq!(queued.len(), queued_set.len(), "queued twice: {:?}", queued);
+                prop_assert_eq!(&s.queued_set.iter().map(|h| h.0[0]).collect::<HashSet<_>>(), &queued_set);
+                prop_assert_eq!(&queued_set, &m.wanted.difference(&m.in_flight).copied().collect::<HashSet<_>>());
+                prop_assert_eq!(&s.in_flight.keys().map(|h| h.0[0]).collect::<HashSet<_>>(), &m.in_flight);
+                prop_assert_eq!(&s.again.iter().map(|h| h.0[0]).collect::<HashSet<_>>(), &m.again);
+                prop_assert!(m.again.is_subset(&m.in_flight));
+                for (h, f) in &s.queued {
+                    if m.unconditional.contains(&h.0[0]) {
+                        prop_assert_eq!(*f, ResumeFlags::empty(), "{} queued downgraded", h.0[0]);
+                    }
+                }
+                drop(s);
+                prop_assert_eq!(map.pending_resume_count(), m.wanted.len() as u64);
+                prop_assert_eq!(map.resume_saves_in_flight(), m.in_flight.len());
+            }
         }
-        assert_eq!(m.retry_schedule_len(), 1);
-    }
-
-    #[test]
-    fn retry_backoff_doubles_to_cap() {
-        assert_eq!(RetryState::delay_for_attempt(1), Duration::from_secs(60));
-        assert_eq!(RetryState::delay_for_attempt(2), Duration::from_secs(120));
-        assert_eq!(RetryState::delay_for_attempt(3), Duration::from_secs(240));
-        assert_eq!(RetryState::delay_for_attempt(7), RetryState::MAX_DELAY);
-        assert_eq!(RetryState::delay_for_attempt(20), RetryState::MAX_DELAY);
     }
 }

@@ -12,7 +12,6 @@ use torrentd_engine::InfoHash;
 use torrentd_engine::MockEngine;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileSource;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::RecordedCall;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -28,6 +27,7 @@ use crate::profile_registry::test_vpn_entry;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
 
 /// A live profile whose engine the test keeps a handle on.
 fn live(id: &str, status: ProfileStatus) -> (ProfileEntry, Arc<MockEngine>) {
@@ -85,6 +85,9 @@ const REASON: &str = "wg-acct_c: no handshake";
 fn three(cov: &Arc<Coverage>) -> (Harness, Arc<MockEngine>, Arc<MockEngine>) {
     let (a, eng_a) = live("acct_a", ProfileStatus::Active);
     let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+    b.update_health(|hl| hl.fence_reason = Some("probe_unavailable"));
+    // A fence that has since lifted leaves its reason behind, unreported.
+    a.update_health(|hl| hl.fence_reason = Some("kill_switch"));
     let h = Harness::authed(cov, |s| {
         install(s, vec![a, b], vec![test_failed_profile("acct_c", REASON)]);
     });
@@ -132,8 +135,11 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         Value::Null,
         "present and null, never omitted"
     );
+    assert_eq!(items[0]["fence_reason"], Value::Null, "not fenced now");
     assert_eq!(items[1]["status"], "vpn_down");
+    assert_eq!(items[1]["fence_reason"], "probe_unavailable");
     assert_eq!(items[2]["status"], "failed");
+    assert_eq!(items[2]["fence_reason"], Value::Null);
     assert_eq!(items[2]["failure_reason"], REASON);
     assert_eq!(items[2]["tunnel_ip"], Value::Null);
     assert_eq!(items[2]["forwarded_port"], Value::Null);
@@ -585,6 +591,81 @@ async fn profiles_behave_as_documented() {
     scenarios(&Coverage::new()).await;
 }
 
+/// Setting a fenced profile online while the kill switch's watch has the
+/// vpn profiles fenced is refused before its tunnel is probed, and changes
+/// nothing; once a check finds the table in force again, the same request
+/// lifts the fence.
+#[tokio::test]
+async fn a_fenced_profile_stays_fenced_while_the_kill_switch_is_not_in_force() {
+    use crate::vpn::killswitch::Fence;
+    let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+    let healthy = Arc::new(AtomicBool::new(true));
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe: crate::vpn_monitor::Prober = {
+        let (inner, probes) = (switchable_probe(&healthy), probes.clone());
+        Arc::new(move |iface: &str, wg: bool| {
+            probes.fetch_add(1, Ordering::SeqCst);
+            inner(iface, wg)
+        })
+    };
+    let mut wired = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        install(s, vec![b], vec![]);
+        s.tunnel_probe = probe.clone();
+        let fence = Arc::new(crate::fence::KillSwitchFence::new(
+            s.profiles.clone(),
+            s.state.clone(),
+            s.metrics.clone(),
+            probe.clone(),
+        ));
+        s.kill_switch = Some(fence.clone());
+        wired = Some(fence);
+    });
+    let fence = wired.unwrap();
+    load(&h.state, 2, "acct_b");
+    let online = || {
+        let token = h.tokens.write.clone();
+        let h = &h;
+        async move {
+            h.send(
+                "PATCH",
+                "/v1/profiles/acct_b",
+                Some(&token),
+                Some(json!({ "state": "online" })),
+            )
+            .await
+        }
+    };
+
+    // Checks that could not run, PROBE_FAILURES_TO_FENCE in a row.
+    fence.fence_all_for(crate::vpn::killswitch::FenceCause::Unverifiable);
+    let resp = online().await;
+    assert_problem(&resp, 409, "kill-switch-not-in-force");
+    assert!(
+        resp.json::<Value>()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("kill switch"),
+        "{}",
+        resp.text()
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 0, "the tunnel is not probed");
+    let detail: Value = h.read("/v1/profiles/acct_b").await.json();
+    assert_eq!(detail["status"], "vpn_down", "still fenced");
+    assert_eq!(
+        calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+        0
+    );
+
+    // A check finds the table in force: the profile was the monitor's to
+    // fence, so the watch's lift leaves it, and setting it online lifts it.
+    fence.lift();
+    let resp = online().await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["status"], "active");
+    assert!(probes.load(Ordering::SeqCst) > 0, "the tunnel was checked");
+}
+
 #[tokio::test]
 async fn bulk_operations_count_what_the_engine_refused() {
     let (a, eng_a) = live("acct_a", ProfileStatus::Active);
@@ -628,8 +709,8 @@ async fn bulk_operations_count_what_the_engine_refused() {
 /// pause.
 #[tokio::test(start_paused = true)]
 async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(REANNOUNCE_BATCH + 50).unwrap();
     for pause in [
@@ -647,12 +728,12 @@ async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
             .resolve(&ProfileId::new("acct_a"))
             .active()
             .unwrap();
-        let run = crate::vpn_monitor::spawn_lift(
+        let run = crate::fence::spawn_lift(
             &h.state.profiles,
             &h.state.metrics,
             entry,
             handles,
-            crate::vpn_monitor::Lift::SetOnline,
+            crate::fence::Lift::SetOnline,
         );
         tokio::time::sleep(REANNOUNCE_PACE / 2).await;
         let resumed = |only: Option<TorrentHandle>| {
@@ -709,8 +790,8 @@ async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
 /// only what was resumed and lists nothing in `skipped_profiles`.
 #[tokio::test(start_paused = true)]
 async fn a_pause_during_a_resume_all_is_not_undone_by_its_later_batches() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     // Both profiles' torrents fit in `load`'s one-byte infohashes.
     let (batch, per) = (REANNOUNCE_BATCH, REANNOUNCE_BATCH + 20);
@@ -1093,8 +1174,8 @@ fn paced_profile(n: u8) -> (Harness, Arc<MockEngine>, Vec<TorrentHandle>) {
 /// held in the record a restart loads unpaused.
 #[tokio::test(start_paused = true)]
 async fn setting_a_profile_online_starts_its_torrents_a_batch_per_pace() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
     let running = usize::from(n) - 1;
@@ -1158,7 +1239,7 @@ async fn setting_a_profile_online_starts_its_torrents_a_batch_per_pace() {
 /// they run.
 #[tokio::test(start_paused = true)]
 async fn a_torrent_the_session_refuses_to_resume_stays_held() {
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let id = ProfileId::new("acct_a");
     let (h, eng, _) = paced_profile(5);
@@ -1326,7 +1407,7 @@ async fn a_hand_resume_racing_a_set_online_leaves_its_pause_held() {
 /// again, each leave the torrent held, as a set-online's pace left it.
 #[tokio::test(start_paused = true)]
 async fn a_hand_resume_that_does_not_leave_it_running_keeps_it_held() {
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let id = ProfileId::new("acct_a");
     for case in ["refused", "fenced"] {
@@ -1399,8 +1480,8 @@ async fn a_hand_resume_that_does_not_leave_it_running_keeps_it_held() {
 /// a restart before the new run reaches them would load them paused.
 #[tokio::test(start_paused = true)]
 async fn a_stopped_run_does_not_release_what_a_newer_set_online_holds() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
     let running = usize::from(n) - 1;
@@ -1441,8 +1522,8 @@ async fn a_stopped_run_does_not_release_what_a_newer_set_online_holds() {
 /// start with the rest, still a batch per pace.
 #[tokio::test(start_paused = true)]
 async fn setting_a_profile_offline_mid_pace_stops_it_and_holds_the_rest() {
-    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
-    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+    use crate::pacing::REANNOUNCE_BATCH;
+    use crate::pacing::REANNOUNCE_PACE;
 
     let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
     let running = usize::from(n) - 1;

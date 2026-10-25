@@ -2,8 +2,20 @@
 # without this every build streams the whole working tree — a warm `target/`
 # alone is gigabytes, and none of it is used: the builder stage compiles from
 # source inside the image.
-target/
+#
+# `**/` because a bare pattern here is anchored at the context root: `target/`
+# alone left every nested build tree (a crate built on its own, a worktree's)
+# in the context. No tracked or vendored path is named `target`.
+**/target/
 .git/
+# Agent worktrees and session state, each a full copy of the tree plus its own
+# `target/`: gigabytes, and none of it source.
+.claude/
+# Local environment files: `.env` and `.env.local` (.gitignore keeps them out
+# of git), and `.envrc` and the like. They hold whatever a developer exported
+# for a shell, tokens included, and `COPY . /src` would otherwise put them in
+# the builder's layer cache. Nothing the build reads starts with `.env`.
+**/.env*
 *.db
 *.db-wal
 *.db-shm

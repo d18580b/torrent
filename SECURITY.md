@@ -2,12 +2,12 @@
 
 ## Supported versions
 
-`master`, and only `master`.
+The latest [release](https://github.com/d18580b/torrent/releases), and
+`master`.
 
-There is no version table here because there is nothing to put in one: this
-repository has published no releases and carries no tags, and `Cargo.toml`
-declares no `workspace.package.version`. A fix ships by landing on `master`.
-If you are running something else, say which commit in your report.
+Releases are cut from `master` only, so a fix lands there and ships in the
+next release. In your report, say which release (`torrentd --version`, or
+the image tag or digest) or which commit you tested.
 
 ## Reporting a vulnerability
 
@@ -17,7 +17,7 @@ vulnerability**
 That opens a draft security advisory that only you, the repository's
 administrators and the people they add to it can see.
 
-- Say which commit you tested, how you configured the daemon (the `[auth]`,
+- Say which release or commit you tested, how you configured the daemon (the `[auth]`,
   `[pool]` and `[[profile]]` sections matter most), and what an attacker gets.
 - Do not attach a working proof of concept up front. Say that you have one;
   attach it if asked.

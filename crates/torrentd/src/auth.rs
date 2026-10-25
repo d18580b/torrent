@@ -535,21 +535,16 @@ impl LoginThrottle {
         }
     }
 
-    /// The same throttle with a shorter penalty, so a test can observe the
-    /// idle sweep without sleeping for the production window. The
-    /// daemon-wide budget is lifted out of the way: these tests drive the
-    /// per-client buckets and never run the KDF.
+    /// The same throttle with a shorter penalty, on a clock only
+    /// [`advance`](Self::advance) moves, so a test can observe the idle sweep
+    /// without sleeping for the window. The daemon-wide budget is lifted out
+    /// of the way: these tests drive the per-client buckets and never run the
+    /// KDF.
     #[cfg(test)]
     fn with_penalty(penalty: Duration) -> Self {
-        Self {
-            penalty,
-            kdf: Mutex::new(KdfBudget::new(
-                u32::MAX,
-                Duration::from_nanos(1),
-                Instant::now(),
-            )),
-            ..Self::new()
-        }
+        let t = Self::with_fake_clock();
+        *t.kdf.lock() = KdfBudget::new(u32::MAX, Duration::from_nanos(1), t.clock.now());
+        Self { penalty, ..t }
     }
 
     /// The same throttle with a daemon-wide budget a test can exhaust and
@@ -939,10 +934,12 @@ mod tests {
             "the prefix and 256 bits of hex"
         );
         assert_eq!(s.expiry(&a), Some(a_expires));
+        assert_eq!(s.len(), 2);
         s.revoke(&a);
         assert!(!s.is_valid(&a), "revoking must actually invalidate");
         assert!(s.is_valid(&b));
         assert!(!s.is_valid("nonsense"));
+        assert_eq!(s.len(), 1, "only the live session counts");
     }
 
     #[test]
@@ -964,6 +961,23 @@ mod tests {
         );
     }
 
+    /// `Auth`'s Debug names how many sessions and tokens it holds, and
+    /// nothing a credential could be read from: no password hash, no token
+    /// digest, no session.
+    #[test]
+    fn auth_debugs_its_counts_and_no_credential() {
+        let (_token, digest) = generate_token();
+        let mut c = cfg(hash_password("pw").unwrap());
+        c.token.push(TokenConfig {
+            name: "prometheus".into(),
+            sha256: digest,
+            scopes: vec![Scope::Metrics],
+        });
+        let auth = Auth::new(c);
+        auth.sessions.create();
+        assert_eq!(format!("{auth:?}"), "Auth { sessions: 1, tokens: 1 }");
+    }
+
     #[test]
     fn expired_sessions_stop_being_valid() {
         let s = SessionStore::new(Duration::from_millis(1));
@@ -971,6 +985,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         assert!(!s.is_valid(&token));
         assert_eq!(s.len(), 0);
+        // `len` counts only live entries; the store itself is swept of the
+        // expired one when the next session is minted.
+        assert_eq!(s.inner.lock().len(), 1, "the expired entry is still held");
+        let (next, _) = s.create();
+        assert_eq!(s.inner.lock().len(), 1, "the expired entry was swept");
+        assert!(s.inner.lock().contains_key(&digest(&next)));
     }
 
     #[test]
@@ -1013,6 +1033,19 @@ mod tests {
             c.session_ttl_secs = good;
             assert!(c.validate().is_ok(), "ttl {good} must be accepted");
         }
+        // The bound the docs quote: 30 days, to the second.
+        let thirty_days = 30 * 86_400;
+        c.session_ttl_secs = thirty_days;
+        assert!(c.validate().is_ok(), "30 days must be accepted");
+        c.session_ttl_secs = thirty_days + 1;
+        assert!(c.validate().is_err(), "past 30 days must be refused");
+    }
+
+    /// A config that names no `session_ttl_secs` gets the documented 12 hours.
+    #[test]
+    fn an_unset_session_ttl_is_twelve_hours() {
+        let c: AuthConfig = toml::from_str("password_hash = \"x\"").unwrap();
+        assert_eq!(c.session_ttl_secs, 12 * 3600);
     }
 
     #[test]
@@ -1198,12 +1231,45 @@ mod tests {
     fn idle_entries_are_swept_for_a_newcomer_even_after_a_consult() {
         let t = LoginThrottle::with_penalty(Duration::from_millis(50));
         fill(&t, 1);
-        std::thread::sleep(Duration::from_millis(150));
+        // A moment short of the idle window every entry is still live, so a
+        // newcomer is turned to the shared bucket.
+        t.advance(Duration::from_millis(49));
+        t.note_failure(ip(1));
+        assert!(!t.per_client.lock().contains_key(&ip(1).unwrap()));
+        t.advance(Duration::from_millis(1));
         for n in 0..MAX_TRACKED_CLIENTS {
             assert!(t.retry_after(Some(filler(n))).is_none());
         }
-        t.note_failure(ip(1));
-        assert!(t.per_client.lock().contains_key(&ip(1).unwrap()));
+        t.note_failure(ip(2));
+        assert!(t.per_client.lock().contains_key(&ip(2).unwrap()));
+    }
+
+    /// A lockout lasts exactly the penalty, and its end clears the count with
+    /// the lock: the client gets a whole burst again, not one attempt before
+    /// the next lockout. Per client and in the shared bucket alike.
+    #[test]
+    fn a_lockout_lasts_the_penalty_and_its_end_restores_the_whole_burst() {
+        for client in [ip(1), None] {
+            let t = LoginThrottle::with_fake_clock();
+            for _ in 0..5 {
+                t.note_failure(client);
+            }
+            assert_eq!(t.retry_after(client), Some(Duration::from_secs(30)));
+            t.advance(Duration::from_secs(29));
+            assert_eq!(t.retry_after(client), Some(Duration::from_secs(1)));
+            t.advance(Duration::from_secs(1));
+            assert_eq!(t.retry_after(client), None, "{client:?}: the window ended");
+            for n in 1..5 {
+                t.note_failure(client);
+                assert_eq!(
+                    t.retry_after(client),
+                    None,
+                    "{client:?}: failure {n} of a fresh burst must not lock out",
+                );
+            }
+            t.note_failure(client);
+            assert_eq!(t.retry_after(client), Some(Duration::from_secs(30)));
+        }
     }
 
     /// A success keeps or gains the client a slot of its own, so a full map's
@@ -1250,6 +1316,50 @@ mod tests {
         t.note_success(ip(1));
         assert!(t.per_client.lock().contains_key(&ip(1).unwrap()));
         assert!(!t.per_client.lock().contains_key(&filler(7)));
+    }
+
+    /// A lockout that ends at this very instant, or has ended, protects no
+    /// one, so the sweep for a newcomer reclaims it, as it does an idle
+    /// entry.
+    #[test]
+    fn an_ended_lockout_is_swept_for_a_newcomer() {
+        let penalty = Duration::from_millis(50);
+        for past in [Duration::ZERO, Duration::from_millis(1)] {
+            let t = LoginThrottle::with_penalty(penalty);
+            fill(&t, 5);
+            t.advance(penalty + past);
+            t.note_failure(ip(1));
+            assert!(
+                t.per_client.lock().contains_key(&ip(1).unwrap()),
+                "{past:?} past the lockouts' end, they made room for the newcomer",
+            );
+        }
+    }
+
+    /// A client's failures do not decay while the map has room: only a full
+    /// map's sweep reclaims an idle entry, so neither another client's
+    /// failure nor another client's success clears them.
+    #[test]
+    fn failures_outlast_idleness_while_the_map_has_room() {
+        let penalty = Duration::from_millis(50);
+        for other_succeeds in [false, true] {
+            let t = LoginThrottle::with_penalty(penalty);
+            for _ in 0..4 {
+                t.note_failure(ip(1));
+            }
+            t.advance(penalty * 2);
+            if other_succeeds {
+                t.note_success(ip(2));
+            } else {
+                t.note_failure(ip(2));
+            }
+            t.note_failure(ip(1));
+            assert_eq!(
+                t.retry_after(ip(1)),
+                Some(penalty),
+                "the fifth failure locks out (other succeeded: {other_succeeds})",
+            );
+        }
     }
 
     #[test]
@@ -1371,6 +1481,65 @@ mod tests {
             Err(refill),
             "ten intervals idle accrue no more than the burst",
         );
+    }
+
+    /// A bucket that still holds tokens accrues only the room it has left:
+    /// the burst caps what it holds, not what it gains.
+    #[test]
+    fn a_partly_spent_budget_refills_only_to_its_burst() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+
+        t.advance(refill * 10);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+        assert!(
+            t.admit_verification(None).is_err(),
+            "one token left and ten intervals idle make a burst of three, no more",
+        );
+    }
+
+    /// A refill that leaves the bucket short of full keeps the part of the
+    /// next interval already served, so the wait it names is what is left
+    /// of that interval.
+    #[test]
+    fn a_refill_short_of_the_burst_keeps_the_interval_already_served() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+
+        t.advance(refill * 2 + refill / 2);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+        assert_eq!(
+            t.admit_verification(None),
+            Err(refill / 2),
+            "two and a half intervals: two runs, and half an interval to the third",
+        );
+    }
+
+    /// Only the first take from a full bucket starts its refill clock: a
+    /// take from a bucket already part spent leaves the interval running.
+    #[test]
+    fn a_take_from_a_part_spent_budget_leaves_its_refill_clock_running() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        assert!(t.admit_verification(None).is_ok());
+        t.advance(refill * 3 / 4);
+        assert!(t.admit_verification(None).is_ok());
+
+        t.advance(refill / 4);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(
+            t.admit_verification(None).is_ok(),
+            "one interval from the first take, one token back",
+        );
+        assert_eq!(t.admit_verification(None), Err(refill));
     }
 
     /// One `POST /v1/sessions` as `create_session` runs it, against `t`'s
@@ -1550,5 +1719,77 @@ mod tests {
         assert_eq!(known.len(), MAX_KNOWN_CLIENTS);
         assert!(!known.contains_key(&filler(0)));
         assert!(known.contains_key(&filler(MAX_KNOWN_CLIENTS)));
+    }
+
+    /// `token` with bit `bit` (0..7, so it stays ASCII) of byte `at` flipped.
+    fn flip(token: &str, at: usize, bit: u8) -> String {
+        let mut bytes = token.as_bytes().to_vec();
+        let at = at % bytes.len();
+        bytes[at] ^= 1 << (bit % 7);
+        String::from_utf8(bytes).expect("an ASCII byte with a low bit flipped is ASCII")
+    }
+
+    /// The shape every minted token has: its prefix and 256 bits of
+    /// lowercase hex, and nothing that starts with the other kind's prefix.
+    fn assert_shape(token: &str, prefix: &str, other: &str) {
+        let hex = token
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("{token}"));
+        assert_eq!(hex.len(), 64, "{token}");
+        assert!(
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{token}"
+        );
+        assert!(!token.starts_with(other), "{token}");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// A minted API token resolves to its entry; the same token with any
+        /// one bit flipped resolves to nothing.
+        #[test]
+        fn a_token_resolves_and_no_one_bit_flip_of_it_does(at in 0usize..68, bit in 0u8..7) {
+            let (token, digest) = generate_token();
+            assert_shape(&token, STATIC_TOKEN_PREFIX, SESSION_TOKEN_PREFIX);
+            let mut c = cfg("unused".into());
+            c.token.push(TokenConfig {
+                name: "t".into(),
+                sha256: digest,
+                scopes: vec![Scope::Read],
+            });
+            let auth = Auth::new(c);
+            proptest::prop_assert_eq!(auth.token_scopes(&token).map(|(n, _)| n), Some("t"));
+            let flipped = flip(&token, at, bit);
+            proptest::prop_assert_ne!(&flipped, &token);
+            proptest::prop_assert!(auth.token_scopes(&flipped).is_none(), "{}", flipped);
+        }
+
+        /// A session token is live; the same token with any one bit flipped
+        /// is not, and a static token is never read as a session.
+        #[test]
+        fn a_session_resolves_and_no_one_bit_flip_of_it_does(at in 0usize..68, bit in 0u8..7) {
+            let s = SessionStore::new(Duration::from_secs(60));
+            let (token, _) = s.create();
+            assert_shape(&token, SESSION_TOKEN_PREFIX, STATIC_TOKEN_PREFIX);
+            proptest::prop_assert!(s.is_valid(&token));
+            proptest::prop_assert!(!s.is_valid(&flip(&token, at, bit)));
+            let (static_token, _) = generate_token();
+            proptest::prop_assert!(!s.is_valid(&static_token));
+        }
+    }
+
+    proptest::proptest! {
+        /// `ct_eq` is ordinary equality on every pair, equal or not.
+        #[test]
+        fn ct_eq_is_equality(
+            a in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..40),
+            b in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..40),
+            same in proptest::prelude::any::<bool>(),
+        ) {
+            let b = if same { a.clone() } else { b };
+            proptest::prop_assert_eq!(ct_eq(&a, &b), a == b);
+        }
     }
 }

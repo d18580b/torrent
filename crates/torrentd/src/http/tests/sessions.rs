@@ -8,6 +8,30 @@ use super::support::assert_problem;
 use super::support::Coverage;
 use super::support::Harness;
 use super::support::PASSWORD;
+use super::support::SESSION_TTL_SECS;
+
+/// The series `TorrentdTokenScopeDenied` alerts on.
+const SCOPE_DENIALS: &str = "torrentd_auth_token_scope_denials_total";
+
+/// The series the login alerts watch, for one `reason`.
+fn login_failures(reason: &str) -> String {
+    format!("torrentd_auth_login_failures_total{{reason=\"{reason}\"}}")
+}
+
+/// `expires_at` is a session TTL from now, to within the time the test took.
+fn assert_expires_in_ttl(expires_at: &serde_json::Value) {
+    let at: jiff::Timestamp = expires_at
+        .as_str()
+        .expect("expires_at is a string")
+        .parse()
+        .expect("expires_at is an RFC 3339 timestamp");
+    let lifetime = at.as_second() - jiff::Timestamp::now().as_second();
+    let ttl = SESSION_TTL_SECS as i64;
+    assert!(
+        (ttl - 5..=ttl + 5).contains(&lifetime),
+        "a session expires session_ttl_secs ({ttl}) from now, not {lifetime}s",
+    );
+}
 
 /// Every declared response of the `sessions` tag.
 pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
@@ -29,6 +53,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     assert!(token.starts_with("tds_"), "{token}");
     assert_eq!(grant["token_type"], "Bearer");
     assert_eq!(grant["scopes"], json!(["read", "write"]));
+    assert_expires_in_ttl(&grant["expires_at"]);
 
     let me: serde_json::Value = h
         .send("GET", "/v1/sessions/current", Some(&token), None)
@@ -36,11 +61,14 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         .json();
     assert_eq!(me["kind"], "session");
     assert_eq!(me["name"], serde_json::Value::Null);
-    assert!(me["expires_at"].is_string());
+    assert_eq!(me["expires_at"], grant["expires_at"]);
 
-    // A session carries `write`, and never `metrics`.
+    // A session carries `write`, and never `metrics`. Only a static token
+    // used beyond its scopes is a scope denial the alert counts: a session
+    // is the operator, and nothing it is refused is a leaked credential.
     let resp = h.send("GET", "/metrics", Some(&token), None).await;
     assert_problem(&resp, 403, "insufficient-scope");
+    assert_eq!(h.metric(SCOPE_DENIALS).await, 0.0);
 
     h.send("DELETE", "/v1/sessions/current", Some(&token), None)
         .await
@@ -69,6 +97,11 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 403, "insufficient-scope");
+    assert_eq!(
+        h.metric(SCOPE_DENIALS).await,
+        2.0,
+        "each refusal of the scrape token is counted once",
+    );
 
     // A static token is described, and cannot be revoked here.
     let me: serde_json::Value = h.read("/v1/sessions/current").await.json();
@@ -157,6 +190,10 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
             .await;
         assert_problem(&resp, 401, "invalid-credentials");
     }
+    // Malformed requests above were refused before the hash, so they are not
+    // failed logins.
+    assert_eq!(h.metric(&login_failures("bad_password")).await, 5.0);
+    assert_eq!(h.metric(&login_failures("throttled")).await, 0.0);
     let resp = h
         .send(
             "POST",
@@ -167,9 +204,17 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         .await;
     assert_problem(&resp, 429, "login-throttled");
     let wait: u64 = resp.header("retry-after").unwrap().parse().unwrap();
-    assert!(wait >= 1);
+    // The 30 s penalty, in whole seconds rounded down: the lockout began a
+    // moment before this request read the clock.
+    assert!((29..=30).contains(&wait), "retry-after {wait}");
     let body: serde_json::Value = resp.json();
     assert_eq!(body["retry_after_secs"], wait);
+    assert_eq!(h.metric(&login_failures("throttled")).await, 1.0);
+    assert_eq!(
+        h.metric(&login_failures("bad_password")).await,
+        5.0,
+        "a throttled attempt never reaches the password check",
+    );
 
     h.assert_conformance();
 
@@ -298,27 +343,115 @@ async fn a_client_that_logged_in_before_gets_past_a_spent_verification_budget() 
     // Spend the shared budget the way an unidentified poller would.
     let throttle = &h.state.auth.as_ref().unwrap().throttle;
     while throttle.admit_verification(None).is_ok() {}
+    assert_eq!(h.metric(&login_failures("verification_budget")).await, 0.0);
 
     let resp = login("203.0.113.8").await;
     assert_problem(&resp, 429, "login-throttled");
     assert!(resp.header("retry-after").is_some());
+    // The series `TorrentdLoginThrottled` alerts on counts this refusal under
+    // its own reason, not as a per-client throttle.
+    assert_eq!(h.metric(&login_failures("verification_budget")).await, 1.0);
+    assert_eq!(h.metric(&login_failures("throttled")).await, 0.0);
     login("203.0.113.7")
         .await
         .assert_status(kynos::http::StatusCode::CREATED);
+    assert_eq!(
+        h.metric(&login_failures("verification_budget")).await,
+        1.0,
+        "a login admitted from the reserve is not a refusal",
+    );
 }
 
 #[tokio::test]
-async fn an_expired_session_is_refused_like_an_unknown_one() {
-    let h = Harness::authed(&Coverage::new(), |_| {});
-    let auth = h.state.auth.as_ref().unwrap();
-    let short = crate::auth::SessionStore::new(std::time::Duration::from_millis(1));
-    let (token, _) = short.create();
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    assert!(!short.is_valid(&token));
-    // Neither a token from another store nor garbage authenticates here.
-    for bad in [token.as_str(), "tds_nonsense", "tdp_nonsense", "nonsense"] {
-        let resp = h.send("GET", "/v1/status", Some(bad), None).await;
-        assert_eq!(resp.status().as_u16(), 401, "{bad}");
+async fn a_session_past_its_ttl_is_refused_over_http() {
+    // A session this daemon issued, used while live and again once its TTL
+    // has run out: the second answer is the expiry's, since the token is
+    // otherwise exactly the one that worked.
+    let h = Harness::authed_with_session_ttl(&Coverage::new(), 1);
+    let resp = h
+        .send(
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(json!({"password": PASSWORD})),
+        )
+        .await;
+    resp.assert_status(kynos::http::StatusCode::CREATED);
+    let token = resp.json::<serde_json::Value>()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.send("GET", "/v1/status", Some(&token), None)
+        .await
+        .assert_status(kynos::http::StatusCode::OK);
+
+    // The store reads the system clock, so the TTL is waited out for real.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let resp = h.send("GET", "/v1/status", Some(&token), None).await;
+    assert_eq!(resp.status().as_u16(), 401, "an expired session is dead");
+    let resp = h
+        .send("GET", "/v1/sessions/current", Some(&token), None)
+        .await;
+    assert_eq!(resp.status().as_u16(), 401);
+    // Refused exactly as an unknown token is: no answer tells a caller which
+    // tokens once existed.
+    for bad in ["tds_nonsense", "tdp_nonsense", "nonsense"] {
+        let unknown = h.send("GET", "/v1/status", Some(bad), None).await;
+        assert_eq!(unknown.status().as_u16(), 401, "{bad}");
+        assert_eq!(unknown.text(), resp.text(), "{bad}");
     }
-    assert_eq!(auth.sessions.len(), 0);
+    assert_eq!(h.state.auth.as_ref().unwrap().sessions.len(), 0);
+}
+
+#[tokio::test]
+async fn an_untrusted_peers_forwarded_header_cannot_dodge_the_throttle() {
+    // With no trusted proxy, `X-Forwarded-For` is the client's own claim. A
+    // client that names a new address on every attempt must still be keyed
+    // on its socket peer, or it gets a fresh burst per request.
+    let h = Harness::authed(&Coverage::new(), |_| {});
+    let clients = [
+        "203.0.113.1",
+        "203.0.113.2",
+        "203.0.113.3",
+        "203.0.113.4",
+        "203.0.113.5",
+        "203.0.113.6",
+    ];
+    for client in &clients[..5] {
+        let resp = h
+            .send_with(
+                "POST",
+                "/v1/sessions",
+                None,
+                Some(json!({"password": "nope"})),
+                &[("x-forwarded-for", client)],
+            )
+            .await;
+        assert_problem(&resp, 401, "invalid-credentials");
+    }
+    let resp = h
+        .send_with(
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(json!({"password": PASSWORD})),
+            &[("x-forwarded-for", clients[5])],
+        )
+        .await;
+    assert_problem(&resp, 429, "login-throttled");
+    let auth = h.state.auth.as_ref().unwrap();
+    assert!(
+        auth.throttle
+            .retry_after(Some("192.0.2.10".parse().unwrap()))
+            .is_some(),
+        "the bucket is the socket peer's",
+    );
+    for client in clients {
+        assert!(
+            auth.throttle
+                .retry_after(Some(client.parse().unwrap()))
+                .is_none(),
+            "{client} holds no bucket",
+        );
+    }
 }

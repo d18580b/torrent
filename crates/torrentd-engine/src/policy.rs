@@ -738,5 +738,11 @@ mod tests {
             check_trackers(&p, &resumed(b"de".to_vec(), None)),
             Err(TrackerRefusal::Unreadable(_))
         ));
+        // A source that could not be read is not the guard refusing it, so
+        // no add path counts it as one.
+        let unreadable = check_trackers(&p, &file(b"not bencode".to_vec())).unwrap_err();
+        assert!(!unreadable.is_guard_refusal());
+        assert!(TrackerRefusal::NotAllowed.is_guard_refusal());
+        assert!(TrackerRefusal::NoTrackers.is_guard_refusal());
     }
 }

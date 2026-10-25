@@ -492,6 +492,12 @@ mod tests {
     #[tokio::test]
     async fn a_bind_that_fails_after_binding_leaves_no_socket_and_no_staging_directory() {
         let Some(gid) = foreign_gid() else {
+            // CI runs as a non-root user, so there the skip is a failure.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "root may chgrp to any gid, so this case cannot be built: \
+                 CI must run the tests as a non-root user"
+            );
             eprintln!("skipped: root may chgrp to any gid");
             return;
         };

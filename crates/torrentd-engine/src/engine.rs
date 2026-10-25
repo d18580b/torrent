@@ -88,6 +88,11 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// data only with the next save, so a caller that must keep it across a
     /// restart queues one.
     fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError>;
+    /// Put one torrent back under the add-time no-download invariant: clear
+    /// [`crate::policy::forbidden`] and set `UPLOAD_MODE`. Takes no flags, so
+    /// it can never lift upload mode. For a status that shows the invariant
+    /// lapsed.
+    fn enforce_no_download(&self, h: TorrentHandle) -> Result<(), EngineError>;
     /// Relocate a torrent's payload via libtorrent, so its storage state stays
     /// consistent. Asynchronous: `Alert::StorageMoved{,Failed}`.
     fn move_storage(
@@ -215,6 +220,9 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError> {
         (**self).unset_flags(h, flags)
+    }
+    fn enforce_no_download(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        (**self).enforce_no_download(h)
     }
     fn move_storage(
         &self,

@@ -10,12 +10,9 @@ use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::port_forward::REANNOUNCE_PACE;
-use torrentd_engine::DesiredState;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode as EnginePortForwardMode;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus as EngineProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentEngine;
 use tracing::info;
@@ -36,10 +33,13 @@ use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::server::count;
 use crate::http::v1::Profiles;
 use crate::http::v1::Torrents;
+use crate::pacing::REANNOUNCE_PACE;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
+use crate::profile_registry::ProfileStatus as ObservedStatus;
 use crate::profile_registry::Resolution;
 use crate::profile_registry::ResumeGate;
+use crate::profile_state::DesiredState;
 
 /// Operations that take no request body.
 macro_rules! bodyless_routes {
@@ -111,12 +111,11 @@ pub enum ProfileStatus {
     VpnDown,
 }
 
-impl From<&EngineProfileStatus> for ProfileStatus {
-    fn from(s: &EngineProfileStatus) -> Self {
+impl From<&ObservedStatus> for ProfileStatus {
+    fn from(s: &ObservedStatus) -> Self {
         match s {
-            EngineProfileStatus::Active => Self::Active,
-            EngineProfileStatus::Failed => Self::Failed,
-            EngineProfileStatus::VpnDown => Self::VpnDown,
+            ObservedStatus::Active => Self::Active,
+            ObservedStatus::VpnDown => Self::VpnDown,
         }
     }
 }
@@ -177,6 +176,13 @@ pub struct Profile {
     pub user_agent: Option<String>,
     /// Why the profile has no session. Set only when `status` is `failed`.
     pub failure_reason: Option<String>,
+    /// Why the profile is fenced, as the `reason` label of
+    /// `torrentd_profile_vpn_fenced_total` names it: `ip_lost_or_changed`,
+    /// `route_mismatch`, `handshake_stale`, `no_handshake`,
+    /// `probe_unavailable` (its tunnel's checks, or the kill switch's, could
+    /// not run several times in a row), or `kill_switch` (the nftables kill
+    /// switch was not in force). Set only when `status` is `vpn_down`.
+    pub fence_reason: Option<String>,
 }
 
 /// Every configured profile.
@@ -275,7 +281,7 @@ fn profile_of(s: &AppState, e: &ProfileEntry) -> Profile {
         Ok(paused) => !paused,
         Err(_) => !states.holds_offline(e.id()),
     };
-    let on_network = h.status == EngineProfileStatus::Active && session_running;
+    let on_network = h.status == ObservedStatus::Active && session_running;
     Profile {
         profile_id: e.config.id.as_str().to_owned(),
         status: ProfileStatus::from(&h.status),
@@ -294,6 +300,10 @@ fn profile_of(s: &AppState, e: &ProfileEntry) -> Profile {
         forwarded_port: h.forwarded_port.or(listen_port),
         user_agent: e.config.user_agent.clone(),
         failure_reason: None,
+        fence_reason: (h.status == ObservedStatus::VpnDown)
+            .then_some(h.fence_reason)
+            .flatten()
+            .map(str::to_owned),
     }
 }
 
@@ -321,6 +331,7 @@ fn profile_of_failed(s: &AppState, f: &FailedProfile) -> Profile {
         forwarded_port: None,
         user_agent: f.config.user_agent.clone(),
         failure_reason: Some(f.reason.clone()),
+        fence_reason: None,
     }
 }
 
@@ -430,6 +441,12 @@ pub enum SetProfileStateError {
         #[problem(extension)]
         profile_status: &'static str,
     },
+    /// The profile is fenced (`vpn_down`) and the network kill switch did
+    /// not last check in force, so the fence stays and its state is
+    /// unchanged.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The network kill switch is not in force")]
+    KillSwitchNotInForce { detail: String },
     /// The state could not be recorded, or a session refused it.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
@@ -458,7 +475,12 @@ pub enum SetProfileStateError {
 /// route by the tunnel. If it passes, the VPN monitor watches the profile
 /// again, handshake included, and the fence's pauses are undone 100 torrents
 /// a second, going on after the response, since each torrent resumed
-/// announces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting
+/// announces to its trackers; if it fails, `409` and nothing changes. Where
+/// `network_kill_switch` is on, the fence stays unless the kill switch last
+/// checked in force: while its watch has the vpn profiles fenced, for a table
+/// found gone or changed or for checks that could not run, setting a fenced
+/// profile online answers `409 kill-switch-not-in-force` and nothing changes,
+/// before its tunnel is checked. A profile that never came up keeps the setting
 /// for its next boot. `offline_all`, while on, keeps every profile offline
 /// whatever this sets.
 #[kynos::patch("/profiles/{profile_id}", tag = Profiles)]
@@ -493,9 +515,26 @@ fn set_state(
         .profiles
         .resolve(profile_id)
         .active()
-        .filter(|e| e.health().status == EngineProfileStatus::VpnDown);
+        .filter(|e| e.health().status == ObservedStatus::VpnDown);
     let lift = match (desired, fenced) {
         (DesiredState::Online, Some(entry)) => {
+            // A healthy tunnel is not enough: lifted now, the profile seeds
+            // with nothing but its source bind between it and the bare
+            // interface until the watch's next check fences it again.
+            if s.kill_switch.as_ref().is_some_and(|ks| !ks.in_force()) {
+                warn!(
+                    profile_id = %profile_id,
+                    "profile set online while fenced; the network kill switch is not in force, \
+                     so it stays fenced",
+                );
+                return Err(SetProfileStateError::KillSwitchNotInForce {
+                    detail: "profile vpn_down: the network kill switch did not last check in \
+                             force, so the profile stays fenced and its state is unchanged. \
+                             Restore the kill switch's nftables table (restarting the daemon \
+                             installs it again), then retry once a check finds it in force."
+                        .to_string(),
+                });
+            }
             if let Err(reason) = crate::vpn_monitor::recovery_check(entry, &s.tunnel_probe) {
                 warn!(
                     profile_id = %profile_id,
@@ -538,7 +577,7 @@ fn set_state(
 /// before the fence. Pause it again after.
 ///
 /// The resumes are paced, a batch a second, by a task that goes on after the
-/// request is answered ([`crate::vpn_monitor::spawn_lift`]).
+/// request is answered ([`crate::fence::spawn_run`]).
 fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     let profile_id = entry.id();
     let handles = s.state.handles_for_profile(profile_id);
@@ -547,7 +586,7 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     // finds it active with no run to resume its torrents.
     let run = entry.begin_resume(handles);
     entry.update_health(|h| {
-        h.status = EngineProfileStatus::Active;
+        h.status = ObservedStatus::Active;
         h.tunnel_ip = entry.session_ip;
         h.paused_for_vpn = 0;
     });
@@ -561,19 +600,19 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
         "fence lifted: the tunnel checked healthy and the profile was set online; resuming \
          its torrents a batch at a time",
     );
-    crate::vpn_monitor::spawn_run(
+    crate::fence::spawn_run(
         &s.profiles,
         &s.metrics,
         entry,
         run,
-        crate::vpn_monitor::Lift::SetOnline,
+        crate::fence::Lift::SetOnline,
     );
 }
 
 /// How a profile going online has its torrents resumed: a batch a second,
 /// from a task that goes on after the request is answered.
-fn online_pace(s: &AppState) -> crate::vpn_monitor::OnlinePace<'_> {
-    crate::vpn_monitor::OnlinePace {
+fn online_pace(s: &AppState) -> crate::fence::OnlinePace<'_> {
+    crate::fence::OnlinePace {
         profiles: &s.profiles,
         state: &s.state,
         metrics: &s.metrics,
@@ -782,7 +821,7 @@ fn pause_and_save(
 }
 
 /// Resume every torrent `profile_id` holds, through the shared pacer
-/// ([`crate::vpn_monitor::resume_paced`]), and add what it reached to `out`.
+/// ([`crate::fence::resume_paced`]), and add what it reached to `out`.
 /// A profile fenced before the last batch is added to `skipped_profiles` with
 /// how many it did not reach.
 ///
@@ -813,7 +852,7 @@ async fn resume_each(
             failed_count: 0,
             failed: Vec::new(),
         };
-        let resumed = crate::vpn_monitor::resume_paced(
+        let resumed = crate::fence::resume_paced(
             profiles,
             id,
             &handles,
@@ -1077,7 +1116,7 @@ pub async fn resume_all_torrents(
         .map(|entry| (entry, entry.open_gate()))
         .collect();
     for (entry, gate) in gates {
-        let held = if entry.health().status == EngineProfileStatus::VpnDown {
+        let held = if entry.health().status == ObservedStatus::VpnDown {
             Some(ProfileProblem::vpn_down())
         } else if s.profile_offline(entry.id()) {
             Some(ProfileProblem::offline())
@@ -1177,18 +1216,18 @@ mod tests {
     /// profile until the run ends.
     #[tokio::test(start_paused = true)]
     async fn a_lifted_fence_names_what_its_run_has_yet_to_resume() {
-        use torrentd_engine::port_forward::REANNOUNCE_BATCH;
         use torrentd_engine::InfoHash;
         use torrentd_engine::TorrentHandle;
         use torrentd_engine::TorrentState;
 
         use crate::app_state::build_test_state;
+        use crate::pacing::REANNOUNCE_BATCH;
         use crate::profile_registry::test_entry;
         use crate::profile_registry::ProfileRegistry;
 
         let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
             "p",
-            EngineProfileStatus::VpnDown,
+            ObservedStatus::VpnDown,
         )]));
         let s = build_test_state(Some(reg));
         let id = ProfileId::new("p");
@@ -1210,7 +1249,7 @@ mod tests {
 
         lift_fence(&s, entry);
         tokio::time::sleep(REANNOUNCE_PACE / 2).await;
-        assert_eq!(entry.health().status, EngineProfileStatus::Active);
+        assert_eq!(entry.health().status, ObservedStatus::Active);
         assert!(
             entry.resume_pending(&last),
             "the first batch went out; the last torrent is still the run's to resume",

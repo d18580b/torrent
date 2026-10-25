@@ -1,0 +1,457 @@
+name: Release
+
+# Releases are cut by merging the pull request release-plz opens; nobody tags
+# or uploads anything by hand, so the only signer is this workflow.
+#
+# On every push to `master`:
+#
+# 1. `release` runs `release-plz release`. On the merge of a release pull
+#    request (release-plz.toml's `release_always = false`) it creates the
+#    `vX.Y.Z` tag and a *draft* GitHub release through the API; on any other
+#    push it does nothing.
+# 2. `release-pr` then runs `release-plz release-pr`, which opens or updates
+#    the release pull request with verified commits made through the API. It
+#    regenerates docs/api/openapi.json on that branch, whose `info.version`
+#    is the crate version, and dispatches ci.yml on it: a pull request opened
+#    with this workflow's token triggers no workflow of its own.
+# 3. When `release` created a release, `dist`, `dist-musl` and `image` build
+#    everything the release ships, from the tagged commit, with no cache, and
+#    `publish` signs and attests the files, uploads them to the draft and
+#    publishes it. GitHub's immutable releases freeze a release's assets and
+#    tag once it is published, which is why it is created as a draft.
+#
+# A token-created tag or release triggers no further workflow, so the build
+# and publish jobs live here rather than in an `on: release` workflow.
+#
+# On a pull request that touches the release machinery, the build jobs run
+# without uploading or pushing anything, so a broken release build fails the
+# pull request rather than the next release.
+#
+# Every action is pinned to a commit SHA with its release in a comment, as in
+# ci.yml. Each job holds only the permissions it uses; the workflow holds
+# none. Expressions reach scripts through `env:`, never pasted into them.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - .github/workflows/release-plz.yml
+      - .github/actions/**
+      - release-plz.toml
+      - cliff.toml
+      - scripts/dist
+      - mise.toml
+      - deploy/Containerfile
+      - rust-toolchain.toml
+
+permissions: {}
+
+# A newer push to a pull request supersedes its older dry run. Pushes to
+# `master` are never grouped: a pending run cancelled by a later push could be
+# the release pull request's merge, and the later push would not release it.
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # ci.yml says why this must equal build.rs's default.
+  LIBTORRENT_SYS_CACHE_DIR: /home/runner/.cache/torrentd/native
+
+jobs:
+  release:
+    name: release-plz release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # the tag and the draft release, both through the API
+      pull-requests: read # `release_always = false`: the pull request a commit came from
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          # release-plz reads the tags and the history since the last one.
+          fetch-depth: 0
+          persist-credentials: false
+      # release-plz reads `cargo metadata`, so it needs cargo; mise provides
+      # release-plz at the version mise.toml pins.
+      - uses: ./.github/actions/setup-rust
+      # Tags and releases go through the API, but release-plz works in a
+      # scratch copy of the repository on the way, where git wants an
+      # identity for anything it records.
+      - run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - id: release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out=$(release-plz release --git-token "$GITHUB_TOKEN" -o json)
+          echo "$out"
+          # Every member is released at the one version; only torrentd has
+          # the tag and the release (release-plz.toml).
+          tag=$(jq -r '[.releases[] | select(.package_name == "torrentd")][0].tag // ""' <<< "$out")
+          version=$(jq -r '[.releases[] | select(.package_name == "torrentd")][0].version // ""' <<< "$out")
+          if [ -n "$tag" ] && [ "$tag" != "v$version" ]; then
+            echo "::error::release-plz tagged $tag for version $version"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  release-pr:
+    name: release-plz release-pr
+    if: github.event_name == 'push'
+    # After `release`, so a merged release pull request's tag exists before
+    # the next one is computed; otherwise this run would propose the version
+    # just released all over again.
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write # the release branch and its commits, through the API
+      pull-requests: write # open, update and label the release pull request
+      actions: write # `gh workflow run ci.yml` on the release branch
+    # One release pull request: a second run waits for the first to finish
+    # rather than racing it on the same branch.
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          fetch-depth: 0
+          persist-credentials: false
+      # Builds torrentd to regenerate the OpenAPI document, like ci.yml's
+      # openapi-check does, from the same caches.
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-deps: 'true'
+          cache-prefix: cargo
+      # Restore only. The key is computed from this checkout of `master`, but
+      # torrentd is built from the release branch, whose bumped
+      # crates/libtorrent-sys/Cargo.toml names a different prefix: saving
+      # would store, under `master`'s exact key, a cache lacking the prefix
+      # that key names, and every later job would take it as a hit and skip
+      # the vendor fetch. For the same reason a hit here proves nothing about
+      # the release branch, so the regeneration step below fetches the
+      # submodules itself, whatever this restored.
+      - uses: ./.github/actions/native-cache
+        with:
+          path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
+          save: 'false'
+      # release-plz commits through the API, but stashes and checks out in a
+      # scratch copy of the repository on the way, which git refuses to do
+      # without an identity.
+      - run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - id: release-pr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          out=$(release-plz release-pr --git-token "$GITHUB_TOKEN" --repo-url "$REPO_URL" -o json)
+          echo "$out"
+          # Empty when release-plz neither opened nor updated a pull request.
+          echo "branch=$(jq -r '.prs[0].head_branch // ""' <<< "$out")" >> "$GITHUB_OUTPUT"
+      # The document's `info.version` is the crate version the release pull
+      # request just moved, so the committed copy is stale on that branch
+      # until it is regenerated, and ci.yml's openapi-check would fail it.
+      # Committed through the GraphQL API, so the commit is verified like
+      # release-plz's own, and only onto the head this job read.
+      - if: steps.release-pr.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.release-pr.outputs.branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/$BRANCH"
+          head=$(git rev-parse FETCH_HEAD)
+          git checkout --detach "$head"
+          # The release branch's gitlinks, unconditionally: build.rs rebuilds
+          # the prefix whenever its stamp differs from what was restored.
+          mise run native-fetch
+          mise run openapi
+          if git diff --quiet -- docs/api/openapi.json; then
+            echo "docs/api/openapi.json is current on $BRANCH"
+            exit 0
+          fi
+          version=$(jq -r .info.version docs/api/openapi.json)
+          jq -n \
+            --arg query 'mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }' \
+            --arg repo "$REPO" --arg branch "$BRANCH" --arg head "$head" \
+            --arg headline "chore(release): regenerate the OpenAPI document for v$version" \
+            --rawfile contents <(base64 -w0 docs/api/openapi.json) \
+            '{query: $query, variables: {input: {
+               branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+               expectedHeadOid: $head,
+               message: {headline: $headline},
+               fileChanges: {additions: [{path: "docs/api/openapi.json", contents: $contents}]}
+             }}}' > "$RUNNER_TEMP/commit.json"
+          gh api graphql --input "$RUNNER_TEMP/commit.json" --jq .data.createCommitOnBranch.commit.oid
+      - if: steps.release-pr.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.release-pr.outputs.branch }}
+          REPO: ${{ github.repository }}
+        run: gh workflow run ci.yml --repo "$REPO" --ref "$BRANCH"
+
+  dist:
+    name: dist (x86_64 glibc)
+    needs: release
+    # `!cancelled()` because `release` is skipped on a pull request, and a
+    # skipped need otherwise skips this job too.
+    if: >-
+      !cancelled() && (github.event_name == 'pull_request'
+      || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # No cargo or native cache: a release is built from the tagged sources
+      # alone, never from a target/ or a libtorrent prefix an earlier run
+      # left. The vendored submodules are fetched and libtorrent is built.
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-deps: 'true'
+      - run: mise run native-fetch
+      # Empty on a pull request, where there is no tag to hold the build to.
+      - run: mise run dist
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-gnu
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  dist-musl:
+    name: dist (static torrentctl, x86_64 musl)
+    needs: release
+    if: >-
+      !cancelled() && (github.event_name == 'pull_request'
+      || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # musl-gcc compiles ring's C for the musl target; it comes with the
+      # system deps, whose libtorrent half goes unused. torrentctl does not
+      # link libtorrent, so the submodules are not fetched.
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-deps: 'true'
+          extra-packages: musl-tools
+      - run: mise run dist-musl
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-musl
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: image (ghcr.io)
+    needs: [release, dist, dist-musl]
+    # After the tarballs, so a release whose binaries fail their checks
+    # pushes no image and moves no tag.
+    if: >-
+      !cancelled() && needs.dist.result == 'success' && needs.dist-musl.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read # the checkout
+      packages: write # push the image, its signature and its attestations
+      id-token: write # keyless Sigstore signing and the attestations' certificates
+      attestations: write # record the attestations with GitHub
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      TAG: ${{ needs.release.outputs.tag }}
+      VERSION: ${{ needs.release.outputs.version }}
+      PUBLISH: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The build context carries the vendored sources (deploy/Containerfile).
+          submodules: recursive
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          # X.Y.Z, X.Y and latest, from the release's tag. Nothing is tagged
+          # on a pull request, where nothing is pushed.
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
+            type=raw,value=latest,enable=${{ env.PUBLISH }}
+          flavor: latest=false
+      # Built once and loaded, so the binary inside is checked before
+      # anything is pushed. No build cache: like the tarballs, the image is
+      # built from the tagged sources alone. buildx's own provenance and SBOM
+      # are off; the Sigstore attestations below are the image's.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Containerfile
+          load: true
+          push: false
+          tags: torrentd:release-check
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+      - name: The image's torrentd is this release's
+        env:
+          EXPECTED: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          # On a pull request there is no release; the checkout's version is
+          # what the image was built from.
+          expected=${EXPECTED:-$(python3 -c 'import tomllib; print(tomllib.load(open("crates/torrentd/Cargo.toml", "rb"))["package"]["version"])')}
+          got=$(docker run --rm --entrypoint /usr/local/bin/torrentd torrentd:release-check --version)
+          if [ "$got" != "torrentd $expected" ]; then
+            echo "::error::the image's torrentd --version printed '$got', expected 'torrentd $expected'"
+            exit 1
+          fi
+          echo "$got"
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # The same build again, from the builder's layers, now pushed.
+      - id: push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+      - if: env.PUBLISH == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+      - if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - if: env.PUBLISH == 'true'
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/image.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - if: env.PUBLISH == 'true'
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/image.spdx.json
+          push-to-registry: true
+
+  publish:
+    name: sign, attest and publish the release
+    needs: [release, dist, dist-musl, image]
+    if: >-
+      !cancelled() && github.event_name == 'push' && needs.release.outputs.tag != ''
+      && needs.dist.result == 'success' && needs.dist-musl.result == 'success'
+      && needs.image.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # upload to the draft release and publish it
+      id-token: write # keyless Sigstore signing and the attestations' certificates
+      attestations: write # record the attestations with GitHub
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+      VERSION: ${{ needs.release.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # The sources the tarballs were built from, for their SBOM.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
+      # The crates both binaries are built from, read from Cargo.lock. The
+      # vendored libtorrent and Boost are pinned submodules, which this does
+      # not list.
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: ${{ runner.temp }}/assets/torrent-${{ needs.release.outputs.version }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - working-directory: ${{ runner.temp }}/assets
+        run: |
+          set -euo pipefail
+          sha256sum -- *.tar.gz *.spdx.json > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/assets/*.tar.gz
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: ${{ runner.temp }}/assets/*.tar.gz
+          sbom-path: ${{ runner.temp }}/assets/torrent-${{ needs.release.outputs.version }}.spdx.json
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - working-directory: ${{ runner.temp }}/assets
+        run: |
+          set -euo pipefail
+          for f in *.tar.gz *.spdx.json SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+      # Every asset onto the draft, then publish it: the release becomes
+      # immutable, assets and tag, from that moment. `--clobber` so a re-run
+      # of this job, after an earlier attempt uploaded some assets and then
+      # failed, replaces them on the still-draft release instead of failing
+      # on the names already there. Immutable releases (above) freeze a
+      # published release's assets, so this cannot replace a released one.
+      - working-directory: ${{ runner.temp }}/assets
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --clobber -- *.tar.gz *.spdx.json SHA256SUMS *.sigstore.json
+          gh release edit "$TAG" --draft=false --latest
+          gh release view "$TAG" --json url,isDraft,assets --jq '{url, isDraft, assets: [.assets[].name]}'

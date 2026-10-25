@@ -51,8 +51,9 @@ and `ProtectHome=yes` ([`deploy/torrentd.service`](../deploy/torrentd.service)).
 
 - **Payload must be readable by `torrentd`.** The scan counts an unreadable
   directory under `errors` (and `torrentd_pool_scan_errors_total{kind="walk"}`
-  or `"stat"`). An unreadable subdirectory of a root is indexed as empty, so
-  the torrents over it read `missing`. An unreadable or missing root keeps the
+  or `"stat"`). An unreadable subdirectory of a root keeps the rows from its
+  last readable scan, so the torrents over it keep their previous state, and
+  the rest of the root is re-indexed. An unreadable or missing root keeps the
   index from its last readable scan, so the torrents over it keep their
   previous state; a root that was never read has no index, and its torrents
   read `missing`. If you will use `allow_mutations` (plans
@@ -83,6 +84,47 @@ paths the daemon cannot (anything under `/home`). Where that matters, scan
 through the daemon instead, with `POST /v1/pool/scan`, which sees exactly what
 the daemon sees.
 
+**Configure it.** Add the section to `/etc/torrentd/torrentd.toml`, with
+your payload's directories as roots and the copy from §1 as the library:
+
+```toml
+[pool]
+roots                 = ["/srv/media/movies", "/srv/media/tv"]   # siblings, never nested
+library_dir           = "/var/lib/torrentd-import/BT_backup"
+max_concurrent_verify = 4          # §5, "Sizing the hashing"
+# allow_mutations     = false      # leave off for an import: adoption needs none
+```
+
+Then let the unit write there, with a drop-in rather than an edit to the
+shipped file. `ReadWritePaths=` in a drop-in adds to the unit's list:
+
+```bash
+sudo systemctl edit torrentd
+```
+
+```ini
+[Service]
+ReadWritePaths=/srv/media/movies /srv/media/tv /var/lib/torrentd-import
+```
+
+Check the file as the daemon's user, then restart: `[pool]` takes a restart,
+and a `SIGHUP` or `POST /v1/config/reload` only warns that it was ignored.
+
+```bash
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config
+sudo systemctl restart torrentd      # skip while the daemon stays stopped for §4's CLI scan
+```
+
+**Map each tracker to its profile first.** A `vpn` profile adopts only a
+torrent whose every tracker is on its `allowed_tracker_domains` (and, where
+two accounts share a tracker, under its `allowed_tracker_urls`): the rest are
+refused, one by one, in §6. List the trackers the old client announces to,
+decide which account each belongs to, and put each domain on that account's
+profile before the first adopt
+([Account isolation](running.md#account-isolation)). Those keys take a
+restart too, so set them with `[pool]`. A torrent whose trackers belong to no
+`vpn` profile goes into a host profile, or stays out.
+
 ## 3. Per client
 
 The scan reads each `.torrent` for its info-hash and file list, and looks for
@@ -93,7 +135,7 @@ identified by the info-hash parsed from its contents.
 
 | Client | Point `library_dir` at | What torrentd reads | Adoption |
 | --- | --- | --- | --- |
-| qBittorrent | `BT_backup/` (under qBittorrent's data directory) | `<hash>.torrent` and `<hash>.fastresume` | Fast path where the resume data marks every piece had; otherwise hashed |
+| qBittorrent | `BT_backup/` (under qBittorrent's data directory) | `<hash>.torrent` and `<hash>.fastresume` | Fast path where the resume data marks every piece had and is not in `seed_mode` (skip hash check); otherwise hashed |
 | Deluge | `state/` (under Deluge's config directory) | `<hash>.torrent` only | Every torrent hashed |
 | Transmission | `torrents/` (under Transmission's config directory) | the `.torrent` files only | Every torrent hashed |
 | rTorrent | the session directory (`session.path`) | `<HASH>.torrent` only | Every torrent hashed |
@@ -105,7 +147,10 @@ identified by the info-hash parsed from its contents.
   `GET /v1/pool/torrents` and nothing else;
 - completion, from the `pieces` bitfield: one entry for each of the
   `.torrent`'s pieces, every one had, or not. A bitfield of any other length
-  claims nothing, and its torrent is hashed;
+  claims nothing, and its torrent is hashed. So is a torrent whose resume
+  data has `seed_mode` set, whatever its bitfield says: qBittorrent's "Skip
+  hash check" adds a torrent that way, and libtorrent then writes every piece
+  as had before checking any;
 - renamed files (`mapped_files`) and the content layout
   (`qBt-contentLayout`), so payload qBittorrent renamed or laid out without
   its top folder is matched where it actually is;
@@ -168,7 +213,21 @@ started during the scan fails to start, with `the pool index is locked by
 another process`, until the scan ends. With the
 daemon up, `POST /v1/pool/scan` does the same scan through the daemon and
 returns the same counts. Nothing scans on its own: the daemon does not scan
-at boot.
+at boot. So there are two orders, and either works:
+
+```bash
+# The daemon stopped for the scan:
+sudo systemctl stop torrentd
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool scan
+sudo systemctl start torrentd
+
+# Or the daemon running, scanning through it. The request answers when the
+# scan ends, which on a large pool is many minutes:
+curl -sX POST localhost:8080/v1/pool/scan -H "Authorization: Bearer $TOKEN"
+```
+
+The second sees exactly what the sandboxed daemon sees (§2). `$TOKEN` is any
+`write` credential, as §5 says.
 
 | State | Meaning | Adopts |
 | --- | --- | --- |
@@ -182,12 +241,19 @@ at boot.
 
 Before trusting the counts:
 
-- **`errors` above 0.** Entries the scan could not read; the log names each.
-  Usually a permissions problem (§2), and it hides payload.
+- **`errors` above 0.** Entries the scan could not read, or symlinks it did
+  not follow (below); the log names each. Usually a permissions problem (§2),
+  and it hides payload.
 - **`partial` or `missing` you did not expect.** Payload outside every root,
   a file renamed in the old client (Deluge, Transmission, rTorrent), or a
   torrent the old client never finished. torrentd never downloads, so a
   `partial` torrent is not adopted.
+- **Symlinks under a root.** The scan does not follow them, so nothing a
+  symlink points at is indexed, whether a file or a directory, and a torrent
+  over it reads `partial` or `missing`. Each one counts in `errors`, as
+  `torrentd_pool_scan_errors_total{kind="symlink"}`, and the log names its
+  path. Add the symlink's target as a root of its own, or replace the
+  symlink with the real file or directory, then rescan.
 - **`overlap`.** Two torrents disagree about the same bytes. Neither adopts,
   and no plan touches those files, until one torrent leaves the library.
 
@@ -196,7 +262,30 @@ selected before it plans any of them. It re-stats each file a `matched` or
 `shared` torrent claims and marks a torrent whose files changed or vanished
 since the scan `drifted`, which the adopt then hashes instead of trusting. A
 qBittorrent torrent rewritten at the same size between the scan and the adopt
-is therefore queued for verification, not fast-pathed. To check the whole pool,
+is therefore queued for verification, not fast-pathed. A file counts as
+changed when its size or its mtime differs from the scan's, to the
+nanosecond. Its device and inode numbers are not compared: a reboot or a
+remount renumbers them on many storage layouts (disk enumeration order, md
+and dm, btrfs and zfs subvolumes, NFS, mergerfs and other FUSE layers)
+without touching a byte, so a reboot between the scan and the adopt, or
+before a `pool check`, drifts nothing. The cost is that a file replaced
+at the same size by something that copies the old mtime onto the new file
+to the nanosecond reads as unchanged; the adopt's fast path then trusts
+the previous client's completion claim for it. A file counts as
+vanished only when it is not found under a root that is present, listable and
+not empty; a root that is missing, unreadable, or empty (an unmounted mount
+point) is logged as unreadable and no torrent over it changes state. A file not
+found whose nearest remaining directory is on another filesystem than the scan
+recorded the file on (a disk mounted inside a root, now unmounted) is logged
+the same way and is not drift. A reboot that renumbered the filesystem is
+told apart from an unmounted disk by the files the check found unchanged
+beside it, which show what the recorded device reads as now; a file
+deleted after such a reboot, from a filesystem on which the check found no
+unchanged claimed file at all, cannot be told apart and is logged as under
+an unmounted directory rather than counted as drift. A file that cannot be stated for another
+reason (permission, I/O) is logged and is not drift. The adopt refuses a
+torrent the check could not see for any of these reasons, rather than trust
+payload nobody looked at. To check the whole pool,
 adopted torrents included, run one yourself:
 
 ```bash
@@ -204,18 +293,48 @@ sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool check
 ```
 
 (or `POST /v1/pool/drift-check`). Do not rescan in place of either. A rescan
-records the rewritten file as the new truth.
+records the rewritten file as the new truth. Both report what the check could
+not see beside what drifted: the unreadable roots, the directories that look
+unmounted, how many files could not be stated, and the torrents left
+unchecked (`unreadable_roots`, `unmounted_dirs`, `files_unreadable` and
+`unchecked` in the API's response). A check that drifted nothing but names an
+unreadable root has not checked that root.
 
 Then see what no torrent claims:
 
 ```bash
 sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool orphans
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool orphans --limit 500
 ```
 
-A large unclaimed directory is usually payload whose `.torrent` you did not
+It lists at most 40 entries per root; `--limit` raises that. A large
+unclaimed directory is usually payload whose `.torrent` you did not
 copy, or payload for torrents that read `partial`.
 
 ## 5. Adopt
+
+**Credentials.** Every call below takes a `write` credential as `$TOKEN`.
+With `[auth]` configured, that is a session token from the operator
+password, or a static token with the `write` scope
+([running.md §6](running.md#6-authentication--required-one-way-or-the-other)):
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/v1/sessions \
+             -H 'content-type: application/json' \
+             -d '{"password":"…"}' | jq -r .token)
+```
+
+A session token lasts `[auth] session_ttl_secs`, 12 hours by default, which a
+large import outlives: a `401` from a token that worked earlier means it
+expired, so sign in again. Without
+`[auth]`, drop the header. On a unix-socket daemon, replace `localhost:8080`
+with `--unix-socket /run/torrentd/api.sock http://localhost`.
+
+**From the terminal client.** `torrentctl`'s Pool screen does the same
+adoption with the dry run built in: mark torrents in the library view with
+`space` and press `a`, or press `A` on a directory in the tree view, pick
+the profile, and the dialog shows the dry run's buckets, `verify_bytes`
+included. A second `Enter` sends the same request for real.
 
 Adopt into an explicit profile, always as a dry run first. Find the root's
 `root_id` with `GET /v1/pool`, then name a subtree of it:
@@ -254,9 +373,78 @@ takes.
 A queued torrent is hashed after the request answers, so its hashing adds
 nothing to the wait.
 
-A torrent listed under `fast_path` can still end up hashed: when its resume
-data turns out unreadable or libtorrent rejects it, the adopt falls back to
-the verify queue and logs `falling back to verification`.
+**How long a request takes.** What a target costs inside the request is
+writes that must reach the disk before it is reported adopted: its pool
+index records (the owner, and either the adoption or the verify queue's
+row), and for a fast-path torrent its `.torrent` and save path in the
+profile's `torrent_dir`. Each waits on an fsync, so the rate is set by how
+fast the disk holding the state directory and `pool.db` flushes, not by the
+payload's size. The daemon works on 8 targets of one request at once, and
+the index records of the targets in flight share one commit. Measured with
+`mise run bench -- pool-adopt` (release build, half the torrents on each
+path) on a volume where one fsync takes 10 to 30 ms: 8 to 28 ms a torrent
+for 500 torrents in one request, 35 to 125 torrents a second, and 33 ms a
+torrent for 5,000 in five requests of 1000, the slowest answering in 36
+seconds. The same runs took 46 to 145 ms a torrent before the work was
+overlapped. So a 1000-torrent request answers in well under a minute there,
+and a 10,000-torrent library adopts in about six minutes of requests; a
+disk that flushes faster shortens both. `crates/torrentd-bench/budgets.toml`
+holds the budget CI keeps it to.
+
+A torrent the index plans for the fast path can still end up hashed: when its
+resume data turns out unreadable, unparseable or keyed by another info-hash,
+or libtorrent rejects its add, the adopt falls back to the verify queue and
+logs `falling back to verification`. The response lists it where it went,
+under `queued_for_verification`, with its bytes in `verify_bytes`; a dry run
+reports the fallbacks it can see before the add, every one but the rejected
+add.
+
+**Batches by account.** Where one root holds several accounts' torrents, a
+subtree does not separate them, but the qBittorrent category often does
+(`GET /v1/pool/torrents` reports it). Collect one account's matched torrents,
+a page of up to 1000 at a time, and adopt them 1000 at most per request:
+
+```bash
+cursor=
+: > acct_a.hashes
+while :; do
+  page=$(curl -sG localhost:8080/v1/pool/torrents -H "Authorization: Bearer $TOKEN" \
+              --data-urlencode state=matched --data-urlencode limit=1000 \
+              ${cursor:+--data-urlencode "cursor=$cursor"})
+  jq -r '.items[] | select(.category == "tracker-a") | .infohash' <<<"$page" >> acct_a.hashes
+  cursor=$(jq -r '.next_cursor // empty' <<<"$page")
+  [ -n "$cursor" ] || break
+done
+rm -f acct_a.batch.*
+if [ -s acct_a.hashes ]; then
+  split -l 1000 acct_a.hashes acct_a.batch.
+  for b in acct_a.batch.*; do
+    jq -Rn --arg p acct_a '{profile_id: $p, dry_run: true,
+          selector: {kind: "infohashes", infohashes: [inputs]}}' < "$b" \
+      | curl -sX POST localhost:8080/v1/pool/adoptions -H "Authorization: Bearer $TOKEN" \
+             -H 'content-type: application/json' -d @- \
+      | jq '{fast_path: (.fast_path | length), queued: (.queued_for_verification | length), verify_bytes, refused}'
+  done
+fi
+```
+
+The `rm -f` clears the previous run's batch files, so a re-run that splits
+into fewer files does not post leftovers; with no matching hashes nothing is
+posted. Run it again with `state=shared` for cross-seeds, and with
+`dry_run: false` once every batch's dry run reads as expected.
+
+**Sizing the hashing.** Every queued torrent is read in full once, so
+`verify_bytes` divided by what the disks holding the payload sustain in
+sequential reads is the least time the batch takes: 20 TB at 400 MB/s is
+about 14 hours, at 150 MB/s about 37. Seeding keeps reading from the same
+disks meanwhile. `max_concurrent_verify` (default `4`) is how many torrents
+hash at once. More helps only where the payload spans independent disks
+that can each serve one: on a single disk, or one parity array, more
+concurrent checks turn sequential reads into seeks and slow the batch and
+the seeding alike. A queue that takes days is still bounded, and survives
+restarts (§7). To seed sooner, adopt the infohashes a dry run lists under
+`fast_path` first, which seed at once, then the hashed ones a batch at a
+time. The value is read at startup (§2).
 
 ## 6. Refusals
 
@@ -271,6 +459,7 @@ which case it is that error's message:
 | `payload is incomplete` | `partial` | Put the missing files under a root and rescan. torrentd will not download them |
 | `no payload found under any managed root` | `missing` | Add the root it lives under, or move it under one, and rescan |
 | `another torrent claims some of the same files` | `overlap` | Remove one of the two `.torrent` files from the library, rescan |
+| `payload could not be checked for changes since the scan` | The drift check before the adopt (§4) found its root unreadable or unmounted, a disk under the root unmounted, or a file it could not stat; the log names which | Mount the disk or fix the permission, then adopt again |
 | `the previous client renamed these files…`, `…content layout moved these files…`, `…resume data maps a file outside…` | qBittorrent moved or renamed files in a way only its resume data describes, and that resume data cannot be used here | Rename the files back to the `.torrent`'s own paths in the old client, recopy `BT_backup`, rescan |
 | `resume data unreadable: …`, `resume data unparseable: …`, `resume add rejected: …`, each ending `…and the previous client renamed this torrent's files…` | A fast-path torrent whose resume data failed, for a torrent whose files qBittorrent renamed. A torrent without renamed files falls back to the verify queue instead (§5), but this one cannot: verifying from the `.torrent` looks for the files at paths where they are not | Recopy that torrent's `.fastresume` from `BT_backup` and rescan, or rename the files back to the `.torrent`'s own paths in the old client |
 | `cannot read the .torrent to check its trackers: …` | The profile has `allowed_tracker_domains`, and the `.torrent` in `library_dir` could not be read to check them | Fix the file's permissions (§2) or recopy it, rescan |
@@ -307,7 +496,10 @@ and `.torrent` adds in turn:
   `torrent_dir` at boot with no resume file beside it, is added `paused`, and
   the queue resumes it, which starts its first check, once a slot is free.
   Dropping thousands of `.torrent` files into `torrent_dir` before a restart
-  therefore checks them a slot at a time.
+  therefore checks them a slot at a time. Name each one
+  `<infohash>.torrent`, with the info-hash in 40 lower-case hex
+  digits: a boot skips any other name with a warning and loads nothing from
+  it ([operations.md](operations.md#what-is-in-the-state-directory)).
 - The disk-error retry takes a slot before it resumes or re-checks a torrent,
   and where none is free looks again a minute later.
 
@@ -337,19 +529,62 @@ The `torrentd_pool_verify_*`, `torrentd_pool_recheck_dropped_total` and
 [`deploy/metrics.md`](../deploy/metrics.md). `GET /v1/pool` reports the queue
 as `verify_queue_depth` and `verify_in_flight`.
 
-- **A failed verification** pauses the torrent and records it `drifted`: the
-  payload does not match its piece hashes. The log says `verification did not
-  leave the torrent seeding; pausing it`.
+- **A failed verification** pauses the torrent, records it `drifted` (the
+  reason is kept in the pool database's `adoption.last_error`, and
+  `GET /v1/pool/torrents` returns it as the torrent's `note`), and counts it
+  in `torrentd_pool_verify_failed_total`. The log says `verification did not
+  leave the torrent seeding; pausing it`, and its `reason` field says which
+  of these it was:
+  - `payload failed verification against the piece hashes`: the check
+    finished and the payload does not match.
+  - `hashing ended without a torrent_checked report and the torrent is not
+    seeding`: the torrent showed a finished check's phase (`incomplete` or
+    `idle`) for 5 seconds, but its `torrent_checked` alert was lost (alert
+    overflow does not replay it). The payload most likely does not match.
+  - `libtorrent reported an unrecoverable error`.
+  - `libtorrent paused the torrent on an error before its check finished`:
+    the check hit an error, most often a disk read error, and libtorrent
+    paused the torrent with it before any verdict. Recorded at once, so the
+    adoption gives up its verify slot. Any failed verification disarms the
+    disk-error retry the error armed, which would otherwise resume the
+    torrent this pause left paused.
+  - `no verification verdict within the check expiry`: for 24 hours the
+    adoption showed neither a running check (`checking`) nor a held one
+    (`paused`), and no verdict came. Either it never appeared in the session,
+    or it was stuck in a phase no check leads to, such as a disk error that
+    did not clear. A check that runs longer than a day, or an adoption held
+    paused (behind the held-add queue, or by a fenced profile), is never
+    expired this way: it keeps its slot until it ends, is removed, or is
+    paused on an error.
+
+  None of these is final. Once the cause is fixed, resume the torrent with
+  `POST /v1/torrents/{infohash}/resume`, then re-verify it with `POST
+  /v1/pool/verifications`, and `drifted` clears if the payload is good. Resume
+  it first: the failure left it paused, and `POST /v1/pool/verifications`
+  skips a paused torrent, because libtorrent does not hash one. Resuming has
+  a cost: it puts the payload the piece hashes rejected back on the network
+  until the check ends. Fix the cause before you resume, and decide whether
+  that window is acceptable; nothing resumes the torrent for you.
 - **A dropped item** never reached a session: its `.torrent` could not be
-  read from `library_dir`, its profile stopped, the tracker check failed at
-  admission, or libtorrent rejected the add. Its registry claim is released,
+  read from `library_dir`, its profile is no longer configured, the tracker
+  check failed at admission, or libtorrent rejected the add. Its registry claim is released,
   so it adopts again once the cause is fixed. The log line ends `dropping
   verify`, or reads `verify dropped: …` or `verify add failed`.
-- **A fenced or offline profile** holds the queue: nothing is admitted for it
-  until it is back (`verify held: profile is off the network`, or `re-hash
-  held: …` for a queued re-hash, logged once per profile each second). A
+- **A fenced or offline profile** holds its own items: nothing is admitted
+  for it until it is back, and the items behind them, for other profiles,
+  are admitted meanwhile (`verify held: profile is off the network`, or
+  `re-hash held: …` for a queued re-hash, logged once per profile each
+  second). A configured profile with no session, one whose tunnel failed at
+  boot, holds its queued adoptions the same way (the `verify held` line's
+  `reason` reads `no_session`): each keeps its row, owner record and
+  registry claim, and is admitted once a restart brings the profile up. A
   queued re-hash also waits while the profile's fence is lifted, until the
   lift's paced resume reaches its torrent.
+- **A running scan** holds the pool index until it commits. Meanwhile no
+  waiting adoption is admitted and no adoption's or re-hash's verdict is
+  recorded; each keeps its place and its slot, and goes on once the scan
+  ends. Re-hashes and `.torrent` adds waiting for a slot are started as
+  usual.
 - **A re-hash paused while it checks** keeps its slot until the check ends,
   because libtorrent goes on with it once the torrent is resumed. Resume or
   remove the torrent to free the slot; otherwise it is freed after 24 hours.

@@ -1,0 +1,95 @@
+# release-plz: how a release is cut. Merging the pull request release-plz
+# opens on `master` is the whole act; .github/workflows/release-plz.yml runs
+# both halves and says what each job does.
+#
+# One version for the whole workspace and one `vX.Y.Z` tag. Nothing is
+# published to crates.io: every crate is `publish = false`, and the git tags
+# are the record of what has been released (`git_only`). The tag, the GitHub
+# release and CHANGELOG.md belong to `torrentd`; every other member moves its
+# version with it (`version_group`) and creates nothing of its own, so
+# `torrentd --version`, `torrentctl --version` and the tag always agree.
+
+[workspace]
+publish = false
+git_only = true
+# Commits are grouped by git-cliff with this repository's Conventional Commit
+# types; cliff.toml says which type lands under which heading.
+changelog_config = "cliff.toml"
+changelog_update = false
+git_tag_enable = false
+git_release_enable = false
+# Every member resolves its latest release from the one shared tag.
+git_tag_name = "v{{ version }}"
+# A release is created as a draft: GitHub's immutable releases freeze a
+# release's assets once it is published, so the workflow uploads and signs
+# every asset first and publishes it last.
+git_release_draft = true
+# Release only on the merge of a release pull request, never on an ordinary
+# push to `master`.
+release_always = false
+# Only the workspace's own versions move in the release pull request;
+# dependency updates are pull requests of their own.
+dependencies_update = false
+semver_check = false
+pr_labels = ["release"]
+pr_name = "chore: release v{{ version }}"
+
+[[package]]
+name = "torrentd"
+version_group = "torrent"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = [
+  "libtorrent-sys",
+  "libtorrent-safe",
+  "torrentd-engine",
+  "torrentd-pool",
+  "torrentd-bench",
+  "torrentctl",
+]
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+git_release_name = "v{{ version }}"
+git_release_latest = true
+git_release_body = """
+{{ changelog }}
+
+### Assets
+
+- `torrent-{{ version }}-x86_64-unknown-linux-gnu.tar.gz`: `torrentd` and \
+`torrentctl` for x86_64 glibc Linux, with the sample configs, the systemd \
+unit, LICENSE, README.md and CHANGELOG.md.
+- `torrentctl-{{ version }}-x86_64-unknown-linux-musl.tar.gz`: a static \
+`torrentctl` for any x86_64 Linux.
+- `SHA256SUMS`, a `.sigstore.json` Sigstore bundle per file, and an SPDX SBOM.
+- The image `ghcr.io/d18580b/torrent:{{ version }}`.
+
+Every file and the image are signed by this repository's release workflow \
+and carry a build-provenance attestation. README.md § *Install* says how to \
+verify them before you run anything.
+"""
+
+[[package]]
+name = "torrentctl"
+version_group = "torrent"
+
+[[package]]
+name = "torrentd-engine"
+version_group = "torrent"
+
+[[package]]
+name = "torrentd-pool"
+version_group = "torrent"
+
+[[package]]
+name = "torrentd-bench"
+version_group = "torrent"
+
+[[package]]
+name = "libtorrent-safe"
+version_group = "torrent"
+
+[[package]]
+name = "libtorrent-sys"
+version_group = "torrent"

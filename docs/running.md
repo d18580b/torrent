@@ -86,6 +86,10 @@ to re-pin.
 
 ## 3. Build
 
+A release tarball replaces this section, §2 and §1's build host: download
+and verify it as [README.md § *Install*](../README.md#install) shows, and
+take `torrentd` from it in step 4b. From source:
+
 ```bash
 cargo build --workspace --release
 ```
@@ -112,6 +116,7 @@ sudo useradd --system --home-dir /var/lib/torrentd --shell /usr/sbin/nologin tor
 
 # 4b. The unit's ExecStart hardcodes /usr/bin/torrentd. (The container image
 #     installs to /usr/local/bin instead; that path is the image's alone.)
+#     From a release tarball, install its torrentd instead of target/release's.
 sudo install -m0755 target/release/torrentd /usr/bin/torrentd
 
 # 4c. Directories.
@@ -169,7 +174,10 @@ while it is running:
   running daemon's pid, having touched nothing (§12). The file holds that pid.
   The lock is the kernel's and goes with the process, however it ends, so
   there is never a stale one to clear after a crash. Delete the file while the
-  daemon runs and the next start no longer sees it.
+  daemon runs and the next start no longer sees it. The lock is per state
+  directory; the kill switch's table is per uid, and a second daemon of the
+  same uid on another state directory is refused by the table lock instead
+  (§11, "Two daemons in one network namespace need separate uids").
 
 A deployment with no `vpn` profile has none of the next three:
 
@@ -188,10 +196,13 @@ A deployment with no `vpn` profile has none of the next three:
   daemon is running and a tunnel whose openvpn dies on its own leaves its
   `ip rule` entries behind.
 - **`wireguard-<iface>.raised`** — a note that *this boot of this host* raised
-  the link now standing under that name. It is what lets a restart after an
-  unclean shutdown adopt the tunnel still standing instead of leaving the
-  profile dark, for WireGuard configs that keep the key out of the `.conf`
-  (`PostUp = wg set %i private-key …`). It carries two things and both have to
+  the link now standing under that name, written only after the daemon's own
+  `ip`/`wg` bring-up of it. It is how a restart after an unclean shutdown
+  adopts a link the daemon itself raised, still standing, instead of leaving
+  the profile dark, when the profile's config gives no `PrivateKey` that start
+  can derive a public key from; a config whose key reads is adopted on the
+  matching key alone, and two readable keys that disagree are never overruled
+  by the record. It carries two things and both have to
   still hold: the host's **boot id**, so it is never believed after a reboot;
   and the **public key the interface was carrying** when it came up, so it is
   never believed for a link that merely has the same name. That second one is
@@ -471,8 +482,8 @@ Pool adoption also refuses a torrent the pool index assigns to another profile,
 even when no session holds it now; `DELETE /v1/torrents/{infohash}` clears the
 index's record along with the assignment.
 
-**Upgrading.** A configuration that loaded before this release can be refused
-by these rules. Add `allowed_tracker_domains` to each `vpn` profile, add
+**Upgrading.** A configuration that loaded on a build from before these rules
+can be refused by them. Add `allowed_tracker_domains` to each `vpn` profile, add
 `allowed_tracker_urls` to each of two profiles on one tracker, replace a
 host profile's wildcard `listen_interfaces` where `vpn` profiles sit beside it,
 and replace an `-LT` fingerprint with the prefix of the client the profile's
@@ -1172,7 +1183,14 @@ The daemon sets none of these itself.
   bare metal. The kernel uses `max(conf/all, conf/<iface>)` per interface, so
   `all = 2` is sufficient on its own — but `all = 0` is *not* safe, because a
   tunnel interface created later inherits `conf/default` and may come up
-  strict. `vpn check` reports both values and the effective mode.
+  strict. `vpn check` reports both values and the effective mode. On the
+  host, write it to a `sysctl.d` file so it outlasts a reboot, and load it:
+
+  ```bash
+  echo 'net.ipv4.conf.all.rp_filter = 2' | sudo tee /etc/sysctl.d/90-torrentd.conf
+  sudo sysctl --system
+  sysctl net.ipv4.conf.all.rp_filter          # net.ipv4.conf.all.rp_filter = 2
+  ```
 
 ## 8. Start it
 
@@ -1232,7 +1250,7 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/v1/config/relo
 | Status | Meaning |
 | --- | --- |
 | `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. It is also the answer when every change in the file needs a restart, and a reload never applies a restart-only key — among them `[auth]` (including a removed `[[auth.token]]`), `allow_unauthenticated`, `http_listen`, `trusted_proxies` and `allowed_hosts`. |
-| `409` | `reload-pending`: the reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run; they read the same file. |
+| `409` | `reload-pending`: a reload is already queued and has not started. The queue, which `SIGHUP` shares, holds one reload, and the queued one reads the file as it stands when it runs, so this request adds nothing to it; a `SIGHUP` sent then is likewise folded into it. |
 | `503` | `reload-unavailable`: the daemon is shutting down, or was built without the reload channel wired up. |
 
 It needs a token with the `write` scope — a session token has it — where
@@ -1252,6 +1270,67 @@ its files. They are still not reloadable — the stores are opened once at
 startup — but pointing a profile at its files is routine configuration, and
 the privacy warning is the line an alert rule watches for an account's identity
 changing under a live session.
+
+### On the compose stack
+
+[`deploy/compose.yaml`](../deploy/compose.yaml) runs the daemon from the
+image `deploy/Containerfile` builds, behind Caddy, which terminates TLS
+(§6a). Every command runs from the repository root; `docker compose` takes
+the same arguments as `podman compose`.
+
+1. **Write the config the stack mounts**, `deploy/torrentd.toml` (git ignores
+   it). Create it before anything else: a bind mount of a file that does not
+   exist mounts an empty directory in its place.
+
+   ```bash
+   cp deploy/torrentd.sample.toml deploy/torrentd.toml
+   ```
+
+   In it, set `http_listen = "0.0.0.0:8080"`, since `proxy` reaches the
+   daemon over the compose network and a loopback bind inside the container
+   is a dead port; uncomment `trusted_proxies = ["172.28.0.2"]`, the address
+   `compose.yaml` pins `proxy` to; and delete `allow_unauthenticated = true`,
+   which a non-loopback bind refuses. The rest of the sample's paths are the
+   ones the stack mounts.
+2. **Name the site.** In [`deploy/Caddyfile`](../deploy/Caddyfile), replace
+   `torrentd.example.com` with the name the host answers to. Caddy fetches a
+   certificate for it, so that name must resolve to this host and ports 80
+   and 443 must reach it.
+3. **Create the payload directory** for the container's uid, as §4 shows for
+   rootful and rootless engines.
+4. **Generate the credentials** and add them to `deploy/torrentd.toml` as an
+   `[auth]` section (§6, and the bottom of the sample), with a `metrics` token
+   if a Prometheus will scrape through the proxy:
+
+   ```bash
+   BUILDAH_FORMAT=docker podman compose -f deploy/compose.yaml build
+   podman compose -f deploy/compose.yaml run --rm torrentd hash-password
+   podman compose -f deploy/compose.yaml run --rm torrentd new-token --name prometheus --scopes metrics
+   ```
+
+   `BUILDAH_FORMAT=docker` keeps the image's health check. It is the
+   `HEALTHCHECK` in `deploy/Containerfile`, which curls
+   `localhost:8080/healthz` every 30 s, and it lives only in a Docker-format
+   image: podman builds the OCI format by default, which has no field for it,
+   and drops it with the warning `HEALTHCHECK is not supported for OCI image
+   format`. `mise run container` builds Docker format for the same reason;
+   `docker compose build` and the published release image keep it already.
+   An image built without it has no health status at all, so nothing marks
+   the container unhealthy.
+
+5. **Start it**, and check it from inside the container (§9):
+
+   ```bash
+   podman compose -f deploy/compose.yaml up -d
+   podman compose -f deploy/compose.yaml exec torrentd curl -s localhost:8080/healthz
+   curl -s https://<your host>/healthz
+   ```
+
+A `vpn` profile in this container needs the `user`, `cap_add` and `devices`
+lines and the `/etc/wireguard` volume that `compose.yaml` carries commented,
+and runs **without** the kill
+switch: the comment above them says why the two cannot be combined here. A
+deployment that needs both runs from `deploy/torrentd.service` instead.
 
 ## 9. First-run checks
 
@@ -1448,8 +1527,11 @@ command changes nothing and needs no privilege at all, which is the form worth
 automating.
 
 **It reports the health monitor's own verdict.** The `route` line is the
-monitor's route probe (`ip route get 1.1.1.1 from <tunnel address>` must
-leave by the tunnel device), and the `health` line is what the monitor's
+monitor's route probe, asked the way the monitor asks it:
+`ip route get 1.1.1.1 from <tunnel address>`, then
+`ip route get 2606:4700:4700::1111 from <address>` from each global IPv6
+address on the device, must each leave by the tunnel device, and the line
+names the first that does not. The `health` line is what the monitor's
 judgement — the same function, on the address, route and handshake just
 observed — would decide about the profile. The `kill_switch_ruleset` line
 dry-runs the exact script boot hands to `nft -f`, rendered by the same
@@ -1506,6 +1588,132 @@ To check the exit address itself, ask something that reports it:
 ```bash
 curl --interface wg-acct-a -s https://api.ipify.org; echo
 ```
+
+### Day one: WireGuard behind the kill switch
+
+One ordered sequence, for a host running the packaged unit, from nothing to
+a WireGuard account seeding behind the kill switch. Each step points at the
+section that explains it; none can be skipped. The account here is `acct_a`
+on `wg-acct-a`. Run the steps before anything is seeded through the
+profile.
+
+1. **The user, the binary and the capability.** Create the dedicated user
+   and the directories as §4 does: the kill switch matches the daemon's uid,
+   so no other process may share it, and it refuses uid 0. Install the unit
+   (§8) without starting it, and in `/etc/systemd/system/torrentd.service`
+   uncomment `AmbientCapabilities=CAP_NET_ADMIN` and
+   `CapabilityBoundingSet=CAP_NET_ADMIN`. Install `iproute2`,
+   `wireguard-tools` and `nftables` (§1).
+2. **The WireGuard config.** Put it at
+   `/etc/wireguard/wg-acct-a.conf`, the one path a profile on `wg-acct-a`
+   accepts (§5), and keep it to what the daemon applies itself (§11, drill
+   6, step 3): `PrivateKey` in the file, no `PreUp`, `PostUp`, `PreDown` or
+   `PostDown`, `Table` absent or `auto`, and
+   `AllowedIPs = 0.0.0.0/0` (plus `::/0` for IPv6). A `DNS` line is ignored.
+   (`Table = off` works only for a link raised by root before the daemon,
+   which the daemon adopts.)
+   `PersistentKeepalive = 25` keeps the handshake fresh on a quiet profile
+   (§11, drill 5). Each account needs its own tunnel address and its own
+   server (`Endpoint`); see [Account isolation](#account-isolation). Then
+   let the daemon's group read it:
+
+   ```bash
+   sudo chgrp torrentd /etc/wireguard /etc/wireguard/wg-acct-a.conf
+   sudo chmod 0750 /etc/wireguard
+   sudo chmod 0640 /etc/wireguard/wg-acct-a.conf
+   ```
+
+   For tracker lookups through the tunnel, raise the link as root before the
+   daemon instead, with the hooks [Tracker lookups through a
+   tunnel](#tracker-lookups-through-a-tunnel) gives; the daemon adopts it.
+3. **The profile and the switch.** A daemon with the kill switch carries
+   `vpn` profiles only: a `network = "host"` profile beside it is refused, and
+   so is an OpenVPN one. Host profiles, and OpenVPN accounts, go in a second
+   daemon under a user of its own (§11, drill 6, "Two daemons in one network
+   namespace"). In `/etc/torrentd/torrentd.toml`:
+
+   ```toml
+   http_listen         = "unix:/run/torrentd/api.sock"
+   allow_unauthenticated = true          # or [auth]: §6
+   network_kill_switch = true
+
+   [[profile]]
+   id                      = "acct_a"
+   network                 = "vpn"
+   vpn_type                = "wireguard"
+   vpn_config              = "/etc/wireguard/wg-acct-a.conf"
+   vpn_interface           = "wg-acct-a"
+   listen_port             = 6891        # or port_forward = "natpmp": step 9
+   peer_fingerprint        = "-qB5030-"
+   user_agent              = "qBittorrent/5.0.3"
+   allowed_tracker_domains = ["tracker.example.com"]
+   ```
+
+   beside the required keys of §5. The unix socket keeps the API to the
+   socket's group (§6); a TCP `http_listen` works too, with `[auth]` on a
+   shared host.
+4. **Reverse-path filtering.** Write and load the `sysctl.d` file of §7, so
+   `net.ipv4.conf.all.rp_filter` is `2` now and after a reboot.
+5. **Validate the file as the daemon's user.** As root it would judge uid 0
+   and refuse the kill switch:
+
+   ```bash
+   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config   # config OK
+   ```
+
+6. **Raise the tunnel once, by hand.** `--bring-up` raises it exactly as the
+   daemon will, checks it, and lowers it again; it needs `CAP_NET_ADMIN`, so
+   it runs under `sudo`, and `--as-uid` dry-runs the kill-switch ruleset for
+   the daemon's uid rather than root's:
+
+   ```bash
+   sudo torrentd --config /etc/torrentd/torrentd.toml vpn check --profile acct_a \
+        --bring-up --egress 1.1.1.1:53 --as-uid "$(id -u torrentd)"
+   ```
+
+   Exit `0` is a pass. The `kill_switch_uid` line reads `[?cap]` here by
+   design ("Checking the VPN on its own" above). Anything that fails is
+   fixed before the next step.
+7. **Start the daemon**, and check the tunnel again as the daemon's user,
+   against the link the daemon now holds. This form changes nothing and is
+   the one to automate:
+
+   ```bash
+   sudo systemctl enable --now torrentd
+   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml vpn check \
+        --profile acct_a --egress 1.1.1.1:53
+   ```
+
+8. **Confirm the switch is armed.** The table stands, named for the daemon's
+   uid, with one accept line pairing the tunnel's address with its
+   interface and a `udp sport` exemption for the tunnel's own transport
+   (§11, drill 6):
+
+   ```bash
+   sudo nft list table inet "torrentd_ks_$(id -u torrentd)"
+   curl -s --unix-socket /run/torrentd/api.sock http://localhost/metrics \
+     | grep -E '^torrentd_kill_switch_(active|table_present) '
+   ```
+
+   Both gauges read `1`: `torrentd_kill_switch_active` says the daemon
+   installed the table, and `torrentd_kill_switch_table_present` that the
+   last 30-second check found it intact. Over TCP, `GET /metrics` takes a
+   `metrics` token (§9). With the alert rules loaded (§9, "Monitoring"),
+   `TorrentdKillSwitchGone` fires while the first reads `1` and the second
+   `0`, and `TorrentdKillSwitchLost` for a loss the next check's reinstall
+   repaired, which the first never sees. Then
+   confirm the exit address is the provider's, not the host's:
+   `curl --interface wg-acct-a -s https://api.ipify.org`.
+9. **On Proton, with a forwarded port.** Generate the WireGuard config with
+   *NAT-PMP (Port Forwarding)* on, for a P2P server, and set
+   `port_forward = "natpmp"` with no `listen_port` (§5, "ProtonVPN"); the
+   gateway defaults to Proton's `10.2.0.1`. Step 6's `vpn check` then also
+   asks the gateway for a port. Every Proton WireGuard config gives the
+   tunnel `10.2.0.2/32`, so a second Proton account goes in a daemon of its
+   own, in its own network namespace, with a config for a different server.
+
+Only then add torrents, or adopt a library into the profile
+([`import.md`](import.md)).
 
 ## 10. Migrating a pool from another client
 
@@ -1630,6 +1838,15 @@ On a scratch pool, not your real one.
    An `ip` killed by a signal, such as the OOM killer, counts as one that
    could not run. Setting a fenced profile online on such a poll keeps
    the fence: lifting it needs the bound address seen on the interface.
+   One such poll fences nothing, but three in a row on which the address or
+   route probe could not run, or the handshake probe while the profile has
+   traffic to carry — or whose probes did not return within 20 s — fence the
+   profile with reason `probe_unavailable`, since it is then seeding with no
+   check in force. `GET /v1/profiles` reports it as the profile's
+   `fence_reason`, as it does every fence's reason. Three kill-switch checks in a row
+   that `nft` cannot answer fence every vpn profile the same way, until a
+   check finds the table in force again. Each profile is probed at once with
+   the others, so one hung `ip` delays no other profile's verdict.
 
    **Then take its route away and leave the tunnel up.** Each poll also asks
    the kernel where a packet from the tunnel address would go
@@ -1639,13 +1856,14 @@ On a scratch pool, not your real one.
    the handshake still look healthy. On a scratch host, with the daemon up:
 
    ```bash
-   sudo deploy/drill/route-fence.sh <iface>
+   sudo deploy/drill/route-fence.sh <iface> <profile_id>
    ```
 
-   The script deletes only that tunnel's `from <address> lookup <table>`
+   `<profile_id>` is the id of the vpn profile `<iface>` belongs to (or set
+   `PROFILE_ID`); the script reads only that profile's series. The script deletes only that tunnel's `from <address> lookup <table>`
    rules — not the whole rule list, which would take the host's own routing
    with it — waits up to one poll plus a grace, and exits 0 once
-   `torrentd_profile_vpn_fenced_total{reason="route_mismatch"}` has risen (the
+   that profile's `torrentd_profile_vpn_fenced_total{reason="route_mismatch"}` has risen (the
    log says `VPN tunnel unhealthy` with `reason=route_mismatch`). Set
    `METRICS_URL` and `METRICS_TOKEN` if `/metrics` is not on
    `127.0.0.1:8080` or needs the scrape token. Afterwards, restore the
@@ -1665,10 +1883,10 @@ On a scratch pool, not your real one.
    socket to the address alone, for TCP as for the listen sockets. The
    traffic then follows the routing table. From the tunnel's IPv4 address it
    can leave by the physical interface, with that source address, until the
-   next poll fences the profile. The route probe asks only from the IPv4
-   address, so it would never fence that path for an IPv6 address. A listen
-   socket on an IPv6 address that is bound to no device therefore stops the
-   daemon, as a wrong device does (below). On such a kernel, a tunnel that
+   next poll fences the profile. The route probe asks from each global IPv6
+   address on the device as well, so a lost `ip -6 rule` fences the profile
+   the same way, but a listen socket on an IPv6 address that is bound to no
+   device still stops the daemon, as a wrong device does (below). On such a kernel, a tunnel that
    holds an IPv6 address runs only once the unit grants `CAP_NET_RAW` or the
    address is dropped from the tunnel's config. With
    `network_kill_switch = true` the kill switch drops this traffic.
@@ -1683,7 +1901,12 @@ On a scratch pool, not your real one.
    tunnel address (a `10.0.0.0/8` LAN beside Proton's `10.2.0.2/32`) would
    win, and `ss -tulnp` would show `10.2.0.2%eth0`. The daemon also checks
    every listen socket a vpn session opens against the kernel, as it comes
-   up and after each NAT-PMP rebind. A socket bound to any device but the
+   up and after each NAT-PMP rebind. At boot that check runs before the
+   scans load any torrent, and again every 256 torrents the scans load and
+   at the end of each profile's scan, on each socket any vpn session
+   reported since, whichever profile is being scanned: a socket on the
+   wrong device fails the boot, and so does a vpn session that reports no
+   listen outcome within 30 s of every profile being up. A socket bound to any device but the
    profile's `vpn_interface` stops the whole daemon, whatever other
    sessions are up. It logs `a listen socket is not held to the profile's
    tunnel device`, closes that profile's listen sockets and then pauses its
@@ -1739,7 +1962,8 @@ On a scratch pool, not your real one.
    interfaces for the daemon's uid, one line per tunnel address pairing it
    with its own interface:
    `meta skuid <uid> ip saddr <tunnel address> oifname "<iface>" accept`.
-   The addresses are read off the live link when the switch is installed:
+   The addresses are read off the live link when the switch is installed,
+   and again before each of its checks (below):
    its first IPv4 address, which a tunnel with none fails the install for,
    and each of its global IPv6 addresses, paired the same way with
    `ip6 saddr`. A session listens on its tunnel device, so it listens and
@@ -1767,10 +1991,19 @@ On a scratch pool, not your real one.
    and in `net-cleanup` (run by root, `net-cleanup` acts for the owner of the
    state directory). So the daemon without the switch leaves the other's
    table standing however often it boots, restarts or stops. Two daemons
-   under one uid share one table, and the ruleset could not tell their
-   traffic apart anyway: one's boot or stop removes the other's switch, and
-   two with the switch on replace each other's install every 30 s. Give each
-   daemon its own user. A table an earlier release left under the shared
+   under one uid would share one table, and the ruleset could not tell their
+   traffic apart anyway: one's boot or stop would remove the other's switch.
+   So the second is refused. Every daemon holds the abstract unix socket
+   `@torrentd_ks_<uid>` for its life, taken at startup right after
+   `torrentd.lock` and before anything touches the table, whatever its state
+   directory and whether or not its switch is on; a second daemon of the same
+   uid in the same network namespace finds it bound and exits `78` with
+   `… holds the abstract unix socket @torrentd_ks_<uid>` and the holder's pid,
+   which `RestartPreventExitStatus=78` does not restart. `net-cleanup` takes
+   the same socket, so it refuses while a daemon of that uid runs (`ss -xap |
+   grep torrentd_ks` shows the holder). The socket goes with the process,
+   however it ends. Give each daemon its own user. A table an earlier
+   build left under the shared
    name `torrentd_ks` is removed by the daemon whose uid its rules confine,
    and by no other.
 
@@ -1793,11 +2026,13 @@ On a scratch pool, not your real one.
 
    **The exemption follows the link.** Every 30 s the daemon checks the
    table is still in force, and before each check it reads each tunnel's
-   listen port and endpoints again. A link re-raised on another port — a
-   config with no `ListenPort` gets one the kernel picks — or to another
-   endpoint gets the ruleset installed again with the live values, logged
-   as `a tunnel's transport changed since the kill switch was installed`, so
-   the tunnel carries again within one check rather than after a restart. A
+   listen port, endpoints and IPv4 and IPv6 addresses again. A link
+   re-raised on another port — a config with no `ListenPort` gets one the
+   kernel picks — to another endpoint, or with other addresses gets the
+   ruleset installed again with the live values, logged as `a tunnel's
+   addresses or transport changed since the kill switch was installed;
+   installing it again with the live ones`, so the tunnel carries again
+   within one check rather than after a restart. A
    reinstall that does not take is a lost table, and fences every vpn
    profile as one does. A link that cannot be read (down) keeps the
    exemption last read.
@@ -1810,10 +2045,14 @@ On a scratch pool, not your real one.
    the daemon's attached; with a tunnel's `from <address>` rule lost, its
    answer to a probe of the tunnel address arriving on the physical link
    used to leave by that link from the tunnel address (drill 8). Each global
-   IPv6 address the link holds when the switch is installed gets the same
-   fence as `ip6 saddr <address> oifname != { … } drop`; one added to the
-   link later is not fenced until the next start, and a link whose IPv6
-   addresses cannot be read gets no IPv6 fence (the warning above).
+   IPv6 address the link holds gets the same fence as `ip6 saddr <address>
+   oifname != { … } drop`, and a link whose IPv6 addresses cannot be read
+   when the switch is installed gets no IPv6 fence (the warning above).
+   Before each of its 30 s checks the switch reads every tunnel's addresses
+   again, as it reads its transport, and installs the ruleset again when
+   they changed: an IPv6 address the link gains after start is paired and
+   fenced from the next check, and one it loses is no longer paired. A read
+   that fails keeps the addresses last read.
 
    What that leaves:
 
@@ -1849,10 +2088,12 @@ On a scratch pool, not your real one.
       is refused. `DNS` and `SaveConfig` are ignored with a warning. With
       `Table = off` the routing is yours: traffic *from* the tunnel address
       must still route by the tunnel, because the health monitor checks
-      exactly that every poll (`ip route get 1.1.1.1 from <address>`) and
-      fences the profile (`route_mismatch`) when it does not.
+      exactly that every poll (`ip route get 1.1.1.1 from <address>`, and
+      `ip route get 2606:4700:4700::1111 from <address>` from each global
+      IPv6 address) and fences the profile (`route_mismatch`) when it does
+      not.
 
-      The bring-up asks the same question once the link is up, and **refuses
+      The bring-up asks the same questions once the link is up, and **refuses
       a config whose answer would be fenced** rather than letting it come up
       and be fenced on the first poll: a `Table = off` link that nothing
       routes through the tunnel is taken down again — which is every link the
@@ -1860,11 +2101,14 @@ On a scratch pool, not your real one.
       can only be added once it exists, so raise a `Table = off` link with
       your own routing before the daemon starts and let the daemon adopt it —
       and a split `AllowedIPs`
-      that does not cover `1.1.1.1` (with an IPv4 `Address`) is refused before
-      anything is created, because only `AllowedIPs` are routed through the
-      tunnel and the probe's packet would leave by the main table. The
-      profile is reported failed with the reason. Use `AllowedIPs =
-      0.0.0.0/0` (plus `::/0` for IPv6). The `Table = off` case, a link
+      that does not cover `1.1.1.1` (with an IPv4 `Address`), or
+      `2606:4700:4700::1111` (with an IPv6 `Address` that is not
+      link-local, beside an IPv4 one), is refused before anything is
+      created, because only `AllowedIPs` are routed through the tunnel and
+      the probe's packet would leave by the main table. The profile is
+      reported failed with the reason. Use `AllowedIPs = 0.0.0.0/0, ::/0`,
+      or drop the IPv6 `Address` and use `AllowedIPs = 0.0.0.0/0`. The
+      `Table = off` case, a link
       whose installed routing is outranked by another rule, and one whose
       routing could not be installed at all are reported as a routing
       failure; `vpn check --bring-up` reports each as a tunnel that came up
@@ -1933,13 +2177,21 @@ On a scratch pool, not your real one.
    seeding a torrent on a private tracker (§5, "ProtonVPN"):
    1. Note `torrentd_profile_forwarded_port` and the port the tracker's peer
       list or client page shows for this client.
-   2. Force a new port by reconnecting the tunnel as root, quickly
-      (`wg-quick down <iface> && wg-quick up <iface>`), so the gateway
-      forgets the mapping. If the VPN monitor saw the tunnel down in
-      between, the profile is paused and fenced as in drill 5 and stays so
-      until it is set online; that is the tunnel-loss path, not this one. Repeat
-      until the log shows `NAT-PMP port changed; rebound live session,
-      reannouncing its torrents` with the profile still `active`.
+   2. Move the tunnel to a new UDP port as root, without lowering it:
+      `wg set <iface> listen-port <unused port>`. The link, its addresses
+      and the source-address routing the daemon installed stay as they are,
+      and with the kill switch on the new port is exempted within one 30 s
+      check (§11.6, "The exemption follows the link"). Do not lower and raise
+      the link with `wg-quick`, which installs the host-wide default route
+      the daemon avoids, and do not restart the daemon for this: it has no
+      command that re-raises a running tunnel, and a restart maps a port for a
+      new session rather than rebinding a live one, so it never reaches this
+      path. Whether the gateway answers with a new port is its choice. If
+      the profile is paused and fenced as in drill 5, that is the
+      tunnel-loss path, not this one, and it stays so until it is set
+      online. Repeat with another port until the log shows `NAT-PMP port
+      changed; rebound live session, reannouncing its torrents` with the
+      profile still `active`.
    3. The reannounce goes out 100 torrents a second, beside the renewals, and
       `reannounced the profile's torrents after the port change` is logged
       when the last batch is out; `torrentd_profile_port_change_reannounce_seconds`
@@ -2122,9 +2374,10 @@ reproduction itself.
 kill switch, a tunnel or a state file — so it shows nothing of the running
 daemon's behaviour; the journal above is where that is. The lock is per state
 directory: a copy pointed at a different `resume_dir` is not stopped by it,
-and with `network_kill_switch` it would still replace the running daemon's
-`inet torrentd_ks_<uid>` table, which is the same table for the same user
-(§11, drill 6). If you stop the service to
+but run as the same user it is stopped by the kill-switch table lock, and
+exits `78` naming the running daemon's pid, because its boot would replace or
+remove the running daemon's `inet torrentd_ks_<uid>` table, which is the same
+table for the same user (§11, drill 6). If you stop the service to
 run it by hand instead, start the service again afterwards:
 `Restart=on-failure` does not bring back a unit that was stopped.
 
@@ -2134,16 +2387,18 @@ run it by hand instead, start the service again afterwards:
 | --- | --- |
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
+| Container reports no health status at all | The image was built in podman's default OCI format, which drops the `HEALTHCHECK`; rebuild it with `mise run container` or `BUILDAH_FORMAT=docker` (§8, "On the compose stack"). |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, then recover each fenced profile as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes; fenced profiles do not resume themselves by design. A profile counted by `profiles_failed` (`status: "failed"`) never came up and has no session for `PATCH` to lift: bring its tunnel back, then restart. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
-| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks_<uid>` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port` to its `wg show <iface> endpoints`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface. A link re-raised on a new port or endpoint gets them within 30 s (the log says `a tunnel's transport changed`); a link re-raised with a new address does not, and needs a restart of the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
+| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks_<uid>` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port` to its `wg show <iface> endpoints`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface. A link re-raised on a new port, endpoint or address gets them within 30 s (the log says `a tunnel's addresses or transport changed since the kill switch was installed; installing it again with the live ones`). Only a change of the address a profile's session is bound to needs a restart of the daemon ([operations](operations.md#recovering-a-fenced-profile)). If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused or an OpenVPN profile fails, "`<directive>` is refused: it …" | The profile's `.ovpn` names a hook, a plugin, a management interface or another directive the daemon does not let it run (§5). Remove the line the error names. Catchable before a restart with `--check-config`. |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced, and it does not lift the fence itself by design. Recover it as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes. |
 | Delete plan refuses, "no claims in the index" | A torrent the daemon owns - loaded, assigned in the registry, or queued for verification - that the matcher has not placed, and that may hold a file under the plan's root: its session saves it under or above that root, one of its files resolves into it or is the same file (device and inode) as one the plan deletes, or no session can say where it is. One a session holds entirely outside the root never refuses. If its `.torrent` is in the library, run `pool scan` and rebuild the plan. If it was added through `POST /v1/torrents`, a scan never claims it: copy its `.torrent` into the library and rescan, move its payload out of the root, or remove it. A torrent whose profile is down keeps refusing until its profile loads it or it is removed. |
+| Delete plan refuses, "saved somewhere other than where the index places them" | A torrent the daemon owns whose claims in the index sit at one copy of its files while its session saves it at another, and that may hold a file under the plan's root: typically one still downloading into this root while a complete copy of the same files lies under another root, which the matcher prefers. The files its session writes read as orphans. Either `DELETE /v1/torrents/<infohash>` without `delete_files` and add it again with `save_path` set to the placement the message names, so it seeds from that copy, or delete the copy you do not want by hand and run `pool scan`; then rebuild the plan. One whose session cannot be read refuses too. |
 | Relocate step fails, "is not loaded, but the registry assigns it" | The torrent belongs to a profile that did not load it, so its resume data and save path name the source directory. Bring the profile up and apply the plan again. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `GET /v1/profiles`, then `POST /v1/profiles/<id>/resume-all`. |

@@ -92,6 +92,7 @@ pub enum RecordedCall {
         handle: TorrentHandle,
         flags: TorrentFlags,
     },
+    EnforceNoDownload(TorrentHandle),
     MoveStorage {
         handle: TorrentHandle,
         new_path: String,
@@ -658,6 +659,11 @@ impl TorrentEngine for MockEngine {
             )));
         }
         Ok(())
+    }
+
+    fn enforce_no_download(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        self.record(RecordedCall::EnforceNoDownload(h));
+        self.check_error("enforce_no_download")
     }
 
     fn move_storage(

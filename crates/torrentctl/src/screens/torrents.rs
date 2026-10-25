@@ -6,6 +6,8 @@ mod add;
 mod detail;
 
 use std::cell::Cell;
+use std::time::Duration;
+use std::time::Instant;
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -261,6 +263,21 @@ pub fn busy(state: &State) -> bool {
         }
 }
 
+/// Whether the last load of what is shown, the list or the open torrent,
+/// failed, so it may predate a change. A files or trackers error counts only
+/// where [`load_detail`] re-reads it: one it will not re-read would never
+/// clear, and the change would be refetched on every re-send.
+pub fn load_failed(state: &State) -> bool {
+    match &state.detail {
+        Some(d) => {
+            d.error.is_some()
+                || (rereads_files(d) && d.files.error.is_some())
+                || (rereads_trackers(d) && d.trackers_error.is_some())
+        }
+        None => state.list.error.is_some(),
+    }
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.confirm.is_some() {
         return Some(Msg::ConfirmKey(key));
@@ -343,6 +360,30 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         None => effects.extend(load_list(state, ctx)),
     }
     effects
+}
+
+/// How often an open torrent's trackers are re-read while its Trackers tab is
+/// shown, whatever the event stream says.
+pub const TRACKERS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Re-read the open torrent's trackers when its Trackers tab is shown and
+/// they were last asked for at least [`TRACKERS_POLL_INTERVAL`] before `now`.
+/// `GET /v1/events`' fingerprint does not cover a tracker's status or
+/// message, which the daemon reads from the session on request, so on an
+/// idle seeding torrent a tracker that starts failing changes nothing the
+/// stream reports: only this poll shows it.
+pub fn poll(state: &mut State, now: Instant, ctx: &Ctx<'_>) -> Vec<Effect> {
+    let Some(detail) = state.detail.as_mut() else {
+        return Vec::new();
+    };
+    let due = detail
+        .trackers_asked
+        .is_none_or(|at| now.saturating_duration_since(at) >= TRACKERS_POLL_INTERVAL);
+    if rereads_trackers(detail) && !detail.trackers_loading && due {
+        load_trackers(detail, ctx)
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -1078,8 +1119,11 @@ fn next_page(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
 
 /// After a page: select the torrent being restored when it has arrived,
 /// or page on towards it while it may still come (the list is ordered by
-/// infohash); otherwise keep the selection in range.
+/// infohash). The selection is in range on every path, paging on included:
+/// a reload can show fewer rows than were selectable before it, and the
+/// page it pages on for may never arrive.
 fn settle(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
+    state.selected = state.selected.min(visible(state).len().saturating_sub(1));
     if let Some(want) = state.restore.clone() {
         let rows = visible(state);
         if let Some(at) = rows
@@ -1100,7 +1144,6 @@ fn settle(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
             state.restore = None;
         }
     }
-    state.selected = state.selected.min(visible(state).len().saturating_sub(1));
     load_more(state, ctx)
 }
 
@@ -1135,23 +1178,28 @@ fn load_detail(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
             crate::app::Msg::Torrents(Msg::Torrent { hash, result })
         }));
     }
-    match detail.tab {
-        // A list longer than one request is not re-read on every change: it
-        // would take a request per thousand files each time, and files do
-        // not change while a torrent seeds (a priority edit updates its row
-        // in place). Such a list is left as it is; reopening the torrent
-        // reloads it, in as many requests as it needs.
-        detail::Tab::Files
-            if !detail.files.loading && detail.files.items.len() <= caps::PAGE_MAX =>
-        {
-            effects.extend(load_files(detail, ctx))
-        }
-        detail::Tab::Trackers if !detail.trackers_loading => {
-            effects.extend(load_trackers(detail, ctx))
-        }
-        _ => {}
+    if rereads_files(detail) && !detail.files.loading {
+        effects.extend(load_files(detail, ctx));
+    } else if rereads_trackers(detail) && !detail.trackers_loading {
+        effects.extend(load_trackers(detail, ctx));
     }
     effects
+}
+
+/// Whether [`load_detail`] re-reads the open torrent's files: only on the
+/// Files tab, and only a list that fits one request. A longer list would take
+/// a request per thousand files on every change, and files do not change
+/// while a torrent seeds (a priority edit updates its row in place). Such a
+/// list is left as it is; reopening the torrent reloads it, in as many
+/// requests as it needs.
+fn rereads_files(detail: &detail::Detail) -> bool {
+    detail.tab == detail::Tab::Files && detail.files.items.len() <= caps::PAGE_MAX
+}
+
+/// Whether [`load_detail`] re-reads the open torrent's trackers: only on the
+/// Trackers tab.
+fn rereads_trackers(detail: &detail::Detail) -> bool {
+    detail.tab == detail::Tab::Trackers
 }
 
 fn load_files(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -1194,6 +1242,7 @@ fn fetch_files(api: &Api, hash: String, request: PageRequest) -> Effect {
 
 fn load_trackers(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
     detail.trackers_loading = true;
+    detail.trackers_asked = Some(Instant::now());
     let api = ctx.api.clone();
     let hash = detail.hash.clone();
     vec![Effect::new(async move {
@@ -1935,6 +1984,65 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_refresh_does_not_snap_a_later_load_back() {
+        let mut state = loaded(1..31, Some("c31"));
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            state.selected = 2;
+            refresh(&mut state, ctx);
+            assert_eq!(state.restore.as_deref(), Some(hash(3).as_str()));
+            let msg = page_msg(&state, true, Err(failure(500, "internal", "engine gone")));
+            update(&mut state, msg, ctx);
+            assert!(!state.list.loading);
+            assert!(
+                state.restore.is_none(),
+                "the failed refresh will not settle"
+            );
+
+            // The operator scrolls on, to the end: the next page is fetched
+            // and settles without jumping back.
+            update(&mut state, Msg::Move(Move::Bottom), ctx);
+            assert!(state.list.loading, "near the end: the next page");
+            let msg = page_msg(&state, false, Ok(page(31..41, None)));
+            update(&mut state, msg, ctx);
+            assert_eq!(state.list.items.len(), 40);
+            assert_eq!(
+                selected_summary(&state).unwrap().infohash,
+                hash(30),
+                "not snapped back to the torrent selected when the refresh failed"
+            );
+        });
+    }
+
+    #[test]
+    fn a_refresh_after_a_failed_one_keeps_the_torrent_selected_now() {
+        let mut state = loaded(1..8, None);
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            update(&mut state, Msg::Move(Move::Down), ctx);
+            refresh(&mut state, ctx);
+            assert_eq!(state.restore.as_deref(), Some(hash(2).as_str()));
+            let msg = page_msg(&state, true, Err(failure(500, "internal", "engine gone")));
+            update(&mut state, msg, ctx);
+            assert!(
+                state.restore.is_none(),
+                "the failed refresh will not settle"
+            );
+
+            update(&mut state, Msg::Move(Move::Bottom), ctx);
+            refresh(&mut state, ctx);
+            assert_eq!(state.restore.as_deref(), Some(hash(7).as_str()));
+            let msg = page_msg(&state, true, Ok(page(1..8, None)));
+            update(&mut state, msg, ctx);
+            assert_eq!(
+                selected_summary(&state).unwrap().infohash,
+                hash(7),
+                "the torrent selected when this refresh began, not the failed one's"
+            );
+        });
+    }
+
+    #[test]
     fn one_reload_at_a_time() {
         let mut state = loaded(1..4, None);
         testing::with_ctx(None, |ctx| {
@@ -1992,6 +2100,61 @@ mod tests {
             let msg = page_msg(&state, true, Ok(page(1..4, None)));
             update(&mut state, msg, ctx);
             assert_eq!(state.selected, 2);
+            assert!(state.restore.is_none());
+        });
+    }
+
+    /// The `/` filter shows 11 of rows 3..34; `G` selects the last, row 33.
+    /// A refresh then remembers it, and its first page, rows 1..32, shows
+    /// only 10 under the filter while it pages on towards row 33.
+    fn chasing_past_the_filtered_rows(state: &mut State, ctx: &Ctx<'_>) {
+        update(state, Msg::StartFilter, ctx);
+        keys(state, ctx, "acct_b");
+        update(state, Msg::FilterKey(testing::key(KeyCode::Enter)), ctx);
+        assert_eq!(visible(state).len(), 11);
+        update(state, Msg::Move(Move::Bottom), ctx);
+        assert_eq!(selected_summary(state).unwrap().infohash, hash(33));
+        assert!(state.list.loading, "near the end: the next page");
+        let msg = page_msg(state, false, Ok(page(34..34, None)));
+        update(state, msg, ctx);
+
+        refresh(state, ctx);
+        assert_eq!(state.restore.as_deref(), Some(hash(33).as_str()));
+        let msg = page_msg(state, true, Ok(page(1..32, Some("c32"))));
+        assert_eq!(update(state, msg, ctx).len(), 1, "it pages on towards 33");
+        assert_eq!(visible(state).len(), 10);
+        assert!(
+            selected_summary(state).is_some(),
+            "selected {} of {} rows while paging on",
+            state.selected,
+            visible(state).len()
+        );
+    }
+
+    #[test]
+    fn a_reload_paging_towards_its_torrent_keeps_the_selection_in_range() {
+        let mut state = loaded(3..34, Some("c34"));
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            chasing_past_the_filtered_rows(&mut state, ctx);
+            let msg = page_msg(&state, false, Err(failure(500, "internal", "engine gone")));
+            update(&mut state, msg, ctx);
+            assert!(state.restore.is_none(), "the failed reload will not settle");
+            assert_eq!(state.selected, 9, "the last row shown, not past it");
+            assert_eq!(selected_summary(&state).unwrap().infohash, hash(30));
+        });
+
+        let mut state = loaded(3..34, Some("c34"));
+        testing::with_ctx(None, |ctx| {
+            state.profiles_loading = true;
+            chasing_past_the_filtered_rows(&mut state, ctx);
+            let msg = page_msg(&state, false, Ok(page(32..35, None)));
+            update(&mut state, msg, ctx);
+            assert_eq!(
+                selected_summary(&state).unwrap().infohash,
+                hash(33),
+                "the torrent paged towards is selected once it arrives"
+            );
             assert!(state.restore.is_none());
         });
     }
@@ -2394,6 +2557,94 @@ mod tests {
             view(&state, ctx, frame, area)
         });
         assert!(screen.contains("metadata not yet received"), "{screen}");
+    }
+
+    #[test]
+    fn the_trackers_tab_polls_its_trackers_on_its_own_timer() {
+        let mut state = opened(true);
+        with_trackers(&mut state);
+        let asked = state.detail.as_ref().unwrap().trackers_asked.unwrap();
+        let due = asked + TRACKERS_POLL_INTERVAL;
+        testing::with_ctx(None, |ctx| {
+            assert!(
+                poll(&mut state, due - Duration::from_millis(1), ctx).is_empty(),
+                "not before the interval"
+            );
+            state.detail.as_mut().unwrap().trackers_selected = 1;
+            assert_eq!(poll(&mut state, due, ctx).len(), 1, "due: re-read");
+            assert!(state.detail.as_ref().unwrap().trackers_loading);
+            assert!(
+                poll(&mut state, due + TRACKERS_POLL_INTERVAL, ctx).is_empty(),
+                "not while a read is in flight"
+            );
+
+            // The tracker that worked now fails: the poll's answer shows it,
+            // and the operator's place in the list holds.
+            let failing: types::TrackerList = testing::from_json(json!({"items": [
+                {"tier": 0, "host": "tracker.example.org:443",
+                 "url": "https://tracker.example.org/announce", "status": "error",
+                 "message": "connection refused", "next_announce_at": null,
+                 "seeds": null, "peers": null},
+                {"tier": 1, "host": "backup.example.net",
+                 "url": "https://backup.example.net/[redacted:9f2c]", "status": "error",
+                 "message": "unregistered torrent", "next_announce_at": null,
+                 "seeds": null, "peers": null},
+            ]}));
+            update(
+                &mut state,
+                Msg::Trackers {
+                    hash: hash(1),
+                    result: Ok(failing),
+                },
+                ctx,
+            );
+            let detail = state.detail.as_ref().unwrap();
+            let trackers = detail.trackers.as_ref().unwrap();
+            assert_eq!(trackers[0].message.as_deref(), Some("connection refused"));
+            assert_eq!(detail.trackers_selected, 1);
+
+            // Only the Trackers tab polls.
+            let later = Instant::now() + TRACKERS_POLL_INTERVAL;
+            update(&mut state, Msg::Tab(true), ctx);
+            assert!(poll(&mut state, later, ctx).is_empty(), "Actions tab");
+            update(&mut state, Msg::Tab(true), ctx);
+            assert!(poll(&mut state, later, ctx).is_empty(), "Overview tab");
+            update(&mut state, Msg::Back, ctx);
+            assert!(state.detail.is_none());
+            assert!(poll(&mut state, later, ctx).is_empty(), "the list");
+        });
+    }
+
+    #[test]
+    fn only_an_error_a_refresh_re_reads_counts_as_failed() {
+        let mut state = opened(false);
+        with_files(&mut state);
+        with_trackers(&mut state);
+        testing::with_ctx(None, |ctx| {
+            update(
+                &mut state,
+                Msg::Trackers {
+                    hash: hash(1),
+                    result: Err(failure(500, "internal", "boom")),
+                },
+                ctx,
+            );
+            assert!(load_failed(&state), "trackers, on the Trackers tab");
+            update(&mut state, Msg::Tab(false), ctx);
+            let detail = state.detail.as_mut().unwrap();
+            let generation = detail.files.generation;
+            detail.files.fail(generation, "no metadata yet".to_owned());
+            assert!(load_failed(&state), "files, on the Files tab");
+            // A refresh re-reads neither from the Overview tab.
+            update(&mut state, Msg::Tab(false), ctx);
+            assert!(!load_failed(&state), "neither, on the Overview tab");
+            // Nor a files list longer than one request.
+            update(&mut state, Msg::Tab(true), ctx);
+            let detail = state.detail.as_mut().unwrap();
+            let row = detail.files.items[0].clone();
+            detail.files.items.resize(caps::PAGE_MAX + 1, row);
+            assert!(!load_failed(&state), "a long files list");
+        });
     }
 
     #[test]
@@ -2944,5 +3195,155 @@ mod tests {
             keys(&mut state, ctx, "del");
         });
         snapshot("delete_confirm", &state, &[(80, 24)], true);
+    }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Rows `from..from + n`, in infohash order, every third in
+        /// `acct_b`, so a `/b` filter shows some rows and hides others.
+        fn rows(from: usize, n: usize, next: Option<&str>) -> types::TorrentPage {
+            let items: Vec<_> = (from..from + n)
+                .map(|i| {
+                    let mut row =
+                        summary(1, if i % 3 == 0 { "acct_b" } else { "acct_a" }, "seeding");
+                    row["infohash"] = json!(format!("{i:040x}"));
+                    row
+                })
+                .collect();
+            testing::from_json(json!({"items": items, "next_cursor": next}))
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Key(KeyCode),
+            /// The daemon answers the request in flight, if there is one,
+            /// with `n` rows and more to come or not. A first page of a
+            /// reload starts the daemon's rows at `shift`: what it lists can
+            /// change between reloads.
+            Page {
+                shift: usize,
+                n: usize,
+                more: bool,
+            },
+            PageFailed,
+            Refresh,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            let key = prop::sample::select(vec![
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+                KeyCode::Char('g'),
+                KeyCode::Char('G'),
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::Home,
+                KeyCode::End,
+                KeyCode::PageUp,
+                KeyCode::PageDown,
+                KeyCode::Char('/'),
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::Backspace,
+                KeyCode::Char('0'),
+                KeyCode::Char('1'),
+                KeyCode::Char('b'),
+                KeyCode::Char('e'),
+                KeyCode::Char('f'),
+                KeyCode::Char('F'),
+            ]);
+            prop_oneof![
+                6 => key.prop_map(Op::Key),
+                3 => (0usize..30, 0usize..40, any::<bool>()).prop_map(|(shift, n, more)| Op::Page { shift, n, more }),
+                1 => Just(Op::PageFailed),
+                1 => Just(Op::Refresh),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Whatever keys are pressed and whatever the daemon answers,
+            /// failed or short, filtered or not, the list's selection is a
+            /// row it shows, or 0 when it shows none.
+            ///
+            /// The daemon is faithful to the protocol: it answers only the
+            /// request in flight, a reload's with a first page, a cursor's
+            /// with the rows from that cursor on.
+            #[test]
+            fn the_selection_stays_within_the_visible_rows(ops in prop::collection::vec(op(), 0..80)) {
+                let mut state = State::default();
+                testing::with_ctx(None, |ctx| -> Result<(), TestCaseError> {
+                    // The request in flight: `None` for a reload's first
+                    // page, else the row its cursor resumes at. A cursor is
+                    // `k<row>`.
+                    let mut in_flight: Option<Option<usize>> = None;
+                    let cursor_row = |c: &Option<String>| -> Option<usize> {
+                        c.as_deref().and_then(|c| c.strip_prefix('k')).and_then(|n| n.parse().ok())
+                    };
+                    let (mut generation, mut loading) = (state.list.generation, false);
+                    let _ = update(&mut state, Msg::Profiles(Ok(profiles())), ctx);
+                    let _ = refresh(&mut state, ctx);
+                    for op in std::iter::once(None).chain(ops.into_iter().map(Some)) {
+                        // The row after the page just sent: where the next
+                        // request, a reload's or for more, resumes.
+                        let mut resume_at = None;
+                        let msg = match &op {
+                            None => None,
+                            Some(Op::Key(code)) => on_key(&state, testing::key(*code)),
+                            Some(Op::Page { .. } | Op::PageFailed) if in_flight.is_none() => None,
+                            Some(Op::Page { shift, n, more }) => {
+                                let request = in_flight.take().unwrap();
+                                let from = request.unwrap_or(*shift);
+                                let next = more.then(|| format!("k{}", from + n));
+                                resume_at = Some(from + n);
+                                let page = rows(from, *n, next.as_deref());
+                                Some(page_msg(&state, request.is_none(), Ok(page)))
+                            }
+                            Some(Op::PageFailed) => {
+                                in_flight = None;
+                                Some(page_msg(&state, false, Err(failure(500, "internal", "boom"))))
+                            }
+                            Some(Op::Refresh) => {
+                                let _ = refresh(&mut state, ctx);
+                                None
+                            }
+                        };
+                        if let Some(msg) = msg {
+                            let _ = update(&mut state, msg, ctx);
+                        }
+                        // What the client asked for since: a reload, or a
+                        // page from its cursor (a reload's next page, or more
+                        // rows near the end).
+                        if state.list.generation != generation {
+                            in_flight = Some(None);
+                        } else if let (true, Some(at)) = (state.list.loading, resume_at) {
+                            in_flight = Some(Some(at));
+                        } else if state.list.loading && !loading {
+                            in_flight = Some(cursor_row(&state.list.next_cursor));
+                        }
+                        if !state.list.loading {
+                            in_flight = None;
+                        }
+                        (generation, loading) = (state.list.generation, state.list.loading);
+                        let op = op.unwrap_or(Op::Refresh);
+                        if state.detail.is_none() {
+                            let shown = visible(&state).len();
+                            prop_assert!(
+                                state.selected < shown.max(1),
+                                "after {:?}: selected {} of {} shown",
+                                op,
+                                state.selected,
+                                shown,
+                            );
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
     }
 }

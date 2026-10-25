@@ -42,8 +42,9 @@ A client must ignore response fields it does not know. Requests are closed in
 the other direction: every request body refuses unknown members with a `422`,
 so a misspelt field fails loudly instead of being silently dropped.
 
-`info.version` is the document's own version. The daemon's version is
-reported by `GET /v1/server`.
+`info.version` is the release the document describes: the daemon's version,
+the one `GET /v1/server` reports and the release tag names. The API's own
+compatibility line is the `/v1` prefix above, not that number.
 
 ## Authentication
 
@@ -255,7 +256,12 @@ described in [`problems.md`](problems.md):
   the event's `kind`.
 - Today there is one kind, `tick`. It is sent when anything a client renders
   may have changed, and at least every ten seconds. It carries an opaque
-  `fingerprint`, not the change itself: refetch what is on screen.
+  `fingerprint`, not the change itself: refetch what is on screen. It covers
+  every torrent's phase, progress, rates and peers, every profile's status
+  and state, the pool index's scans and adoption states, and every plan's
+  status and step progress. It does not cover what a torrent's detail reads
+  from its session on request (its trackers' status and messages, its peers,
+  its files): a client showing those polls them.
 - The first event carries `retry: 5000`, the reconnect delay in milliseconds.
 - A comment line every fifteen seconds keeps the connection alive through
   proxies.
@@ -281,7 +287,9 @@ has:
 
 The alert drill's `fault-injection` build adds `POST /v1/faults`, tagged
 `testing`. No deployment runs that build, and the committed document does not
-include it.
+include it. Such a binary exits 78 at startup unless `TORRENTD_FAULT_INJECTION=1`
+is set, which only the drill does, and exports
+`torrentd_build_fault_injection 1` while it runs.
 
 ## Deleting a torrent's payload
 

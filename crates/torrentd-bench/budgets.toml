@@ -1,0 +1,104 @@
+# What every torrentd-bench subcommand is held to. Compiled into the bench
+# (include_str!), so a run is measured against this file as it stands in the
+# tree it was built from, and a breach exits the bench non-zero.
+#
+# Each budget is a measured run plus headroom, the run named beside it. A
+# budget may only tighten: raising one needs, in the same change, the
+# measured run that shows why the work got slower or bigger.
+#
+# "The CI run" below is CI's `bench` job on a GitHub-hosted ubuntu-24.04
+# runner (image 20261012.334), 2026-10-24: workflow run 40117446316, job
+# 120941584393, at commit 7a6f081a. Every budget CI checks comes from it.
+
+[alert-throughput]
+# State-map updates per second, at least.
+# Measured: the CI run 53.3M/s; locally 19.7M/s to 39.0M/s. The phase lasts
+# about 4 ms, so the rate swings between runs: budgeted at about half the
+# slowest run seen.
+min_updates_per_sec = 10_000_000
+
+[memory-scaling]
+# Resident KiB per seeding torrent over the empty session's baseline, at most.
+# Measured: the CI run (--count 10000) 26 KiB; locally 25 to 26 KiB.
+# Budgeted at 2x.
+max_kib_per_torrent = 52
+
+# The synthetic pool `pool-scan`, `pool-match` and `pool-adopt-preview` build,
+# chosen with `--size`. `files` counts every file under the one managed root:
+# `torrents` x `files_per_torrent` sparse payload files the library's
+# torrents match by (path, size), every one a distinct size of 1 MiB or more,
+# and the rest small files nothing claims. Every other torrent carries a
+# `.fastresume` marking every piece had, so the preview takes both paths.
+[sizes.full]
+files = 1_000_000
+torrents = 5_000
+files_per_torrent = 10
+
+# What CI runs on every push.
+[sizes.ci]
+files = 100_000
+torrents = 500
+files_per_torrent = 10
+
+# Per size: the timed phase's wall seconds, and the process's peak resident
+# MiB while it ran (the peak is reset just before it, after the pool is built
+# and any phase it builds on has run).
+#
+# The `ci` size is what CI checks, so its budgets come from the CI run: wall
+# time at about 4x and never under a second (a shared runner is noisy), peak
+# RSS at 1.5x to 2x. CI never builds the `full` size (it takes minutes and
+# 5 TB of sparse payload), so its budgets come from the reference run instead:
+# 2026-10-24 on an AMD Ryzen 7 7800X3D (8 cores / 16 threads), the pool on
+# btrfs over NVMe, release build, wall time at about 4x and peak RSS at about
+# 2x. That machine ran the `ci` size slower than the CI run did (scan 1.16 s
+# against 0.69 s), so its `full` figures do not flatter CI hardware.
+
+# The first scan of the root and the library, from an empty index.
+# Measured: full 14.28 s, 185 MiB (reference); ci 0.69 s, 30 MiB (CI run).
+[pool-scan.full]
+max_secs = 60.0
+max_peak_rss_mib = 384
+
+[pool-scan.ci]
+max_secs = 3.0
+max_peak_rss_mib = 64
+
+# Matching the whole library against that index.
+# Measured: full 2.42 s, 33 MiB (reference); ci 0.13 s, 29 MiB (CI run).
+[pool-match.full]
+max_secs = 10.0
+max_peak_rss_mib = 64
+
+[pool-match.ci]
+max_secs = 1.0
+max_peak_rss_mib = 48
+
+# Planning an adopt of every matched torrent under the root.
+# Measured: full 3.18 s, 31 MiB (reference); ci 0.03 s, 32 MiB (CI run).
+[pool-adopt-preview.full]
+max_secs = 13.0
+max_peak_rss_mib = 64
+
+[pool-adopt-preview.ci]
+max_secs = 1.0
+max_peak_rss_mib = 48
+
+# `pool-adopt`: adopting every torrent of the pool through a running release
+# torrentd, 1000 infohashes per request: wall milliseconds per torrent over
+# every request, the scan before it untimed. Half the torrents take the fast
+# path (an add in seed mode and its records), half are queued for
+# verification (their records and an enqueue); the hashing itself is not
+# timed.
+# Not yet measured on CI: both budgets come from the change that added the
+# case (issue #507), on a host whose pool sat on an XFS volume taking 10 to
+# 30 ms per fsync, release build. There, before that change overlapped and
+# grouped the per-torrent writes, ci took 46 to 145 ms per torrent; after
+# it, ci 8 to 28 ms and full 33 ms (5 requests, the slowest 36 s). Three
+# runs of each daemon interleaved: before 70 to 122 ms, after 15 to 28 ms.
+# Budgeted at about 2x the slowest run after (2.5x for full, run once);
+# CI's disks flush faster than that volume.
+[pool-adopt.full]
+max_ms_per_torrent = 80.0
+
+[pool-adopt.ci]
+max_ms_per_torrent = 55.0

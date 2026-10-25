@@ -11,17 +11,39 @@
 //! `MemoryResumeStore` keeps everything in a `DashMap` keyed by
 //! `(profile, infohash)`. Used by Layer 1 unit tests so we don't hit the
 //! filesystem.
+//!
+//! # Durability
+//!
+//! Where this store and [`crate::torrent_store`] say a write or delete is
+//! durable before it returns, they mean exactly this:
+//!
+//! - A write's data reaches the disk before its new name can: its temp file
+//!   is `fsync`ed, or a batch's filesystem flushed, before the rename, and a
+//!   flush that reports an error abandons the rename. Any crash leaves the
+//!   previous file or the new one, never a torn mix.
+//! - The rename or unlink itself is made durable by `fsync`ing the
+//!   directory, and that step is best effort: a failure is logged, counted in
+//!   `dir_fsync_errors_total`, and does not fail the call (`sync_dir` in
+//!   [`crate::batch_writer`] says why). Until the filesystem commits
+//!   that directory on its own, a power loss can revert the name: a write to
+//!   the previous file, or to none, and a delete to the deleted file.
+//!
+//! A process crash that the machine survives loses nothing either way. Only
+//! a power loss after a failed directory `fsync` can, and the counter says
+//! when one has failed.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(any(test, feature = "test-support"))]
 use dashmap::DashMap;
 use libtorrent_safe::InfoHash;
 use libtorrent_safe::ResumeData;
 use thiserror::Error;
 use tracing::debug;
+use tracing::info;
 use tracing::warn;
 
 use crate::batch_writer::remove_if_present;
@@ -43,11 +65,63 @@ pub struct Scan<T> {
     pub unreadable: u64,
 }
 
+/// What a store's listing of one profile's directory found, by name alone:
+/// the info-hashes a [`Scan`] would hold, with no file read.
+///
+/// The boot scans list a directory and read each file as they get to it, so
+/// what they hold at once is one file, not every file in the directory, and
+/// a file they skip by its name is never read at all.
+#[derive(Debug, Default)]
+pub struct Listing {
+    /// The info-hash every well-formed name carries, in directory order.
+    pub names: Vec<InfoHash>,
+    /// Directory entries that could not be read. A file that is named well
+    /// and cannot be read is found only when it is read.
+    pub unreadable: u64,
+}
+
+impl<T> From<Scan<T>> for Listing {
+    fn from(scan: Scan<T>) -> Self {
+        Self {
+            names: scan.entries.into_iter().map(|(ih, _)| ih).collect(),
+            unreadable: scan.unreadable,
+        }
+    }
+}
+
 pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     /// Scan every resume file owned by `profile`. Implementations skip
     /// files that don't parse as a 40-char hex info-hash filename, and count
     /// the ones that do but cannot be read.
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError>;
+
+    /// The info-hash of every resume file owned by `profile`, by name, with
+    /// the housekeeping [`ResumeStore::scan`] does first and no file read:
+    /// the boot's resume scan, which reads each with [`ResumeStore::read`]
+    /// as it reaches it.
+    ///
+    /// The default reads every file through `scan`; a store that can list
+    /// without reading overrides it.
+    fn list(&self, profile: &ProfileId) -> Result<Listing, ResumeStoreError> {
+        self.scan(profile).map(Listing::from)
+    }
+
+    /// Read the resume file for `(profile, ih)`, or `None` where there is
+    /// none, a write queued for it included.
+    ///
+    /// The default looks it up in a whole [`ResumeStore::scan`]; a store
+    /// that can read one file overrides it.
+    fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<ResumeData>, ResumeStoreError> {
+        Ok(self
+            .scan(profile)?
+            .entries
+            .into_iter()
+            .find_map(|(found, data)| (found == *ih).then_some(data)))
+    }
 
     /// [`ResumeStore::scan`]'s entries alone.
     fn load_all(
@@ -58,7 +132,9 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Atomically replace the resume file for `(profile, ih)` with `data`,
-    /// durably, before returning.
+    /// durably before returning in the sense the module's Durability section
+    /// gives: the data always, the new name as far as a directory `fsync`
+    /// can make it.
     fn write(
         &self,
         profile: &ProfileId,
@@ -83,7 +159,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     fn flush(&self) {}
 
     /// Delete the resume file for `(profile, ih)`, and any write queued for
-    /// it, durably before returning. Missing files are not an error.
+    /// it, before returning, then `fsync` the directory, best effort (see the
+    /// module's Durability section). Missing files are not an error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
 
     /// Whether `(profile, ih)` has a resume file, on disk or queued for one.
@@ -95,7 +172,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
         Ok(false)
     }
 
-    /// Record, durably before returning, that `(profile, ih)` was removed.
+    /// Record, durably before returning (as the module's Durability section
+    /// defines it), that `(profile, ih)` was removed.
     ///
     /// `DELETE` writes one before it removes the torrent from its session,
     /// and it stands until every file that would bring the torrent back is
@@ -116,7 +194,8 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Remove `(profile, ih)`'s tombstone, durably before returning. Missing
+    /// Remove `(profile, ih)`'s tombstone before returning, then `fsync` the
+    /// directory, best effort (see the module's Durability section). Missing
     /// is not an error.
     fn clear_tombstone(
         &self,
@@ -132,6 +211,17 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// The info-hash `name` spells, only where it is spelled exactly as this
+/// daemon writes it: 40 lower-case hex digits, [`InfoHash::to_hex`]'s form.
+///
+/// Every file and registry row is written and deleted under that one
+/// spelling. A name that decoded under any other — `ABCD…` for `abcd…` —
+/// would be loaded at boot, yet every delete removes only the lower-case
+/// name, so the torrent would come back after each removal.
+pub fn canonical_infohash(name: &str) -> Option<InfoHash> {
+    InfoHash::from_hex(name).filter(|ih| ih.to_hex() == name)
+}
+
 /// Read every `<infohash><suffix>` file in `dir`, skipping — with a warning
 /// — names that are not an info-hash and files that cannot be read. `what`
 /// names the store in the log.
@@ -141,41 +231,12 @@ pub(crate) fn scan_dir(
     profile: &ProfileId,
     what: &str,
 ) -> std::io::Result<Scan<Vec<u8>>> {
-    let mut out = Scan::default();
-    if !dir.exists() {
-        return Ok(out);
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(
-                    target: "torrentd_engine::store",
-                    profile_id = %profile,
-                    dir = %dir.display(),
-                    error.cause = %e,
-                    "skipping a {what} directory entry that could not be read",
-                );
-                out.unreadable += 1;
-                continue;
-            }
-        };
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(stem) = name.strip_suffix(suffix) else {
-            continue;
-        };
-        let Some(ih) = InfoHash::from_hex(stem) else {
-            warn!(
-                target: "torrentd_engine::store",
-                profile_id = %profile,
-                file = %path.display(),
-                "skipping {what} file with invalid name",
-            );
-            continue;
-        };
+    let (named, unreadable) = list_dir(dir, suffix, profile, what)?;
+    let mut out = Scan {
+        entries: Vec::new(),
+        unreadable,
+    };
+    for (ih, path) in named {
         match fs::read(&path) {
             Ok(bytes) => out.entries.push((ih, bytes)),
             Err(e) => {
@@ -192,6 +253,56 @@ pub(crate) fn scan_dir(
         }
     }
     Ok(out)
+}
+
+/// Every `<infohash><suffix>` file in `dir`, by name and path, reading
+/// none, and how many directory entries could not be read. Names that are
+/// not an info-hash are skipped with a warning, as [`scan_dir`] skips them.
+fn list_dir(
+    dir: &Path,
+    suffix: &str,
+    profile: &ProfileId,
+    what: &str,
+) -> std::io::Result<(Vec<(InfoHash, PathBuf)>, u64)> {
+    let mut named = Vec::new();
+    let mut unreadable = 0u64;
+    if !dir.exists() {
+        return Ok((named, unreadable));
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(
+                    target: "torrentd_engine::store",
+                    profile_id = %profile,
+                    dir = %dir.display(),
+                    error.cause = %e,
+                    "skipping a {what} directory entry that could not be read",
+                );
+                unreadable += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(suffix) else {
+            continue;
+        };
+        let Some(ih) = canonical_infohash(stem) else {
+            warn!(
+                target: "torrentd_engine::store",
+                profile_id = %profile,
+                file = %path.display(),
+                "skipping {what} file whose name is not a lower-case hex info-hash",
+            );
+            continue;
+        };
+        named.push((ih, path));
+    }
+    Ok((named, unreadable))
 }
 
 #[derive(Debug, Error)]
@@ -250,10 +361,76 @@ impl PartitionedDir {
             .join(format!("{}{}", ih.to_hex(), self.suffix))
     }
 
+    /// Every file in `profile`'s directory, after removing the temp files an
+    /// interrupted write left there (see [`PartitionedDir::remove_stale_temps`]).
+    /// The boot's scan, run before anything writes.
     pub(crate) fn scan(&self, profile: &ProfileId) -> std::io::Result<Scan<Vec<u8>>> {
         // Whatever is still queued lands first, so the scan reads the newest.
         self.flush();
+        self.remove_stale_temps(profile)?;
         scan_dir(&self.dir_for(profile), self.suffix, profile, self.what)
+    }
+
+    /// [`PartitionedDir::scan`]'s names alone, after the same flush and
+    /// temp-file removal, with no file read: each is read by
+    /// [`PartitionedDir::read`] as the boot reaches it.
+    pub(crate) fn list(&self, profile: &ProfileId) -> std::io::Result<Listing> {
+        self.flush();
+        self.remove_stale_temps(profile)?;
+        let (named, unreadable) =
+            list_dir(&self.dir_for(profile), self.suffix, profile, self.what)?;
+        Ok(Listing {
+            names: named.into_iter().map(|(ih, _)| ih).collect(),
+            unreadable,
+        })
+    }
+
+    /// The file for `(profile, ih)`: the bytes a queued write holds, else
+    /// what is on disk, else `None`.
+    pub(crate) fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let path = self.path_for(profile, ih);
+        if let Some(queued) = self.pending(&path) {
+            return Ok(Some(queued.to_vec()));
+        }
+        match fs::read(&path) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Remove the `<infohash><suffix>.tmp` and `.now.tmp` files a write
+    /// killed between its temp file and its rename leaves in `profile`'s
+    /// directory. Nothing reads them, but nothing else removes them either
+    /// until that torrent is written again, which a removed or never-saved
+    /// torrent never is. Held between this store's batches, so none of its
+    /// own temp files is removed mid-batch.
+    pub(crate) fn remove_stale_temps(&self, profile: &ProfileId) -> std::io::Result<()> {
+        let dir = self.dir_for(profile);
+        let remove = || {
+            crate::batch_writer::remove_stale_temps(&dir, self.suffix, |stem| {
+                canonical_infohash(stem).is_some()
+            })
+        };
+        let removed = match &self.writer {
+            Some(w) => w.between_batches(remove),
+            None => remove(),
+        }?;
+        if removed > 0 {
+            info!(
+                target: "torrentd_engine::store",
+                profile_id = %profile,
+                dir = %dir.display(),
+                removed,
+                "removed {what} temp files left by interrupted writes",
+                what = self.what,
+            );
+        }
+        Ok(())
     }
 
     /// The info-hash of every file in `profile`'s directory, by name alone:
@@ -270,15 +447,16 @@ impl PartitionedDir {
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(self.suffix)) else {
                 continue;
             };
-            if let Some(ih) = InfoHash::from_hex(stem) {
+            if let Some(ih) = canonical_infohash(stem) {
                 out.push(ih);
             }
         }
         Ok(out)
     }
 
-    /// Replace the file durably before returning: temp file, `fsync`,
-    /// `rename`, `fsync` of the directory.
+    /// Replace the file before returning: temp file, `fsync`, `rename`, then
+    /// a best-effort `fsync` of the directory (the module's Durability
+    /// section).
     pub(crate) fn write(
         &self,
         profile: &ProfileId,
@@ -323,8 +501,9 @@ impl PartitionedDir {
     }
 
     /// Remove the file and any write queued for it, then `fsync` the
-    /// directory, so a crash or power loss after this returns cannot bring
-    /// the file back for the next boot's scan to load.
+    /// directory, so a crash after this returns cannot bring the file back
+    /// for the next boot's scan to load. A power loss can, where that `fsync`
+    /// failed (the module's Durability section).
     pub(crate) fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> std::io::Result<()> {
         let path = self.path_for(profile, ih);
         match &self.writer {
@@ -406,6 +585,8 @@ impl FsResumeStore {
 
 impl ResumeStore for FsResumeStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
+        // A tombstone is written through a temp file too.
+        self.tombstones.remove_stale_temps(profile)?;
         let raw = self.resume.scan(profile)?;
         Ok(Scan {
             entries: raw
@@ -415,6 +596,19 @@ impl ResumeStore for FsResumeStore {
                 .collect(),
             unreadable: raw.unreadable,
         })
+    }
+
+    fn list(&self, profile: &ProfileId) -> Result<Listing, ResumeStoreError> {
+        self.tombstones.remove_stale_temps(profile)?;
+        Ok(self.resume.list(profile)?)
+    }
+
+    fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<ResumeData>, ResumeStoreError> {
+        Ok(self.resume.read(profile, ih)?.map(ResumeData::new))
     }
 
     fn write(
@@ -464,12 +658,14 @@ impl ResumeStore for FsResumeStore {
 // MemoryResumeStore (test fixture)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct MemoryResumeStore {
     inner: DashMap<(ProfileId, InfoHash), Vec<u8>>,
     tombstones: DashMap<(ProfileId, InfoHash), ()>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MemoryResumeStore {
     pub fn new() -> Self {
         Self::default()
@@ -492,6 +688,7 @@ impl MemoryResumeStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ResumeStore for MemoryResumeStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
         Ok(Scan {
@@ -503,6 +700,29 @@ impl ResumeStore for MemoryResumeStore {
                 .collect(),
             unreadable: 0,
         })
+    }
+
+    fn list(&self, profile: &ProfileId) -> Result<Listing, ResumeStoreError> {
+        Ok(Listing {
+            names: self
+                .inner
+                .iter()
+                .filter(|e| e.key().0 == *profile)
+                .map(|e| e.key().1)
+                .collect(),
+            unreadable: 0,
+        })
+    }
+
+    fn read(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<Option<ResumeData>, ResumeStoreError> {
+        Ok(self
+            .inner
+            .get(&(profile.clone(), *ih))
+            .map(|e| ResumeData::new(e.value().clone())))
     }
 
     fn write(
@@ -595,6 +815,66 @@ mod tests {
         assert_eq!(scan.entries[0].0, good);
     }
 
+    /// The boot's resume scan lists and then reads one file at a time, so a
+    /// listing holds names, not contents: a file that cannot be read is
+    /// listed and fails only its own read, a queued write lands first, and a
+    /// file gone since the listing reads as `None`.
+    #[test]
+    fn a_listing_reads_no_file_and_each_file_reads_on_its_own() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let good = InfoHash([0x01u8; 20]);
+        let bad = InfoHash([0x02u8; 20]);
+        let queued = InfoHash([0x03u8; 20]);
+        store.write(&profile, &good, b"ok").unwrap();
+        std::fs::create_dir(
+            dir.path()
+                .join("p")
+                .join(format!("{}.resume", bad.to_hex())),
+        )
+        .unwrap();
+        store.write_batched(&profile, &queued, b"later").unwrap();
+        assert_eq!(
+            store.read(&profile, &queued).unwrap().unwrap().as_bytes(),
+            b"later",
+            "a queued write reads before it lands"
+        );
+
+        let listing = store.list(&profile).unwrap();
+        let mut names = listing.names.clone();
+        names.sort_by_key(|ih| ih.0);
+        assert_eq!(names, vec![good, bad, queued]);
+        assert_eq!(listing.unreadable, 0, "no file is read to list it");
+        assert!(
+            dir.path()
+                .join("p")
+                .join(format!("{}.resume", queued.to_hex()))
+                .exists(),
+            "the listing lands what is queued first, as the scan does"
+        );
+
+        assert_eq!(
+            store.read(&profile, &good).unwrap().unwrap().as_bytes(),
+            b"ok"
+        );
+        assert!(store.read(&profile, &bad).is_err());
+        store.delete(&profile, &good).unwrap();
+        assert!(store.read(&profile, &good).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_memory_store_lists_and_reads_one_profile() {
+        let store = MemoryResumeStore::new();
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let ih = InfoHash([0x07u8; 20]);
+        store.write(&p, &ih, b"x").unwrap();
+        assert_eq!(store.list(&p).unwrap().names, vec![ih]);
+        assert!(store.list(&q).unwrap().names.is_empty());
+        assert_eq!(store.read(&p, &ih).unwrap().unwrap().as_bytes(), b"x");
+        assert!(store.read(&q, &ih).unwrap().is_none());
+    }
+
     #[test]
     fn batched_writes_land_and_a_delete_after_one_sticks() {
         let dir = tempdir().unwrap();
@@ -639,9 +919,10 @@ mod tests {
 
     /// A crash between a write's temp file and its rename leaves
     /// `<infohash>.resume.tmp` (a batch's) or `<infohash>.resume.now.tmp`
-    /// (`write`'s) beside the resume files. The next boot's scan must neither
-    /// load one as a torrent nor count it unreadable, and the next write for
-    /// that torrent must replace it.
+    /// (`write`'s) beside the resume files, and `<infohash>.removed.tmp` for
+    /// a tombstone. The next boot's scan must neither load one as a torrent
+    /// nor count it unreadable, and removes them: a torrent never written
+    /// again would otherwise keep its temp file forever.
     #[test]
     fn a_leftover_tmp_file_is_neither_scanned_nor_fatal() {
         let dir = tempdir().unwrap();
@@ -655,9 +936,19 @@ mod tests {
         std::fs::write(&batch_tmp, b"torn half of a resume file").unwrap();
         std::fs::write(&now_tmp, b"torn").unwrap();
 
+        let tomb_tmp = profile_dir.join(format!("{}.removed.tmp", batched.to_hex()));
+        std::fs::write(&tomb_tmp, b"").unwrap();
+        // Not a name the store writes: left alone.
+        let foreign = profile_dir.join("notes.resume.tmp");
+        std::fs::write(&foreign, b"mine").unwrap();
+
         let scan = store.scan(&p).unwrap();
         assert!(scan.entries.is_empty(), "a temp file was loaded");
         assert_eq!(scan.unreadable, 0, "a temp file was counted unreadable");
+        for tmp in [&batch_tmp, &now_tmp, &tomb_tmp] {
+            assert!(!tmp.exists(), "the boot scan left {}", tmp.display());
+        }
+        assert!(foreign.exists(), "the scan removed a file it did not write");
         assert!(store.tombstones(&p).unwrap().is_empty());
         assert!(!store.exists(&p, &batched).unwrap());
 
@@ -679,6 +970,52 @@ mod tests {
             !batch_tmp.exists() && !now_tmp.exists(),
             "the writes reused them"
         );
+    }
+
+    /// Every delete removes the lower-case name. A file named in upper case
+    /// that a scan still loaded would survive each `DELETE` and come back at
+    /// every boot, as would an upper-case tombstone that boot honours but
+    /// `clear_tombstone` never removes.
+    #[test]
+    fn only_a_lower_case_hex_name_is_scanned_or_listed() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let p = ProfileId::new("p");
+        let ih = InfoHash([0xabu8; 20]);
+        let profile_dir = dir.path().join("p");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let upper = ih.to_hex().to_uppercase();
+        let mixed = format!("Ab{}", &ih.to_hex()[2..]);
+        for stem in [&upper, &mixed] {
+            std::fs::write(profile_dir.join(format!("{stem}.resume")), b"x").unwrap();
+            std::fs::write(profile_dir.join(format!("{stem}.removed")), b"").unwrap();
+        }
+
+        let scan = store.scan(&p).unwrap();
+        assert!(scan.entries.is_empty(), "{:?}", scan.entries);
+        assert_eq!(scan.unreadable, 0);
+        assert!(store.tombstones(&p).unwrap().is_empty());
+
+        store.write(&p, &ih, b"canonical").unwrap();
+        store.write_tombstone(&p, &ih).unwrap();
+        assert_eq!(store.load_all(&p).unwrap().len(), 1);
+        assert_eq!(store.tombstones(&p).unwrap(), vec![ih]);
+        store.delete(&p, &ih).unwrap();
+        store.clear_tombstone(&p, &ih).unwrap();
+        assert!(
+            store.load_all(&p).unwrap().is_empty(),
+            "the delete is final"
+        );
+        assert!(store.tombstones(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_infohash_accepts_only_to_hex_spelling() {
+        let ih = InfoHash([0x0fu8; 20]);
+        assert_eq!(canonical_infohash(&ih.to_hex()), Some(ih));
+        assert_eq!(canonical_infohash(&ih.to_hex().to_uppercase()), None);
+        assert_eq!(canonical_infohash("0f"), None);
+        assert_eq!(canonical_infohash(&"g".repeat(40)), None);
     }
 
     #[test]

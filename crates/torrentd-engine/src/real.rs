@@ -1,15 +1,21 @@
-//! `RealEngine` — delegates to a `libtorrent_safe::Session` 1:1.
+//! `RealEngine` — implements `TorrentEngine` over a `libtorrent_safe::Session`.
 //!
-//! No business logic here; that lives in the alert loop and handlers.
-//! `RealEngine` exists only to satisfy `TorrentEngine` so production code
-//! can swap in `MockEngine` for tests.
+//! Each call delegates to the session; the business logic lives in the
+//! alert loop and handlers. Beyond the session it keeps only what the
+//! session cannot answer itself: the torrents it holds (`held`), the last
+//! alert translation failure count, and whether `close` has destroyed it.
+//! Tests swap in `MockEngine` through the same trait.
 //!
-//! Concurrency: `libtorrent_safe::Session` is `!Send + !Sync`. We park it
-//! behind a `parking_lot::Mutex` and route every call through that lock.
-//! libtorrent's session is internally thread-safe but the C shim's per-
-//! session handle map is mutex-guarded already, so the contention overhead
-//! is small for the shape of work torrentd does (one engine call per
-//! second per torrent, max).
+//! Concurrency: `libtorrent_safe::Session` is `Send` but not `Sync`, and
+//! `TorrentEngine` must be both. The session is parked behind a
+//! `parking_lot::Mutex` and every call goes through that lock, which is what
+//! makes `RealEngine` `Sync`: the shim allows one caller per session at a
+//! time (its alert pop takes no lock), so the mutex is required for
+//! soundness, not only for ordering. Every engine call but one, the HTTP
+//! handlers' included, waits on that one lock, which is why `pop_alerts`
+//! converts at most [`MAX_ALERTS_PER_POP`] alerts per acquisition. The
+//! exception is `alert_translate_errors`, which reads the count the last
+//! `pop_alerts` stored in an atomic and never touches the session.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -166,6 +172,11 @@ impl TorrentEngine for RealEngine {
     #[instrument(skip_all, fields(op = "unset_flags", infohash = %h.infohash, flags = ?flags))]
     fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<(), EngineError> {
         Ok(self.session()?.unset_flags(h, flags)?)
+    }
+
+    #[instrument(skip_all, fields(op = "enforce_no_download", infohash = %h.infohash))]
+    fn enforce_no_download(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        Ok(self.session()?.enforce_no_download(h)?)
     }
 
     #[instrument(skip_all, fields(op = "move_storage", infohash = %h.infohash, new_path))]
@@ -404,8 +415,12 @@ mod tests {
         .shutdown_deadline(Duration::from_secs(1))
         .spawn();
 
+        // The overflow handler tracks the lost adds before it counts the
+        // overflow, so a full map alone can be read in between: wait for
+        // both, or a slow runner fails the guard below with the work done.
+        let overflowed = || metrics.count_for("alert_queue_overflows_total") > 0;
         let deadline = Instant::now() + Duration::from_secs(20);
-        while state.len() < ADDS as usize && Instant::now() < deadline {
+        while !(state.len() == ADDS as usize && overflowed()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -500,7 +515,7 @@ mod tests {
         engine.torrent_statuses().expect("statuses");
         while !engine.pop_alerts().is_empty() {}
         for h in &paused {
-            assert!(state.track_added(*h, &p, Instant::now()));
+            assert!(state.track_added(*h, &p, true, Instant::now()));
             state.update(&h.infohash, |st| st.phase = TorrentPhase::Incomplete);
         }
         // Paused, and then the flood: the next update, the only one that
@@ -540,8 +555,16 @@ mod tests {
                 })
             })
         };
+        // The overflow handler refreshes the statuses before it counts them
+        // and the overflow, so `settled` alone can hold in between: wait for
+        // the counters too, or a slow runner fails the guards below with the
+        // work done.
+        let counted = || {
+            metrics.count_for("alert_queue_overflows_total") > 0
+                && metrics.count_for("statuses_refreshed_total") >= u64::from(PAUSED)
+        };
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !settled() && Instant::now() < deadline {
+        while !(settled() && counted()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(

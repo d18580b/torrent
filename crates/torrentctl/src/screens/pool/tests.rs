@@ -88,6 +88,7 @@ fn torrents(n: u8, next: Option<&str>) -> types::PoolTorrentPage {
                 "infohash": hash(i + 1), "name": format!("Some.Linux.Distro.{i}.x86_64.iso"),
                 "total_size": (i as i64 + 1) * 3_000_000_000_i64, "num_files": i as i64 * 7 + 1,
                 "state": state, "base_rel": null,
+                "note": if state == Some("partial") { Some("1 of 2 files present") } else { None },
                 "profile_id": if state == Some("adopted") { Some("acct_a") } else { None },
                 "category": null, "tags": [], "has_fastresume": i % 2 == 0,
             })
@@ -358,6 +359,60 @@ fn views_switch_with_brackets_and_arrows_but_not_tab() {
 }
 
 #[test]
+fn busy_reads_the_load_of_the_view_shown() {
+    // Overview: its own load.
+    let mut state = with_overview();
+    assert!(!busy(&state));
+    state.overview.loading = true;
+    assert!(busy(&state), "the overview is loading");
+
+    // Tree before a root is picked: the overview that picks it.
+    let mut state = with_overview();
+    state.view = View::Tree;
+    assert!(state.tree.root.is_none());
+    state.tree.entries.loading = true;
+    assert!(!busy(&state), "no root: the tree's entries are not read");
+    state.overview.loading = true;
+    assert!(busy(&state), "no root: the overview picking one is");
+
+    // Tree with a root: its entries, not the overview.
+    let mut state = with_tree();
+    assert_eq!(state.view, View::Tree);
+    assert!(!busy(&state));
+    state.overview.loading = true;
+    assert!(!busy(&state), "a root: the overview's load is not read");
+    state.tree.entries.loading = true;
+    assert!(busy(&state), "a root: its entries are loading");
+
+    // Library: its page of items, and no other view's load.
+    let mut state = with_library(3, None);
+    assert!(!busy(&state));
+    state.overview.loading = true;
+    state.tree.entries.loading = true;
+    state.plans.list.loading = true;
+    assert!(!busy(&state), "other views' loads are not read");
+    state.library.items.loading = true;
+    assert!(busy(&state), "the library is loading");
+
+    // Plans: the list, and an open plan's detail or its steps.
+    let mut state = with_plans();
+    assert!(!busy(&state));
+    state.library.items.loading = true;
+    assert!(!busy(&state), "the library's load is not read");
+    state.plans.list.loading = true;
+    assert!(busy(&state), "the plan list is loading");
+
+    let mut state = with_detail(delete_plan("draft"));
+    assert!(!busy(&state));
+    state.plans.detail.as_mut().unwrap().loading = true;
+    assert!(busy(&state), "the open plan is loading");
+    let detail = state.plans.detail.as_mut().unwrap();
+    detail.loading = false;
+    detail.steps.loading = true;
+    assert!(busy(&state), "the open plan's steps are loading");
+}
+
+#[test]
 fn the_tree_waits_for_the_overview_to_pick_a_root() {
     let mut state = State::default();
     assert_eq!(
@@ -498,7 +553,7 @@ fn scanning_asks_first_and_drift_runs_once_at_a_time() {
         "already checking"
     );
     let report =
-        testing::from_json(json!({"drifted": [hash(9)], "files_changed": 2, "files_vanished": 1}));
+        drift_report(json!({"drifted": [hash(9)], "files_changed": 2, "files_vanished": 1}));
     let effects = send(
         &mut state,
         Msg::Overview(overview::Msg::DriftChecked(Ok(report))),
@@ -506,6 +561,95 @@ fn scanning_asks_first_and_drift_runs_once_at_a_time() {
     );
     assert_eq!(effects, 2, "a toast and a reload");
     assert!(!state.overview.checking_drift);
+}
+
+/// A drift report: `fields` over one that found and missed nothing.
+fn drift_report(fields: serde_json::Value) -> types::DriftReport {
+    let mut report = json!({"drifted": [], "files_changed": 0, "files_vanished": 0,
+        "files_unreadable": 0, "unreadable_roots": [], "unmounted_dirs": [], "unchecked": []});
+    for (k, v) in fields.as_object().unwrap() {
+        report[k] = v.clone();
+    }
+    testing::from_json(report)
+}
+
+/// The toast a drift report raises.
+fn drift_toast(report: types::DriftReport) -> crate::app::Toast {
+    let mut state = with_overview();
+    let server = testing::server(true, true);
+    let effects = testing::with_ctx(Some(&server), |ctx| {
+        update(
+            &mut state,
+            Msg::Overview(overview::Msg::DriftChecked(Ok(report))),
+            ctx,
+        )
+    });
+    match effects.into_iter().next().map(testing::deliver) {
+        Some(crate::app::Msg::Toast(toast)) => toast,
+        other => panic!("a toast first, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_drift_check_that_could_not_read_a_root_does_not_say_nothing_drifted() {
+    use crate::app::ToastKind;
+
+    let clean = drift_toast(drift_report(json!({})));
+    assert_eq!(
+        (clean.kind, clean.text.as_str()),
+        (ToastKind::Success, "drift check: nothing drifted")
+    );
+    // An unmounted root: nothing marked, everything over it unchecked.
+    let unmounted = drift_toast(drift_report(
+        json!({"unreadable_roots": ["/srv/pool/a"], "unchecked": [hash(9), hash(10)]}),
+    ));
+    assert_eq!(unmounted.kind, ToastKind::Info);
+    assert_eq!(
+        unmounted.text,
+        "drift check: 1 roots could not be read — 2 torrents unchecked"
+    );
+    let unstatable = drift_toast(drift_report(
+        json!({"files_unreadable": 1, "unchecked": [hash(9)]}),
+    ));
+    assert_eq!(unstatable.kind, ToastKind::Info);
+    assert_eq!(
+        unstatable.text,
+        "drift check: nothing drifted, 1 torrents unchecked"
+    );
+    // Drift with every root read and every torrent checked asks for a
+    // rescan and claims nothing went unseen.
+    let drifted = drift_toast(drift_report(
+        json!({"drifted": [hash(11)], "files_changed": 1}),
+    ));
+    assert_eq!(drifted.kind, ToastKind::Info);
+    assert_eq!(
+        drifted.text,
+        "drift check: 1 torrents drifted — rescan and verify them"
+    );
+    // Drift under a readable root still asks for a rescan when another
+    // root could not be read.
+    let both = drift_toast(drift_report(json!({
+        "drifted": [hash(11)],
+        "files_changed": 1,
+        "unreadable_roots": ["/srv/pool/a"],
+        "unchecked": [hash(9), hash(10)]
+    })));
+    assert_eq!(both.kind, ToastKind::Info);
+    assert_eq!(
+        both.text,
+        "drift check: 1 torrents drifted — rescan and verify them; \
+         1 roots could not be read — 2 torrents unchecked"
+    );
+    // Drift alongside unstatable files keeps the unchecked count too.
+    let drifted_unstatable = drift_toast(drift_report(json!({
+        "drifted": [hash(11)],
+        "files_unreadable": 1,
+        "unchecked": [hash(9)]
+    })));
+    assert_eq!(
+        drifted_unstatable.text,
+        "drift check: 1 torrents drifted — rescan and verify them; 1 torrents unchecked"
+    );
 }
 
 // The tree.
@@ -654,6 +798,50 @@ fn a_tree_refresh_keeps_the_selected_entry() {
     );
 }
 
+#[test]
+fn a_move_during_a_tree_refresh_is_the_entry_kept() {
+    let mut state = with_tree();
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    assert!(state.tree.entries.loading);
+    assert_eq!(state.tree.reselect.as_deref(), Some("movies"));
+
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 0);
+    assert_eq!(state.tree.selected, 1, "a key moves while the reload runs");
+    assert_eq!(
+        state.tree.reselect.as_deref(),
+        Some("series"),
+        "the reload now restores the entry the operator moved to"
+    );
+
+    // An entry appeared ahead of it: its row moved, and the selection must
+    // follow the name rather than stay on row 1.
+    let mut page = tree_page(None);
+    page.items.insert(
+        0,
+        testing::from_json(entry("anime", "anime", true, &["adopted"])),
+    );
+    let generation = state.tree.entries.generation;
+    send(
+        &mut state,
+        Msg::Tree(tree::Msg::Page {
+            generation,
+            first: true,
+            result: Ok(page),
+        }),
+        true,
+    );
+    assert!(!state.tree.entries.loading);
+    assert_eq!(
+        state.tree.entries.items[state.tree.selected].name, "series",
+        "the selection follows the entry the operator moved to during the reload"
+    );
+    assert!(
+        state.tree.reselect.is_none(),
+        "spent once the reload settles"
+    );
+}
+
 /// `n` directory entries from the `from`th, in name order, continuing at
 /// `next`.
 fn wide_tree(from: usize, n: usize, next: Option<&str>) -> types::TreePage {
@@ -709,6 +897,52 @@ fn a_tree_refresh_past_1000_entries_keeps_them_and_the_selection() {
     assert!(!state.tree.entries.loading);
     assert_eq!(state.tree.entries.items.len(), 1300);
     assert_eq!(state.tree.entries.items[state.tree.selected].name, "d01200");
+}
+
+#[test]
+fn a_failed_tree_refresh_does_not_snap_a_later_page_back() {
+    let mut state = with_overview();
+    send(&mut state, Msg::OpenRoot, true);
+    let tree_page = |state: &State, first: bool, page: types::TreePage| {
+        Msg::Tree(tree::Msg::Page {
+            generation: state.tree.entries.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    let msg = tree_page(&state, true, wide_tree(0, 100, Some("k100")));
+    send(&mut state, msg, true);
+    state.tree.selected = 10;
+
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    assert_eq!(state.tree.reselect.as_deref(), Some("d00010"));
+    let generation = state.tree.entries.generation;
+    send(
+        &mut state,
+        Msg::Tree(tree::Msg::Page {
+            generation,
+            first: true,
+            result: Err(problem(500, "internal", None)),
+        }),
+        true,
+    );
+    assert!(!state.tree.entries.loading);
+    assert!(
+        state.tree.reselect.is_none(),
+        "the failed refresh will not settle"
+    );
+
+    // The operator scrolls on, to the end: the next page is fetched.
+    state.tree.selected = 98;
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 1);
+    let msg = tree_page(&state, false, wide_tree(100, 50, None));
+    send(&mut state, msg, true);
+    assert_eq!(state.tree.entries.items.len(), 150);
+    assert_eq!(
+        state.tree.selected, 99,
+        "not snapped back to the entry selected when the failed refresh began"
+    );
 }
 
 #[test]
@@ -1805,6 +2039,55 @@ fn a_plan_list_refresh_past_1000_plans_keeps_them_and_the_selection() {
 }
 
 #[test]
+fn a_failed_plan_list_refresh_does_not_snap_a_later_page_back() {
+    let mut state = State {
+        view: View::Plans,
+        ..State::default()
+    };
+    let server = testing::server(true, true);
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    let plans_page = |state: &State, first: bool, page: types::PlanPage| {
+        Msg::Plans(plans::Msg::Page {
+            generation: state.plans.list.generation,
+            first,
+            result: Ok(page),
+        })
+    };
+    let msg = plans_page(&state, true, wide_plans(0, 100, Some("p100")));
+    send(&mut state, msg, true);
+    state.plans.selected = 10;
+
+    testing::with_ctx(Some(&server), |ctx| refresh(&mut state, ctx));
+    assert_eq!(state.plans.reselect, Some(10));
+    let generation = state.plans.list.generation;
+    send(
+        &mut state,
+        Msg::Plans(plans::Msg::Page {
+            generation,
+            first: true,
+            result: Err(problem(500, "internal", None)),
+        }),
+        true,
+    );
+    assert!(!state.plans.list.loading);
+    assert!(
+        state.plans.reselect.is_none(),
+        "the failed refresh will not settle"
+    );
+
+    // The operator scrolls on, to the end: the next page is fetched.
+    state.plans.selected = 98;
+    assert_eq!(press(&mut state, KeyCode::Char('j'), true), 1);
+    let msg = plans_page(&state, false, wide_plans(100, 50, None));
+    send(&mut state, msg, true);
+    assert_eq!(state.plans.list.items.len(), 150);
+    assert_eq!(
+        state.plans.list.items[state.plans.selected].id, 99,
+        "not snapped back to the plan selected when the failed refresh began"
+    );
+}
+
+#[test]
 fn a_plan_steps_refresh_past_1000_steps_keeps_them_and_the_selection() {
     // A 1300-step plan whose body carries the first 100.
     let plan = || -> types::Plan {
@@ -1956,9 +2239,11 @@ fn the_overview_renders() {
         "torrents": 1234, "matched": 300, "partial": 50, "missing": 40, "overlap": 11, "shared": 6,
         "drifted": 3, "errors": 2}),
     ));
-    state.overview.drift = Some(testing::from_json(
+    state.overview.drift = Some(drift_report(
         json!({"drifted": [hash(9), hash(10), hash(11)],
-        "files_changed": 4, "files_vanished": 1}),
+        "files_changed": 4, "files_vanished": 1, "files_unreadable": 2,
+        "unreadable_roots": ["/srv/pool/b", "/srv/pool/c", "/srv/pool/d"],
+        "unmounted_dirs": ["/srv/pool/a/disk"], "unchecked": [hash(12)]}),
     ));
     for (w, h) in [(80, 24), (160, 48)] {
         snapshot(&format!("pool_overview_{w}x{h}"), shot(&state, w, h, false));

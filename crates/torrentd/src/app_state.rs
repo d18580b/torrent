@@ -9,16 +9,16 @@ use std::sync::Arc;
 use libtorrent_safe::InfoHash;
 use parking_lot::Mutex;
 use torrentd_engine::AlertSource;
-use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::ResumeStore;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentStore;
 
 use crate::metrics_sink::PromSink;
 use crate::profile_registry::ProfileRegistry;
+use crate::profile_registry::ProfileStatus;
+use crate::registry::AssignmentRegistry;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -35,7 +35,7 @@ pub struct AppState {
     /// Resume-data store.
     ///
     /// Only the delete path needs it here. An engine-backed removal gets both
-    /// stores cleaned for free through `TorrentRemoved` ->
+    /// stores cleaned for free through `TorrentRemoved` -> the engine's
     /// `handlers/add.rs`; the branch that clears a registry entry for a
     /// profile with no session has no such alert, and without this the files
     /// stayed on disk and the startup scan re-assigned the info-hash at the
@@ -50,9 +50,9 @@ pub struct AppState {
     /// in which case every `/v1/pool` operation answers `pool-not-configured`.
     pub pool: Option<Arc<crate::pool_service::PoolService>>,
     /// The daemon's bound on hash checks, `[pool]` or not: the pool's verify
-    /// queue where there is one ([`crate::pool_service::VerifyQueue::for_daemon`]).
+    /// queue where there is one ([`crate::check_queue::VerifyQueue::for_daemon`]).
     /// A `.torrent` add holds its first check here, and a recheck queues.
-    pub checks: Arc<crate::pool_service::VerifyQueue>,
+    pub checks: Arc<crate::check_queue::VerifyQueue>,
     /// Alert-loop liveness stamp (Unix millis at its last iteration). Read by
     /// `/healthz` so a wedged loop makes the daemon report unready.
     pub alert_heartbeat: Arc<AtomicU64>,
@@ -105,8 +105,9 @@ pub struct AppState {
     pub tunnel_probe: crate::vpn_monitor::Prober,
     /// The kill-switch watch's fence, where `network_kill_switch` is on. An
     /// add that finds its profile fenced records what it paused with it, so
-    /// the fence's lift resumes that too.
-    pub kill_switch: Option<Arc<crate::vpn_monitor::KillSwitchFence>>,
+    /// the fence's lift resumes that too. Setting a fenced profile online
+    /// refuses while it says the kill switch did not last check in force.
+    pub kill_switch: Option<Arc<crate::fence::KillSwitchFence>>,
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
@@ -270,11 +271,12 @@ pub(crate) fn build_test_state_with_sessions(
     profiles: Option<Arc<ProfileRegistry>>,
     session_ids: &[&str],
 ) -> AppState {
-    use torrentd_engine::AssignmentRegistry;
     use torrentd_engine::MemoryTorrentStore;
     use torrentd_engine::MockEngine;
     use torrentd_engine::ProfileSource;
     use torrentd_engine::TorrentEngine;
+
+    use crate::registry::AssignmentRegistry;
 
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
     // Tests that do not care about profiles get one named `p`, which is what
@@ -284,17 +286,20 @@ pub(crate) fn build_test_state_with_sessions(
             crate::profile_registry::test_entry("p", ProfileStatus::Active),
         ]))
     });
-    // A distinct registry file per call. Cargo runs tests in threads of one
-    // process, so a fixed name here is one file shared by every test that
-    // builds a state — harmless while nothing wrote to it, and a rename race
-    // the moment a test persists an assignment.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let reg_dir = std::env::temp_dir().join(format!("torrentd-test-{}", std::process::id()));
-    std::fs::create_dir_all(&reg_dir).expect("create test registry dir");
-    let reg_path = reg_dir.join(format!(
-        "reg-{}.json",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    // A registry database no earlier state, in this process or any other,
+    // has used: one created in a directory made for this call alone. Cargo
+    // runs tests in threads of one process, so a fixed name is one file
+    // shared by every test that builds a state. A name made of the pid and a
+    // per-process counter is not enough either: the databases outlive their
+    // process, and a later run that reuses a pid reaches the same counter
+    // value and opens an earlier test's database, assignments and all, so
+    // a test that claimed nothing finds a claim in its registry.
+    let reg_dir = tempfile::Builder::new()
+        .prefix("torrentd-test-")
+        .tempdir()
+        .expect("create test registry dir")
+        .keep();
+    let reg_path = reg_dir.join("reg.json");
     AppState {
         source: Arc::new(ProfileSource::new(
             session_ids
@@ -310,7 +315,7 @@ pub(crate) fn build_test_state_with_sessions(
         metrics: Arc::new(PromSink::new()),
         auth: None,
         pool: None,
-        checks: crate::pool_service::VerifyQueue::for_daemon(None),
+        checks: crate::check_queue::VerifyQueue::for_daemon(None),
         alert_heartbeat: Arc::new(AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -379,6 +384,32 @@ mod work_gate_tests {
 mod tests {
     use super::*;
     use crate::profile_registry::test_entry;
+
+    /// Every test state opens a registry database of its own, in a directory
+    /// created for it, so it starts empty whatever an earlier state, or an
+    /// earlier process with the same pid, left on disk.
+    #[test]
+    fn each_test_state_starts_with_a_registry_of_its_own() {
+        let first = build_test_state(None);
+        let ih = libtorrent_safe::InfoHash::from_hex(&"ab".repeat(20)).unwrap();
+        first.registry.assign(ih, ProfileId::new("p")).unwrap();
+        let second = build_test_state(None);
+        assert_eq!(second.registry.len(), 0, "{:?}", second.registry.entries());
+        assert_ne!(
+            first.registry.path().parent(),
+            second.registry.path().parent(),
+        );
+        let entries: Vec<_> = std::fs::read_dir(second.registry.path().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .all(|n| n.to_string_lossy().starts_with("reg.json")),
+            "a directory used by nothing else: {entries:?}"
+        );
+    }
 
     #[test]
     fn profile_vpn_down_true_only_for_vpndown_profiles() {

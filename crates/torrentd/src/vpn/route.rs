@@ -5,10 +5,10 @@
 //! — to the tunnel device where the kernel allows `SO_BINDTODEVICE`. Its
 //! listen sockets, which also send its uTP and UDP tracker traffic, are
 //! device-bound only as far as libtorrent's own best effort goes (see
-//! `startup.rs`), so for them, and for TCP where the device binding is
-//! refused, these rules are what keeps the traffic in the tunnel. What a tunnel needs from the routing table is
-//! narrow: traffic *from* its address goes to a table of its own, whose
-//! routes all point at the tunnel.
+//! `startup::profiles`), so for them, and for TCP where the device binding
+//! is refused, these rules are what keeps the traffic in the tunnel. What a
+//! tunnel needs from the routing table is narrow: traffic *from* its address
+//! goes to a table of its own, whose routes all point at the tunnel.
 //! Nothing else on the host is rerouted, and no tunnel's routes are visible to
 //! another tunnel's traffic.
 //!
@@ -31,10 +31,21 @@
 //! the address on the device and the handshake fresh, so neither of the other
 //! two checks can see it, while every packet the profile sends falls through
 //! to the main table's default route.
+//!
+//! The probe asks from every address a session sends from: the link's IPv4
+//! address, and each global IPv6 address it holds, to the probe destination
+//! of that address's family ([`probe_dest`]). A session listens on the tunnel
+//! device and so sends from each of them, and an `ip -6 rule` lost on its own
+//! leaves the IPv4 route intact while the IPv6 traffic falls through to the
+//! main table. So a tunnel needs a route in each family it holds an address
+//! in: an IPv6 address on a link whose `AllowedIPs` route no IPv6 to the
+//! internet (no `::/0`) is routed by the main table and fences the profile,
+//! as an IPv4 address without `0.0.0.0/0` does.
 
 use std::io;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 use super::exec;
 
@@ -54,6 +65,28 @@ const MAX_RULES: usize = 64;
 /// private range would be the wrong choice — a host may blackhole or route
 /// those specially, and the probe would fence a healthy profile.
 pub(crate) const PROBE_DEST: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+
+/// [`PROBE_DEST`]'s IPv6 counterpart, asked from a tunnel's IPv6 addresses,
+/// on the same terms: a public address (not the `2001:db8::/32`
+/// documentation range), and nothing is sent to it.
+pub(crate) const PROBE_DEST_V6: Ipv6Addr =
+    Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+
+/// The destination the route probe asks about from `src`: [`PROBE_DEST`] or
+/// [`PROBE_DEST_V6`], whichever is in `src`'s family. `ip route get` refuses
+/// a destination and a source in different families.
+pub(crate) fn probe_dest(src: IpAddr) -> IpAddr {
+    match src {
+        IpAddr::V4(_) => IpAddr::V4(PROBE_DEST),
+        IpAddr::V6(_) => IpAddr::V6(PROBE_DEST_V6),
+    }
+}
+
+/// The global IPv6 addresses on `iface` the probe asks from besides its IPv4
+/// one: each is an address a session listening on the device sends from.
+pub(crate) fn v6_sources(iface: &str) -> io::Result<Vec<Ipv6Addr>> {
+    super::ip_lookup::global_ipv6(iface)
+}
 
 /// The `-4`/`-6` family flag for an address or prefix.
 pub(crate) fn family(addr: &str) -> &'static str {
@@ -279,5 +312,102 @@ mod tests {
     fn the_family_follows_the_address() {
         assert_eq!(family("10.2.0.2/32"), "-4");
         assert_eq!(family("fd00::2/128"), "-6");
+        assert_eq!(
+            probe_dest(IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2))),
+            IpAddr::V4(PROBE_DEST)
+        );
+        assert_eq!(
+            probe_dest("fd00::2".parse().unwrap()),
+            IpAddr::V6(PROBE_DEST_V6)
+        );
+    }
+
+    /// `ip -6 route get`'s answer once the tunnel's `ip -6 rule` is gone:
+    /// the lookup falls through to the main table's router-advertised route.
+    #[test]
+    fn an_ipv6_answer_is_judged_as_an_ipv4_one_is() {
+        assert_eq!(
+            judge(
+                "wg-a",
+                "2606:4700:4700::1111 from fd00::2 dev wg-a table 1952710658 metric 1024 pref medium"
+            ),
+            RouteProbe::ViaTunnel,
+        );
+        let r = judge(
+            "wg-a",
+            "2606:4700:4700::1111 from fd00::2 via fe80::1 dev eth0 proto ra metric 1024 pref medium",
+        );
+        assert!(
+            matches!(r, RouteProbe::Elsewhere(ref why) if why.contains("eth0")),
+            "{r:?}"
+        );
+    }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// An interface name as config validation admits one.
+        const IFACE: &str = "[A-Za-z0-9_=+.-]{1,15}";
+
+        /// Words an `ip route get` answer is made of, around its `dev`.
+        fn words() -> impl Strategy<Value = Vec<String>> {
+            prop::collection::vec("[a-z0-9.:/]{1,12}", 0..6)
+        }
+
+        proptest! {
+            /// Whatever `ip` prints, judging it answers.
+            #[test]
+            fn judging_never_panics(iface in ".*", answer in ".*") {
+                let _ = judge(&iface, &answer);
+            }
+
+            /// A route by a longer interface that starts with the tunnel's
+            /// name is not the tunnel's.
+            #[test]
+            fn a_longer_interface_sharing_the_prefix_is_never_the_tunnel(
+                iface in IFACE,
+                suffix in "[A-Za-z0-9_=+.-]{1,4}",
+                before in words(),
+                after in words(),
+            ) {
+                let answer = format!(
+                    "1.1.1.1 {} dev {iface}{suffix} {}",
+                    before.join(" "),
+                    after.join(" "),
+                );
+                prop_assume!(!answer.split_whitespace().collect::<Vec<_>>()
+                    .windows(2).any(|w| w[0] == "dev" && w[1] == iface));
+                prop_assert!(
+                    matches!(judge(&iface, &answer), RouteProbe::Elsewhere(_)),
+                    "{}", answer
+                );
+            }
+
+            /// The first `dev` of the first line names the tunnel, and only
+            /// a reject route stands in the way; later lines never count.
+            #[test]
+            fn the_first_lines_device_decides(
+                iface in IFACE,
+                reject in prop::option::of(prop_oneof![
+                    Just("unreachable"), Just("prohibit"), Just("blackhole"), Just("throw"),
+                ]),
+                before in words(),
+                after in words(),
+            ) {
+                prop_assume!(!before.iter().any(|w| w == "dev") && iface != "eth0");
+                let first = format!(
+                    "{} 1.1.1.1 {} dev {iface} {}",
+                    reject.unwrap_or(""),
+                    before.join(" "),
+                    after.join(" "),
+                );
+                let via = judge(&iface, &format!("{first}\n    cache dev eth0\n"));
+                prop_assert_eq!(via == RouteProbe::ViaTunnel, reject.is_none(), "{}", first);
+                let later = judge(&iface, &format!("1.1.1.1 dev eth0\n{first}\n"));
+                prop_assert!(matches!(later, RouteProbe::Elsewhere(_)), "{}", first);
+            }
+        }
     }
 }

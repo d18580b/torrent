@@ -131,9 +131,18 @@ pub struct Harness {
     coverage: Arc<Coverage>,
 }
 
+/// The `[auth] session_ttl_secs` an authenticated harness runs with, unless
+/// it asks for another.
+pub const SESSION_TTL_SECS: u64 = 3600;
+
 /// Configure `[auth]` on `state` with [`PASSWORD`] and one static token per
 /// scope.
 pub fn with_auth(state: &mut AppState) -> Tokens {
+    with_auth_ttl(state, SESSION_TTL_SECS)
+}
+
+/// As [`with_auth`], with sessions that live `session_ttl_secs`.
+fn with_auth_ttl(state: &mut AppState, session_ttl_secs: u64) -> Tokens {
     let mut tokens = Tokens::default();
     let mut configs = Vec::new();
     for (name, scopes, slot) in [
@@ -151,7 +160,7 @@ pub fn with_auth(state: &mut AppState) -> Tokens {
     }
     state.auth = Some(Auth::new(AuthConfig {
         password_hash: cheap_hash(),
-        session_ttl_secs: 3600,
+        session_ttl_secs,
         token: configs,
     }));
     tokens
@@ -190,6 +199,28 @@ impl Harness {
         setup(&mut state);
         let tokens = with_auth(&mut state);
         Self::new(coverage, state, tokens)
+    }
+
+    /// As [`authed`](Self::authed) with no setup, with sessions that live
+    /// `session_ttl_secs`. `Auth::new` does not validate, so this may go
+    /// below the configurable minimum, which is what lets a test outlive one.
+    pub fn authed_with_session_ttl(coverage: &Arc<Coverage>, session_ttl_secs: u64) -> Self {
+        let mut state = crate::app_state::build_test_state(None);
+        let tokens = with_auth_ttl(&mut state, session_ttl_secs);
+        Self::new(coverage, state, tokens)
+    }
+
+    /// The `/metrics` sample named exactly `series` (`name{labels}`), read
+    /// with the `metrics` token, or 0 where the scrape has none.
+    pub async fn metric(&self, series: &str) -> f64 {
+        let resp = self
+            .send("GET", "/metrics", Some(&self.tokens.metrics.clone()), None)
+            .await;
+        resp.assert_status(StatusCode::OK);
+        resp.text()
+            .lines()
+            .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+            .map_or(0.0, |v| v.trim().parse().unwrap())
     }
 
     /// Send `method path` with `token` as the bearer credential, if any, and
@@ -303,7 +334,7 @@ impl Harness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(
-            // The server `startup::serve_once` runs, so the operation's own
+            // The server `startup::http_stage::serve_once` runs, so the operation's own
             // deadline answers a stalled body only where production lets it.
             crate::startup::http_server(service)
                 .listener(listener)

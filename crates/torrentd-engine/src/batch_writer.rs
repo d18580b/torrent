@@ -11,9 +11,14 @@
 //! queued and returns at once; the writer thread takes whatever has queued up,
 //! and for the whole batch:
 //!
-//! 1. writes every temp file, without flushing each;
-//! 2. flushes each filesystem once with `syncfs(2)`, so every temp file's data
-//!    is on disk before any rename can expose it;
+//! 1. opens each directory, then writes every temp file, without flushing
+//!    each;
+//! 2. flushes each filesystem once with `syncfs(2)` through the directory
+//!    opened in step 1, so every temp file's data is on disk before any
+//!    rename can expose it. The descriptor predates the writes because
+//!    `syncfs` reports a writeback error only to descriptors opened before
+//!    it was recorded: one opened after could see a clean flush while a temp
+//!    file's data was lost, and the rename would replace a good file with it;
 //! 3. renames every temp file over its target;
 //! 4. `fsync`s each directory once, so the renames are durable. This step is
 //!    best effort: a failure is logged once per directory, counted every
@@ -72,6 +77,8 @@ use crate::profile::ProfileId;
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Step {
+    /// This directory was opened for the `syncfs(2)` that flushes a batch.
+    OpenDir(PathBuf),
     /// The temp file at this path was written, not yet flushed.
     Write(PathBuf),
     /// The file at this path was `fsync`ed.
@@ -110,7 +117,8 @@ pub(crate) fn steps_under(root: &Path) -> Vec<Step> {
         .unwrap()
         .iter()
         .filter(|s| {
-            let (Step::Write(p)
+            let (Step::OpenDir(p)
+            | Step::Write(p)
             | Step::SyncFile(p)
             | Step::SyncFs(p)
             | Step::Rename(p)
@@ -255,6 +263,63 @@ impl BatchWriter {
     pub fn pending_len(&self) -> usize {
         self.shared.pending.lock().by_path.len()
     }
+
+    /// Run `f` with no batch in progress and none starting until it returns.
+    pub(crate) fn between_batches<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _io = self.shared.io.lock();
+        f()
+    }
+}
+
+/// Remove every temp file a write to `<infohash><suffix>` in `dir` leaves
+/// behind when the process dies between writing it and renaming it:
+/// `<infohash><suffix>.tmp` (a batch's or [`write_atomic`]'s) and
+/// `<infohash><suffix>.now.tmp` ([`BatchWriter::write_now`]'s). Returns how
+/// many it removed. A missing directory holds none.
+///
+/// Only names whose info-hash `is_name` accepts are touched, so nothing the
+/// stores did not write is removed. Meant for boot, before anything writes:
+/// a temp file a write is still filling would be removed from under it, and
+/// that write would then fail. A file that cannot be removed is logged and
+/// skipped; it is never read, and the next write for its torrent replaces
+/// it.
+pub(crate) fn remove_stale_temps(
+    dir: &Path,
+    suffix: &str,
+    is_name: impl Fn(&str) -> bool,
+) -> io::Result<usize> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(target) = name
+            .strip_suffix(".now.tmp")
+            .or_else(|| name.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if !target.strip_suffix(suffix).is_some_and(&is_name) {
+            continue;
+        }
+        let path = dir.join(name);
+        match remove_if_present(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(
+                target: "torrentd_engine::batch_writer",
+                file = %path.display(),
+                error.cause = %e,
+                "could not remove a temp file left by an interrupted write",
+            ),
+        }
+    }
+    Ok(removed)
 }
 
 impl Drop for BatchWriter {
@@ -331,15 +396,32 @@ fn run_batch(shared: &Shared) {
         }
     };
 
+    // 0. Each directory, created and opened before any temp file in it is
+    //    written. `syncfs(2)` reports a writeback error only to a descriptor
+    //    opened before the error was recorded (the filesystem's errseq is
+    //    sampled at open), so a descriptor opened after the temp files were
+    //    written and closed can miss an EIO on them, and step 3 would then
+    //    rename a file whose data never reached the disk over a good one.
+    let mut dir_fds: HashMap<PathBuf, Result<fs::File, io::ErrorKind>> = HashMap::new();
+    for (path, _) in &batch {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        if dir_fds.contains_key(dir) {
+            continue;
+        }
+        let r = fs::create_dir_all(dir).and_then(|()| fs::File::open(dir));
+        if r.is_ok() {
+            record(|| Step::OpenDir(dir.to_path_buf()));
+        }
+        dir_fds.insert(dir.to_path_buf(), r.map_err(|e| e.kind()));
+    }
+
     // 1. Every temp file, unflushed.
-    let mut made_dirs: HashSet<PathBuf> = HashSet::new();
     let mut written: Vec<(&PathBuf, &Queued)> = Vec::with_capacity(batch.len());
     for (path, q) in &batch {
         let dir = path.parent().unwrap_or(Path::new("."));
         let r = (|| {
-            if !made_dirs.contains(dir) {
-                fs::create_dir_all(dir)?;
-                made_dirs.insert(dir.to_path_buf());
+            if let Some(Err(kind)) = dir_fds.get(dir) {
+                return Err(io::Error::from(*kind));
             }
             let mut f = fs::OpenOptions::new()
                 .write(true)
@@ -371,12 +453,17 @@ fn run_batch(shared: &Shared) {
     let mut flushed_devices: HashMap<u64, Result<(), io::ErrorKind>> = HashMap::new();
     let mut dir_ok: HashMap<PathBuf, Result<(), io::ErrorKind>> = HashMap::new();
     for dir in &dirs {
-        let r = fs::File::open(dir).and_then(|d| {
+        let d = match dir_fds.get(dir) {
+            Some(Ok(d)) => Ok(d),
+            Some(Err(kind)) => Err(io::Error::from(*kind)),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        };
+        let r = d.and_then(|d| {
             let dev = d.metadata()?.dev();
             if let Some(done) = flushed_devices.get(&dev) {
                 return done.map_err(io::Error::from);
             }
-            let r = syncfs(&d);
+            let r = syncfs(d);
             if r.is_ok() {
                 record(|| Step::SyncFs(dir.clone()));
             }
@@ -650,6 +737,39 @@ mod tests {
         assert_eq!(count(|s| matches!(s, Step::SyncFile(_))), 0, "{steps:?}");
     }
 
+    /// `syncfs(2)` reports a writeback error only to a descriptor opened
+    /// before the error was recorded. A batch that opened its directory
+    /// after writing and closing its temp files could miss an EIO on one of
+    /// them and rename lost data over a good file, so the directory the
+    /// flush goes through is opened before the first temp file is written.
+    #[test]
+    fn a_batch_opens_the_directory_it_flushes_before_writing_any_temp_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("p");
+        let w = BatchWriter::spawn("test-writer", None);
+        let paths: Vec<PathBuf> = (1..=2u8)
+            .map(|i| root.join(format!("{i}.resume")))
+            .collect();
+        {
+            let _io = w.shared.io.lock();
+            for (i, p) in (1u8..).zip(&paths) {
+                w.enqueue(p.clone(), &ProfileId::new("p"), &ih(i), b"x");
+            }
+        }
+        w.flush();
+        let steps = steps_under(&root);
+        let opened = at(&steps, &Step::OpenDir(root.clone()));
+        for p in &paths {
+            assert!(
+                opened < at(&steps, &Step::Write(tmp_for(p))),
+                "{} was written before the directory its flush goes through was opened: \
+                 {steps:?}",
+                p.display(),
+            );
+        }
+        assert!(opened < at(&steps, &Step::SyncFs(root.clone())));
+    }
+
     /// The per-file protocol, [`write_atomic`] and [`BatchWriter::write_now`]:
     /// the temp file is written and `fsync`ed before the rename exposes it,
     /// and the directory is `fsync`ed after.
@@ -827,16 +947,40 @@ mod tests {
         assert!(dir_fsync_errors() >= before + 2, "the repeat counts too");
     }
 
+    /// Waits for the write itself to appear rather than for the queue to
+    /// empty: a batch's `syncfs` can outlast any short bound on a loaded host,
+    /// and a bound that expires silently would read a file not yet renamed.
+    /// A failed write reaches the hook, so it fails the test with its cause
+    /// instead of running out the clock.
     #[test]
     fn the_thread_lands_writes_without_being_asked() {
         let dir = tempdir().unwrap();
-        let w = BatchWriter::spawn("test-writer", None);
+        let failed: Arc<Mutex<Option<String>>> = Arc::default();
+        let hook: WriteErrorHook = {
+            let failed = Arc::clone(&failed);
+            Arc::new(move |_, _, e| *failed.lock() = Some(e.to_string()))
+        };
+        let w = BatchWriter::spawn("test-writer", Some(hook));
         let path = dir.path().join("a.resume");
         w.enqueue(path.clone(), &ProfileId::new("p"), &ih(1), b"bg");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while w.pending_len() > 0 && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            // A rename is atomic: the file is absent or holds every byte.
+            if let Ok(got) = fs::read(&path) {
+                assert_eq!(got, b"bg");
+                break;
+            }
+            if let Some(e) = failed.lock().take() {
+                panic!("the queued write failed: {e}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} not written within 60s; {} still queued, steps: {:?}",
+                path.display(),
+                w.pending_len(),
+                steps_under(dir.path()),
+            );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(fs::read(&path).unwrap(), b"bg");
     }
 }

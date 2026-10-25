@@ -9,8 +9,11 @@
 //!
 //! * **Fast path** — the previous client left a `.fastresume` saying the
 //!   torrent was complete — a `pieces` bitfield with one entry for each of
-//!   the `.torrent`'s pieces, every one had — and every file is still in the
-//!   index at the size the torrent declares. Payload rewritten in place at the same size is caught
+//!   the `.torrent`'s pieces, every one had, from resume data not in
+//!   libtorrent's `seed_mode` — and every file is still in the
+//!   index at the size the torrent declares, at a placement that is
+//!   unambiguous: the save path the sidecar declares, or the only complete
+//!   copy under the managed roots. Payload rewritten in place at the same size is caught
 //!   separately by the drift pass an adopt runs over its selection first,
 //!   which marks the torrent `Drifted` and so sends it down the verify path
 //!   instead. Given both, its piece state is as good as a verification
@@ -38,6 +41,8 @@ use tracing::warn;
 
 use crate::model::AdoptionState;
 use crate::model::PoolError;
+use crate::model::PoolTorrent;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 /// What adopting one torrent would do.
@@ -218,7 +223,7 @@ pub fn plan(
 
     let can_fast_path = may_fast_path
         && match &hints {
-            Some(h) => fastresume_is_trustworthy(store, infohash, h, meta())?,
+            Some(h) => fastresume_is_trustworthy(store, &torrent, h, meta(), &save_path)?,
             None => false,
         };
 
@@ -265,15 +270,19 @@ pub fn plan(
 }
 
 /// The metadata of the `.torrent` at `path`, or `None` where it cannot be read
-/// or parsed.
+/// or parsed, or is larger than the library's read cap.
 fn torrent_meta(path: &Path) -> Option<TorrentMeta> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::scan::read_capped(path).ok()?;
     libtorrent_safe::torrent_metadata(&bytes).ok()
 }
 
 /// Each file's path as the `.torrent` gives it, `/`-separated: where the
 /// scan places a file the previous client left where the `.torrent` says.
-fn torrent_paths(meta: &TorrentMeta) -> Vec<String> {
+///
+/// The one rewrite of a torrent's declared paths into the index's form: the
+/// scan writes its file rows from it, and adoption compares those rows with
+/// it.
+pub(crate) fn torrent_paths(meta: &TorrentMeta) -> Vec<String> {
     meta.files
         .iter()
         .map(|f| f.path.replace('\\', "/"))
@@ -318,11 +327,21 @@ fn files_follow_the_torrent(
 /// Whether the previous client's completion claim can stand in for our own
 /// verification.
 ///
-/// Two conditions, both necessary. The sidecar has to say the torrent was
+/// Three conditions, all necessary. The sidecar has to say the torrent was
 /// complete — a bitfield with one entry per piece of the `.torrent`, every
-/// one had; an incomplete or mis-sized one has nothing useful to assert — and
+/// one had, outside `seed_mode` (see
+/// [`ResumeHints::is_complete`](crate::fastresume::ResumeHints::is_complete));
+/// an incomplete or mis-sized one has nothing useful to assert —
 /// every file has to still be present in the index at the size the torrent
-/// declares.
+/// declares, and the placement at `save_path` has to be the one the sidecar
+/// is about.
+///
+/// That last condition holds where the previous client's declared save path
+/// is `save_path` itself, or where `save_path` holds the only complete copy
+/// under the managed roots. Otherwise the matcher picked one of several
+/// same-size copies — by the size anchor, typically, where the declared path
+/// lies outside every root — and a stale or preallocated one would be
+/// announced as complete, so the torrent is verified instead.
 ///
 /// Note what that second condition does *not* cover: it compares the torrent
 /// against the index, so it only rules out payload that changed size. Payload
@@ -335,10 +354,12 @@ fn files_follow_the_torrent(
 /// the last scan or drift check saw.
 fn fastresume_is_trustworthy(
     store: &PoolStore,
-    infohash: &str,
+    torrent: &PoolTorrent,
     hints: &crate::fastresume::ResumeHints,
     meta: Option<&TorrentMeta>,
+    save_path: &Path,
 ) -> Result<bool, PoolError> {
+    let infohash = torrent.infohash.as_str();
     // The piece count is the `.torrent`'s; without it, no bitfield can be
     // held to it.
     let Some(meta) = meta else {
@@ -352,7 +373,8 @@ fn fastresume_is_trustworthy(
         return Ok(false);
     };
 
-    for f in store.torrent_files(infohash)? {
+    let files = store.torrent_files(infohash)?;
+    for f in &files {
         if !f.is_on_disk() {
             continue;
         }
@@ -364,17 +386,22 @@ fn fastresume_is_trustworthy(
             _ => return Ok(false),
         }
     }
-    Ok(true)
-}
 
-fn join_rel(base: &str, rel: &str) -> String {
-    let base = base.trim_matches('/');
-    let rel = rel.trim_matches('/');
-    if base.is_empty() {
-        rel.to_string()
-    } else {
-        format!("{base}/{rel}")
+    // The previous client's bitfield is about the payload at the path it
+    // declared, so where that is the base adopted from, the claim is about
+    // these very files.
+    if torrent
+        .declared_save_path
+        .as_deref()
+        .is_some_and(|declared| Path::new(declared) == save_path)
+    {
+        return Ok(true);
     }
+    // Otherwise only an unambiguous placement lets it stand: one complete
+    // copy, the one adopted from. Two copies at the same sizes say nothing
+    // about which one the bitfield described.
+    let copies = crate::matcher::complete_copies(store, torrent, &files)?;
+    Ok(copies == [(root_id, base_rel)])
 }
 
 /// Summary of what a bulk adopt over a subtree would do, without doing it.
@@ -451,7 +478,62 @@ pub fn torrent_path(store: &PoolStore, infohash: &str) -> Result<Option<PathBuf>
     Ok(store.torrent(infohash)?.map(|t| t.source_path))
 }
 
-/// The `.torrent` bytes, read from the library.
-pub fn torrent_bytes(path: &Path) -> Result<Vec<u8>, PoolError> {
-    Ok(std::fs::read(path)?)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::MAX_LIBRARY_FILE_BYTES;
+
+    /// Only a refusal is one, and each plan names its own kind.
+    #[test]
+    fn only_a_refusal_is_a_refusal() {
+        let fast = AdoptPlan::FastPath {
+            resume_path: PathBuf::from("/l/t.fastresume"),
+            torrent_path: PathBuf::from("/l/t.torrent"),
+            save_path: PathBuf::from("/d"),
+            files_renamed: false,
+        };
+        let verify = AdoptPlan::Verify {
+            torrent_path: PathBuf::from("/l/t.torrent"),
+            save_path: PathBuf::from("/d"),
+            resume_path: None,
+        };
+        let refuse = AdoptPlan::Refuse {
+            reason: refusal::MISSING,
+        };
+        assert!(!fast.is_refusal());
+        assert!(!verify.is_refusal());
+        assert!(refuse.is_refusal());
+        assert_eq!(
+            [fast.kind(), verify.kind(), refuse.kind()],
+            ["fast_path", "verify", "refuse"]
+        );
+    }
+
+    /// Issue #543: the adoption's reads of a `.torrent` hold to the library
+    /// read cap, as the scan's do. The file past it is still a torrent a
+    /// parser accepts, so only the cap keeps it from being read whole.
+    #[test]
+    fn a_torrent_past_the_library_read_cap_is_not_read() {
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pad_file.torrent"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("t.torrent");
+        std::fs::write(&at, &fixture).unwrap();
+        assert!(torrent_meta(&at).is_some());
+
+        // An unknown top-level key holding a cap's worth of bytes.
+        let pad = MAX_LIBRARY_FILE_BYTES as usize;
+        let mut big = format!("d1:a{pad}:").into_bytes();
+        big.resize(big.len() + pad, 0);
+        big.extend_from_slice(&fixture[1..]);
+        assert_eq!(
+            libtorrent_safe::info_hash_from_torrent(&big).unwrap(),
+            libtorrent_safe::info_hash_from_torrent(&fixture).unwrap(),
+        );
+        std::fs::write(&at, &big).unwrap();
+
+        assert!(torrent_meta(&at).is_none());
+    }
 }

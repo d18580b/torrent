@@ -109,10 +109,11 @@ pub enum Session {
     Unreachable {
         reason: String,
         since: Instant,
-        /// Whether to ask again unprompted. Not after a 403: a token
-        /// without the `read` scope stays without it, and every refusal
-        /// raises the daemon's scope-denial alert.
-        retry: bool,
+        /// Why the daemon refused (a 403), or `None` when it is asked again
+        /// unprompted. A refusal is not retried: a token without the `read`
+        /// scope stays without it, a Host outside `allowed_hosts` stays
+        /// outside it, and every refusal is counted by the daemon.
+        refused: Option<Refusal>,
     },
     /// The daemon wants a password.
     SignedOut,
@@ -121,6 +122,29 @@ pub enum Session {
         server: Box<types::ServerInfo>,
         principal: Box<types::Principal>,
     },
+}
+
+/// Why the daemon answered the session check with a 403.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// `insufficient-scope`: the token lacks the `read` scope.
+    Scope,
+    /// Any other 403, such as a daemon without `[auth]` refusing a Host it
+    /// does not answer to.
+    Forbidden,
+}
+
+impl Refusal {
+    /// The refusal a session-check failure carries, if it is one.
+    fn of(failure: &Failure) -> Option<Self> {
+        if failure.status != Some(403) {
+            None
+        } else if failure.is("insufficient-scope") {
+            Some(Self::Scope)
+        } else {
+            Some(Self::Forbidden)
+        }
+    }
 }
 
 /// A transient notice in the corner.
@@ -176,7 +200,7 @@ pub struct Model {
     pub tab: Tab,
     pub session: Session,
     /// Whether the credential in use is a session token this client minted
-    /// from the password, and so revokes on quit.
+    /// from the password, and so revokes on the way out.
     pub minted: bool,
     /// The user asked to quit and the client is finishing up first: revoking
     /// a minted token, or waiting for an in-flight sign-in to answer so the
@@ -208,7 +232,8 @@ pub struct Model {
     /// The fingerprint of the stream tick that last refreshed the visible
     /// screen. A tick carrying the same one says nothing changed, so it
     /// fetches nothing. Not recorded when the screen had a load in flight
-    /// and skipped it, so a re-send retries. Forgotten whenever the stream's
+    /// and skipped it, so a re-send retries; forgotten when the screen's load
+    /// fails, so a re-send retries that too. Forgotten whenever the stream's
     /// state changes, so the first tick after a reconnect always refreshes.
     pub fingerprint: Option<String>,
 }
@@ -217,7 +242,8 @@ pub struct Model {
 #[derive(Debug)]
 pub enum Msg {
     Key(KeyEvent),
-    /// A render tick (250 ms): spinners, toast expiry, the polling fallback.
+    /// A render tick (250 ms): spinners, toast expiry, the polling fallback,
+    /// and the poll of an open torrent's trackers.
     Tick,
     /// `GET /v1/events` delivered a tick carrying this fingerprint of the
     /// daemon's state: something visible changed if it differs from the last.
@@ -339,8 +365,8 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             {
                 model.toasts.pop_front();
             }
-            if let Session::Unreachable { since, retry, .. } = model.session {
-                if retry && now.duration_since(since) >= RETRY_INTERVAL {
+            if let Session::Unreachable { since, refused, .. } = model.session {
+                if refused.is_none() && now.duration_since(since) >= RETRY_INTERVAL {
                     model.session = Session::Checking;
                     return vec![check_session(&model.api)];
                 }
@@ -351,11 +377,18 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             let due = model
                 .last_refresh
                 .is_none_or(|at| now.duration_since(at) >= POLL_INTERVAL);
-            if model.live != Live::Streaming
-                && due
-                && matches!(model.session, Session::SignedIn { .. })
-            {
+            if !matches!(model.session, Session::SignedIn { .. }) {
+                return Vec::new();
+            }
+            if model.live != Live::Streaming && due {
                 return refresh_visible(model);
+            }
+            // What the stream does not cover and the screen shows: an open
+            // torrent's trackers, polled on their own timer.
+            if model.tab == Tab::Torrents {
+                return route(model, |m, ctx| {
+                    screens::torrents::poll(&mut m.torrents, now, ctx)
+                });
             }
             Vec::new()
         }
@@ -410,7 +443,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.session = Session::Unreachable {
                 reason: failure.message(),
                 since: Instant::now(),
-                retry: failure.status != Some(403),
+                refused: Refusal::of(&failure),
             };
             Vec::new()
         }
@@ -423,6 +456,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             model.api = api;
             model.minted = true;
+            model.login.busy = false;
+            if model.quitting {
+                // The quit came after the daemon answered but before this
+                // landed: the token is live and owed a revocation, then the
+                // exit the quit asked for.
+                effects.push(revoke(&model.api, true));
+                return effects;
+            }
             model.session = Session::Checking;
             effects.push(check_session(&model.api));
             effects
@@ -523,16 +564,16 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             };
             screens::login::update(&mut model.login, msg, &ctx)
         }
-        Msg::Dashboard(msg) => route(model, |m, ctx| {
+        Msg::Dashboard(msg) => answered(model, |m, ctx| {
             screens::dashboard::update(&mut m.dashboard, msg, ctx)
         }),
-        Msg::Torrents(msg) => route(model, |m, ctx| {
+        Msg::Torrents(msg) => answered(model, |m, ctx| {
             screens::torrents::update(&mut m.torrents, msg, ctx)
         }),
-        Msg::Profiles(msg) => route(model, |m, ctx| {
+        Msg::Profiles(msg) => answered(model, |m, ctx| {
             screens::profiles::update(&mut m.profiles, msg, ctx)
         }),
-        Msg::Pool(msg) => route(model, |m, ctx| screens::pool::update(&mut m.pool, msg, ctx)),
+        Msg::Pool(msg) => answered(model, |m, ctx| screens::pool::update(&mut m.pool, msg, ctx)),
     }
 }
 
@@ -547,6 +588,19 @@ fn route(model: &mut Model, f: impl FnOnce(&mut Model, &Ctx<'_>) -> Vec<Effect>)
         tick,
     };
     f(model, &ctx)
+}
+
+/// Route a screen's message, most often a load's answer. Where the visible
+/// screen's load has failed, the fingerprint that triggered it is forgotten,
+/// so the daemon's next re-send of it retries rather than leaving the error
+/// and the rows from before the change on screen until something else
+/// changes.
+fn answered(model: &mut Model, f: impl FnOnce(&mut Model, &Ctx<'_>) -> Vec<Effect>) -> Vec<Effect> {
+    let effects = route(model, f);
+    if load_failed(model) {
+        model.fingerprint = None;
+    }
+    effects
 }
 
 /// Refresh whatever is on screen.
@@ -573,6 +627,17 @@ fn busy(model: &Model) -> bool {
         Tab::Torrents => screens::torrents::busy(&model.torrents),
         Tab::Profiles => screens::profiles::busy(&model.profiles),
         Tab::Pool => screens::pool::busy(&model.pool),
+    }
+}
+
+/// Whether the visible screen's last load failed, so what it shows may
+/// predate the change that triggered it.
+fn load_failed(model: &Model) -> bool {
+    match model.tab {
+        Tab::Dashboard => screens::dashboard::load_failed(&model.dashboard),
+        Tab::Torrents => screens::torrents::load_failed(&model.torrents),
+        Tab::Profiles => screens::profiles::load_failed(&model.profiles),
+        Tab::Pool => screens::pool::load_failed(&model.pool),
     }
 }
 
@@ -1122,6 +1187,62 @@ mod tests {
     }
 
     #[test]
+    fn an_open_trackers_tab_is_polled_while_the_stream_is_up() {
+        use screens::torrents::Msg as T;
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = signed_in_as(model_at(&daemon), false);
+        m.tab = Tab::Torrents;
+        update(&mut m, Msg::LiveChanged(Live::Streaming));
+        let infohash = "ab".repeat(20);
+        let page: types::TorrentPage = testing::from_json(serde_json::json!({
+            "items": [{
+                "infohash": infohash, "profile_id": "acct_a", "phase": "seeding",
+                "progress": 1.0, "upload_rate": 0, "download_rate": 0,
+                "total_uploaded": 0, "total_payload_uploaded": 0, "num_peers": 0,
+                "is_finished": true, "is_seeding": true,
+            }],
+            "next_cursor": null,
+        }));
+        let generation = m.torrents.list.generation;
+        update(
+            &mut m,
+            Msg::Torrents(T::Page {
+                generation,
+                first: true,
+                result: Ok(page),
+            }),
+        );
+        update(&mut m, Msg::Torrents(T::Open));
+        update(&mut m, Msg::Torrents(T::Tab(true)));
+        update(&mut m, Msg::Torrents(T::Tab(true)));
+        let trackers: types::TrackerList = testing::from_json(serde_json::json!({"items": []}));
+        update(
+            &mut m,
+            Msg::Torrents(T::Trackers {
+                hash: infohash.clone(),
+                result: Ok(trackers),
+            }),
+        );
+        // Nothing the stream reports has changed, and the screen refreshed
+        // just now; only the trackers' own timer is due.
+        m.last_refresh = Some(Instant::now());
+        let detail = m.torrents.detail.as_mut().unwrap();
+        detail.trackers_asked = detail
+            .trackers_asked
+            .map(|at| at - screens::torrents::TRACKERS_POLL_INTERVAL);
+
+        testing::run(update(&mut m, Msg::Tick));
+        assert_eq!(
+            daemon.lines(),
+            [format!("GET /v1/torrents/{infohash}/trackers")]
+        );
+        assert!(
+            update(&mut m, Msg::Tick).is_empty(),
+            "and not again until the interval"
+        );
+    }
+
+    #[test]
     fn a_tick_with_an_unchanged_fingerprint_fetches_nothing() {
         let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut m = signed_in_as(model_at(&daemon), false);
@@ -1201,6 +1322,93 @@ mod tests {
     }
 
     #[test]
+    fn a_change_is_remembered_only_when_the_visible_screen_is_not_loading() {
+        // Each tab's own busy() decides, through the load flag it reads.
+        type SetLoading = fn(&mut Model, bool);
+        let tabs: [(Tab, SetLoading); 3] = [
+            (Tab::Dashboard, |m, on| m.dashboard.loading = on),
+            (Tab::Profiles, |m, on| m.profiles.loading = on),
+            (Tab::Pool, |m, on| m.pool.overview.loading = on),
+        ];
+        for (tab, set_loading) in tabs {
+            let mut m = signed_in(true);
+            m.tab = tab;
+            update(&mut m, Msg::LiveChanged(Live::Streaming));
+            // Every screen idle but the one shown, so only its gate decides.
+            m.dashboard.loading = false;
+            m.profiles.loading = false;
+            m.pool.overview.loading = false;
+            let tick = || Msg::Changed("00000000000000aa".to_owned());
+
+            set_loading(&mut m, true);
+            update(&mut m, tick());
+            assert_eq!(
+                m.fingerprint, None,
+                "{tab:?}: a change skipped mid-load is not remembered"
+            );
+
+            set_loading(&mut m, false);
+            assert!(
+                !update(&mut m, tick()).is_empty(),
+                "{tab:?}: its re-send refreshes the screen"
+            );
+            assert_eq!(
+                m.fingerprint.as_deref(),
+                Some("00000000000000aa"),
+                "{tab:?}: a change refreshed in full is remembered"
+            );
+
+            set_loading(&mut m, false);
+            assert!(
+                update(&mut m, tick()).is_empty(),
+                "{tab:?}: once remembered, a re-send fetches nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_change_whose_refresh_fails_is_retried_on_its_re_send() {
+        let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
+        let mut m = signed_in_as(model_at(&daemon), false);
+        m.tab = Tab::Profiles;
+        update(&mut m, Msg::LiveChanged(Live::Streaming));
+        let tick = |fp: &str| Msg::Changed(fp.to_owned());
+        let answer = |m: &mut Model, effects: Vec<Effect>| {
+            for msg in testing::run(effects) {
+                update(m, msg);
+            }
+        };
+
+        // The refresh the change triggers fails: a transient 500, say.
+        let effects = update(&mut m, tick("00000000000000aa"));
+        answer(&mut m, effects);
+        assert_eq!(daemon.lines(), ["GET /v1/profiles"]);
+        assert!(m.profiles.error.is_some(), "the failure is shown");
+
+        // The daemon re-sends the same fingerprint: the failed load is
+        // retried, not left on screen until some other change arrives.
+        let effects = update(&mut m, tick("00000000000000aa"));
+        answer(&mut m, effects);
+        assert_eq!(
+            daemon.lines(),
+            ["GET /v1/profiles", "GET /v1/profiles"],
+            "a change whose refresh failed is fetched again on its re-send"
+        );
+
+        // Once a refresh it triggered succeeds, a re-send fetches nothing.
+        assert_eq!(update(&mut m, tick("00000000000000aa")).len(), 1);
+        update(
+            &mut m,
+            Msg::Profiles(screens::profiles::Msg::Loaded(Ok(Vec::new()))),
+        );
+        assert!(m.profiles.error.is_none());
+        assert!(
+            update(&mut m, tick("00000000000000aa")).is_empty(),
+            "once loaded, a re-send fetches nothing"
+        );
+    }
+
+    #[test]
     fn an_unreachable_daemon_is_retried_not_treated_as_a_sign_out() {
         let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut m = model_at(&daemon);
@@ -1229,22 +1437,33 @@ mod tests {
     }
 
     #[test]
-    fn a_token_without_the_read_scope_is_not_asked_again_unprompted() {
-        let mut m = model();
-        let refused = Failure {
-            status: Some(403),
-            ..Failure::local("Forbidden", None)
-        };
-        update(&mut m, Msg::SessionChecked(Err(refused)));
-        if let Session::Unreachable { since, .. } = &mut m.session {
+    fn a_refused_session_check_is_not_asked_again_unprompted() {
+        for (slug, refusal) in [
+            ("insufficient-scope", Refusal::Scope),
+            ("about:blank", Refusal::Forbidden),
+        ] {
+            let mut m = model();
+            let refused = Failure {
+                status: Some(403),
+                slug: Some(slug.to_owned()),
+                ..Failure::local("Forbidden", None)
+            };
+            update(&mut m, Msg::SessionChecked(Err(refused)));
+            let Session::Unreachable { since, refused, .. } = &mut m.session else {
+                panic!("{slug}: {:?}", m.session);
+            };
+            assert_eq!(*refused, Some(refusal), "{slug}");
             *since -= RETRY_INTERVAL;
+            assert!(
+                update(&mut m, Msg::Tick).is_empty(),
+                "{slug}: no retry loop"
+            );
+            assert_eq!(
+                update(&mut m, Msg::Key(testing::key(KeyCode::Char('r')))).len(),
+                1,
+                "{slug}: `r` still asks"
+            );
         }
-        assert!(update(&mut m, Msg::Tick).is_empty(), "no retry loop");
-        assert_eq!(
-            update(&mut m, Msg::Key(testing::key(KeyCode::Char('r')))).len(),
-            1,
-            "`r` still asks"
-        );
     }
 
     #[test]
@@ -1365,6 +1584,41 @@ mod tests {
         update(&mut m, Msg::Quit);
         update(&mut m, Msg::Quit);
         assert!(m.quit);
+    }
+
+    #[test]
+    fn quitting_between_the_sign_in_answer_and_signed_in_revokes_the_new_token() {
+        let daemon = testing::Recorder::start("204 No Content", "");
+        let mut m = model_at(&daemon);
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        m.login.busy = true;
+        // The daemon answered; `SignedIn` is on its way but not yet applied.
+        let msgs = testing::run(update(
+            &mut m,
+            Msg::Login(screens::login::Msg::Answered(Ok("tds_gap".into()))),
+        ));
+        let [Msg::SignedIn(api)] = &msgs[..] else {
+            panic!("SignedIn on its way: {msgs:?}");
+        };
+        assert!(m.login.busy, "a token is on its way");
+
+        let effects = update(&mut m, Msg::Quit);
+        assert!(!m.quit, "waits for the token on its way");
+        testing::run(effects);
+        let msgs = testing::run(update(&mut m, Msg::SignedIn(api.clone())));
+        assert_eq!(
+            daemon.requests(),
+            [testing::Request {
+                line: REVOKE.to_owned(),
+                bearer: Some("tds_gap".to_owned()),
+            }],
+            "revokes the new token and describes nothing"
+        );
+        assert!(
+            matches!(msgs[..], [Msg::Exit(None)]),
+            "then leaves: {msgs:?}"
+        );
+        assert!(!m.login.busy);
     }
 
     #[test]

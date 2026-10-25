@@ -110,7 +110,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "The WireGuard handshake probe cannot run for {{ $labels.profile_id }} (wg missing or unprivileged); only IP presence is checked"
+          summary: "The WireGuard handshake probe cannot run for {{ $labels.profile_id }} (wg missing or unprivileged); while it has torrents to carry, 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
 
       - alert: TorrentdTransferProbeUnavailable
         # Once the transfer probe has failed three polls in a row, and for as
@@ -128,14 +128,14 @@ groups:
       - alert: TorrentdRouteProbeUnavailable
         # While the route probe cannot run (ip missing, denied, or timing out,
         # or the address probe failing so it is never asked) route loss is not
-        # detected, and a route change that sends the tunnel's traffic out the
-        # host route never fences the profile.
+        # detected, but 3 such polls in a row fence the profile
+        # probe_unavailable, well inside this alert's `for`.
         expr: torrentd_profile_vpn_route_probe_ok == 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "The route probe cannot run for {{ $labels.profile_id }}; the tunnel's routing is not being checked, so route loss will not fence it"
+          summary: "The route probe cannot run for {{ $labels.profile_id }}; the tunnel's routing is not being checked, so 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
 
       - alert: TorrentdHandshakeAgeRising
         # The trend before the fence. WireGuard re-handshakes every two
@@ -261,7 +261,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
+          summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed; 3 checks in a row that nft cannot answer fence every vpn profile probe_unavailable until a check finds the kill switch intact"
 
       - alert: TorrentdKillSwitchLeftInstalled
         expr: torrentd_last_shutdown_kill_switch_removal_failed == 1

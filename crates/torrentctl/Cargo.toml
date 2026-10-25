@@ -1,6 +1,6 @@
 [package]
 name = "torrentctl"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -58,6 +58,7 @@ libc = { workspace = true }
 # `test-util` pauses the clock, so a test can show a request outlasting the
 # 15-second request timeout without waiting for it.
 tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

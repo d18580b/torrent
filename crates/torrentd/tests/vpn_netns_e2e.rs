@@ -669,12 +669,16 @@ fn restore_base_rules(flush: &str) {
 ///    and counts `kill_switch_lost_total{outcome="reinstalled"}`, within
 ///    [`WATCH_BOUND`]; until it does, the source bind alone keeps the
 ///    daemon's traffic in the tunnel, and it does;
-/// 2. `ip -6 rule flush`, then `ip rule flush`: the tunnel's routing rules
+/// 2. the tunnel's IPv6 `from <address>` rule deleted alone: the IPv4 route
+///    is still the tunnel's, and the VPN monitor fences the profile
+///    `route_mismatch` on the IPv6 one; the rule put back, setting the
+///    profile online lifts the fence;
+/// 3. `ip -6 rule flush`, then `ip rule flush`: the tunnel's routing rules
 ///    are gone and the host's own put back ([`restore_base_rules`]), so the
 ///    physical link's default routes are live; nothing leaves by them, and
 ///    a datagram from the tunnel's addresses is refused by the kill switch
 ///    ([`assert_only_the_kill_switch_stops`]);
-/// 3. `ip link del wg-e2e`: the tunnel is gone; nothing leaks, and the VPN
+/// 4. `ip link del wg-e2e`: the tunnel is gone; nothing leaks, and the VPN
 ///    monitor fences the profile, which `GET /v1/profiles` reports.
 ///
 /// The faults that leave the tunnel carrying come first, so the daemon is
@@ -791,7 +795,45 @@ fn vpn_netns_e2e_no_leak() {
     });
     peer.assert_no_leak(base, "across `nft flush ruleset` and the reinstall");
 
-    // 2. The routing rules: IPv6's, then IPv4's, each carrying the tunnel's
+    // 2. The tunnel's IPv6 routing rule alone. Its IPv4 route still leaves by
+    //    the tunnel and its address and handshake are healthy, so only the
+    //    route probe from its IPv6 address sees that IPv6 leaves by the
+    //    physical link. Put back, the fence lifts on setting it online.
+    let rule = sh(&format!("ip -6 rule show from {TUNNEL_V6}"));
+    let table = rule
+        .split_whitespace()
+        .skip_while(|t| *t != "lookup")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the tunnel's IPv6 rule names its table: {rule:?}"))
+        .to_string();
+    sh(&format!("ip -6 rule del from {TUNNEL_V6} table {table}"));
+    prompt(ih);
+    poll(
+        "the VPN monitor to fence the profile on its IPv6 route",
+        MONITOR_BOUND,
+        || (listed_status() == "vpn_down").then_some(()),
+    );
+    assert_eq!(
+        metric(&format!(
+            "torrentd_profile_vpn_fenced_total{{profile_id=\"{PROFILE}\",reason=\"route_mismatch\"}}"
+        )),
+        Some(1.0),
+        "fenced as route_mismatch with the IPv6 rule gone",
+    );
+    assert_only_the_kill_switch_stops(&[TUNNEL_V6], "with the tunnel's IPv6 rule gone");
+    peer.assert_no_leak(base, "with the tunnel's IPv6 rule gone");
+    sh(&format!("ip -6 rule add from {TUNNEL_V6} table {table}"));
+    let (code, body) = http(
+        "PATCH",
+        &format!("/v1/profiles/{PROFILE}"),
+        Some("{\"state\":\"online\"}"),
+    );
+    assert_eq!(code, 200, "the fence lifts with the rule back: {body}");
+    poll("the fence to lift", Duration::from_secs(10), || {
+        (listed_status() == "active").then_some(())
+    });
+
+    // 3. The routing rules: IPv6's, then IPv4's, each carrying the tunnel's
     //    `from <tunnel address>` rule. Each flush leaves a source of the
     //    tunnel's routed out of the physical link; IPv4's still goes through
     //    the tunnel until its own rule is flushed.
@@ -808,7 +850,7 @@ fn vpn_netns_e2e_no_leak() {
         peer.assert_no_leak(base, &after);
     }
 
-    // 3. The tunnel itself, and its addresses with it.
+    // 4. The tunnel itself, and its addresses with it.
     sh(&format!("ip link del {WG}"));
     prompt(ih);
     thread::sleep(LEAK_WINDOW);

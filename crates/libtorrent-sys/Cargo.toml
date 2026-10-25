@@ -1,6 +1,6 @@
 [package]
 name = "libtorrent-sys"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -23,7 +23,7 @@ default = ["bundled"]
 # configurations, and `--no-default-features` type-checks the whole workspace.
 bundled = []
 
-# Layer 2: the FFI shim's own tests, in `tests/shim.rs`. Gated because they
+# Layer 2: the FFI shim's own tests, in `tests/shim/`. Gated because they
 # read `.torrent` fixtures out of the vendored libtorrent checkout, so they
 # need the submodule on disk even when a cached native prefix would otherwise
 # make it unnecessary. `mise run test-shim`.

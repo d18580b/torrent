@@ -18,12 +18,12 @@ use kynos::schema::ParamValue;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::Claim;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use tracing::info;
 
 use crate::app_state::AppState;
+use crate::bulk_adopt::in_parallel;
 use crate::http::page::page;
 use crate::http::page::paginate;
 use crate::http::page::InvalidCursor;
@@ -43,8 +43,9 @@ use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
-use crate::pool_service::execute_adopt;
+use crate::pool_service::Adopted;
 use crate::pool_service::PoolService;
+use crate::registry::Claim;
 
 /// The most infohashes one adoption or verification request may name.
 pub const MAX_INFOHASHES: usize = 1000;
@@ -204,6 +205,14 @@ fn hex(infohash: &str) -> Result<InfoHashHex, String> {
 
 fn hexes(infohashes: impl IntoIterator<Item = String>) -> Result<Vec<InfoHashHex>, String> {
     infohashes.into_iter().map(|ih| hex(&ih)).collect()
+}
+
+/// Host paths as the API spells them, as [`RootSummary::path`] does.
+fn lossy(paths: Vec<std::path::PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Validate `infohashes` as a list of 1..=1000 into `invalid`.
@@ -378,8 +387,9 @@ pub struct ScanSummary {
     pub shared: u64,
     /// Complete torrents still carrying drift no verification has cleared.
     pub drifted: u64,
-    /// Entries skipped because they could not be read; the daemon's log names
-    /// each, and `pool_scan_errors_total` counts them by kind.
+    /// Entries skipped because they could not be read, or because they are
+    /// symlinks under a root, which the scan does not follow; the daemon's
+    /// log names each, and `pool_scan_errors_total` counts them by kind.
     pub errors: u64,
 }
 
@@ -446,8 +456,26 @@ pub struct DriftReport {
     pub drifted: Vec<InfoHashHex>,
     /// Claimed files whose size or modification time changed.
     pub files_changed: u64,
-    /// Claimed files that are gone.
+    /// Claimed files that are gone from a root that is present and readable.
     pub files_vanished: u64,
+    /// Claimed files whose stat failed for a reason other than not-found (a
+    /// permission or I/O error). Not evidence of change, so not drift.
+    pub files_unreadable: u64,
+    /// Roots, as absolute paths on the daemon's host, that were missing, not
+    /// listable, or empty though the index holds files under them: what an
+    /// unmounted root looks like. A file not found under one is not counted
+    /// as vanished, so `drifted` says nothing about the payload there.
+    pub unreadable_roots: Vec<String>,
+    /// Directories inside a readable root that a claimed file was not found
+    /// under and that are on another filesystem than the index recorded: the
+    /// mount point of a disk unmounted inside the root. A file not found
+    /// under one is not counted as vanished.
+    pub unmounted_dirs: Vec<String>,
+    /// Torrents this check could not vouch for and found no change in: over
+    /// an unreadable root, under an unmounted directory, or with a file that
+    /// could not be stated. Their state is left alone, so they are neither
+    /// `drifted` nor known unchanged.
+    pub unchecked: Vec<InfoHashHex>,
 }
 
 /// Check adopted and matched payload for drift.
@@ -467,9 +495,7 @@ pub async fn check_pool_drift(
     let guard = s.work.enter();
     let report = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        let roots: std::collections::HashMap<i64, std::path::PathBuf> =
-            pool.roots().iter().cloned().collect();
-        pool.with_store_mut(|st| torrentd_pool::drift::detect(st, |id| roots.get(&id).cloned()))
+        pool.drift_check()
     })
     .await
     .map_err(|e| PoolFailure::Internal {
@@ -482,6 +508,10 @@ pub async fn check_pool_drift(
         drifted: hexes(report.drifted).map_err(|detail| PoolFailure::Internal { detail })?,
         files_changed: report.files_changed,
         files_vanished: report.files_vanished,
+        files_unreadable: report.files_unreadable,
+        unreadable_roots: lossy(report.unreadable_roots),
+        unmounted_dirs: lossy(report.unmounted_dirs),
+        unchecked: hexes(report.unchecked).map_err(|detail| PoolFailure::Internal { detail })?,
     }))
 }
 
@@ -823,6 +853,14 @@ pub struct PoolTorrent {
     /// The directory, relative to its root, the payload was matched at;
     /// `null` when unmatched.
     pub base_rel: Option<String>,
+    /// Why its state is what it is, where the state alone does not say,
+    /// from whichever last set it: a scan's match (for example how many of
+    /// its files are present, that its on-disk stats changed since it was
+    /// verified, that another torrent claims the same files, or that it has
+    /// more than one complete copy, which makes a delete plan refuse to
+    /// touch any of them), or a verification that failed (why its payload
+    /// did not check out). `null` when there is nothing to add.
+    pub note: Option<String>,
     /// The profile that owns it, as the library or an adoption recorded;
     /// `null` when none has.
     pub profile_id: Option<String>,
@@ -882,6 +920,7 @@ pub async fn list_pool_torrents(
             Ok(PoolTorrent {
                 infohash: hex(&t.infohash)?,
                 base_rel: r.base_rel,
+                note: r.note,
                 state: r.state.map(AdoptionState::from),
                 name: t.name,
                 total_size: t.total_size,
@@ -1020,7 +1059,10 @@ from_profile_problem!(AdoptError);
 /// torrent another profile already holds is refused rather than announced from
 /// a second account. A torrent whose previous client left trustworthy resume
 /// data seeds at once (`fast_path`); any other is hashed by libtorrent before
-/// it seeds (`queued_for_verification`). Torrents that are not `matched` are
+/// it seeds (`queued_for_verification`). Each is listed under the path it
+/// took: one planned for the fast path whose resume data turns out unusable,
+/// or whose add the session rejects, is verified instead and listed under
+/// `queued_for_verification`. Torrents that are not `matched` are
 /// refused, each with the reason. `dry_run` reports all of this and adopts
 /// nothing.
 ///
@@ -1063,8 +1105,12 @@ pub async fn adopt_pool_torrents(
     blocking(move || adopt_each(&s, &pool, &req, &profile).map(Json)).await
 }
 
+/// The refusal for a target the drift check before an adopt could not see.
+const UNCHECKED_PAYLOAD: &str = "payload could not be checked for changes since the scan: its root or disk is unreadable or unmounted, or a file could not be stated (the log names it); make it readable, then adopt again";
+
 /// [`adopt_pool_torrents`] past its up-front checks: resolve the targets and
-/// adopt, or refuse, each in turn.
+/// adopt, or refuse, each ([`adopt_one`]), several at once
+/// ([`crate::bulk_adopt`]).
 fn adopt_each(
     s: &AppState,
     pool: &PoolService,
@@ -1082,11 +1128,7 @@ fn adopt_each(
             if pool.root_path_of(*root_id).is_none() {
                 return Err(AdoptError::RootNotFound);
             }
-            let pv = pool
-                .with_store(|st| {
-                    torrentd_pool::adopt::preview(st, *root_id, path, |id| pool.root_path_of(id))
-                })
-                .map_err(fail)?;
+            let pv = pool.adopt_preview(*root_id, path).map_err(fail)?;
             pv.fast_path
                 .into_iter()
                 .chain(pv.verify)
@@ -1117,6 +1159,12 @@ fn adopt_each(
         .map_err(|e| AdoptError::Internal {
             detail: internal("the drift check before adopting", e),
         })?;
+    // What the pass could not see — an unreadable or unmounted root or disk,
+    // or a file it could not stat — it leaves `matched`, which the planner
+    // would fast-path on a claim nobody checked. Refused instead, until the
+    // payload is readable again.
+    let unchecked: std::collections::HashSet<&str> =
+        drift.unchecked.iter().map(String::as_str).collect();
 
     let mut resp = AdoptionResult {
         dry_run: req.dry_run,
@@ -1125,99 +1173,25 @@ fn adopt_each(
         refused: Vec::new(),
         verify_bytes: 0,
     };
-
-    for (ih, infohash) in targets {
-        let refuse = |resp: &mut AdoptionResult, reason: String| {
-            resp.refused.push(RefusedTorrent { infohash, reason });
-        };
-        // Refused, not a 500: by now earlier targets may already be claimed
-        // and loaded, and a failure here must leave the response saying
-        // exactly which. The cause is logged; the reason says only that the
-        // index could not be read for this torrent.
-        let plan = match pool
-            .with_store(|st| torrentd_pool::adopt::plan(st, &ih, |id| pool.root_path_of(id)))
-        {
-            Ok(plan) => plan,
-            Err(e) => {
-                refuse(
-                    &mut resp,
-                    internal("reading the pool index for this torrent", e),
-                );
-                continue;
+    let outcomes = in_parallel(
+        &targets,
+        |(ih, _)| ih.as_str(),
+        |(ih, infohash)| {
+            if unchecked.contains(ih.as_str()) {
+                return Outcome::Refused(UNCHECKED_PAYLOAD.to_owned());
             }
-        };
-
-        // The two adoptable outcomes differ only in which bucket they land in
-        // and whether their bytes are counted, so collapse them: everything
-        // after this point — the registry claim above all — must hold for both,
-        // and holding it in two branches is how it came to hold in neither.
-        let verifies = match plan {
-            torrentd_pool::AdoptPlan::Refuse { reason } => {
-                refuse(&mut resp, reason.to_owned());
-                continue;
+            adopt_one(s, pool, req, profile, ih, *infohash)
+        },
+    );
+    // In the order the targets were named, whichever finished first.
+    for ((_, infohash), outcome) in targets.into_iter().zip(outcomes) {
+        match outcome {
+            Outcome::FastPath => resp.fast_path.push(infohash),
+            Outcome::Queued { bytes } => {
+                resp.verify_bytes += bytes;
+                resp.queued_for_verification.push(infohash);
             }
-            torrentd_pool::AdoptPlan::FastPath { .. } => false,
-            torrentd_pool::AdoptPlan::Verify { .. } => true,
-        };
-
-        // Counted only once it is taken, so a refused torrent's bytes are not.
-        let accept = |resp: &mut AdoptionResult| {
-            if verifies {
-                resp.verify_bytes += pool
-                    .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
-                    .unwrap_or(0);
-            }
-            bucket(resp, verifies).push(infohash);
-        };
-        // Refusals that keep one account's torrent out of another are counted
-        // where every add path counts them — by the adoption, not its dry run,
-        // which changes nothing.
-        let isolation_refused = || {
-            if !req.dry_run {
-                s.metrics.inc_counter(
-                    "profile_assignment_registry_errors_total",
-                    &[("profile_id", profile.as_str())],
-                );
-            }
-        };
-        if let Err(reason) = check_index_owner(pool, &ih, profile) {
-            isolation_refused();
-            refuse(&mut resp, reason);
-            continue;
-        }
-        if req.dry_run {
-            // Everything up to the add, the account-isolation guard included,
-            // so a dry run refuses what the adoption would.
-            match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), true) {
-                Ok(_) => accept(&mut resp),
-                Err(r) => refuse(&mut resp, r.reason),
-            }
-            continue;
-        }
-
-        // Safety Rules 3 and 4, in the order they are written: the registry is
-        // the authority on which profile owns an info-hash, and it is consulted
-        // *before* any session receives the torrent.
-        //
-        // Claiming afterwards could not enforce anything. libtorrent refuses a
-        // duplicate within one session, but a profile is a whole separate
-        // session by construction, so an info-hash already seeding in profile A
-        // was free to be adopted into profile B and start announcing from a
-        // second account — the permanent-ban case Rule 3 exists for — while the
-        // conflict was recorded as a warning after the fact.
-        if let Err(reason) = claim_in_registry(s, infohash, profile) {
-            refuse(&mut resp, reason);
-            continue;
-        }
-        match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), false) {
-            Ok(_) => accept(&mut resp),
-            Err(r) => {
-                release_claim(s, infohash);
-                if r.isolation {
-                    isolation_refused();
-                }
-                refuse(&mut resp, r.reason);
-            }
+            Outcome::Refused(reason) => resp.refused.push(RefusedTorrent { infohash, reason }),
         }
     }
 
@@ -1228,17 +1202,107 @@ fn adopt_each(
         queued = resp.queued_for_verification.len(),
         refused = resp.refused.len(),
         drifted = drift.drifted.len(),
+        unchecked = drift.unchecked.len(),
         "adopt",
     );
     Ok(resp)
 }
 
-/// Which result bucket an adopted torrent belongs in.
-fn bucket(resp: &mut AdoptionResult, verifies: bool) -> &mut Vec<InfoHashHex> {
-    if verifies {
-        &mut resp.queued_for_verification
-    } else {
-        &mut resp.fast_path
+/// What [`adopt_one`] did with one target, and so where the response lists it.
+#[derive(Debug)]
+enum Outcome {
+    FastPath,
+    /// Queued to be hashed: `bytes` is what verifying it reads.
+    Queued {
+        bytes: u64,
+    },
+    Refused(String),
+}
+
+/// Adopt, or refuse, one target past the drift check: the steps
+/// `POST /v1/pool/adoptions` takes for each torrent, in order.
+fn adopt_one(
+    s: &AppState,
+    pool: &PoolService,
+    req: &AdoptRequest,
+    profile: &ProfileId,
+    ih: &str,
+    infohash: InfoHashHex,
+) -> Outcome {
+    // Refused, not a 500: by now other targets may already be claimed and
+    // loaded, and a failure here must leave the response saying exactly
+    // which. The cause is logged; the reason says only that the index could
+    // not be read for this torrent.
+    let plan = match pool.adopt_plan(ih) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return Outcome::Refused(internal("reading the pool index for this torrent", e));
+        }
+    };
+
+    // The plan is read here only to refuse before the registry claim: the
+    // two adoptable plans take the same steps below — the claim above all
+    // — and holding them in two branches is how they came to hold in
+    // neither. Which bucket a torrent lands in is not the plan's to say: a
+    // fast-path plan falls back to verification where its resume data
+    // will not do, so it is what `PoolService::adopt` did.
+    if let torrentd_pool::AdoptPlan::Refuse { reason } = plan {
+        return Outcome::Refused(reason.to_owned());
+    }
+
+    // Counted only once it is taken, so a refused torrent's bytes are not.
+    let accept = |adopted: Adopted| match adopted {
+        Adopted::FastPath => Outcome::FastPath,
+        Adopted::QueuedForVerification => Outcome::Queued {
+            bytes: pool.total_size(ih),
+        },
+    };
+    // Refusals that keep one account's torrent out of another are counted
+    // where every add path counts them — by the adoption, not its dry run,
+    // which changes nothing.
+    let isolation_refused = || {
+        if !req.dry_run {
+            s.metrics.inc_counter(
+                "profile_assignment_registry_errors_total",
+                &[("profile_id", profile.as_str())],
+            );
+        }
+    };
+    if let Err(reason) = check_index_owner(pool, ih, profile) {
+        isolation_refused();
+        return Outcome::Refused(reason);
+    }
+    if req.dry_run {
+        // Everything up to the add, the account-isolation guard included,
+        // so a dry run refuses what the adoption would.
+        return match pool.adopt(&s.source, &s.profiles, ih, profile.clone(), true) {
+            Ok(adopted) => accept(adopted),
+            Err(r) => Outcome::Refused(r.reason),
+        };
+    }
+
+    // Safety Rules 3 and 4, in the order they are written: the registry is
+    // the authority on which profile owns an info-hash, and it is consulted
+    // *before* any session receives the torrent.
+    //
+    // Claiming afterwards could not enforce anything. libtorrent refuses a
+    // duplicate within one session, but a profile is a whole separate
+    // session by construction, so an info-hash already seeding in profile A
+    // was free to be adopted into profile B and start announcing from a
+    // second account — the permanent-ban case Rule 3 exists for — while the
+    // conflict was recorded as a warning after the fact.
+    if let Err(reason) = claim_in_registry(s, infohash, profile) {
+        return Outcome::Refused(reason);
+    }
+    match pool.adopt(&s.source, &s.profiles, ih, profile.clone(), false) {
+        Ok(adopted) => accept(adopted),
+        Err(r) => {
+            release_claim(s, infohash);
+            if r.isolation {
+                isolation_refused();
+            }
+            Outcome::Refused(r.reason)
+        }
     }
 }
 
@@ -1287,7 +1351,7 @@ fn claim_in_registry(
 /// `DELETE /v1/torrents/{infohash}` clears the record, so it never outlasts
 /// the torrent it describes.
 fn check_index_owner(pool: &PoolService, ih: &str, profile: &ProfileId) -> Result<(), String> {
-    match pool.with_store(|st| st.profile_of(ih)) {
+    match pool.index_owner(ih) {
         Ok(Some(owner)) if owner != profile.as_str() => Err(format!(
             "the pool index assigns this torrent to profile {owner}"
         )),
@@ -1967,22 +2031,12 @@ fn create_plan_blocking(
         detail: internal("creating a plan", e),
     };
 
-    let built = pool
-        .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
-        .map_err(|e| fail(&e))?;
-    let steps = match built {
-        Ok(steps) => steps,
+    let id = match pool.create_plan(&spec).map_err(|e| fail(&e))? {
+        Ok(id) => id,
         // A refusal is the expected outcome for overlap, drift, or an occupied
         // destination — a 409 with the reason, not a 500.
         Err(refused) => return Err(CreatePlanError::PlanRefused(refused.to_string())),
     };
-
-    let spec_json = serde_json::to_string(&spec).map_err(|e| fail(&e))?;
-    let id = pool
-        .with_store(|st| st.create_plan(kind, &spec_json, now_secs()))
-        .map_err(|e| fail(&e))?;
-    pool.with_store_mut(|st| st.add_plan_steps(id, &steps))
-        .map_err(|e| fail(&e))?;
 
     let plan = load_plan(pool, id)
         .map_err(|detail| CreatePlanError::Internal { detail })?
@@ -2167,8 +2221,12 @@ pub enum DeletePlanError {
     #[error("no such plan")]
     #[problem(status = 404, title = "Plan not found")]
     PlanNotFound,
-    /// The plan is mid-apply.
-    #[error("plan is mid-apply; it will be resumed rather than discarded")]
+    /// The plan is `applying`: an apply is running it, or a crash left it
+    /// for the next boot to re-drive.
+    #[error(
+        "plan is applying; discard it once it is applied or failed (a plan a crash left \
+         applying is re-driven at the next boot)"
+    )]
     #[problem(status = 409, title = "The plan is being applied")]
     PlanApplying,
     /// The pool index failed; the daemon's log has the cause.
@@ -2180,8 +2238,13 @@ pub enum DeletePlanError {
 /// Discard a mutation plan.
 ///
 /// Removes the plan and its steps, whatever it did. Nothing on disk changes:
-/// discarding an applied plan does not undo it. A plan mid-apply is refused —
-/// startup resumes it rather than losing track of half a change.
+/// discarding an applied plan does not undo it. A plan in `applying` is
+/// refused with `409`, decided in the same statement as the delete, so no
+/// apply can claim the plan in between: an apply is running it now, or a
+/// crash left it, and the next boot re-drives it to `applied`, or to `failed`
+/// when the re-drive refuses it. Either can then be discarded. With
+/// `[pool] allow_mutations` off at boot the re-drive does not run, and the
+/// plan stays `applying` until it is turned back on.
 #[kynos::delete("/pool/plans/{plan_id}", tag = Pool)]
 pub async fn delete_plan(
     _caller: Scoped<Bearer, Write>,
@@ -2192,19 +2255,16 @@ pub async fn delete_plan(
     let fail = |e: torrentd_pool::PoolError| DeletePlanError::Internal {
         detail: internal("discarding a plan", e),
     };
-    // On the blocking pool, and on the writer for the read as well as the
-    // delete: the status that refuses a plan mid-apply must be the one the
-    // delete acts on.
+    // One conditional statement on the writer: the status that refuses a plan
+    // mid-apply is the one the delete acts on, with no window for an apply to
+    // claim the plan between a read and the delete.
     blocking(move || {
-        let Some(plan) = pool.with_store(|st| st.plan(p.plan_id)).map_err(fail)? else {
-            return Err(DeletePlanError::PlanNotFound);
-        };
-        if plan.status == torrentd_pool::model::plan_status::APPLYING {
-            return Err(DeletePlanError::PlanApplying);
+        use torrentd_pool::store::PlanDelete;
+        match pool.discard_plan(p.plan_id).map_err(fail)? {
+            PlanDelete::Deleted => Ok(NoContent),
+            PlanDelete::NotFound => Err(DeletePlanError::PlanNotFound),
+            PlanDelete::Applying => Err(DeletePlanError::PlanApplying),
         }
-        pool.with_store_mut(|st| st.delete_plan(p.plan_id))
-            .map_err(fail)?;
-        Ok(NoContent)
     })
     .await
 }
@@ -2229,8 +2289,10 @@ pub struct ApplyOutcome {
     pub failed: u32,
     /// Steps already done by an earlier apply, and not repeated.
     pub skipped: u32,
-    /// Where the plan stands now: `applied`, or `failed` when a step failed —
-    /// the plan's steps then show which, and why.
+    /// Where the plan stands now: `applied`; `failed` when a step failed —
+    /// the plan's steps then show which, and why; or `applying` when a
+    /// daemon shutdown stopped the apply between steps, which the next boot
+    /// re-drives.
     pub status: PlanStatus,
 }
 
@@ -2337,12 +2399,7 @@ pub async fn apply_plan(
         let writer = Arc::clone(&pool);
         let expected = blocking(move || {
             writer
-                .with_store(|st| -> Result<_, torrentd_pool::PoolError> {
-                    Ok((st.plan_steps(id)?, st.index_generation()?))
-                })
-                .map(|(steps, generation)| {
-                    torrentd_pool::plan::confirm_token(id, generation, &steps)
-                })
+                .confirm_token(id)
                 .map_err(|e| internal("reading a plan", e))
         })
         .await
@@ -2363,7 +2420,7 @@ pub async fn apply_plan(
     let guard = work.enter();
     let outcome = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        crate::pool_apply::apply(&worker, &source, &state, id, &|| work.is_cancelled())
+        crate::apply::apply(&worker, &source, &state, id, &|| work.is_cancelled())
     })
     .await
     .map_err(|e| ApplyPlanError::Internal {
@@ -2390,13 +2447,6 @@ pub async fn apply_plan(
             _ => Err(ApplyPlanError::ApplyFailed(reason)),
         },
     }
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Operations that take no request body.

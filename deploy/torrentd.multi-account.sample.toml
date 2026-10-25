@@ -177,3 +177,12 @@ port_forward_gateway    = "10.2.0.1"
 peer_fingerprint        = "-DE211s-"
 user_agent              = "Deluge/2.1.1 libtorrent/2.0.14.0"
 allowed_tracker_domains = ["tracker-b.example.com"]
+
+# An account behind OpenVPN is a third `[[profile]]` of the same shape, with
+# `vpn_type = "openvpn"`, `vpn_config` naming the provider's `.ovpn` and
+# `vpn_interface` a `tun` device name. It is not written out here: the kill
+# switch is refused beside an OpenVPN profile, and this file's two accounts
+# keep the option of moving into a daemon of their own with the switch on, as
+# the kill-switch note above describes. deploy/torrentd.sample.toml has the
+# example, commented, with the two ways it differs: no kill switch beside it,
+# and a NAT-PMP gateway that has to be written.

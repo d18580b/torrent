@@ -1,4 +1,8 @@
+use std::path::Path;
+
 use super::*;
+use crate::model::PlanStep;
+use crate::model::PoolError;
 
 /// The daemon and a CLI `pool check` may write side by side; a CLI
 /// `pool scan` may not run beside either, and nothing opens beside it.
@@ -53,6 +57,7 @@ fn a_lock_file_that_cannot_be_written_still_locks() {
     drop(PoolStore::open(&db).unwrap());
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
     if bypasses_permissions(&lock) {
+        crate::scan::permissions_do_not_bind("a lock file this user may not write");
         return;
     }
 
@@ -96,6 +101,7 @@ fn the_lock_file_is_left_readable_and_an_unreadable_one_is_skipped() {
 
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
     if bypasses_permissions(&lock) {
+        crate::scan::permissions_do_not_bind("a lock file this user may not write");
         return;
     }
     let store = PoolStore::open(&db).expect("an unreadable lock file does not refuse the open");
@@ -186,4 +192,15 @@ fn a_file_store_runs_wal_with_synchronous_full() {
         .pragma_query_value(None, "synchronous", |r| r.get(0))
         .unwrap();
     assert_eq!(sync, 2, "synchronous must be FULL");
+}
+
+/// The matcher, drift, adoption and the planners all key a torrent's file
+/// by this one join, so a path one of them resolves is the path the others
+/// resolve: trimmed of `/` at either end, a backslash kept as part of a name.
+#[test]
+fn join_rel_trims_slashes_and_keeps_backslashes() {
+    assert_eq!(join_rel("", "a/b.bin"), "a/b.bin");
+    assert_eq!(join_rel("/", "/a/b.bin/"), "a/b.bin");
+    assert_eq!(join_rel("/x/y/", "b.bin"), "x/y/b.bin");
+    assert_eq!(join_rel("d\\e", "f\\g.bin"), "d\\e/f\\g.bin");
 }

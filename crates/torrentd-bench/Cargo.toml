@@ -1,11 +1,11 @@
 [package]
 name = "torrentd-bench"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Layer 4 soak / load harness for torrentd (memory scaling, alert throughput, startup time)."
+description = "Layer 4 load harness for torrentd (alert throughput, memory scaling, startup time, pool scan/match/adopt preview at scale), held to budgets.toml."
 publish = false
 
 [[bin]]
@@ -14,8 +14,16 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
-torrentd-engine = { path = "../torrentd-engine" }
-libtorrent-safe = { path = "../libtorrent-safe" }
+# budgets.toml, compiled in.
+serde = { workspace = true }
+# `pool-adopt` reads the daemon's JSON responses.
+serde_json = { workspace = true }
+toml = { workspace = true }
+# The synthetic pool is built in a temporary directory removed afterwards.
+tempfile = { workspace = true }
+torrentd-engine = { workspace = true }
+torrentd-pool = { workspace = true }
+libtorrent-safe = { workspace = true }
 
 [lints]
 workspace = true

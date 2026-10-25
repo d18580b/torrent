@@ -3,8 +3,10 @@
 //! The Prometheus implementation lives in the `torrentd` binary so this
 //! crate doesn't pull in the `prometheus` crate and its compile-time
 //! cost into every Layer 1 unit test. Tests use `RecordingSink` which
-//! captures every call for assertion.
+//! captures every call for assertion; it and `MetricCall` exist only in
+//! this crate's tests and under the `test-support` feature.
 
+#[cfg(any(test, feature = "test-support"))]
 use parking_lot::Mutex;
 
 /// Deletes of a removed torrent's files that failed, by `profile_id` and by
@@ -51,6 +53,7 @@ impl MetricsSink for NoopSink {
     fn observe_histogram(&self, _: &str, _: f64, _: &[(&str, &str)]) {}
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub enum MetricCall {
     IncCounter {
@@ -74,11 +77,13 @@ pub enum MetricCall {
     },
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct RecordingSink {
     calls: Mutex<Vec<MetricCall>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl RecordingSink {
     pub fn new() -> Self {
         Self::default()
@@ -101,6 +106,7 @@ impl RecordingSink {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn own_labels(labels: &[(&str, &str)]) -> Vec<(String, String)> {
     labels
         .iter()
@@ -108,6 +114,7 @@ fn own_labels(labels: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MetricsSink for RecordingSink {
     fn inc_counter(&self, name: &str, labels: &[(&str, &str)]) {
         self.calls.lock().push(MetricCall::IncCounter {

@@ -5,9 +5,9 @@
 //! and those carry exactly the migration hints worth having: where the payload
 //! actually lives, and how the operator had it organised.
 //!
-//! Scope is deliberately tiny: read strings, flat lists of strings, and lists
-//! of those (libtorrent's `trackers` tiers) at the **top level** of one
-//! bencoded dict, and give up on anything unexpected. This is
+//! Scope is deliberately tiny: read strings, integers, flat lists of strings,
+//! and lists of those (libtorrent's `trackers` tiers) at the **top level**
+//! of one bencoded dict, and give up on anything unexpected. This is
 //! not a general bencode implementation and must never grow into one — in
 //! particular it is never used to compute an info-hash, which stays in
 //! libtorrent so the daemon cannot disagree with itself about a torrent's
@@ -29,6 +29,11 @@ pub struct ResumeHints {
     /// claims completion depends on the torrent's piece count, which only the
     /// `.torrent` holds: see [`ResumeHints::is_complete`].
     pub bitfield: Option<Bitfield>,
+    /// libtorrent's `seed_mode`, set to a non-zero integer: the torrent was
+    /// added as a seed (qBittorrent's "skip hash check") and libtorrent had
+    /// not yet hashed every piece when it wrote this. Its bitfield then marks
+    /// every piece had without anyone having checked one.
+    pub seed_mode: bool,
     /// libtorrent's `mapped_files`: a file the previous client renamed, by
     /// index into the torrent's file list. `None` where it kept the name.
     pub mapped_files: Vec<Option<String>>,
@@ -111,9 +116,16 @@ impl ResumeHints {
     /// bitfield with exactly one entry per piece, every one of them set: a
     /// shorter one says nothing about the pieces it leaves out, and a longer
     /// one was written for some other torrent.
+    ///
+    /// Resume data in `seed_mode` is never complete, whatever its bitfield
+    /// says: libtorrent writes every piece of a torrent added as a seed as
+    /// had before checking any, so the bitfield is the claim of whoever added
+    /// it, not of a hash check.
     pub fn is_complete(&self, num_pieces: u64) -> bool {
-        self.bitfield
-            .is_some_and(|b| num_pieces > 0 && b.len as u64 == num_pieces && b.all_had)
+        !self.seed_mode
+            && self
+                .bitfield
+                .is_some_and(|b| num_pieces > 0 && b.len as u64 == num_pieces && b.all_had)
     }
 
     /// The on-disk paths for a torrent whose `.torrent` lists `paths` under
@@ -121,9 +133,9 @@ impl ResumeHints {
     ///
     /// `mapped_files` wins: it is what the client actually did. Failing it,
     /// `qBt-contentLayout` is applied the way qBittorrent applies it —
-    /// `NoSubfolder` drops a multi-file torrent's top directory, `Subfolder`
-    /// puts a single file inside a directory named after it without its
-    /// extension.
+    /// `NoSubfolder` drops the top directory of a torrent in multi-file mode,
+    /// even one holding a single file, and `Subfolder` puts a single-file
+    /// torrent's file inside a directory named after it without its extension.
     pub fn relayout(&self, paths: &[String], name: &str) -> Option<Relayout> {
         if self.mapped_files.iter().any(Option::is_some) || self.mapped_files_unreadable > 0 {
             let mut rejected = self.mapped_files_unreadable;
@@ -151,16 +163,14 @@ impl ResumeHints {
         }
         let in_name_dir = |p: &String| p.split_once('/').is_some_and(|(top, _)| top == name);
         match self.content_layout.as_deref() {
-            Some("NoSubfolder") if paths.len() > 1 && paths.iter().all(in_name_dir) => {
-                Some(Relayout {
-                    paths: paths
-                        .iter()
-                        .map(|p| p.split_once('/').map_or(p.clone(), |(_, r)| r.to_owned()))
-                        .collect(),
-                    in_resume_data: false,
-                    rejected: 0,
-                })
-            }
+            Some("NoSubfolder") if paths.iter().all(in_name_dir) => Some(Relayout {
+                paths: paths
+                    .iter()
+                    .map(|p| p.split_once('/').map_or(p.clone(), |(_, r)| r.to_owned()))
+                    .collect(),
+                in_resume_data: false,
+                rejected: 0,
+            }),
             Some("Subfolder") if paths.len() == 1 && !paths[0].contains('/') => {
                 let stem = Path::new(&paths[0])
                     .file_stem()
@@ -198,11 +208,13 @@ fn normalised_relative(p: &str) -> Option<String> {
 }
 
 /// The hints in the `.fastresume` at `path`, or why there are none: a file
-/// that cannot be read, or that is not a bencoded dictionary. A caller holding
-/// hints from an earlier read keeps them on an error, rather than taking it
-/// for a sidecar that holds none.
+/// that cannot be read or is larger than
+/// [`MAX_LIBRARY_FILE_BYTES`](crate::scan::MAX_LIBRARY_FILE_BYTES), or that is
+/// not a bencoded dictionary. A caller holding hints from an earlier read
+/// keeps them on an error, rather than taking it for a sidecar that holds
+/// none.
 pub fn read_hints(path: &Path) -> Result<ResumeHints, SidecarError> {
-    let bytes = std::fs::read(path)?;
+    let bytes = crate::scan::read_capped(path)?;
     parse_hints(&bytes).ok_or(SidecarError::Parse)
 }
 
@@ -231,16 +243,18 @@ pub fn parse_hints(bytes: &[u8]) -> Option<ResumeHints> {
         .unwrap_or_default();
 
     // Completion is read from the `pieces` bitfield — one byte per piece, the
-    // low bit set for a piece the client had — and nothing else.
+    // low bit set for a piece the client had — and vetoed by `seed_mode`.
     //
-    // `seed_mode` is not completion: libtorrent sets it for a torrent *added*
-    // as a seed, whose pieces nobody has checked yet, which is the opposite of
-    // the claim this flag would stand in for. `qBt-seedStatus` is
-    // qBittorrent's own idea of what it was doing, not a statement about the
-    // pieces. Absent a bitfield, or with any piece missing from it,
-    // completion is unknown and adoption takes the verifying path. How many
-    // entries the bitfield has is kept too: only the `.torrent` knows how
-    // many it needs.
+    // `seed_mode` is the opposite of completion: libtorrent sets it for a
+    // torrent *added* as a seed (qBittorrent's "skip hash check"), whose
+    // pieces nobody has checked yet, and writes every one of them as had
+    // all the same. Such a torrent is hashed, never fast-pathed.
+    // `qBt-seedStatus` is qBittorrent's own idea of what it was doing, not a
+    // statement about the pieces, and is ignored. Absent a bitfield, or with
+    // any piece missing from it, completion is unknown and adoption takes
+    // the verifying path. How many entries the bitfield has is kept too:
+    // only the `.torrent` knows how many it needs.
+    let seed_mode = matches!(top.get("seed_mode"), Some(Value::Int(n)) if *n != 0);
     let bitfield = match top.get("pieces") {
         Some(Value::Str(bits)) => Some(Bitfield {
             len: bits.len(),
@@ -289,6 +303,7 @@ pub fn parse_hints(bytes: &[u8]) -> Option<ResumeHints> {
         category: get_str("qBt-category").filter(|s| !s.is_empty()),
         tags,
         bitfield,
+        seed_mode,
         mapped_files,
         mapped_files_unreadable,
         content_layout: get_str("qBt-contentLayout").filter(|s| !s.is_empty()),
@@ -299,6 +314,8 @@ pub fn parse_hints(bytes: &[u8]) -> Option<ResumeHints> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Value {
     Str(Vec<u8>),
+    /// An integer — `seed_mode` is the one read.
+    Int(i64),
     /// A list of strings — `mapped_files` is the one read.
     List(Vec<Vec<u8>>),
     /// A list of lists of strings — `trackers`, by tier.
@@ -375,14 +392,13 @@ impl Parser<'_> {
                 while self.peek()? != b'e' {
                     self.i += 1;
                 }
-                // Validated, so a malformed integer still fails the parse;
-                // no integer key is read any more.
-                let _: i64 = std::str::from_utf8(&self.b[start..self.i])
+                // Validated, so a malformed integer still fails the parse.
+                let n: i64 = std::str::from_utf8(&self.b[start..self.i])
                     .ok()?
                     .parse()
                     .ok()?;
                 self.i += 1; // consume 'e'
-                Some(Value::Skipped)
+                Some(Value::Int(n))
             }
             b'0'..=b'9' => self.read_bytes().map(Value::Str),
             b'l' => {
@@ -535,6 +551,36 @@ mod tests {
         }
         v.push(b'e');
         v
+    }
+
+    /// Issue #652: qBittorrent's "skip hash check" adds a torrent in
+    /// libtorrent's `seed_mode`, whose resume data marks every piece had
+    /// although none was checked. A bitfield of exactly the right length,
+    /// every entry had, is still not complete beside `seed_mode=1`, so the
+    /// torrent is hashed; `seed_mode=0` leaves the bitfield's claim standing.
+    #[test]
+    fn seed_mode_is_never_complete_whatever_the_bitfield_says() {
+        let all_had = bbytes(&[1, 1, 1, 1]);
+        let h = parse_hints(&bdict(&[
+            ("pieces", all_had.clone()),
+            ("seed_mode", bint(1)),
+        ]))
+        .unwrap();
+        assert!(h.seed_mode);
+        assert_eq!(
+            h.bitfield,
+            Some(Bitfield {
+                len: 4,
+                all_had: true
+            })
+        );
+        assert!(!h.is_complete(4));
+        let h = parse_hints(&bdict(&[("pieces", all_had), ("seed_mode", bint(0))])).unwrap();
+        assert!(!h.seed_mode);
+        assert!(h.is_complete(4));
+        // Only an integer is libtorrent's flag.
+        let b = bdict(&[("pieces", bbytes(&[1])), ("seed_mode", bstr("1"))]);
+        assert!(parse_hints(&b).unwrap().is_complete(1));
     }
 
     #[test]
@@ -779,6 +825,40 @@ mod tests {
         assert_eq!(layout("Original").relayout(&multi, "Show"), None);
         assert_eq!(layout("NoSubfolder").relayout(&single, "Film"), None);
         assert_eq!(ResumeHints::default().relayout(&multi, "Show"), None);
+        // A torrent whose files already sit in a top directory gets no
+        // second one: qBittorrent adds a subfolder only where there is none.
+        assert_eq!(layout("Subfolder").relayout(&multi, "Show"), None);
+        let one_in_dir = vec!["Show/a.mkv".to_owned()];
+        assert_eq!(layout("Subfolder").relayout(&one_in_dir, "Show"), None);
+    }
+
+    #[test]
+    fn no_subfolder_drops_the_top_directory_of_a_one_file_multi_file_torrent() {
+        // Multi-file mode with one file: qBittorrent still drops `Show/`.
+        let one = vec!["Show/a.mkv".to_owned()];
+        let layout = ResumeHints {
+            content_layout: Some("NoSubfolder".to_owned()),
+            ..ResumeHints::default()
+        };
+        let r = layout.relayout(&one, "Show").unwrap();
+        assert_eq!(r.paths, ["a.mkv"]);
+        assert!(!r.in_resume_data);
+        assert_eq!(r.rejected, 0);
+
+        // Every path must sit under `name/`: one that does not keeps the
+        // layout as it is, for one file or several.
+        assert_eq!(layout.relayout(&["Other/a.mkv".to_owned()], "Show"), None);
+        let mixed: Vec<String> = ["Show/a.mkv", "Other/b.mkv"].map(String::from).to_vec();
+        assert_eq!(layout.relayout(&mixed, "Show"), None);
+
+        // `Subfolder` applies only to a single-file torrent: several files
+        // without a directory are not one, and get none.
+        let subfolder = ResumeHints {
+            content_layout: Some("Subfolder".to_owned()),
+            ..ResumeHints::default()
+        };
+        let flat: Vec<String> = ["a.mkv", "b.mkv"].map(String::from).to_vec();
+        assert_eq!(subfolder.relayout(&flat, "Show"), None);
     }
 
     #[test]
@@ -861,5 +941,197 @@ mod tests {
         let h = parse_hints(&b).unwrap();
         assert_eq!(h.save_path, None);
         assert_eq!(h.category, None);
+    }
+
+    mod props {
+        use std::path::Component;
+
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Bytes shaped like bencode: its tokens, lengths that may or may
+        /// not fit, and anything else.
+        fn bencode_soup() -> impl Strategy<Value = Vec<u8>> {
+            let token = prop_oneof![
+                prop::sample::select(vec![
+                    &b"d"[..],
+                    b"l",
+                    b"e",
+                    b"i",
+                    b"0:",
+                    b"1:",
+                    b"4:",
+                    b"999:",
+                    b"18446744073709551616:",
+                    b"i-1e",
+                    b"6:pieces",
+                    b"12:mapped_files",
+                    b"8:trackers",
+                    b"12:qBt-savePath",
+                ])
+                .prop_map(<[u8]>::to_vec),
+                prop::collection::vec(any::<u8>(), 0..6),
+            ];
+            prop::collection::vec(token, 0..24).prop_map(|t| t.concat())
+        }
+
+        /// A string a hint keeps as written: not empty.
+        fn text() -> impl Strategy<Value = String> {
+            ".{1,16}"
+        }
+
+        prop_compose! {
+            /// Hints in the shape a reading of them takes: nothing empty, no
+            /// tag with a comma or surrounding space, no URL with a NUL.
+            fn hints()(
+                save_path in prop::option::of(text()),
+                category in prop::option::of(text()),
+                tags in prop::collection::vec("[a-zA-Z0-9_-]{1,8}", 0..4),
+                pieces in prop::option::of(prop::collection::vec(any::<u8>(), 0..12)),
+                seed_mode in any::<bool>(),
+                mapped_files in prop::collection::vec(prop::option::of(text()), 0..5),
+                content_layout in prop::option::of(text()),
+                trackers in prop::collection::vec(
+                    prop::collection::vec("[^\u{0}]{1,24}", 1..3),
+                    0..3,
+                ),
+            ) -> (ResumeHints, Option<Vec<u8>>) {
+                let bitfield = pieces.as_ref().map(|bits| Bitfield {
+                    len: bits.len(),
+                    all_had: bits.iter().all(|b| b & 1 == 1),
+                });
+                (
+                    ResumeHints {
+                        save_path,
+                        category,
+                        tags,
+                        bitfield,
+                        seed_mode,
+                        mapped_files,
+                        mapped_files_unreadable: 0,
+                        content_layout,
+                        trackers,
+                    },
+                    pieces,
+                )
+            }
+        }
+
+        /// `hints` as a `.fastresume` writes them.
+        fn encode(hints: &ResumeHints, pieces: &Option<Vec<u8>>) -> Vec<u8> {
+            let mut entries: Vec<(&str, Vec<u8>)> = vec![("qBt-seedStatus", bint(1))];
+            let mut opt = |key, v: &Option<String>| {
+                if let Some(v) = v {
+                    entries.push((key, bstr(v)));
+                }
+            };
+            opt("qBt-savePath", &hints.save_path);
+            opt("qBt-category", &hints.category);
+            opt("qBt-contentLayout", &hints.content_layout);
+            if !hints.tags.is_empty() {
+                entries.push(("qBt-tags", bstr(&hints.tags.join(", "))));
+            }
+            if let Some(bits) = pieces {
+                entries.push(("pieces", bbytes(bits)));
+            }
+            entries.push(("seed_mode", bint(i64::from(hints.seed_mode))));
+            let mapped: Vec<&str> = hints
+                .mapped_files
+                .iter()
+                .map(|m| m.as_deref().unwrap_or(""))
+                .collect();
+            entries.push(("mapped_files", blist(&mapped)));
+            entries.push(("nested", bdict(&[("x", blist(&["y"]))])));
+            let tiers: Vec<Vec<&str>> = hints
+                .trackers
+                .iter()
+                .map(|t| t.iter().map(String::as_str).collect())
+                .collect();
+            let tiers: Vec<&[&str]> = tiers.iter().map(Vec::as_slice).collect();
+            entries.push(("trackers", btiers(&tiers)));
+            bdict(&entries)
+        }
+
+        /// A mapped path made of plain names, traversals, roots, empties and
+        /// Windows separators.
+        fn mapped_path() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop::sample::select(vec!["a", "b.mkv", "..", ".", "", "/", "\\", "C:"]),
+                0..5,
+            )
+            .prop_map(|parts| parts.join("/"))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Whatever a sidecar holds, reading it answers.
+            #[test]
+            fn reading_any_bytes_never_panics(
+                bytes in prop_oneof![bencode_soup(), prop::collection::vec(any::<u8>(), 0..64)],
+            ) {
+                let _ = parse_hints(&bytes);
+            }
+
+            /// Hints written as a `.fastresume` writes them read back as
+            /// they were, beside keys and nested values the reader skips.
+            #[test]
+            fn hints_round_trip((hints, pieces) in hints()) {
+                prop_assert_eq!(parse_hints(&encode(&hints, &pieces)), Some(hints));
+            }
+
+            /// Every path a relayout takes from `mapped_files` is relative
+            /// and made of plain names only; a mapped path that is not is
+            /// left at the `.torrent`'s path and counted as refused.
+            #[test]
+            fn a_relayout_takes_only_plain_relative_paths(
+                paths in prop::collection::vec("[a-z]{1,4}(/[a-z]{1,4}){0,2}", 0..5),
+                mapped in prop::collection::vec(prop::option::of(mapped_path()), 0..6),
+                unreadable in 0usize..3,
+                name in "[a-z]{1,4}",
+            ) {
+                let hints = ResumeHints {
+                    mapped_files: mapped.clone(),
+                    mapped_files_unreadable: unreadable,
+                    ..ResumeHints::default()
+                };
+                let Some(out) = hints.relayout(&paths, &name) else {
+                    prop_assert!(unreadable == 0 && mapped.iter().all(Option::is_none));
+                    return Ok(());
+                };
+                prop_assert!(out.in_resume_data);
+                prop_assert_eq!(out.paths.len(), paths.len());
+                // The plain names a path holds, or `None` where it holds
+                // anything else (a root, a `..`, a leading `.`) or nothing.
+                let names = |p: &str| -> Option<Vec<String>> {
+                    let parts: Option<Vec<String>> = Path::new(p)
+                        .components()
+                        .map(|c| match c {
+                            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                            _ => None,
+                        })
+                        .collect();
+                    parts.filter(|p| !p.is_empty())
+                };
+                let mut refused = 0;
+                for (i, (got, was)) in out.paths.iter().zip(&paths).enumerate() {
+                    match mapped.get(i).cloned().flatten() {
+                        Some(m) => match names(&m.replace('\\', "/")) {
+                            Some(want) => {
+                                prop_assert_eq!(names(got), Some(want), "{:?} from {:?}", got, m);
+                                prop_assert_eq!(got, &names(got).unwrap().join("/"));
+                            }
+                            None => {
+                                refused += 1;
+                                prop_assert_eq!(got, was, "{:?} from {:?}", got, m);
+                            }
+                        },
+                        None => prop_assert_eq!(got, was),
+                    }
+                }
+                prop_assert_eq!(out.rejected, unreadable + refused);
+            }
+        }
     }
 }

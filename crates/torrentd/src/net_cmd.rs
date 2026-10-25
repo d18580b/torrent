@@ -31,7 +31,10 @@
 //!
 //! Idempotent: a second run, or a run after a graceful shutdown, finds nothing
 //! and succeeds. It refuses while a daemon holds the state directory's
-//! single-instance lock, since everything it would remove is that daemon's.
+//! single-instance lock, since everything it would remove is that daemon's,
+//! and while a daemon of the table's uid on any state directory holds that
+//! uid's table lock (`vpn::killswitch::TableLock`), since the table is then
+//! that daemon's kill switch, in force.
 
 use std::collections::HashSet;
 use std::io;
@@ -41,7 +44,7 @@ use anyhow::Context;
 use tracing::info;
 
 use crate::config::Config;
-use crate::startup::InstanceLock;
+use crate::instance_lock::InstanceLock;
 use crate::vpn;
 use crate::vpn::ReleasedOpenvpn;
 use crate::vpn::ReleasedWireguard;
@@ -70,7 +73,8 @@ pub fn cleanup(cfg: &Config) -> anyhow::Result<()> {
             .map(|m| std::os::unix::fs::MetadataExt::uid(&m)),
     );
     let table = uid.map_or_else(vpn::killswitch::own_table_name, vpn::killswitch::table_name);
-    cleanup_with(net_admin, &cfg.instance_lock_path(), || {
+    let table_lock = || uid.map(vpn::killswitch::TableLock::acquire).transpose();
+    cleanup_with(net_admin, &cfg.instance_lock_path(), table_lock, || {
         run_steps(
             || vpn::release_recorded_wireguard(&state_dir, |_| false),
             || {
@@ -103,10 +107,14 @@ fn kill_switch_uid(euid: Option<u32>, state_dir_owner: Option<u32>) -> Option<u3
 }
 
 /// [`cleanup`] with the host calls handed in: `net_admin` is what
-/// [`holds_net_admin`] read, and `steps` is [`run_steps`] over the real host.
+/// [`holds_net_admin`] read, `table_lock` takes the table's uid's
+/// [`vpn::killswitch::TableLock`] (`None` where that uid is unknown, and the
+/// table step fails on its own), and `steps` is [`run_steps`] over the real
+/// host.
 fn cleanup_with(
     net_admin: Option<bool>,
     lock_path: &Path,
+    table_lock: impl FnOnce() -> io::Result<Option<vpn::killswitch::TableLock>>,
     steps: impl FnOnce() -> Vec<String>,
 ) -> anyhow::Result<()> {
     // Without CAP_NET_ADMIN there is nothing to do and nothing that could be
@@ -124,6 +132,12 @@ fn cleanup_with(
 
     let _lock = InstanceLock::acquire(lock_path).context(
         "net-cleanup refuses while a daemon runs: everything it would remove is that daemon's",
+    )?;
+    // The state directory's lock is not the table's: a daemon of the same
+    // uid on another state directory owns the very table this would remove.
+    let _table_lock = table_lock().context(
+        "net-cleanup refuses while a daemon of this uid runs: the kill-switch table it would \
+         remove is that daemon's",
     )?;
 
     let failures = steps();
@@ -359,8 +373,19 @@ mod tests {
     fn without_cap_net_admin_nothing_runs_and_it_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("state").join("torrentd.lock");
-        cleanup_with(Some(false), &lock, || panic!("no step runs without it")).unwrap();
+        cleanup_with(
+            Some(false),
+            &lock,
+            || panic!("no table lock is taken without it"),
+            || panic!("no step runs without it"),
+        )
+        .unwrap();
         assert!(!lock.exists(), "the lock is not even taken");
+    }
+
+    /// No table lock to take: the table's uid is unknown.
+    fn no_table_lock() -> io::Result<Option<vpn::killswitch::TableLock>> {
+        Ok(None)
     }
 
     /// While a daemon holds the state directory's lock it refuses, and runs
@@ -370,13 +395,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("torrentd.lock");
         let _daemon = InstanceLock::acquire(&lock).unwrap();
-        let err = cleanup_with(Some(true), &lock, || {
-            panic!("no step runs under a live daemon")
-        })
+        let err = cleanup_with(
+            Some(true),
+            &lock,
+            || panic!("the state directory's lock refuses first"),
+            || panic!("no step runs under a live daemon"),
+        )
         .expect_err("a held lock refuses");
         assert!(
             format!("{err:#}").contains("refuses while a daemon runs"),
             "got: {err:#}"
+        );
+    }
+
+    /// While a daemon of the table's uid holds its table lock, from another
+    /// state directory, it refuses and runs no step: the table is that
+    /// daemon's kill switch, in force.
+    #[test]
+    fn a_held_table_lock_refuses_before_any_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("torrentd.lock");
+        let name = format!("torrentd_ks_test_{}_net_cleanup", std::process::id());
+        let _daemon = vpn::killswitch::TableLock::acquire_named(&name).unwrap();
+        let err = cleanup_with(
+            Some(true),
+            &lock,
+            || vpn::killswitch::TableLock::acquire_named(&name).map(Some),
+            || panic!("no step runs under a live daemon of this uid"),
+        )
+        .expect_err("a held table lock refuses");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refuses while a daemon of this uid runs"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("(pid {})", std::process::id())),
+            "the refusal names the holder: {msg}"
         );
     }
 
@@ -386,7 +441,7 @@ mod tests {
     fn failed_steps_fail_the_run_naming_each() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("torrentd.lock");
-        let err = cleanup_with(Some(true), &lock, || {
+        let err = cleanup_with(Some(true), &lock, no_table_lock, || {
             vec!["step one broke".to_string(), "step two broke".to_string()]
         })
         .expect_err("a failed step fails the run");
@@ -395,7 +450,7 @@ mod tests {
         assert!(msg.contains("step one broke; step two broke"), "got: {msg}");
 
         let ran = std::cell::Cell::new(false);
-        cleanup_with(None, &lock, || {
+        cleanup_with(None, &lock, no_table_lock, || {
             ran.set(true);
             vec![]
         })

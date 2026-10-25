@@ -2,13 +2,21 @@
  * alert_union.h — discriminated payload struct for lt_pop_alert.
  *
  * The payload is a tagged union: the `kind` discriminant (lt_alert_kind from
- * libtorrent_shim.h) selects which variant in `payload` is live. Variants
- * use fixed-size character buffers (LT_PATH_MAX, LT_MSG_MAX) for short
- * strings — if the source string is longer, it is truncated and NUL
- * terminated. Variants that carry bulk data (resume buffers, stats counter
+ * libtorrent_shim.h) selects which variant in `payload` is live. Every
+ * string a variant carries is an lt_str on the heap, sized to its text, so
+ * the union itself stays small: the shim queues a whole libtorrent pop of
+ * these by value, and fixed-size buffers made each one ~3.2 KB whatever it
+ * held. Each lt_str field is capped by the capacity lt_str's comment below
+ * names for it (LT_PATH_MAX, LT_MSG_MAX, LT_OP_MAX or LT_ADDR_MAX, trailing
+ * NUL included) — a longer source string is cut at the last whole UTF-8
+ * sequence that fits.
+ * Variants that carry bulk data (resume buffers, metadata, stats counter
  * arrays, torrent_status arrays) or a path a decision rests on (the
- * storage_moved save path) hold heap-allocated pointers; the caller
- * must invoke lt_alert_payload_free() exactly once after consumption.
+ * storage_moved save path, never cut) hold heap-allocated pointers too. The
+ * union's size is pinned by a static_assert in shim_alerts.cpp. The
+ * caller must call lt_alert_payload_free() on every popped alert, whatever
+ * its kind, before it discards the union; a second call is harmless, because
+ * the first nulls what it frees.
  */
 #ifndef LIBTORRENT_SHIM_ALERT_UNION_H
 #define LIBTORRENT_SHIM_ALERT_UNION_H
@@ -18,15 +26,25 @@
 
 #include "libtorrent_shim.h"
 
+/* libtorrent_shim.h closes its own `extern "C"` block before it ends, so a
+ * C++ translation unit needs this header to open one for the declarations
+ * below. A C one needs nothing. */
 #ifdef __cplusplus
 extern "C" {
-#else
-/* Re-open the C linkage block opened in libtorrent_shim.h since the
- * function declarations below need to be `extern "C"` from C++ TUs. */
 #endif
 
 /* String capacities (LT_PATH_MAX, LT_MSG_MAX, …) come from libtorrent_shim.h,
  * included above. */
+
+/* A string an alert carries: `len` bytes of text at `ptr`, then a NUL, on the
+ * heap and freed by lt_alert_payload_free. An empty string is `ptr` NULL and
+ * `len` 0. `len` stays below the field's capacity: LT_MSG_MAX for every
+ * `message`, LT_PATH_MAX for `filename`, `path` and `tracker_url`, LT_OP_MAX
+ * for `operation`, and LT_ADDR_MAX for `endpoint` and `iface`. */
+struct lt_str {
+    char*  ptr;
+    size_t len;
+};
 
 /* ------------------------------------------------------------------ */
 /* state_update_alert payload                                          */
@@ -72,7 +90,7 @@ struct lt_alert_resume_failed {
     int32_t  error_code;
     uint8_t  not_modified;          /* 1 iff the failure was 'resume_data_not_modified' */
     uint8_t  _pad[3];
-    char     message[LT_MSG_MAX];
+    struct lt_str message;
 };
 
 /* ------------------------------------------------------------------ */
@@ -81,15 +99,15 @@ struct lt_alert_resume_failed {
 
 struct lt_alert_torrent_error {
     int32_t error_code;
-    char    filename[LT_PATH_MAX];
-    char    message[LT_MSG_MAX];
+    struct lt_str   filename;
+    struct lt_str   message;
 };
 
 struct lt_alert_file_error {
     int32_t error_code;
-    char    filename[LT_PATH_MAX];
-    char    operation[LT_OP_MAX];
-    char    message[LT_MSG_MAX];
+    struct lt_str   filename;
+    struct lt_str   operation;
+    struct lt_str   message;
 };
 
 struct lt_alert_hash_failed {
@@ -107,14 +125,14 @@ struct lt_alert_metadata_received {
 
 struct lt_alert_listen_failed {
     int32_t error_code;
-    char    operation[LT_OP_MAX];
-    char    endpoint[LT_ADDR_MAX];
-    char    iface[LT_ADDR_MAX];     /* `interface` is a Win32 reserved word */
-    char    message[LT_MSG_MAX];
+    struct lt_str   operation;
+    struct lt_str   endpoint;
+    struct lt_str   iface;     /* `interface` is a Win32 reserved word */
+    struct lt_str   message;
 };
 
 struct lt_alert_listen_succeeded {
-    char    endpoint[LT_ADDR_MAX];
+    struct lt_str   endpoint;
 };
 
 struct lt_alert_session_stats {
@@ -153,8 +171,8 @@ struct lt_alert_tracker_error {
     uint8_t aborted;
     uint8_t _pad[3];
     int32_t times_in_row;
-    char    tracker_url[LT_PATH_MAX];
-    char    message[LT_MSG_MAX];
+    struct lt_str   tracker_url;
+    struct lt_str   message;
 };
 
 /* Shared by tracker_warning, scrape_failed, portmap_error, udp_error,
@@ -165,11 +183,11 @@ struct lt_alert_tracker_error {
 struct lt_alert_warning {
     int32_t error_code;
     int32_t warning_code;
-    char    message[LT_MSG_MAX];
+    struct lt_str   message;
 };
 
 struct lt_alert_log {
-    char    message[LT_MSG_MAX];
+    struct lt_str   message;
 };
 
 /* ------------------------------------------------------------------ */
@@ -187,9 +205,9 @@ struct lt_alert_storage_moved {
 
 struct lt_alert_storage_moved_failed {
     int32_t error_code;
-    char    operation[LT_OP_MAX];
-    char    path[LT_PATH_MAX];
-    char    message[LT_MSG_MAX];
+    struct lt_str   operation;
+    struct lt_str   path;
+    struct lt_str   message;
 };
 
 /* Empty payload markers (kept for layout symmetry). */
@@ -198,7 +216,7 @@ struct lt_alert_torrent_checked  { int32_t _empty; };
 struct lt_alert_torrent_removed  { int32_t _empty; };
 struct lt_alert_add_torrent {
     int32_t error_code;       /* 0 on success */
-    char    message[LT_MSG_MAX];
+    struct lt_str   message;
 };
 
 /* ------------------------------------------------------------------ */
@@ -251,7 +269,11 @@ struct lt_alert_union {
 /* ------------------------------------------------------------------ */
 
 /* Pop one alert from the session.
- * Returns 1 if an alert was written to *out, 0 if the queue is empty.
+ * Returns 1 if an alert was written to *out, 0 if the queue is empty or an
+ * argument is null. When the shim's own queue is empty this pops and
+ * translates libtorrent's pending alerts first, outside any lock, so two
+ * calls on one session must never run concurrently (see "Thread model" in
+ * libtorrent_shim.h).
  * After consuming an alert, the caller MUST call lt_alert_payload_free(out)
  * to release any heap-allocated payload (resume data, stats counters, etc.)
  * regardless of whether the payload was inspected.
@@ -262,8 +284,9 @@ int  lt_pop_alert(lt_session* s, struct lt_alert_union* out);
  * safe to call on a zero-initialized union. */
 void lt_alert_payload_free(struct lt_alert_union* u);
 
-/* Every torrent's status, read from the session now. `statuses` is
- * heap-allocated; release the whole struct with lt_status_list_free(). */
+/* Every torrent's status, read from the session now. `statuses` is a
+ * heap-allocated array of `count` views, NULL when the session holds no
+ * torrent; release the whole struct with lt_status_list_free(). */
 struct lt_status_list {
     struct lt_torrent_status_view* statuses;
     size_t count;

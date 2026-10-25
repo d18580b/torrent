@@ -6,13 +6,25 @@
 #
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
-#   mise run fmt|fmt-fix|lint|lint-fix|test|check
-#   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
-#   mise run openapi|openapi-check|test-fault-injection|deny
-#   mise run lint-tracing|size-check|container|commit-lint <file-or-range>
+#   mise run fmt|fmt-fix|lint|lint-fix|test|check|msrv|rustfmt-toolchain
+#   mise run test-shim|test-shim-asan|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
+#   mise run openapi|openapi-check|test-fault-injection|release-features|deny
+#   mise run lint-tracing|lint-workflows|size-check|container|commit-lint <file-or-range>
+#   mise run dist|dist-musl
+#   mise run unit-check [unit]
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
+#   mise run drill-alerts|drill-udp-transport|drill-listener-replies
+#   mise run drill-ipv6-egress|drill-natpmp-fence
+#   mise run drill-route-fence <iface> [profile_id]
 #   mise run bench -- <subcommand>
+#   mise run mutants <crate> [--file <glob>]... [-- <cargo-mutants flags>]
+#   mise run mutants-diff [base]|mutants-shard <k/n>|mutants-netns
+
+# The oldest mise these tasks are run on: the version CI pins in
+# .github/actions/setup-rust. An older mise refuses this file rather than
+# running the tasks with behaviour nothing here was tested against.
+min_version = "2026.10.17"
 
 [tools]
 hk = "1.48.0"
@@ -22,6 +34,18 @@ hk = "1.48.0"
 # Supply-chain policy (deny.toml): advisories, licenses, bans, sources. The
 # cargo backend fetches the prebuilt binary through cargo-binstall.
 "cargo:cargo-deny" = "0.20.2"
+# Mutation testing (the mutants tasks below, .cargo/mutants.toml). Prebuilt
+# through cargo-binstall like the two above.
+"cargo:cargo-mutants" = "27.1.0"
+# Releases (release-plz.toml, .github/workflows/release-plz.yml). The release
+# workflow runs this exact release, and so does a local `release-plz update`.
+"aqua:release-plz/release-plz" = "0.4.1"
+# The workflow lint (`lint-workflows`): actionlint checks every workflow and
+# runs shellcheck over each `run:` script, and zizmor audits them for
+# injection, credential and permission mistakes.
+"aqua:rhysd/actionlint" = "1.7.12"
+"aqua:koalaman/shellcheck" = "0.11.0"
+"aqua:zizmorcore/zizmor" = "1.31.1"
 # pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
 # Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
 
@@ -36,14 +60,23 @@ jobs = 1
 [env]
 # Nightly is used ONLY for rustfmt: granular import normalization
 # (imports_granularity / group_imports in rustfmt.toml) is an unstable feature.
-# Everything else builds/lints/tests on the pinned stable toolchain.
-RUSTFMT_TOOLCHAIN = "nightly"
+# Everything else builds/lints/tests on the stable release rust-toolchain.toml
+# pins. A dated nightly, not `nightly`, so a rustfmt change cannot reformat the
+# tree or fail `fmt` without a commit here; this is its only definition, and
+# `setup`, `rustfmt-toolchain`, `fmt` and `fmt-fix` all read it.
+RUSTFMT_TOOLCHAIN = "nightly-2026-10-22"
 # Warnings are errors everywhere a mise task builds, locally exactly as in CI,
 # so a warning fails a hook or a local `mise run test` instead of first
 # surfacing as a red CI run. It replaces, rather than extends, a RUSTFLAGS the
 # shell exports: one value means one build cache shared by every task, and a
 # developer's own codegen flags belong in a cargo config, not in RUSTFLAGS.
 RUSTFLAGS = "-D warnings"
+# The files whose decisive tests need a real kernel network stack (the
+# `#[ignore]`d nft and live-link tests test-netns runs). mutants-netns mutates
+# exactly these, inside a network namespace with the ignored tests included;
+# mutants-shard leaves them out, so no mutant is reported by two runs that
+# consulted different tests.
+TORRENTD_MUTANTS_NETNS = "crates/torrentd/src/vpn/killswitch.rs crates/torrentd/src/vpn/wireguard.rs"
 
 [tasks.fmt]
 description = "Check formatting (nightly rustfmt)"
@@ -107,6 +140,20 @@ fi
 description = "Fail on source files over 2689 lines not in .size-baseline, and on stale baseline entries"
 run = "scripts/size-check"
 
+# deploy/torrentd.service: systemd parses it, it keeps the ExecStopPost=
+# net-cleanup, RestartPreventExitStatus=78 and capability lines its safety
+# rests on, and the built torrentd accepts the subcommand ExecStopPost= runs.
+# Needs systemd-analyze. deploy/check-unit.sh lists every refusal.
+[tasks.unit-check]
+description = "Verify deploy/torrentd.service (or the unit given) and its directives against the built torrentd"
+usage = '''
+arg "[unit]" default="deploy/torrentd.service" help="The unit file to check"
+'''
+run = [
+  "cargo build -p torrentd",
+  'deploy/check-unit.sh "$usage_unit"',
+]
+
 # Conventional Commits, checked by the convco [tools] pins. The commit-msg hook
 # passes the message file git wrote; CI passes a pull request's BASE..HEAD
 # range, which backstops the hook against `--no-verify`.
@@ -126,10 +173,12 @@ fi
 '''
 
 # deploy/Containerfile's stages. The build context needs the vendor submodules,
-# so run this from a recursive checkout.
+# so run this from a recursive checkout. `--format docker` keeps the
+# Containerfile's HEALTHCHECK: podman's default OCI format has no field for it,
+# and podman drops it with a warning.
 [tasks.container]
 description = "Build the container image from deploy/Containerfile (needs podman and the vendor submodules)"
-run = "podman build -f deploy/Containerfile -t torrentd:dev ."
+run = "podman build --format docker -f deploy/Containerfile -t torrentd:dev ."
 
 [tasks.test]
 description = "Workspace tests (default features; parity with CI)"
@@ -143,13 +192,25 @@ run = "cargo test --workspace"
 description = "Layer 2: FFI shim tests (needs the vendored libtorrent fixtures)"
 run = "cargo test -p libtorrent-sys --features shim-tests"
 
+# The shim's buffer-ownership cases again, in a C++ binary built with
+# AddressSanitizer against an instrumented libtorrent, since test-shim cannot
+# run under it (crates/libtorrent-sys/tests/asan/run.sh says why). Needs
+# clang with its ASan runtime; the first run builds that libtorrent into the
+# native cache root, which native-clean empties.
+[tasks.test-shim-asan]
+description = "Layer 2 under ASan: the shim's buffer ownership, with LeakSanitizer (needs clang)"
+run = "crates/libtorrent-sys/tests/asan/run.sh"
+
 [tasks.test-lifecycle]
 description = "Layer 3: real libtorrent sessions against real disk (no network)"
 run = "cargo test -p torrentd-engine --test lifecycle -- --ignored"
 
+# One test at a time, here and in test-torrentctl: every daemon they spawn
+# runs as this user, and a daemon holds its uid's kill-switch table lock
+# (`@torrentd_ks_<uid>`) for its life, so a second one beside it exits 78.
 [tasks.test-daemon]
 description = "Layer 3: spawns the built binary and drives it over HTTP"
-run = "cargo test -p torrentd --test daemon -- --ignored"
+run = "cargo test -p torrentd --test daemon -- --ignored --test-threads=1"
 
 # The spargen-generated client torrentctl is built on, against a real daemon:
 # the other half of the contract, a second tool's reading of the document held
@@ -158,7 +219,7 @@ run = "cargo test -p torrentd --test daemon -- --ignored"
 description = "Layer 3: torrentctl's generated client against a spawned daemon"
 run = [
   "cargo build -p torrentd",
-  "cargo test -p torrentctl --test e2e -- --ignored",
+  "cargo test -p torrentctl --test e2e -- --ignored --test-threads=1",
 ]
 
 # Every test that needs a real kernel network stack: the kill switch's real
@@ -196,13 +257,28 @@ description = "promtool: check deploy/prometheus's alert rules and run their fix
 # Prometheus release, which no registry mise resolves packages as a tool, and
 # the pinned image is the exact binary a deployment's Prometheus evaluates the
 # rules with. `:Z` relabels the mount for SELinux hosts; docker ignores it
-# elsewhere.
+# elsewhere. The image, tag and digest are read from deploy/drill/compose.yaml,
+# the one place they are written, so the release promtool checks the rules
+# with is the release the drill's Prometheus evaluates them with.
 run = '''
 set -eu
 engine=$(command -v podman || command -v docker)
+image=$(sed -n 's|^ *image: *\(docker\.io/prom/prometheus:[^ ]*\) *$|\1|p' deploy/drill/compose.yaml)
+case "$image" in
+  *"
+"*)
+    echo "::error::more than one docker.io/prom/prometheus image in deploy/drill/compose.yaml"
+    exit 1
+    ;;
+  *@sha256:*) ;;
+  *)
+    echo "::error::no digest-pinned docker.io/prom/prometheus image in deploy/drill/compose.yaml"
+    exit 1
+    ;;
+esac
 promtool() {
   "$engine" run --rm -v "$PWD/deploy/prometheus:/w:ro,Z" -w /w \
-    --entrypoint promtool docker.io/prom/prometheus:v3.5.0 "$@"
+    --entrypoint promtool "$image" "$@"
 }
 promtool check rules torrentd.rules.yml
 promtool test rules torrentd.rules.test.yml
@@ -222,6 +298,7 @@ run = [
   "mise run test",
   "mise run test-fault-injection",
   "mise run test-shim",
+  "mise run test-shim-asan",
   "mise run test-lifecycle",
   "mise run test-daemon",
   "mise run test-torrentctl",
@@ -230,8 +307,156 @@ run = [
 ]
 
 [tasks.bench]
-description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM). --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
-run = "cargo run --release -p torrentd-bench --"
+description = "Layer 4: alert throughput, memory per torrent, startup time, and the pool's scan, match, adopt preview and adoption through a running daemon; every budgeted one fails on a breach of crates/torrentd-bench/budgets.toml. CI's bench job runs it at --size ci; the default pool size, full, takes minutes. --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having. torrentd is built in release first, beside the bench, for pool-adopt to run."
+run = "cargo build --release -p torrentd && cargo run --release -p torrentd-bench --"
+
+# Mutation testing: cargo-mutants changes the code one mutant at a time and
+# reports each one no test failed on (`missed`). It builds every mutant in a
+# copy of the tree outside this checkout, and in that copy libtorrent-sys's
+# build script cannot name the vendored libtorrent: the copy has no `.git`, so
+# it falls back to hashing marker files that are absent whenever the vendor
+# submodules are (CI on a native-cache hit), misses the cached prefix, and
+# tries to build libtorrent from sources that are not there. Every task below
+# therefore hands the copy LIBTORRENT_SYS_PREFIX (CONTRIBUTING.md, Build),
+# which skips that lookup and links the prefix this checkout already uses.
+# Settings every run shares are in .cargo/mutants.toml; results land in
+# target/mutants.out.
+#
+# The prefix variable wants libtorrent and Boost under one directory, and the
+# cache keeps them side by side (`lt-<key>/libtorrent`, `lt-<key>/boost`), so
+# this links the two into target/mutants-native/lt-<key> and writes that path
+# to target/mutants-native/prefix. The prefix is whichever one
+# `cargo build -p libtorrent-sys` resolves here, provisioning it if need be;
+# its link-search line names it. A LIBTORRENT_SYS_PREFIX already in the
+# environment (a system libtorrent) is used as it is.
+[tasks.mutants-native]
+description = "Link the cached libtorrent prefix where the mutants tasks hand it to cargo-mutants' copies"
+hide = true
+run = '''
+set -eu
+out="$PWD/target/mutants-native"
+mkdir -p "$out"
+if [ -n "${LIBTORRENT_SYS_PREFIX:-}" ]; then
+  printf '%s\n' "$LIBTORRENT_SYS_PREFIX" > "$out/prefix"
+  exit 0
+fi
+libdir=$(cargo build -p libtorrent-sys --message-format=json-render-diagnostics \
+  | grep -o '"native=[^"]*/lt-[0-9a-f]*/libtorrent/lib[0-9]*"' | head -n 1 | tr -d '"')
+libdir=${libdir#native=}
+if [ -z "$libdir" ]; then
+  echo "::error::cargo build -p libtorrent-sys named no lt-<key> prefix"
+  exit 1
+fi
+lt=${libdir%/libtorrent/*}
+prefix="$out/$(basename "$lt")"
+rm -rf "$prefix"
+mkdir -p "$prefix/include"
+ln -s "$lt/libtorrent/include/libtorrent" "$prefix/include/libtorrent"
+ln -s "$lt/boost/include/boost" "$prefix/include/boost"
+ln -s "$libdir" "$prefix/$(basename "$libdir")"
+printf '%s\n' "$prefix" > "$out/prefix"
+'''
+
+# One crate, or the files in it that --file names. Flags after `--` go to
+# cargo-mutants, e.g. `-- --list`, `-- --shard 0/8` or `-- --iterate`; mise
+# consumes one `--` itself, so arguments for cargo test or the test binary go
+# through cargo-mutants' own --cargo-test-arg rather than a further `--`.
+#
+#   mise run mutants torrentd --file crates/torrentd/src/auth.rs
+#   mise run mutants torrentd-pool -- --list
+[tasks.mutants]
+description = "cargo-mutants over one crate, or the files in it --file names"
+depends = ["mutants-native"]
+usage = '''
+arg "<crate>" help="The workspace package whose code is mutated, e.g. torrentd"
+flag "-f --file <glob>" var=#true help="Mutate only files this glob matches (repeatable); a glob containing a slash matches the whole path"
+arg "[flags]" var=#true required=#false help="Further cargo-mutants flags, after --"
+'''
+run = '''
+set -eu
+# mise shell-quotes each value (vpn-check says why `eval set --` is the
+# form that round-trips it); each glob becomes a `--file GLOB` pair.
+eval "set -- ${usage_file:-}"
+n=$#
+for glob do
+  set -- "$@" --file "$glob"
+done
+shift "$n"
+eval "set -- \"\$@\" ${usage_flags:-}"
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) \
+  cargo mutants --package "$usage_crate" --output target "$@"
+'''
+
+# The mutants in the Rust lines a branch changes, across the workspace: what
+# the pull-request job runs. The diff runs from the merge base to the working
+# tree, so uncommitted edits count. With no Rust line changed it builds
+# nothing and exits 0.
+[tasks.mutants-diff]
+description = "cargo-mutants over the Rust lines changed since a base ref, less the netns files"
+usage = '''
+arg "[base]" default="origin/master" help="The ref the change is measured from (its merge base with the working tree)"
+'''
+run = '''
+set -eu
+mkdir -p target
+git diff --merge-base "$usage_base" -- '*.rs' > target/mutants.diff
+if [ ! -s target/mutants.diff ]; then
+  echo "no Rust line changed since $usage_base; nothing to mutate"
+  exit 0
+fi
+mise run mutants-native
+set --
+for f in $TORRENTD_MUTANTS_NETNS; do
+  set -- "$@" --exclude "$f"
+done
+# The pull-request job gives this 12 minutes, so a mutant that hangs the
+# tests is cut off at twice the baseline's test time (at least 30 seconds)
+# rather than cargo-mutants' default five times, and the rest still run.
+# --timeout would set one fixed cap instead, but it caps the unmutated
+# baseline's tests too and fails the whole run when they outlast it.
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) \
+  cargo mutants --workspace --in-diff target/mutants.diff --output target \
+  --timeout-multiplier 2 --minimum-test-timeout 30 "$@"
+'''
+
+# One shard of every mutant in the workspace: the nightly job's unit.
+[tasks.mutants-shard]
+description = "One shard (k/n, k from 0) of cargo-mutants over the whole workspace, less the netns files"
+depends = ["mutants-native"]
+usage = '''
+arg "<shard>" help="k/n: shard k, counted from 0, of n, e.g. 0/8"
+'''
+run = '''
+set -eu
+set --
+for f in $TORRENTD_MUTANTS_NETNS; do
+  set -- "$@" --exclude "$f"
+done
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) \
+  cargo mutants --workspace --shard "$usage_shard" --output target "$@"
+'''
+
+# The netns files, each mutant tested by the binary's tests in their modules
+# with the ignored ones included, inside a user and network namespace as
+# test-netns's first namespace runs them: same host needs, and the same skip
+# of the live-link test that has to run as a uid other than 0. Crates are
+# fetched before entering the namespace, which has no network.
+[tasks.mutants-netns]
+description = "cargo-mutants over the kill switch and WireGuard, with their real-kernel tests, in a network namespace"
+depends = ["mutants-native"]
+run = '''
+set -eu
+cargo fetch --locked
+set --
+for f in $TORRENTD_MUTANTS_NETNS; do
+  set -- "$@" --file "$f"
+done
+LIBTORRENT_SYS_PREFIX=$(cat target/mutants-native/prefix) CARGO_NET_OFFLINE=true \
+  unshare --user --map-root-user --net -- \
+  cargo mutants --package torrentd --output target "$@" \
+  -- --bin torrentd -- --include-ignored --test-threads=1 \
+  --skip live_link_the_kill_switch killswitch:: wireguard::
+'''
 
 # The HTTP API's OpenAPI document, derived from the handlers by kynos and
 # committed so a change to the contract shows up in review. `openapi-check` is
@@ -254,12 +479,68 @@ run = [
 description = "Run torrentd's tests in the fault-injection build"
 run = "cargo test -p torrentd --features fault-injection"
 
+# The features the shipped build resolves: deploy/Containerfile's
+# `cargo build --release --workspace --bin torrentd` with no extra features,
+# which is every workspace member's normal and build dependencies unified.
+# `fault-injection` (and the engine's `test-support` doubles it pulls in) must
+# be off there; a member that depended on torrentd or the engine with either
+# on would turn them on for the release build too. Reads `cargo metadata`;
+# builds nothing.
+[tasks.release-features]
+description = "Fail if the release build resolves fault-injection or test-support on"
+run = '''
+set -eu
+tree=$(cargo tree --locked --workspace -e normal,build --prefix none -f '{p} [{f}]')
+leaks=$(printf '%s\n' "$tree" \
+  | grep -E '^torrentd(-engine)? v.*\[([^]]*,)?(fault-injection|test-support)(,[^]]*)?\]' \
+  | sort -u || true)
+if [ -n "$leaks" ]; then
+  echo "::error::the release build resolves a test-only feature on:"
+  printf '%s\n' "$leaks"
+  exit 1
+fi
+printf '%s\n' "$tree" | grep -E '^torrentd(-engine)? v' | sort -u
+'''
+
 # The dependency policy in deny.toml: RustSec advisories, licenses, duplicate
 # and wildcard bans, and allowed sources. Reads Cargo.lock and the advisory
 # database; builds nothing.
 [tasks.deny]
 description = "cargo-deny: advisories, licenses, bans and sources (deny.toml)"
 run = "cargo deny check"
+
+# The release tarballs .github/workflows/release-plz.yml publishes, built the
+# same way locally. `dist` is the glibc build of both binaries, by the command
+# release-features models (no extra features, the whole workspace's feature
+# set unified), so that check runs first; `dist-musl` is a static torrentctl
+# and needs musl-gcc (Debian/Ubuntu `musl-tools`, Fedora `musl-gcc`) for
+# ring's C. scripts/dist checks each binary's version, against RELEASE_TAG
+# too when that is set, and packages it into target/dist/.
+[tasks.dist]
+description = "Build and package the x86_64 glibc release tarball (torrentd + torrentctl) into target/dist/"
+run = [
+  "mise run release-features",
+  "cargo build --release --locked --workspace --bin torrentd --bin torrentctl",
+  "scripts/dist gnu",
+]
+
+[tasks.dist-musl]
+description = "Build and package the static x86_64 musl torrentctl tarball into target/dist/ (needs musl-gcc)"
+run = [
+  "rustup target add x86_64-unknown-linux-musl",
+  "cargo build --release --locked -p torrentctl --target x86_64-unknown-linux-musl",
+  "scripts/dist musl",
+]
+
+# Every workflow and composite action: actionlint (with shellcheck over each
+# `run:` script) and zizmor's offline audits, configured by
+# .github/zizmor.yml. Offline, so it needs no token and reads nothing remote.
+[tasks.lint-workflows]
+description = "actionlint and zizmor over .github/"
+run = [
+  "actionlint",
+  "zizmor --offline .github",
+]
 
 # Live verification against real VPN credentials. Deliberately separate from
 # every `test` task: it needs a real host with real tunnels, it is the one
@@ -289,6 +570,51 @@ run = '''
 # mise's own quoting, which is the only form that round-trips both.
 eval "set -- $usage_flags"
 cargo run --quiet -p torrentd -- --config "$usage_config" vpn check "$@"
+'''
+
+# The drills in deploy/drill, one task per script; each script's header says
+# what it needs, does and exits with. None is part of `test-all`: the alert
+# drill takes minutes and a container engine, and route-fence changes the
+# host's routing. The namespace drills render the kill switch with, or run,
+# target/debug/torrentd, so they build it first; `cargo build` is a no-op when
+# it is current, and the drill then runs this checkout's daemon, not an older
+# build's.
+[tasks.drill-alerts]
+description = "Alert-delivery drill: faults in a real daemon, each alert checked at a webhook (needs podman or docker)"
+run = "deploy/drill/run.sh"
+
+[tasks.drill-udp-transport]
+description = "Namespace drill: nothing but the tunnel's transport leaves through the kill switch's udp sport exemption"
+run = ["cargo build -p torrentd", "deploy/drill/udp-transport.sh"]
+
+[tasks.drill-listener-replies]
+description = "Namespace drill: what the host answers a neighbour's probes with by the physical link under the kill switch"
+run = ["cargo build -p torrentd", "deploy/drill/listener-replies.sh"]
+
+[tasks.drill-ipv6-egress]
+description = "Namespace drill: none of the daemon's IPv6 leaves by the physical link under the kill switch"
+run = ["cargo build -p torrentd", "deploy/drill/ipv6-egress.sh"]
+
+[tasks.drill-natpmp-fence]
+description = "Namespace drill: a fence landing mid NAT-PMP renewal is not followed by a rebind"
+run = ["cargo build -p torrentd", "deploy/drill/natpmp-fence.sh target/debug/torrentd"]
+
+# On a scratch host with a running daemon, as root: it deletes a tunnel's
+# `from <address>` rules and does not put them back (docs/running.md §11).
+# Run through sudo when not root, keeping the variables the script reads.
+[tasks.drill-route-fence]
+description = "Route-fence drill: delete a tunnel's source rules and expect its profile fenced (root; changes the host)"
+usage = '''
+arg "<iface>" help="The tunnel's interface"
+arg "[profile_id]" help="The vpn profile the tunnel belongs to; PROFILE_ID when omitted"
+'''
+run = '''
+set -eu
+set -- deploy/drill/route-fence.sh "$usage_iface" ${usage_profile_id:+"$usage_profile_id"}
+if [ "$(id -u)" = 0 ]; then
+  exec "$@"
+fi
+exec sudo --preserve-env=PROFILE_ID,METRICS_URL,METRICS_TOKEN,POLL_SECS,GRACE_SECS -- "$@"
 '''
 
 # `depends` here, not the sequential `run` list `test-all` uses: mise schedules
@@ -336,6 +662,36 @@ run = 'rm -rf "${LIBTORRENT_SYS_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torre
 [tasks.setup]
 description = "One-time dev setup: nightly rustfmt toolchain + activate git hooks"
 run = [
-  "rustup toolchain install nightly --profile minimal --component rustfmt",
+  "mise run rustfmt-toolchain",
   "hk install",
 ]
+
+# Also what CI's fmt job runs, so the job and a developer install the same
+# nightly from the one RUSTFMT_TOOLCHAIN above. Rerun after that value moves.
+[tasks.rustfmt-toolchain]
+description = "Install the dated nightly toolchain rustfmt runs on"
+run = "rustup toolchain install $RUSTFMT_TOOLCHAIN --profile minimal --component rustfmt"
+
+# The workspace's `rust-version` is a claim that it builds on that release;
+# rust-toolchain.toml pins a newer one, so nothing else ever compiles there.
+# The version is read from Cargo.toml rather than copied, so moving the MSRV is
+# one edit (plus clippy.toml's `msrv`, which must match it). `cargo +VERSION`
+# overrides rust-toolchain.toml. RUSTFLAGS from [env] applies, so a warning
+# only that release reports fails this too.
+[tasks.msrv]
+description = "Check the workspace and its tests compile on the MSRV (rust-version)"
+run = '''
+set -eu
+msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+if [ -z "$msrv" ]; then
+  echo "::error::no rust-version in Cargo.toml"
+  exit 1
+fi
+clippy_msrv=$(sed -n 's/^msrv = "\(.*\)"$/\1/p' clippy.toml)
+if [ "$clippy_msrv" != "$msrv" ]; then
+  echo "::error::clippy.toml msrv ($clippy_msrv) must equal Cargo.toml rust-version ($msrv)"
+  exit 1
+fi
+rustup toolchain install "$msrv" --profile minimal
+cargo "+$msrv" check --workspace --all-targets --locked
+'''

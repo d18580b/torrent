@@ -1,6 +1,6 @@
 [package]
 name = "torrentd-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,8 +11,7 @@ publish = false
 [dependencies]
 libtorrent-safe = { workspace = true }
 
-# Async / concurrency
-tokio = { workspace = true }
+# Concurrency
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -22,37 +21,43 @@ tracing = { workspace = true }
 
 # Errors
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
-# Serialization (AssignmentRegistry's one-time JSON import)
+# Serialization (profile config, port-forward and VPN types)
 serde = { workspace = true }
-serde_json = { workspace = true }
-
-# AssignmentRegistry's database
-rusqlite = { workspace = true }
 
 # Misc
-bytes = { workspace = true }
-hex = { workspace = true }
-once_cell = { workspace = true }
-tempfile = { workspace = true }
 libc = { workspace = true }
 
 [features]
-# The test doubles: `MockEngine`, `MockVpn` and `MockForwarder`. Compiled into
+# The test doubles: `MockEngine`, `MockVpn`, `MockForwarder` and `MockClock`,
+# and the fixtures `MemoryResumeStore`, `MemoryTorrentStore` and
+# `RecordingSink`. Compiled into
 # this crate's own tests regardless; a dependent crate enables this for its
-# tests (a dev-dependency) or for the alert drill's `fault-injection` build,
-# and a release build of the daemon carries none of them.
+# tests (a dev-dependency) or for the alert drill's `fault-injection` build.
+# That build is optimised too (`cargo build --release` in deploy/Containerfile
+# with `torrentd/fault-injection`), so `--release` alone says nothing: the
+# daemon carries these exactly when built with `fault-injection`, which then
+# refuses to start without TORRENTD_FAULT_INJECTION=1. A build without the
+# feature carries none of them, and `mise run release-features` fails CI if
+# a normal dependency ever turns this on for the workspace's own build.
 test-support = []
 
 [dev-dependencies]
+# The test doubles and fixtures above, for tests/lifecycle.rs: an integration
+# test links the library as built for dependents, without `cfg(test)`.
+torrentd-engine = { path = ".", features = ["test-support"] }
 # The willing-seeder test in tests/lifecycle.rs dials a peer and reads a
 # torrent's payload download counter, which only `test-api` exposes.
 libtorrent-safe = { workspace = true, features = ["test-api"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# Serde round trips in the profile and port-forward tests.
+serde_json = { workspace = true }
+# Magnet URIs in tests/lifecycle.rs.
+hex = { workspace = true }
 # Layer 3 integration fixtures: real SHA-1 piece hashes for generated .torrents.
 sha1 = { workspace = true }
+# Property tests: the state map's resume queue, the profile set validator.
+proptest = { workspace = true }
 
 [lints]
 workspace = true

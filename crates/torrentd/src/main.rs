@@ -1,9 +1,14 @@
-//! `torrentd` — headless petabyte-scale torrent seeding daemon.
+//! `torrentd` — headless torrent seeding daemon for libraries already on
+//! disk. The scale it is measured at is what `mise run bench` reports against
+//! `crates/torrentd-bench/budgets.toml`: a million files and 5,000 torrents
+//! under one root.
 //!
-//! This binary wires together the
-//! torrentd-engine layer (TorrentEngine, alert loop, registry) with
-//! configuration, signals, a kynos HTTP control plane, and the VPN /
-//! netlink integration. Run with `--config <path>` it is the daemon; the
+//! This binary wires the torrentd-engine layer (`TorrentEngine`, the alert
+//! loop, the state map and the resume and `.torrent` stores) together with
+//! the assignment registry ([`registry`]), configuration, signals, a kynos
+//! HTTP control plane ([`http`]), the managed pool ([`pool_service`]), and
+//! the VPN and kill-switch integration ([`vpn`]); [`startup`] runs the
+//! daemon. Run with `--config <path>` it is the daemon; the
 //! subcommands in [`cli`] are operator tools that run to completion instead.
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -21,22 +26,32 @@ compile_error!(
 
 mod api_socket;
 mod app_state;
+mod apply;
 mod auth;
+mod bulk_adopt;
+mod check_queue;
 mod cli;
 mod config;
+mod fence;
 mod http;
+mod instance_lock;
+mod live_torrent;
 mod metrics_sink;
 mod net_cmd;
-mod pool_apply;
+mod pacing;
 mod pool_cmd;
 mod pool_service;
+mod pool_trash;
 mod port_forward_monitor;
 mod profile_registry;
 mod profile_state;
+mod redact;
+mod registry;
 mod reload;
 mod sd_notify;
 mod signals;
 mod startup;
+mod torrent_keys;
 mod tracing_init;
 mod vpn;
 mod vpn_cmd;
@@ -319,6 +334,32 @@ fn refuse_config(e: &anyhow::Error) -> ! {
     std::process::exit(EX_CONFIG);
 }
 
+/// The variable a `fault-injection` build needs set to `1` before the daemon
+/// or `--check-config` will run.
+const FAULT_INJECTION_ENV: &str = "TORRENTD_FAULT_INJECTION";
+
+/// Refuse to run a `fault-injection` build that nobody asked to run.
+///
+/// That build wraps every session in `FaultEngine` and mounts
+/// `POST /v1/faults`, through which a write-scope token can panic a task,
+/// stall the alert loop, or report a kill switch gone. It exists for the
+/// alert drill (deploy/drill), which sets [`FAULT_INJECTION_ENV`]; a binary
+/// from that build that reached a real host does not, and stops here with
+/// `EX_CONFIG` before it reads a config or raises anything. `built` is
+/// `cfg!(feature = "fault-injection")`, a parameter so a default build's
+/// tests reach both answers; `env` is the variable's value. Only `1` opts in.
+fn fault_injection_refusal(built: bool, env: Option<&std::ffi::OsStr>) -> Option<anyhow::Error> {
+    if !built || env.is_some_and(|v| v == "1") {
+        return None;
+    }
+    Some(anyhow::anyhow!(
+        "this torrentd is a fault-injection build (cargo feature `fault-injection`): it \
+         mounts POST /v1/faults, which injects panics, alert-loop stalls and fake alerts \
+         into the daemon, and exists only for the alert drill (deploy/drill). Deploy a \
+         build without that feature; to run this one anyway, set {FAULT_INJECTION_ENV}=1",
+    ))
+}
+
 /// Load the config with the validation this invocation actually needs.
 ///
 /// The daemon and `--check-config` get the full check, authentication posture
@@ -389,13 +430,19 @@ fn openapi_cmd(out: Option<&std::path::Path>) -> anyhow::Result<()> {
 /// tunnel is raised; left to `killswitch::enable`, it came after every
 /// profile's tunnel and session were up, as a boot failure the unit restarts.
 fn check_config(cfg: &config::Config) -> anyhow::Result<()> {
-    check_config_as(cfg, vpn::killswitch::current_uid)
+    check_config_as(
+        cfg,
+        vpn::killswitch::current_uid,
+        vpn::killswitch::nft_available,
+    )
 }
 
-/// [`check_config`], with the effective uid handed in so a test can be root.
+/// [`check_config`], with the effective uid and the `nft` probe handed in, so
+/// a test can be root, or judge a host with or without nftables.
 fn check_config_as(
     cfg: &config::Config,
     uid: impl FnOnce() -> std::io::Result<u32>,
+    nft_available: impl FnOnce() -> bool,
 ) -> anyhow::Result<()> {
     if cfg.network_kill_switch {
         let uid = uid().context("read this process's uid for the kill switch")?;
@@ -405,7 +452,7 @@ fn check_config_as(
     }
     // The kill switch shells out to `nft`; fail the pre-flight check now
     // rather than aborting startup later.
-    if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
+    if cfg.network_kill_switch && !nft_available() {
         anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
     }
     // An OpenVPN profile's file is executable configuration: one naming a
@@ -470,6 +517,15 @@ fn main() -> anyhow::Result<()> {
         eprintln!("error: --config <PATH> is required");
         std::process::exit(2);
     };
+    // The daemon and its pre-flight, before the config is read: a
+    // fault-injection build refuses both unless the drill opted in.
+    if cli.command.is_none() {
+        let env = std::env::var_os(FAULT_INJECTION_ENV);
+        if let Some(e) = fault_injection_refusal(cfg!(feature = "fault-injection"), env.as_deref())
+        {
+            refuse_config(&e);
+        }
+    }
     // 78 is for the daemon and its pre-flight, the two a unit's
     // `RestartPreventExitStatus=78` can see. An operator subcommand keeps
     // exiting 1 for a config it cannot load: its exit statuses are its own
@@ -570,6 +626,52 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fault_injection_build_refuses_to_start_unless_the_variable_is_1() {
+        use std::ffi::OsStr;
+        // A build without the feature never consults the variable.
+        assert!(fault_injection_refusal(false, None).is_none());
+        assert!(fault_injection_refusal(false, Some(OsStr::new("0"))).is_none());
+        // One with it refuses unset, and every value but `1`.
+        for env in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some(" 1"),
+        ] {
+            let e = fault_injection_refusal(true, env.map(OsStr::new))
+                .unwrap_or_else(|| panic!("{env:?} let a fault-injection build start"));
+            let msg = format!("{e:#}");
+            assert!(msg.contains("fault-injection build"), "{msg}");
+            assert!(msg.contains("TORRENTD_FAULT_INJECTION=1"), "{msg}");
+        }
+        assert!(fault_injection_refusal(true, Some(OsStr::new("1"))).is_none());
+    }
+
+    #[test]
+    fn the_alert_drill_opts_its_fault_injection_build_in() {
+        // The drill's daemon is the one fault-injection build meant to run;
+        // without the variable it would exit 78 and the drill would fail on
+        // a dead API rather than on a missing alert. run.sh's `--check-config`
+        // of the generated config runs the same build outside compose.
+        let drill = |file: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/drill")
+                .join(file);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        assert!(
+            drill("compose.yaml").contains(&format!("{FAULT_INJECTION_ENV}: \"1\"")),
+            "deploy/drill/compose.yaml must set {FAULT_INJECTION_ENV}: \"1\" on torrentd",
+        );
+        assert!(
+            drill("run.sh").contains(&format!("-e {FAULT_INJECTION_ENV}=1")),
+            "deploy/drill/run.sh's config check must pass -e {FAULT_INJECTION_ENV}=1",
+        );
+    }
 
     /// The config an existing non-loopback deployment is holding on upgrade:
     /// no `[auth]`, no opt-out, and a bind it cannot move — a container
@@ -832,23 +934,60 @@ http_listen = "127.0.0.1:8080"
         );
     }
 
+    /// A kill switch over a WireGuard profile, loaded the way the daemon and
+    /// `--check-config` load it.
+    fn kill_switch_over_wireguard(dir: &std::path::Path) -> config::Config {
+        let p = dir.join("torrentd.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "{TOP}allow_unauthenticated = true\nnetwork_kill_switch = true\n\n\
+                 [[profile]]\nid = \"acct_a\"\n\
+                 network = \"vpn\"\nvpn_type = \"wireguard\"\n\
+                 vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
+                 listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
+                 user_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n"
+            ),
+        )
+        .unwrap();
+        config::Config::load(&p).expect("the file is valid on any host")
+    }
+
     #[test]
-    fn the_pre_flight_probes_nft_and_config_loading_does_not() {
-        // The property: whether `nft` exists is a fact about the host, so it
-        // is `--check-config`'s to establish and not `Config::load`'s.
-        // `Config::load` is what the SIGHUP pump and every operator
-        // subcommand run; probing the host there refuses a reload, and
-        // refuses `hash-password`, on a machine without nftables.
-        //
-        // The probe's outcome depends on the host, so what is pinned is the
-        // seam: `check_config` is the only caller, and a config with the kill
-        // switch off never reaches it.
-        let cfg = cfg_from(&format!(
-            "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
-             listen_interfaces = \"0.0.0.0:6881\"\n"
-        ));
-        assert!(!cfg.network_kill_switch);
-        check_config(&cfg).expect("no kill switch, so no probe and nothing to refuse");
+    fn check_config_passes_a_vpn_kill_switch_config_as_non_root_with_nft() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = kill_switch_over_wireguard(dir.path());
+        let mut probed = false;
+        check_config_as(
+            &cfg,
+            || Ok(998),
+            || {
+                probed = true;
+                true
+            },
+        )
+        .expect("a non-root daemon on a host with nft passes");
+        assert!(probed, "the kill switch asks whether nft is there");
+    }
+
+    #[test]
+    fn check_config_refuses_when_nft_is_absent() {
+        // Whether `nft` exists is a fact about the host, so it is the
+        // pre-flight's to establish and not `Config::load`'s: the SIGHUP pump
+        // and every operator subcommand load the config too, and probing the
+        // host there refuses a reload, and `hash-password`, on a machine
+        // without nftables. The helper's `Config::load` accepted the file;
+        // only the probe refuses it.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = kill_switch_over_wireguard(dir.path());
+        let msg = format!(
+            "{:#}",
+            check_config_as(&cfg, || Ok(998), || false).expect_err("no nft is refused")
+        );
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("`nft`"),
+            "got: {msg}",
+        );
     }
 
     #[test]
@@ -861,7 +1000,12 @@ http_listen = "127.0.0.1:8080"
             "{TOP}network_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
              network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n"
         ));
-        let e = check_config_as(&cfg, || Ok(0)).expect_err("uid 0 is refused");
+        let e = check_config_as(
+            &cfg,
+            || Ok(0),
+            || unreachable!("refused before the nft probe"),
+        )
+        .expect_err("uid 0 is refused");
         assert!(startup::is_config_refusal(&e), "got: {e:#}");
         assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
         // The daemon's pre-flight is judged as the daemon itself, so its
@@ -886,10 +1030,15 @@ http_listen = "127.0.0.1:8080"
             "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
              listen_interfaces = \"0.0.0.0:6881\"\n"
         ));
-        check_config_as(&off, || unreachable!("no kill switch, no uid")).unwrap();
+        check_config_as(
+            &off,
+            || unreachable!("no kill switch, no uid"),
+            || unreachable!("no kill switch, no nft probe"),
+        )
+        .unwrap();
     }
 
-    /// #229: an OpenVPN profile whose `.ovpn` names a hook or a plugin is
+    /// An OpenVPN profile whose `.ovpn` names a hook or a plugin is
     /// refused by `--check-config` — and by the daemon's pre-flight, which
     /// is the same call — with the profile, the file and the directive
     /// named. A file the check cannot read is left to that profile's
@@ -914,8 +1063,12 @@ http_listen = "127.0.0.1:8080"
             std::fs::write(&ovpn, format!("client\ndev tun\n{line}\n")).unwrap();
             let msg = format!(
                 "{:#}",
-                check_config_as(&profile(&ovpn), || unreachable!("no kill switch"))
-                    .expect_err(line)
+                check_config_as(
+                    &profile(&ovpn),
+                    || unreachable!("no kill switch"),
+                    || unreachable!("no kill switch"),
+                )
+                .expect_err(line)
             );
             assert!(msg.contains(&format!("`{name}`")), "{line:?}: {msg}");
             assert!(msg.contains("acct_b.ovpn"), "{line:?}: {msg}");

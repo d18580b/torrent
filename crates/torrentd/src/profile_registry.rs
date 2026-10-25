@@ -19,7 +19,6 @@ use torrentd_engine::InfoHash;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
-use torrentd_engine::ProfileStatus;
 use torrentd_engine::Settings;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
@@ -27,6 +26,20 @@ use torrentd_engine::TorrentHandle;
 use crate::profile_state::DesiredStates;
 use crate::profile_state::PacedHolds;
 use crate::profile_state::Record;
+
+/// What the daemon observed of a running profile's tunnel and session.
+///
+/// A profile whose VPN bring-up failed at startup never gets an entry here:
+/// it is listed among the registry's failed profiles instead.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ProfileStatus {
+    /// VPN bring-up succeeded and the engine is constructed.
+    Active,
+    /// VPN tunnel went down mid-session; all torrents in this profile are
+    /// paused until the operator sets the profile online and its tunnel
+    /// checks healthy again.
+    VpnDown,
+}
 
 /// Mutable per-profile health, updated by the VPN monitor and read by `/profiles`.
 #[derive(Clone, Debug)]
@@ -36,7 +49,7 @@ pub struct ProfileHealth {
     /// Number of torrents the fence paused when the tunnel went down: the
     /// monitor's walk of the state map and the boot scans' `ScanFence`. A
     /// torrent added into an already-fenced profile and paused by the add
-    /// handler or `vpn_monitor::hold_if_fenced` is not counted, because both
+    /// handler or `fence::hold_if_fenced` is not counted, because both
     /// of those (and the walk) can pause the same torrent.
     ///
     /// Both writers add to it through [`Self::count_paused_for_vpn`], so a
@@ -49,12 +62,18 @@ pub struct ProfileHealth {
     /// count.
     pub counted_for_vpn: Arc<HashSet<InfoHash>>,
     /// How many times the profile has been fenced: bumped by every fence
-    /// (`vpn_monitor::fence`, which the monitor and the kill-switch watch's
+    /// (`fence::fence`, which the monitor and the kill-switch watch's
     /// `fence_all` both run) in the same update that marks it `vpn_down` and
     /// starts `paused_for_vpn` over, and reset by no lift. The boot scans'
     /// `ScanFence` reads a value it has not seen as a new fence, under which
     /// the torrents it paused before are paused again.
     pub fence_generation: u64,
+    /// Why the latest fence went on: the `reason` its
+    /// `profile_vpn_fenced_total` increment carries (`vpn_monitor`'s
+    /// `DownReason::as_str`, or `kill_switch`). Set in the update that marks
+    /// the profile `vpn_down`, and left by a lift, so it describes the
+    /// profile only while `status` is `VpnDown`; `None` before any fence.
+    pub fence_reason: Option<&'static str>,
     /// Current NAT-PMP-negotiated listening port (natpmp profiles only; `None`
     /// for static profiles).
     pub forwarded_port: Option<u16>,
@@ -179,7 +198,7 @@ impl ResumeGate {
 }
 
 /// A paced resume a fence's lift started in one profile
-/// (`vpn_monitor::spawn_lift`): every torrent it was asked to resume, whether
+/// (`fence::spawn_lift`): every torrent it was asked to resume, whether
 /// it has been told to stop, and what the operator paused while it ran.
 #[derive(Debug)]
 pub struct PacedResume {
@@ -225,6 +244,7 @@ impl ProfileEntry {
                 paused_for_vpn: 0,
                 counted_for_vpn: Arc::default(),
                 fence_generation: 0,
+                fence_reason: None,
                 forwarded_port,
                 forwarded_epoch,
                 port_forward_ok: true,
@@ -347,7 +367,7 @@ impl ProfileEntry {
     /// the entry, so a kill-switch fence does not take it back and the next
     /// lift does not resume what the operator paused. A kill-switch fence
     /// standing over the profile holds a gate of its own from the moment it
-    /// fenced (`vpn_monitor::KillSwitchFence`), which this halts too, so its
+    /// fenced (`fence::KillSwitchFence`), which this halts too, so its
     /// lift resumes nothing.
     ///
     /// What a paced set-online still holds ([`PacedHolds`]) is released too:
@@ -368,7 +388,7 @@ impl ProfileEntry {
     /// Leave `h` out of every paced resume running in this profile, before a
     /// pause of that one torrent. Once this returns none of them resumes it,
     /// nor does the lift of a kill-switch fence standing over the profile,
-    /// whose gate opened when it fenced (`vpn_monitor::KillSwitchFence`), and
+    /// whose gate opened when it fenced (`fence::KillSwitchFence`), and
     /// the next boot does not load it unpaused ([`PacedHolds`]).
     pub fn exclude_from_resumes(&self, h: TorrentHandle) {
         for gate in self.live_gates() {
@@ -439,6 +459,23 @@ impl ProfileEntry {
     /// cover.
     pub fn note_running(&self, h: TorrentHandle, running: bool) -> Option<bool> {
         self.noted.lock().insert(h, running)
+    }
+
+    /// Ready `h` for a pause of that one torrent: note it paused, leave it out
+    /// of every paced resume ([`ProfileEntry::exclude_from_resumes`]), and
+    /// note it paused again. Returns what was noted before, for
+    /// [`ProfileEntry::restore_noted`] should the engine refuse the pause.
+    ///
+    /// Noted first, so a kill-switch fence or a set-online that reads what is
+    /// running from here on, before a state update reports the pause, does
+    /// not resume it; the gates catch one that read before. Noted again once
+    /// the gates exclude it: a paced resume that took a gate between the two
+    /// noted it running, and that resume lands before this pause.
+    pub fn prepare_pause(&self, h: TorrentHandle) -> Option<bool> {
+        let before = self.note_running(h, false);
+        self.exclude_from_resumes(h);
+        self.note_running(h, false);
+        before
     }
 
     /// [`ProfileEntry::note_running`] with `running` false, for every one of
@@ -605,7 +642,7 @@ pub enum Refusal {
 ///
 /// A session-level resume starts every torrent whose own paused flag is clear
 /// at once, so going online pauses each of those first and hands them to
-/// [`OnlinePacing::start`] (`vpn_monitor::OnlinePace` in the daemon).
+/// [`OnlinePacing::start`] (`fence::OnlinePace` in the daemon).
 pub trait OnlinePacing {
     /// Every torrent `id` holds, each with whether its own paused flag is
     /// clear, so the session resuming would start it.
@@ -1180,10 +1217,11 @@ mod tests {
     /// online; one without DHT is never sent the setting.
     #[test]
     fn a_host_profile_with_dht_has_it_stopped_while_offline() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::ProfileNetwork;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let entry = |id: &str, dht: bool| {
             let mut e = test_host_entry(id);
@@ -1259,9 +1297,10 @@ mod tests {
     /// resume, less what the operator paused while it ran.
     #[test]
     fn going_online_holds_and_pauses_what_would_start_then_paces_it() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let mut e = test_host_entry("p");
         let mock = Arc::new(MockEngine::new());
@@ -1332,9 +1371,10 @@ mod tests {
     /// paused unrecorded.
     #[test]
     fn a_hold_that_cannot_be_written_leaves_the_session_paused() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
@@ -1372,10 +1412,11 @@ mod tests {
     /// where a retry would not reach them because the session runs.
     #[test]
     fn a_failed_dht_start_still_paces_what_the_set_online_paused() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::EngineError;
         use torrentd_engine::MockEngine;
         use torrentd_engine::ProfileNetwork;
+
+        use crate::profile_state::DesiredState;
 
         let mut e = test_host_entry("p");
         e.config.network = ProfileNetwork::Host {
@@ -1415,10 +1456,11 @@ mod tests {
     /// paused, rather than resumed bare with every torrent at once.
     #[test]
     fn an_unreadable_session_state_is_paced_as_paused() {
-        use torrentd_engine::DesiredState;
         use torrentd_engine::EngineError;
         use torrentd_engine::MockEngine;
         use torrentd_engine::RecordedCall;
+
+        use crate::profile_state::DesiredState;
 
         let mut e = test_host_entry("p");
         let mock = Arc::new(MockEngine::new());

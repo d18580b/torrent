@@ -188,14 +188,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         }
         Msg::DriftChecked(Ok(report)) => {
             state.checking_drift = false;
-            let toast = if report.drifted.is_empty() {
-                Toast::success("drift check: nothing drifted")
-            } else {
-                Toast::info(format!(
-                    "drift check: {} torrents drifted — rescan and verify them",
-                    report.drifted.len()
-                ))
-            };
+            let toast = drift_toast(&report);
             state.drift = Some(report);
             let mut effects = vec![Effect::toast(toast)];
             effects.extend(load(state, ctx));
@@ -205,6 +198,38 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             state.checking_drift = false;
             vec![Effect::now(failed("checking for drift", failure))]
         }
+    }
+}
+
+/// What a drift check found and what it could not see, both at once: an
+/// unmounted root must neither read as "nothing drifted" nor hide the
+/// torrents that did drift under another root.
+fn drift_toast(report: &types::DriftReport) -> Toast {
+    let drifted = (!report.drifted.is_empty()).then(|| {
+        format!(
+            "{} torrents drifted — rescan and verify them",
+            report.drifted.len()
+        )
+    });
+    let unseen = if !report.unreadable_roots.is_empty() {
+        Some(format!(
+            "{} roots could not be read — {} torrents unchecked",
+            report.unreadable_roots.len(),
+            report.unchecked.len()
+        ))
+    } else if !report.unchecked.is_empty() {
+        Some(format!("{} torrents unchecked", report.unchecked.len()))
+    } else {
+        None
+    };
+    match (drifted, unseen) {
+        (None, None) => Toast::success("drift check: nothing drifted"),
+        (None, Some(unseen)) if report.unreadable_roots.is_empty() => {
+            Toast::info(format!("drift check: nothing drifted, {unseen}"))
+        }
+        (None, Some(unseen)) => Toast::info(format!("drift check: {unseen}")),
+        (Some(drifted), None) => Toast::info(format!("drift check: {drifted}")),
+        (Some(drifted), Some(unseen)) => Toast::info(format!("drift check: {drifted}; {unseen}")),
     }
 }
 
@@ -572,6 +597,149 @@ fn result_lines<'a>(state: &State, ctx: &Ctx<'_>, wide: bool) -> Vec<Line<'a>> {
             fmt::count(d.files_vanished)
         )));
         lines.push(Line::from(spans));
+        // What the check could not see, so an unmounted root does not pass
+        // for a clean check. On a narrow screen the roots take a line of
+        // their own.
+        let mut unseen = Vec::new();
+        let warn = |text: String| {
+            Line::from(vec![
+                label(""),
+                Span::styled(format!("◐ {text}"), theme.fg(Tone::Warn)),
+            ])
+        };
+        if !d.unreadable_roots.is_empty() {
+            let shown = if wide { 2 } else { 1 };
+            let mut roots = d
+                .unreadable_roots
+                .iter()
+                .take(shown)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if d.unreadable_roots.len() > shown {
+                roots.push_str(&format!(" +{}", d.unreadable_roots.len() - shown));
+            }
+            let roots = format!("unreadable: {roots}");
+            if wide {
+                unseen.push(roots);
+            } else {
+                lines.push(warn(roots));
+            }
+        }
+        if !d.unmounted_dirs.is_empty() {
+            unseen.push(format!(
+                "{} unmounted dirs",
+                fmt::count(d.unmounted_dirs.len() as i64)
+            ));
+        }
+        if d.files_unreadable > 0 {
+            unseen.push(format!(
+                "{} files unstatable",
+                fmt::count(d.files_unreadable)
+            ));
+        }
+        if !d.unchecked.is_empty() {
+            unseen.push(format!(
+                "{} unchecked",
+                fmt::count(d.unchecked.len() as i64)
+            ));
+        }
+        if !unseen.is_empty() {
+            lines.push(warn(unseen.join(" · ")));
+        }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    mod props {
+        use proptest::prelude::*;
+        use serde_json::json;
+
+        use super::super::*;
+        use crate::testing;
+
+        /// An overview with `n` roots.
+        fn pool(n: usize) -> types::PoolOverview {
+            let roots: Vec<_> = (0..n)
+                .map(|i| {
+                    json!({"root_id": i, "path": format!("/srv/pool/{i}"), "bytes_total": 100,
+                           "bytes_adopted": 0, "bytes_matched": 0, "bytes_orphan": 0,
+                           "files_total": 1, "files_orphan": 0})
+                })
+                .collect();
+            testing::from_json(json!({
+                "library_dir": "/srv/library", "torrents": 0, "files": 0,
+                "states": {"missing": 0, "partial": 0, "matched": 0, "adopted": 0,
+                           "drifted": 0, "overlap": 0, "shared": 0},
+                "verify_queue_depth": 0, "verify_in_flight": 0, "roots": roots,
+            }))
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Move(Motion),
+            /// The load in flight answers with this many roots, or fails.
+            Loaded(Option<usize>),
+            /// An answer to a load since superseded.
+            StaleLoaded(usize),
+            Refresh,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            let motion = prop::sample::select(vec![
+                Motion::Up,
+                Motion::Down,
+                Motion::Top,
+                Motion::Bottom,
+                Motion::PageUp,
+                Motion::PageDown,
+            ]);
+            prop_oneof![
+                4 => motion.prop_map(Op::Move),
+                2 => prop::option::weighted(0.9, 0usize..25).prop_map(Op::Loaded),
+                1 => (0usize..25).prop_map(Op::StaleLoaded),
+                1 => Just(Op::Refresh),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Whatever moves are made and however many roots each load
+            /// returns, the selected root is one the overview lists, or 0
+            /// when it lists none.
+            #[test]
+            fn the_selected_root_stays_within_the_roots(ops in prop::collection::vec(op(), 0..60)) {
+                let mut state = State::default();
+                testing::with_ctx(None, |ctx| -> Result<(), TestCaseError> {
+                    let _ = refresh(&mut state, ctx);
+                    for op in ops {
+                        let generation = state.generation;
+                        match op.clone() {
+                            Op::Move(m) => drop(update(&mut state, Msg::Move(m), ctx)),
+                            Op::Loaded(Some(n)) => drop(update(&mut state, Msg::Loaded(generation, Ok(pool(n))), ctx)),
+                            Op::Loaded(None) => drop(update(
+                                &mut state,
+                                Msg::Loaded(generation, Err(Failure { status: Some(500), ..Default::default() })),
+                                ctx,
+                            )),
+                            Op::StaleLoaded(n) => drop(update(&mut state, Msg::Loaded(generation.wrapping_sub(1), Ok(pool(n))), ctx)),
+                            Op::Refresh => drop(load(&mut state, ctx)),
+                        }
+                        let roots = state.pool.as_ref().map_or(0, |p| p.roots.len());
+                        prop_assert!(
+                            state.selected < roots.max(1),
+                            "after {:?}: selected {} of {} roots",
+                            op,
+                            state.selected,
+                            roots,
+                        );
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }
