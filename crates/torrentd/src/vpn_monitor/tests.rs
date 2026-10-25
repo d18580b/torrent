@@ -1893,6 +1893,31 @@ fn the_recovery_check_wants_the_bound_address_routed_by_the_tunnel() {
     );
 }
 
+/// The recovery check probes a profile's tunnel as the poll loop does: on
+/// its interface, as the tunnel type it is.
+#[test]
+fn the_recovery_check_probes_the_tunnel_as_its_type() {
+    let entry = crate::profile_registry::test_vpn_entry("acct_a", ProfileStatus::VpnDown);
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let probe: Prober = {
+        let asked = asked.clone();
+        Arc::new(move |iface: &str, is_wg: bool| {
+            asked.lock().unwrap().push((iface.to_string(), is_wg));
+            TunnelProbes {
+                ip: Ok(ip(2)),
+                route: Some(Ok(RouteProbe::ViaTunnel)),
+                handshake: None,
+            }
+        })
+    };
+    assert_eq!(recovery_check(&entry, &probe), Ok(()));
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [("wg-acct_a".to_string(), true)],
+        "one probe of the WireGuard link",
+    );
+}
+
 mod props {
     use proptest::prelude::*;
 
