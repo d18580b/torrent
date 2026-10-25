@@ -548,6 +548,93 @@ mod tests {
         assert_eq!(state_of(&store, "cc"), AdoptionState::Matched);
     }
 
+    /// A path component replaced by a file is the path gone even for a file
+    /// the index recorded on another device: only a surviving *directory* on
+    /// another filesystem is a mount point.
+    #[test]
+    fn a_component_replaced_by_a_file_is_drift_whatever_device_it_was_on() {
+        let (_dir, root, mut store) = pool(&["aa"]);
+        let (root_id, _) = store.adoption_base("aa").unwrap().unwrap();
+        let mut a = store.file(root_id, "aa/a.bin").unwrap().unwrap();
+        a.dev = a.dev.wrapping_add(1);
+        store.begin_staging().unwrap();
+        store.stage_files(&[a]).unwrap();
+        store.swap_staged_root(root_id, 0).unwrap();
+        std::fs::remove_dir_all(root.join("aa")).unwrap();
+        std::fs::write(root.join("aa"), b"not a directory").unwrap();
+        // The root needs an entry besides `aa` to read as mounted.
+        std::fs::write(root.join("other"), b"x").unwrap();
+
+        let r = root.clone();
+        let report = detect(&mut store, |_| Some(r.clone())).unwrap();
+        assert_eq!(report.drifted, vec!["aa".to_string()]);
+        assert_eq!(report.files_vanished, 1);
+        assert!(report.unmounted_dirs.is_empty(), "{report:?}");
+        assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
+    }
+
+    /// Each unreadable root is reported once, whichever torrents it holds.
+    #[test]
+    fn every_unreadable_root_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PoolStore::open_in_memory().unwrap();
+        let mut roots = Vec::new();
+        for (name, ihs) in [("r1", ["aa", "bb"]), ("r2", ["cc", "dd"])] {
+            let root = dir.path().join(name);
+            for ih in ihs {
+                matched(&mut store, &root, ih);
+            }
+            let id = store.upsert_root(&root).unwrap();
+            crate::scan_root(&mut store, &root).unwrap();
+            roots.push((id, root));
+        }
+        crate::match_all(&mut store).unwrap();
+        // Both unmounted: the mount points stay, empty.
+        for (_, root) in &roots {
+            std::fs::remove_dir_all(root).unwrap();
+            std::fs::create_dir(root).unwrap();
+        }
+
+        let by_id = roots.clone();
+        let report = detect(&mut store, |id| {
+            by_id.iter().find(|(r, _)| *r == id).map(|(_, p)| p.clone())
+        })
+        .unwrap();
+        let mut unreadable = report.unreadable_roots.clone();
+        unreadable.sort();
+        assert_eq!(unreadable, vec![roots[0].1.clone(), roots[1].1.clone()]);
+        assert!(report.drifted.is_empty(), "{report:?}");
+    }
+
+    /// The probe after the stats is for vanished files alone: a pass that
+    /// found only changed files does not probe the root again, so a root that
+    /// reads empty only after the stats is not reported unreadable.
+    #[test]
+    fn a_pass_with_no_vanished_file_does_not_probe_its_root_again() {
+        let (dir, root, mut store) = pool(&["aa", "bb"]);
+        rewrite_in_place(&root, "aa");
+        let away = dir.path().join("away");
+        let calls = std::cell::Cell::new(0);
+        let r = root.clone();
+        let selected = ["aa".to_string(), "bb".to_string()];
+        let report = detect_before_adopt(&mut store, &selected, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                // Emptied after `aa`'s stats; `bb` is no longer configured.
+                std::fs::rename(&r, &away).unwrap();
+                std::fs::create_dir(&r).unwrap();
+                return None;
+            }
+            Some(r.clone())
+        })
+        .unwrap();
+
+        assert_eq!(report.drifted, vec!["aa".to_string()]);
+        assert_eq!(report.files_changed, 1);
+        assert!(report.unreadable_roots.is_empty(), "{report:?}");
+        assert!(report.unchecked.is_empty(), "{report:?}");
+    }
+
     /// A file that cannot be stated for a reason other than not-found —
     /// here permission, as EIO would be — is counted, and is not drift.
     #[test]
