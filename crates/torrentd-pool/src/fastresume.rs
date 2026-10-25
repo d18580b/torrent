@@ -121,9 +121,9 @@ impl ResumeHints {
     ///
     /// `mapped_files` wins: it is what the client actually did. Failing it,
     /// `qBt-contentLayout` is applied the way qBittorrent applies it —
-    /// `NoSubfolder` drops a multi-file torrent's top directory, `Subfolder`
-    /// puts a single file inside a directory named after it without its
-    /// extension.
+    /// `NoSubfolder` drops the top directory of a torrent in multi-file mode,
+    /// even one holding a single file, and `Subfolder` puts a single-file
+    /// torrent's file inside a directory named after it without its extension.
     pub fn relayout(&self, paths: &[String], name: &str) -> Option<Relayout> {
         if self.mapped_files.iter().any(Option::is_some) || self.mapped_files_unreadable > 0 {
             let mut rejected = self.mapped_files_unreadable;
@@ -151,16 +151,14 @@ impl ResumeHints {
         }
         let in_name_dir = |p: &String| p.split_once('/').is_some_and(|(top, _)| top == name);
         match self.content_layout.as_deref() {
-            Some("NoSubfolder") if paths.len() > 1 && paths.iter().all(in_name_dir) => {
-                Some(Relayout {
-                    paths: paths
-                        .iter()
-                        .map(|p| p.split_once('/').map_or(p.clone(), |(_, r)| r.to_owned()))
-                        .collect(),
-                    in_resume_data: false,
-                    rejected: 0,
-                })
-            }
+            Some("NoSubfolder") if paths.iter().all(in_name_dir) => Some(Relayout {
+                paths: paths
+                    .iter()
+                    .map(|p| p.split_once('/').map_or(p.clone(), |(_, r)| r.to_owned()))
+                    .collect(),
+                in_resume_data: false,
+                rejected: 0,
+            }),
             Some("Subfolder") if paths.len() == 1 && !paths[0].contains('/') => {
                 let stem = Path::new(&paths[0])
                     .file_stem()
@@ -786,6 +784,35 @@ mod tests {
         assert_eq!(layout("Subfolder").relayout(&multi, "Show"), None);
         let one_in_dir = vec!["Show/a.mkv".to_owned()];
         assert_eq!(layout("Subfolder").relayout(&one_in_dir, "Show"), None);
+    }
+
+    #[test]
+    fn no_subfolder_drops_the_top_directory_of_a_one_file_multi_file_torrent() {
+        // Multi-file mode with one file: qBittorrent still drops `Show/`.
+        let one = vec!["Show/a.mkv".to_owned()];
+        let layout = ResumeHints {
+            content_layout: Some("NoSubfolder".to_owned()),
+            ..ResumeHints::default()
+        };
+        let r = layout.relayout(&one, "Show").unwrap();
+        assert_eq!(r.paths, ["a.mkv"]);
+        assert!(!r.in_resume_data);
+        assert_eq!(r.rejected, 0);
+
+        // Every path must sit under `name/`: one that does not keeps the
+        // layout as it is, for one file or several.
+        assert_eq!(layout.relayout(&["Other/a.mkv".to_owned()], "Show"), None);
+        let mixed: Vec<String> = ["Show/a.mkv", "Other/b.mkv"].map(String::from).to_vec();
+        assert_eq!(layout.relayout(&mixed, "Show"), None);
+
+        // `Subfolder` applies only to a single-file torrent: several files
+        // without a directory are not one, and get none.
+        let subfolder = ResumeHints {
+            content_layout: Some("Subfolder".to_owned()),
+            ..ResumeHints::default()
+        };
+        let flat: Vec<String> = ["a.mkv", "b.mkv"].map(String::from).to_vec();
+        assert_eq!(subfolder.relayout(&flat, "Show"), None);
     }
 
     #[test]
