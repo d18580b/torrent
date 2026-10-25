@@ -1108,6 +1108,79 @@ fn an_errored_torrent_retires_as_failed() {
     ));
 }
 
+/// A passed verification queues an unconditional resume save as it records
+/// `adopted`: on disk is only the add-time resume file, with no pieces, and
+/// the 30-minute sweep is too late for a crash in between not to re-hash
+/// the payload at boot. It pauses nothing.
+#[test]
+fn a_passed_verify_saves_resume_data_at_once() {
+    use std::sync::Arc;
+
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RecordedCall;
+    use torrentd_engine::StateMap;
+    use torrentd_pool::AdoptionState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+    let pool = crate::pool_service::PoolService::open(&cfg)
+        .unwrap()
+        .unwrap();
+    let engine = Arc::new(MockEngine::new());
+    let source = torrentd_engine::ProfileSource::new(vec![(
+        ProfileId::new("p"),
+        engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+    )]);
+    let state = StateMap::new();
+    let hash = InfoHash([0x12; 20]);
+    state.insert(hash, st(TorrentPhase::Seeding, Some(SETTLE)));
+    let ih = hash.to_hex();
+    pool.with_store(|s| {
+        s.upsert_torrent(
+            &torrentd_pool::PoolTorrent {
+                infohash: ih.clone(),
+                infohash_v1: None,
+                infohash_v2: None,
+                name: "T".into(),
+                total_size: 1,
+                num_files: 1,
+                source_path: dir.path().join("t.torrent"),
+                fastresume_path: None,
+                declared_save_path: None,
+                category: None,
+                tags: vec![],
+                profile: None,
+            },
+            0,
+        )
+    })
+    .unwrap();
+    assert!(state.dispatch_resume_saves(10).is_empty());
+
+    let profiles = crate::profile_registry::ProfileRegistry::new(vec![]);
+    super::worker::record_verify_outcome(
+        &pool,
+        super::worker::Writer::Wait,
+        &source,
+        &state,
+        &profiles,
+        &hash,
+        &ih,
+        VerifyOutcome::Verified,
+    );
+    assert_eq!(
+        state.dispatch_resume_saves(10),
+        vec![(hash, torrentd_engine::ResumeFlags::empty())],
+        "the passed verification is saved at once, not left for the sweep",
+    );
+    assert!(!engine
+        .calls()
+        .iter()
+        .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+    let got = pool.with_store(|s| s.adoption_state(&ih)).unwrap();
+    assert_eq!(got, Some(AdoptionState::Adopted));
+}
+
 /// A failed verification records `drifted` and pauses the torrent; a
 /// passed one is the only thing that clears drift.
 #[test]
