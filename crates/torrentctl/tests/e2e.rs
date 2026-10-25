@@ -62,6 +62,9 @@ const STREAM_LISTEN_PORT: u16 = 16994;
 /// The session-loss test's daemon.
 const RESTART_HTTP: &str = "127.0.0.1:18194";
 const RESTART_LISTEN_PORT: u16 = 16995;
+/// The exit-path revocation test's daemon.
+const EXIT_HTTP: &str = "127.0.0.1:18196";
+const EXIT_LISTEN_PORT: u16 = 16997;
 const MAGNET_HEX: &str = "0505050505050505050505050505050505050505";
 /// How long the `App` is given to reach each state it is driven to.
 const STEP: Duration = Duration::from_secs(30);
@@ -584,6 +587,107 @@ async fn a_session_does_not_survive_a_daemon_restart() {
         api::Error::Api(response) => assert_eq!(response.status().as_u16(), 401),
         other => panic!("a session from before the restart is a 401, got {other:?}"),
     }
+}
+
+/// A session token signed in from the password, as `Msg::SignedIn` leaves
+/// the model holding it.
+async fn minted_model(base: &str) -> Model {
+    let grant = api::Client::new(base)
+        .unwrap()
+        .create_session(&types::CreateSession {
+            password: PASSWORD.to_owned(),
+        })
+        .await
+        .expect("sign in")
+        .into_inner();
+    let mut model = Model::new(
+        Api::new(base, Some(&grant.token)).unwrap(),
+        Theme::new(Depth::Mono),
+    );
+    model.minted = true;
+    torrentctl::api::call(model.api.client.get_current_session())
+        .await
+        .expect("the token works before the exit");
+    model
+}
+
+/// The daemon refuses the token `model` holds.
+async fn assert_refused(model: &Model, path: &str) {
+    let refused = torrentctl::api::call(model.api.client.get_current_session())
+        .await
+        .expect_err("a revoked token is refused");
+    assert_eq!(refused.status, Some(401), "{path}: {refused:?}");
+}
+
+/// However the client exits — a signal, the end of its input, or a quit
+/// after the daemon answered the sign-in but before `SignedIn` landed — the
+/// daemon refuses the token it minted afterwards.
+#[tokio::test]
+#[ignore = "spawns torrentd; run with `mise run test-torrentctl`"]
+async fn a_minted_token_is_revoked_on_every_exit_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = password_hash(dir.path());
+    let (_daemon, base, _) = start_on(dir.path(), Some(&hash), EXIT_HTTP, EXIT_LISTEN_PORT).await;
+    let no_input = futures_util::stream::pending::<std::io::Result<crossterm::event::Event>>;
+
+    // A real SIGTERM to this process. Once installed, the handlers keep
+    // SIGHUP, SIGINT and SIGTERM from killing the test process for the rest
+    // of its life; `test-torrentctl` runs these tests one at a time.
+    let signals = runtime::Signals::install().expect("install the signal handlers");
+    let model = minted_model(&base).await;
+    let run = tokio::spawn(runtime::run_with(model, |_| Ok(()), no_input(), signals));
+    // SAFETY: kill(2) with this process's own id and a valid signal.
+    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+    let ended = tokio::time::timeout(STEP, run)
+        .await
+        .expect("the loop left on SIGTERM")
+        .expect("no panic");
+    assert!(ended.result.is_ok() && ended.model.quit);
+    assert_refused(&ended.model, "SIGTERM").await;
+
+    // The terminal's input ends.
+    let model = minted_model(&base).await;
+    let never = futures_util::stream::pending::<&'static str>();
+    let ended = tokio::time::timeout(
+        STEP,
+        runtime::run_with(model, |_| Ok(()), futures_util::stream::empty(), never),
+    )
+    .await
+    .expect("the loop left at the end of its input");
+    assert!(ended.result.is_ok() && ended.model.quit);
+    assert_refused(&ended.model, "end of input").await;
+
+    // Esc after the daemon answered the sign-in, before `SignedIn` lands.
+    let mut app = Driver::start(Api::new(&base, Some(torrentctl::api::ANONYMOUS)).unwrap());
+    app.until("the sign-in prompt", |m| {
+        matches!(m.session, Session::SignedOut)
+    })
+    .await;
+    app.type_text(PASSWORD);
+    app.key(KeyCode::Enter);
+    let deadline = tokio::time::Instant::now() + STEP;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, app.rx.recv())
+            .await
+            .expect("the daemon answers the sign-in")
+            .expect("the driver holds a sender");
+        let login = matches!(msg, Msg::Login(_));
+        app.send(msg);
+        // Answered with a token: the password is cleared, and the login
+        // stays busy until `SignedIn` lands.
+        if login && app.model.login.busy && app.model.login.password.value().is_empty() {
+            break;
+        }
+    }
+    assert!(!app.model.minted, "SignedIn has not landed yet");
+    app.key(KeyCode::Esc);
+    assert!(
+        app.model.quitting && !app.model.quit,
+        "waits for the token on its way"
+    );
+    app.until("quit", |m| m.quit).await;
+    assert!(app.model.minted, "the model holds the token it revoked");
+    assert_refused(&app.model, "quit before SignedIn").await;
 }
 
 /// A panic inside the loop hands the terminal back: run under a pty, the
