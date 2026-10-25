@@ -2007,18 +2007,20 @@ fn only_the_check_that_starts_fencing_logs_the_error() {
     let log = crate::tracing_init::Buf::default();
     let (_reload, subscriber) =
         crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let errors = || {
+        log.text()
+            .lines()
+            .filter(|l| l.contains("could not be checked this many times in a row"))
+            .count()
+    };
     torrentd_engine::testing::with_subscriber(subscriber, || {
         let fenced = unchecked(Watch::Unchecked(PROBE_FAILURES_TO_FENCE - 1), &fence);
         assert_eq!(fenced, Watch::Unverified);
+        assert_eq!(errors(), 1, "the check that fences says so");
         assert_eq!(unchecked(fenced, &fence), Watch::Unverified);
+        assert_eq!(errors(), 1, "a later one does not say it again");
     });
     assert_eq!(fence.take(), ["fence unverifiable", "fence unverifiable"]);
-    let log = log.text();
-    let errors = log
-        .lines()
-        .filter(|l| l.contains("could not be checked this many times in a row"))
-        .count();
-    assert_eq!(errors, 1, "{log}");
 }
 
 /// A table found gone while the watch is fenced for checks that could not
