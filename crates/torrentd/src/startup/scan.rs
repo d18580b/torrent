@@ -1312,13 +1312,12 @@ async fn readd_magnets(
         misplaced,
         removed_at_boot,
     } = scan;
+    // `listing.unreadable` is not counted: it counts the directory entries
+    // that could not be read, and the `.torrent` listing of this same
+    // directory already counted each of them under `torrent_file`.
     let listing = torrent_store
         .list_magnets(profile)
         .context("scan torrent dir for magnets")?;
-    load_failures
-        .entry(profile.clone())
-        .or_default()
-        .torrent_file += listing.unreadable;
     let mut added = 0usize;
     for (i, ih) in listing.names.into_iter().enumerate() {
         between_scan_batches(i, "magnet", boot_shutdown, boot_progress, || {
