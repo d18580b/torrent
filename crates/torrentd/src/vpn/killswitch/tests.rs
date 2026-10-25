@@ -49,6 +49,32 @@ fn the_own_table_is_this_uids() {
     assert_eq!(own_table_name(), table_name(current_uid().unwrap()));
 }
 
+/// The uid the ruleset confines is this process's effective one, as the
+/// kernel reports it.
+#[test]
+fn the_current_uid_is_the_effective_uid() {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    assert_eq!(current_uid().unwrap(), unsafe { libc::geteuid() });
+}
+
+/// `--check-config` reports nftables usable exactly when `nft --version`
+/// runs and exits zero on this host.
+#[test]
+fn nft_is_available_exactly_when_it_runs() {
+    let runs = std::process::Command::new("nft")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert_eq!(nft_available(), runs);
+}
+
+/// A link that does not exist has no listen port to exempt, whether `wg`
+/// is installed or not.
+#[test]
+fn a_link_that_does_not_exist_has_no_listen_port() {
+    listen_port("tdks-nolink0").expect_err("no such link");
+}
+
 /// Set in the process [`a_bind_failure_without_a_holder_is_no_refusal`]
 /// starts, the only one in which its half that exhausts descriptors runs.
 const EXHAUST_DESCRIPTORS: &str = "TORRENTD_TEST_KS_EXHAUST_DESCRIPTORS";
