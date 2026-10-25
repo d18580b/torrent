@@ -3,12 +3,15 @@
  *
  * The payload is a tagged union: the `kind` discriminant (lt_alert_kind from
  * libtorrent_shim.h) selects which variant in `payload` is live. Variants
- * use fixed-size character buffers (LT_PATH_MAX, LT_MSG_MAX) for short
- * strings — if the source string is longer, it is truncated and NUL
- * terminated. Variants that carry bulk data (resume buffers, stats counter
+ * use fixed-size character buffers (LT_PATH_MAX, LT_MSG_MAX, LT_OP_MAX,
+ * LT_ADDR_MAX) for short strings — a longer source string is cut at the last
+ * whole UTF-8 sequence that fits, and every buffer is NUL terminated.
+ * Variants that carry bulk data (resume buffers, metadata, stats counter
  * arrays, torrent_status arrays) or a path a decision rests on (the
- * storage_moved save path) hold heap-allocated pointers; the caller
- * must invoke lt_alert_payload_free() exactly once after consumption.
+ * storage_moved save path) hold heap-allocated pointers. The caller must call
+ * lt_alert_payload_free() on every popped alert, whatever its kind, before it
+ * discards the union; a second call is harmless, because the first nulls
+ * what it frees.
  */
 #ifndef LIBTORRENT_SHIM_ALERT_UNION_H
 #define LIBTORRENT_SHIM_ALERT_UNION_H
@@ -18,11 +21,11 @@
 
 #include "libtorrent_shim.h"
 
+/* libtorrent_shim.h closes its own `extern "C"` block before it ends, so a
+ * C++ translation unit needs this header to open one for the declarations
+ * below. A C one needs nothing. */
 #ifdef __cplusplus
 extern "C" {
-#else
-/* Re-open the C linkage block opened in libtorrent_shim.h since the
- * function declarations below need to be `extern "C"` from C++ TUs. */
 #endif
 
 /* String capacities (LT_PATH_MAX, LT_MSG_MAX, …) come from libtorrent_shim.h,
@@ -251,7 +254,11 @@ struct lt_alert_union {
 /* ------------------------------------------------------------------ */
 
 /* Pop one alert from the session.
- * Returns 1 if an alert was written to *out, 0 if the queue is empty.
+ * Returns 1 if an alert was written to *out, 0 if the queue is empty or an
+ * argument is null. When the shim's own queue is empty this pops and
+ * translates libtorrent's pending alerts first, outside any lock, so two
+ * calls on one session must never run concurrently (see "Thread model" in
+ * libtorrent_shim.h).
  * After consuming an alert, the caller MUST call lt_alert_payload_free(out)
  * to release any heap-allocated payload (resume data, stats counters, etc.)
  * regardless of whether the payload was inspected.
@@ -262,8 +269,9 @@ int  lt_pop_alert(lt_session* s, struct lt_alert_union* out);
  * safe to call on a zero-initialized union. */
 void lt_alert_payload_free(struct lt_alert_union* u);
 
-/* Every torrent's status, read from the session now. `statuses` is
- * heap-allocated; release the whole struct with lt_status_list_free(). */
+/* Every torrent's status, read from the session now. `statuses` is a
+ * heap-allocated array of `count` views, NULL when the session holds no
+ * torrent; release the whole struct with lt_status_list_free(). */
 struct lt_status_list {
     struct lt_torrent_status_view* statuses;
     size_t count;
