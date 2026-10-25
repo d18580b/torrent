@@ -488,11 +488,13 @@ A crash here is any exit that skipped the stop sequence: `kill -9`, an OOM
 kill, a panic abort, or a power cut. `Restart=on-failure` starts the daemon
 again after 5 s. Work through these in order once it is up.
 
-**Network state.** The daemon's own teardown did not run. Under the packaged
-unit, `ExecStopPost=` ran `torrentd net-cleanup` once the process was gone,
-before `Restart=` started it again, as the network-state paragraph of
-[Retiring a profile](#retiring-a-profile) describes: the kill-switch table and every WireGuard link the daemon raised,
-with its `ip rule` entries, are already removed, and so is a retired OpenVPN
+**Network state.** The daemon's own teardown did not run. A power cut takes
+the links, rules and table down with the host. After any other crash under the
+packaged unit, `ExecStopPost=` ran `torrentd net-cleanup` once the process was
+gone, before `Restart=` started it again, as the network-state paragraph of
+[Retiring a profile](#retiring-a-profile) describes: the kill-switch table and
+every WireGuard link the daemon raised, with its `ip rule` entries, are
+already removed, and so is a retired OpenVPN
 profile's process, rules and records. What is left is a link the daemon
 adopted rather than raised, a configured OpenVPN profile's records and rules,
 and whatever the cleanup could not remove: it logs that to the journal, and
