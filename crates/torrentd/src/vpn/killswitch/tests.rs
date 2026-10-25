@@ -1075,9 +1075,6 @@ fn disable_against_real_nft() {
     assert!(remove_table_for(1000).expect("uid 1000's own removal takes it"));
 }
 
-/// A table an earlier release left under the shared name, against a real
-/// `nft`: another uid's removal leaves it, its own uid's removes it. Run
-/// it as [`disable_against_real_nft`] says.
 /// The renderer writes `!=` only against a set of interface names, so a
 /// listing reading `oifname != "<one name>"` is not a rule it installed.
 #[test]
@@ -1114,6 +1111,9 @@ fn removing_the_own_table_against_real_nft() {
     assert!(!table_listed(&list_tables().expect("list"), &own));
 }
 
+/// A table an earlier release left under the shared name, against a real
+/// `nft`: another uid's removal leaves it, its own uid's removes it. Run
+/// it as [`disable_against_real_nft`] says.
 #[test]
 #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
 fn a_legacy_table_against_real_nft() {
