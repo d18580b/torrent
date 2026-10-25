@@ -63,10 +63,12 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
         .build()
         .wrap_err("start the async runtime")?;
     // `ratatui::init` puts the terminal in raw mode on the alternate screen
-    // and installs a panic hook that restores it first.
+    // and installs a panic hook that restores it first. A panic on a
+    // background task ends `run` with `Model::fatal` set.
     let mut terminal = ratatui::init();
     // However the loop ends, a session token minted from the password is
-    // revoked before `run` returns (or resumes a panic in the loop).
+    // revoked before `run` returns (or resumes a panic in the loop), except
+    // after a background task's panic, which only reports it.
     let ended = runtime.block_on(runtime::run(model, &mut terminal));
     ratatui::restore();
     // Printed only now: on the alternate screen it would vanish with it.
@@ -74,13 +76,29 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
         eprintln!("{notice}");
     }
     ended.result.wrap_err("the terminal failed")?;
-    // A signal ended it: report that as a shell would for a process the
-    // signal killed, not as a clean exit.
-    Ok(ended
-        .signal
-        .map_or(std::process::ExitCode::SUCCESS, |signal| {
-            runtime::signal_exit_status(signal).into()
-        }))
+    exit_code(ended.model.fatal.as_deref(), ended.signal)
+}
+
+/// The exit status once the terminal is the user's again. A signal that
+/// ended the loop decides it: 128 plus the signal's number, as a shell
+/// reports a process the signal killed, not a clean exit. That holds even
+/// when a background task then panicked while a minted token was being
+/// revoked; the panic's reason is still printed. A panic alone fails with
+/// its reason through color_eyre.
+fn exit_code(
+    fatal: Option<&str>,
+    signal: Option<&str>,
+) -> color_eyre::Result<std::process::ExitCode> {
+    match (signal, fatal) {
+        (Some(signal), fatal) => {
+            if let Some(what) = fatal {
+                eprintln!("torrentctl stopped: {what}");
+            }
+            Ok(runtime::signal_exit_status(signal).into())
+        }
+        (None, Some(what)) => color_eyre::eyre::bail!("torrentctl stopped: {what}"),
+        (None, None) => Ok(std::process::ExitCode::SUCCESS),
+    }
 }
 
 /// Log to a file in the XDG state directory, never to the terminal the UI
@@ -103,4 +121,29 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         )
         .init();
     Some(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitCode;
+
+    use super::exit_code;
+    use super::runtime::signal_exit_status;
+
+    #[test]
+    fn a_signal_decides_the_exit_status_even_after_a_panic() {
+        let status = ExitCode::from(signal_exit_status("SIGTERM"));
+        assert_eq!(exit_code(None, Some("SIGTERM")).unwrap(), status);
+        assert_eq!(
+            exit_code(Some("a request panicked: x"), Some("SIGTERM")).unwrap(),
+            status
+        );
+    }
+
+    #[test]
+    fn a_panic_alone_fails_with_its_reason() {
+        let err = exit_code(Some("a request panicked: x"), None).unwrap_err();
+        assert_eq!(err.to_string(), "torrentctl stopped: a request panicked: x");
+        assert_eq!(exit_code(None, None).unwrap(), ExitCode::SUCCESS);
+    }
 }

@@ -219,6 +219,9 @@ pub struct Model {
     /// What to print once the terminal is restored: a revocation on the way
     /// out that failed.
     pub exit_notice: Option<String>,
+    /// Why the client stopped, when a background task panicked: the loop
+    /// ends and the process exits non-zero with it.
+    pub fatal: Option<String>,
     pub login: screens::login::State,
     pub dashboard: screens::dashboard::State,
     pub torrents: screens::torrents::State,
@@ -260,6 +263,9 @@ pub enum Msg {
     /// not be revoked — then this says so, to print once the terminal is
     /// back.
     Exit(Option<String>),
+    /// A background task panicked, with what it said: the model can no
+    /// longer be trusted to reflect the daemon, so the client stops.
+    Fatal(String),
     Login(screens::login::Msg),
     Dashboard(screens::dashboard::Msg),
     Torrents(screens::torrents::Msg),
@@ -290,6 +296,7 @@ impl Model {
             tick: 0,
             quit: false,
             exit_notice: None,
+            fatal: None,
             login: Default::default(),
             dashboard: Default::default(),
             torrents: Default::default(),
@@ -518,6 +525,17 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Exit(notice) => {
             model.exit_notice = notice;
+            model.quit = true;
+            Vec::new()
+        }
+        Msg::Fatal(what) => {
+            // Leave now: a revocation would be one more task on a runtime
+            // that just lost one, so a minted token is only reported.
+            model.fatal = Some(if model.minted {
+                format!("{what}; the session token signed in here was not revoked")
+            } else {
+                what
+            });
             model.quit = true;
             Vec::new()
         }
@@ -990,6 +1008,27 @@ mod tests {
         update(&mut m, Msg::Exit(None));
         assert!(m.quit);
         assert_eq!(m.exit_notice, None, "revoked: nothing to report");
+    }
+
+    /// A background task's panic quits at once, revoking nothing, and says
+    /// when a minted token is left live.
+    #[test]
+    fn a_fatal_message_quits_at_once_and_reports_a_minted_token() {
+        let mut m = signed_in(false);
+        assert!(update(&mut m, Msg::Fatal("a request panicked: x".into())).is_empty());
+        assert!(m.quit);
+        assert_eq!(m.fatal.as_deref(), Some("a request panicked: x"));
+
+        let mut m = model();
+        let minted = m.api.with_token("tds_minted").unwrap();
+        update(&mut m, Msg::SignedIn(minted));
+        assert!(m.minted);
+        assert!(update(&mut m, Msg::Fatal("a request panicked: x".into())).is_empty());
+        assert!(m.quit);
+        assert_eq!(
+            m.fatal.as_deref(),
+            Some("a request panicked: x; the session token signed in here was not revoked")
+        );
     }
 
     /// A daemon that accepts the connection and never answers: the
