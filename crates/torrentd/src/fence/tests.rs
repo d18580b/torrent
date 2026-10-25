@@ -343,6 +343,30 @@ async fn a_batch_resumed_as_the_profile_is_fenced_is_paused_again() {
     assert_eq!(pauses(&engine), [handle(1), handle(2)], "both paused again");
 }
 
+/// A batch that panics on the blocking pool takes the paced resume down
+/// with it, rather than reading as a run stopped short of its torrents.
+#[tokio::test]
+async fn a_batch_that_panics_panics_its_paced_resume() {
+    let (entry, engine) = mock_entry(ProfileStatus::Active);
+    engine.inject_panic("resume_torrent");
+    let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+    let run = tokio::spawn(async move {
+        resume_paced(
+            profiles,
+            ProfileId::new("acct_a"),
+            &[handle(1)],
+            REANNOUNCE_PACE,
+            || false,
+            Arc::new(ResumeGate::default()),
+            Arc::new(PromSink::new()),
+            |_, _| {},
+        )
+        .await
+    });
+    let failed = run.await.expect_err("the batch's panic reaches the run");
+    assert!(failed.is_panic(), "{failed}");
+}
+
 /// A run that passed its cancel check while the profile was fenced, and
 /// whose batch reaches the session only after a lift replaced it and
 /// marked the profile active, resumes nothing: the lift's own run
