@@ -620,6 +620,22 @@ pub(super) fn admit_adoption(
             return Admission::Skipped;
         }
     };
+    // The adopt held the `.torrent` to the indexed info-hash when it queued
+    // it, but the library file can be replaced while the item waits. Added,
+    // another torrent would sit under this one's claim and be persisted as
+    // its `.torrent` (issue #612).
+    if let Err(key) = crate::torrent_keys::torrent_key_mismatch(&item.infohash, &bytes) {
+        warn!(
+            target: "torrentd::pool",
+            infohash = %item.infohash,
+            torrent_infohash = key.map(|k| k.to_hex()).as_deref().unwrap_or("unreadable"),
+            path = %item.torrent_path.display(),
+            "library .torrent no longer names the queued torrent; dropping verify",
+        );
+        q.failed.fetch_add(1, Ordering::Relaxed);
+        release_dropped_claim(pool, Writer::Held(store), registry, &item);
+        return Admission::Skipped;
+    }
     // No SEED_MODE: that is what makes libtorrent hash the payload
     // against the piece hashes before it will seed. The no-download
     // invariant rides along regardless — see `torrentd_engine::policy`.

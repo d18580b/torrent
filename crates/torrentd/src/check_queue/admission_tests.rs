@@ -101,6 +101,21 @@ impl Worker {
     }
 }
 
+/// A one-file `.torrent` named `name`, written to `dir`, and the info-hash
+/// its session keys it by, which admission holds the queued item to.
+fn library_torrent(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, InfoHash) {
+    let mut t = format!(
+        "d4:infod6:lengthi1e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+        name.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    let path = dir.join(format!("{name}.torrent"));
+    std::fs::write(&path, &t).unwrap();
+    (path, libtorrent_safe::info_hash_from_torrent(&t).unwrap())
+}
+
 /// `POST /v1/pool/verifications` naming 50 torrents with
 /// `max_concurrent_verify = 4` never has more than 4 checking at once,
 /// counting an adoption's verification against the same limit, and
@@ -633,17 +648,12 @@ fn adoptions_and_rehashes_waiting_together_are_admitted_in_turn() {
     pool.verify = Arc::new(super::VerifyQueue::new(4));
     let w = Worker::new(dir.path());
     let q = pool.verify_queue();
-    for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
-        let mut t = format!("d4:infod6:lengthi1e4:name1:{name}12:piece lengthi16384e6:pieces20:")
-            .into_bytes();
-        t.extend_from_slice(&[0u8; 20]);
-        t.extend_from_slice(b"ee");
-        let path = dir.path().join(format!("{name}.torrent"));
-        std::fs::write(&path, t).unwrap();
+    for name in ["a", "b", "c"] {
+        let (path, ih) = library_torrent(dir.path(), name);
         q.enqueue(super::PendingVerify {
             torrent_path: path,
             save_path: dir.path().to_path_buf(),
-            ..pending(InfoHash([0xA0 + i as u8; 20]), "p")
+            ..pending(ih, "p")
         });
     }
     let rehashes = [0xB0, 0xB1, 0xB2].map(|b| InfoHash([b; 20]));
@@ -709,12 +719,7 @@ fn a_verify_tick_does_not_wait_on_a_scan_holding_the_writer() {
     w.load(rehash, 2, "p", TorrentPhase::Seeding);
     q.enqueue_recheck(rehash.to_hex(), false);
     // An adoption waiting for a slot.
-    let waiting = InfoHash([0xE2; 20]);
-    let mut t = b"d4:infod6:lengthi1e4:name1:w12:piece lengthi16384e6:pieces20:".to_vec();
-    t.extend_from_slice(&[0u8; 20]);
-    t.extend_from_slice(b"ee");
-    let path = dir.path().join("w.torrent");
-    std::fs::write(&path, t).unwrap();
+    let (path, waiting) = library_torrent(dir.path(), "w");
     q.enqueue(super::PendingVerify {
         torrent_path: path,
         save_path: dir.path().to_path_buf(),
@@ -805,21 +810,10 @@ fn a_fenced_adoption_at_the_head_does_not_hold_back_the_ones_behind_it() {
     pool.verify = Arc::new(super::VerifyQueue::new(4));
     let w = Worker::new(dir.path());
     let q = pool.verify_queue();
-    let fenced = InfoHash([0xD0; 20]);
-    for (i, (ih, profile)) in [
-        (fenced, "down"),
-        (InfoHash([0xD1; 20]), "p"),
-        (InfoHash([0xD2; 20]), "p"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut t =
-            format!("d4:infod6:lengthi1e4:name1:{i}12:piece lengthi16384e6:pieces20:").into_bytes();
-        t.extend_from_slice(&[0u8; 20]);
-        t.extend_from_slice(b"ee");
-        let path = dir.path().join(format!("{i}.torrent"));
-        std::fs::write(&path, t).unwrap();
+    let mut fenced = None;
+    for (i, profile) in ["down", "p", "p"].into_iter().enumerate() {
+        let (path, ih) = library_torrent(dir.path(), &i.to_string());
+        fenced.get_or_insert(ih);
         q.enqueue(super::PendingVerify {
             torrent_path: path,
             save_path: dir.path().to_path_buf(),
@@ -843,7 +837,11 @@ fn a_fenced_adoption_at_the_head_does_not_hold_back_the_ones_behind_it() {
         .iter()
         .map(|v| v.infohash.clone())
         .collect();
-    assert_eq!(held, [fenced.to_hex()], "the fenced one waits, queued once");
+    assert_eq!(
+        held,
+        [fenced.unwrap().to_hex()],
+        "the fenced one waits, queued once"
+    );
 
     // Still fenced on the next tick: held again, and nothing else added.
     w.tick(&pool);
@@ -921,6 +919,39 @@ fn an_adoption_whose_torrent_is_past_the_cap_is_dropped_unread() {
         .iter()
         .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
     assert_eq!((q.failed(), q.depth(), q.in_flight()), (1, 0, 0));
+}
+
+/// Issue #612: an adoption whose library `.torrent` was replaced by another
+/// torrent's after it was queued is dropped at admission as a failed verify,
+/// its registry claim released. Before, the other torrent was added under
+/// this one's claim and persisted as its `.torrent`.
+#[test]
+fn an_adoption_whose_library_torrent_was_replaced_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, queued) = library_torrent(dir.path(), "a");
+    let mut pool = pool_with(dir.path(), queued, None);
+    pool.verify = Arc::new(super::VerifyQueue::new(4));
+    let w = Worker::new(dir.path());
+    w.registry.assign(queued, ProfileId::new("p")).unwrap();
+    let q = pool.verify_queue();
+    q.enqueue(super::PendingVerify {
+        torrent_path: path.clone(),
+        save_path: dir.path().to_path_buf(),
+        ..pending(queued, "p")
+    });
+    // The library file now holds another torrent.
+    let (other_path, other) = library_torrent(dir.path(), "b");
+    assert_ne!(other, queued);
+    std::fs::rename(other_path, &path).unwrap();
+
+    w.tick(&pool);
+    assert!(!w
+        .engine
+        .calls()
+        .iter()
+        .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
+    assert_eq!((q.failed(), q.depth(), q.in_flight()), (1, 0, 0));
+    assert_eq!(w.registry.lookup(&queued), None, "the claim is released");
 }
 
 /// Re-hashes held for a fenced profile log the hold once per profile per
