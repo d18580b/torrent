@@ -30,6 +30,8 @@ mod worker;
 #[cfg(test)]
 pub(crate) use worker::admit_tick_for_tests;
 pub(crate) use worker::force_recheck_marking_checking;
+#[cfg(test)]
+pub(crate) use worker::retire_rechecks_for_tests;
 pub use worker::run_verify_queue;
 pub(crate) use worker::verify_add_params;
 

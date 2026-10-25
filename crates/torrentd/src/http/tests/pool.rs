@@ -1936,6 +1936,42 @@ async fn verification(cov: &Arc<Coverage>) {
     assert!(!q.tracks_recheck(IH_OUTSIDE));
     assert!(!q.tracks_recheck(IH_B));
 
+    // The pool's torrent fails its check: the queue records why, and the
+    // listing carries that reason as the torrent's note.
+    let tick = || {
+        crate::check_queue::admit_tick_for_tests(
+            q,
+            Some(&watched),
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    // Admitted, its check starts; it ends without seeding.
+    tick();
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    h.state.state.update(&hash, |st| {
+        st.phase = torrentd_engine::TorrentPhase::Errored;
+        st.phase_since_check = true;
+        st.checked_at = Some(std::time::Instant::now());
+    });
+    tick();
+    crate::check_queue::retire_rechecks_for_tests(
+        &watched,
+        &*h.state.source,
+        &h.state.state,
+        &h.state.profiles,
+    );
+    assert!(!q.tracks_recheck(IH_A));
+    let listed: Value = h.read("/v1/pool/torrents").await.json();
+    let row = items(&listed)
+        .into_iter()
+        .find(|t| t["infohash"] == IH_A)
+        .unwrap();
+    assert_eq!(row["state"], "drifted");
+    assert_eq!(row["note"], "libtorrent reported an unrecoverable error");
+
     let resp = h
         .send(
             "POST",
