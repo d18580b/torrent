@@ -125,6 +125,8 @@ jobs:
         if: steps.origin.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           out=$(release-plz release --git-token "$GITHUB_TOKEN" -o json)
@@ -133,6 +135,22 @@ jobs:
           # the tag and the release (release-plz.toml).
           tag=$(jq -r '[.releases[] | select(.package_name == "torrentd")][0].tag // ""' <<< "$out")
           version=$(jq -r '[.releases[] | select(.package_name == "torrentd")][0].version // ""' <<< "$out")
+          # A re-run after an earlier attempt created the tag and the draft
+          # and then failed (moving or verifying the tag, below): release-plz
+          # finds the tag and releases nothing. The release is resumed from
+          # this commit's version while its release is still a draft, so the
+          # tag step and the build and publish jobs run again; a published
+          # release, or none, leaves the run doing nothing.
+          if [ -z "$tag" ]; then
+            current=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/torrentd/Cargo.toml", "rb"))["package"]["version"])')
+            draft=$(gh api --paginate "repos/$REPO/releases" \
+              --jq ".[] | select(.draft and .tag_name == \"v$current\") | .id")
+            if [ -n "$draft" ]; then
+              echo "resuming the draft release of v$current"
+              tag=v$current
+              version=$current
+            fi
+          fi
           if [ -n "$tag" ] && [ "$tag" != "v$version" ]; then
             echo "::error::release-plz tagged $tag for version $version"
             exit 1
@@ -302,7 +320,9 @@ jobs:
           if [ -n "$head" ]; then
             git fetch --no-tags origin "$head"
             # A re-run on the same commit: the branch already holds this
-            # release, so its commit, checks and pull request are left alone.
+            # release, so its commit is left alone. The steps below still
+            # dispatch the checks and open or update the pull request, since
+            # the attempt being re-run may have failed before either.
             if [ "$(git rev-parse "$head^")" = "$SHA" ] \
               && git diff --cached --quiet --ignore-submodules=all "$head"; then
               echo "$BRANCH already holds this release of $SHA"
