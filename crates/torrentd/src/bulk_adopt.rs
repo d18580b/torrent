@@ -114,8 +114,9 @@ impl GroupCommit {
     /// is `f`'s own to report: it fails that statement and no other job's,
     /// unless SQLite rolled back the whole transaction for it, which fails
     /// the group with `Err`. So `f` checks
-    /// [`PoolStore::in_open_transaction`] before each write after its first,
-    /// or that write would autocommit while `Err` says it never landed.
+    /// [`PoolStore::in_open_transaction`] before each write that follows
+    /// another statement, a read included, or that write would autocommit
+    /// while `Err` says it never landed.
     pub(crate) fn run<T, G>(
         &self,
         lock: impl FnOnce() -> G,
@@ -381,10 +382,9 @@ mod tests {
                 queue.run(
                     || writer.lock(),
                     move |st| {
-                        // As an adopt's job does: a check before each write
-                        // after its first.
-                        for (i, p) in paths.iter().enumerate() {
-                            if i > 0 && !st.in_open_transaction() {
+                        // As an adopt's job does: a check before each write.
+                        for p in paths {
+                            if !st.in_open_transaction() {
                                 break;
                             }
                             let _ = st.upsert_root(std::path::Path::new(p));

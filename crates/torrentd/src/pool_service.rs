@@ -1458,6 +1458,13 @@ fn execute_adopt(
             let (ih, owner) = (infohash.to_owned(), profile.as_str().to_owned());
             let recorded = pool.with_store_grouped(move |s| {
                 let base = s.adoption_base(&ih).ok().flatten();
+                // A transaction SQLite rolled back fails the whole group
+                // with `Err`, so this value is never read; a read can roll
+                // it back as a write can, and a write now would autocommit
+                // records the caller is told never landed.
+                if !s.in_open_transaction() {
+                    return (Ok(()), Ok(()));
+                }
                 let adoption = s.set_adoption(
                     &ih,
                     AdoptionState::Adopted,
@@ -1467,9 +1474,7 @@ fn execute_adopt(
                     None,
                     None,
                 );
-                // A transaction SQLite rolled back fails the whole group
-                // with `Err`, so this value is never read; writing on would
-                // autocommit an owner the caller is told never landed.
+                // Again after the first write, which can roll it back too.
                 if !s.in_open_transaction() {
                     return (adoption, Ok(()));
                 }
@@ -1568,6 +1573,10 @@ pub(crate) fn enqueue_verify(
         // the item.
         let recorded = match s.profile_of(&row.infohash) {
             Ok(Some(owner)) if owner == row.profile => Ok(false),
+            // As on the fast path: a read that rolled back the transaction
+            // fails the group with `Err`, so this value is never read, and
+            // an owner written now would autocommit.
+            _ if !s.in_open_transaction() => Ok(false),
             _ => s
                 .set_profile(&row.infohash, Some(&row.profile))
                 .map(|()| true),
