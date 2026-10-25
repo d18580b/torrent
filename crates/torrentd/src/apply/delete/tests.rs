@@ -371,6 +371,86 @@ fn deleting_refuses_an_alias_whose_indexed_identity_predates_the_claimed_files()
     assert!(!orphan.exists());
 }
 
+/// Issue #684: a claimed file's row carried from before a reboot can hold
+/// an identity that equals an unrelated orphan's, indexed and live, since
+/// inode numbers repeat across filesystems. The orphan is not that file,
+/// so its delete goes through; a hard link to the claimed file is still
+/// refused, by a message that names the claimed file it is.
+#[test]
+fn deleting_an_orphan_that_collides_with_a_stale_claimed_identity_goes_through() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("pool");
+    let second = dir.path().join("other");
+    let claimed_file = write(&first, "T/a.bin", 16);
+    let orphan = write(&second, "misc/o.bin", 8);
+    std::fs::create_dir_all(second.join("T")).unwrap();
+    let link = second.join("T/a.bin");
+    std::fs::hard_link(&claimed_file, &link).unwrap();
+
+    let mut cfg = Config::minimal_for_tests(dir.path(), true);
+    cfg.pool.as_mut().unwrap().roots.push(second.clone());
+    let pool = PoolService::open(&cfg).unwrap().unwrap();
+    pool.scan().unwrap();
+    let first_id = pool.roots().iter().find(|(_, r)| r == &first).unwrap().0;
+    claimed(&pool, dir.path(), &"ab".repeat(20), "T/a.bin");
+
+    // The claimed file's row, as a rescan that could not stat it would
+    // carry it: an identity the orphan now holds.
+    let orphan_md = std::fs::metadata(&orphan).unwrap();
+    let orphan_id = (orphan_md.dev(), orphan_md.ino());
+    let current = pool
+        .with_store(|st| st.file(first_id, "T/a.bin"))
+        .unwrap()
+        .expect("indexed");
+    let reindex = |row: torrentd_pool::PoolFile| {
+        pool.with_store_mut(|st| {
+            st.begin_staging()?;
+            st.stage_files(&[row])?;
+            st.swap_staged_root(first_id, 0)
+        })
+        .unwrap()
+    };
+    reindex(torrentd_pool::PoolFile {
+        dev: orphan_id.0,
+        ino: orphan_id.1,
+        ..current.clone()
+    });
+    let claimed_ids = pool.with_store(|s| s.claimed_identities()).unwrap();
+    assert!(
+        claimed_ids.contains(&orphan_id),
+        "the stale claimed row collides with the orphan"
+    );
+
+    let mut guards = DeleteGuards::default();
+    delete_file(&pool, &orphan, 1, "1-0", &mut guards)
+        .expect("an orphan that only collides with a stale row is deleted");
+    assert!(!orphan.exists());
+    assert!(second
+        .join(torrentd_pool::plan::TRASH_DIR)
+        .join("1-0/misc/o.bin")
+        .exists());
+
+    // With the claimed row current again, a hard link to the claimed file
+    // is still refused: the claimed file stat'd live is it.
+    reindex(current);
+    let e = failed(delete_file(
+        &pool,
+        &link,
+        1,
+        "1-0",
+        &mut DeleteGuards::default(),
+    ));
+    assert!(
+        e.contains("same file")
+            && e.contains("a torrent claims")
+            && e.contains(&claimed_file.display().to_string()),
+        "got {e}"
+    );
+    assert!(link.exists() && claimed_file.exists());
+}
+
 #[test]
 fn deleting_moves_the_file_into_the_trash_and_a_rescan_ignores_it() {
     let dir = tempfile::tempdir().unwrap();
