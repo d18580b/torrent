@@ -67,8 +67,8 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     // background task ends `run` with `Model::fatal` set.
     let mut terminal = ratatui::init();
     // However the loop ends, a session token minted from the password is
-    // revoked before `run` returns (or resumes a panic in the loop), except
-    // after a background task's panic, which only reports it.
+    // revoked before `run` returns (or resumes a panic in the loop),
+    // including after a background task's panic.
     let ended = runtime.block_on(runtime::run(model, &mut terminal));
     ratatui::restore();
     // Printed only now: on the alternate screen it would vanish with it.

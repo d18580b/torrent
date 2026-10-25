@@ -264,7 +264,8 @@ pub enum Msg {
     /// back.
     Exit(Option<String>),
     /// A background task panicked, with what it said: the model can no
-    /// longer be trusted to reflect the daemon, so the client stops.
+    /// longer be trusted to reflect the daemon, so the client stops, after
+    /// revoking a minted token as a quit does. A second one leaves at once.
     Fatal(String),
     Login(screens::login::Msg),
     Dashboard(screens::dashboard::Msg),
@@ -529,15 +530,30 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Fatal(what) => {
-            // Leave now: a revocation would be one more task on a runtime
-            // that just lost one, so a minted token is only reported.
-            model.fatal = Some(if model.minted {
-                format!("{what}; the session token signed in here was not revoked")
+            if model.fatal.is_some() {
+                // A second panic: leave now, reporting a minted token the
+                // revocation under way may not have reached.
+                if model.minted {
+                    model.exit_notice.get_or_insert_with(|| {
+                        "torrentctl: the session token signed in here was not revoked; it \
+                         stays valid on the daemon until it expires"
+                            .to_owned()
+                    });
+                }
+                model.quit = true;
+                return Vec::new();
+            }
+            // The runtime caught the panic and is intact: the loop stops
+            // drawing (see `runtime::run_with`), and the exit finishes as a
+            // quit does — revoking a minted token, or waiting for an
+            // in-flight sign-in to revoke what it mints. A quit already
+            // under way keeps its revocation in flight.
+            model.fatal = Some(what);
+            if model.quitting {
+                Vec::new()
             } else {
-                what
-            });
-            model.quit = true;
-            Vec::new()
+                update(model, Msg::Quit)
+            }
         }
         Msg::Key(key) => on_key(model, key),
         Msg::Login(screens::login::Msg::Answered(result)) if model.quitting => {
@@ -547,7 +563,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 .ok()
                 .and_then(|token| model.api.with_token(&token).ok())
             {
-                Some(api) => vec![revoke(&api, true)],
+                Some(api) => {
+                    // The token is live and owed this revocation: counted
+                    // as minted, so an exit that cannot wait for it (a
+                    // second panic or signal, or a timeout) reports it.
+                    model.api = api;
+                    model.minted = true;
+                    vec![revoke(&model.api, true)]
+                }
                 None => {
                     model.quit = true;
                     Vec::new()
@@ -1010,25 +1033,87 @@ mod tests {
         assert_eq!(m.exit_notice, None, "revoked: nothing to report");
     }
 
-    /// A background task's panic quits at once, revoking nothing, and says
-    /// when a minted token is left live.
+    /// A background task's panic with nothing to revoke quits at once.
     #[test]
-    fn a_fatal_message_quits_at_once_and_reports_a_minted_token() {
+    fn a_fatal_message_with_nothing_minted_quits_at_once() {
         let mut m = signed_in(false);
         assert!(update(&mut m, Msg::Fatal("a request panicked: x".into())).is_empty());
         assert!(m.quit);
         assert_eq!(m.fatal.as_deref(), Some("a request panicked: x"));
+        assert_eq!(m.exit_notice, None);
+    }
 
+    /// After a password sign-in, a background task's panic revokes the
+    /// minted token as a quit does; a second panic leaves at once and says
+    /// the token stayed valid.
+    #[test]
+    fn a_fatal_message_revokes_a_minted_token_and_a_second_one_reports_it() {
+        let daemon = testing::Recorder::start("204 No Content", "");
+        let mut m = model_at(&daemon);
+        let minted = m.api.with_token("tds_minted").unwrap();
+        update(&mut m, Msg::SignedIn(minted));
+        let effects = update(&mut m, Msg::Fatal("a request panicked: x".into()));
+        assert!(!m.quit, "waits for the revocation");
+        assert!(m.quitting);
+        assert_eq!(m.fatal.as_deref(), Some("a request panicked: x"));
+        let msgs = testing::run(effects);
+        assert_eq!(
+            daemon.requests(),
+            [testing::Request {
+                line: REVOKE.to_owned(),
+                bearer: Some("tds_minted".to_owned()),
+            }],
+            "one revocation, of the minted token"
+        );
+        assert!(matches!(msgs[..], [Msg::Exit(None)]), "{msgs:?}");
+        update(&mut m, Msg::Exit(None));
+        assert!(m.quit);
+        assert_eq!(m.exit_notice, None, "revoked: nothing to report");
+
+        // A second panic before the revocation answers.
         let mut m = model();
         let minted = m.api.with_token("tds_minted").unwrap();
         update(&mut m, Msg::SignedIn(minted));
-        assert!(m.minted);
-        assert!(update(&mut m, Msg::Fatal("a request panicked: x".into())).is_empty());
+        update(&mut m, Msg::Fatal("a request panicked: x".into()));
+        assert!(update(&mut m, Msg::Fatal("a request panicked: y".into())).is_empty());
         assert!(m.quit);
         assert_eq!(
             m.fatal.as_deref(),
-            Some("a request panicked: x; the session token signed in here was not revoked")
+            Some("a request panicked: x"),
+            "the first"
         );
+        let notice = m.exit_notice.expect("a notice");
+        assert!(notice.contains("was not revoked"), "{notice}");
+    }
+
+    /// A panic while a quit's revocation is in flight starts no second one,
+    /// and a sign-in answered during the quit counts as minted: a second
+    /// panic reports its token.
+    #[test]
+    fn a_fatal_message_during_a_quit_keeps_its_revocation_and_counts_a_late_sign_in() {
+        let mut m = model();
+        let minted = m.api.with_token("tds_minted").unwrap();
+        update(&mut m, Msg::SignedIn(minted));
+        assert_eq!(update(&mut m, Msg::Quit).len(), 1, "the revocation");
+        assert!(update(&mut m, Msg::Fatal("a request panicked: x".into())).is_empty());
+        assert!(!m.quit, "still waits for the revocation in flight");
+
+        let mut m = model();
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        m.login.busy = true;
+        update(&mut m, Msg::Quit);
+        assert!(!m.minted);
+        let effects = update(
+            &mut m,
+            Msg::Login(screens::login::Msg::Answered(Ok("tds_late".into()))),
+        );
+        assert_eq!(effects.len(), 1, "its revocation");
+        assert!(m.minted, "the late token is counted");
+        update(&mut m, Msg::Fatal("a request panicked: x".into()));
+        update(&mut m, Msg::Fatal("a request panicked: y".into()));
+        assert!(m.quit);
+        let notice = m.exit_notice.expect("a notice");
+        assert!(notice.contains("was not revoked"), "{notice}");
     }
 
     /// A daemon that accepts the connection and never answers: the

@@ -147,13 +147,29 @@ pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
 /// the names of signals to leave on from `signals` ([`Signals`]).
 /// Whatever ends the loop, a session token the model minted is revoked
 /// before this returns; a panic in the loop is resumed once it has been.
-/// The one exception is a panic on a background task ([`Msg::Fatal`]),
-/// which leaves at once and only reports a minted token.
+/// That includes a panic on a background task ([`Msg::Fatal`]): the loop
+/// stops drawing at once, and [`finish`] revokes the token without drawing.
 pub async fn run_with<K, S>(
+    model: Model,
+    draw: impl FnMut(&Model) -> std::io::Result<()>,
+    keys: K,
+    signals: S,
+) -> Ended
+where
+    K: Stream<Item = std::io::Result<Event>> + Unpin,
+    S: Stream<Item = &'static str> + Unpin,
+{
+    run_spawning(model, draw, keys, signals, Vec::new()).await
+}
+
+/// [`run_with`], spawning `first` alongside the first session check: how a
+/// test puts a background task's panic on the runtime.
+async fn run_spawning<K, S>(
     mut model: Model,
     draw: impl FnMut(&Model) -> std::io::Result<()>,
     keys: K,
     mut signals: S,
+    mut first: Vec<Effect>,
 ) -> Ended
 where
     K: Stream<Item = std::io::Result<Event>> + Unpin,
@@ -164,7 +180,8 @@ where
     // a sign-out changes it.
     let (api_tx, api_rx) = watch::channel(model.api.clone());
     spawn_task(&tx, "the event stream", follow_events(api_rx, tx.clone()));
-    spawn(&tx, vec![app::check_session(&model.api)]);
+    first.push(app::check_session(&model.api));
+    spawn(&tx, first);
 
     let looped = AssertUnwindSafe(drive(
         &mut model,
@@ -220,7 +237,10 @@ where
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while !model.quit {
+    // A background task's panic stops the drawing at once: the panic hook
+    // has handed the terminal back. The exit it started finishes in
+    // [`finish`].
+    while !model.quit && model.fatal.is_none() {
         draw(model)?;
         if std::env::var_os(PANIC_AFTER_DRAW).is_some() {
             panic!("{PANIC_AFTER_DRAW} is set");
@@ -267,7 +287,9 @@ where
 /// mints — without drawing, since the terminal may be gone. Bounded by
 /// [`FINISH_TIMEOUT`]. A second signal leaves at once, unless it is the
 /// `cause` (the signal that ended the loop) again within [`REPEAT_GRACE`],
-/// which is a repeat of it.
+/// which is a repeat of it. Where no signal ended the loop, the first
+/// SIGHUP is taken for its cause — the hangup behind a draw or input error
+/// — and only a signal after that is a second ask.
 async fn finish<S>(
     model: &mut Model,
     tx: &mpsc::UnboundedSender<Msg>,
@@ -285,6 +307,9 @@ async fn finish<S>(
     }
     let started = tokio::time::Instant::now();
     let deadline = started + FINISH_TIMEOUT;
+    // When `cause` last arrived, for telling a repeat of it from a second ask.
+    let mut repeat_from = started;
+    let mut cause = cause;
     // Whether a session token is known to exist: one in use that this client
     // minted, or one a sign-in answered with while quitting, whose
     // revocation is in flight.
@@ -312,7 +337,18 @@ async fn finish<S>(
                 return;
             }
             Some(name) = signals.next() => {
-                if Some(name) == cause && started.elapsed() < REPEAT_GRACE {
+                if cause.is_none() && name == "SIGHUP" {
+                    // The loop ended on its own — a draw or input error, the
+                    // end of the input, a panic — and a hangup follows: the
+                    // terminal going away is what ended it (a draw on a
+                    // closed tty fails with EIO before the SIGHUP lands), so
+                    // this is the same exit, not a second ask.
+                    tracing::debug!(target: "torrentctl::runtime", signal = name, "a hangup after the loop ended: the same exit");
+                    cause = Some(name);
+                    repeat_from = tokio::time::Instant::now();
+                    continue;
+                }
+                if Some(name) == cause && repeat_from.elapsed() < REPEAT_GRACE {
                     tracing::debug!(target: "torrentctl::runtime", signal = name, "the same signal again at once: a repeat, not a second ask");
                     continue;
                 }
@@ -738,6 +774,94 @@ mod tests {
             assert!(ended.model.quit, "{name}");
             assert!(revoked(&daemon), "{name}: {:?}", daemon.requests());
         }
+    }
+
+    /// After a password sign-in, a background task's panic stops the loop
+    /// and the token is still revoked before `run_with` returns.
+    #[tokio::test]
+    async fn a_background_panic_revokes_a_minted_token() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let ended = bounded(run_spawning(
+            minted(&daemon),
+            |_| Ok(()),
+            no_input(),
+            no_signals(),
+            vec![Effect::new(async { panic!("effect blew up") })],
+        ))
+        .await;
+        assert!(ended.result.is_ok());
+        assert_eq!(
+            ended.model.fatal.as_deref(),
+            Some("a request panicked: effect blew up")
+        );
+        assert!(ended.model.quit, "the revocation completed");
+        assert!(revoked(&daemon), "{:?}", daemon.requests());
+        assert_eq!(ended.model.exit_notice, None, "revoked: nothing to say");
+    }
+
+    /// A draw on a closed terminal fails before the hangup's SIGHUP lands:
+    /// that SIGHUP, and the kernel's repeat of it, are the same exit, and
+    /// the token is still revoked.
+    #[tokio::test]
+    async fn a_hangup_after_a_draw_error_still_revokes() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let ended = bounded(run_with(
+            minted(&daemon),
+            |_| Err(std::io::Error::other("EIO")),
+            no_input(),
+            futures_util::stream::iter(["SIGHUP", "SIGHUP"]),
+        ))
+        .await;
+        assert_eq!(ended.result.expect_err("the draw error").to_string(), "EIO");
+        assert!(ended.model.quit, "the revocation completed");
+        assert!(revoked(&daemon), "{:?}", daemon.requests());
+    }
+
+    /// After a draw error and its hangup, a distinct signal, or the hangup
+    /// again once [`REPEAT_GRACE`] has passed, is a second ask: it leaves
+    /// without waiting for the revocation.
+    #[tokio::test]
+    async fn a_second_ask_after_a_draw_error_and_its_hangup_leaves_without_waiting() {
+        let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", wedged.local_addr().expect("an address"));
+        let model = || {
+            let api = Api::new(&url, Some("tds_minted")).expect("a valid URL");
+            let mut model = Model::new(api, crate::testing::theme());
+            model.minted = true;
+            model
+        };
+        let draw = |_: &Model| Err(std::io::Error::other("EIO"));
+
+        let started = Instant::now();
+        let ended = bounded(run_with(
+            model(),
+            draw,
+            no_input(),
+            futures_util::stream::iter(["SIGHUP", "SIGINT"]),
+        ))
+        .await;
+        assert!(
+            started.elapsed() < crate::app::REVOKE_TIMEOUT,
+            "left after {:?}",
+            started.elapsed()
+        );
+        assert!(ended.model.quitting && !ended.model.quit);
+
+        let signals = futures_util::stream::once(async { "SIGHUP" }).chain(
+            futures_util::stream::once(async {
+                tokio::time::sleep(REPEAT_GRACE + Duration::from_millis(200)).await;
+                "SIGHUP"
+            }),
+        );
+        let started = Instant::now();
+        let ended = bounded(run_with(model(), draw, no_input(), Box::pin(signals))).await;
+        let left = started.elapsed();
+        assert!(
+            left >= REPEAT_GRACE && left < crate::app::REVOKE_TIMEOUT,
+            "left after {left:?}"
+        );
+        assert!(ended.model.quitting && !ended.model.quit);
+        drop(wedged);
     }
 
     #[tokio::test]
