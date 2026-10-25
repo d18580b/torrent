@@ -390,9 +390,12 @@ pub fn render_ruleset(uid: u32, tunnels: &[Tunnel]) -> io::Result<String> {
     render_ruleset_with_transport(uid, tunnels, &[])
 }
 
-/// [`render_ruleset`], plus the tunnels' own transport: for each of
-/// `transports`, a UDP datagram of `uid`'s from its listen port to each of its
-/// peer endpoints is accepted on any interface, ahead of the drop.
+/// Render the fail-closed nftables ruleset confining uid `uid`'s egress to
+/// loopback and to each of `tunnels`' interfaces from that tunnel's own
+/// address, plus the tunnels' own transport: for each of `transports`, a UDP
+/// datagram of `uid`'s from its listen port to each of its peer endpoints is
+/// accepted on any interface, ahead of the drop. Pure (no I/O). Refuses an
+/// interface name it cannot quote; see [`check_interface_names`].
 ///
 /// This is the ruleset `enable` installs. Without it no WireGuard link
 /// carries the daemon's traffic: the encrypted UDP to the provider leaves by

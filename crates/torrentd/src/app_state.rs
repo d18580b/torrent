@@ -35,7 +35,7 @@ pub struct AppState {
     /// Resume-data store.
     ///
     /// Only the delete path needs it here. An engine-backed removal gets both
-    /// stores cleaned for free through `TorrentRemoved` ->
+    /// stores cleaned for free through `TorrentRemoved` -> the engine's
     /// `handlers/add.rs`; the branch that clears a registry entry for a
     /// profile with no session has no such alert, and without this the files
     /// stayed on disk and the startup scan re-assigned the info-hash at the

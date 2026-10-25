@@ -5,10 +5,10 @@
 //! — to the tunnel device where the kernel allows `SO_BINDTODEVICE`. Its
 //! listen sockets, which also send its uTP and UDP tracker traffic, are
 //! device-bound only as far as libtorrent's own best effort goes (see
-//! `startup.rs`), so for them, and for TCP where the device binding is
-//! refused, these rules are what keeps the traffic in the tunnel. What a tunnel needs from the routing table is
-//! narrow: traffic *from* its address goes to a table of its own, whose
-//! routes all point at the tunnel.
+//! `startup::profiles`), so for them, and for TCP where the device binding
+//! is refused, these rules are what keeps the traffic in the tunnel. What a
+//! tunnel needs from the routing table is narrow: traffic *from* its address
+//! goes to a table of its own, whose routes all point at the tunnel.
 //! Nothing else on the host is rerouted, and no tunnel's routes are visible to
 //! another tunnel's traffic.
 //!

@@ -3,10 +3,12 @@
 //! `crates/torrentd-bench/budgets.toml`: a million files and 5,000 torrents
 //! under one root.
 //!
-//! This binary wires together the
-//! torrentd-engine layer (TorrentEngine, alert loop, registry) with
-//! configuration, signals, a kynos HTTP control plane, and the VPN /
-//! netlink integration. Run with `--config <path>` it is the daemon; the
+//! This binary wires the torrentd-engine layer (`TorrentEngine`, the alert
+//! loop, the state map and the resume and `.torrent` stores) together with
+//! the assignment registry ([`registry`]), configuration, signals, a kynos
+//! HTTP control plane ([`http`]), the managed pool ([`pool_service`]), and
+//! the VPN and kill-switch integration ([`vpn`]); [`startup`] runs the
+//! daemon. Run with `--config <path>` it is the daemon; the
 //! subcommands in [`cli`] are operator tools that run to completion instead.
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -1036,7 +1038,7 @@ http_listen = "127.0.0.1:8080"
         .unwrap();
     }
 
-    /// #229: an OpenVPN profile whose `.ovpn` names a hook or a plugin is
+    /// An OpenVPN profile whose `.ovpn` names a hook or a plugin is
     /// refused by `--check-config` — and by the daemon's pre-flight, which
     /// is the same call — with the profile, the file and the directive
     /// named. A file the check cannot read is left to that profile's

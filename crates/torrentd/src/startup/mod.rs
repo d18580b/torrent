@@ -5,6 +5,19 @@
 //! of them becomes one `Arc<dyn AlertSource>` that the rest of the daemon
 //! consumes uniformly. A deployment with a single profile is that set with
 //! n = 1.
+//!
+//! This module runs the stages in order; each stage is a submodule.
+//! [`refusal`] names the boot failures that are the configuration's, and
+//! [`limits`] checks the open-file budget. [`profiles`] raises each
+//! profile's tunnel, port and session, and [`cleanup`] takes down what a
+//! boot that fails part-way left on the host. [`listen_check`] checks that
+//! every vpn session's listen sockets are held to its tunnel device. [`scan`] re-adds the
+//! resume files and `.torrent`s, under the fence [`scan_fence`] keeps over
+//! fenced profiles. [`tasks`] supervises the background tasks, and
+//! [`http_stage`] binds and serves the API. After the HTTP drain,
+//! [`teardown`] takes the daemon off the network, and [`shutdown_report`]
+//! records what the exit leaves for the next boot to report and removes the
+//! kill switch on the way out.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -135,8 +148,8 @@ fn boot_shutdown_receivers(
 /// ([`between_scan_batches`](scan::between_scan_batches)).
 const BOOT_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// The resume store's batch-writer error hook: count the failure as the
-/// handler used to, and mark the torrent's file stale. The handler has
+/// The resume store's batch-writer error hook: count the failure under
+/// `resume_write_errors_total`, and mark the torrent's file stale. The handler has
 /// already cleared `needs_save_resume` by then, and libtorrent its modified
 /// bit, so without the mark no `ONLY_IF_MODIFIED` save, the shutdown drain's
 /// included, would ever rewrite it.
@@ -1486,7 +1499,7 @@ mod tests {
         }
     }
 
-    /// The signal seam that used to have 400 lines in it.
+    /// A shutdown raised during boot reaches both of `boot`'s receivers.
     ///
     /// `subscribe()` sets a new receiver's cursor to the channel's current
     /// tail, so a receiver created after a send provably cannot see it. Both

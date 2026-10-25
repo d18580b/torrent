@@ -5,6 +5,15 @@
 //! described in one OpenAPI 3.2 document derived from the handlers and their
 //! types, published at `GET /v1/openapi.json` and committed at
 //! `docs/api/openapi.json`, where CI fails if it goes stale.
+//!
+//! [`v1`] holds the versioned operations, and `healthz` and `metrics` the
+//! two root routes. What every operation shares sits beside them: [`ctx`]
+//! is the context a handler runs against, [`security`] the bearer scheme and
+//! the unauthenticated posture's gate, [`forwarded`] the real client behind
+//! a trusted proxy, `headers` the headers every response carries, [`page`]
+//! the cursor pagination, and [`validate`] the answer to a request that
+//! breaks a declared constraint. `fault_injection` exists only in a
+//! `fault-injection` build.
 
 pub mod ctx;
 #[cfg(feature = "fault-injection")]

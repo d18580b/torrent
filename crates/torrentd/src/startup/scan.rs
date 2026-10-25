@@ -72,8 +72,9 @@ pub(super) async fn between_scan_batches(
 /// `DELETE` writes a tombstone before it removes a torrent, and the removal
 /// alert's handler clears it once the torrent's files are gone. One still
 /// standing is a delete a crash cut short or a file that would not delete:
-/// its resume file, `.torrent` and save path are deleted now, and the torrent
-/// is not loaded, whatever of them is left. The tombstone is cleared once they
+/// its resume file, `.torrent` and `.save_path` sidecar are deleted now (its
+/// payload is not touched), and the torrent is not loaded, whatever of them
+/// is left. The tombstone is cleared once they
 /// are gone, and kept for the next boot otherwise; each failure is counted
 /// under `torrent_remove_cleanup_errors_total`.
 ///
@@ -490,7 +491,8 @@ fn torrent_dir_scan_params(
 
 /// `params`, added paused: a `.torrent` whose first check waits for a slot
 /// in the check queue, which resumes it. A resume add is paused whatever its
-/// resume data says, and whatever `paced` cleared.
+/// resume data says, and whatever `paced` cleared. A magnet is returned
+/// unchanged: the boot scans never add one.
 fn with_paused(mut params: AddParams) -> AddParams {
     let paused = libtorrent_safe::TorrentFlags::PAUSED;
     match &mut params {

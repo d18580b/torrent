@@ -709,13 +709,14 @@ fn clear_unheld(
 ) -> Result<(), DeleteTorrentError> {
     // The two stores first, then the registry entry.
     //
-    // Clearing the registry entry alone does not hold: `startup.rs` re-scans
+    // Clearing the registry entry alone does not hold: `startup::scan` re-scans
     // `<resume_dir>/<id>` and `<torrent_dir>/<id>` at the next start and
     // re-`assign`s every info-hash it finds, so the operator's clear would be
     // silently undone the first time the daemon restarts. The engine-backed
     // path deletes them in the request too, under a tombstone, and again in
-    // `TorrentRemoved` -> `handlers/add.rs`; with no session there is no
-    // removal to race and no alert, so the deletes alone are done here.
+    // `TorrentRemoved` -> the engine's `handlers/add.rs`; with no session
+    // there is no removal to race and no alert, so the deletes alone are
+    // done here.
     //
     // The order is what makes the advice below true. Clearing the registry
     // first and deleting after would mean a failed delete tells the operator
