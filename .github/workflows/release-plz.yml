@@ -196,7 +196,7 @@ jobs:
               echo "$TAG names $commit, the release pull request's head that $SHA merges with the same tree; moving it to $SHA"
               commit=$SHA
             else
-              echo "::error::$TAG names $commit, which is neither the released commit $SHA nor a parent of it with the same tree, so nothing is built or published. Re-running this run fails the same way. Recover with: gh release delete $TAG --repo $REPO --cleanup-tag --yes; the next push to master proposes the release again, and its pull request is merged once release-plz-next is up to date with master (README.md, Releasing)."
+              echo "::error::$TAG names $commit, which is neither the released commit $SHA nor a parent of it with the same tree, so nothing is built or published. Re-running this run fails the same way. Recover with: gh release delete $TAG --repo $REPO --cleanup-tag --yes; then squash-merge a pull request from a release-plz-retry-$TAG branch of this repository that changes no version (an empty commit is enough), which releases $TAG again: master already holds its version, so no release pull request may return (README.md, Releasing)."
               exit 1
             fi
           fi
