@@ -11,9 +11,11 @@
 //! `parking_lot::Mutex` and every call goes through that lock, which is what
 //! makes `RealEngine` `Sync`: the shim allows one caller per session at a
 //! time (its alert pop takes no lock), so the mutex is required for
-//! soundness, not only for ordering. Every engine call, the HTTP handlers'
-//! included, waits on that one lock, which is why `pop_alerts` converts at
-//! most [`MAX_ALERTS_PER_POP`] alerts per acquisition.
+//! soundness, not only for ordering. Every engine call but one, the HTTP
+//! handlers' included, waits on that one lock, which is why `pop_alerts`
+//! converts at most [`MAX_ALERTS_PER_POP`] alerts per acquisition. The
+//! exception is `alert_translate_errors`, which reads the count the last
+//! `pop_alerts` stored in an atomic and never touches the session.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
