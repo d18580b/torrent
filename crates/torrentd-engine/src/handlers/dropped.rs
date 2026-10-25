@@ -595,6 +595,63 @@ mod tests {
         assert!(!state.contains(&h.infohash));
     }
 
+    /// Records every `u64` field of the `warn` events dispatched to it, by
+    /// name, so a test can read what the journal line says.
+    #[derive(Default)]
+    struct WarnFields(parking_lot::Mutex<Vec<(&'static str, u64)>>);
+
+    impl tracing::field::Visit for &WarnFields {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.lock().push((field.name(), value));
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl tracing::Subscriber for WarnFields {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = self;
+                event.record(&mut visitor);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The overflow's warning counts the kinds it dropped, and the one for
+    /// dropped add alerts counts the torrents it tracked again: the numbers
+    /// an operator reads to size what the overflow cost.
+    #[test]
+    fn the_overflow_warnings_count_what_was_dropped_and_recovered() {
+        let mock = Arc::new(MockEngine::new());
+        mock.register_handle(InfoHash([1; 20]));
+        mock.register_handle(InfoHash([2; 20]));
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        let fields = Arc::new(WarnFields::default());
+        crate::testing::with_subscriber(Arc::clone(&fields), || {
+            run_on(mock, &state, &metrics, ADD_DROPPED);
+        });
+        let fields = fields.0.lock().clone();
+        let field = |name: &str| -> Vec<u64> {
+            fields
+                .iter()
+                .filter(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .collect()
+        };
+        assert_eq!(field("kinds"), vec![1], "{fields:?}");
+        assert_eq!(field("torrent_count"), vec![2], "{fields:?}");
+    }
+
     const REMOVED_DROPPED: [u64; 2] = [1u64 << TORRENT_REMOVED_TYPE, 0];
 
     /// Handle an overflow with `bits` against `engine`, in profile `p`, with
@@ -814,6 +871,62 @@ mod tests {
         assert!(state.contains(&ih));
         assert_eq!(torrents.load_all(&p).unwrap().len(), 1);
         assert_eq!(metrics.count_for("removals_reconciled_total"), 0);
+    }
+
+    /// The warning counts as unrecorded only an entry still tracked under
+    /// the handle the session lost: not one whose entry went, or moved to
+    /// another handle, between the listing and the settling.
+    #[test]
+    fn only_an_entry_still_tracked_under_the_lost_handle_counts_as_unrecorded() {
+        let mock = Arc::new(MockEngine::new());
+        let (state, resume, torrents) = (
+            StateMap::new(),
+            MemoryResumeStore::new(),
+            MemoryTorrentStore::new(),
+        );
+        let metrics = RecordingSink::new();
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let p = ProfileId::new("p");
+        let now = std::time::Instant::now();
+        // Lost with no removal recorded, and still tracked under its handle.
+        let lost = mock.register_handle(InfoHash([10; 20]));
+        assert!(state.track_added(lost, &p, true, now));
+        // Listed under a handle the map has since replaced.
+        let stale = mock.register_handle(InfoHash([11; 20]));
+        let current = mock.register_handle(InfoHash([11; 20]));
+        assert!(state.track_added(current, &p, true, now));
+        // Listed, and gone from the map since.
+        let gone = mock.register_handle(InfoHash([12; 20]));
+        let ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            fence_hold: None,
+            profile_id: p.clone(),
+            span: tracing::info_span!("test"),
+        };
+
+        let fields = Arc::new(WarnFields::default());
+        crate::testing::with_subscriber(Arc::clone(&fields), || {
+            reconcile_removals(&ctx, vec![lost, stale, gone], &[current]);
+        });
+        let fields = fields.0.lock().clone();
+        let field = |name: &str| -> Vec<u64> {
+            fields
+                .iter()
+                .filter(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .collect()
+        };
+        assert_eq!(field("unrecorded_count"), vec![1], "{fields:?}");
+        assert_eq!(field("torrent_count"), vec![0], "{fields:?}");
+        assert!(state.contains(&lost.infohash));
+        assert_eq!(state.get(&current.infohash).unwrap().handle, current);
     }
 
     #[test]

@@ -512,9 +512,35 @@ The `torrentd_pool_verify_*`, `torrentd_pool_recheck_dropped_total` and
 [`deploy/metrics.md`](../deploy/metrics.md). `GET /v1/pool` reports the queue
 as `verify_queue_depth` and `verify_in_flight`.
 
-- **A failed verification** pauses the torrent and records it `drifted`: the
-  payload does not match its piece hashes. The log says `verification did not
-  leave the torrent seeding; pausing it`.
+- **A failed verification** pauses the torrent, records it `drifted` (the
+  reason is kept in the pool database's `adoption.last_error`, and
+  `GET /v1/pool/torrents` returns it as the torrent's `note`), and counts it
+  in `torrentd_pool_verify_failed_total`. The log says `verification did not
+  leave the torrent seeding; pausing it`, and its `reason` field says which
+  of these it was:
+  - `payload failed verification against the piece hashes`: the check
+    finished and the payload does not match.
+  - `hashing ended without a torrent_checked report and the torrent is not
+    seeding`: the torrent showed a finished check's phase (`incomplete` or
+    `idle`) for 5 seconds, but its `torrent_checked` alert was lost (alert
+    overflow does not replay it). The payload most likely does not match.
+  - `libtorrent reported an unrecoverable error`.
+  - `no verification verdict within the check expiry`: for 24 hours the
+    adoption showed neither a running check (`checking`) nor a held one
+    (`paused`), and no verdict came. Either it never appeared in the session,
+    or it was stuck in a phase no check leads to, such as a disk error that
+    did not clear. A check that runs longer than a day, or an adoption held
+    paused (behind the held-add queue, or by a fenced profile), is never
+    expired this way: it keeps its slot until it ends or is removed.
+
+  None of these is final. Once the cause is fixed, resume the torrent with
+  `POST /v1/torrents/{infohash}/resume`, then re-verify it with `POST
+  /v1/pool/verifications`, and `drifted` clears if the payload is good. Resume
+  it first: the failure left it paused, and `POST /v1/pool/verifications`
+  skips a paused torrent, because libtorrent does not hash one. Resuming has
+  a cost: it puts the payload the piece hashes rejected back on the network
+  until the check ends. Fix the cause before you resume, and decide whether
+  that window is acceptable; nothing resumes the torrent for you.
 - **A dropped item** never reached a session: its `.torrent` could not be
   read from `library_dir`, its profile stopped, the tracker check failed at
   admission, or libtorrent rejected the add. Its registry claim is released,

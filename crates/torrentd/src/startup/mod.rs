@@ -276,9 +276,10 @@ pub async fn boot(
     // Signals, installed before anything that can block or fail, so a
     // SIGTERM during a tunnel bring-up is handled rather than fatal.
     let channels = SignalChannels::new();
-    let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
     // The HTTP surface asks for a reload the same way SIGHUP does, through
-    // this channel, so both paths converge on one implementation.
+    // this channel, so both paths converge on one implementation. It holds
+    // one request, so a second one while it waits is `409 reload-pending`.
+    let (reload_tx, reload_rx) = crate::http::v1::server::reload_queue();
     let reload_tx_for_api = reload_tx.clone();
     let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
     let shutdown_tx = channels.shutdown_tx.clone();
@@ -809,7 +810,7 @@ pub async fn boot(
 
     // The two boot scans, resume files first: a torrent with resume data is
     // loaded from it, and the torrent-dir scan adds only what no resume file
-    // covered.
+    // covered: a `.torrent`, else a magnet's recorded URI.
     let mut tally = ScanTally::default();
     {
         let inputs = ScanInputs {

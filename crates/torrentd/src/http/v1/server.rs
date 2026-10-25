@@ -731,6 +731,21 @@ fn pool_fingerprint(
     }
 }
 
+/// The reload queue `SIGHUP` and `POST /v1/config/reload` share.
+///
+/// It holds one reload. The reload task takes a request off the queue before
+/// it re-reads the file, so a queued reload reads the file as it stands when
+/// it runs and stands for every request made while it waits: a second one
+/// adds nothing, and is answered `409 reload-pending` rather than queued. A
+/// request made while a reload is *running* finds the queue empty and is
+/// queued behind it.
+pub fn reload_queue() -> (
+    tokio::sync::mpsc::Sender<()>,
+    tokio::sync::mpsc::Receiver<()>,
+) {
+    tokio::sync::mpsc::channel(1)
+}
+
 /// Why a reload was not queued.
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
@@ -755,7 +770,10 @@ pub enum ReloadError {
 /// `max_concurrent_http_announces`); the reload task logs what it applied and
 /// warns about anything that needs a restart. `202` means the request was
 /// queued, not that it succeeded, and it is also the answer when nothing in
-/// the file could be applied. `[auth]` is one of the restart-only sections:
+/// the file could be applied. One reload is queued at a time: a request made
+/// while one is queued and has not started is `409 reload-pending`, since the
+/// queued reload will read the same file, and one made while a reload is
+/// running is queued behind it. `[auth]` is one of the restart-only sections:
 /// a `[[auth.token]]` removed from the file keeps authenticating until the
 /// daemon restarts.
 #[kynos::post("/config/reload", tag = Server)]

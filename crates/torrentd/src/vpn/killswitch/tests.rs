@@ -28,7 +28,27 @@ fn a_second_table_lock_refuses_and_names_the_holder() {
         "the refusal names the socket and the table: {msg}"
     );
     drop(first);
-    TableLock::acquire_named(&name).expect("the lock is free once the holder is gone");
+    reacquire_after_drop(&name).expect("the lock is free once the holder is gone");
+}
+
+/// Take the lock on `name` just after its holder was dropped. Another test
+/// in this binary that spawns a process forks a child holding a copy of
+/// every descriptor, the socket included, until that child execs and
+/// close-on-exec closes it; for that window the name is still bound. So
+/// a refusal here is retried for up to a second, and any other failure,
+/// or a refusal that outlasts the second, is returned.
+fn reacquire_after_drop(name: &str) -> io::Result<TableLock> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match TableLock::acquire_named(name) {
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrInUse && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The lock is on the table's own name, so a lock on another uid's
@@ -41,6 +61,110 @@ fn another_uids_table_lock_does_not_refuse() {
     let _a = TableLock::acquire_named(&a).expect("one uid's lock");
     TableLock::acquire_named(&b).expect("another uid's lock is not refused");
     assert_eq!(table_name(1000), "torrentd_ks_1000");
+}
+
+/// The table an operator is told to delete is this process's own.
+#[test]
+fn the_own_table_is_this_uids() {
+    assert_eq!(own_table_name(), table_name(current_uid().unwrap()));
+}
+
+/// The uid the ruleset confines is this process's effective one, as the
+/// kernel reports it.
+#[test]
+fn the_current_uid_is_the_effective_uid() {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    assert_eq!(current_uid().unwrap(), unsafe { libc::geteuid() });
+}
+
+/// `--check-config` reports nftables usable exactly when `nft --version`
+/// runs and exits zero on this host.
+#[test]
+fn nft_is_available_exactly_when_it_runs() {
+    let runs = std::process::Command::new("nft")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert_eq!(nft_available(), runs);
+}
+
+/// A link that does not exist has no listen port to exempt, whether `wg`
+/// is installed or not.
+#[test]
+fn a_link_that_does_not_exist_has_no_listen_port() {
+    listen_port("tdks-nolink0").expect_err("no such link");
+}
+
+/// Set in the process [`a_bind_failure_without_a_holder_is_no_refusal`]
+/// starts, the only one in which its half that exhausts descriptors runs.
+const EXHAUST_DESCRIPTORS: &str = "TORRENTD_TEST_KS_EXHAUST_DESCRIPTORS";
+
+/// A bind that fails for want of a descriptor keeps its own kind, and says
+/// what failed, instead of reading as another process holding the lock.
+/// The descriptor limit is shared by every test in the binary, so the half
+/// that exhausts it runs in a process of its own: this test binary again,
+/// filtered to that one test.
+#[test]
+fn a_bind_failure_without_a_holder_is_no_refusal() {
+    let name = "vpn::killswitch::tests::bind_without_a_descriptor";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(EXHAUST_DESCRIPTORS, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the filter ran no test: {stdout}"
+    );
+}
+
+#[test]
+#[ignore = "run by a_bind_failure_without_a_holder_is_no_refusal"]
+fn bind_without_a_descriptor() {
+    if std::env::var_os(EXHAUST_DESCRIPTORS).is_none() {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit`.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+        0
+    );
+    // No descriptor above those already open.
+    let lowered = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `lowered` is a valid `rlimit` no higher than the hard limit.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) },
+        0
+    );
+    let lock = TableLock::acquire_named(&lock_name("emfile"));
+    // SAFETY: `limit` is the `rlimit` read above.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+        0
+    );
+    let err = lock.expect_err("no descriptor is left for the socket");
+    assert_ne!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("bind the abstract unix socket @"),
+        "{err}"
+    );
 }
 
 /// `/proc/net/unix`'s abstract entries are found by their exact name and
@@ -844,18 +968,31 @@ fn a_legacy_failure_after_the_own_table_is_removed_is_a_warning() {
     let listing = || Ok(format!("table inet torrentd_ks\ntable inet {TABLE}\n"));
 
     let deleted = std::cell::RefCell::new(Vec::new());
-    let removed = disable_with(
-        998,
-        listing,
-        |_| Err(io::Error::other("nft -j list table exited 1")),
-        |name| {
-            deleted.borrow_mut().push(name.to_string());
-            Ok(())
-        },
-    )
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let removed = torrentd_engine::testing::with_subscriber(subscriber, || {
+        disable_with(
+            998,
+            listing,
+            |_| Err(io::Error::other("nft -j list table exited 1")),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+    })
     .expect("the own table is gone, so the call succeeds");
     assert!(removed);
     assert_eq!(*deleted.borrow(), [TABLE], "only the own table is deleted");
+    // The warning is the only place the failure is reported, and it says how
+    // to remove the table by hand.
+    let log = log.text();
+    assert!(
+        log.contains("nft -j list table exited 1")
+            && log.contains("nft delete table inet torrentd_ks"),
+        "{log}"
+    );
 
     let deleted = std::cell::RefCell::new(Vec::new());
     let removed = disable_with(
@@ -956,6 +1093,42 @@ fn disable_against_real_nft() {
     );
     assert!(!remove_table_for(998).expect("and deleting it again is still success"));
     assert!(remove_table_for(1000).expect("uid 1000's own removal takes it"));
+}
+
+/// The renderer writes `!=` only against a set of interface names, so a
+/// listing reading `oifname != "<one name>"` is not a rule it installed.
+#[test]
+fn a_negated_single_interface_match_is_not_a_rule_the_kill_switch_installs() {
+    let set = serde_json::json!([
+        {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}},
+                   "right": {"set": ["wg0", "lo"]}}},
+        {"drop": null},
+    ]);
+    assert_eq!(
+        rule_line(&set).unwrap(),
+        "oifname != { \"lo\", \"wg0\" } drop"
+    );
+    let single = serde_json::json!([
+        {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
+        {"drop": null},
+    ]);
+    rule_line(&single).expect_err("never installed");
+}
+
+/// `remove_table` and `disable` act on this process's own uid's table, and
+/// say whether there was one.
+#[test]
+#[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+fn removing_the_own_table_against_real_nft() {
+    let own = own_table_name();
+    let table = render_ruleset(current_uid().unwrap(), &[tunnel("wg0")]).unwrap();
+    apply(&table).expect("install this uid's table");
+    assert!(remove_table().expect("remove it"), "there was a table");
+    assert!(!table_listed(&list_tables().expect("list"), &own));
+    assert!(!remove_table().expect("nothing left"), "there was none");
+    apply(&table).expect("install it again");
+    disable().expect("disable removes it");
+    assert!(!table_listed(&list_tables().expect("list"), &own));
 }
 
 /// A table an earlier release left under the shared name, against a real
@@ -1843,6 +2016,32 @@ fn a_check_that_cannot_run_n_times_fences() {
         metrics.count_for("kill_switch_probe_errors_total"),
         u64::from(PROBE_FAILURES_TO_FENCE) * 2,
     );
+}
+
+/// The error that says the kill switch cannot be checked is logged by the
+/// check that fences, once, and not again by each later one that fences
+/// again.
+#[test]
+fn only_the_check_that_starts_fencing_logs_the_error() {
+    use crate::vpn_monitor::PROBE_FAILURES_TO_FENCE;
+    let fence = Recorded::default();
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let errors = || {
+        log.text()
+            .lines()
+            .filter(|l| l.contains("could not be checked this many times in a row"))
+            .count()
+    };
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        let fenced = unchecked(Watch::Unchecked(PROBE_FAILURES_TO_FENCE - 1), &fence);
+        assert_eq!(fenced, Watch::Unverified);
+        assert_eq!(errors(), 1, "the check that fences says so");
+        assert_eq!(unchecked(fenced, &fence), Watch::Unverified);
+        assert_eq!(errors(), 1, "a later one does not say it again");
+    });
+    assert_eq!(fence.take(), ["fence unverifiable", "fence unverifiable"]);
 }
 
 /// A table found gone while the watch is fenced for checks that could not

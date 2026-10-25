@@ -19,7 +19,7 @@ use crate::torrent_store::TorrentStore;
 pub struct RemovalCleanup {
     /// The resume file is still there.
     pub resume_failed: bool,
-    /// The `.torrent` or its save path is still there.
+    /// The `.torrent`, its magnet URI or its save path is still there.
     pub torrent_failed: bool,
     /// The tombstone could not be written or cleared, as asked.
     pub tombstone_failed: bool,
@@ -44,8 +44,8 @@ pub enum Tombstone {
 }
 
 /// Delete what would bring `(profile, ih)` back at the next boot: its resume
-/// file, and its `.torrent` and save path unless `keep_torrent` (they are a
-/// re-add's). Each delete that fails is logged and counted under
+/// file, and its `.torrent`, magnet URI and save path unless `keep_torrent`
+/// (they are a re-add's). Each delete that fails is logged and counted under
 /// [`REMOVE_CLEANUP_ERRORS`].
 ///
 /// For `DELETE`, which runs this before it answers and keeps the tombstone it

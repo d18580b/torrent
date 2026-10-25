@@ -647,7 +647,7 @@
           "server"
         ],
         "summary": "Re-read the configuration file.",
-        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
+        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. One reload is queued at a time: a request made\nwhile one is queued and has not started is `409 reload-pending`, since the\nqueued reload will read the same file, and one made while a reload is\nrunning is queued behind it. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
         "operationId": "reload_config",
         "responses": {
           "401": {
@@ -11144,6 +11144,13 @@
               "null"
             ],
             "description": "The directory, relative to its root, the payload was matched at;\n`null` when unmatched."
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why its state is what it is, where the state alone does not say,\nfrom whichever last set it: a scan's match (for example how many of\nits files are present, that its on-disk stats changed since it was\nverified, that another torrent claims the same files, or that it has\nmore than one complete copy, which makes a delete plan refuse to\ntouch any of them), or a verification that failed (why its payload\ndid not check out). `null` when there is nothing to add."
           },
           "profile_id": {
             "type": [

@@ -250,3 +250,55 @@ fn torrents_page_is_keyset_paged_in_infohash_order_and_filters_by_state() {
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].base_rel.as_deref(), Some(""));
 }
+
+#[test]
+fn torrents_page_carries_the_note_the_match_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "whole/a.bin", 5);
+    write_file(root, "half/a.bin", 6);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let base = root.display().to_string();
+    add_torrent(
+        &mut store,
+        "01",
+        "whole",
+        Some(&base),
+        &[("whole/a.bin", 5)],
+    );
+    add_torrent(
+        &mut store,
+        "02",
+        "half",
+        Some(&base),
+        &[("half/a.bin", 6), ("half/b.bin", 7)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    // Never matched: no adoption row, so no note either.
+    add_torrent(&mut store, "03", "new", None, &[("new/x", 1)]);
+
+    let notes = |rows: Vec<torrentd_pool::store::TorrentListing>| {
+        rows.into_iter()
+            .map(|r| (r.torrent.infohash, r.note))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        notes(store.torrents_page(None, None, 10).unwrap()),
+        [
+            ("01".to_owned(), None),
+            ("02".to_owned(), Some("1 of 2 files present".to_owned())),
+            ("03".to_owned(), None),
+        ],
+    );
+    // The state-filtered query reads the note too.
+    assert_eq!(
+        notes(
+            store
+                .torrents_page(None, Some(AdoptionState::Partial), 10)
+                .unwrap()
+        ),
+        [("02".to_owned(), Some("1 of 2 files present".to_owned()))],
+    );
+}

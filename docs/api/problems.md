@@ -353,7 +353,8 @@ files should go, then re-send with `confirm={infohash}`.
 ## `reload-pending`
 
 **409**, from `POST /v1/config/reload`. A reload is already queued and has not
-run yet. The queued reload will read the same file.
+run yet. The queue, which `SIGHUP` shares, holds one reload, and the queued one
+will read the same file. A request made once it has started is queued.
 
 ## `reload-unavailable`
 

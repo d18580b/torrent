@@ -1232,3 +1232,124 @@ fn a_rescan_keeps_a_torrent_the_caller_says_is_owned_at_its_recorded_base() {
         Some((root_id, String::new()))
     );
 }
+
+#[test]
+fn a_torrent_with_no_files_is_counted_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, dir.path()).unwrap();
+    add_torrent(&mut store, "nf", "None", None, &[]);
+
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(stats.missing, 1);
+    assert_eq!(state_of(&store, "nf"), AdoptionState::Missing);
+}
+
+/// A torrent none of whose files has bytes is placed nowhere: every base
+/// would otherwise "hold" it.
+#[test]
+fn a_torrent_of_only_empty_files_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "loose.bin", 10);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "ef", "E", None, &[("E/a", 0), ("E/b", 0)]);
+
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(stats.missing, 1, "{stats:?}");
+    assert_eq!(state_of(&store, "ef"), AdoptionState::Missing);
+}
+
+/// A partial torrent that turns out to overlap another is counted as an
+/// overlap, and no longer as partial.
+#[test]
+fn a_partial_torrent_found_overlapping_moves_from_partial_to_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "P/a.bin", 100);
+    write_file(root, "P/c.bin", 50);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    // Partial: b.bin is absent.
+    add_torrent(
+        &mut store,
+        "pp",
+        "P",
+        None,
+        &[("P/a.bin", 100), ("P/b.bin", 200)],
+    );
+    // Complete, over a different set sharing a.bin.
+    add_torrent(
+        &mut store,
+        "pq",
+        "P",
+        None,
+        &[("P/a.bin", 100), ("P/c.bin", 50)],
+    );
+
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        (stats.partial, stats.matched, stats.overlap),
+        (0, 0, 2),
+        "{stats:?}"
+    );
+    assert_eq!(state_of(&store, "pp"), AdoptionState::Overlap);
+}
+
+/// Of the incomplete placements, the one resolving the most files wins,
+/// even when one resolving fewer is tried first.
+#[test]
+fn a_partial_torrent_is_placed_where_the_most_files_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // At the root: only a.bin. Under `x`: b.bin and c.bin, the largest,
+    // which the size anchor finds.
+    write_file(root, "T/a.bin", 100);
+    write_file(root, "x/T/b.bin", 200);
+    write_file(root, "x/T/c.bin", 300);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "mp",
+        "T",
+        None,
+        &[("T/a.bin", 100), ("T/b.bin", 200), ("T/c.bin", 300)],
+    );
+
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "mp"), AdoptionState::Partial);
+    assert_eq!(
+        store.adoption_base("mp").unwrap(),
+        Some((root_id, "x".to_string()))
+    );
+    assert_eq!(store.claims_of("mp").unwrap().len(), 2);
+}
+
+/// Files a torrent lists without its name are looked for in a directory
+/// named after it, which no size anchor finds when the largest is absent.
+#[test]
+fn a_directory_named_after_the_torrent_is_a_candidate_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 100);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "nd",
+        "T",
+        None,
+        &[("a.bin", 100), ("b.bin", 200)],
+    );
+
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "nd"), AdoptionState::Partial);
+    assert_eq!(
+        store.adoption_base("nd").unwrap(),
+        Some((root_id, "T".to_string()))
+    );
+}

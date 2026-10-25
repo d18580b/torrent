@@ -286,17 +286,20 @@ pub(crate) fn build_test_state_with_sessions(
             crate::profile_registry::test_entry("p", ProfileStatus::Active),
         ]))
     });
-    // A distinct registry file per call. Cargo runs tests in threads of one
-    // process, so a fixed name here is one file shared by every test that
-    // builds a state — harmless while nothing wrote to it, and a rename race
-    // the moment a test persists an assignment.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let reg_dir = std::env::temp_dir().join(format!("torrentd-test-{}", std::process::id()));
-    std::fs::create_dir_all(&reg_dir).expect("create test registry dir");
-    let reg_path = reg_dir.join(format!(
-        "reg-{}.json",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    // A registry database no earlier state, in this process or any other,
+    // has used: one created in a directory made for this call alone. Cargo
+    // runs tests in threads of one process, so a fixed name is one file
+    // shared by every test that builds a state. A name made of the pid and a
+    // per-process counter is not enough either: the databases outlive their
+    // process, and a later run that reuses a pid reaches the same counter
+    // value and opens an earlier test's database, assignments and all, so
+    // a test that claimed nothing finds a claim in its registry.
+    let reg_dir = tempfile::Builder::new()
+        .prefix("torrentd-test-")
+        .tempdir()
+        .expect("create test registry dir")
+        .keep();
+    let reg_path = reg_dir.join("reg.json");
     AppState {
         source: Arc::new(ProfileSource::new(
             session_ids
@@ -381,6 +384,32 @@ mod work_gate_tests {
 mod tests {
     use super::*;
     use crate::profile_registry::test_entry;
+
+    /// Every test state opens a registry database of its own, in a directory
+    /// created for it, so it starts empty whatever an earlier state, or an
+    /// earlier process with the same pid, left on disk.
+    #[test]
+    fn each_test_state_starts_with_a_registry_of_its_own() {
+        let first = build_test_state(None);
+        let ih = libtorrent_safe::InfoHash::from_hex(&"ab".repeat(20)).unwrap();
+        first.registry.assign(ih, ProfileId::new("p")).unwrap();
+        let second = build_test_state(None);
+        assert_eq!(second.registry.len(), 0, "{:?}", second.registry.entries());
+        assert_ne!(
+            first.registry.path().parent(),
+            second.registry.path().parent(),
+        );
+        let entries: Vec<_> = std::fs::read_dir(second.registry.path().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .all(|n| n.to_string_lossy().starts_with("reg.json")),
+            "a directory used by nothing else: {entries:?}"
+        );
+    }
 
     #[test]
     fn profile_vpn_down_true_only_for_vpndown_profiles() {

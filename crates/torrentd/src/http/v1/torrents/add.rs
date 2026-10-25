@@ -341,18 +341,18 @@ pub async fn add_torrent(
     // Recorded beside the `.torrent` once the add succeeds.
     let recorded_save_path = save_path.clone();
     // What the session will be handed, built before the guard so the guard
-    // reads exactly that.
-    let (params, torrent_bytes) = match source {
+    // reads exactly that, and what is recorded for the boot to re-add it from.
+    let (params, record) = match source {
         // A magnet's `private` bit is unknown until its metadata arrives, so
         // it touches no DHT, PEX or LSD before then, whatever the profile
         // allows; the metadata handler lifts that once it shows it public.
         AddSource::Magnet(uri) => (
             AddParams::Magnet {
-                uri,
+                uri: uri.clone(),
                 save_path,
                 flags: torrentd_engine::policy::magnet_flags(profile_cfg),
             },
-            None,
+            AddRecord::Magnet(uri),
         ),
         // Nothing vouches for a payload named only by a `.torrent`: it may be
         // absent, still copying or truncated. Hash it before it seeds, as
@@ -366,7 +366,7 @@ pub async fn add_torrent(
                 flags: torrentd_engine::verify_flags(profile_cfg),
                 trackers: Vec::new(),
             },
-            Some(bytes),
+            AddRecord::Torrent(bytes),
         ),
     };
 
@@ -449,7 +449,7 @@ pub async fn add_torrent(
             params,
             infohash,
             &owner,
-            torrent_bytes,
+            record,
             &recorded_save_path,
         )
     })
@@ -497,9 +497,20 @@ enum SettleError {
     Engine(EngineError),
 }
 
+/// What an add persists beside its save path once it succeeds, for the boot
+/// to re-add the torrent from if no resume file is saved before it stops.
+enum AddRecord {
+    /// The `.torrent`.
+    Torrent(Vec<u8>),
+    /// The magnet URI: a magnet has no `.torrent` until its metadata
+    /// arrives, and without this a daemon stopped before then and before its
+    /// first resume save left its claim and nothing to load (issue #627).
+    Magnet(String),
+}
+
 /// Hand `params` to the session, then settle the claim on `infohash` either
-/// way: release it when the add failed, persist the `.torrent` and the
-/// `save_path` it was added at when it succeeded.
+/// way: release it when the add failed, persist the `.torrent` or magnet URI
+/// and the `save_path` it was added at when it succeeded.
 ///
 /// A `.torrent` (`AddParams::File`) is added paused, and its first check
 /// waits for a slot in the daemon's check queue, which resumes it:
@@ -517,7 +528,7 @@ fn add_and_settle(
     mut params: AddParams,
     infohash: InfoHash,
     profile_id: &ProfileId,
-    torrent_bytes: Option<Vec<u8>>,
+    record: AddRecord,
     save_path: &str,
 ) -> Result<torrentd_engine::TorrentHandle, SettleError> {
     // Release the claim so the add can be retried. A release that fails to
@@ -576,11 +587,11 @@ fn add_and_settle(
     // otherwise delete the two files written below when it is handled.
     s.state.note_readded(profile_id, &infohash);
 
-    // Persist the .torrent so the startup inventory scan can recover it if
-    // resume data is ever lost, and the save path first, so that scan never
-    // finds the one without the other and re-adds the torrent at
-    // `default_save_path`. A magnet's is written too: its `.torrent` arrives
-    // with its metadata, and the scan reads this beside it.
+    // Persist the .torrent, or the magnet URI, so the startup inventory scan
+    // can recover it if resume data is ever lost, and the save path first, so
+    // that scan never finds the one without the other and re-adds the torrent
+    // at `default_save_path`. A magnet's `.torrent` arrives with its
+    // metadata; until then the scan re-adds it from its URI.
     if let Err(e) = s.torrents.write_save_path(profile_id, &infohash, save_path) {
         warn!(
             infohash = %infohash,
@@ -593,18 +604,27 @@ fn add_and_settle(
             &[("profile_id", profile_id.as_str()), ("source", "api")],
         );
     }
-    if let Some(bytes) = torrent_bytes {
-        if let Err(e) = s.torrents.write(profile_id, &infohash, &bytes) {
-            warn!(
-                infohash = %infohash,
-                error.cause = %e,
-                "failed to persist .torrent file",
-            );
-            s.metrics.inc_counter(
-                "torrent_file_persist_errors_total",
-                &[("profile_id", profile_id.as_str()), ("source", "api")],
-            );
-        }
+    let (written, what) = match &record {
+        AddRecord::Torrent(bytes) => (
+            s.torrents.write(profile_id, &infohash, bytes),
+            ".torrent file",
+        ),
+        AddRecord::Magnet(uri) => (
+            s.torrents.write_magnet(profile_id, &infohash, uri),
+            "magnet URI",
+        ),
+    };
+    if let Err(e) = written {
+        warn!(
+            infohash = %infohash,
+            error.cause = %e,
+            "failed to persist the torrent's {what}; if it stops before its first resume save, \
+             a restart does not reload it",
+        );
+        s.metrics.inc_counter(
+            "torrent_file_persist_errors_total",
+            &[("profile_id", profile_id.as_str()), ("source", "api")],
+        );
     }
     Ok(handle)
 }
