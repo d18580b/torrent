@@ -356,6 +356,24 @@ takes.
 A queued torrent is hashed after the request answers, so its hashing adds
 nothing to the wait.
 
+**How long a request takes.** What a target costs inside the request is
+writes that must reach the disk before it is reported adopted: its pool
+index records (the owner, and either the adoption or the verify queue's
+row), and for a fast-path torrent its `.torrent` and save path in the
+profile's `torrent_dir`. Each waits on an fsync, so the rate is set by how
+fast the disk holding the state directory and `pool.db` flushes, not by the
+payload's size. The daemon works on 8 targets of one request at once, and
+the index records of the targets in flight share one commit. Measured with
+`mise run bench -- pool-adopt` (release build, half the torrents on each
+path) on a volume where one fsync takes 10 to 30 ms: 8 to 28 ms a torrent
+for 500 torrents in one request, 35 to 125 torrents a second, and 33 ms a
+torrent for 5,000 in five requests of 1000, the slowest answering in 36
+seconds. The same runs took 46 to 145 ms a torrent before the work was
+overlapped. So a 1000-torrent request answers in well under a minute there,
+and a 10,000-torrent library adopts in about six minutes of requests; a
+disk that flushes faster shortens both. `crates/torrentd-bench/budgets.toml`
+holds the budget CI keeps it to.
+
 A torrent the index plans for the fast path can still end up hashed: when its
 resume data turns out unreadable, unparseable or keyed by another info-hash,
 or libtorrent rejects its add, the adopt falls back to the verify queue and

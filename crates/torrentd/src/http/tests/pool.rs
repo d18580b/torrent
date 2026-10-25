@@ -935,6 +935,43 @@ async fn adoption_ignores_allow_mutations() {
     assert_eq!(r["queued_for_verification"], json!([IH_A]));
 }
 
+/// Issue #507: the targets of one request are adopted side by side, and the
+/// response still lists each where it went in the order named. An infohash
+/// named twice meets its first occurrence's claim exactly as one target at a
+/// time did: refused by the registry, not raced for it.
+#[tokio::test]
+async fn a_parallel_adoption_answers_in_request_order_and_repeats_in_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let r: Value = h
+        .send(
+            "POST",
+            "/v1/pool/adoptions",
+            Some(&h.tokens.write.clone()),
+            adopt(
+                "p",
+                false,
+                json!({"kind": "infohashes", "infohashes": [IH_C, IH_A, IH_B, IH_A]}),
+            ),
+        )
+        .await
+        .json();
+    assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
+    assert_eq!(r["verify_bytes"], 96, "{r}");
+    let refused: Vec<&str> = r["refused"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["infohash"].as_str().unwrap())
+        .collect();
+    assert_eq!(refused, [IH_C, IH_B, IH_A], "{r}");
+    assert_eq!(
+        r["refused"][2]["reason"], "info-hash already loaded in profile p",
+        "{r}"
+    );
+}
+
 /// The drift check before an adopt leaves a torrent over an unmounted root
 /// `matched`, since nothing it could see changed; adopting it anyway trusted
 /// payload nobody looked at. Refused, dry run and adoption alike, and
