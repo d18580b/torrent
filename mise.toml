@@ -173,10 +173,12 @@ fi
 '''
 
 # deploy/Containerfile's stages. The build context needs the vendor submodules,
-# so run this from a recursive checkout.
+# so run this from a recursive checkout. `--format docker` keeps the
+# Containerfile's HEALTHCHECK: podman's default OCI format has no field for it,
+# and podman drops it with a warning.
 [tasks.container]
 description = "Build the container image from deploy/Containerfile (needs podman and the vendor submodules)"
-run = "podman build -f deploy/Containerfile -t torrentd:dev ."
+run = "podman build --format docker -f deploy/Containerfile -t torrentd:dev ."
 
 [tasks.test]
 description = "Workspace tests (default features; parity with CI)"
