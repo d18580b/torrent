@@ -32,3 +32,30 @@ where
     let _pin = Dispatch::new(NoSubscriber::default());
     tracing::subscriber::with_default(subscriber, f)
 }
+
+/// Keeps `subscriber` as this thread's default, and the second dispatcher
+/// [`with_subscriber`] pins alive, until it is dropped.
+#[must_use = "the subscriber is this thread's default only while the guard lives"]
+#[derive(Debug)]
+pub struct SubscriberGuard {
+    // Fields drop in declaration order: the default is restored before the
+    // pinned dispatcher goes, as it is in `with_subscriber`.
+    _default: tracing::subscriber::DefaultGuard,
+    _pin: Dispatch,
+}
+
+/// The guard-returning counterpart of [`with_subscriber`], for a test that
+/// must hold `subscriber` across an `.await` or over code a closure cannot
+/// wrap. `subscriber` stays this thread's default until the returned guard
+/// is dropped, with the same protection and the same remaining window that
+/// [`with_subscriber`] describes.
+pub fn set_subscriber<S>(subscriber: S) -> SubscriberGuard
+where
+    S: Subscriber + Send + Sync + 'static,
+{
+    let pin = Dispatch::new(NoSubscriber::default());
+    SubscriberGuard {
+        _default: tracing::subscriber::set_default(subscriber),
+        _pin: pin,
+    }
+}

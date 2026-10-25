@@ -995,7 +995,7 @@ async fn the_poll_loop_does_not_fence_on_an_address_probe_that_could_not_run() {
     let log = crate::tracing_init::Buf::default();
     let (_reload, subscriber) =
         crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
-    let guard = tracing::subscriber::set_default(subscriber);
+    let guard = torrentd_engine::testing::set_subscriber(subscriber);
     let (status, exported) = poll_acct_a(StateMap::new(), MAX, addr_unavailable(fresh), 2).await;
     drop(guard);
     assert_eq!(
@@ -1177,7 +1177,7 @@ async fn a_hung_probe_holds_back_no_other_profile() {
     let log = crate::tracing_init::Buf::default();
     let (_reload, subscriber) =
         crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
-    let guard = tracing::subscriber::set_default(subscriber);
+    let guard = torrentd_engine::testing::set_subscriber(subscriber);
 
     let (release, hang) = std::sync::mpsc::channel::<()>();
     let hang = Arc::new(std::sync::Mutex::new(hang));

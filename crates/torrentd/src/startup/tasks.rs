@@ -55,7 +55,7 @@ mod tests {
         let log = crate::tracing_init::Buf::default();
         let (_handle, subscriber) =
             crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
         let metrics = Arc::new(PromSink::new());
         let up = || {
             String::from_utf8(metrics.render())
