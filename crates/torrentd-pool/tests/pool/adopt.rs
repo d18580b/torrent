@@ -765,3 +765,67 @@ fn preview_splits_a_subtree_by_what_it_would_cost() {
     // or days of disk reads.
     assert_eq!(pv.verify_bytes, 2000);
 }
+
+#[test]
+fn preview_covers_only_the_subtree_its_prefix_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "sub/A/a.bin", 1000);
+    write_file(&root, "sub/deep/B/b.bin", 2000);
+    // `subx` shares the prefix's spelling but is not under it.
+    write_file(&root, "subx/C/c.bin", 3000);
+    write_file(&root, "other/D/d.bin", 4000);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "pa",
+        "A",
+        &[("A/a.bin", 1000)],
+        Some(true),
+    );
+    add_torrent_with_sidecar(&mut store, &lib, "pb", "B", &[("B/b.bin", 2000)], None);
+    add_torrent_with_sidecar(&mut store, &lib, "pc", "C", &[("C/c.bin", 3000)], None);
+    add_torrent_with_sidecar(&mut store, &lib, "pd", "D", &[("D/d.bin", 4000)], None);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        store.adoption_base("pa").unwrap(),
+        Some((root_id, "sub".to_string()))
+    );
+
+    let r = root.clone();
+    let root_path_of = |id| (id == root_id).then(|| r.clone());
+    // Leading and trailing slashes name the same subtree.
+    let pv = torrentd_pool::adopt::preview(&store, root_id, "/sub/", root_path_of).unwrap();
+    assert_eq!(pv.fast_path, vec!["pa".to_string()]);
+    assert_eq!(pv.verify, vec!["pb".to_string()]);
+    assert_eq!(pv.verify_bytes, 2000);
+    assert!(pv.refused.is_empty(), "{:?}", pv.refused);
+
+    // Another root's preview takes none of them.
+    let elsewhere = torrentd_pool::adopt::preview(&store, root_id + 1, "", root_path_of).unwrap();
+    assert_eq!(elsewhere, Default::default());
+
+    // The add path's lookups resolve the same torrent.
+    assert_eq!(
+        torrentd_pool::adopt::save_path_of(&store, "pa", root_path_of).unwrap(),
+        Some(root.join("sub"))
+    );
+    assert_eq!(
+        torrentd_pool::adopt::save_path_of(&store, "pa", |_| None).unwrap(),
+        None
+    );
+    assert_eq!(
+        torrentd_pool::adopt::torrent_path(&store, "pa").unwrap(),
+        Some(lib.join("pa.torrent"))
+    );
+    assert_eq!(
+        torrentd_pool::adopt::torrent_path(&store, "zz").unwrap(),
+        None
+    );
+}

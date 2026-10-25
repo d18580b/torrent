@@ -451,6 +451,32 @@ mod tests {
     use super::*;
     use crate::scan::MAX_LIBRARY_FILE_BYTES;
 
+    /// Only a refusal is one, and each plan names its own kind.
+    #[test]
+    fn only_a_refusal_is_a_refusal() {
+        let fast = AdoptPlan::FastPath {
+            resume_path: PathBuf::from("/l/t.fastresume"),
+            torrent_path: PathBuf::from("/l/t.torrent"),
+            save_path: PathBuf::from("/d"),
+            files_renamed: false,
+        };
+        let verify = AdoptPlan::Verify {
+            torrent_path: PathBuf::from("/l/t.torrent"),
+            save_path: PathBuf::from("/d"),
+            resume_path: None,
+        };
+        let refuse = AdoptPlan::Refuse {
+            reason: refusal::MISSING,
+        };
+        assert!(!fast.is_refusal());
+        assert!(!verify.is_refusal());
+        assert!(refuse.is_refusal());
+        assert_eq!(
+            [fast.kind(), verify.kind(), refuse.kind()],
+            ["fast_path", "verify", "refuse"]
+        );
+    }
+
     /// Issue #543: the adoption's reads of a `.torrent` hold to the library
     /// read cap, as the scan's do. The file past it is still a torrent a
     /// parser accepts, so only the cap keeps it from being read whole.
