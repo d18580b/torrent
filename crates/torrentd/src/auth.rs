@@ -1422,6 +1422,46 @@ mod tests {
         );
     }
 
+    /// A bucket that still holds tokens accrues only the room it has left:
+    /// the burst caps what it holds, not what it gains.
+    #[test]
+    fn a_partly_spent_budget_refills_only_to_its_burst() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+
+        t.advance(refill * 10);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+        assert!(
+            t.admit_verification(None).is_err(),
+            "one token left and ten intervals idle make a burst of three, no more",
+        );
+    }
+
+    /// A refill that leaves the bucket short of full keeps the part of the
+    /// next interval already served, so the wait it names is what is left
+    /// of that interval.
+    #[test]
+    fn a_refill_short_of_the_burst_keeps_the_interval_already_served() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+
+        t.advance(refill * 2 + refill / 2);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+        assert_eq!(
+            t.admit_verification(None),
+            Err(refill / 2),
+            "two and a half intervals: two runs, and half an interval to the third",
+        );
+    }
+
     /// One `POST /v1/sessions` as `create_session` runs it, against `t`'s
     /// clock: the per-client consult, the budget, then the verdict the KDF
     /// would reach. `Ok` names the budget that paid for a verification.
