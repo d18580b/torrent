@@ -46,7 +46,11 @@ impl PoolStore {
         Ok(s.and_then(|s| AdoptionState::parse(&s)))
     }
 
-    /// `(base_rel, root_id)` recorded for a matched/adopted torrent.
+    /// `(root_id, base_rel)` recorded for a torrent, in that order: the root
+    /// its payload was matched in and the payload's base directory relative
+    /// to it. `None` when the torrent has no adoption row, or its row records
+    /// no root or no base (a torrent never matched, or one whose root has
+    /// since left the index, which nulls `root_id`), whatever its state.
     pub fn adoption_base(&self, infohash: &str) -> Result<Option<(i64, String)>, PoolError> {
         Ok(self
             .conn

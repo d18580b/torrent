@@ -234,9 +234,19 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
 /// indexed, with its own sidecar's hints, and the other is counted in
 /// [`ScanStats::duplicate_infohashes`].
 ///
+/// The walk is sorted and does not follow symlinks; only regular files named
+/// `*.torrent` are read. A `.torrent` that cannot be read, does not parse, or
+/// names no info-hash is logged and counted in [`ScanStats::errors`] and
+/// skipped, and the scan goes on. A missing `library_dir` is logged and
+/// returns empty stats with the index untouched. A store failure ends the
+/// scan with `Err`, keeping what it had already written.
+///
 /// A torrent whose `.torrent` is gone leaves the index, except one in
-/// `loaded` (hex info-hashes a session serves) — see
-/// [`PoolStore::retain_torrents`].
+/// `loaded` (hex info-hashes a session serves) or one `adopted` or `drifted`
+/// — see [`PoolStore::retain_torrents`]. That pruning runs only when the
+/// library was read in full: a single walk, read or parse error (a sidecar's
+/// excepted) keeps every torrent missing from this scan, because the
+/// torrent behind the error cannot be told apart from one that is gone.
 pub fn scan_library(
     store: &mut PoolStore,
     library_dir: &Path,
