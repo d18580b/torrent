@@ -52,11 +52,15 @@ const ADMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// verification deadline, which would have to be derived from payload size.
 const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a re-hash of a loaded torrent is held without a verdict.
+/// How long a re-hash of a loaded torrent, or an adoption showing neither a
+/// running nor a held check, is held without a verdict.
 ///
-/// A day is long past any re-hash this daemon could be running. Past it the
-/// request, or the phase report its verdict waits for, was lost, and the entry
-/// is forgotten rather than held for the life of the process.
+/// A day is long past any re-hash this daemon could be running, and an
+/// adoption's clock runs only while it shows no `Checking` or `Paused`. Past
+/// it the request, or the report its verdict waits for, was lost: a
+/// re-hash's entry is forgotten, and an adoption is recorded failed
+/// (`drifted`, paused), rather than either be held for the life of the
+/// process.
 const RECHECK_EXPIRY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// The daemon's one bound on hash checks: adoptions added without seed mode,
@@ -206,6 +210,19 @@ struct InFlight {
     /// One it held and no longer does was removed while it hashed, and has
     /// no verdict left to record.
     seen: bool,
+    /// Since when it has shown neither a running check (`Checking`) nor a
+    /// held one (`Paused`): set when it goes in flight, and reset whenever
+    /// the state map shows either. One past [`RECHECK_EXPIRY`] from here is
+    /// recorded failed rather than hold its slot for the life of the
+    /// process, so a hash running longer than a day, or an adoption held
+    /// paused behind the held-add queue, is never cut off.
+    waiting_since: std::time::Instant,
+    /// Since when the state map has shown its hashing over without a
+    /// `torrent_checked` stamp: a phase only a finished check reaches, short
+    /// of seeding. `None` while it shows anything else. One held past
+    /// [`VERIFY_SETTLE`] lost its `torrent_checked_alert`, which the alert
+    /// overflow recovery does not replay.
+    ended_unchecked: Option<std::time::Instant>,
 }
 
 /// A re-hash of a loaded torrent `POST /v1/pool/verifications` or
@@ -674,7 +691,22 @@ impl VerifyQueue {
         self.in_flight.lock().push(InFlight {
             infohash,
             seen: false,
+            waiting_since: std::time::Instant::now(),
+            ended_unchecked: None,
         });
+    }
+
+    /// Every adoption in flight as though it last showed a running or held
+    /// check, and began showing any hashing-over phase it shows, `by`
+    /// earlier.
+    #[cfg(test)]
+    fn age_in_flight(&self, by: std::time::Duration) {
+        for f in self.in_flight.lock().iter_mut() {
+            f.waiting_since -= by;
+            if let Some(t) = f.ended_unchecked.as_mut() {
+                *t -= by;
+            }
+        }
     }
 
     /// Whether the queue is waiting on `infohash`'s verdict.

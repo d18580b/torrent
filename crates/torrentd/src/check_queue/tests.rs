@@ -467,6 +467,175 @@ fn a_restored_in_flight_adoption_records_its_verdict_and_a_removed_one_is_forgot
     assert!(pool.with_store(|s| s.verify_queue().unwrap()).is_empty());
 }
 
+/// An adoption whose `torrent_checked_alert` was dropped never gets
+/// `checked_at`, and one whose check failed then sits in `Incomplete`, which
+/// [`verify_outcome`] reads as still waiting: it held its verify slot for the
+/// life of the process. Shown that way past the settle, it is recorded
+/// failed - paused, `drifted`, counted - and its slot is freed.
+#[test]
+fn an_adoption_whose_checked_alert_was_lost_frees_its_slot_as_failed() {
+    use std::sync::Arc;
+
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RecordedCall;
+    use torrentd_engine::StateMap;
+    use torrentd_pool::AdoptionState;
+
+    use crate::profile_registry::test_entry;
+    use crate::profile_registry::ProfileRegistry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hash = InfoHash([0x73; 20]);
+    let pool = pool_with(dir.path(), hash, None);
+    let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+    let engine = Arc::new(MockEngine::new());
+    let source = torrentd_engine::ProfileSource::new(vec![(
+        ProfileId::new("p"),
+        engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+    )]);
+    let state = StateMap::new();
+    let q = pool.verify_queue();
+    q.track_in_flight(hash.to_hex());
+    let retire = || {
+        super::worker::retire_in_flight(
+            &pool,
+            super::worker::Writer::Wait,
+            &source,
+            &state,
+            &profiles,
+        );
+    };
+
+    // Hashing, or held paused: it keeps its slot however long that lasts,
+    // past the expiry too.
+    for phase in [TorrentPhase::Checking, TorrentPhase::Paused] {
+        state.insert(hash, st(phase, None));
+        retire();
+        q.age_in_flight(super::RECHECK_EXPIRY);
+        retire();
+        assert!(q.is_in_flight(&hash.to_hex()));
+    }
+
+    // The check ends failed and its alert is lost. Just seen, it is given
+    // the settle.
+    state.insert(hash, st(TorrentPhase::Incomplete, None));
+    retire();
+    assert!(q.is_in_flight(&hash.to_hex()));
+    assert_eq!(q.failed(), 0);
+
+    q.age_in_flight(SETTLE);
+    retire();
+    assert_eq!(q.in_flight(), 0);
+    assert_eq!(q.failed(), 1);
+    assert!(engine
+        .calls()
+        .iter()
+        .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+    let got = pool
+        .with_store(|s| s.adoption_state(&hash.to_hex()))
+        .unwrap();
+    assert_eq!(got, Some(AdoptionState::Drifted));
+}
+
+/// The decision behind the test above, and its backstop: a finished check's
+/// phase shown unstamped is failed only once held for the settle, any other
+/// phase between resets it, and one showing neither a running nor a held
+/// check past the expiry is failed, while one showing either never is.
+#[test]
+fn an_adoption_with_no_verdict_is_failed_after_the_settle_or_the_expiry() {
+    use super::worker::lost_check_outcome;
+    use super::RECHECK_EXPIRY;
+
+    let young = Duration::from_secs(1);
+    for phase in [TorrentPhase::Incomplete, TorrentPhase::Idle] {
+        let s = st(phase, None);
+        let mut since = None;
+        let mut waiting = Instant::now() - young;
+        assert_eq!(
+            lost_check_outcome(Some(&s), &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Waiting,
+        );
+        assert!(since.is_some());
+        since = since.map(|t| t - SETTLE);
+        assert!(matches!(
+            lost_check_outcome(Some(&s), &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Failed(_),
+        ));
+    }
+
+    // A healthy check passing through: `Seeding` would be decided by
+    // `verify_outcome`, so any phase still undecided here resets the clock.
+    for phase in [
+        TorrentPhase::Checking,
+        TorrentPhase::Paused,
+        TorrentPhase::DiskError,
+    ] {
+        let mut since = Some(Instant::now() - SETTLE);
+        let mut waiting = Instant::now() - young;
+        assert_eq!(
+            lost_check_outcome(
+                Some(&st(phase, None)),
+                &mut since,
+                &mut waiting,
+                SETTLE,
+                RECHECK_EXPIRY,
+            ),
+            VerifyOutcome::Waiting,
+        );
+        assert_eq!(since, None);
+    }
+
+    // A stamped check is `verify_outcome`'s to decide, not this.
+    let mut since = None;
+    let mut waiting = Instant::now() - young;
+    assert_eq!(
+        lost_check_outcome(
+            Some(&st(TorrentPhase::Incomplete, Some(Duration::ZERO))),
+            &mut since,
+            &mut waiting,
+            SETTLE,
+            RECHECK_EXPIRY,
+        ),
+        VerifyOutcome::Waiting,
+    );
+
+    // A running or held check is never expired, however long it has waited:
+    // a multi-terabyte hash past a day, or an adoption held paused behind the
+    // held-add queue. Showing either restarts the clock.
+    for phase in [TorrentPhase::Checking, TorrentPhase::Paused] {
+        let mut since = None;
+        let mut waiting = Instant::now() - RECHECK_EXPIRY - young;
+        assert_eq!(
+            lost_check_outcome(
+                Some(&st(phase, None)),
+                &mut since,
+                &mut waiting,
+                SETTLE,
+                RECHECK_EXPIRY,
+            ),
+            VerifyOutcome::Waiting,
+        );
+        assert!(waiting.elapsed() < young);
+    }
+
+    // Past the expiry showing neither: never in the state map, or stuck in
+    // a phase no check leads to.
+    let stuck = st(TorrentPhase::DiskError, None);
+    for entry in [Some(&stuck), None] {
+        let mut since = None;
+        let mut waiting = Instant::now() - (RECHECK_EXPIRY - young);
+        assert_eq!(
+            lost_check_outcome(entry, &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Waiting,
+        );
+        waiting -= young;
+        assert_eq!(
+            lost_check_outcome(entry, &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Failed("no verification verdict within the check expiry"),
+        );
+    }
+}
+
 /// An owner record the enqueue did not write, or that names another
 /// profile by the time of the drop, is not the drop's to clear.
 #[test]

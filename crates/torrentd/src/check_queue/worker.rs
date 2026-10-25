@@ -694,6 +694,12 @@ pub(super) fn admit_adoption(
 /// Record the verdict of every in-flight torrent whose hashing is over, and
 /// stop waiting on one removed while it hashed.
 ///
+/// Hashing is over once [`verify_outcome`] decides it, or, where its
+/// `torrent_checked_alert` was lost, once [`lost_check_outcome`] does: one
+/// showing a finished check's phase unstamped, or one showing no running or
+/// held check for [`RECHECK_EXPIRY`], is recorded failed, so no adoption holds its slot for
+/// the life of the process.
+///
 /// A removed torrent leaves the state map, and with no entry its outcome
 /// reads as still waiting; it is told apart from one whose add has not
 /// landed yet by having been seen there before. Its persisted entry goes
@@ -735,7 +741,16 @@ pub(super) fn retire_in_flight(
             }
             (false, false) => {}
         }
-        let outcome = verify_outcome(entry.as_ref(), VERIFY_SETTLE);
+        let mut outcome = verify_outcome(entry.as_ref(), VERIFY_SETTLE);
+        if outcome == VerifyOutcome::Waiting {
+            outcome = lost_check_outcome(
+                entry.as_ref(),
+                &mut f.ended_unchecked,
+                &mut f.waiting_since,
+                VERIFY_SETTLE,
+                RECHECK_EXPIRY,
+            );
+        }
         if outcome == VerifyOutcome::Waiting {
             return true;
         }
@@ -1121,6 +1136,60 @@ pub(super) fn verify_outcome(
         }
         _ => VerifyOutcome::Waiting,
     }
+}
+
+/// Decide an in-flight adoption [`verify_outcome`] left `Waiting`, from what
+/// it shows without a `torrent_checked` stamp and how long it has waited.
+///
+/// `checked_at` comes only from `torrent_checked_alert`, which the alert
+/// overflow recovery does not replay. A torrent whose check failed and whose
+/// alert was dropped shows `Incomplete` (libtorrent's `downloading`) for good,
+/// and [`verify_outcome`] waits on it forever. `Incomplete` and `Idle` are
+/// phases only a finished check reaches: an adoption is added in `Checking`
+/// ([`TorrentPhase::on_add`]), and a status update reports `checking` until
+/// the check ends. One shown in either, unstamped, for `settle` running is
+/// therefore over and not seeding, and is failed. `ended_unchecked` carries
+/// when that began across ticks; any other phase resets it, so a healthy
+/// check passing through on its way to `Seeding` is not condemned.
+///
+/// One showing neither a running check (`Checking`) nor a held one
+/// (`Paused`) for `expiry` or longer is failed: its check, or the report its
+/// verdict waits for, was lost - one never seen in the state map, one stuck
+/// in a phase no check leads to - and it would otherwise hold a verify slot
+/// for the life of the process. `waiting_since` carries when that began
+/// across ticks, and either of those phases resets it, so a hash running
+/// longer than `expiry`, or an adoption held paused behind the held-add
+/// queue, keeps waiting as it always did.
+pub(super) fn lost_check_outcome(
+    entry: Option<&torrentd_engine::TorrentState>,
+    ended_unchecked: &mut Option<std::time::Instant>,
+    waiting_since: &mut std::time::Instant,
+    settle: Duration,
+    expiry: Duration,
+) -> VerifyOutcome {
+    if entry.is_some_and(|st| matches!(st.phase, TorrentPhase::Checking | TorrentPhase::Paused)) {
+        *waiting_since = std::time::Instant::now();
+    }
+    let over = entry.is_some_and(|st| {
+        st.checked_at.is_none() && matches!(st.phase, TorrentPhase::Incomplete | TorrentPhase::Idle)
+    });
+    if over {
+        if ended_unchecked
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            >= settle
+        {
+            return VerifyOutcome::Failed(
+                "hashing ended without a torrent_checked report and the torrent is not seeding",
+            );
+        }
+    } else {
+        *ended_unchecked = None;
+    }
+    if waiting_since.elapsed() >= expiry {
+        return VerifyOutcome::Failed("no verification verdict within the check expiry");
+    }
+    VerifyOutcome::Waiting
 }
 
 /// Decide a re-hash of a loaded torrent requested at `started`, or `None`
