@@ -11124,6 +11124,13 @@
             ],
             "description": "The directory, relative to its root, the payload was matched at;\n`null` when unmatched."
           },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last scan reached its verdict, where the state alone does\nnot say: for example how many of its files are present, that its\non-disk stats changed since it was verified, that another torrent\nclaims the same files, or that it has more than one complete copy\n(which makes a delete plan refuse to touch any of them). `null` when\nthere is nothing to add."
+          },
           "profile_id": {
             "type": [
               "string",

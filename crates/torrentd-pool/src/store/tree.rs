@@ -469,8 +469,8 @@ impl PoolStore {
     }
 
     /// Up to `limit` library torrents in infohash order after `after`, each
-    /// with its adoption state and the base it was matched at, optionally
-    /// only those in `state`.
+    /// with its adoption state, the base it was matched at and the note the
+    /// match left, optionally only those in `state`.
     ///
     /// Keyset pagination in SQL: a page costs `limit` index steps whatever
     /// the library's size, where loading every torrent and cutting a page
@@ -489,6 +489,7 @@ impl PoolStore {
                 torrent: row_to_torrent(r)?,
                 state: state.as_deref().and_then(AdoptionState::parse),
                 base_rel: r.get(13)?,
+                note: r.get(14)?,
             })
         };
         let rows = match state {
@@ -497,7 +498,7 @@ impl PoolStore {
                     "SELECT t.infohash, t.infohash_v1, t.infohash_v2, t.name, t.total_size,
                             t.num_files, t.source_path, t.fastresume_path, t.declared_save_path,
                             t.category, t.tags, t.profile, a.state,
-                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END
+                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END, a.last_error
                      FROM torrent t
                      LEFT JOIN adoption a ON a.infohash = t.infohash
                      WHERE t.infohash > ?1
@@ -511,7 +512,7 @@ impl PoolStore {
                     "SELECT t.infohash, t.infohash_v1, t.infohash_v2, t.name, t.total_size,
                             t.num_files, t.source_path, t.fastresume_path, t.declared_save_path,
                             t.category, t.tags, t.profile, a.state,
-                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END
+                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END, a.last_error
                      FROM adoption a
                      JOIN torrent t ON t.infohash = a.infohash
                      WHERE a.state = ?1 AND a.infohash > ?2
