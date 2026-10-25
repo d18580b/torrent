@@ -5,6 +5,13 @@
 
 using namespace lt_shim;
 
+// drain_session_alerts holds a whole libtorrent pop of these by value, and
+// the session's ready queue holds them until popped: up to the alert queue
+// size each. Strings live on the heap, sized to their text, so the union is
+// a header and a handful of pointers; a fixed-size string buffer added to a
+// variant fails here rather than growing every queued alert by its capacity.
+static_assert(sizeof(lt_alert_union) <= 128, "lt_alert_union must stay small");
+
 namespace {
 
 std::uint32_t map_torrent_flags(lt::torrent_flags_t f) {
@@ -100,7 +107,7 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         out.kind = LT_ALERT_ADD_TORRENT;
         if (x->error) {
             out.payload.add_torrent.error_code = x->error.value();
-            copy_utf8_truncated(out.payload.add_torrent.message, LT_MSG_MAX, x->error.message());
+            set_utf8_truncated(out.payload.add_torrent.message, LT_MSG_MAX, x->error.message());
         }
         fill_torrent_scope(out, s, x->handle, /*is_add=*/true);
         return true;
@@ -141,18 +148,18 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     if (auto* x = lt::alert_cast<lt::torrent_error_alert>(a)) {
         out.kind = LT_ALERT_TORRENT_ERROR;
         out.payload.torrent_error.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.torrent_error.filename, LT_PATH_MAX, x->filename());
-        copy_utf8_truncated(out.payload.torrent_error.message, LT_MSG_MAX, x->error.message());
+        set_utf8_truncated(out.payload.torrent_error.filename, LT_PATH_MAX, x->filename());
+        set_utf8_truncated(out.payload.torrent_error.message, LT_MSG_MAX, x->error.message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::file_error_alert>(a)) {
         out.kind = LT_ALERT_FILE_ERROR;
         out.payload.file_error.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.file_error.filename, LT_PATH_MAX, x->filename());
-        copy_utf8_truncated(out.payload.file_error.operation, LT_OP_MAX,
+        set_utf8_truncated(out.payload.file_error.filename, LT_PATH_MAX, x->filename());
+        set_utf8_truncated(out.payload.file_error.operation, LT_OP_MAX,
                             lt::operation_name(x->op));
-        copy_utf8_truncated(out.payload.file_error.message, LT_MSG_MAX, x->error.message());
+        set_utf8_truncated(out.payload.file_error.message, LT_MSG_MAX, x->error.message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
@@ -213,27 +220,27 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         out.payload.resume_failed.error_code = x->error.value();
         out.payload.resume_failed.not_modified =
             (x->error == lt::errors::resume_data_not_modified) ? 1 : 0;
-        copy_utf8_truncated(out.payload.resume_failed.message, LT_MSG_MAX, x->error.message());
+        set_utf8_truncated(out.payload.resume_failed.message, LT_MSG_MAX, x->error.message());
         return true;
     }
     if (auto* x = lt::alert_cast<lt::listen_failed_alert>(a)) {
         out.kind = LT_ALERT_LISTEN_FAILED;
         out.payload.listen_failed.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.listen_failed.operation, LT_OP_MAX,
+        set_utf8_truncated(out.payload.listen_failed.operation, LT_OP_MAX,
                             lt::operation_name(x->op));
         std::ostringstream ep;
         ep << x->address << ':' << x->port;
-        copy_utf8_truncated(out.payload.listen_failed.endpoint, LT_ADDR_MAX, ep.str());
-        copy_utf8_truncated(out.payload.listen_failed.iface, LT_ADDR_MAX,
+        set_utf8_truncated(out.payload.listen_failed.endpoint, LT_ADDR_MAX, ep.str());
+        set_utf8_truncated(out.payload.listen_failed.iface, LT_ADDR_MAX,
                             std::string(x->listen_interface()));
-        copy_utf8_truncated(out.payload.listen_failed.message, LT_MSG_MAX, x->error.message());
+        set_utf8_truncated(out.payload.listen_failed.message, LT_MSG_MAX, x->error.message());
         return true;
     }
     if (auto* x = lt::alert_cast<lt::listen_succeeded_alert>(a)) {
         out.kind = LT_ALERT_LISTEN_SUCCEEDED;
         std::ostringstream ep;
         ep << x->address << ':' << x->port;
-        copy_utf8_truncated(out.payload.listen_succeeded.endpoint, LT_ADDR_MAX, ep.str());
+        set_utf8_truncated(out.payload.listen_succeeded.endpoint, LT_ADDR_MAX, ep.str());
         return true;
     }
     if (auto* x = lt::alert_cast<lt::session_stats_alert>(a)) {
@@ -286,22 +293,22 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
              || x->error == lt::errors::session_is_closing
              || x->error == lt::errors::destructing_torrent) ? 1 : 0;
         out.payload.tracker_error.times_in_row = x->times_in_row;
-        copy_utf8_truncated(out.payload.tracker_error.tracker_url, LT_PATH_MAX,
+        set_utf8_truncated(out.payload.tracker_error.tracker_url, LT_PATH_MAX,
                             x->tracker_url());
-        copy_utf8_truncated(out.payload.tracker_error.message, LT_MSG_MAX,
+        set_utf8_truncated(out.payload.tracker_error.message, LT_MSG_MAX,
                             std::string(x->error_message()));
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::torrent_log_alert>(a)) {
         out.kind = LT_ALERT_TORRENT_LOG;
-        copy_utf8_truncated(out.payload.log_msg.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.log_msg.message, LT_MSG_MAX, x->message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::log_alert>(a)) {
         out.kind = LT_ALERT_LOG;
-        copy_utf8_truncated(out.payload.log_msg.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.log_msg.message, LT_MSG_MAX, x->message());
         return true;
     }
     if (auto* x = lt::alert_cast<lt::torrent_checked_alert>(a)) {
@@ -329,11 +336,11 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     if (auto* x = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
         out.kind = LT_ALERT_STORAGE_MOVED_FAILED;
         out.payload.storage_moved_failed.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.storage_moved_failed.operation, LT_OP_MAX,
+        set_utf8_truncated(out.payload.storage_moved_failed.operation, LT_OP_MAX,
                             lt::operation_name(x->op));
-        copy_utf8_truncated(out.payload.storage_moved_failed.path, LT_PATH_MAX,
+        set_utf8_truncated(out.payload.storage_moved_failed.path, LT_PATH_MAX,
                             std::string(x->file_path()));
-        copy_utf8_truncated(out.payload.storage_moved_failed.message, LT_MSG_MAX,
+        set_utf8_truncated(out.payload.storage_moved_failed.message, LT_MSG_MAX,
                             x->error.message());
         fill_torrent_scope(out, s, x->handle);
         return true;
@@ -344,40 +351,40 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     // and libtorrent's own rendering of the alert for the log line.
     if (auto* x = lt::alert_cast<lt::tracker_warning_alert>(a)) {
         out.kind = LT_ALERT_TRACKER_WARNING;
-        copy_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::scrape_failed_alert>(a)) {
         out.kind = LT_ALERT_SCRAPE_FAILED;
         out.payload.warning.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::portmap_error_alert>(a)) {
         out.kind = LT_ALERT_PORTMAP_ERROR;
         out.payload.warning.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
         return true;
     }
     if (auto* x = lt::alert_cast<lt::udp_error_alert>(a)) {
         out.kind = LT_ALERT_UDP_ERROR;
         out.payload.warning.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
         return true;
     }
     if (auto* x = lt::alert_cast<lt::fastresume_rejected_alert>(a)) {
         out.kind = LT_ALERT_FASTRESUME_REJECTED;
         out.payload.warning.error_code = x->error.value();
-        copy_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::performance_alert>(a)) {
         out.kind = LT_ALERT_PERFORMANCE;
         out.payload.warning.warning_code = static_cast<std::int32_t>(x->warning_code);
-        copy_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        set_utf8_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
@@ -493,6 +500,51 @@ extern "C" void lt_alert_payload_free(lt_alert_union* u) {
             std::free(u->payload.storage_moved.path);
             u->payload.storage_moved.path = nullptr;
             u->payload.storage_moved.path_len = 0;
+            break;
+        case LT_ALERT_ADD_TORRENT:
+            free_str(u->payload.add_torrent.message);
+            break;
+        case LT_ALERT_TORRENT_ERROR:
+            free_str(u->payload.torrent_error.filename);
+            free_str(u->payload.torrent_error.message);
+            break;
+        case LT_ALERT_FILE_ERROR:
+            free_str(u->payload.file_error.filename);
+            free_str(u->payload.file_error.operation);
+            free_str(u->payload.file_error.message);
+            break;
+        case LT_ALERT_SAVE_RESUME_DATA_FAILED:
+            free_str(u->payload.resume_failed.message);
+            break;
+        case LT_ALERT_LISTEN_FAILED:
+            free_str(u->payload.listen_failed.operation);
+            free_str(u->payload.listen_failed.endpoint);
+            free_str(u->payload.listen_failed.iface);
+            free_str(u->payload.listen_failed.message);
+            break;
+        case LT_ALERT_LISTEN_SUCCEEDED:
+            free_str(u->payload.listen_succeeded.endpoint);
+            break;
+        case LT_ALERT_TRACKER_ERROR:
+            free_str(u->payload.tracker_error.tracker_url);
+            free_str(u->payload.tracker_error.message);
+            break;
+        case LT_ALERT_TORRENT_LOG:
+        case LT_ALERT_LOG:
+            free_str(u->payload.log_msg.message);
+            break;
+        case LT_ALERT_STORAGE_MOVED_FAILED:
+            free_str(u->payload.storage_moved_failed.operation);
+            free_str(u->payload.storage_moved_failed.path);
+            free_str(u->payload.storage_moved_failed.message);
+            break;
+        case LT_ALERT_TRACKER_WARNING:
+        case LT_ALERT_SCRAPE_FAILED:
+        case LT_ALERT_PORTMAP_ERROR:
+        case LT_ALERT_UDP_ERROR:
+        case LT_ALERT_FASTRESUME_REJECTED:
+        case LT_ALERT_PERFORMANCE:
+            free_str(u->payload.warning.message);
             break;
         default:
             break;

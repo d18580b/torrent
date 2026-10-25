@@ -85,9 +85,11 @@ typedef uintptr_t lt_handle;
 /* Buffer capacities and bounds                                        */
 /* ------------------------------------------------------------------ */
 
-/* Fixed string capacities, trailing NUL included, of the alert payloads in
- * alert_union.h and of lt_tracker_entry below. A longer string is cut at the
- * last whole UTF-8 sequence that fits. Defined here rather than in
+/* String capacities, trailing NUL included, of the alert payload strings in
+ * alert_union.h (heap lt_str values sized to their text, so a capacity is a
+ * cap, not an allocation) and of lt_tracker_entry's fixed buffers below. A
+ * longer string is cut at the last whole UTF-8 sequence that fits. Defined
+ * here rather than in
  * alert_union.h because lt_tracker_entry needs them too, and alert_union.h is
  * the one that includes this file. The metadata, file-list and details
  * structs below do not use them: their names and paths are never truncated. */

@@ -171,9 +171,50 @@ lt_handle add_file(lt_session* s, const std::string& torrent, const std::string&
     return h;
 }
 
+// An alert's heap string, NUL included: null with length 0 when empty.
+std::string text(const lt_str& s) {
+    if (!s.ptr) {
+        CHECK(s.len == 0);
+        return {};
+    }
+    CHECK(s.len != 0);
+    return sized(s.ptr, s.len);
+}
+
 // Read every heap payload `u` carries, end to end, and return what it held.
+// A kind with several strings returns them joined by '\n'.
 std::string touch_payload(const lt_alert_union& u) {
+    const auto& p = u.payload;
     switch (u.kind) {
+    case LT_ALERT_ADD_TORRENT:
+        return text(p.add_torrent.message);
+    case LT_ALERT_TORRENT_ERROR:
+        return text(p.torrent_error.filename) + "\n" + text(p.torrent_error.message);
+    case LT_ALERT_FILE_ERROR:
+        return text(p.file_error.filename) + "\n" + text(p.file_error.operation) + "\n" +
+               text(p.file_error.message);
+    case LT_ALERT_SAVE_RESUME_DATA_FAILED:
+        return text(p.resume_failed.message);
+    case LT_ALERT_LISTEN_FAILED:
+        return text(p.listen_failed.operation) + "\n" + text(p.listen_failed.endpoint) + "\n" +
+               text(p.listen_failed.iface) + "\n" + text(p.listen_failed.message);
+    case LT_ALERT_LISTEN_SUCCEEDED:
+        return text(p.listen_succeeded.endpoint);
+    case LT_ALERT_TRACKER_ERROR:
+        return text(p.tracker_error.tracker_url) + "\n" + text(p.tracker_error.message);
+    case LT_ALERT_TORRENT_LOG:
+    case LT_ALERT_LOG:
+        return text(p.log_msg.message);
+    case LT_ALERT_STORAGE_MOVED_FAILED:
+        return text(p.storage_moved_failed.operation) + "\n" +
+               text(p.storage_moved_failed.path) + "\n" + text(p.storage_moved_failed.message);
+    case LT_ALERT_TRACKER_WARNING:
+    case LT_ALERT_SCRAPE_FAILED:
+    case LT_ALERT_PORTMAP_ERROR:
+    case LT_ALERT_UDP_ERROR:
+    case LT_ALERT_FASTRESUME_REJECTED:
+    case LT_ALERT_PERFORMANCE:
+        return text(p.warning.message);
     case LT_ALERT_STATE_UPDATE: {
         const auto& p = u.payload.state_update;
         return p.count ? read_all(p.statuses, p.count * sizeof(*p.statuses)) : std::string();
@@ -431,11 +472,16 @@ void query_ownership(const std::string& work) {
 }
 
 // Every alert kind with a heap payload this suite can provoke without a peer:
-// state_update, session_stats, save_resume (queries.rs, web_seeds.rs) and
-// storage_moved past the old buffer (queries.rs). Then the saved resume data
-// fed back through lt_add_torrent_resume_ex (web_seeds.rs).
+// listen_succeeded's endpoint string (boundaries.rs), state_update,
+// session_stats, save_resume (queries.rs, web_seeds.rs) and storage_moved
+// past the old buffer (queries.rs). Then the saved resume data fed back
+// through lt_add_torrent_resume_ex (web_seeds.rs). Every other string an
+// alert popped on the way carries is read and freed by pop_until too.
 void alert_payloads(const std::string& work) {
     lt_session* s = make_session();
+    std::string endpoint;
+    CHECK(pop_until(s, LT_ALERT_LISTEN_SUCCEEDED, 0, &endpoint));
+    CHECK(endpoint.rfind("127.0.0.1:", 0) == 0);
     const std::string src = work + "/src";
     std::string dst = work + "/moved";
     for (int i = 0; i < 6; ++i) dst += "/" + std::string(200, 'm');

@@ -11,9 +11,9 @@ use libtorrent_sys as ffi;
 use crate::error::Error;
 use crate::error::Result;
 
-/// A NUL-terminated string the shim wrote into a fixed-size buffer (an
-/// alert's `[c_char; LT_MSG_MAX]`, a tracker entry's URL, an `err_out`), as
-/// an owned `String`.
+/// A NUL-terminated string the shim wrote into a fixed-size buffer (a
+/// tracker entry's `[c_char; LT_PATH_MAX]` URL, an `err_out`), as an owned
+/// `String`.
 ///
 /// Reads up to the first NUL, or the whole buffer where it holds none, and
 /// never past it. Invalid UTF-8 becomes U+FFFD: a stray byte from libtorrent

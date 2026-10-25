@@ -99,6 +99,17 @@ pub(crate) fn add_magnet(s: *mut lt_session, uri: &str) -> lt_handle {
     h
 }
 
+/// A string a popped alert carries. An empty one is null with length 0; any
+/// other is `len` bytes and a NUL, which [`sized_c_str`] asserts.
+pub(crate) fn alert_text(s: &lt_str) -> String {
+    if s.ptr.is_null() {
+        assert_eq!(s.len, 0, "a null alert string has no length");
+        return String::new();
+    }
+    assert_ne!(s.len, 0, "an empty alert string is null, not allocated");
+    sized_c_str(s.ptr, s.len)
+}
+
 pub(crate) fn c_buf(buf: &[c_char]) -> String {
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
     let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
@@ -216,7 +227,7 @@ fn storage_moved_reports_a_destination_past_the_old_buffer_whole() {
     let moved = wait_for(s, |u| {
         if u.kind == lt_alert_kind_LT_ALERT_STORAGE_MOVED_FAILED {
             let p = unsafe { &u.payload.storage_moved_failed };
-            panic!("move failed: {}", c_buf(&p.message));
+            panic!("move failed: {}", alert_text(&p.message));
         }
         (u.kind == lt_alert_kind_LT_ALERT_STORAGE_MOVED && u.handle == h).then(|| {
             let p = unsafe { &u.payload.storage_moved };
@@ -470,6 +481,27 @@ fn statuses_report_every_torrent_under_its_handle() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// An alert's strings come back on the heap, sized to their text: the
+/// session's listen_succeeded names the loopback endpoint it bound, and a
+/// refused announce names its tracker by its whole URL. `alert_text` holds
+/// each to the `lt_str` contract: null when empty, else `len` bytes and a
+/// NUL.
+#[test]
+fn alert_strings_are_heap_copies_sized_to_their_text() {
+    let s = make_session();
+    let endpoint = wait_for(s, |u| {
+        (u.kind == lt_alert_kind_LT_ALERT_LISTEN_SUCCEEDED)
+            .then(|| alert_text(unsafe { &u.payload.listen_succeeded.endpoint }))
+    })
+    .expect("no listen_succeeded alert");
+    assert!(endpoint.starts_with("127.0.0.1:"), "{endpoint:?}");
+    unsafe { lt_session_destroy(s) };
+
+    let url = "http://127.0.0.1:1/announce";
+    let e = first_tracker_error_alert(url);
+    assert_eq!(e.tracker_url, url);
+}
+
 /// A tracker error carries the category its code belongs to: an announce to
 /// a closed loopback port is refused with an `errno`, in the system category,
 /// and was not cancelled.
@@ -504,8 +536,17 @@ fn first_tracker_error_announcing_to(url: &str) -> (i32, i32, u8) {
     (e.error_code, e.error_category, e.aborted)
 }
 
+/// A tracker error alert, copied out of the union before its payload is
+/// freed.
+struct TrackerError {
+    error_code: i32,
+    error_category: i32,
+    aborted: u8,
+    tracker_url: String,
+}
+
 /// [`first_tracker_error_announcing_to`]'s alert, whole.
-fn first_tracker_error_alert(url: &str) -> lt_alert_tracker_error {
+fn first_tracker_error_alert(url: &str) -> TrackerError {
     let s = make_session();
     let bytes = multi_file_tracker_torrent();
     let url = CString::new(url).unwrap();
@@ -536,7 +577,13 @@ fn first_tracker_error_alert(url: &str) -> lt_alert_tracker_error {
         if u.kind != lt_alert_kind_LT_ALERT_TRACKER_ERROR {
             return None;
         }
-        Some(unsafe { u.payload.tracker_error })
+        let e = unsafe { &u.payload.tracker_error };
+        Some(TrackerError {
+            error_code: e.error_code,
+            error_category: e.error_category,
+            aborted: e.aborted,
+            tracker_url: alert_text(&e.tracker_url),
+        })
     });
     unsafe { lt_session_destroy(s) };
     got.expect("no tracker_error alert")
@@ -551,13 +598,9 @@ fn a_tracker_url_cut_to_fit_its_alert_keeps_whole_characters() {
     // text, LT_PATH_MAX - 1, falls on the second byte of one.
     let url = format!("http://127.0.0.1:1/a{}", "é".repeat(LT_PATH_MAX as usize));
     let e = first_tracker_error_alert(&url);
-    let bytes: Vec<u8> = e
-        .tracker_url
-        .iter()
-        .take_while(|c| **c != 0)
-        .map(|c| *c as u8)
-        .collect();
-    let got = std::str::from_utf8(&bytes).expect("the cut URL is whole UTF-8");
+    // `alert_text` decodes lossily, so a cut through a character would show
+    // as U+FFFD, which no prefix of the URL holds.
+    let got = e.tracker_url.as_str();
     assert!(url.starts_with(got), "{got:?} is not a prefix of the URL");
     assert_eq!(
         got.len(),
