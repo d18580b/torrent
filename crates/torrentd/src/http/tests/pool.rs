@@ -1560,6 +1560,118 @@ async fn a_same_profile_adoption_that_loses_the_claim_race_is_refused_and_keeps_
     assert!(q.calls().is_empty(), "{:?}", q.calls());
 }
 
+/// Issue #656: an adoption whose pool-index records fail to commit is
+/// refused, on either path, and leaves no registry claim, no verify-queue
+/// item, in memory or in `pool.db`, and none of its records behind. It used
+/// to be reported adopted, with the verify item only in memory.
+///
+/// `RAISE(ROLLBACK)` stands in for `SQLITE_FULL`/`SQLITE_IOERR`, which roll
+/// back the whole shared transaction; `RAISE(ABORT)` fails only the statement,
+/// after the target's first record is written, which its savepoint takes back.
+#[tokio::test]
+async fn an_adoption_whose_records_fail_to_commit_is_refused_and_leaves_nothing() {
+    const TRACKER: &str = "http://tracker.example/announce";
+    for fast_path in [true, false] {
+        for raise in ["ROLLBACK", "ABORT"] {
+            let what = format!("fast_path={fast_path} RAISE({raise})");
+            let dir = tempfile::tempdir().unwrap();
+            let (pool, _) = fixture(dir.path(), false);
+            let index = Arc::clone(&pool);
+            let library = dir.path().join("library");
+            std::fs::create_dir_all(&library).unwrap();
+            let source = metainfo(TRACKER);
+            std::fs::write(library.join(format!("{IH_A}.torrent")), &source).unwrap();
+            if fast_path {
+                let resume = library.join(format!("{IH_A}.fastresume"));
+                std::fs::write(&resume, fastresume(&source, None)).unwrap();
+                let mut row = torrent(dir.path(), IH_A, 96, 2);
+                row.fastresume_path = Some(resume);
+                index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+            }
+            // The fast path writes its adoption record first, the verify path
+            // its owner record: the second write of each fails.
+            let trigger = if fast_path {
+                "BEFORE UPDATE OF profile ON torrent"
+            } else {
+                "BEFORE INSERT ON verify_queue"
+            };
+            rusqlite::Connection::open(dir.path().join("pool.db"))
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER boom {trigger} BEGIN SELECT RAISE({raise}, 'disk full'); END;"
+                ))
+                .unwrap();
+            let engine = Arc::new(torrentd_engine::MockEngine::new());
+            let h = Harness::authed(&Coverage::new(), |s| {
+                let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
+                    "p",
+                    ProfileStatus::Active,
+                )]));
+                *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p"]);
+                s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                    torrentd_engine::ProfileId::new("p"),
+                    engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+                )]));
+                s.pool = Some(pool);
+            });
+
+            let resp = h
+                .send(
+                    "POST",
+                    "/v1/pool/adoptions",
+                    Some(&h.tokens.write),
+                    adopt(
+                        "p",
+                        false,
+                        json!({"kind": "infohashes", "infohashes": [IH_A]}),
+                    ),
+                )
+                .await;
+            resp.assert_status(StatusCode::OK);
+            let r = resp.json::<Value>();
+
+            assert_eq!(r["fast_path"], json!([]), "{what}: {r}");
+            assert_eq!(r["queued_for_verification"], json!([]), "{what}: {r}");
+            assert_eq!(r["refused"][0]["infohash"], json!(IH_A), "{what}: {r}");
+            let reason = r["refused"][0]["reason"].as_str().unwrap();
+            assert!(
+                reason.starts_with("the pool index could not record the adoption: "),
+                "{what}: {r}"
+            );
+            let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+            assert_eq!(h.state.registry.lookup(&hash), None, "{what}");
+            let queue = index.verify_queue();
+            assert_eq!((queue.depth(), queue.held()), (0, vec![]), "{what}");
+            assert!(
+                index.with_store(|st| st.verify_queue().unwrap()).is_empty(),
+                "{what}"
+            );
+            assert_eq!(
+                index.with_store(|st| st.adoption_state(IH_A).unwrap()),
+                Some(AdoptionState::Matched),
+                "{what}"
+            );
+            assert_eq!(
+                index.with_store(|st| st.profile_of(IH_A).unwrap()),
+                None,
+                "{what}"
+            );
+            // The session that accepted the fast-path torrent gives it back.
+            let calls = engine.calls();
+            let removed = calls.iter().any(|c| {
+                matches!(
+                    c,
+                    torrentd_engine::RecordedCall::RemoveTorrent {
+                        delete_files: false,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(removed, fast_path, "{what}: {calls:?}");
+        }
+    }
+}
+
 async fn verification(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let (pool, _) = fixture(dir.path(), false);
