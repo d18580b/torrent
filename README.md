@@ -588,6 +588,36 @@ mise run bench -- pool-scan --size ci            # the pool at the size CI runs;
 `mise run vpn-check <config> [-- <flags>]` runs `vpn check` (see
 [Profiles](#profiles)) from a source checkout, against a real tunnel.
 
+## Releasing
+
+[`release-plz.yml`](.github/workflows/release-plz.yml) keeps one release
+pull request open, from the branch `release-plz-next`, and refreshes it on
+every push to `master`. Merging it cuts the release. Squash, rebase and
+"Create a merge commit" all release. With a merge commit, release-plz tags
+the pull request's head, and the workflow moves the tag to the merge commit
+only when that head is one of its parents and both have the same tree. So
+merge only once `release-plz-next` is up to date with `master`: after a
+push to `master`, wait for the workflow's `release pull request` job to
+refresh it.
+
+When the `release-plz release` job fails, nothing is built or published, and
+the tag and the draft release stay behind. The job's error says which case
+it is:
+
+- **GitHub did not verify the tagged commit, or an API call failed.** Re-run
+  the failed run. It resumes the draft release, then moves and checks the tag
+  again.
+- **The tag names a commit the merge did not release** (`... neither the
+  released commit ... nor a parent of it with the same tree`). A re-run fails
+  the same way. Delete the tag and the draft, then let the next push to
+  `master` propose the release again, and merge that pull request:
+
+  ```bash
+  gh release delete vX.Y.Z --repo d18580b/torrent --cleanup-tag --yes
+  ```
+
+A published release is immutable. Neither path changes one.
+
 ## Contributing & license
 
 Development setup, coding standards and the commit convention are in

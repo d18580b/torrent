@@ -12,7 +12,8 @@ name: Release
 #    `vX.Y.Z` tag and a *draft* GitHub release through the API, then replaces
 #    the annotated tag object release-plz made, which nobody signed, with a
 #    lightweight tag on the merge commit GitHub signed, and checks that
-#    GitHub verifies that commit. On any other push it does nothing.
+#    GitHub verifies that commit. Squash, rebase and merge-commit merges all
+#    release (README.md, Releasing). On any other push it does nothing.
 # 2. `release-pr` then runs `release-plz update` and regenerates
 #    docs/api/openapi.json (its `info.version` is the crate version) in its
 #    checkout, records the result as one verified commit on the pushed
@@ -182,11 +183,24 @@ jobs:
             commit) commit=$object ;;
             *) echo "::error::$TAG points at a $type"; exit 1 ;;
           esac
+          # Merged with "Create a merge commit", the release pull request's
+          # head is an ancestor of the pushed commit, and release-plz tags that
+          # head rather than the merge commit. It is accepted only where it is
+          # a parent of the merge commit and has the merge commit's tree, so
+          # moving the tag to the merge commit releases exactly what the
+          # pull request held. A squash or rebase merge tags the pushed commit
+          # itself.
           if [ "$commit" != "$SHA" ]; then
-            echo "::error::$TAG names $commit, not the released commit $SHA"
-            exit 1
+            if git rev-list --parents -n 1 "$SHA" | tr ' ' '\n' | tail -n +2 | grep -qxF "$commit" \
+              && [ "$(git rev-parse --verify --quiet "$commit^{tree}")" = "$(git rev-parse --verify "$SHA^{tree}")" ]; then
+              echo "$TAG names $commit, the release pull request's head that $SHA merges with the same tree; moving it to $SHA"
+              commit=$SHA
+            else
+              echo "::error::$TAG names $commit, which is neither the released commit $SHA nor a parent of it with the same tree, so nothing is built or published. Re-running this run fails the same way. Recover with: gh release delete $TAG --repo $REPO --cleanup-tag --yes; the next push to master proposes the release again, and its pull request is merged once release-plz-next is up to date with master (README.md, Releasing)."
+              exit 1
+            fi
           fi
-          if [ "$type" = tag ]; then
+          if [ "$type" = tag ] || [ "$object" != "$commit" ]; then
             gh api -X PATCH "repos/$REPO/git/refs/tags/$TAG" -f sha="$commit" -F force=true \
               --jq '.object | "\(.type) \(.sha)"'
           fi
