@@ -1520,6 +1520,25 @@ mod tests {
         );
     }
 
+    /// Only the first take from a full bucket starts its refill clock: a
+    /// take from a bucket already part spent leaves the interval running.
+    #[test]
+    fn a_take_from_a_part_spent_budget_leaves_its_refill_clock_running() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        assert!(t.admit_verification(None).is_ok());
+        t.advance(refill * 3 / 4);
+        assert!(t.admit_verification(None).is_ok());
+
+        t.advance(refill / 4);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(
+            t.admit_verification(None).is_ok(),
+            "one interval from the first take, one token back",
+        );
+        assert_eq!(t.admit_verification(None), Err(refill));
+    }
+
     /// One `POST /v1/sessions` as `create_session` runs it, against `t`'s
     /// clock: the per-client consult, the budget, then the verdict the KDF
     /// would reach. `Ok` names the budget that paid for a verification.
