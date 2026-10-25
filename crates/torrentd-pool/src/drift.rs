@@ -1,12 +1,16 @@
 //! Cheap change detection over the managed roots.
 //!
 //! Re-hashing a petabyte is days of I/O, so the routine check compares
-//! `(size, mtime, inode, device)` against the snapshot the last scan recorded.
-//! That catches truncation, replacement, in-place edits and re-creation — every
-//! way payload realistically changes under a seeder — for the cost of a stat.
+//! `(size, mtime)` against the snapshot the last scan recorded. That catches
+//! truncation, in-place edits, and replacement or re-creation by anything that
+//! does not copy the old mtime onto the new file — every way payload
+//! realistically changes under a seeder — for the cost of a stat. Inode and
+//! device are not compared: a reboot or a remount renumbers them on common
+//! storage layouts without touching a byte (see `same_file`).
 //!
-//! It cannot catch a change that preserves all four, which in practice means a
-//! deliberate write through the same inode with a restored mtime. Anything
+//! It cannot catch a change that preserves both, which in practice means a
+//! deliberate write, or a replacement at the same size, with the old mtime
+//! restored to the nanosecond. Anything
 //! relying on byte-level certainty (adoption, and any destructive operation)
 //! must go through libtorrent's verification instead; this pass only decides
 //! *when* that is worth paying for. The one adoption that skips it is the
@@ -70,10 +74,11 @@ fn probe_root(root: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// The directory a not-found `file` under `root` cannot be trusted over, if
-/// any: the nearest directory above it that still exists, up to and
-/// including `root`, when that directory is on another filesystem than the
-/// one the index recorded the file on (`indexed_dev`).
+/// The directory a file not found in `parent` under `root` cannot be trusted
+/// over, if any: the nearest of `parent` and the directories above it that
+/// still exists, up to and including `root`, when that directory is on
+/// another filesystem than the one the index recorded the file on
+/// (`indexed_dev`).
 ///
 /// A disk mounted inside a readable root leaves its mount point behind when
 /// it is unmounted, and every file on it then reads not-found exactly as a
@@ -81,17 +86,24 @@ fn probe_root(root: &std::path::Path) -> Result<(), String> {
 /// file's own filesystem; an unmounted one's is the mount point, on the
 /// filesystem below it. Only files already not found are walked up, so a
 /// pass over a healthy pool pays nothing for it.
+///
+/// `devs` carries what each recorded device number reads as now, so a file
+/// deleted after a reboot renumbered its filesystem is still drift. Where the
+/// pass found no unchanged file on that filesystem to learn it from, the
+/// recorded number is compared as it stands, and a deleted file then reads as
+/// under an unmounted directory: left unchecked, not drift.
 fn untrusted_parent(
     root: &std::path::Path,
-    file: &std::path::Path,
+    parent: &std::path::Path,
     indexed_dev: u64,
+    devs: &DevMap,
 ) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    let mut dir = file.parent()?;
+    let mut dir = parent;
     while dir.starts_with(root) {
         match std::fs::symlink_metadata(dir) {
             Ok(m) if m.is_dir() => {
-                return (m.dev() != indexed_dev).then(|| dir.to_path_buf());
+                return (!devs.same_fs(indexed_dev, m.dev())).then(|| dir.to_path_buf());
             }
             // A file where a directory was is the path gone, not unmounted.
             Ok(_) => return None,
@@ -200,6 +212,18 @@ pub fn detect_before_adopt(
     )
 }
 
+/// A torrent's files not found, as the directory each was in and the device
+/// the index recorded it on, with how many files share both.
+///
+/// Every file judged after the stats is held until then, so it is held by
+/// what its judgement reads rather than by its own path: a disk unmounted
+/// inside a readable root leaves every claimed file on it not found, and
+/// those share a directory per torrent folder, not one entry each. Ordered,
+/// so `unmounted_dirs` comes out the same on every pass.
+type Gone = std::collections::BTreeMap<(std::path::PathBuf, u64), u64>;
+
+type Candidate = (String, i64, std::path::PathBuf, u64, Gone, bool);
+
 fn detect_among(
     store: &mut PoolStore,
     infohashes: &[String],
@@ -208,11 +232,14 @@ fn detect_among(
 ) -> Result<DriftReport, PoolError> {
     let mut report = DriftReport::default();
     let mut probes = RootProbes::default();
+    let mut devs = DevMap::default();
     // Each torrent with evidence, or with a file it could not check:
-    // (infohash, root, its root path, files changed, files vanished, a file
-    // left unchecked). Vanished files count only once their root is
-    // confirmed readable after the stats, below.
-    let mut candidates: Vec<(String, i64, std::path::PathBuf, u64, u64, bool)> = Vec::new();
+    // (infohash, root, its root path, files changed, files not found by
+    // directory and recorded device, a file left unchecked). A file
+    // not found is judged only once every stat is made, below: by then
+    // `devs` has learnt every renumbered filesystem it can, and the root has
+    // been probed again.
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     for infohash in infohashes {
         let Some(state) = store.adoption_state(infohash)? else {
@@ -237,7 +264,7 @@ fn detect_among(
             continue;
         }
 
-        let (mut changed, mut vanished, mut unsure) = (0u64, 0u64, false);
+        let (mut changed, mut gone, mut unsure) = (0u64, Gone::new(), false);
         for f in store.torrent_files(infohash)? {
             if !f.is_on_disk() {
                 continue;
@@ -249,7 +276,10 @@ fn detect_among(
             let path = root_path.join(&rel);
             match std::fs::metadata(&path) {
                 Ok(m) => {
-                    if !same_file(&indexed, &m) {
+                    if same_file(&indexed, &m) {
+                        use std::os::unix::fs::MetadataExt;
+                        devs.learn(indexed.dev, m.dev());
+                    } else {
                         changed += 1;
                     }
                 }
@@ -260,21 +290,8 @@ fn detect_among(
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                     ) =>
                 {
-                    match untrusted_parent(&root_path, &path, indexed.dev) {
-                        None => vanished += 1,
-                        Some(dir) => {
-                            unsure = true;
-                            if !report.unmounted_dirs.contains(&dir) {
-                                warn!(
-                                    target: "torrentd_pool::drift",
-                                    root_id,
-                                    dir = %dir.display(),
-                                    "a claimed file is gone and its nearest directory is on another filesystem than the file was (an unmounted disk?); no file gone from it is counted as drift",
-                                );
-                                report.unmounted_dirs.push(dir);
-                            }
-                        }
-                    }
+                    let parent = path.parent().unwrap_or(&root_path).to_path_buf();
+                    *gone.entry((parent, indexed.dev)).or_default() += 1;
                 }
                 Err(e) => {
                     warn!(
@@ -290,26 +307,37 @@ fn detect_among(
             }
         }
 
-        if changed > 0 || vanished > 0 || unsure {
-            candidates.push((
-                infohash.clone(),
-                root_id,
-                root_path,
-                changed,
-                vanished,
-                unsure,
-            ));
+        if changed > 0 || !gone.is_empty() || unsure {
+            candidates.push((infohash.clone(), root_id, root_path, changed, gone, unsure));
         }
     }
 
     let mut drifted: Vec<String> = Vec::new();
-    for (infohash, root_id, root_path, changed, vanished, unsure) in candidates {
-        let (vanished, unsure) =
-            if vanished > 0 && !probes.still_readable(root_id, &root_path, &mut report) {
-                (0, true)
+    for (infohash, root_id, root_path, changed, gone, mut unsure) in candidates {
+        let mut vanished = 0u64;
+        if !gone.is_empty() {
+            if probes.still_readable(root_id, &root_path, &mut report) {
+                for ((parent, indexed_dev), files) in gone {
+                    match untrusted_parent(&root_path, &parent, indexed_dev, &devs) {
+                        None => vanished += files,
+                        Some(dir) => {
+                            unsure = true;
+                            if !report.unmounted_dirs.contains(&dir) {
+                                warn!(
+                                    target: "torrentd_pool::drift",
+                                    root_id,
+                                    dir = %dir.display(),
+                                    "a claimed file is gone and its nearest directory is on another filesystem than the file was (an unmounted disk?); no file gone from it is counted as drift",
+                                );
+                                report.unmounted_dirs.push(dir);
+                            }
+                        }
+                    }
+                }
             } else {
-                (vanished, unsure)
-            };
+                unsure = true;
+            }
+        }
         report.files_changed += changed;
         report.files_vanished += vanished;
         if changed > 0 || vanished > 0 {
@@ -345,8 +373,58 @@ fn detect_among(
     Ok(report)
 }
 
+/// Whether `live` still holds what the index recorded: the same size and the
+/// same mtime, to the nanosecond.
+///
+/// Device and inode are deliberately not compared. Neither survives a reboot
+/// or a remount on a common storage layout: disk enumeration order, md and dm,
+/// btrfs and zfs subvolumes, NFS, and FUSE layers (mergerfs, unRAID's
+/// `/mnt/user`) all renumber them, and nothing re-stamps the index at boot.
+/// Comparing them marked a whole adopted pool drifted after a routine reboot,
+/// and only a full re-hash clears that.
 fn same_file(indexed: &crate::model::PoolFile, live: &std::fs::Metadata) -> bool {
-    crate::scan::file_stamp(live) == (indexed.size, indexed.mtime_ns, indexed.ino, indexed.dev)
+    let (size, mtime_ns, _ino, _dev) = crate::scan::file_stamp(live);
+    (size, mtime_ns) == (indexed.size, indexed.mtime_ns)
+}
+
+/// What each device number the index recorded reads as now, learnt from the
+/// files this pass found unchanged: the filesystem a reboot or a remount
+/// renumbered.
+///
+/// A device number that two unchanged files disagree about maps to nothing,
+/// as one this pass found no unchanged file on does.
+#[derive(Default)]
+struct DevMap(std::collections::HashMap<u64, Option<u64>>);
+
+impl DevMap {
+    fn learn(&mut self, indexed: u64, live: u64) {
+        self.0
+            .entry(indexed)
+            .and_modify(|seen| {
+                if *seen != Some(live) {
+                    *seen = None;
+                }
+            })
+            .or_insert(Some(live));
+    }
+
+    /// Whether a directory on `live` now is on the filesystem the index
+    /// recorded a file on as `indexed`.
+    ///
+    /// Where this pass learnt what `indexed` reads as now, that answers.
+    /// Otherwise a `live` this pass learnt is another recorded filesystem's
+    /// is not this one, and only then are the two numbers compared as they
+    /// stand, which is right until a reboot renumbers the filesystem.
+    fn same_fs(&self, indexed: u64, live: u64) -> bool {
+        if let Some(Some(now)) = self.0.get(&indexed) {
+            return *now == live;
+        }
+        let anothers = self
+            .0
+            .iter()
+            .any(|(k, v)| *k != indexed && *v == Some(live));
+        !anothers && indexed == live
+    }
 }
 
 #[cfg(test)]
@@ -707,10 +785,12 @@ mod tests {
         assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
     }
 
-    /// A size change alone, and a replacement that keeps size and mtime but
-    /// not the inode, are each drift.
+    /// A size change alone is drift. A replacement that keeps size and mtime
+    /// but not the inode is not: it reads exactly as a remount that
+    /// renumbered the inode does, and only the mtime copied to the
+    /// nanosecond makes it so.
     #[test]
-    fn a_size_or_inode_change_is_drift() {
+    fn a_size_change_is_drift_and_an_inode_change_alone_is_not() {
         let (dir, root, mut store) = pool(&["aa", "bb", "cc"]);
 
         let a = root.join("aa/a.bin");
@@ -734,11 +814,39 @@ mod tests {
 
         let r = root.clone();
         let report = detect(&mut store, |_| Some(r.clone())).unwrap();
-        let mut drifted = report.drifted.clone();
-        drifted.sort();
-        assert_eq!(drifted, vec!["aa".to_string(), "bb".to_string()]);
-        assert_eq!(report.files_changed, 2);
+        assert_eq!(report.drifted, vec!["aa".to_string()]);
+        assert_eq!(report.files_changed, 1);
+        assert_eq!(state_of(&store, "bb"), AdoptionState::Matched);
         assert_eq!(state_of(&store, "cc"), AdoptionState::Matched);
+    }
+
+    /// What a recorded device number reads as now is what unchanged files
+    /// showed; one they disagree about, or none showed, falls back to the
+    /// number as recorded, unless it is another recorded filesystem's now.
+    #[test]
+    fn a_device_map_answers_from_what_the_pass_learnt() {
+        let mut devs = DevMap::default();
+        // Nothing learnt: the numbers as they stand.
+        assert!(devs.same_fs(1, 1));
+        assert!(!devs.same_fs(1, 2));
+
+        // 1 now reads as 5.
+        devs.learn(1, 5);
+        devs.learn(1, 5);
+        assert!(devs.same_fs(1, 5));
+        assert!(!devs.same_fs(1, 1));
+
+        // 2 was not learnt, and 5 is 1's now: a directory on 5 is not on 2's
+        // filesystem, though one on 2 still compares as recorded.
+        assert!(!devs.same_fs(2, 5));
+        assert!(devs.same_fs(2, 2));
+
+        // Two unchanged files disagree about 3: nothing is learnt for it.
+        devs.learn(3, 7);
+        devs.learn(3, 8);
+        assert!(devs.same_fs(3, 3));
+        assert!(!devs.same_fs(3, 7));
+        assert!(!devs.same_fs(3, 8));
     }
 
     #[test]
