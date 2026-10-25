@@ -32,6 +32,7 @@ use crate::pool_service::now_secs;
 use crate::pool_service::off_worker;
 use crate::pool_service::PoolService;
 use crate::profile_registry::ProfileStatus;
+use crate::profile_registry::Resolution;
 use crate::registry::AssignmentRegistry;
 
 /// Drive the verify queue: retire finished verifications, admit new ones.
@@ -572,8 +573,9 @@ pub(super) fn admit_held_add(
 
 /// Add the adoption at the head of the queue to its session, to verify.
 ///
-/// One whose profile is fenced or set offline goes to the back and is
-/// skipped, as a held re-hash or add is: the adoptions behind it, into
+/// One whose profile is fenced, set offline, or configured but without a
+/// session (its tunnel failed at boot) goes to the back and is skipped, as a
+/// held re-hash or add is: the adoptions behind it, into
 /// profiles still on the network, are admitted this tick rather than wait
 /// for the fence to lift. The hold is logged once per profile per tick:
 /// `held_logged` names the profiles already logged.
@@ -596,25 +598,40 @@ pub(super) fn admit_adoption(
     // profile — the one thing fencing exists to prevent. Put it back and
     // wait for the operator. A profile the operator set offline is
     // held the same way: adoptions into it are refused, and what was
-    // queued before it went offline waits for it to come back.
-    let fenced = profiles
-        .resolve(&item.profile)
+    // queued before it went offline waits for it to come back. So is one
+    // for a configured profile with no session, a tunnel that failed at
+    // boot (issue #651): its queue is what a restart that brings the
+    // profile up admits, and dropping it would release every claim in it.
+    let resolution = profiles.resolve(&item.profile);
+    let configured = !matches!(resolution, Resolution::Unknown);
+    let fenced = resolution
         .active()
         .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
-    if fenced || profiles.held_offline(&item.profile) {
+    let engine = source.engine_for(&item.profile);
+    let held = if fenced {
+        Some("vpn_down")
+    } else if profiles.held_offline(&item.profile) {
+        Some("offline")
+    } else if engine.is_none() && configured {
+        Some("no_session")
+    } else {
+        None
+    };
+    if let Some(reason) = held {
         if held_logged.insert(item.profile.clone()) {
             warn!(
                 target: "torrentd::pool",
                 profile_id = %item.profile,
                 infohash = %item.infohash,
-                reason = if fenced { "vpn_down" } else { "offline" },
+                reason,
                 "verify held: profile is off the network",
             );
         }
         q.pending.lock().push_back(item);
         return Admission::Skipped;
     }
-    let Some(engine) = source.engine_for(&item.profile) else {
+    // No `[[profile]]` declares it any more: nothing will ever admit it.
+    let Some(engine) = engine else {
         warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
         release_dropped_claim(pool, Writer::Held(store), registry, &item);
         return Admission::Skipped;

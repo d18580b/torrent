@@ -12,6 +12,7 @@ use torrentd_engine::TorrentPhase;
 use torrentd_engine::TorrentState;
 
 use super::tests::SETTLE;
+use crate::pool_service::tests::owner_of;
 use crate::pool_service::tests::padded_past_the_cap;
 use crate::pool_service::tests::pending;
 use crate::pool_service::tests::pool_with;
@@ -952,6 +953,134 @@ fn an_adoption_whose_library_torrent_was_replaced_is_dropped() {
         .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
     assert_eq!((q.failed(), q.depth(), q.in_flight()), (1, 0, 0));
     assert_eq!(w.registry.lookup(&queued), None, "the claim is released");
+}
+
+/// Issue #651: a boot whose persisted adoption queue names a profile with no
+/// session holds that profile's items, row, owner record and registry claim
+/// intact, and admits them once the profile has an engine. Before, each was
+/// dropped as though its profile were gone. An item whose profile no
+/// `[[profile]]` declares any more is still dropped.
+#[test]
+fn a_boot_holds_the_queued_adoptions_of_a_profile_without_a_session() {
+    use crate::profile_registry::test_entry;
+    use crate::profile_registry::test_failed_profile;
+    use crate::profile_registry::ProfileRegistry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let w = Worker::new(dir.path());
+    let torrents: Vec<_> = [("a", "p"), ("b", "f"), ("c", "gone")]
+        .into_iter()
+        .map(|(name, profile)| {
+            let (path, ih) = library_torrent(dir.path(), name);
+            (path, ih, profile)
+        })
+        .collect();
+    let mut pool = pool_with(dir.path(), torrents[0].1, None);
+    // The run before the restart: every profile up, each adoption claimed,
+    // recorded as its profile's, and queued in `pool.db`.
+    let before = ProfileRegistry::new(
+        ["p", "f", "gone"]
+            .into_iter()
+            .map(|id| test_entry(id, ProfileStatus::Active))
+            .collect(),
+    );
+    for (path, ih, profile) in &torrents {
+        pool.with_store(|s| {
+            s.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.to_hex(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "t".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: path.clone(),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+            .unwrap();
+        });
+        w.registry.assign(*ih, ProfileId::new(*profile)).unwrap();
+        crate::pool_service::enqueue_verify(
+            &pool,
+            &before,
+            &ih.to_hex(),
+            path.clone(),
+            dir.path().to_path_buf(),
+            None,
+            ProfileId::new(*profile),
+            false,
+        )
+        .unwrap();
+    }
+    // The restart: the in-memory queue is gone, `p` is up but its session
+    // not yet reachable, `f`'s tunnel failed, and `gone` left the config.
+    pool.verify = Arc::new(super::VerifyQueue::new(4));
+    let ihs: Vec<InfoHash> = torrents.iter().map(|t| t.1).collect();
+    assert_eq!(
+        pool.restore_verify_queue(&w.registry, &Default::default()),
+        ihs
+    );
+    let booted = Arc::new(
+        ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)])
+            .with_failed(vec![test_failed_profile("f", "tunnel failed")]),
+    );
+    let no_engine: Arc<dyn torrentd_engine::AlertSource> =
+        Arc::new(torrentd_engine::ProfileSource::new(Vec::new()));
+    let tick = |source: &Arc<dyn torrentd_engine::AlertSource>| {
+        let store = pool.lock_writer();
+        super::worker::admit(
+            pool.verify_queue(),
+            Some((&pool, &store)),
+            source,
+            &w.state,
+            &w.metrics,
+            &booted,
+            &w.registry,
+        );
+    };
+    let adds = || {
+        w.engine
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_)))
+            .count()
+    };
+    let rows = || -> Vec<String> {
+        pool.with_store(|s| s.verify_queue().unwrap())
+            .into_iter()
+            .map(|r| r.infohash)
+            .collect()
+    };
+    let intact = |ih: InfoHash, profile: &str| {
+        assert!(rows().contains(&ih.to_hex()), "{profile}'s row stays");
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some(profile));
+        assert_eq!(w.registry.lookup(&ih), Some(ProfileId::new(profile)));
+    };
+
+    for _ in 0..2 {
+        tick(&no_engine);
+        assert_eq!(adds(), 0);
+        assert_eq!(pool.verify_queue().depth(), 2, "`p` and `f` wait");
+        intact(ihs[0], "p");
+        intact(ihs[1], "f");
+    }
+    // The undeclared profile's item went the first tick, with its records.
+    assert!(!rows().contains(&ihs[2].to_hex()));
+    assert_eq!(owner_of(&pool, ihs[2]), None);
+    assert_eq!(w.registry.lookup(&ihs[2]), None);
+
+    // `p`'s engine appears: its adoption is admitted, and `f`'s still waits.
+    tick(&w.source);
+    assert_eq!(adds(), 1);
+    assert_eq!(pool.verify_queue().in_flight(), 1);
+    assert_eq!(pool.verify_queue().depth(), 1);
+    intact(ihs[1], "f");
 }
 
 /// Re-hashes held for a fenced profile log the hold once per profile per
