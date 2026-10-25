@@ -542,15 +542,18 @@ as `verify_queue_depth` and `verify_in_flight`.
   until the check ends. Fix the cause before you resume, and decide whether
   that window is acceptable; nothing resumes the torrent for you.
 - **A dropped item** never reached a session: its `.torrent` could not be
-  read from `library_dir`, its profile stopped, the tracker check failed at
-  admission, or libtorrent rejected the add. Its registry claim is released,
+  read from `library_dir`, its profile is no longer configured, the tracker
+  check failed at admission, or libtorrent rejected the add. Its registry claim is released,
   so it adopts again once the cause is fixed. The log line ends `dropping
   verify`, or reads `verify dropped: …` or `verify add failed`.
 - **A fenced or offline profile** holds its own items: nothing is admitted
   for it until it is back, and the items behind them, for other profiles,
   are admitted meanwhile (`verify held: profile is off the network`, or
   `re-hash held: …` for a queued re-hash, logged once per profile each
-  second). A
+  second). A configured profile with no session, one whose tunnel failed at
+  boot, holds its queued adoptions the same way (the `verify held` line's
+  `reason` reads `no_session`): each keeps its row, owner record and
+  registry claim, and is admitted once a restart brings the profile up. A
   queued re-hash also waits while the profile's fence is lifted, until the
   lift's paced resume reaches its torrent.
 - **A running scan** holds the pool index until it commits. Meanwhile no
