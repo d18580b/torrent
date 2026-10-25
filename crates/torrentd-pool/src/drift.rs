@@ -635,6 +635,52 @@ mod tests {
         assert!(report.unchecked.is_empty(), "{report:?}");
     }
 
+    /// Counts the `info` events from this module dispatched to it.
+    #[derive(Default)]
+    struct DriftInfos(std::sync::atomic::AtomicUsize);
+
+    impl tracing::Subscriber for DriftInfos {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let m = event.metadata();
+            if *m.level() == tracing::Level::INFO && m.target() == "torrentd_pool::drift" {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The `drift detected` line is written for a pass that found drift, and
+    /// only for one.
+    #[test]
+    fn only_a_pass_that_found_drift_says_so() {
+        let (_dir, root, mut store) = pool(&["aa"]);
+        let r = root.clone();
+        let infos = std::sync::Arc::new(DriftInfos::default());
+        let count = |store: &mut PoolStore| {
+            // A second live dispatcher, so a callsite a parallel test
+            // registered first still asks this one (see torrentd-engine's
+            // `testing::with_subscriber`).
+            let _pin = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let before = infos.0.load(std::sync::atomic::Ordering::Relaxed);
+            tracing::subscriber::with_default(std::sync::Arc::clone(&infos), || {
+                detect(store, |_| Some(r.clone())).unwrap()
+            });
+            infos.0.load(std::sync::atomic::Ordering::Relaxed) - before
+        };
+        assert_eq!(count(&mut store), 0, "a clean pass");
+        rewrite_in_place(&root, "aa");
+        assert_eq!(count(&mut store), 1, "a pass that found drift");
+    }
+
     /// A file that cannot be stated for a reason other than not-found —
     /// here permission, as EIO would be — is counted, and is not drift.
     #[test]
