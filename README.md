@@ -307,7 +307,12 @@ the current directory. `TORRENTCTL_TOKEN` and a token file are trimmed, and a
 token from any source that is not visible ASCII (a space, a control or a
 non-ASCII character) is refused at startup. With no token, it
 asks for the operator password and holds the session token it gets in memory,
-revoking it on quit.
+revoking it however the client exits: a quit, the terminal closing
+(`SIGHUP`), `SIGINT` or `SIGTERM`, an error reading the terminal or drawing
+to it, the end of its input, or a panic. A sign-in still in flight is waited
+for and its token revoked too. Outside a quit, the revocation is given five
+seconds and a second signal skips it; a token that could not be revoked is
+reported once the terminal is restored, and stays valid until it expires.
 
 **Config file.** `$XDG_CONFIG_HOME/torrentctl/config.toml`, or the file
 `--config` names, which must then exist. It takes `url` and `token_file`, and
