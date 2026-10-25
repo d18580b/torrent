@@ -920,6 +920,39 @@ fn a_delete_plan_left_with_nothing_says_why() {
     assert_eq!(refusal("empty"), "no unclaimed files under that path");
 }
 
+/// A torrent's own empty files are the declared ones without bytes; a
+/// padding entry is never one, whatever its size.
+#[test]
+fn a_padding_entry_is_never_a_torrents_own_empty_file() {
+    let mut store = PoolStore::open_in_memory().unwrap();
+    add_torrent(
+        &mut store,
+        "pe",
+        "T",
+        None,
+        &[
+            ("T/a.bin", 64),
+            ("T/.pad/0", 0),
+            ("T/.pad/7", 7),
+            ("T/e", 0),
+        ],
+    );
+    let listed = torrentd_pool::plan::listed_under(&store, "pe", 1, "base").unwrap();
+    assert_eq!(
+        listed.empty,
+        std::collections::HashSet::from(["base/T/e".to_string()])
+    );
+}
+
+#[test]
+fn a_relocate_source_that_is_not_a_directory_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("T");
+    std::fs::write(&file, b"x").unwrap();
+    let why = torrentd_pool::plan::unlisted_entry(&file, "T", &Default::default()).unwrap();
+    assert!(why.ends_with("itself, which is not a directory"), "{why}");
+}
+
 /// An index from before the trash was left unindexed may still list it;
 /// a delete plan never takes a file from it.
 #[test]
