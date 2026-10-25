@@ -38,6 +38,7 @@ use tracing::warn;
 
 use crate::model::AdoptionState;
 use crate::model::PoolError;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 /// What adopting one torrent would do.
@@ -273,7 +274,11 @@ fn torrent_meta(path: &Path) -> Option<TorrentMeta> {
 
 /// Each file's path as the `.torrent` gives it, `/`-separated: where the
 /// scan places a file the previous client left where the `.torrent` says.
-fn torrent_paths(meta: &TorrentMeta) -> Vec<String> {
+///
+/// The one rewrite of a torrent's declared paths into the index's form: the
+/// scan writes its file rows from it, and adoption compares those rows with
+/// it.
+pub(crate) fn torrent_paths(meta: &TorrentMeta) -> Vec<String> {
     meta.files
         .iter()
         .map(|f| f.path.replace('\\', "/"))
@@ -367,16 +372,6 @@ fn fastresume_is_trustworthy(
     Ok(true)
 }
 
-fn join_rel(base: &str, rel: &str) -> String {
-    let base = base.trim_matches('/');
-    let rel = rel.trim_matches('/');
-    if base.is_empty() {
-        rel.to_string()
-    } else {
-        format!("{base}/{rel}")
-    }
-}
-
 /// Summary of what a bulk adopt over a subtree would do, without doing it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdoptPreview {
@@ -451,12 +446,6 @@ pub fn torrent_path(store: &PoolStore, infohash: &str) -> Result<Option<PathBuf>
     Ok(store.torrent(infohash)?.map(|t| t.source_path))
 }
 
-/// The `.torrent` bytes, read from the library, or an error where the file
-/// is larger than the library's read cap.
-pub fn torrent_bytes(path: &Path) -> Result<Vec<u8>, PoolError> {
-    Ok(crate::scan::read_capped(path)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,7 +464,6 @@ mod tests {
         let at = dir.path().join("t.torrent");
         std::fs::write(&at, &fixture).unwrap();
         assert!(torrent_meta(&at).is_some());
-        assert_eq!(torrent_bytes(&at).unwrap(), fixture);
 
         // An unknown top-level key holding a cap's worth of bytes.
         let pad = MAX_LIBRARY_FILE_BYTES as usize;
@@ -489,9 +477,5 @@ mod tests {
         std::fs::write(&at, &big).unwrap();
 
         assert!(torrent_meta(&at).is_none());
-        match torrent_bytes(&at) {
-            Err(PoolError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::FileTooLarge),
-            other => panic!("{:?}", other.map(|b| b.len())),
-        }
     }
 }

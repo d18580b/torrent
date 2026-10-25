@@ -33,6 +33,7 @@ use crate::model::ops;
 use crate::model::AdoptionState;
 use crate::model::PlanStep;
 use crate::model::PoolError;
+use crate::store::join_rel;
 use crate::store::PoolStore;
 
 /// What the operator asked for. Persisted with the plan so a resumed apply can
@@ -687,15 +688,6 @@ pub fn unlisted_entry(dir: &Path, base: &str, listed: &Listed) -> Option<String>
         }
     }
     None
-}
-
-fn join_rel(base: &str, rel: &str) -> String {
-    let (base, rel) = (base.trim_matches('/'), rel.trim_matches('/'));
-    if base.is_empty() {
-        rel.to_owned()
-    } else {
-        format!("{base}/{rel}")
-    }
 }
 
 /// Resolve a root-relative path, refusing anything that escapes its root.

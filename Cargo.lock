@@ -3622,7 +3622,6 @@ dependencies = [
 name = "torrentd-pool"
 version = "0.2.0"
 dependencies = [
- "hex",
  "jwalk",
  "libtorrent-safe",
  "proptest",

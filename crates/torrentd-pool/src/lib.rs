@@ -63,3 +63,12 @@ pub use scan::scan_library;
 pub use scan::scan_root;
 pub use scan::ScanStats;
 pub use store::PoolStore;
+
+/// Seconds since the Unix epoch, as the index's timestamp columns store
+/// them; 0 for a clock set before it.
+pub(crate) fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}

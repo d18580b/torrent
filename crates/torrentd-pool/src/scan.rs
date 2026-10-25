@@ -6,8 +6,6 @@
 //! is metadata-only by construction.
 
 use std::path::Path;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use tracing::info;
 use tracing::warn;
@@ -17,6 +15,7 @@ use crate::model::PoolError;
 use crate::model::PoolFile;
 use crate::model::PoolTorrent;
 use crate::model::TorrentFileRow;
+use crate::now_secs;
 use crate::store::PoolStore;
 use crate::store::STAGE_BATCH;
 
@@ -376,11 +375,7 @@ pub fn scan_library(
         // libtorrent's `mapped_files`, or moved by qBittorrent's content
         // layout. Matching the `.torrent`'s own paths instead reads renamed
         // payload as missing — and offers it up as orphans to delete.
-        let paths: Vec<String> = meta
-            .files
-            .iter()
-            .map(|f| f.path.replace('\\', "/"))
-            .collect();
+        let paths = crate::adopt::torrent_paths(&meta);
         let paths = hints
             .relayout(&paths, &meta.name)
             .map_or(paths, |r| r.paths);
@@ -487,13 +482,6 @@ pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
         return Err(too_large());
     }
     Ok(bytes)
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// The `(size, mtime, inode, device)` the index records for a file.

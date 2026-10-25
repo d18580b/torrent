@@ -23,12 +23,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# The migration test hand-builds a v1 index to prove the upgrade path.
-rusqlite = { workspace = true }
 proptest = { workspace = true }
 
 [lints]
