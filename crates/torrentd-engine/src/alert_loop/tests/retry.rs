@@ -700,3 +700,176 @@ fn a_due_timer_between_a_failed_check_and_its_status_update_resumes() {
         "the backoff advances from the kept count"
     );
 }
+
+/// Check slots that are always free and record what they gave out and got
+/// back, running `on_take` as each is taken.
+struct DisarmingSlots<F: Fn(&InfoHash)> {
+    on_take: F,
+    taken: std::sync::Mutex<Vec<InfoHash>>,
+    released: std::sync::Mutex<Vec<InfoHash>>,
+}
+
+impl<F: Fn(&InfoHash) + Send + Sync> CheckSlots for DisarmingSlots<F> {
+    fn try_take(&self, _: &ProfileId, ih: InfoHash) -> bool {
+        self.taken.lock().unwrap().push(ih);
+        (self.on_take)(&ih);
+        true
+    }
+    fn release(&self, ih: &InfoHash) {
+        self.released.lock().unwrap().push(*ih);
+    }
+}
+
+/// Issue #671: the daemon's check-queue worker takes a torrent's retry and
+/// then pauses it. A retry `retries_due` had already returned read its
+/// state once, before that, and resumed the torrent anyway. Disarmed after
+/// the loop's first read, it now does nothing and gives its slot back.
+#[test]
+fn a_retry_disarmed_after_it_came_due_does_not_act() {
+    for (has_error, phase) in [
+        (true, TorrentPhase::Paused),
+        (false, TorrentPhase::DiskError),
+    ] {
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
+        let (state, h) = state_with_a_due_retry(clock.now());
+        state.update(&h.infohash, |s| {
+            s.has_error = has_error;
+            s.phase = phase;
+        });
+        // The worker's take lands while the loop holds its snapshot: here,
+        // as the loop takes its check slot.
+        let slots = DisarmingSlots {
+            on_take: {
+                let state = Arc::clone(&state);
+                move |ih: &InfoHash| {
+                    state.update(ih, |s| s.retry = None);
+                }
+            },
+            taken: Default::default(),
+            released: Default::default(),
+        };
+
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            None,
+            Some(&slots),
+            clock.now(),
+        );
+
+        assert!(
+            !engine.calls().iter().any(|c| matches!(
+                c,
+                crate::mock::RecordedCall::ResumeTorrent(_)
+                    | crate::mock::RecordedCall::ForceRecheck(_)
+            )),
+            "has_error {has_error}: a disarmed retry acted: {:?}",
+            engine.calls(),
+        );
+        assert!(
+            state.get(&h.infohash).unwrap().retry.is_none(),
+            "has_error {has_error}: the disarmed retry was re-armed",
+        );
+        assert_eq!(*slots.taken.lock().unwrap(), [h.infohash]);
+        assert_eq!(
+            *slots.released.lock().unwrap(),
+            [h.infohash],
+            "has_error {has_error}: the slot was not given back",
+        );
+        assert!(!recording.calls().iter().any(|c| matches!(
+            c,
+            MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
+        )));
+    }
+}
+
+/// Issue #671: a retry disarmed during the resume itself pauses the
+/// torrent again and stays disarmed, rather than being re-armed by the
+/// backoff and resuming the torrent at its next deadline.
+#[test]
+fn a_retry_disarmed_during_its_resume_pauses_the_torrent_again() {
+    let clock = Arc::new(MockClock::new());
+    let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+    let engine = Arc::new(MockEngine::new());
+    let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+        Arc::clone(&engine) as Arc<dyn TorrentEngine>
+    ));
+    let recording = Arc::new(RecordingSink::new());
+    let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
+    let (state, h) = state_with_a_due_retry(clock.now());
+    // Never fenced. The question asked after the resume is where the
+    // worker's take lands: after the resume, before the backoff.
+    let asked = Arc::new(AtomicU64::new(0));
+    let fence: ProfileFenced = {
+        let asked = Arc::clone(&asked);
+        let state = Arc::clone(&state);
+        Arc::new(move |_: &ProfileId| {
+            if asked.fetch_add(1, Ordering::SeqCst) > 0 {
+                state.update(&h.infohash, |s| s.retry = None);
+            }
+            false
+        })
+    };
+    let slots = DisarmingSlots {
+        on_take: |_: &InfoHash| {},
+        taken: Default::default(),
+        released: Default::default(),
+    };
+
+    execute_due_retries(
+        &source,
+        &state,
+        &metrics,
+        &dyn_clock,
+        Some(&fence),
+        Some(&slots),
+        clock.now(),
+    );
+
+    let calls: Vec<_> = engine
+        .calls()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c,
+                crate::mock::RecordedCall::ResumeTorrent(_)
+                    | crate::mock::RecordedCall::PauseTorrent(_)
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            calls.as_slice(),
+            [
+                crate::mock::RecordedCall::ResumeTorrent(r),
+                crate::mock::RecordedCall::PauseTorrent(p),
+            ] if *r == h && *p == h
+        ),
+        "the resumed torrent was not paused again: {calls:?}",
+    );
+    assert!(
+        state.get(&h.infohash).unwrap().retry.is_none(),
+        "the backoff re-armed a disarmed retry",
+    );
+    assert_eq!(
+        *slots.released.lock().unwrap(),
+        [h.infohash],
+        "the re-paused torrent's slot was not given back",
+    );
+    assert!(
+        !recording.calls().iter().any(|c| matches!(
+            c,
+            MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
+        )),
+        "an undone resume is not counted as a retry attempt",
+    );
+}
