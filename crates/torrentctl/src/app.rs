@@ -1548,6 +1548,41 @@ mod tests {
     }
 
     #[test]
+    fn quitting_between_the_sign_in_answer_and_signed_in_revokes_the_new_token() {
+        let daemon = testing::Recorder::start("204 No Content", "");
+        let mut m = model_at(&daemon);
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        m.login.busy = true;
+        // The daemon answered; `SignedIn` is on its way but not yet applied.
+        let msgs = testing::run(update(
+            &mut m,
+            Msg::Login(screens::login::Msg::Answered(Ok("tds_gap".into()))),
+        ));
+        let [Msg::SignedIn(api)] = &msgs[..] else {
+            panic!("SignedIn on its way: {msgs:?}");
+        };
+        assert!(m.login.busy, "a token is on its way");
+
+        let effects = update(&mut m, Msg::Quit);
+        assert!(!m.quit, "waits for the token on its way");
+        testing::run(effects);
+        let msgs = testing::run(update(&mut m, Msg::SignedIn(api.clone())));
+        assert_eq!(
+            daemon.requests(),
+            [testing::Request {
+                line: REVOKE.to_owned(),
+                bearer: Some("tds_gap".to_owned()),
+            }],
+            "revokes the new token and describes nothing"
+        );
+        assert!(
+            matches!(msgs[..], [Msg::Exit(None)]),
+            "then leaves: {msgs:?}"
+        );
+        assert!(!m.login.busy);
+    }
+
+    #[test]
     fn the_first_check_asks_for_a_password_without_calling_it_an_error() {
         let mut m = model();
         update(&mut m, Msg::SessionChecked(Err(unauthorized())));

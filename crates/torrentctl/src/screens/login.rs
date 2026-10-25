@@ -287,6 +287,7 @@ mod tests {
     fn a_granted_token_signs_the_app_in() {
         let daemon = testing::Recorder::start("500 Internal Server Error", "{}");
         let mut state = typed("pw");
+        state.busy = true;
         let effects = testing::with_api(&daemon.api(), None, |ctx| {
             update(&mut state, Msg::Answered(Ok("tds_abc".into())), ctx)
         });
@@ -294,6 +295,7 @@ mod tests {
             state.password.value().is_empty(),
             "the password is not kept"
         );
+        assert!(state.busy, "busy until SignedIn lands and clears it");
         let msgs = testing::run(effects);
         let [crate::app::Msg::SignedIn(api)] = &msgs[..] else {
             panic!("SignedIn with the new credential: {msgs:?}");
