@@ -139,6 +139,79 @@ fn a_complete_fastresume_takes_the_fast_path() {
     }
 }
 
+/// Two copies of `T` at the same sizes, `A/T` (stale or preallocated) and
+/// `B/T`, with a complete sidecar declaring `declared` as the save path:
+/// the store, matched, and the root's id and path.
+fn two_same_size_copies(
+    dir: &Path,
+    declared: impl Fn(&Path) -> String,
+) -> (PoolStore, i64, PathBuf) {
+    let root = dir.join("data");
+    let lib = dir.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "A/T/a.bin", 4096);
+    write_file(&root, "B/T/a.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "fc",
+        "T",
+        &[("T/a.bin", 4096)],
+        Some(true),
+    );
+    let mut t = store.torrent("fc").unwrap().unwrap();
+    t.declared_save_path = Some(declared(&root));
+    store.upsert_torrent(&t, 0).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    (store, root_id, root)
+}
+
+/// Issue #613: the previous client saved outside every root (qBittorrent in
+/// a container, say), so the matcher placed the torrent by the size anchor,
+/// on one of two copies of the same sizes. The complete bitfield says
+/// nothing about which of them it described, so the torrent is verified.
+#[test]
+fn a_complete_fastresume_over_one_of_two_same_size_copies_is_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, root_id, root) = two_same_size_copies(dir.path(), |_| "/downloads".to_owned());
+    assert_eq!(state_of(&store, "fc"), AdoptionState::Matched);
+    let (_, base) = store.adoption_base("fc").unwrap().unwrap();
+
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, "fc", |id| (id == root_id).then(|| r.clone())).unwrap();
+    match plan {
+        AdoptPlan::Verify { save_path, .. } => assert_eq!(save_path, root.join(base)),
+        other => panic!("expected verify, got {other:?}"),
+    }
+}
+
+/// The same two copies, but the previous client declared one of them as its
+/// save path: the matcher adopts from it, and the bitfield is about it.
+#[test]
+fn a_complete_fastresume_over_its_declared_copy_takes_the_fast_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, root_id, root) = two_same_size_copies(dir.path(), |root| {
+        root.join("B").to_string_lossy().into_owned()
+    });
+    assert_eq!(
+        store.adoption_base("fc").unwrap(),
+        Some((root_id, "B".to_owned()))
+    );
+
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, "fc", |id| (id == root_id).then(|| r.clone())).unwrap();
+    match plan {
+        AdoptPlan::FastPath { save_path, .. } => assert_eq!(save_path, root.join("B")),
+        other => panic!("expected fast path, got {other:?}"),
+    }
+}
+
 #[test]
 fn an_incomplete_fastresume_falls_back_to_verifying() {
     // The previous client never finished it, so its piece state vouches for

@@ -10,7 +10,9 @@
 //! * **Fast path** — the previous client left a `.fastresume` saying the
 //!   torrent was complete — a `pieces` bitfield with one entry for each of
 //!   the `.torrent`'s pieces, every one had — and every file is still in the
-//!   index at the size the torrent declares. Payload rewritten in place at the same size is caught
+//!   index at the size the torrent declares, at a placement that is
+//!   unambiguous: the save path the sidecar declares, or the only complete
+//!   copy under the managed roots. Payload rewritten in place at the same size is caught
 //!   separately by the drift pass an adopt runs over its selection first,
 //!   which marks the torrent `Drifted` and so sends it down the verify path
 //!   instead. Given both, its piece state is as good as a verification
@@ -38,6 +40,7 @@ use tracing::warn;
 
 use crate::model::AdoptionState;
 use crate::model::PoolError;
+use crate::model::PoolTorrent;
 use crate::store::join_rel;
 use crate::store::PoolStore;
 
@@ -219,7 +222,7 @@ pub fn plan(
 
     let can_fast_path = may_fast_path
         && match &hints {
-            Some(h) => fastresume_is_trustworthy(store, infohash, h, meta())?,
+            Some(h) => fastresume_is_trustworthy(store, &torrent, h, meta(), &save_path)?,
             None => false,
         };
 
@@ -323,11 +326,19 @@ fn files_follow_the_torrent(
 /// Whether the previous client's completion claim can stand in for our own
 /// verification.
 ///
-/// Two conditions, both necessary. The sidecar has to say the torrent was
+/// Three conditions, all necessary. The sidecar has to say the torrent was
 /// complete — a bitfield with one entry per piece of the `.torrent`, every
-/// one had; an incomplete or mis-sized one has nothing useful to assert — and
+/// one had; an incomplete or mis-sized one has nothing useful to assert —
 /// every file has to still be present in the index at the size the torrent
-/// declares.
+/// declares, and the placement at `save_path` has to be the one the sidecar
+/// is about.
+///
+/// That last condition holds where the previous client's declared save path
+/// is `save_path` itself, or where `save_path` holds the only complete copy
+/// under the managed roots. Otherwise the matcher picked one of several
+/// same-size copies — by the size anchor, typically, where the declared path
+/// lies outside every root — and a stale or preallocated one would be
+/// announced as complete, so the torrent is verified instead.
 ///
 /// Note what that second condition does *not* cover: it compares the torrent
 /// against the index, so it only rules out payload that changed size. Payload
@@ -340,10 +351,12 @@ fn files_follow_the_torrent(
 /// the last scan or drift check saw.
 fn fastresume_is_trustworthy(
     store: &PoolStore,
-    infohash: &str,
+    torrent: &PoolTorrent,
     hints: &crate::fastresume::ResumeHints,
     meta: Option<&TorrentMeta>,
+    save_path: &Path,
 ) -> Result<bool, PoolError> {
+    let infohash = torrent.infohash.as_str();
     // The piece count is the `.torrent`'s; without it, no bitfield can be
     // held to it.
     let Some(meta) = meta else {
@@ -357,7 +370,8 @@ fn fastresume_is_trustworthy(
         return Ok(false);
     };
 
-    for f in store.torrent_files(infohash)? {
+    let files = store.torrent_files(infohash)?;
+    for f in &files {
         if !f.is_on_disk() {
             continue;
         }
@@ -369,7 +383,22 @@ fn fastresume_is_trustworthy(
             _ => return Ok(false),
         }
     }
-    Ok(true)
+
+    // The previous client's bitfield is about the payload at the path it
+    // declared, so where that is the base adopted from, the claim is about
+    // these very files.
+    if torrent
+        .declared_save_path
+        .as_deref()
+        .is_some_and(|declared| Path::new(declared) == save_path)
+    {
+        return Ok(true);
+    }
+    // Otherwise only an unambiguous placement lets it stand: one complete
+    // copy, the one adopted from. Two copies at the same sizes say nothing
+    // about which one the bitfield described.
+    let copies = crate::matcher::complete_copies(store, torrent, &files)?;
+    Ok(copies == [(root_id, base_rel)])
 }
 
 /// Summary of what a bulk adopt over a subtree would do, without doing it.
