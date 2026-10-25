@@ -1222,6 +1222,25 @@ pub(crate) enum FenceCause {
 /// How often [`watch`] checks the table is still installed.
 const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The most checks apart two reinstalls of one loss are tried: 10 checks of
+/// [`WATCH_INTERVAL`], five minutes.
+const REINSTALL_RETRY_MAX_CHECKS: u32 = 10;
+
+/// How many checks that find the table still lost pass, after the
+/// `failures`th reinstall in a row of one loss did not check intact, before
+/// the next check installs it again: the reinstalls are 1, 2, 4, 8 checks
+/// apart, then [`REINSTALL_RETRY_MAX_CHECKS`] apart for as long as the loss
+/// lasts. The first retry is the very next check, so one transient `nft`
+/// failure costs one interval of fencing, not the rest of the run; a fault
+/// that persists is retried at most every five minutes rather than every
+/// check, each retry an `nft -f -` transaction and an error in the log.
+fn retry_wait(failures: u32) -> u32 {
+    1u32.checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(REINSTALL_RETRY_MAX_CHECKS)
+        - 1
+}
+
 /// Where the watch stands between checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Watch {
@@ -1232,11 +1251,19 @@ enum Watch {
     /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE),
     /// and nothing is fenced for them.
     Unchecked(u32),
-    /// A check found it gone or changed: every vpn profile was fenced, and the
-    /// one reinstall this loss gets was tried and did not check intact. Each
-    /// later check fences again until one finds the table intact, including
-    /// a check that cannot run.
-    Lost,
+    /// A check found it gone or changed: every vpn profile was fenced, and
+    /// the last `failures` reinstalls of this loss in a row did not check
+    /// intact. Each later check fences again until one finds the table
+    /// intact, including a check that cannot run; a check that finds it
+    /// still gone or changed installs it again once `wait` more such checks
+    /// have passed ([`retry_wait`]).
+    Lost {
+        /// Reinstalls of this loss that did not check intact, at least 1.
+        failures: u32,
+        /// Checks that find the table still lost before the next one
+        /// reinstalls it.
+        wait: u32,
+    },
     /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
     /// checks in a row could not run: every vpn profile was fenced
     /// ([`FenceCause::Unverifiable`]), and stays so until a check finds the
@@ -1255,12 +1282,14 @@ enum Watch {
 ///
 /// Each check compares the live table with the rendered one ([`verify`]) and
 /// sets `kill_switch_table_present` to whether it matched. A table gone or
-/// changed fences every vpn profile, then the table is installed again once,
-/// in one transaction, and checked again; only a reinstall that checks intact
+/// changed fences every vpn profile, then the table is installed again, in
+/// one transaction, and checked again; only a reinstall that checks intact
 /// lifts the fence. While it is not intact the check repeats each interval,
 /// fencing again any profile set online meanwhile, whether or not that check
-/// can run; a later check that finds it
-/// intact — restored by the operator — lifts the fence then. A check that
+/// can run, and a check that finds it still gone or changed installs it
+/// again with a backoff ([`retry_wait`]): the next check, then 2, 4 and 8
+/// checks on, then every 10, until one checks intact. A check that finds it
+/// intact — reinstalled, or restored by the operator — lifts the fence. A check that
 /// cannot run counts in `kill_switch_probe_errors_total` and, alone, changes
 /// nothing, since not knowing is not the same as absent; but
 /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
@@ -1497,12 +1526,18 @@ fn refresh(
 /// leaves the watch.
 ///
 /// Each loss found from any state but [`Watch::Lost`] counts once in
-/// `kill_switch_lost_total`, by whether the one reinstall checked intact
+/// `kill_switch_lost_total`, by whether its first reinstall checked intact
 /// (`reinstalled`) or not (`lost`). The whole loss, fence and reinstall
 /// included, happens within this one call, so `kill_switch_table_present` is
 /// back at 1 before any scrape can read the 0: the counter is the only trace a
 /// loss the reinstall repaired leaves. The checks that repeat while the watch
-/// is [`Watch::Lost`] are the same loss, and are not counted again.
+/// is [`Watch::Lost`] are the same loss, and are not counted again, the
+/// reinstalls they retry included.
+///
+/// A check that finds the table still lost while the watch is
+/// [`Watch::Lost`] fences again, and reinstalls it only once the loss's
+/// `wait` has run out ([`retry_wait`]); the fence comes off only when a
+/// reinstall's own readback, or a later check, finds the table intact.
 ///
 /// A check that cannot run fences nothing until it is the
 /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)th
@@ -1521,7 +1556,7 @@ fn tick(
     let why = match verify() {
         Ok(Verdict::Intact) => {
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
-            if matches!(state, Watch::Lost | Watch::Unverified) {
+            if matches!(state, Watch::Lost { .. } | Watch::Unverified) {
                 tracing::warn!(
                     target: "torrentd::vpn::killswitch",
                     state = ?state,
@@ -1553,45 +1588,65 @@ fn tick(
          longer confined to the tunnels; fencing every vpn profile",
     );
     fence.fence_all();
-    if state == Watch::Lost {
-        return Watch::Lost;
-    }
+    // How many reinstalls of this loss have already failed: none for a loss
+    // this check found.
+    let failed = match state {
+        Watch::Lost { failures, wait: 0 } => failures,
+        Watch::Lost { failures, wait } => {
+            return Watch::Lost {
+                failures,
+                wait: wait - 1,
+            };
+        }
+        Watch::Intact | Watch::Unchecked(_) | Watch::Unverified => 0,
+    };
+    let lost = |failures: u32| Watch::Lost {
+        failures,
+        wait: retry_wait(failures),
+    };
     let next = match reinstall().and_then(|()| verify()) {
         Ok(Verdict::Intact) => {
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
             tracing::warn!(
                 target: "torrentd::vpn::killswitch",
+                failed_reinstalls = failed,
                 "reinstalled the network kill switch and verified it; lifting the fence",
             );
             fence.lift();
             Watch::Intact
         }
         Ok(verdict) => {
+            let next = lost(failed.saturating_add(1));
             tracing::error!(
                 target: "torrentd::vpn::killswitch",
                 verdict = ?verdict,
+                state = ?next,
                 "reinstalled the network kill switch, and it still does not check as installed; \
-                 the vpn profiles stay fenced. Restart the daemon to reinstall it",
+                 the vpn profiles stay fenced, and a later check installs it again",
             );
-            Watch::Lost
+            next
         }
         Err(e) => {
+            let next = lost(failed.saturating_add(1));
             tracing::error!(
                 target: "torrentd::vpn::killswitch",
-                state = ?state,
+                state = ?next,
                 error.cause = %e,
-                "could not reinstall the network kill switch; the vpn profiles stay fenced. \
-                 Restart the daemon to reinstall it",
+                "could not reinstall the network kill switch; the vpn profiles stay fenced, and \
+                 a later check installs it again",
             );
-            Watch::Lost
+            next
         }
     };
-    let outcome = if next == Watch::Intact {
-        "reinstalled"
-    } else {
-        "lost"
-    };
-    metrics.inc_counter("kill_switch_lost_total", &[("outcome", outcome)]);
+    // A retry is the same loss, already counted when it was found.
+    if failed == 0 {
+        let outcome = if next == Watch::Intact {
+            "reinstalled"
+        } else {
+            "lost"
+        };
+        metrics.inc_counter("kill_switch_lost_total", &[("outcome", outcome)]);
+    }
     next
 }
 
@@ -1602,9 +1657,11 @@ fn unchecked(state: Watch, fence: &dyn Fence) -> Watch {
         // The loss stands: nothing has found the table back. Fence again, as
         // a check that finds it still lost does, so a profile set online
         // meanwhile does not keep seeding for as long as `nft` cannot run.
-        Watch::Lost => {
+        // Its retry waits for a check that runs, which can read back what a
+        // reinstall installed: `wait` counts only those.
+        Watch::Lost { .. } => {
             fence.fence_all();
-            return Watch::Lost;
+            return state;
         }
         Watch::Intact => 1,
         Watch::Unchecked(n) => n.saturating_add(1),
