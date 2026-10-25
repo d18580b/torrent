@@ -619,10 +619,29 @@ fn loaded_relocate(
     Arc<dyn AlertSource>,
     StateMap,
 ) {
+    let loaded = loaded_session(pool, root, ih, held_at);
+    loaded
+        .1
+        .inject_error("move_storage", torrentd_engine::EngineError::Shutdown);
+    loaded
+}
+
+/// [`loaded_relocate`] with a `move_storage` that succeeds and moves
+/// nothing: the test plays libtorrent's part on the disk and in the state.
+fn loaded_session(
+    pool: &PoolService,
+    root: &Path,
+    ih: &str,
+    held_at: &Path,
+) -> (
+    i64,
+    Arc<torrentd_engine::MockEngine>,
+    Arc<dyn AlertSource>,
+    StateMap,
+) {
     add_and_rematch(pool, ih, "T", Some(&root.join("old")), &[("T/a.bin", 100)]);
     let plan_id = relocate_plan(pool, ih);
     let mock = Arc::new(torrentd_engine::MockEngine::new());
-    mock.inject_error("move_storage", torrentd_engine::EngineError::Shutdown);
     let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
     let handle = mock.register_handle(hash);
     mock.set_torrent_details(
@@ -743,6 +762,97 @@ fn a_session_holding_the_torrent_at_the_source_reaches_the_move() {
         "move_storage was not called: {:?}",
         mock.calls()
     );
+}
+
+/// Apply a relocate of loaded `T` from `pool/old` to `pool/new`, playing
+/// libtorrent's part from another thread: once the step asks for the move,
+/// the payload is renamed to the destination and the move reported done.
+/// The apply, and so every step's fsync, runs on this thread.
+fn apply_a_landed_move(dir: &Path) -> (Arc<PoolService>, i64, crate::apply::ApplyOutcome) {
+    let root = dir.join("pool");
+    write(&root, "old/T/a.bin", 100);
+    let pool = service(dir, true);
+    pool.scan().unwrap();
+    let ih = "ab".repeat(20);
+    let (plan_id, _mock, source, state) = loaded_session(&pool, &root, &ih, &root.join("old"));
+    let hash = libtorrent_safe::InfoHash::from_hex(&ih).unwrap();
+    let out = std::thread::scope(|s| {
+        s.spawn(|| {
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !matches!(
+                state.get(&hash).and_then(|t| t.storage_move),
+                Some(StorageMove::Pending)
+            ) {
+                assert!(
+                    std::time::Instant::now() < give_up,
+                    "the move was never asked for"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::fs::create_dir_all(root.join("new")).unwrap();
+            std::fs::rename(root.join("old/T"), root.join("new/T")).unwrap();
+            state.update(&hash, |t| {
+                t.storage_move = Some(StorageMove::Moved {
+                    path: root.join("new").to_string_lossy().into_owned(),
+                })
+            });
+        });
+        apply(&pool, &source, &state, plan_id, &|| false).unwrap()
+    });
+    (pool, plan_id, out)
+}
+
+/// A storage move libtorrent reported done is made durable before its step
+/// is journaled done: across devices libtorrent copied each file and removed
+/// the source, so the moved file and every directory from its own up to the
+/// root are fsynced, or a power loss could leave neither copy.
+#[test]
+fn a_landed_storage_move_fsyncs_the_payload_before_it_is_recorded_done() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    fsat::FSYNCED.with_borrow_mut(Vec::clear);
+    let (pool, plan_id, out) = apply_a_landed_move(dir.path());
+    let synced = fsat::FSYNCED.take();
+    assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
+    let step = &pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0];
+    assert_eq!(step.status, step_status::DONE);
+    for p in ["new/T/a.bin", "new/T", "new", ""] {
+        let p = root.join(p);
+        let md = std::fs::metadata(&p).unwrap();
+        assert!(
+            synced.contains(&(md.dev(), md.ino())),
+            "{} was not fsynced before the step was recorded done",
+            p.display(),
+        );
+    }
+    let above = std::fs::metadata(dir.path()).unwrap();
+    assert!(!synced.contains(&(above.dev(), above.ino())));
+}
+
+/// The step is journaled only after its fsyncs: one that fails leaves the
+/// step `in_progress` as an unknown outcome, never `done`, and never
+/// `failed`, since the payload has already left the source.
+#[test]
+fn a_landed_storage_move_whose_fsync_fails_is_an_unknown_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    fsat::FAIL_FSYNC.set(true);
+    let (pool, plan_id, out) = apply_a_landed_move(dir.path());
+    fsat::FAIL_FSYNC.set(false);
+    assert_eq!(
+        (out.done, out.failed, out.status.as_str()),
+        (0, 1, "failed"),
+        "{out:?}"
+    );
+    let step = &pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0];
+    assert_eq!(step.status, step_status::IN_PROGRESS);
+    let why = step.error.clone().unwrap_or_default();
+    assert!(
+        why.contains("outcome unknown") && why.contains("fsync"),
+        "{why}"
+    );
+    assert_names_the_unknown_outcome_remedy(&why);
+    assert!(dir.path().join("pool/new/T/a.bin").exists());
 }
 
 /// A session at the source with none of the payload there has nothing to

@@ -159,6 +159,7 @@ pub fn rename_noreplace(from: &File, a: &str, to: &File, b: &str) -> io::Result<
     Ok(())
 }
 
+/// `fsync(2)` on an open directory or file.
 pub fn fsync(dir: &File) -> io::Result<()> {
     #[cfg(test)]
     {
@@ -177,11 +178,12 @@ pub fn fsync(dir: &File) -> io::Result<()> {
 #[cfg(test)]
 thread_local! {
     /// Fails every [`fsync`] on this thread with `EIO`, for the tests of
-    /// a rename that happened but could not be made durable.
+    /// a rename or storage move that happened but could not be made
+    /// durable.
     pub static FAIL_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-    /// The `(device, inode)` of every directory [`fsync`] was called on, on
-    /// this thread, in order, for the tests of which directories a step
+    /// The `(device, inode)` of every directory or file [`fsync`] was
+    /// called on, on this thread, in order, for the tests of what a step
     /// makes durable.
     pub static FSYNCED: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
