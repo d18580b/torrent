@@ -306,7 +306,7 @@ mod tests {
         );
     }
 
-    /// The scenario in #105: an unclean exit left the table, and the operator
+    /// An unclean exit left the table, and the operator
     /// turned the kill switch off. The boot removes it and says so, and
     /// neither a failure nor a host without `nft` stops the boot.
     #[test]

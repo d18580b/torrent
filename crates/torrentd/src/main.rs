@@ -1036,7 +1036,7 @@ http_listen = "127.0.0.1:8080"
         .unwrap();
     }
 
-    /// #229: an OpenVPN profile whose `.ovpn` names a hook or a plugin is
+    /// An OpenVPN profile whose `.ovpn` names a hook or a plugin is
     /// refused by `--check-config` — and by the daemon's pre-flight, which
     /// is the same call — with the profile, the file and the directive
     /// named. A file the check cannot read is left to that profile's

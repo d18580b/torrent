@@ -5,6 +5,19 @@
 //! of them becomes one `Arc<dyn AlertSource>` that the rest of the daemon
 //! consumes uniformly. A deployment with a single profile is that set with
 //! n = 1.
+//!
+//! This module runs the stages in order; each stage is a submodule.
+//! [`refusal`] names the boot failures that are the configuration's, and
+//! [`limits`] checks the open-file budget. [`profiles`] raises each
+//! profile's tunnel, port and session, and [`cleanup`] takes down what a
+//! boot that fails part-way left on the host. [`listen_check`] holds every
+//! vpn session's listen sockets to its tunnel device. [`scan`] re-adds the
+//! resume files and `.torrent`s, under the fence [`scan_fence`] keeps over
+//! fenced profiles. [`tasks`] supervises the background tasks, and
+//! [`http_stage`] binds and serves the API. After the HTTP drain,
+//! [`teardown`] takes the daemon off the network, and [`shutdown_report`]
+//! records what the exit leaves for the next boot to report and removes the
+//! kill switch on the way out.
 
 use std::collections::HashSet;
 use std::sync::Arc;
