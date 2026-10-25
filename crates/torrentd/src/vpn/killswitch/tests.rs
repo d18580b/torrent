@@ -1065,6 +1065,22 @@ fn disable_against_real_nft() {
 /// A table an earlier release left under the shared name, against a real
 /// `nft`: another uid's removal leaves it, its own uid's removes it. Run
 /// it as [`disable_against_real_nft`] says.
+/// `remove_table` and `disable` act on this process's own uid's table, and
+/// say whether there was one.
+#[test]
+#[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+fn removing_the_own_table_against_real_nft() {
+    let own = own_table_name();
+    let table = render_ruleset(current_uid().unwrap(), &[tunnel("wg0")]).unwrap();
+    apply(&table).expect("install this uid's table");
+    assert!(remove_table().expect("remove it"), "there was a table");
+    assert!(!table_listed(&list_tables().expect("list"), &own));
+    assert!(!remove_table().expect("nothing left"), "there was none");
+    apply(&table).expect("install it again");
+    disable().expect("disable removes it");
+    assert!(!table_listed(&list_tables().expect("list"), &own));
+}
+
 #[test]
 #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
 fn a_legacy_table_against_real_nft() {
