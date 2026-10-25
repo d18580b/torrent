@@ -37,8 +37,9 @@ the info-hash in exactly 40 lower-case hex digits, the spelling the daemon
 writes. A boot skips a `.resume`, `.torrent` or `.magnet` named any other way,
 `ABCD….torrent` for `abcd….torrent` included, logging `skipping torrent file
 whose name is not a lower-case hex info-hash` (`resume file` for a `.resume`,
-`magnet file` for a `.magnet`), and loads nothing from it. A `.save_path` is only ever read under the lower-case name, so one
-spelled otherwise is never found. Rename such a file to the lower-case spelling
+`magnet file` for a `.magnet`), and loads nothing from it. A `.save_path` is
+only ever read under the lower-case name, so one spelled otherwise is never
+found. Rename such a file to the lower-case spelling
 before you restart.
 
 The plan journal is the one record here that a rescan cannot reconstruct.
