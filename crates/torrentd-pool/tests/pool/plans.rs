@@ -816,3 +816,174 @@ fn a_destination_behind_a_symlink_is_refused() {
         Some(root.join("archive/T").as_path()),
     );
 }
+
+#[test]
+fn an_adopted_torrent_whose_payload_is_all_present_is_relocated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "src/T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "ad", "T", None, &[("T/a.bin", 128)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let (rid, base) = store.adoption_base("ad").unwrap().unwrap();
+    store
+        .set_adoption(
+            "ad",
+            AdoptionState::Adopted,
+            Some(rid),
+            Some(&base),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "ad".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].op, torrentd_pool::model::ops::MOVE_TORRENT);
+}
+
+#[test]
+fn each_plan_names_its_kind() {
+    let relocate = PlanSpec::Relocate {
+        infohash: "ad".into(),
+        dest_root_id: 1,
+        dest_rel: "dest".into(),
+    };
+    let delete = PlanSpec::DeleteOrphans {
+        root_id: 1,
+        prefix: String::new(),
+    };
+    assert_eq!(
+        [relocate.kind(), delete.kind()],
+        ["relocate", "delete_orphans"]
+    );
+}
+
+/// A delete plan with no file left to delete says which guard held each
+/// one back, by count, or that there was nothing unclaimed to begin with.
+#[test]
+fn a_delete_plan_left_with_nothing_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    // The claimed file again under another name: unclaimed by path only.
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+    // The size of a file a missing torrent has not found.
+    write_file(root, "maybe/film.mkv", 4321);
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    add_torrent(&mut store, "m1", "M", None, &[("M/film.mkv", 4321)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "m1"), AdoptionState::Missing);
+
+    let refusal = |prefix: &str| {
+        build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+        .unwrap_err()
+    };
+    let aliased = refusal("links");
+    assert!(
+        aliased.contains("0 have the size") && aliased.contains("1 are the same file"),
+        "{aliased}"
+    );
+    let held_back = refusal("maybe");
+    assert!(
+        held_back.contains("1 have the size") && held_back.contains("0 are the same file"),
+        "{held_back}"
+    );
+    assert_eq!(refusal("empty"), "no unclaimed files under that path");
+}
+
+/// A torrent's own empty files are the declared ones without bytes; a
+/// padding entry is never one, whatever its size.
+#[test]
+fn a_padding_entry_is_never_a_torrents_own_empty_file() {
+    let mut store = PoolStore::open_in_memory().unwrap();
+    add_torrent(
+        &mut store,
+        "pe",
+        "T",
+        None,
+        &[
+            ("T/a.bin", 64),
+            ("T/.pad/0", 0),
+            ("T/.pad/7", 7),
+            ("T/e", 0),
+        ],
+    );
+    let listed = torrentd_pool::plan::listed_under(&store, "pe", 1, "base").unwrap();
+    assert_eq!(
+        listed.empty,
+        std::collections::HashSet::from(["base/T/e".to_string()])
+    );
+}
+
+#[test]
+fn a_relocate_source_that_is_not_a_directory_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("T");
+    std::fs::write(&file, b"x").unwrap();
+    let why = torrentd_pool::plan::unlisted_entry(&file, "T", &Default::default()).unwrap();
+    assert!(why.ends_with("itself, which is not a directory"), "{why}");
+}
+
+/// An index from before the trash was left unindexed may still list it;
+/// a delete plan never takes a file from it.
+#[test]
+fn a_delete_plan_never_takes_a_file_from_the_trash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "junk/x.bin", 9);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let junk = store.file(root_id, "junk/x.bin").unwrap().unwrap();
+    let trashed = torrentd_pool::model::PoolFile {
+        rel_path: format!("{}/old.bin", torrentd_pool::plan::TRASH_DIR),
+        ino: junk.ino + 1,
+        ..junk.clone()
+    };
+    store.begin_staging().unwrap();
+    store.stage_files(&[junk, trashed]).unwrap();
+    store.swap_staged_root(root_id, 0).unwrap();
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: String::new(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"));
+}
