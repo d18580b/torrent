@@ -523,10 +523,11 @@ pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// The `(size, mtime, inode, device)` the index records for a file.
 ///
-/// Public because anything comparing live metadata against the index — drift
-/// detection, and the last-moment check before a delete — has to compute it
-/// the same way the scanner did. Two copies of this encoding that disagree
-/// would either miss a change or reject every unchanged file.
+/// Public because anything comparing live metadata against the index has to
+/// compute it the same way the scanner did. Two copies of this encoding that
+/// disagree would either miss a change or reject every unchanged file. A
+/// check that a file is unchanged compares only [`content_stamp`], its
+/// `(size, mtime)` part.
 ///
 /// The device is part of it because an inode number is only unique within
 /// one filesystem: a different volume mounted over a directory after the scan
@@ -535,6 +536,20 @@ pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 pub fn file_stamp(m: &std::fs::Metadata) -> (u64, i64, u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (m.len(), mtime_ns(m), m.ino(), m.dev())
+}
+
+/// The `(size, mtime)` part of [`file_stamp`]: what a check that a file
+/// still holds the bytes the index recorded compares — the drift check, and
+/// the last-moment check before a delete moves a file into the trash.
+///
+/// Device and inode are left out. Neither survives a reboot or a remount on
+/// a common storage layout (disk enumeration order, md and dm, btrfs and zfs
+/// subvolumes, NFS, FUSE layers such as mergerfs), and nothing re-stamps the
+/// index at boot, so comparing them refuses every unchanged file after a
+/// routine reboot. They stay in [`file_stamp`], which the index records,
+/// for the checks that compare one indexed identity with another.
+pub fn content_stamp(m: &std::fs::Metadata) -> (u64, i64) {
+    (m.len(), mtime_ns(m))
 }
 
 fn mtime_ns(m: &std::fs::Metadata) -> i64 {

@@ -29,17 +29,15 @@ struct PayloadFile {
     resolved: Option<std::path::PathBuf>,
     root: std::path::PathBuf,
     rel: String,
-    stamp: (u64, i64, u64, u64),
-}
-
-impl PayloadFile {
-    /// Its indexed `(dev, ino)`: what [`TorrentPayload::shared_with`]
-    /// compares a file reached by another path against, since a bind mount
-    /// or a hard link reaches the same file through a path neither spelling
-    /// nor symlink resolution relates to this one.
-    fn identity(&self) -> (u64, u64) {
-        (self.stamp.3, self.stamp.2)
-    }
+    /// Its indexed `(size, mtime)`, re-checked at the move.
+    stamp: (u64, i64),
+    /// Its `(dev, ino)` as stat'd when the payload was proven: what
+    /// [`TorrentPayload::shared_with`] compares a file reached by another
+    /// path against, since a bind mount or a hard link reaches the same file
+    /// through a path neither spelling nor symlink resolution relates to this
+    /// one. The live identity, not the indexed one: the other side is stat'd
+    /// live too, and a reboot since the scan renumbers the index's.
+    identity: (u64, u64),
 }
 
 /// `(dev, ino)` of whatever `path` names, following symlinks, or `None`
@@ -129,7 +127,7 @@ impl TorrentPayload {
                     .collect();
                 self.files
                     .iter()
-                    .find(|f| forms(f).any(|p| theirs.contains(p)) || ids.contains(&f.identity()))
+                    .find(|f| forms(f).any(|p| theirs.contains(p)) || ids.contains(&f.identity))
             }
         };
         hit.map(|f| f.path.as_path())
@@ -187,8 +185,10 @@ impl std::fmt::Display for PayloadRefusal {
 ///    and a torrent the matcher has not placed contributes neither. A file
 ///    the torrent declares empty, and that is empty on disk and in the
 ///    index, needs no claim: the matcher claims no file without bytes;
-/// 3. still be the file the index recorded: the same `(size, mtime, inode,
-///    device)`, checked here and again at the move.
+/// 3. still hold what the index recorded: the same `(size, mtime)`, checked
+///    here and again at the move. Device and inode are not compared, as the
+///    drift check does not compare them: a reboot or a remount renumbers
+///    them without touching a byte.
 ///
 /// A listed file that is on neither the disk nor the index was never
 /// written, and is skipped. Refused as [`PayloadRefusal::Shared`] when other
@@ -282,8 +282,8 @@ pub fn torrent_payload(
         if !md.is_file() {
             return unproven(format!("{} is not a regular file", path.display()));
         }
-        let stamp = (row.size, row.mtime_ns, row.ino, row.dev);
-        if torrentd_pool::file_stamp(&md) != stamp {
+        let stamp = (row.size, row.mtime_ns);
+        if torrentd_pool::scan::content_stamp(&md) != stamp {
             return unproven(format!(
                 "{} changed since the scan that indexed it; rescan before deleting",
                 path.display(),
@@ -295,6 +295,10 @@ pub fn torrent_payload(
             root,
             rel,
             stamp,
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (md.dev(), md.ino())
+            },
         });
     }
     Ok(TorrentPayload {
@@ -346,7 +350,10 @@ mod tests {
     use super::*;
     use crate::apply::test_support::claimed;
     use crate::apply::test_support::long_rel_path;
+    use crate::apply::test_support::renumber;
+    use crate::apply::test_support::resize_keeping_mtime;
     use crate::apply::test_support::service;
+    use crate::apply::test_support::touch_later;
     use crate::apply::test_support::write;
     use crate::apply::FAIL_FSYNC;
 
@@ -654,6 +661,55 @@ mod tests {
         let elsewhere: std::collections::HashSet<(u64, u64)> =
             identity_of(&alias).into_iter().collect();
         assert!(!under_by_identity(&a, &elsewhere, &mut seen));
+    }
+
+    /// Issue #669: a reboot or remount that renumbers device and inode does
+    /// not stop the payload going to the trash, and the identity a live
+    /// torrent is compared against is the file's as it reads now, so a hard
+    /// link is still caught under the renumbered index. A changed size or
+    /// mtime is still refused.
+    #[test]
+    fn a_renumbered_payload_goes_to_the_trash_unless_its_size_or_mtime_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let a = write(&root, "T/a.bin", 16);
+        write(&root, "T/resized.bin", 16);
+        write(&root, "T/touched.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        renumber(&pool, &["T/a.bin", "T/resized.bin", "T/touched.bin"]);
+        resize_keeping_mtime(&root, "T/resized.bin", 48);
+        touch_later(&root, "T/touched.bin");
+        let a_only = ["T/a.bin".to_owned()];
+
+        // `claimed` replaces the torrent's claims, so each file is claimed
+        // alone before its payload is proven.
+        for rel in ["T/resized.bin", "T/touched.bin"] {
+            claimed(&pool, dir.path(), &ih, rel);
+            let e = torrent_payload(&pool, &ih, &root, &[rel.to_owned()])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("changed since the scan"), "{rel}: {e}");
+        }
+
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        let payload = torrent_payload(&pool, &ih, &root, &a_only).unwrap();
+        let alias = dir.path().join("alias");
+        std::fs::create_dir_all(alias.join("T")).unwrap();
+        std::fs::hard_link(&a, alias.join("T/a.bin")).unwrap();
+        let live = LiveTorrent {
+            save_path: alias.clone(),
+            files: Some(a_only.to_vec()),
+        };
+        assert_eq!(payload.shared_with(&live), Some(a.as_path()));
+        std::fs::remove_file(alias.join("T/a.bin")).unwrap();
+
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert!(out.failed.is_none(), "{:?}", out.failed);
+        assert_eq!(out.moved, 1);
+        assert!(!a.exists());
+        assert!(root.join(".torrentd-trash/torrent-x-1/T/a.bin").exists());
     }
 
     #[test]

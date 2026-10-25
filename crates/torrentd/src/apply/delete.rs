@@ -24,10 +24,12 @@ mod tests;
 /// 2. The index is a complete account of what is protected — checked once per
 ///    apply in [`apply`](super::apply), since it is a property of the whole plan rather than
 ///    of one file.
-/// 3. The file on disk is still the file that was indexed. A `(size, mtime,
-///    inode, device)` match is the same evidence `drift` trusts; anything
-///    else means the bytes changed after the scan decided they were
-///    expendable.
+/// 3. The file on disk still holds what was indexed. A `(size, mtime)`
+///    match is the same evidence `drift` trusts; anything else means the
+///    bytes changed after the scan decided they were expendable. Device and
+///    inode are not compared, as `drift` does not compare them: a reboot or
+///    a remount renumbers them, and comparing them refused every delete
+///    after one.
 /// 4. No torrent the index *now* holds as partial, missing or overlapping
 ///    expects its payload where the file is, or is missing a file of its
 ///    size — the planner's guards ([`torrentd_pool::plan::DeleteGuard`]),
@@ -36,8 +38,9 @@ mod tests;
 /// 5. The file is not another path to a claimed file: its indexed `(device,
 ///    inode)` is no claimed file's, under any root. Claims are by path, so a
 ///    hard link, or a root that aliases another through a bind mount, reads
-///    as unclaimed while renaming it moves claimed bytes. The stamp check in
-///    (3) ties that indexed identity to the file actually moved.
+///    as unclaimed while renaming it moves claimed bytes. Both identities
+///    are the index's, so a reboot that renumbered the disk since the scan
+///    changes neither side of the comparison.
 ///
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, so a directory swapped for a symlink after planning stops the
@@ -72,11 +75,12 @@ pub(super) fn delete_file(
     Ok(())
 }
 
-/// A file's indexed `(size, mtime, inode, device)`.
-type FileStamp = (u64, i64, u64, u64);
+/// A file's indexed `(size, mtime)`, as [`torrentd_pool::scan::content_stamp`]
+/// computes it.
+type FileStamp = (u64, i64);
 
 /// Checks 1 and 3 to 5 of [`delete_file`] for `path`, whose root, path
-/// relative to it, and indexed `(size, mtime, inode, device)` it returns,
+/// relative to it, and indexed `(size, mtime)` it returns,
 /// or why the delete is refused.
 fn sanctioned_delete(
     pool: &PoolService,
@@ -122,7 +126,7 @@ fn sanctioned_delete(
         ));
     }
 
-    Ok((root, rel, (row.size, row.mtime_ns, row.ino, row.dev)))
+    Ok((root, rel, (row.size, row.mtime_ns)))
 }
 
 /// The directory under `<root>/.torrentd-trash/` a delete plan's files go
@@ -140,8 +144,11 @@ pub(super) fn plan_trash_bucket(plan_id: i64, created_at: i64) -> String {
 
 /// Move the file at `rel` under `root` (`path` is the two joined, for
 /// messages) into `<root>/.torrentd-trash/<bucket>/`, keeping its
-/// root-relative directories, once its `(size, mtime, inode, device)` is
-/// still `stamp` — the scan's record of it.
+/// root-relative directories, once its `(size, mtime)` is still `stamp` —
+/// the scan's record of it. Device and inode are not compared: a reboot or
+/// a remount renumbers them without touching a byte
+/// ([`torrentd_pool::scan::content_stamp`]), and the walk below, not the
+/// stamp, is what keeps the move on the file under `root`.
 ///
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, the file is examined and moved through its parent's
@@ -174,7 +181,7 @@ pub(crate) fn move_into_trash(
     if !md.is_file() {
         return Err(format!("{} is not a regular file", path.display()).into());
     }
-    if torrentd_pool::file_stamp(&md) != stamp {
+    if torrentd_pool::scan::content_stamp(&md) != stamp {
         return Err(format!(
             "{} changed since the scan that indexed it; rescan before deleting",
             path.display(),
