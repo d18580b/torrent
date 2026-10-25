@@ -7,11 +7,20 @@
 
 use libtorrent_sys as ffi;
 
-use crate::ffi_util::fixed_c_str;
 use crate::ffi_util::sized_str;
 use crate::handle::InfoHash;
 use crate::handle::TorrentHandle;
 use crate::resume::ResumeData;
+
+/// A string a popped alert carries, copied out of the shim's heap.
+///
+/// The shim leaves every `lt_str` in a popped union null with length 0, or
+/// pointing at `len` readable bytes, until `lt_alert_payload_free` releases
+/// them; [`Alert::from_raw_owned`] reads each one before that call.
+fn alert_str(s: &ffi::lt_str) -> String {
+    // SAFETY: as above; `sized_str` reads a null pointer as empty.
+    unsafe { sized_str(s.ptr, s.len) }
+}
 
 /// Compact tag enum mirroring `lt_alert_kind`. Useful for routing /
 /// metrics keying without matching the full payload.
@@ -401,7 +410,7 @@ impl Alert {
         let alert = match kind {
             AlertKind::AddTorrent => {
                 let p = unsafe { &raw.payload.add_torrent };
-                let msg = fixed_c_str(&p.message);
+                let msg = alert_str(&p.message);
                 Alert::AddTorrent {
                     hdr,
                     error_code: p.error_code,
@@ -425,8 +434,8 @@ impl Alert {
                 Alert::TorrentError {
                     hdr,
                     error_code: p.error_code,
-                    filename: fixed_c_str(&p.filename),
-                    message: fixed_c_str(&p.message),
+                    filename: alert_str(&p.filename),
+                    message: alert_str(&p.message),
                 }
             }
             AlertKind::FileError => {
@@ -434,9 +443,9 @@ impl Alert {
                 Alert::FileError {
                     hdr,
                     error_code: p.error_code,
-                    filename: fixed_c_str(&p.filename),
-                    operation: fixed_c_str(&p.operation),
-                    message: fixed_c_str(&p.message),
+                    filename: alert_str(&p.filename),
+                    operation: alert_str(&p.operation),
+                    message: alert_str(&p.message),
                 }
             }
             AlertKind::HashFailed => {
@@ -476,7 +485,7 @@ impl Alert {
                     hdr,
                     error_code: p.error_code,
                     not_modified: p.not_modified != 0,
-                    message: fixed_c_str(&p.message),
+                    message: alert_str(&p.message),
                 }
             }
             AlertKind::ListenFailed => {
@@ -484,17 +493,17 @@ impl Alert {
                 Alert::ListenFailed {
                     hdr,
                     error_code: p.error_code,
-                    operation: fixed_c_str(&p.operation),
-                    endpoint: fixed_c_str(&p.endpoint),
-                    iface: fixed_c_str(&p.iface),
-                    message: fixed_c_str(&p.message),
+                    operation: alert_str(&p.operation),
+                    endpoint: alert_str(&p.endpoint),
+                    iface: alert_str(&p.iface),
+                    message: alert_str(&p.message),
                 }
             }
             AlertKind::ListenSucceeded => {
                 let p = unsafe { &raw.payload.listen_succeeded };
                 Alert::ListenSucceeded {
                     hdr,
-                    endpoint: fixed_c_str(&p.endpoint),
+                    endpoint: alert_str(&p.endpoint),
                 }
             }
             AlertKind::TorrentChecked => Alert::TorrentChecked { hdr },
@@ -513,9 +522,9 @@ impl Alert {
                 Alert::StorageMovedFailed {
                     hdr,
                     error_code: p.error_code,
-                    operation: fixed_c_str(&p.operation),
-                    path: fixed_c_str(&p.path),
-                    message: fixed_c_str(&p.message),
+                    operation: alert_str(&p.operation),
+                    path: alert_str(&p.path),
+                    message: alert_str(&p.message),
                 }
             }
             AlertKind::SessionStats => {
@@ -543,8 +552,8 @@ impl Alert {
                     error_category: ErrorCategory::from_raw(p.error_category),
                     aborted: p.aborted != 0,
                     times_in_row: p.times_in_row,
-                    tracker_url: fixed_c_str(&p.tracker_url),
-                    message: fixed_c_str(&p.message),
+                    tracker_url: alert_str(&p.tracker_url),
+                    message: alert_str(&p.message),
                 }
             }
             AlertKind::TrackerWarning
@@ -558,13 +567,13 @@ impl Alert {
                     hdr,
                     error_code: p.error_code,
                     warning_code: p.warning_code,
-                    message: fixed_c_str(&p.message),
+                    message: alert_str(&p.message),
                 }
             }
             AlertKind::TrackerReply => Alert::TrackerReply { hdr },
             AlertKind::TorrentLog | AlertKind::Log => {
                 let p = unsafe { &raw.payload.log_msg };
-                let msg = fixed_c_str(&p.message);
+                let msg = alert_str(&p.message);
                 if matches!(kind, AlertKind::TorrentLog) {
                     Alert::TorrentLog { hdr, message: msg }
                 } else {

@@ -112,4 +112,117 @@ mod link_smoke {
             assert_eq!(u.kind, kind, "freeing does not change the kind");
         }
     }
+
+    /// Every string an alert carries is an `lt_str` on the heap. For each
+    /// kind that carries any, the free releases and nulls every one of its
+    /// strings, so a second free frees nothing: a string the free missed
+    /// would leak, and one it freed without nulling would be freed twice.
+    #[test]
+    fn payload_free_releases_every_string_per_kind() {
+        type Strings = fn(&mut lt_alert_payload_u) -> Vec<*mut lt_str>;
+        let kinds: [(u32, Strings); 16] = [
+            (lt_alert_kind_LT_ALERT_ADD_TORRENT, |p| unsafe {
+                vec![&raw mut p.add_torrent.message]
+            }),
+            (lt_alert_kind_LT_ALERT_TORRENT_ERROR, |p| unsafe {
+                vec![
+                    &raw mut p.torrent_error.filename,
+                    &raw mut p.torrent_error.message,
+                ]
+            }),
+            (lt_alert_kind_LT_ALERT_FILE_ERROR, |p| unsafe {
+                vec![
+                    &raw mut p.file_error.filename,
+                    &raw mut p.file_error.operation,
+                    &raw mut p.file_error.message,
+                ]
+            }),
+            (lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA_FAILED, |p| unsafe {
+                vec![&raw mut p.resume_failed.message]
+            }),
+            (lt_alert_kind_LT_ALERT_LISTEN_FAILED, |p| unsafe {
+                vec![
+                    &raw mut p.listen_failed.operation,
+                    &raw mut p.listen_failed.endpoint,
+                    &raw mut p.listen_failed.iface,
+                    &raw mut p.listen_failed.message,
+                ]
+            }),
+            (lt_alert_kind_LT_ALERT_LISTEN_SUCCEEDED, |p| unsafe {
+                vec![&raw mut p.listen_succeeded.endpoint]
+            }),
+            (lt_alert_kind_LT_ALERT_TRACKER_ERROR, |p| unsafe {
+                vec![
+                    &raw mut p.tracker_error.tracker_url,
+                    &raw mut p.tracker_error.message,
+                ]
+            }),
+            (lt_alert_kind_LT_ALERT_TORRENT_LOG, |p| unsafe {
+                vec![&raw mut p.log_msg.message]
+            }),
+            (lt_alert_kind_LT_ALERT_LOG, |p| unsafe {
+                vec![&raw mut p.log_msg.message]
+            }),
+            (lt_alert_kind_LT_ALERT_STORAGE_MOVED_FAILED, |p| unsafe {
+                vec![
+                    &raw mut p.storage_moved_failed.operation,
+                    &raw mut p.storage_moved_failed.path,
+                    &raw mut p.storage_moved_failed.message,
+                ]
+            }),
+            (lt_alert_kind_LT_ALERT_TRACKER_WARNING, |p| unsafe {
+                vec![&raw mut p.warning.message]
+            }),
+            (lt_alert_kind_LT_ALERT_SCRAPE_FAILED, |p| unsafe {
+                vec![&raw mut p.warning.message]
+            }),
+            (lt_alert_kind_LT_ALERT_PORTMAP_ERROR, |p| unsafe {
+                vec![&raw mut p.warning.message]
+            }),
+            (lt_alert_kind_LT_ALERT_UDP_ERROR, |p| unsafe {
+                vec![&raw mut p.warning.message]
+            }),
+            (lt_alert_kind_LT_ALERT_FASTRESUME_REJECTED, |p| unsafe {
+                vec![&raw mut p.warning.message]
+            }),
+            (lt_alert_kind_LT_ALERT_PERFORMANCE, |p| unsafe {
+                vec![&raw mut p.warning.message]
+            }),
+        ];
+        for (kind, strings) in kinds {
+            let mut u: lt_alert_union = unsafe { std::mem::zeroed() };
+            u.kind = kind;
+            for s in strings(&mut u.payload) {
+                let block = unsafe { malloc(2) }.cast::<std::os::raw::c_char>();
+                assert!(!block.is_null(), "malloc failed");
+                unsafe {
+                    *block = b'x' as std::os::raw::c_char;
+                    *block.add(1) = 0;
+                    (*s).ptr = block;
+                    (*s).len = 1;
+                }
+            }
+
+            unsafe { lt_alert_payload_free(&mut u) };
+            for s in strings(&mut u.payload) {
+                let (ptr, len) = unsafe { ((*s).ptr, (*s).len) };
+                assert!(ptr.is_null(), "kind {kind}: the free must null each string");
+                assert_eq!(len, 0, "kind {kind}");
+            }
+            unsafe { lt_alert_payload_free(&mut u) };
+            assert_eq!(u.kind, kind, "freeing does not change the kind");
+        }
+    }
+
+    /// The shim queues a whole libtorrent pop of unions by value, so each
+    /// one's size is paid per queued alert. Strings on the heap keep it a
+    /// header and a few pointers, where fixed buffers made it ~3.2 KB.
+    #[test]
+    fn the_alert_union_stays_small() {
+        assert!(
+            std::mem::size_of::<lt_alert_union>() <= 128,
+            "{} bytes",
+            std::mem::size_of::<lt_alert_union>()
+        );
+    }
 }

@@ -44,8 +44,10 @@
 //     serves only the known set of libtorrent settings.
 //   - Alert translation is centralized in translate_alert(); each branch
 //     handles exactly one libtorrent alert type via alert_cast<T>.
-//   - Every string copied into a fixed-size buffer goes through one
-//     truncator, copy_utf8_truncated, which never cuts a UTF-8 sequence.
+//   - Every string cut to a capacity goes through one truncator,
+//     utf8_truncated_len, which never cuts a UTF-8 sequence: through
+//     copy_utf8_truncated into a fixed-size buffer, or through
+//     set_utf8_truncated into an alert's heap lt_str.
 //
 // Everything here other than lt_session lives in namespace lt_shim, which no
 // header outside the shim names.
@@ -87,6 +89,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -119,9 +122,9 @@ namespace lt_shim {
 // sequence can have. Bytes that are not UTF-8 there are cut where they fall,
 // rather than losing everything back to the last byte that is not a
 // continuation byte.
-inline void copy_utf8_truncated(char* dest, std::size_t cap, const char* src, std::size_t n) {
-    if (cap == 0) return;
-    if (!src) { dest[0] = '\0'; return; }
+// How many of `src[0, n)`'s bytes fit a `cap`-byte buffer with its NUL, cut
+// as copy_utf8_truncated below cuts them. `cap` is at least 1.
+inline std::size_t utf8_truncated_len(std::size_t cap, const char* src, std::size_t n) {
     if (n > cap - 1) {
         std::size_t const cut = cap - 1;
         n = cut;
@@ -129,12 +132,51 @@ inline void copy_utf8_truncated(char* dest, std::size_t cap, const char* src, st
                && (static_cast<unsigned char>(src[n]) & 0xC0) == 0x80) --n;
         if ((static_cast<unsigned char>(src[n]) & 0xC0) == 0x80) n = cut;
     }
+    return n;
+}
+
+inline void copy_utf8_truncated(char* dest, std::size_t cap, const char* src, std::size_t n) {
+    if (cap == 0) return;
+    if (!src) { dest[0] = '\0'; return; }
+    n = utf8_truncated_len(cap, src, n);
     std::memcpy(dest, src, n);
     dest[n] = '\0';
 }
 
 inline void copy_utf8_truncated(char* dest, std::size_t cap, const std::string& s) {
     copy_utf8_truncated(dest, cap, s.data(), s.size());
+}
+
+// Point `dest` at a heap copy of `src[0, n)`, cut exactly as
+// copy_utf8_truncated cuts it into a `cap`-byte buffer, and NUL terminated.
+// An empty string allocates nothing and leaves `dest` null with length 0.
+// lt_alert_payload_free releases it. Throws std::bad_alloc, leaving `dest`
+// as it was, when the allocation fails.
+inline void set_utf8_truncated(lt_str& dest, std::size_t cap, const char* src, std::size_t n) {
+    if (cap == 0 || !src) return;
+    n = utf8_truncated_len(cap, src, n);
+    if (n == 0) return;
+    auto* buf = static_cast<char*>(std::malloc(n + 1));
+    if (!buf) throw std::bad_alloc{};
+    std::memcpy(buf, src, n);
+    buf[n] = '\0';
+    dest.ptr = buf;
+    dest.len = n;
+}
+
+inline void set_utf8_truncated(lt_str& dest, std::size_t cap, const std::string& s) {
+    set_utf8_truncated(dest, cap, s.data(), s.size());
+}
+
+inline void set_utf8_truncated(lt_str& dest, std::size_t cap, const char* s) {
+    if (s) set_utf8_truncated(dest, cap, s, std::strlen(s));
+}
+
+// Release what set_utf8_truncated allocated, and null it. Idempotent.
+inline void free_str(lt_str& s) {
+    std::free(s.ptr);
+    s.ptr = nullptr;
+    s.len = 0;
 }
 
 inline void set_err(char* err_out, int err_len, const char* msg) {
