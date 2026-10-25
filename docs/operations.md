@@ -22,6 +22,7 @@ The small state files are described in full in
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
 | `library/` (`[pool] library_dir`; the sample config puts it here, though it can sit anywhere outside a managed root) | The `.torrent` files the pool index is built from: each scan indexes every torrent in it and matches it against the roots. | The pool's metainfo, including the only remaining copy of a pool torrent whose `torrents/<profile>/` file is gone. A scan of a missing `library_dir` logs `torrent library directory does not exist` and changes nothing; a scan of an empty one drops from the index every torrent no session is serving. | Nothing. Whatever filled it: you, or the client whose state directory it was copied from. |
 | `torrents/<profile>/<infohash>.save_path` (beside the `.torrent`) | The save path a torrent was added at through `POST /v1/torrents` or adopted at from the pool, as UTF-8 text. | Where a torrent with no resume file is re-added: without it, `default_save_path`. | Nothing. Each API add and each adoption writes it, and a pool relocation of a loaded torrent rewrites it. |
+| `torrents/<profile>/<infohash>.magnet` (beside the `.torrent`) | The magnet URI a torrent was added from through `POST /v1/torrents`, as UTF-8 text. | A magnet stopped before its metadata arrived and before its first resume save: the boot has nothing to re-add it from, and its claim stays as an unloaded claim. | Nothing. Each magnet add writes it. It is read only where no resume file loaded the torrent and no `.torrent` is filed beside it, and deleted with the `.torrent`. |
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
 | `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
 | `paced_holds.json` | The torrents a profile set online paused itself and has not started again yet. Going online pauses every torrent that was running, then starts them 100 a second; this names them, so a boot in the middle loads them unpaused rather than as paused as their resume data says. Written before those pauses, and again as they start or as you pause one of them. | Those torrents come back paused after a restart in the middle of a set-online, like ones you paused yourself. `POST /v1/profiles/{id}/resume-all` starts them, and any you paused on purpose with them. | Nothing. Each set-online writes it again. |
@@ -31,13 +32,14 @@ The small state files are described in full in
 | `openvpn-<iface>.pid` | The pid of that profile's `openvpn` process. It is the teardown's only handle on it. | The `openvpn` process keeps running past the next shutdown, and you must stop it by hand. | Every OpenVPN bring-up. |
 | `openvpn-<iface>.table` | The routing table that profile's source-address `ip rule` entries point at. | If that `openvpn` process dies on its own, its `ip rule` entries stay behind, and you must delete them by hand. | Every OpenVPN bring-up. |
 
-The `<infohash>` in a `.resume`, `.torrent` or `.save_path` name is the
-info-hash in exactly 40 lower-case hex digits, the spelling the daemon writes.
-A boot skips a `.resume` or `.torrent` named any other way, `ABCD….torrent`
-for `abcd….torrent` included, logging `skipping torrent file whose name is not
-a lower-case hex info-hash` (`resume file` for a `.resume`), and loads nothing
-from it. A `.save_path` is only ever read under the lower-case name, so one
-spelled otherwise is never found. Rename such a file to the lower-case spelling
+The `<infohash>` in a `.resume`, `.torrent`, `.save_path` or `.magnet` name is
+the info-hash in exactly 40 lower-case hex digits, the spelling the daemon
+writes. A boot skips a `.resume`, `.torrent` or `.magnet` named any other way,
+`ABCD….torrent` for `abcd….torrent` included, logging `skipping torrent file
+whose name is not a lower-case hex info-hash` (`resume file` for a `.resume`,
+`magnet file` for a `.magnet`), and loads nothing from it. A `.save_path` is
+only ever read under the lower-case name, so one spelled otherwise is never
+found. Rename such a file to the lower-case spelling
 before you restart.
 
 The plan journal is the one record here that a rescan cannot reconstruct.
@@ -649,6 +651,17 @@ resume file at all:
   keeps the `.torrent` and save path the new add wrote. An adopted
   torrent whose `.torrent` write failed too has neither file in the stores,
   so it is one of the unloaded claims above.
+- **A magnet added through `POST /v1/torrents` whose metadata had not
+  arrived.** It has no `.torrent` yet either. The boot re-adds it from the
+  `.magnet` record beside its save path, at that save path, with DHT, PEX and
+  LSD off until its metadata arrives, as the API added it, and after the
+  same tracker guard; it keeps its claim. A record that cannot be read counts
+  in `torrentd_boot_torrent_load_failures{source="torrent_file"}`, and one
+  naming another infohash than its file name, or one its session refuses, in
+  `source="torrent_dir_add"`. Where that record is missing, because its write
+  failed (`torrentd_torrent_file_persist_errors_total`) or the magnet predates
+  it, nothing is re-added and the claim is one of the unloaded claims above:
+  `DELETE` it, then add the magnet again.
 
 ### Recovering a fenced profile
 

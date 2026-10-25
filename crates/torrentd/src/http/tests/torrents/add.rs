@@ -245,6 +245,16 @@ pub(super) async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         recorded(&InfoHash::from_hex(MAGNET_HEX).unwrap()).as_ref(),
         Some(&default)
     );
+    // Issue #627: a magnet records its URI too, the one thing the boot can
+    // re-add it from before its metadata or its first resume save lands. A
+    // `.torrent` add records none: its `.torrent` is that record.
+    let magnet_of = |ih: &InfoHash| h.state.torrents.read_magnet(&p, ih).unwrap();
+    assert_eq!(
+        magnet_of(&InfoHash::from_hex(MAGNET_HEX).unwrap()).as_deref(),
+        Some(MAGNET)
+    );
+    assert_eq!(magnet_of(&added), None);
+    assert_eq!(magnet_of(&from_disk), None);
 
     // Every add the API made — the magnet, the metainfo and the server path —
     // kept its torrent in upload mode with no flag that could lift it.
