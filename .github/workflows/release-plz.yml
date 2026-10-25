@@ -15,12 +15,12 @@ name: Release
 #    GitHub verifies that commit. On any other push it does nothing.
 # 2. `release-pr` then runs `release-plz update` and regenerates
 #    docs/api/openapi.json (its `info.version` is the crate version) in its
-#    checkout, resets `release-plz-next` to the pushed commit and records the
-#    result there as one verified commit through the GraphQL API. It opens or
-#    updates the release pull request; where GitHub refuses this workflow's
-#    token a pull request (an organisation or repository setting), the run
-#    stays green and its summary links the comparison to open it from by
-#    hand. It dispatches ci.yml and this workflow on the branch, since
+#    checkout, records the result as one verified commit on the pushed
+#    commit through the GraphQL API, and moves `release-plz-next` onto it.
+#    It opens or updates the release pull request; where GitHub refuses this
+#    workflow's token a pull request (an organisation or repository
+#    setting), the run stays green and its summary links the comparison to
+#    open it from by hand. It dispatches ci.yml and this workflow on the branch, since
 #    anything this workflow's token pushes triggers no workflow of its own,
 #    and deletes the timestamped `release-plz-*` branches `release-plz
 #    release-pr` used to leave behind. With nothing to release it deletes
@@ -202,7 +202,7 @@ jobs:
     env:
       # The one release branch. Its `release-plz-` prefix is what makes
       # `release-plz release` treat the merge of its pull request as a
-      # release. This job owns it and resets it on every run: a commit
+      # release. This job owns it and replaces it on every run: a commit
       # pushed to it by hand is overwritten by the next push to `master`.
       BRANCH: release-plz-next
       REPO: ${{ github.repository }}
@@ -270,15 +270,18 @@ jobs:
           mise run native-fetch
           mise run openapi
           git add --update -- docs/api/openapi.json
-      # The branch is reset to the pushed commit and the staged change is
-      # committed onto it through the GraphQL API, so the commit is verified,
-      # and only onto the head this job set.
+      # The staged change becomes one commit on the pushed commit, made
+      # through the GraphQL API so GitHub signs and verifies it, and the
+      # release branch is moved onto it.
       - id: commit
         if: steps.update.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}
           VERSION: ${{ steps.update.outputs.version }}
+          # Not `release-plz-*`: neither a release branch nor one the
+          # pruning below would touch.
+          SCRATCH: release-scratch-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           title="chore: release v$VERSION"
@@ -305,10 +308,14 @@ jobs:
               echo "$BRANCH already holds this release of $SHA"
               exit 0
             fi
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$SHA" -F force=true --silent
-          else
-            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$SHA" --silent
           fi
+          # The commit is made on a scratch branch at the pushed commit and
+          # the release branch then moved onto it. Resetting the release
+          # branch to `master` first would, for that moment, make its open
+          # pull request's head a commit `master` contains, which GitHub
+          # takes for a merge and closes the pull request as merged.
+          gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$SCRATCH" -f sha="$SHA" --silent
+          trap 'gh api -X DELETE "repos/$REPO/git/refs/heads/$SCRATCH" || echo "::warning::could not delete $SCRATCH"' EXIT
           echo '[]' > "$RUNNER_TEMP/additions.json"
           git diff --cached --name-only --diff-filter=d --ignore-submodules=all -z HEAD |
             while IFS= read -r -d '' path; do
@@ -321,7 +328,7 @@ jobs:
             jq -Rs 'split("\u0000") | map(select(. != "") | {path: .})' > "$RUNNER_TEMP/deletions.json"
           jq -n \
             --arg query 'mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }' \
-            --arg repo "$REPO" --arg branch "$BRANCH" --arg head "$SHA" --arg headline "$title" \
+            --arg repo "$REPO" --arg branch "$SCRATCH" --arg head "$SHA" --arg headline "$title" \
             --slurpfile additions "$RUNNER_TEMP/additions.json" \
             --slurpfile deletions "$RUNNER_TEMP/deletions.json" \
             '{query: $query, variables: {input: {
@@ -330,7 +337,13 @@ jobs:
                message: {headline: $headline},
                fileChanges: {additions: $additions[0], deletions: $deletions[0]}
              }}}' > "$RUNNER_TEMP/commit.json"
-          gh api graphql --input "$RUNNER_TEMP/commit.json" --jq .data.createCommitOnBranch.commit.oid
+          commit=$(gh api graphql --input "$RUNNER_TEMP/commit.json" --jq .data.createCommitOnBranch.commit.oid)
+          echo "$commit"
+          if [ -n "$head" ]; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$commit" -F force=true --silent
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" --silent
+          fi
       # Anything this workflow's token pushes triggers no workflow, so CI and
       # the dry run of the build jobs (`dist`, `dist-musl`, `image`) are
       # dispatched on the branch. Their checks land on its head commit, which
