@@ -767,3 +767,90 @@ fn a_held_partial_adoption_claimed_elsewhere_blocks_a_delete_plan() {
         "the live torrent's session copy was trashed"
     );
 }
+
+/// A claim lies at a base for each on-disk file its path ends with at a `/`
+/// boundary, and at none for a file it ends with mid-component, a padding or
+/// empty file, or a root nothing resolves.
+#[test]
+fn claim_sites_finds_every_base_a_claim_lies_at() {
+    let mut st = torrentd_pool::PoolStore::open_in_memory().unwrap();
+    let root = std::path::PathBuf::from("/r");
+    let root_id = st.upsert_root(&root).unwrap();
+    let gone_id = st.upsert_root(Path::new("/gone")).unwrap();
+    let ih = "ab".repeat(20);
+    let files: &[(&str, u64, bool)] = &[
+        ("a/b.bin", 64, false),
+        ("b.bin", 64, false),
+        ("c.bin", 64, false),
+        ("pad", 64, true),
+        ("empty.bin", 0, false),
+    ];
+    st.upsert_torrent(
+        &torrentd_pool::PoolTorrent {
+            infohash: ih.clone(),
+            infohash_v1: None,
+            infohash_v2: None,
+            name: "T".to_owned(),
+            total_size: files.iter().map(|(_, s, _)| s).sum(),
+            num_files: files.len(),
+            source_path: "/library/t.torrent".into(),
+            fastresume_path: None,
+            declared_save_path: None,
+            category: None,
+            tags: vec![],
+            profile: None,
+        },
+        0,
+    )
+    .unwrap();
+    let rows: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (p, size, pad))| torrentd_pool::model::TorrentFileRow {
+            infohash: ih.clone(),
+            idx: i as i64,
+            rel_path: (*p).to_owned(),
+            size: *size,
+            pieces_root: None,
+            pad_file: *pad,
+        })
+        .collect();
+    st.replace_torrent_files(&ih, &rows).unwrap();
+    let claims: Vec<(i64, String)> = [
+        (root_id, "X/a/b.bin"),
+        (root_id, "c.bin"),
+        (root_id, "Y/xb.bin"),
+        (root_id, "Z/pad"),
+        (root_id, "Z/empty.bin"),
+        (gone_id, "c.bin"),
+    ]
+    .into_iter()
+    .map(|(id, rel)| (id, rel.to_owned()))
+    .collect();
+    st.replace_claims(&ih, &claims).unwrap();
+
+    let sites = claim_sites(&st, &ih, |id| (id == root_id).then(|| root.clone())).unwrap();
+    let got: std::collections::HashMap<(i64, String), Vec<std::path::PathBuf>> = st
+        .claims_of(&ih)
+        .unwrap()
+        .into_iter()
+        .zip(sites.per_claim)
+        .collect();
+    let want = |id: i64, rel: &str, bases: &[&str]| {
+        assert_eq!(
+            got[&(id, rel.to_owned())],
+            bases
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>(),
+            "claim {rel} on root {id}",
+        );
+    };
+    want(root_id, "X/a/b.bin", &["/r/X", "/r/X/a"]);
+    want(root_id, "c.bin", &["/r"]);
+    want(root_id, "Y/xb.bin", &[]);
+    want(root_id, "Z/pad", &[]);
+    want(root_id, "Z/empty.bin", &[]);
+    want(gone_id, "c.bin", &[]);
+    assert_eq!(got.len(), claims.len());
+}

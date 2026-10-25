@@ -131,6 +131,8 @@ fn check_claimed_torrents_save_where_placed(
     if held.is_empty() {
         return Ok(());
     }
+    // Started before the index read, so the logged time includes it.
+    let started = std::time::Instant::now();
     let placements: Vec<ClaimSites> = pool
         .with_store(|st| {
             held.iter()
@@ -138,7 +140,6 @@ fn check_claimed_torrents_save_where_placed(
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(|e| e.to_string())?;
-    let started = std::time::Instant::now();
     let mut away = 0usize;
     let mut blocking: Vec<String> = Vec::new();
     for ((ih, st), placed) in held.iter().zip(&placements) {
@@ -244,12 +245,22 @@ impl ClaimSites {
 }
 
 /// [`ClaimSites`] for `infohash`, its roots resolved with `root_path_of`.
+///
+/// A claim lies at a base for each of the torrent's on-disk files its path
+/// ends with at a `/` boundary. Each such tail of the claim is looked up in
+/// a set of the file paths, so a claim costs one lookup per path component
+/// rather than a comparison with every file.
 fn claim_sites(
     st: &torrentd_pool::PoolStore,
     infohash: &str,
     root_path_of: impl Fn(i64) -> Option<std::path::PathBuf>,
 ) -> Result<ClaimSites, torrentd_pool::PoolError> {
     let files = st.torrent_files(infohash)?;
+    let on_disk: std::collections::HashSet<&str> = files
+        .iter()
+        .filter(|f| f.is_on_disk())
+        .map(|f| f.rel_path.trim_matches('/'))
+        .collect();
     let per_claim = st
         .claims_of(infohash)?
         .into_iter()
@@ -257,19 +268,16 @@ fn claim_sites(
             let Some(root) = root_path_of(root_id) else {
                 return Vec::new();
             };
-            files
-                .iter()
-                .filter(|f| f.is_on_disk())
-                .filter_map(|f| {
-                    let base = rel.strip_suffix(f.rel_path.trim_matches('/'))?;
-                    (base.is_empty() || base.ends_with('/')).then(|| {
-                        let base = base.trim_matches('/');
-                        if base.is_empty() {
-                            root.clone()
-                        } else {
-                            root.join(base)
-                        }
-                    })
+            std::iter::once(0)
+                .chain(rel.match_indices('/').map(|(i, _)| i + 1))
+                .filter(|&at| on_disk.contains(&rel[at..]))
+                .map(|at| {
+                    let base = rel[..at].trim_matches('/');
+                    if base.is_empty() {
+                        root.clone()
+                    } else {
+                        root.join(base)
+                    }
                 })
                 .collect()
         })
