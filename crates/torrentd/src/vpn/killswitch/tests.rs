@@ -1755,7 +1755,10 @@ async fn a_check_past_the_stop_neither_reinstalls_nor_fences() {
     );
     assert_eq!(
         next,
-        Watch::Lost,
+        Watch::Lost {
+            failures: 1,
+            wait: 0
+        },
         "the refused reinstall is not taken for a repair"
     );
     assert_eq!(
@@ -1874,24 +1877,73 @@ fn a_lost_table_fences_then_lifts_only_on_a_verified_reinstall() {
     }
 }
 
+/// A loss whose one reinstall failed, retried at the next check.
+const LOST_ONCE: Watch = Watch::Lost {
+    failures: 1,
+    wait: 0,
+};
+
+/// A loss whose retry is still some checks away.
+const LOST_WAITING: Watch = Watch::Lost {
+    failures: 3,
+    wait: 2,
+};
+
 /// A reinstall that fails, or that does not check intact, leaves every
-/// profile fenced. Later checks fence again — a profile set online
-/// meanwhile is fenced once more — without a second reinstall, and the
-/// fence comes off at the first check that finds the table intact.
+/// profile fenced. Each later check fences again — a profile set online
+/// meanwhile is fenced once more — and retries the reinstall when its wait
+/// has run out; the fence comes off at the first check that finds the
+/// table intact.
 #[test]
 fn a_reinstall_that_does_not_verify_keeps_the_fence() {
-    for (label, after) in [
-        ("refused", Err(io::Error::other("nft -f - exited 1"))),
-        ("still drifted", Ok(())),
-    ] {
+    for (label, refused) in [("refused", true), ("still drifted", false)] {
         let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
-        let after = std::cell::RefCell::new(Some(after));
-        let reinstall = || after.borrow_mut().take().expect("one reinstall per loss");
-        let check = verdicts(vec![Ok(Verdict::Absent), drifted()]);
-        let next = tick(Watch::Intact, &check, reinstall, &fence, &metrics);
-        assert_eq!(next, Watch::Lost, "{label}");
+        let reinstalls = std::cell::Cell::new(0);
+        let reinstall = || {
+            reinstalls.set(reinstalls.get() + 1);
+            if refused {
+                Err(io::Error::other("nft -f - exited 1"))
+            } else {
+                Ok(())
+            }
+        };
+        // A refused reinstall is not read back.
+        let after = |found: io::Result<Verdict>| {
+            if refused {
+                vec![found]
+            } else {
+                vec![found, drifted()]
+            }
+        };
+        let next = tick(
+            Watch::Intact,
+            verdicts(after(Ok(Verdict::Absent))),
+            reinstall,
+            &fence,
+            &metrics,
+        );
+        assert_eq!(next, LOST_ONCE, "{label}");
         assert_eq!(gauge(&metrics), Some(0.0), "{label}");
         assert_eq!(fence.take(), ["fence"], "{label}: fenced, not lifted");
+        assert_eq!(reinstalls.get(), 1, "{label}");
+
+        let next = tick(
+            next,
+            verdicts(after(Ok(Verdict::Absent))),
+            reinstall,
+            &fence,
+            &metrics,
+        );
+        assert_eq!(
+            next,
+            Watch::Lost {
+                failures: 2,
+                wait: 1
+            },
+            "{label}"
+        );
+        assert_eq!(fence.take(), ["fence"], "{label}: fenced again");
+        assert_eq!(reinstalls.get(), 2, "{label}: retried at the next check");
 
         let next = tick(
             next,
@@ -1900,12 +1952,16 @@ fn a_reinstall_that_does_not_verify_keeps_the_fence() {
             &fence,
             &metrics,
         );
-        assert_eq!(next, Watch::Lost, "{label}");
         assert_eq!(
-            fence.take(),
-            ["fence"],
-            "{label}: fenced again, no reinstall"
+            next,
+            Watch::Lost {
+                failures: 2,
+                wait: 0
+            },
+            "{label}"
         );
+        assert_eq!(fence.take(), ["fence"], "{label}: fenced again");
+        assert_eq!(reinstalls.get(), 2, "{label}: not retried while it waits");
 
         let next = tick(
             next,
@@ -1926,6 +1982,120 @@ fn a_reinstall_that_does_not_verify_keeps_the_fence() {
     }
 }
 
+/// A reinstall that failed is tried again at the next check, and its
+/// success returns the watch to intact; the fence comes off only after the
+/// retry's own readback finds the table intact, and a retry whose readback
+/// does not keeps it on. The loss is counted once, when it was found.
+#[test]
+fn a_retried_reinstall_lifts_the_fence_only_after_its_readback_verifies() {
+    let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+    let checks = std::cell::RefCell::new(std::collections::VecDeque::from(vec![
+        // Found lost; the reinstall is refused and nothing is read back.
+        Ok(Verdict::Absent),
+        // Still lost; the retry installs, but its readback finds it drifted.
+        Ok(Verdict::Absent),
+        drifted(),
+        // Still lost; this retry's readback finds it intact.
+        drifted(),
+        Ok(Verdict::Intact),
+    ]));
+    let verify = || {
+        fence.0.lock().unwrap().push("verify");
+        checks
+            .borrow_mut()
+            .pop_front()
+            .expect("no more checks scripted")
+    };
+    let refuse = std::cell::Cell::new(true);
+    let reinstall = || {
+        fence.0.lock().unwrap().push("reinstall");
+        if refuse.replace(false) {
+            Err(io::Error::other("nft -f - exited 1"))
+        } else {
+            Ok(())
+        }
+    };
+
+    let next = tick(Watch::Intact, verify, reinstall, &fence, &metrics);
+    assert_eq!(next, LOST_ONCE);
+    assert_eq!(fence.take(), ["verify", "fence", "reinstall"]);
+
+    let next = tick(next, verify, reinstall, &fence, &metrics);
+    assert_eq!(
+        next,
+        Watch::Lost {
+            failures: 2,
+            wait: 1
+        },
+        "a readback that does not verify is a failed retry"
+    );
+    assert_eq!(fence.take(), ["verify", "fence", "reinstall", "verify"]);
+    assert_eq!(gauge(&metrics), Some(0.0));
+
+    let next = tick(
+        Watch::Lost {
+            failures: 2,
+            wait: 0,
+        },
+        verify,
+        reinstall,
+        &fence,
+        &metrics,
+    );
+    assert_eq!(next, Watch::Intact);
+    assert_eq!(
+        fence.take(),
+        ["verify", "fence", "reinstall", "verify", "lift"],
+        "lifted only after the retry's readback"
+    );
+    assert_eq!(gauge(&metrics), Some(1.0));
+    assert_eq!(lost_for(&metrics, "lost"), 1, "one loss, counted once");
+    assert_eq!(lost_for(&metrics, "reinstalled"), 0);
+}
+
+/// The retries of a reinstall that keeps failing back off — 1, 2, 4, 8
+/// checks apart — up to [`REINSTALL_RETRY_MAX_CHECKS`] apart and no
+/// further, and every check between them fences again and lifts nothing.
+#[test]
+fn reinstall_retries_back_off_to_a_bound_and_keep_the_fence() {
+    let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+    let at = std::cell::RefCell::new(Vec::new());
+    let check = std::cell::Cell::new(0);
+    let mut state = Watch::Intact;
+    for n in 0..60 {
+        check.set(n);
+        state = tick(
+            state,
+            || Ok(Verdict::Absent),
+            || {
+                at.borrow_mut().push(check.get());
+                Err(io::Error::other("nft -f - exited 1"))
+            },
+            &fence,
+            &metrics,
+        );
+        assert!(matches!(state, Watch::Lost { .. }), "check {n}: {state:?}");
+        assert_eq!(fence.take(), ["fence"], "check {n}: fenced, never lifted");
+    }
+    let at = at.into_inner();
+    let gaps: Vec<u32> = at.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(gaps[..6], [1, 2, 4, 8, 10, 10]);
+    assert!(
+        gaps.iter().all(|&g| g <= REINSTALL_RETRY_MAX_CHECKS),
+        "{gaps:?}"
+    );
+    assert_eq!(lost_for(&metrics, "lost"), 1, "one loss, counted once");
+    assert_eq!(gauge(&metrics), Some(0.0));
+}
+
+#[test]
+fn retry_wait_doubles_then_holds_at_the_bound() {
+    let waits: Vec<u32> = (1..=7).map(retry_wait).collect();
+    assert_eq!(waits, [0, 1, 3, 7, 9, 9, 9]);
+    assert_eq!(retry_wait(u32::MAX), REINSTALL_RETRY_MAX_CHECKS - 1);
+    assert_eq!(retry_wait(0), 0, "not reached, and does not underflow");
+}
+
 fn cannot_run() -> io::Result<Verdict> {
     Err(io::Error::other("nft: permission denied"))
 }
@@ -1938,7 +2108,8 @@ fn cannot_run() -> io::Result<Verdict> {
 fn a_check_that_cannot_run_is_counted_and_changes_nothing() {
     for (state, after, fenced) in [
         (Watch::Intact, Watch::Unchecked(1), &[][..]),
-        (Watch::Lost, Watch::Lost, &["fence"][..]),
+        (LOST_ONCE, LOST_ONCE, &["fence"][..]),
+        (LOST_WAITING, LOST_WAITING, &["fence"][..]),
     ] {
         let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
         let next = tick(
