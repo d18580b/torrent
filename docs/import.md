@@ -539,13 +539,20 @@ as `verify_queue_depth` and `verify_in_flight`.
     `idle`) for 5 seconds, but its `torrent_checked` alert was lost (alert
     overflow does not replay it). The payload most likely does not match.
   - `libtorrent reported an unrecoverable error`.
+  - `libtorrent paused the torrent on an error before its check finished`:
+    the check hit an error, most often a disk read error, and libtorrent
+    paused the torrent with it before any verdict. Recorded at once, so the
+    adoption gives up its verify slot. Any failed verification disarms the
+    disk-error retry the error armed, which would otherwise resume the
+    torrent this pause left paused.
   - `no verification verdict within the check expiry`: for 24 hours the
     adoption showed neither a running check (`checking`) nor a held one
     (`paused`), and no verdict came. Either it never appeared in the session,
     or it was stuck in a phase no check leads to, such as a disk error that
     did not clear. A check that runs longer than a day, or an adoption held
     paused (behind the held-add queue, or by a fenced profile), is never
-    expired this way: it keeps its slot until it ends or is removed.
+    expired this way: it keeps its slot until it ends, is removed, or is
+    paused on an error.
 
   None of these is final. Once the cause is fixed, resume the torrent with
   `POST /v1/torrents/{infohash}/resume`, then re-verify it with `POST

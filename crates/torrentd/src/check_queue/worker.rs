@@ -742,9 +742,9 @@ pub(super) fn admit_adoption(
 ///
 /// Hashing is over once [`verify_outcome`] decides it, or, where its
 /// `torrent_checked_alert` was lost, once [`lost_check_outcome`] does: one
-/// showing a finished check's phase unstamped, or one showing no running or
-/// held check for [`RECHECK_EXPIRY`], is recorded failed, so no adoption holds its slot for
-/// the life of the process.
+/// paused on an error, one showing a finished check's phase unstamped, or
+/// one showing no running or held check for [`RECHECK_EXPIRY`], is recorded
+/// failed, so no adoption holds its slot for the life of the process.
 ///
 /// A removed torrent leaves the state map, and with no entry its outcome
 /// reads as still waiting; it is told apart from one whose add has not
@@ -1084,6 +1084,16 @@ pub(super) fn record_verify_outcome(
                 // hold would load it unpaused at the next boot.
                 let entry = profiles.resolve(&st.profile_id).active();
                 let before = entry.map(|e| e.prepare_pause(st.handle));
+                // So would the disk-error retry. A check that fails on a
+                // disk read error arms it (`file_error`), and libtorrent's
+                // pause keeps the error, so a due retry would resume the
+                // torrent this pauses: re-checked and seeding, while its
+                // record stays drifted and no verdict follows. Disarmed
+                // before the pause, so a retry coming due in between finds
+                // nothing to do, and re-armed as it was if the pause fails,
+                // leaving the error-paused torrent with its one way back.
+                let mut retry = None;
+                state.update(hash, |s| retry = s.retry.take());
                 let paused = source
                     .engine_for(&st.profile_id)
                     .map(|e| e.pause_torrent(st.handle));
@@ -1096,6 +1106,13 @@ pub(super) fn record_verify_outcome(
                     // Its flag did not change, so the note goes back.
                     if let (Some(e), Some(before)) = (entry, before) {
                         e.restore_noted(st.handle, before);
+                    }
+                    if retry.is_some() {
+                        state.update(hash, |s| {
+                            if s.retry.is_none() {
+                                s.retry = retry;
+                            }
+                        });
                     }
                     warn!(
                         target: "torrentd::pool",
@@ -1184,6 +1201,11 @@ pub(super) fn verify_outcome(
     }
 }
 
+/// The reason [`lost_check_outcome`] records for an adoption libtorrent
+/// paused on an error before its check reached a verdict.
+pub(super) const ERROR_PAUSED_REASON: &str =
+    "libtorrent paused the torrent on an error before its check finished";
+
 /// Decide an in-flight adoption [`verify_outcome`] left `Waiting`, from what
 /// it shows without a `torrent_checked` stamp and how long it has waited.
 ///
@@ -1206,6 +1228,15 @@ pub(super) fn verify_outcome(
 /// across ticks, and either of those phases resets it, so a hash running
 /// longer than `expiry`, or an adoption held paused behind the held-add
 /// queue, keeps waiting as it always did.
+///
+/// Except one paused on an error ([`error_paused`]), as a disk read error
+/// during the check leaves it: that check is over, with no
+/// `torrent_checked`. It is failed at once, and [`record_verify_outcome`]
+/// disarms the disk-error retry its `file_error` armed, which would
+/// otherwise resume the torrent it pauses. Held as paused, it would reset
+/// the expiry on every tick and keep
+/// its slot for the life of the process, and `max_concurrent_verify` of them
+/// would stall every adoption, re-hash and held add.
 pub(super) fn lost_check_outcome(
     entry: Option<&torrentd_engine::TorrentState>,
     ended_unchecked: &mut Option<std::time::Instant>,
@@ -1213,6 +1244,9 @@ pub(super) fn lost_check_outcome(
     settle: Duration,
     expiry: Duration,
 ) -> VerifyOutcome {
+    if entry.is_some_and(error_paused) {
+        return VerifyOutcome::Failed(ERROR_PAUSED_REASON);
+    }
     if entry.is_some_and(|st| matches!(st.phase, TorrentPhase::Checking | TorrentPhase::Paused)) {
         *waiting_since = std::time::Instant::now();
     }
