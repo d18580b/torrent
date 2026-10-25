@@ -89,10 +89,16 @@ max_peak_rss_mib = 48
 # path (an add in seed mode and its records), half are queued for
 # verification (their records and an enqueue); the hashing itself is not
 # timed.
-# Measured: ci 46 to 145 ms per torrent on the reference workstation's
-# scratch XFS volume (every per-torrent write waits on its own fsync there).
+# Not yet measured on CI: both budgets come from the change that added the
+# case (issue #507), on a host whose pool sat on an XFS volume taking 10 to
+# 30 ms per fsync, release build. There, before that change overlapped and
+# grouped the per-torrent writes, ci took 46 to 145 ms per torrent; after
+# it, ci 8 to 28 ms and full 33 ms (5 requests, the slowest 36 s). Three
+# runs of each daemon interleaved: before 70 to 122 ms, after 15 to 28 ms.
+# Budgeted at about 2x the slowest run after (2.5x for full, run once);
+# CI's disks flush faster than that volume.
 [pool-adopt.full]
-max_ms_per_torrent = 300.0
+max_ms_per_torrent = 80.0
 
 [pool-adopt.ci]
-max_ms_per_torrent = 300.0
+max_ms_per_torrent = 55.0
