@@ -67,14 +67,27 @@ impl Signals {
             terminate: signal(SignalKind::terminate())?,
         })
     }
+}
 
-    /// The name of the next signal to arrive.
-    async fn recv(&mut self) -> &'static str {
-        tokio::select! {
-            _ = self.hangup.recv() => "SIGHUP",
-            _ = self.interrupt.recv() => "SIGINT",
-            _ = self.terminate.recv() => "SIGTERM",
+/// The name of each signal as it arrives.
+impl Stream for Signals {
+    type Item = &'static str;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<&'static str>> {
+        let this = self.get_mut();
+        for (signal, name) in [
+            (&mut this.hangup, "SIGHUP"),
+            (&mut this.interrupt, "SIGINT"),
+            (&mut this.terminate, "SIGTERM"),
+        ] {
+            if let std::task::Poll::Ready(Some(())) = signal.poll_recv(cx) {
+                return std::task::Poll::Ready(Some(name));
+            }
         }
+        std::task::Poll::Pending
     }
 }
 
@@ -102,17 +115,19 @@ pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
     .await
 }
 
-/// [`run`], drawing with `draw` and reading terminal events from `keys`.
+/// [`run`], drawing with `draw`, reading terminal events from `keys` and
+/// the names of signals to leave on from `signals` ([`Signals`]).
 /// Whatever ends the loop, a session token the model minted is revoked
 /// before this returns; a panic in the loop is resumed once it has been.
-pub async fn run_with<K>(
+pub async fn run_with<K, S>(
     mut model: Model,
     draw: impl FnMut(&Model) -> std::io::Result<()>,
     keys: K,
-    mut signals: Signals,
+    mut signals: S,
 ) -> Ended
 where
     K: Stream<Item = std::io::Result<Event>> + Unpin,
+    S: Stream<Item = &'static str> + Unpin,
 {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     // The event stream follows whichever credential is in use: a sign-in or
@@ -150,17 +165,18 @@ where
 
 /// The loop itself: until the model quits, the input ends or fails, a draw
 /// fails, or a signal arrives.
-async fn drive<K>(
+async fn drive<K, S>(
     model: &mut Model,
     mut draw: impl FnMut(&Model) -> std::io::Result<()>,
     mut keys: K,
-    signals: &mut Signals,
+    signals: &mut S,
     tx: &mpsc::UnboundedSender<Msg>,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     api_tx: &watch::Sender<Api>,
 ) -> std::io::Result<()>
 where
     K: Stream<Item = std::io::Result<Event>> + Unpin,
+    S: Stream<Item = &'static str> + Unpin,
 {
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -180,7 +196,7 @@ where
                     return Ok(());
                 }
             },
-            name = signals.recv() => {
+            Some(name) = signals.next() => {
                 tracing::info!(target: "torrentctl::runtime", signal = name, "signalled to leave");
                 return Ok(());
             }
@@ -205,12 +221,14 @@ where
 /// token, or wait for an in-flight sign-in to answer and revoke what it
 /// mints — without drawing, since the terminal may be gone. Bounded by
 /// [`FINISH_TIMEOUT`]; a second signal leaves at once.
-async fn finish(
+async fn finish<S>(
     model: &mut Model,
     tx: &mpsc::UnboundedSender<Msg>,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
-    signals: &mut Signals,
-) {
+    signals: &mut S,
+) where
+    S: Stream<Item = &'static str> + Unpin,
+{
     // A quit already under way has its revocation in flight: wait for it
     // rather than quit a second time, which would leave at once.
     if !model.quitting {
@@ -232,7 +250,7 @@ async fn finish(
                 });
                 return;
             }
-            name = signals.recv() => {
+            Some(name) = signals.next() => {
                 tracing::warn!(target: "torrentctl::runtime", signal = name, "signalled again: leaving without revoking");
                 return;
             }
@@ -495,6 +513,176 @@ mod tests {
             Live::Reconnecting { reason } => reason,
             other => panic!("expected the stream down, got {other:?}"),
         }
+    }
+
+    const REVOKE: &str = "DELETE /v1/sessions/current";
+
+    /// A model holding `tds_minted`, minted from the password, aimed at
+    /// `daemon`.
+    fn minted(daemon: &crate::testing::Recorder) -> Model {
+        let api = daemon.api().with_token("tds_minted").expect("a valid URL");
+        let mut model = Model::new(api, crate::testing::theme());
+        model.minted = true;
+        model
+    }
+
+    /// Terminal input that never arrives.
+    fn no_input() -> futures_util::stream::Pending<std::io::Result<Event>> {
+        futures_util::stream::pending()
+    }
+
+    /// Signals that never arrive.
+    fn no_signals() -> futures_util::stream::Pending<&'static str> {
+        futures_util::stream::pending()
+    }
+
+    fn revoked(daemon: &crate::testing::Recorder) -> bool {
+        daemon.requests().contains(&crate::testing::Request {
+            line: REVOKE.to_owned(),
+            bearer: Some("tds_minted".to_owned()),
+        })
+    }
+
+    async fn bounded(run: impl std::future::Future<Output = Ended>) -> Ended {
+        tokio::time::timeout(PATIENCE, run)
+            .await
+            .unwrap_or_else(|_| panic!("run_with did not return within {PATIENCE:?}"))
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_input_revokes_a_minted_token() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let ended = bounded(run_with(
+            minted(&daemon),
+            |_| Ok(()),
+            futures_util::stream::empty(),
+            no_signals(),
+        ))
+        .await;
+        assert!(ended.result.is_ok());
+        assert!(ended.model.quit);
+        assert!(revoked(&daemon), "{:?}", daemon.requests());
+        assert_eq!(ended.model.exit_notice, None, "revoked: nothing to say");
+    }
+
+    #[tokio::test]
+    async fn an_input_or_draw_error_revokes_a_minted_token_and_is_returned() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let ended = bounded(run_with(
+            minted(&daemon),
+            |_| Ok(()),
+            futures_util::stream::iter([Err(std::io::Error::other("the tty is gone"))]),
+            no_signals(),
+        ))
+        .await;
+        let error = ended.result.expect_err("the input error");
+        assert_eq!(error.to_string(), "the tty is gone");
+        assert!(revoked(&daemon), "input: {:?}", daemon.requests());
+
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let ended = bounded(run_with(
+            minted(&daemon),
+            |_| Err(std::io::Error::other("cannot draw")),
+            no_input(),
+            no_signals(),
+        ))
+        .await;
+        let error = ended.result.expect_err("the draw error");
+        assert_eq!(error.to_string(), "cannot draw");
+        assert!(revoked(&daemon), "draw: {:?}", daemon.requests());
+    }
+
+    #[tokio::test]
+    async fn a_signal_revokes_a_minted_token() {
+        for name in ["SIGHUP", "SIGINT", "SIGTERM"] {
+            let daemon = crate::testing::Recorder::start("204 No Content", "");
+            let ended = bounded(run_with(
+                minted(&daemon),
+                |_| Ok(()),
+                no_input(),
+                futures_util::stream::iter([name]),
+            ))
+            .await;
+            assert!(ended.result.is_ok(), "{name}");
+            assert!(ended.model.quit, "{name}");
+            assert!(revoked(&daemon), "{name}: {:?}", daemon.requests());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_loop_revokes_a_minted_token_then_resumes() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let panicked = AssertUnwindSafe(run_with(
+            minted(&daemon),
+            |_| panic!("the draw panicked"),
+            no_input(),
+            no_signals(),
+        ))
+        .catch_unwind()
+        .await;
+        let panic = panicked.err().expect("the panic is resumed");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"the draw panicked"));
+        assert!(revoked(&daemon), "{:?}", daemon.requests());
+    }
+
+    /// A daemon that takes connections and never answers: the revocation
+    /// is still waiting when the second signal arrives.
+    #[tokio::test]
+    async fn a_second_signal_leaves_without_waiting_for_the_revocation() {
+        let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", wedged.local_addr().expect("an address"));
+        let api = Api::new(&url, Some("tds_minted")).expect("a valid URL");
+        let mut model = Model::new(api, crate::testing::theme());
+        model.minted = true;
+        let started = Instant::now();
+        let ended = bounded(run_with(
+            model,
+            |_| Ok(()),
+            no_input(),
+            futures_util::stream::iter(["SIGTERM", "SIGTERM"]),
+        ))
+        .await;
+        assert!(
+            started.elapsed() < crate::app::REVOKE_TIMEOUT,
+            "left after {:?}",
+            started.elapsed()
+        );
+        assert!(ended.model.quitting && !ended.model.quit);
+        drop(wedged);
+    }
+
+    /// A quit already waiting on its revocation is not quit a second time
+    /// by a signal, which would leave at once: the revocation completes.
+    #[tokio::test]
+    async fn a_signal_during_a_quit_waits_for_its_revocation() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let (keys_tx, mut keys_rx) = mpsc::unbounded_channel();
+        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        let keys = futures_util::stream::poll_fn(move |cx| keys_rx.poll_recv(cx));
+        let signals = futures_util::stream::poll_fn(move |cx| signal_rx.poll_recv(cx));
+        let run = tokio::spawn(run_with(
+            minted(&daemon),
+            move |model| {
+                // Signalled on the draw after the quit was taken, while its
+                // revocation is in flight.
+                if model.quitting && !model.quit {
+                    let _ = signal_tx.send("SIGTERM");
+                }
+                Ok(())
+            },
+            keys,
+            signals,
+        ));
+        let q = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        keys_tx.send(Ok(Event::Key(q))).expect("running");
+        let ended = bounded(async { run.await.expect("no panic") }).await;
+        assert!(ended.model.quit, "the revocation completed");
+        let revocations = daemon.lines().iter().filter(|l| *l == REVOKE).count();
+        assert_eq!(revocations, 1, "{:?}", daemon.requests());
+        assert!(revoked(&daemon));
     }
 
     #[tokio::test]
