@@ -383,7 +383,11 @@ row), and for a fast-path torrent its `.torrent` and save path in the
 profile's `torrent_dir`. Each waits on an fsync, so the rate is set by how
 fast the disk holding the state directory and `pool.db` flushes, not by the
 payload's size. The daemon works on 8 targets of one request at once, and
-the index records of the targets in flight share one commit. Measured with
+the index records of the targets in flight share one commit. A target whose
+index records do not commit is refused rather than reported adopted (§6):
+none of its records stay in the index, it is not queued, its registry claim
+is released, and a fast-path torrent the session already accepted is taken
+back out of it. Measured with
 `mise run bench -- pool-adopt` (release build, half the torrents on each
 path) on a volume where one fsync takes 10 to 30 ms: 8 to 28 ms a torrent
 for 500 torrents in one request, 35 to 125 torrents a second, and 33 ms a
@@ -473,6 +477,7 @@ which case it is that error's message:
 | `infohash … already assigned to profile …` | The assignment registry gives it to another profile in a row the daemon had not seen yet | Adopt it into that profile, or `DELETE` it there first |
 | `assignment registry database …` | The assignment registry could not be written, or holds a row with an unusable profile id. Another process holding the database for longer than the 5-second busy timeout gives `database is locked` | Adopt again once the other writer finishes. For any other cause, the message names the database and what is wrong with it |
 | `the pool index assigns this torrent to profile …` | The index records another profile as its owner, even with no session holding it | Adopt into that profile, or `DELETE` it first, which clears the owner. Where `DELETE` answers `404`, the torrent was already deleted and the owner record outlived it (a release lost to a restart, or a failed index write): restart the daemon, whose boot clears every owner record no registry assignment, session or verify-queue item backs, and logs each one |
+| `the pool index could not record the adoption: …` | Writing the torrent's records to `pool.db` failed. A full disk or an I/O error makes SQLite roll back the whole transaction the torrent's records share with the other torrents being adopted at that moment, and the message is then `a failed statement rolled back the shared transaction`, for each of them; for any other failure it is SQLite's own. Nothing was adopted, and a fast-path torrent the session had accepted was removed from it again, keeping its files. Where the session refused that removal too, the torrent is instead reported under `fast_path` without its index records, and the log says `the session refused to remove the torrent` | Free space on, or fix, the volume holding `pool.db`, then adopt again |
 | `profile … is not live`, `profile failed to start: …` | The session is not running | Fix the profile, then adopt |
 | `unknown profile_id` | The profile stopped being configured while the batch ran (an unknown id up front is a `404` for the whole request) | Check the `profile_id` against the configuration, then adopt |
 | `matched against a root that is no longer configured`, `matched but no base directory was recorded`, `torrent is not in the library` | The index is stale | Rescan |
