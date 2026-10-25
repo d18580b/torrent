@@ -5,5 +5,4 @@
 # when a split brings a file under the limit, delete its line in the same
 # change. Never add a line.
 crates/torrentctl/src/screens/torrents.rs
-crates/torrentd/src/http/tests/torrents.rs
 crates/torrentd/tests/daemon.rs
