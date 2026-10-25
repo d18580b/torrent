@@ -45,9 +45,9 @@ pub(super) fn move_torrent(
     // changed. The planner refuses an escaping destination, so reaching this is
     // either a stale plan or a row edited underneath us — both worth refusing
     // rather than handing to `move_storage`.
-    if !under_a_managed_root(pool, Path::new(dst)) {
+    let Some(root) = managed_root_of(pool, Path::new(dst)) else {
         return Err(format!("destination {dst} is outside every managed root").into());
-    }
+    };
     // The infohash is recovered from the claim rather than carried in the step,
     // so a resumed apply re-resolves against the current index instead of a
     // stale copy.
@@ -75,7 +75,7 @@ pub(super) fn move_torrent(
             .into());
         }
         refuse_live_files_under(source, state, Path::new(&step.src))?;
-        let moved = move_directory(Path::new(&step.src), Path::new(dst));
+        let moved = move_directory(Path::new(&step.src), Path::new(dst), root);
         // An unknown outcome is one whose rename happened: the payload is at
         // `dst` now, so the base follows it as it does a move that is done.
         if !matches!(moved, Err(StepFailure::Failed(_))) {
@@ -467,11 +467,13 @@ fn refuse_live_files_under(
 /// entry already at `dst` refuses it, an empty directory included, and one
 /// that appears there after a check cannot be replaced either. Both parents
 /// are then fsynced, so the rename survives a crash, and so is every directory
-/// that gained an entry when `dst`'s missing ancestors were made, so the path
-/// to the payload survives too; a failure there comes after the rename
-/// happened, and is [`StepFailure::Unknown`] rather than `failed`, which
-/// would say the payload is still at `src`.
-fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
+/// on the way to `dst`'s parent from `root` down, made here or found (a
+/// concurrent step may have just made one and not fsynced it yet), and
+/// every one above `root` that gained an entry when a missing ancestor was
+/// made, so the path to the payload survives too; a failure there comes
+/// after the rename happened, and is [`StepFailure::Unknown`] rather than
+/// `failed`, which would say the payload is still at `src`.
+fn move_directory(src: &Path, dst: &Path, root: &Path) -> Result<(), StepFailure> {
     fn named(p: &Path) -> Result<(&Path, &str), String> {
         let name = p.file_name().and_then(|n| n.to_str());
         p.parent()
@@ -479,7 +481,7 @@ fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
             .ok_or_else(|| format!("{} is not a directory that can be renamed", p.display()))
     }
     let ((src_parent, src_name), (dst_parent, dst_name)) = (named(src)?, named(dst)?);
-    let grown = fsat::create_dir_all(dst_parent)
+    let holders = fsat::create_dir_all(dst_parent, root)
         .map_err(|e| format!("create {}: {e}", dst_parent.display()))?;
     let open = |p: &Path| std::fs::File::open(p).map_err(|e| format!("open {}: {e}", p.display()));
     let (from, to) = (open(src_parent)?, open(dst_parent)?);
@@ -499,10 +501,10 @@ fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
         }
         Err(e) => return Err(format!("rename {} → {}: {e}", src.display(), dst.display()).into()),
     }
-    let made_in = grown.iter().map(|(p, d)| (d, p.as_path()));
+    let on_the_way = holders.iter().map(|(p, d)| (d, p.as_path()));
     for (dir, path) in [(&from, src_parent), (&to, dst_parent)]
         .into_iter()
-        .chain(made_in)
+        .chain(on_the_way)
     {
         fsat::fsync(dir).map_err(|e| {
             StepFailure::Unknown(format!(
@@ -521,17 +523,18 @@ fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
     Ok(())
 }
 
-/// Whether `path` lies inside one of the configured managed roots.
+/// The configured managed root `path` lies inside, if any.
 ///
 /// Shares the planner's check, which follows the symlinks that exist rather
 /// than comparing components lexically. The lexical form let a symlinked
 /// directory inside a root carry a destination onto another volume while still
 /// looking contained, and this is the last gate before `move_storage` or
 /// `create_dir_all` acts on it.
-fn under_a_managed_root(pool: &PoolService, path: &Path) -> bool {
+fn managed_root_of<'a>(pool: &'a PoolService, path: &Path) -> Option<&'a Path> {
     pool.roots()
         .iter()
-        .any(|(_, root)| torrentd_pool::plan::contains(root, path))
+        .find(|(_, root)| torrentd_pool::plan::contains(root, path))
+        .map(|(_, root)| root.as_path())
 }
 
 /// Which torrent's payload sits at `dir`.

@@ -20,33 +20,34 @@ fn cname(name: &str) -> io::Result<CString> {
 }
 
 /// The end of a [`walk`]: the directory it reached, and every directory
-/// that gained an entry because the walk made a directory in it.
+/// the walk passed through on the way.
 pub struct Walked {
     /// `None` for an empty walk, which is the start itself.
     pub dir: Option<File>,
-    /// Each directory a `mkdirat` added an entry to, shallowest first.
-    /// Until each is fsynced, a crash can lose the directory made in it,
-    /// and with it everything later moved beneath.
-    pub grown: Vec<File>,
+    /// With `create`, each directory that holds the next component of the
+    /// walk, the start included, shallowest first; empty without it. Every
+    /// one is returned, not only those a `mkdirat` here added an entry to:
+    /// a component that already existed may have been made a moment ago by
+    /// another step that has not fsynced it yet. Until each is fsynced, a
+    /// crash can lose the directory beneath it, and with it everything
+    /// later moved there.
+    pub crossed: Vec<File>,
 }
 
 /// Open `components` one directory at a time beneath `start`, each with
 /// `O_NOFOLLOW`: a symlink anywhere on the way is `ELOOP`, never followed.
-/// With `create`, a missing directory is made (`0700`) first, and the
-/// directory it was made in is returned in [`Walked::grown`].
+/// With `create`, a missing directory is made (`0700`) first, and every
+/// directory on the way is returned in [`Walked::crossed`].
 pub fn walk(start: &File, components: &[&str], create: bool) -> io::Result<Walked> {
     let mut cur: Option<File> = None;
-    let mut grown = Vec::new();
+    let mut crossed = Vec::new();
     for c in components {
         let name = cname(c)?;
         let dirfd = cur.as_ref().unwrap_or(start).as_raw_fd();
-        let mut made = false;
         if create {
             // SAFETY: a valid directory fd and a NUL-terminated name.
             let rc = unsafe { libc::mkdirat(dirfd, name.as_ptr(), 0o700) };
-            if rc == 0 {
-                made = true;
-            } else {
+            if rc != 0 {
                 let e = io::Error::last_os_error();
                 if e.raw_os_error() != Some(libc::EEXIST) {
                     return Err(e);
@@ -66,43 +67,57 @@ pub fn walk(start: &File, components: &[&str], create: bool) -> io::Result<Walke
         }
         let next = unsafe { File::from_raw_fd(fd) };
         let parent = cur.replace(next);
-        if made {
-            grown.push(match parent {
+        if create {
+            crossed.push(match parent {
                 Some(p) => p,
                 None => start.try_clone()?,
             });
         }
     }
-    Ok(Walked { dir: cur, grown })
+    Ok(Walked { dir: cur, crossed })
 }
 
-/// `std::fs::create_dir_all(path)`, returning each directory that gained an
-/// entry because a missing ancestor of `path` (or `path` itself) was made
-/// in it, opened and paired with its path, shallowest first.
+/// `std::fs::create_dir_all(path)`, returning, opened and paired with its
+/// path, shallowest first, each directory that holds an entry on the way to
+/// `path` and either lies within `within` or gained that entry because a
+/// missing ancestor was made in it.
+///
+/// One within `within` is returned whether or not this call made anything
+/// in it: an entry that already existed may have been made a moment ago by
+/// another step that has not fsynced it yet. Above `within` only what this
+/// call made counts, since torrentd makes no directories there otherwise.
+/// `within` is compared by components, so a path that reaches it through a
+/// different spelling counts as outside it.
 ///
 /// Missing ancestors are found before the create, so one that another
 /// process makes in between is reported too; fsyncing it costs nothing.
-pub fn create_dir_all(path: &Path) -> io::Result<Vec<(PathBuf, File)>> {
-    let mut missing = Vec::new();
+pub fn create_dir_all(path: &Path, within: &Path) -> io::Result<Vec<(PathBuf, File)>> {
+    let mut holders = Vec::new();
+    let mut existing = false;
     for a in path.ancestors().take_while(|a| !a.as_os_str().is_empty()) {
-        match std::fs::metadata(a) {
-            Ok(_) => break,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(a),
-            Err(e) => return Err(e),
+        if !existing {
+            match std::fs::metadata(a) {
+                Ok(_) => existing = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let Some(parent) = a.parent() else { break };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if !existing || parent.starts_with(within) {
+            holders.push(parent);
+        } else {
+            break;
         }
     }
     std::fs::create_dir_all(path)?;
-    missing
+    holders
         .iter()
         .rev()
-        .filter_map(|a| a.parent())
-        .map(|p| {
-            if p.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                p
-            }
-        })
         .map(|p| Ok((p.to_path_buf(), File::open(p)?)))
         .collect()
 }
