@@ -809,7 +809,7 @@ pub async fn boot(
 
     // The two boot scans, resume files first: a torrent with resume data is
     // loaded from it, and the torrent-dir scan adds only what no resume file
-    // covered.
+    // covered: a `.torrent`, else a magnet's recorded URI.
     let mut tally = ScanTally::default();
     {
         let inputs = ScanInputs {
