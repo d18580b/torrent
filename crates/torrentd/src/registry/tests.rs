@@ -604,12 +604,25 @@ fn a_kill_9_mid_write_loses_no_acknowledged_assignment() {
 /// 100_000 entries; and `synchronous = FULL` fsynced every commit, which
 /// made 100K assigns take 505 s. Both are asserted on what the writer
 /// does, not on a wall clock, so a loaded runner cannot fail it: each
-/// assign changes exactly one row, and commits are not fsynced.
+/// assign changes exactly one row, and commits are not fsynced (WAL with
+/// `synchronous = NORMAL`; either one alone fsyncs every commit).
 #[test]
 fn a_hundred_thousand_assigns_take_seconds() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("registry.db");
     let r = AssignmentRegistry::new_empty(&db);
+    // NORMAL skips the per-commit fsync only under WAL; in rollback
+    // journal modes (DELETE, TRUNCATE, PERSIST) it still fsyncs each one.
+    let journal_mode: String = r
+        .writer
+        .lock()
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        journal_mode.to_ascii_lowercase(),
+        "wal",
+        "the writer left WAL, so commits fsync again"
+    );
     // 1 is NORMAL: under WAL, no fsync per commit.
     let synchronous: i64 = r
         .writer
