@@ -43,6 +43,84 @@ fn another_uids_table_lock_does_not_refuse() {
     assert_eq!(table_name(1000), "torrentd_ks_1000");
 }
 
+/// The table an operator is told to delete is this process's own.
+#[test]
+fn the_own_table_is_this_uids() {
+    assert_eq!(own_table_name(), table_name(current_uid().unwrap()));
+}
+
+/// Set in the process [`a_bind_failure_without_a_holder_is_no_refusal`]
+/// starts, the only one in which its half that exhausts descriptors runs.
+const EXHAUST_DESCRIPTORS: &str = "TORRENTD_TEST_KS_EXHAUST_DESCRIPTORS";
+
+/// A bind that fails for want of a descriptor keeps its own kind, and says
+/// what failed, instead of reading as another process holding the lock.
+/// The descriptor limit is shared by every test in the binary, so the half
+/// that exhausts it runs in a process of its own: this test binary again,
+/// filtered to that one test.
+#[test]
+fn a_bind_failure_without_a_holder_is_no_refusal() {
+    let name = "vpn::killswitch::tests::bind_without_a_descriptor";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(EXHAUST_DESCRIPTORS, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the filter ran no test: {stdout}"
+    );
+}
+
+#[test]
+#[ignore = "run by a_bind_failure_without_a_holder_is_no_refusal"]
+fn bind_without_a_descriptor() {
+    if std::env::var_os(EXHAUST_DESCRIPTORS).is_none() {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit`.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+        0
+    );
+    // No descriptor above those already open.
+    let lowered = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `lowered` is a valid `rlimit` no higher than the hard limit.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) },
+        0
+    );
+    let lock = TableLock::acquire_named(&lock_name("emfile"));
+    // SAFETY: `limit` is the `rlimit` read above.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+        0
+    );
+    let err = lock.expect_err("no descriptor is left for the socket");
+    assert_ne!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("bind the abstract unix socket @"),
+        "{err}"
+    );
+}
+
 /// `/proc/net/unix`'s abstract entries are found by their exact name and
 /// no other: a longer name sharing the prefix is not the socket.
 #[test]
