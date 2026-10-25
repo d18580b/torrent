@@ -3882,7 +3882,7 @@
           "profiles"
         ],
         "summary": "Set one profile online or offline.",
-        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says: those that were running are started again 100\na second, going on after the response, since each one started announces\nto its trackers. Setting it offline meanwhile stops that, and the next\n`online` starts the rest; a restart starts them at boot. The setting is\nwritten to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
+        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says: those that were running are started again 100\na second, going on after the response, since each one started announces\nto its trackers. Setting it offline meanwhile stops that, and the next\n`online` starts the rest; a restart starts them at boot. The setting is\nwritten to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. Where\n`network_kill_switch` is on, the fence stays unless the kill switch last\nchecked in force: while its watch has the vpn profiles fenced, for a table\nfound gone or changed or for checks that could not run, setting a fenced\nprofile online answers `409 kill-switch-not-in-force` and nothing changes,\nbefore its tunnel is checked. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
         "operationId": "set_profile_state",
         "parameters": [
           {
@@ -4121,21 +4121,42 @@
             }
           },
           "409": {
-            "description": "The profile is unavailable",
+            "description": "The profile is unavailable; The network kill switch is not in force",
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "allOf": [
+                  "oneOf": [
                     {
-                      "$ref": "#/components/schemas/Problem"
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The profile is unavailable"
                     },
                     {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#kill-switch-not-in-force"
+                            }
+                          }
                         }
-                      }
+                      ],
+                      "title": "The network kill switch is not in force"
                     }
                   ]
                 }

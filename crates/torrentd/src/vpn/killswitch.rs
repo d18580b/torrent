@@ -1233,7 +1233,9 @@ enum Watch {
     /// and nothing is fenced for them.
     Unchecked(u32),
     /// A check found it gone or changed: every vpn profile was fenced, and the
-    /// one reinstall this loss gets was tried and did not check intact.
+    /// one reinstall this loss gets was tried and did not check intact. Each
+    /// later check fences again until one finds the table intact, including
+    /// a check that cannot run.
     Lost,
     /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
     /// checks in a row could not run: every vpn profile was fenced
@@ -1256,7 +1258,8 @@ enum Watch {
 /// changed fences every vpn profile, then the table is installed again once,
 /// in one transaction, and checked again; only a reinstall that checks intact
 /// lifts the fence. While it is not intact the check repeats each interval,
-/// fencing again any profile set online meanwhile; a later check that finds it
+/// fencing again any profile set online meanwhile, whether or not that check
+/// can run; a later check that finds it
 /// intact — restored by the operator — lifts the fence then. A check that
 /// cannot run counts in `kill_switch_probe_errors_total` and, alone, changes
 /// nothing, since not knowing is not the same as absent; but
@@ -1506,7 +1509,8 @@ fn refresh(
 /// in a row, which fences every vpn profile
 /// ([`FenceCause::Unverifiable`]); each later one fences again any profile set
 /// online meanwhile. One that cannot run while the watch is [`Watch::Lost`]
-/// leaves it so: every profile is fenced already, for the loss.
+/// leaves it so, and fences again any profile set online meanwhile
+/// ([`FenceCause::NotInForce`]): the loss is the last thing a check found.
 fn tick(
     state: Watch,
     verify: impl Fn() -> io::Result<Verdict>,
@@ -1595,7 +1599,13 @@ fn tick(
 /// [`tick`].
 fn unchecked(state: Watch, fence: &dyn Fence) -> Watch {
     let failures = match state {
-        Watch::Lost => return Watch::Lost,
+        // The loss stands: nothing has found the table back. Fence again, as
+        // a check that finds it still lost does, so a profile set online
+        // meanwhile does not keep seeding for as long as `nft` cannot run.
+        Watch::Lost => {
+            fence.fence_all();
+            return Watch::Lost;
+        }
         Watch::Intact => 1,
         Watch::Unchecked(n) => n.saturating_add(1),
         Watch::Unverified => crate::vpn_monitor::PROBE_FAILURES_TO_FENCE,

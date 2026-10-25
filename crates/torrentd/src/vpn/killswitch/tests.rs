@@ -1931,13 +1931,14 @@ fn cannot_run() -> io::Result<Verdict> {
 }
 
 /// One check that cannot run is counted and fences nothing: not knowing
-/// is not absent. While the watch is lost, every profile is fenced
-/// already, and it stays lost.
+/// is not absent. While the watch is lost, the loss is the last thing a
+/// check found: it stays lost, and fences again for the loss any profile
+/// set online meanwhile, with neither a reinstall nor a second count.
 #[test]
 fn a_check_that_cannot_run_is_counted_and_changes_nothing() {
-    for (state, after) in [
-        (Watch::Intact, Watch::Unchecked(1)),
-        (Watch::Lost, Watch::Lost),
+    for (state, after, fenced) in [
+        (Watch::Intact, Watch::Unchecked(1), &[][..]),
+        (Watch::Lost, Watch::Lost, &["fence"][..]),
     ] {
         let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
         let next = tick(
@@ -1949,7 +1950,7 @@ fn a_check_that_cannot_run_is_counted_and_changes_nothing() {
         );
         assert_eq!(next, after);
         assert_eq!(gauge(&metrics), None, "not knowing is not absent");
-        assert_eq!(fence.take(), Vec::<&str>::new());
+        assert_eq!(fence.take(), fenced, "{state:?}");
         assert_eq!(metrics.count_for("kill_switch_probe_errors_total"), 1);
         assert_eq!(metrics.count_for("kill_switch_lost_total"), 0);
     }
