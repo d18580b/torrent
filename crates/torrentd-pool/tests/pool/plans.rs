@@ -330,6 +330,75 @@ fn delete_orphans_targets_only_unclaimed_files() {
     assert!(root.join("keep/loose.bin").exists());
 }
 
+/// Issue #657: the matcher claims no file without bytes, so a matched
+/// torrent's declared empty file has no claim row; it is still the
+/// torrent's, and a delete over its directory leaves it alone. An empty
+/// file the torrent does not declare, or the declared path once it holds
+/// bytes, is unclaimed as before.
+#[test]
+fn delete_orphans_leaves_a_matched_torrents_declared_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 128);
+    write_file(root, "T/empty.txt", 0);
+    write_file(root, "T/stray.txt", 0);
+    // A second torrent placed under a non-empty base: its declared path is
+    // root-relative only once joined to that base.
+    write_file(root, "sub/U/b.bin", 256);
+    write_file(root, "sub/U/none.txt", 0);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "e1",
+        "T",
+        None,
+        &[("T/a.bin", 128), ("T/empty.txt", 0), ("T/.pad/0", 0)],
+    );
+    add_torrent(
+        &mut store,
+        "e2",
+        "U",
+        None,
+        &[("U/b.bin", 256), ("U/none.txt", 0)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "e1"), AdoptionState::Matched);
+    assert_eq!(state_of(&store, "e2"), AdoptionState::Matched);
+    assert!(!store.is_orphan(root_id, "sub/U/none.txt").unwrap());
+    assert!(store.orphan_files(root_id, "sub").unwrap().is_empty());
+    // The directory rollups the listing reads agree with the file rows.
+    assert_eq!(store.rollup(root_id, "T").unwrap().files_orphan, 1);
+    assert_eq!(store.rollup(root_id, "sub").unwrap().files_orphan, 0);
+    assert_eq!(store.rollup(root_id, "").unwrap().files_orphan, 1);
+    let spec = PlanSpec::DeleteOrphans {
+        root_id,
+        prefix: "T".into(),
+    };
+
+    let steps = build_plan(&store, &spec, root_id, root).unwrap();
+    let srcs: Vec<&str> = steps.iter().map(|s| s.src.as_str()).collect();
+    assert_eq!(srcs.len(), 1, "{srcs:?}");
+    assert!(srcs[0].ends_with("T/stray.txt"), "{srcs:?}");
+    assert_eq!(store.orphan_files(root_id, "T").unwrap(), ["T/stray.txt"]);
+    // The executor's last-moment re-check agrees with the planner.
+    assert!(!store.is_orphan(root_id, "T/empty.txt").unwrap());
+    assert!(store.is_orphan(root_id, "T/stray.txt").unwrap());
+
+    // Bytes at the declared path are not the empty file the torrent declares.
+    write_file(root, "T/empty.txt", 5);
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    assert!(store.is_orphan(root_id, "T/empty.txt").unwrap());
+    assert_eq!(
+        store.orphan_files(root_id, "T").unwrap(),
+        ["T/empty.txt", "T/stray.txt"]
+    );
+    let rollup = store.rollup(root_id, "T").unwrap();
+    assert_eq!((rollup.files_orphan, rollup.bytes_orphan), (2, 5));
+}
+
 #[test]
 fn delete_orphans_is_scoped_to_the_named_subtree() {
     let dir = tempfile::tempdir().unwrap();

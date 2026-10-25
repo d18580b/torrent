@@ -32,6 +32,40 @@ struct PayloadFile {
     stamp: (u64, i64, u64, u64),
 }
 
+impl PayloadFile {
+    /// Its indexed `(dev, ino)`: what [`TorrentPayload::shared_with`]
+    /// compares a file reached by another path against, since a bind mount
+    /// or a hard link reaches the same file through a path neither spelling
+    /// nor symlink resolution relates to this one.
+    fn identity(&self) -> (u64, u64) {
+        (self.stamp.3, self.stamp.2)
+    }
+}
+
+/// `(dev, ino)` of whatever `path` names, following symlinks, or `None`
+/// when it cannot be stat'd.
+fn identity_of(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|md| (md.dev(), md.ino()))
+}
+
+/// Whether `path` or a directory above it is one of `dirs`, by `(dev, ino)`:
+/// how a file is found under a directory that a bind mount aliases, where
+/// no path comparison can see it. Each ancestor's identity is kept in
+/// `seen`, so the files of one payload stat each directory once.
+fn under_by_identity(
+    path: &Path,
+    dirs: &std::collections::HashSet<(u64, u64)>,
+    seen: &mut std::collections::HashMap<std::path::PathBuf, Option<(u64, u64)>>,
+) -> bool {
+    path.ancestors().any(|dir| {
+        let id = *seen
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| identity_of(dir));
+        id.is_some_and(|id| dirs.contains(&id))
+    })
+}
+
 impl TorrentPayload {
     /// How many files the trash move covers. Files the torrent lists that
     /// were never created on disk are not among them.
@@ -49,17 +83,28 @@ impl TorrentPayload {
     /// sessions spell it and resolved, and each of `other`'s files is
     /// resolved on its own full path, so a `save_path` reaching the same
     /// directory through a symlink, a symlinked directory below it, and a
-    /// file that is itself a symlink to the payload are all caught. A
-    /// torrent whose metadata
-    /// has not arrived yet could write any file under its `save_path`, so
-    /// every payload file under it counts as shared.
+    /// file that is itself a symlink to the payload are all caught. Each is
+    /// also compared by `(dev, ino)`, so a file reached through a bind mount
+    /// aliasing a root, or a hard link, is caught where no path relates
+    /// them. A torrent whose metadata has not arrived yet could write any
+    /// file under its `save_path`, so every payload file under it counts as
+    /// shared, its `save_path` compared by path and by the identity of each
+    /// directory above the payload file.
     pub fn shared_with(&self, other: &LiveTorrent) -> Option<&std::path::Path> {
         let bases = other.bases();
         fn forms(f: &PayloadFile) -> impl Iterator<Item = &std::path::PathBuf> {
             std::iter::once(&f.path).chain(f.resolved.as_ref())
         }
-        let hit: Box<dyn Fn(&PayloadFile) -> bool> = match &other.files {
-            None => Box::new(|f| forms(f).any(|p| bases.iter().any(|b| p.starts_with(b)))),
+        let hit = match &other.files {
+            None => {
+                let dirs: std::collections::HashSet<(u64, u64)> =
+                    bases.iter().filter_map(|b| identity_of(b)).collect();
+                let mut seen = std::collections::HashMap::new();
+                self.files.iter().find(|f| {
+                    forms(f).any(|p| bases.iter().any(|b| p.starts_with(b)))
+                        || under_by_identity(&f.path, &dirs, &mut seen)
+                })
+            }
             Some(files) => {
                 // Each of its files as spelled under either base, and with
                 // every symlink on its own path resolved: a cross-seed whose
@@ -76,10 +121,18 @@ impl TorrentPayload {
                             .chain(std::fs::canonicalize(joined).ok())
                     })
                     .collect();
-                Box::new(move |f| forms(f).any(|p| theirs.contains(p)))
+                // And each by identity: a bind mount of a root, or a hard
+                // link, reaches the same file through an unrelated path.
+                let ids: std::collections::HashSet<(u64, u64)> = files
+                    .iter()
+                    .filter_map(|rel| identity_of(&other.save_path.join(rel)))
+                    .collect();
+                self.files
+                    .iter()
+                    .find(|f| forms(f).any(|p| theirs.contains(p)) || ids.contains(&f.identity()))
             }
         };
-        self.files.iter().find(|f| hit(f)).map(|f| f.path.as_path())
+        hit.map(|f| f.path.as_path())
     }
 }
 
@@ -131,7 +184,9 @@ impl std::fmt::Display for PayloadRefusal {
 ///    and a payload outside every root has no trash to go to;
 /// 2. be in the index, and claimed there by this torrent — the index's
 ///    record is what the co-claimant check and the re-stat below rest on,
-///    and a torrent the matcher has not placed contributes neither;
+///    and a torrent the matcher has not placed contributes neither. A file
+///    the torrent declares empty, and that is empty on disk and in the
+///    index, needs no claim: the matcher claims no file without bytes;
 /// 3. still be the file the index recorded: the same `(size, mtime, inode,
 ///    device)`, checked here and again at the move.
 ///
@@ -167,25 +222,31 @@ pub fn torrent_payload(
         if !torrentd_pool::plan::contains(&root, &path) {
             return Err(outside(&path));
         }
-        located.push((path, root_id, root, rel));
+        located.push((path, root_id, root, rel, file));
     }
-    let (claims, others, rows) = pool
+    let (claims, empty, others, rows) = pool
         .with_reader(|s| {
             let claims: std::collections::HashSet<(i64, String)> =
                 s.claims_of(infohash)?.into_iter().collect();
+            let empty: std::collections::HashSet<String> = s
+                .torrent_files(infohash)?
+                .into_iter()
+                .filter(|f| f.size == 0 && !f.pad_file)
+                .map(|f| f.rel_path)
+                .collect();
             let others = s.co_claimants(infohash)?;
             let rows = located
                 .iter()
-                .map(|(_, root_id, _, rel)| s.file(*root_id, rel))
+                .map(|(_, root_id, _, rel, _)| s.file(*root_id, rel))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, torrentd_pool::PoolError>((claims, others, rows))
+            Ok::<_, torrentd_pool::PoolError>((claims, empty, others, rows))
         })
         .map_err(|e| PayloadRefusal::Unproven(e.to_string()))?;
     if !others.is_empty() {
         return Err(PayloadRefusal::Shared(others));
     }
     let mut out = Vec::with_capacity(located.len());
-    for ((path, root_id, root, rel), row) in located.into_iter().zip(rows) {
+    for ((path, root_id, root, rel, file), row) in located.into_iter().zip(rows) {
         let unproven = |why: String| Err(PayloadRefusal::Unproven(why));
         let on_disk = match std::fs::symlink_metadata(&path) {
             Ok(md) => Some(md),
@@ -208,7 +269,11 @@ pub fn torrent_payload(
                 ))
             }
         };
-        if !claims.contains(&(root_id, rel.clone())) {
+        // The matcher claims no file without bytes, so a file this torrent
+        // declares empty has no claim row: it is this torrent's while it is
+        // still empty, on disk and in the index.
+        let own_empty = row.size == 0 && md.len() == 0 && empty.contains(file.as_str());
+        if !own_empty && !claims.contains(&(root_id, rel.clone())) {
             return unproven(format!(
                 "the index does not record this torrent claiming {}; rescan before deleting",
                 path.display(),
@@ -478,6 +543,117 @@ mod tests {
             payload.shared_with(&live(&dir.path().join("data"), None)),
             None
         );
+    }
+
+    /// Issue #657: the matcher claims no file without bytes, so a torrent's
+    /// declared empty file has no claim row. It is proven this torrent's
+    /// while it is empty, and goes to the trash with the rest; an empty
+    /// file the torrent does not declare, or the declared one once it holds
+    /// bytes, is still refused.
+    #[test]
+    fn a_torrents_declared_empty_file_goes_to_the_trash_with_its_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let a = write(&root, "T/a.bin", 16);
+        let empty = write(&root, "T/empty.txt", 0);
+        write(&root, "T/stray.txt", 0);
+        write(&root, "T/other.txt", 0);
+        let filled = write(&root, "T/filled.txt", 5);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        let row = |idx: i64, rel: &str, size: u64, pad_file: bool| torrentd_pool::TorrentFileRow {
+            infohash: ih.clone(),
+            idx,
+            rel_path: rel.to_owned(),
+            size,
+            pieces_root: None,
+            pad_file,
+        };
+        pool.with_store_mut(|st| {
+            st.replace_torrent_files(
+                &ih,
+                &[
+                    row(0, "T/a.bin", 16, false),
+                    row(1, "T/empty.txt", 0, false),
+                    row(2, "T/stray.txt", 0, true),
+                    row(3, "T/filled.txt", 0, false),
+                ],
+            )
+        })
+        .unwrap();
+        let files =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|f| (*f).to_owned()).collect() };
+
+        // A padding entry is never a file the torrent declares empty.
+        let e = torrent_payload(&pool, &ih, &root, &files(&["T/a.bin", "T/stray.txt"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not record this torrent claiming"), "{e}");
+
+        // Nor is an empty file it does not declare at all.
+        let e = torrent_payload(&pool, &ih, &root, &files(&["T/a.bin", "T/other.txt"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not record this torrent claiming"), "{e}");
+        // Bytes at a declared empty path are not the empty file it declares.
+        let e = torrent_payload(&pool, &ih, &root, &files(&["T/a.bin", "T/filled.txt"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not record this torrent claiming"), "{e}");
+        assert!(filled.exists());
+
+        let payload =
+            torrent_payload(&pool, &ih, &root, &files(&["T/a.bin", "T/empty.txt"])).unwrap();
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert!(out.failed.is_none(), "{:?}", out.failed);
+        assert_eq!(out.moved, 2);
+        assert!(!a.exists() && !empty.exists());
+        let trash = root.join(".torrentd-trash/torrent-x-1/T");
+        assert_eq!(std::fs::read(trash.join("empty.txt")).unwrap(), b"");
+        assert_eq!(std::fs::read(trash.join("a.bin")).unwrap(), vec![7u8; 16]);
+    }
+
+    /// Issue #657: a live torrent reaching a payload file through a path no
+    /// spelling or symlink relates to it — a bind mount aliasing a root, or
+    /// a hard link — is caught by `(dev, ino)`.
+    #[test]
+    fn a_payload_is_shared_with_a_live_torrent_reaching_it_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let a = write(&root, "T/a.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        let payload = torrent_payload(&pool, &ih, &root, &["T/a.bin".to_owned()]).unwrap();
+
+        // The same file under another save path, through a hard link: as a
+        // bind mount does, it shares the inode and no path.
+        let alias = dir.path().join("alias");
+        std::fs::create_dir_all(alias.join("T")).unwrap();
+        std::fs::hard_link(&a, alias.join("T/a.bin")).unwrap();
+        let live = LiveTorrent {
+            save_path: alias.clone(),
+            files: Some(vec!["T/a.bin".to_owned()]),
+        };
+        assert_eq!(payload.shared_with(&live), Some(a.as_path()));
+        // A different file at the same relative path is not shared.
+        std::fs::remove_file(alias.join("T/a.bin")).unwrap();
+        write(&alias, "T/a.bin", 16);
+        assert_eq!(payload.shared_with(&live), None);
+
+        // With no metadata, its save path is compared with each directory
+        // above the payload file by identity, which is what catches a bind
+        // mount of one: no path test sees it.
+        let dirs: std::collections::HashSet<(u64, u64)> =
+            identity_of(&root.join("T")).into_iter().collect();
+        let mut seen = std::collections::HashMap::new();
+        assert!(under_by_identity(&a, &dirs, &mut seen));
+        let elsewhere: std::collections::HashSet<(u64, u64)> =
+            identity_of(&alias).into_iter().collect();
+        assert!(!under_by_identity(&a, &elsewhere, &mut seen));
     }
 
     #[test]
