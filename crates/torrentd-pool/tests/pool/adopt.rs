@@ -505,6 +505,60 @@ fn an_unparseable_sidecar_refuses_a_renamed_torrent() {
     );
 }
 
+/// Issue #622: a multi-file torrent holding one file, under qBittorrent's
+/// `NoSubfolder` layout, sits at `<save_path>/<file>` without the torrent's
+/// top directory. The scan finds it there, and adoption refuses it as it does
+/// every `NoSubfolder` torrent: libtorrent cannot be told about a layout only
+/// qBittorrent recorded, and neither the resume data nor the `.torrent`'s own
+/// paths lead it to where the file is.
+#[test]
+fn a_one_file_no_subfolder_torrent_is_found_flat_and_refused() {
+    for (complete, reason) in [
+        (true, refusal::LAYOUT_NOT_IN_RESUME),
+        (false, refusal::RENAMED_INCOMPLETE),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write_file(&root, "dl/ep1.mkv", 2048);
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(
+            library.join("t.torrent"),
+            v1_metainfo("Show", &[("Show/ep1.mkv", 2048)]),
+        )
+        .unwrap();
+        let mut fr = b"d6:pieces2:".to_vec();
+        fr.extend_from_slice(if complete { b"\x01\x01" } else { b"\x01\x00" });
+        fr.extend_from_slice(b"17:qBt-contentLayout");
+        fr.extend_from_slice(&bstr_of("NoSubfolder"));
+        fr.extend_from_slice(b"12:qBt-savePath");
+        fr.extend_from_slice(&bstr_of(&root.join("dl").to_string_lossy()));
+        fr.push(b'e');
+        std::fs::write(library.join("t.fastresume"), fr).unwrap();
+
+        let mut store = PoolStore::open_in_memory().unwrap();
+        torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+        let ih = store.torrents().unwrap().pop().unwrap().infohash;
+        let files = store.torrent_files(&ih).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].rel_path, "ep1.mkv");
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+        let root_id = store.root_id(&root).unwrap();
+        assert_eq!(
+            store.adoption_base(&ih).unwrap(),
+            Some((root_id, "dl".to_owned()))
+        );
+        assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+
+        let plan =
+            torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| root.clone()))
+                .unwrap();
+        assert_eq!(plan, AdoptPlan::Refuse { reason }, "complete: {complete}");
+    }
+}
+
 /// Issue #438: a known torrent moved within the library with a sidecar that
 /// no longer parses keeps what the last good read recorded, while its row
 /// points at the `.torrent` and sidecar where this scan found them. The add

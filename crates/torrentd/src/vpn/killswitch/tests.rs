@@ -28,7 +28,27 @@ fn a_second_table_lock_refuses_and_names_the_holder() {
         "the refusal names the socket and the table: {msg}"
     );
     drop(first);
-    TableLock::acquire_named(&name).expect("the lock is free once the holder is gone");
+    reacquire_after_drop(&name).expect("the lock is free once the holder is gone");
+}
+
+/// Take the lock on `name` just after its holder was dropped. Another test
+/// in this binary that spawns a process forks a child holding a copy of
+/// every descriptor, the socket included, until that child execs and
+/// close-on-exec closes it; for that window the name is still bound. So
+/// a refusal here is retried for up to a second, and any other failure,
+/// or a refusal that outlasts the second, is returned.
+fn reacquire_after_drop(name: &str) -> io::Result<TableLock> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match TableLock::acquire_named(name) {
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrInUse && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The lock is on the table's own name, so a lock on another uid's
