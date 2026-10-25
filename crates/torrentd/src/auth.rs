@@ -1318,19 +1318,22 @@ mod tests {
         assert!(!t.per_client.lock().contains_key(&filler(7)));
     }
 
-    /// A lockout that ends at this very instant protects no one, so the
-    /// sweep for a newcomer reclaims it, as it does an idle entry.
+    /// A lockout that ends at this very instant, or has ended, protects no
+    /// one, so the sweep for a newcomer reclaims it, as it does an idle
+    /// entry.
     #[test]
-    fn a_lockout_ending_this_instant_is_swept_for_a_newcomer() {
+    fn an_ended_lockout_is_swept_for_a_newcomer() {
         let penalty = Duration::from_millis(50);
-        let t = LoginThrottle::with_penalty(penalty);
-        fill(&t, 5);
-        t.advance(penalty);
-        t.note_failure(ip(1));
-        assert!(
-            t.per_client.lock().contains_key(&ip(1).unwrap()),
-            "the ended lockouts made room for the newcomer",
-        );
+        for past in [Duration::ZERO, Duration::from_millis(1)] {
+            let t = LoginThrottle::with_penalty(penalty);
+            fill(&t, 5);
+            t.advance(penalty + past);
+            t.note_failure(ip(1));
+            assert!(
+                t.per_client.lock().contains_key(&ip(1).unwrap()),
+                "{past:?} past the lockouts' end, they made room for the newcomer",
+            );
+        }
     }
 
     /// A client's failures do not decay while the map has room: only a full
