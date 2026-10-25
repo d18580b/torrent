@@ -78,6 +78,9 @@ impl PoolStore {
     /// one per (directory, claimant), never the file list. Every writer of
     /// `file` or `claim` that the daemon runs ends with this: a root swap
     /// rebuilds its root, and a match rebuilds every root.
+    ///
+    /// An empty file at a declared empty path of a torrent placed in the
+    /// root is not counted as an orphan, as in [`PoolStore::orphan_files`].
     pub fn rebuild_rollups(&mut self, root_id: i64) -> Result<(), PoolError> {
         #[derive(Default)]
         struct Agg {
@@ -92,6 +95,7 @@ impl PoolStore {
             st.conn
                 .execute("DELETE FROM dir_claim WHERE root_id = ?1", params![root_id])?;
 
+            let declared = st.declared_empty_paths(root_id)?;
             let mut dirs: HashMap<String, Agg> = HashMap::new();
             {
                 let mut q = st.conn.prepare(
@@ -105,6 +109,7 @@ impl PoolStore {
                     let rel: String = r.get(0)?;
                     let size = r.get::<_, i64>(1)? as u64;
                     let claimed: bool = r.get(2)?;
+                    let orphan = !claimed && (size > 0 || !declared.contains(&rel));
                     for dir in ancestors(&rel) {
                         // Only directories new to this walk allocate a key.
                         if !dirs.contains_key(dir) {
@@ -115,7 +120,7 @@ impl PoolStore {
                         };
                         agg.bytes_total = agg.bytes_total.saturating_add(size);
                         agg.files_total += 1;
-                        if !claimed {
+                        if orphan {
                             agg.bytes_orphan = agg.bytes_orphan.saturating_add(size);
                             agg.files_orphan += 1;
                         }
@@ -273,6 +278,34 @@ impl PoolStore {
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
 
+    /// Whether `rel_path` is a declared empty file of a torrent placed in
+    /// `root_id`: the single-path form of [`PoolStore::declared_empty_paths`].
+    ///
+    /// Driven from the root's adoptions, and only a torrent whose recorded
+    /// base is an ancestor of `rel_path` has its file rows read, so the cost
+    /// never grows with the number of declared empty files in the root. The
+    /// path comparison is [`super::join_rel`]'s, written in SQL.
+    fn is_declared_empty(&self, root_id: i64, rel_path: &str) -> Result<bool, PoolError> {
+        let declared: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM adoption a CROSS JOIN torrent_file t
+                WHERE a.root_id = ?1 AND a.base_rel IS NOT NULL
+                  AND (trim(a.base_rel, '/') = ''
+                       OR substr(?2, 1, length(trim(a.base_rel, '/')) + 1)
+                          = trim(a.base_rel, '/') || '/')
+                  AND t.infohash = a.infohash
+                  AND t.size = 0 AND t.pad_file = 0
+                  AND trim(t.rel_path, '/') = CASE
+                        WHEN trim(a.base_rel, '/') = '' THEN ?2
+                        ELSE substr(?2, length(trim(a.base_rel, '/')) + 2)
+                      END
+             )",
+            params![root_id, rel_path],
+            |r| r.get(0),
+        )?;
+        Ok(declared != 0)
+    }
+
     /// Files under `(root_id, prefix)` that `infohash` does **not** claim.
     ///
     /// A relocate moves a whole directory, so the only way that is safe is if
@@ -377,7 +410,7 @@ impl PoolStore {
             .optional()?;
         match size {
             None => Ok(false),
-            Some(0) => Ok(!self.declared_empty_paths(root_id)?.contains(rel_path)),
+            Some(0) => Ok(!self.is_declared_empty(root_id, rel_path)?),
             Some(_) => Ok(true),
         }
     }

@@ -342,6 +342,10 @@ fn delete_orphans_leaves_a_matched_torrents_declared_empty_file() {
     write_file(root, "T/a.bin", 128);
     write_file(root, "T/empty.txt", 0);
     write_file(root, "T/stray.txt", 0);
+    // A second torrent placed under a non-empty base: its declared path is
+    // root-relative only once joined to that base.
+    write_file(root, "sub/U/b.bin", 256);
+    write_file(root, "sub/U/none.txt", 0);
 
     let mut store = PoolStore::open_in_memory().unwrap();
     let root_id = store.upsert_root(root).unwrap();
@@ -353,8 +357,22 @@ fn delete_orphans_leaves_a_matched_torrents_declared_empty_file() {
         None,
         &[("T/a.bin", 128), ("T/empty.txt", 0), ("T/.pad/0", 0)],
     );
+    add_torrent(
+        &mut store,
+        "e2",
+        "U",
+        None,
+        &[("U/b.bin", 256), ("U/none.txt", 0)],
+    );
     torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "e1"), AdoptionState::Matched);
+    assert_eq!(state_of(&store, "e2"), AdoptionState::Matched);
+    assert!(!store.is_orphan(root_id, "sub/U/none.txt").unwrap());
+    assert!(store.orphan_files(root_id, "sub").unwrap().is_empty());
+    // The directory rollups the listing reads agree with the file rows.
+    assert_eq!(store.rollup(root_id, "T").unwrap().files_orphan, 1);
+    assert_eq!(store.rollup(root_id, "sub").unwrap().files_orphan, 0);
+    assert_eq!(store.rollup(root_id, "").unwrap().files_orphan, 1);
     let spec = PlanSpec::DeleteOrphans {
         root_id,
         prefix: "T".into(),
@@ -377,6 +395,8 @@ fn delete_orphans_leaves_a_matched_torrents_declared_empty_file() {
         store.orphan_files(root_id, "T").unwrap(),
         ["T/empty.txt", "T/stray.txt"]
     );
+    let rollup = store.rollup(root_id, "T").unwrap();
+    assert_eq!((rollup.files_orphan, rollup.bytes_orphan), (2, 5));
 }
 
 #[test]
