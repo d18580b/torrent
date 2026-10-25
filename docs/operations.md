@@ -197,7 +197,11 @@ touches nothing until it is applied.
   whose session cannot be read. A cross-device move of an unloaded torrent's
   directory is refused: move the data yourself and rescan.
 - **`delete_orphans`** moves every unclaimed file under a root, or a subtree of
-  one, into the trash.
+  one, into the trash. Applying it is refused while a torrent the daemon owns
+  may hold a file under that root unaccounted for: one the index holds no
+  claims for, or a claimed one whose session saves it somewhere other than
+  where the index places it, such as a torrent still downloading into this
+  root while the matcher placed it at a complete copy under another.
 
 ```bash
 # Rescan first: the planner reasons from the index as it stands.
