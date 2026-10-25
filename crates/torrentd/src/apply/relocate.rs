@@ -466,9 +466,11 @@ fn refuse_live_files_under(
 /// The move is `renameat2(RENAME_NOREPLACE)` between the two parents, so an
 /// entry already at `dst` refuses it, an empty directory included, and one
 /// that appears there after a check cannot be replaced either. Both parents
-/// are then fsynced, so the rename survives a crash; a failure there comes
-/// after the rename happened, and is [`StepFailure::Unknown`] rather than
-/// `failed`, which would say the payload is still at `src`.
+/// are then fsynced, so the rename survives a crash, and so is every directory
+/// that gained an entry when `dst`'s missing ancestors were made, so the path
+/// to the payload survives too; a failure there comes after the rename
+/// happened, and is [`StepFailure::Unknown`] rather than `failed`, which
+/// would say the payload is still at `src`.
 fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
     fn named(p: &Path) -> Result<(&Path, &str), String> {
         let name = p.file_name().and_then(|n| n.to_str());
@@ -477,7 +479,7 @@ fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
             .ok_or_else(|| format!("{} is not a directory that can be renamed", p.display()))
     }
     let ((src_parent, src_name), (dst_parent, dst_name)) = (named(src)?, named(dst)?);
-    std::fs::create_dir_all(dst_parent)
+    let grown = fsat::create_dir_all(dst_parent)
         .map_err(|e| format!("create {}: {e}", dst_parent.display()))?;
     let open = |p: &Path| std::fs::File::open(p).map_err(|e| format!("open {}: {e}", p.display()));
     let (from, to) = (open(src_parent)?, open(dst_parent)?);
@@ -497,7 +499,11 @@ fn move_directory(src: &Path, dst: &Path) -> Result<(), StepFailure> {
         }
         Err(e) => return Err(format!("rename {} → {}: {e}", src.display(), dst.display()).into()),
     }
-    for (dir, path) in [(&from, src_parent), (&to, dst_parent)] {
+    let made_in = grown.iter().map(|(p, d)| (d, p.as_path()));
+    for (dir, path) in [(&from, src_parent), (&to, dst_parent)]
+        .into_iter()
+        .chain(made_in)
+    {
         fsat::fsync(dir).map_err(|e| {
             StepFailure::Unknown(format!(
                 "outcome unknown: {} was renamed to {}, but fsync {} failed ({e}), so the \

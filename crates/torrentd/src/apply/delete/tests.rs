@@ -52,6 +52,39 @@ fn a_delete_whose_fsync_fails_after_the_move_is_an_unknown_outcome() {
         .exists());
 }
 
+/// Every directory the trash walk makes a directory in is fsynced before
+/// the step returns, as are the two the rename changed: otherwise a crash
+/// can lose the trash path and leave the moved file unreachable by it while
+/// the journal says the step is done.
+#[test]
+fn a_delete_fsyncs_every_directory_that_gained_an_entry() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    let file = write(&root, "a/b/f.bin", 5);
+    let stamp = torrentd_pool::file_stamp(&std::fs::symlink_metadata(&file).unwrap());
+    fsat::FSYNCED.with_borrow_mut(Vec::clear);
+    move_into_trash(&root, &file, "a/b/f.bin", stamp, "bucket").unwrap();
+    let synced = fsat::FSYNCED.take();
+    let trash = root.join(torrentd_pool::plan::TRASH_DIR);
+    for d in [
+        root.clone(),
+        root.join("a/b"),
+        trash.clone(),
+        trash.join("bucket"),
+        trash.join("bucket/a"),
+        trash.join("bucket/a/b"),
+    ] {
+        let md = std::fs::metadata(&d).unwrap();
+        assert!(
+            synced.contains(&(md.dev(), md.ino())),
+            "{} gained an entry but was not fsynced",
+            d.display(),
+        );
+    }
+    assert!(trash.join("bucket/a/b/f.bin").exists());
+}
+
 /// The planner's unresolved-payload guards hold at apply time too. A
 /// rescan between building and applying that leaves a torrent partial
 /// over the plan's files, or missing a file of one's size, stops those

@@ -308,6 +308,31 @@ fn moving_a_directory_never_replaces_the_destination() {
     );
 }
 
+/// Every directory that gains an entry when the destination's missing
+/// ancestors are made is fsynced before the move returns, as are the two
+/// the rename changed: otherwise a crash can lose the path to the payload
+/// while the journal says the step is done.
+#[test]
+fn moving_a_directory_fsyncs_every_directory_that_gained_an_entry() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "old/T/a.bin", 3);
+    let dst = dir.path().join("x/y/z/T");
+    fsat::FSYNCED.with_borrow_mut(Vec::clear);
+    move_directory(&dir.path().join("old/T"), &dst).unwrap();
+    let synced = fsat::FSYNCED.take();
+    for d in ["", "old", "x", "x/y", "x/y/z"] {
+        let d = dir.path().join(d);
+        let md = std::fs::metadata(&d).unwrap();
+        assert!(
+            synced.contains(&(md.dev(), md.ino())),
+            "{} gained an entry but was not fsynced",
+            d.display(),
+        );
+    }
+    assert!(dst.join("a.bin").exists());
+}
+
 /// An fsync that fails after the rename is not a step that did not
 /// happen: the payload is at the destination, so the step stays
 /// `in_progress` for a human and the adoption base follows the payload.
