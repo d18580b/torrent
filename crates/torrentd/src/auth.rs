@@ -934,10 +934,12 @@ mod tests {
             "the prefix and 256 bits of hex"
         );
         assert_eq!(s.expiry(&a), Some(a_expires));
+        assert_eq!(s.len(), 2);
         s.revoke(&a);
         assert!(!s.is_valid(&a), "revoking must actually invalidate");
         assert!(s.is_valid(&b));
         assert!(!s.is_valid("nonsense"));
+        assert_eq!(s.len(), 1, "only the live session counts");
     }
 
     #[test]
