@@ -601,22 +601,33 @@ fn a_kill_9_mid_write_loses_no_acknowledged_assignment() {
 
 /// Acceptance: 100K assigns take seconds, not hours. The JSON file this
 /// replaced rewrote every entry on every add, so the 100_000th add wrote
-/// 100_000 entries. About 7 s in a debug build; the bound is loose so a
-/// loaded CI runner does not fail it, and still minutes short of the old
-/// file's quadratic cost.
+/// 100_000 entries; and `synchronous = FULL` fsynced every commit, which
+/// made 100K assigns take 505 s. Both are asserted on what the writer
+/// does, not on a wall clock, so a loaded runner cannot fail it: each
+/// assign changes exactly one row, and commits are not fsynced.
 #[test]
 fn a_hundred_thousand_assigns_take_seconds() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("registry.db");
     let r = AssignmentRegistry::new_empty(&db);
-    let start = std::time::Instant::now();
+    // 1 is NORMAL: under WAL, no fsync per commit.
+    let synchronous: i64 = r
+        .writer
+        .lock()
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .unwrap();
+    assert_eq!(synchronous, 1, "the writer fsyncs every commit");
+    let before = r.writer.lock().total_changes();
     for i in 0..100_000u32 {
         let mut b = [0u8; 20];
         b[..4].copy_from_slice(&i.to_be_bytes());
         r.assign(InfoHash(b), ProfileId::new("p")).unwrap();
     }
-    let took = start.elapsed();
-    assert!(took < Duration::from_secs(120), "took {took:?}");
+    let rows_written = r.writer.lock().total_changes() - before;
+    assert_eq!(
+        rows_written, 100_000,
+        "an assign rewrote more than its own row"
+    );
     // Fast because each assign writes one row, not because it wrote
     // nothing: every one of them is on disk.
     drop(r);
