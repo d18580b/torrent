@@ -200,7 +200,7 @@ pub struct Model {
     pub tab: Tab,
     pub session: Session,
     /// Whether the credential in use is a session token this client minted
-    /// from the password, and so revokes on quit.
+    /// from the password, and so revokes on the way out.
     pub minted: bool,
     /// The user asked to quit and the client is finishing up first: revoking
     /// a minted token, or waiting for an in-flight sign-in to answer so the
@@ -449,6 +449,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             model.api = api;
             model.minted = true;
+            model.login.busy = false;
+            if model.quitting {
+                // The quit came after the daemon answered but before this
+                // landed: the token is live and owed a revocation, then the
+                // exit the quit asked for.
+                effects.push(revoke(&model.api, true));
+                return effects;
+            }
             model.session = Session::Checking;
             effects.push(check_session(&model.api));
             effects

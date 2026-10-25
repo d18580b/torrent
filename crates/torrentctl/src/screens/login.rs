@@ -2,7 +2,7 @@
 //!
 //! Shown when there is no token, or when the daemon refused the one in use.
 //! The session token `POST /v1/sessions` returns is held in memory only and
-//! revoked on quit.
+//! revoked however the client exits (see `runtime`).
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -78,11 +78,13 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             })]
         }
         Msg::Answered(Ok(token)) => {
-            state.busy = false;
             state.password.reset();
             match ctx.api.with_token(&token) {
+                // Still busy until `SignedIn` lands and clears it: a quit in
+                // between must know a token is on its way, to revoke it.
                 Ok(api) => vec![Effect::now(crate::app::Msg::SignedIn(api))],
                 Err(e) => {
+                    state.busy = false;
                     state.error = Some(e);
                     Vec::new()
                 }

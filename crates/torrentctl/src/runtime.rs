@@ -1,13 +1,23 @@
 //! The loop: draw, wait for a key, a tick, a change notification or an
 //! effect's result, apply it, spawn what it asks for, repeat.
+//!
+//! However the loop ends — a quit, a draw or input error, the end of the
+//! input, a panic, or SIGHUP, SIGINT or SIGTERM — a session token this
+//! client minted is revoked before it returns ([`finish`]).
 
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use crossterm::event::Event;
 use crossterm::event::EventStream;
 use crossterm::event::KeyEventKind;
+use futures_util::FutureExt as _;
+use futures_util::Stream;
 use futures_util::StreamExt as _;
 use ratatui::DefaultTerminal;
+use tokio::signal::unix::signal;
+use tokio::signal::unix::Signal;
+use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -26,25 +36,137 @@ const TICK: Duration = Duration::from_millis(250);
 /// (the alternate screen left, the cursor shown) rather than leaving it raw.
 pub const PANIC_AFTER_DRAW: &str = "TORRENTCTL_TEST_PANIC";
 
-/// Run until the user quits, returning what to tell them once the terminal
-/// is theirs again ([`Model::exit_notice`]).
-pub async fn run(
+/// How long [`finish`] may take after an exit the user did not ask for: long
+/// enough for a revocation to answer or reach [`app::REVOKE_TIMEOUT`], short
+/// enough that a SIGTERM is not answered with a SIGKILL first.
+pub const FINISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How the loop ended: the model as it was left (its
+/// [`Model::exit_notice`] is what to tell the user once the terminal is
+/// theirs again), and whether the terminal failed.
+pub struct Ended {
+    pub model: Model,
+    pub result: std::io::Result<()>,
+}
+
+/// SIGHUP (the terminal went away), SIGINT and SIGTERM, caught so that they
+/// end the loop through [`finish`] rather than kill the process with a
+/// minted token still live. Installed once, before the loop starts: from
+/// then on these signals no longer terminate the process by themselves.
+pub struct Signals {
+    hangup: Signal,
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl Signals {
+    pub fn install() -> std::io::Result<Self> {
+        Ok(Self {
+            hangup: signal(SignalKind::hangup())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// The name of the next signal to arrive.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.hangup.recv() => "SIGHUP",
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
+/// Run on the terminal until the user quits or the loop otherwise ends.
+pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
+    let signals = match Signals::install() {
+        Ok(signals) => signals,
+        Err(e) => {
+            return Ended {
+                model,
+                result: Err(e),
+            };
+        }
+    };
+    run_with(
+        model,
+        |model| {
+            terminal
+                .draw(|frame| crate::ui::view(model, frame))
+                .map(drop)
+        },
+        EventStream::new(),
+        signals,
+    )
+    .await
+}
+
+/// [`run`], drawing with `draw` and reading terminal events from `keys`.
+/// Whatever ends the loop, a session token the model minted is revoked
+/// before this returns; a panic in the loop is resumed once it has been.
+pub async fn run_with<K>(
     mut model: Model,
-    terminal: &mut DefaultTerminal,
-) -> std::io::Result<Option<String>> {
+    draw: impl FnMut(&Model) -> std::io::Result<()>,
+    keys: K,
+    mut signals: Signals,
+) -> Ended
+where
+    K: Stream<Item = std::io::Result<Event>> + Unpin,
+{
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     // The event stream follows whichever credential is in use: a sign-in or
     // a sign-out changes it.
     let (api_tx, api_rx) = watch::channel(model.api.clone());
     tokio::spawn(follow_events(api_rx, tx.clone()));
-
     spawn(&tx, vec![app::check_session(&model.api)]);
-    let mut keys = EventStream::new();
+
+    let looped = AssertUnwindSafe(drive(
+        &mut model,
+        draw,
+        keys,
+        &mut signals,
+        &tx,
+        &mut rx,
+        &api_tx,
+    ))
+    .catch_unwind()
+    .await;
+    if !model.quit {
+        finish(&mut model, &tx, &mut rx, &mut signals).await;
+    }
+    match looped {
+        Ok(result) => Ended { model, result },
+        Err(panic) => {
+            // The panic hook has handed the terminal back already, so this
+            // stays on the operator's screen.
+            if let Some(notice) = &model.exit_notice {
+                eprintln!("{notice}");
+            }
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
+/// The loop itself: until the model quits, the input ends or fails, a draw
+/// fails, or a signal arrives.
+async fn drive<K>(
+    model: &mut Model,
+    mut draw: impl FnMut(&Model) -> std::io::Result<()>,
+    mut keys: K,
+    signals: &mut Signals,
+    tx: &mpsc::UnboundedSender<Msg>,
+    rx: &mut mpsc::UnboundedReceiver<Msg>,
+    api_tx: &watch::Sender<Api>,
+) -> std::io::Result<()>
+where
+    K: Stream<Item = std::io::Result<Event>> + Unpin,
+{
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     while !model.quit {
-        terminal.draw(|frame| crate::ui::view(&model, frame))?;
+        draw(model)?;
         if std::env::var_os(PANIC_AFTER_DRAW).is_some() {
             panic!("{PANIC_AFTER_DRAW} is set");
         }
@@ -53,12 +175,19 @@ pub async fn run(
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => Msg::Key(key),
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => return Err(e),
-                None => break,
+                None => {
+                    tracing::info!(target: "torrentctl::runtime", "the terminal input ended");
+                    return Ok(());
+                }
             },
+            name = signals.recv() => {
+                tracing::info!(target: "torrentctl::runtime", signal = name, "signalled to leave");
+                return Ok(());
+            }
             _ = tick.tick() => Msg::Tick,
             Some(msg) = rx.recv() => msg,
         };
-        let effects = app::update(&mut model, msg);
+        let effects = app::update(model, msg);
         // A sign-in replaces the credential; the stream follows it.
         api_tx.send_if_modified(|current| {
             let changed = current.epoch != model.api.epoch;
@@ -67,9 +196,50 @@ pub async fn run(
             }
             changed
         });
-        spawn(&tx, effects);
+        spawn(tx, effects);
     }
-    Ok(model.exit_notice)
+    Ok(())
+}
+
+/// Finish an exit the user did not ask for as a quit would: revoke a minted
+/// token, or wait for an in-flight sign-in to answer and revoke what it
+/// mints — without drawing, since the terminal may be gone. Bounded by
+/// [`FINISH_TIMEOUT`]; a second signal leaves at once.
+async fn finish(
+    model: &mut Model,
+    tx: &mpsc::UnboundedSender<Msg>,
+    rx: &mut mpsc::UnboundedReceiver<Msg>,
+    signals: &mut Signals,
+) {
+    // A quit already under way has its revocation in flight: wait for it
+    // rather than quit a second time, which would leave at once.
+    if !model.quitting {
+        let effects = app::update(model, Msg::Quit);
+        spawn(tx, effects);
+    }
+    let deadline = tokio::time::Instant::now() + FINISH_TIMEOUT;
+    while !model.quit {
+        let msg = tokio::select! {
+            Some(msg) = rx.recv() => msg,
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!(target: "torrentctl::runtime", "the session token was not revoked within {FINISH_TIMEOUT:?}");
+                model.exit_notice.get_or_insert_with(|| {
+                    format!(
+                        "torrentctl: the session token was not revoked within {}s; it stays \
+                         valid on the daemon until it expires",
+                        FINISH_TIMEOUT.as_secs()
+                    )
+                });
+                return;
+            }
+            name = signals.recv() => {
+                tracing::warn!(target: "torrentctl::runtime", signal = name, "signalled again: leaving without revoking");
+                return;
+            }
+        };
+        let effects = app::update(model, msg);
+        spawn(tx, effects);
+    }
 }
 
 /// Run each effect on its own task, sending its message to `tx`.
