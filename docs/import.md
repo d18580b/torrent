@@ -513,7 +513,8 @@ The `torrentd_pool_verify_*`, `torrentd_pool_recheck_dropped_total` and
 as `verify_queue_depth` and `verify_in_flight`.
 
 - **A failed verification** pauses the torrent, records it `drifted` (the
-  reason is kept in the pool database's `adoption.last_error`), and counts it
+  reason is kept in the pool database's `adoption.last_error`, and
+  `GET /v1/pool/torrents` returns it as the torrent's `note`), and counts it
   in `torrentd_pool_verify_failed_total`. The log says `verification did not
   leave the torrent seeding; pausing it`, and its `reason` field says which
   of these it was:

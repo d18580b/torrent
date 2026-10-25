@@ -853,12 +853,13 @@ pub struct PoolTorrent {
     /// The directory, relative to its root, the payload was matched at;
     /// `null` when unmatched.
     pub base_rel: Option<String>,
-    /// Why the last scan reached its verdict, where the state alone does
-    /// not say: for example how many of its files are present, that its
-    /// on-disk stats changed since it was verified, that another torrent
-    /// claims the same files, or that it has more than one complete copy
-    /// (which makes a delete plan refuse to touch any of them). `null` when
-    /// there is nothing to add.
+    /// Why its state is what it is, where the state alone does not say,
+    /// from whichever last set it: a scan's match (for example how many of
+    /// its files are present, that its on-disk stats changed since it was
+    /// verified, that another torrent claims the same files, or that it has
+    /// more than one complete copy, which makes a delete plan refuse to
+    /// touch any of them), or a verification that failed (why its payload
+    /// did not check out). `null` when there is nothing to add.
     pub note: Option<String>,
     /// The profile that owns it, as the library or an adoption recorded;
     /// `null` when none has.
