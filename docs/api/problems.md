@@ -183,10 +183,16 @@ nftables table gone or changed, or because too many checks in a row could not
 run, and no check has found the table in force since. Lifting the fence then
 would put the profile back on the network with nothing confining its egress,
 so the profile stays fenced and its state is unchanged; the tunnel is not
-checked. Restore the table (a daemon restart installs it again), or whatever
-keeps `nft` from running, and retry once a check finds the table in force,
-which the daemon logs as lifting the fence it put on the vpn profiles: from
-then on the request checks the tunnel and lifts the fence as before.
+checked. The watch installs the table again on its own: a check that finds it
+still gone or changed reinstalls it, the next check after a failed reinstall,
+then 2, 4 and 8 checks on, then every 10 checks (five minutes) for as long as
+it stays lost, counting only checks `nft` can run. When a reinstall does not
+take, fix what removes the table or what makes the reinstall fail (the error
+log names it), restore the table yourself, or restart the daemon, which
+installs it again; fix whatever keeps `nft` from running. Retry once a check
+finds the table in force, which the daemon logs as lifting the fence it put on
+the vpn profiles: from then on the request checks the tunnel and lifts the
+fence as before.
 
 ## `torrent-exists`
 

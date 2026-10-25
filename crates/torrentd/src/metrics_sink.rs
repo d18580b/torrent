@@ -387,8 +387,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
          answer fence every vpn profile (profile_vpn_fenced_total reason probe_unavailable).";
     "kill_switch_lost_total" Counter Daemon ("outcome": &["reinstalled", "lost"]) Zero =>
         "Times a runtime check found the kill switch's nftables table missing or drifted, by \
-         whether the one reinstall checked intact (reinstalled) or not (lost). Each loss counts \
-         once; the checks that repeat while it stays lost do not.";
+         whether its first reinstall checked intact (reinstalled) or not (lost). Each loss counts \
+         once; the checks that repeat while it stays lost, and the reinstalls they retry, do not.";
     // the previous run's shutdown
     "last_shutdown_unsaved_resumes" Gauge Daemon Owner("always") =>
         "Resume saves the previous run's shutdown drain left unsaved; 0 if unknown.";

@@ -690,7 +690,12 @@ network throughout.
    many checks in a row could not run, and no check has found the table in
    force since, the answer is `409 kill-switch-not-in-force`: the profile
    stays fenced with its state unchanged, and the tunnel is not checked.
-   Restore the table, or whatever keeps `nft` from running, and send the
+   The watch reinstalls the table itself while it stays lost: the next
+   check after a reinstall that did not take, then 2, 4 and 8 checks on,
+   then every 10 checks (five minutes), counting only checks `nft` can run,
+   each failure logged at `error` with its cause. If those keep failing, fix
+   what removes the table or breaks the reinstall, or restore the table
+   yourself; fix whatever keeps `nft` from running. Send the
    request again once a check finds the table in force, which the daemon
    logs at `warn` as `the network kill switch is in force as installed
    again; lifting the fence it put on the vpn profiles` (or `reinstalled
