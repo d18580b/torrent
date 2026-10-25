@@ -367,6 +367,55 @@ async fn a_batch_that_panics_panics_its_paced_resume() {
     assert!(failed.is_panic(), "{failed}");
 }
 
+/// A pause of the whole profile that lands between two resumes of one
+/// batch stops the run there: what the batch had left and every later
+/// batch count as not reached.
+#[tokio::test]
+async fn a_pause_all_inside_a_batch_counts_the_rest_of_the_run_not_reached() {
+    let id = ProfileId::new("acct_mid_batch");
+    let engine = Arc::new(torrentd_engine::MockEngine::new());
+    let profiles = Arc::new(ProfileRegistry::new(vec![ProfileEntry::new(
+        crate::profile_registry::test_vpn_entry(id.as_str(), ProfileStatus::Active).config,
+        engine.clone(),
+        ip(2),
+        None,
+        0,
+    )]));
+    let gate = profiles.iter().next().unwrap().open_gate();
+    let n = REANNOUNCE_BATCH as u64 + 5;
+    let handles: Vec<TorrentHandle> = (1..=n).map(handle).collect();
+    *super::lift::BEFORE_GATED_RESUME.lock().unwrap() = Some((id.clone(), {
+        let profiles = profiles.clone();
+        Box::new(move |i| {
+            if i == 1 {
+                profiles.iter().next().unwrap().halt_resumes();
+            }
+        })
+    }));
+    let resumed = resume_paced(
+        profiles,
+        id,
+        &handles,
+        REANNOUNCE_PACE,
+        || false,
+        gate,
+        Arc::new(PromSink::new()),
+        |_, _| {},
+    )
+    .await;
+    *super::lift::BEFORE_GATED_RESUME.lock().unwrap() = None;
+    assert_eq!(
+        resumed,
+        Resumed {
+            resumed: 1,
+            not_reached: n as usize - 1,
+            halted: true,
+            ..Resumed::default()
+        },
+    );
+    assert_eq!(resumes(&engine), [handle(1)], "nothing after the pause");
+}
+
 /// A paced resume counts what the session refused apart from what it
 /// resumed, and hands each refusal to its caller.
 #[tokio::test]
