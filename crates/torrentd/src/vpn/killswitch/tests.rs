@@ -1065,6 +1065,26 @@ fn disable_against_real_nft() {
 /// A table an earlier release left under the shared name, against a real
 /// `nft`: another uid's removal leaves it, its own uid's removes it. Run
 /// it as [`disable_against_real_nft`] says.
+/// The renderer writes `!=` only against a set of interface names, so a
+/// listing reading `oifname != "<one name>"` is not a rule it installed.
+#[test]
+fn a_negated_single_interface_match_is_not_a_rule_the_kill_switch_installs() {
+    let set = serde_json::json!([
+        {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}},
+                   "right": {"set": ["wg0", "lo"]}}},
+        {"drop": null},
+    ]);
+    assert_eq!(
+        rule_line(&set).unwrap(),
+        "oifname != { \"lo\", \"wg0\" } drop"
+    );
+    let single = serde_json::json!([
+        {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
+        {"drop": null},
+    ]);
+    rule_line(&single).expect_err("never installed");
+}
+
 /// `remove_table` and `disable` act on this process's own uid's table, and
 /// say whether there was one.
 #[test]
