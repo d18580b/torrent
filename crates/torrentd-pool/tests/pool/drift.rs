@@ -164,3 +164,39 @@ fn deleting_a_claimed_file_is_drift() {
     assert_eq!(report.files_vanished, 1);
     assert_eq!(state_of(&store, "7g"), AdoptionState::Drifted);
 }
+
+/// Files gone from one directory are held as that directory until the stats
+/// are done, and each still counts.
+#[test]
+fn every_file_deleted_from_one_directory_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    for rel in ["D/a.bin", "D/b.bin", "D/c.bin", "D/s/d.bin"] {
+        write_file(&root, rel, 256);
+    }
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(
+        &mut store,
+        "8h",
+        "D",
+        None,
+        &[
+            ("D/a.bin", 256),
+            ("D/b.bin", 256),
+            ("D/c.bin", 256),
+            ("D/s/d.bin", 256),
+        ],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    for rel in ["D/a.bin", "D/b.bin", "D/s/d.bin"] {
+        std::fs::remove_file(root.join(rel)).unwrap();
+    }
+    let r = root.clone();
+    let report = torrentd_pool::drift::detect(&mut store, |_| Some(r.clone())).unwrap();
+    assert_eq!(report.files_vanished, 3);
+    assert!(report.unmounted_dirs.is_empty(), "{report:?}");
+    assert_eq!(report.drifted, vec!["8h".to_string()]);
+}

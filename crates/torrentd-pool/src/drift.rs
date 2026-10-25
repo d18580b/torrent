@@ -74,10 +74,11 @@ fn probe_root(root: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// The directory a not-found `file` under `root` cannot be trusted over, if
-/// any: the nearest directory above it that still exists, up to and
-/// including `root`, when that directory is on another filesystem than the
-/// one the index recorded the file on (`indexed_dev`).
+/// The directory a file not found in `parent` under `root` cannot be trusted
+/// over, if any: the nearest of `parent` and the directories above it that
+/// still exists, up to and including `root`, when that directory is on
+/// another filesystem than the one the index recorded the file on
+/// (`indexed_dev`).
 ///
 /// A disk mounted inside a readable root leaves its mount point behind when
 /// it is unmounted, and every file on it then reads not-found exactly as a
@@ -93,12 +94,12 @@ fn probe_root(root: &std::path::Path) -> Result<(), String> {
 /// under an unmounted directory: left unchecked, not drift.
 fn untrusted_parent(
     root: &std::path::Path,
-    file: &std::path::Path,
+    parent: &std::path::Path,
     indexed_dev: u64,
     devs: &DevMap,
 ) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    let mut dir = file.parent()?;
+    let mut dir = parent;
     while dir.starts_with(root) {
         match std::fs::symlink_metadata(dir) {
             Ok(m) if m.is_dir() => {
@@ -211,14 +212,17 @@ pub fn detect_before_adopt(
     )
 }
 
-type Candidate = (
-    String,
-    i64,
-    std::path::PathBuf,
-    u64,
-    Vec<(std::path::PathBuf, u64)>,
-    bool,
-);
+/// A torrent's files not found, as the directory each was in and the device
+/// the index recorded it on, with how many files share both.
+///
+/// Every file judged after the stats is held until then, so it is held by
+/// what its judgement reads rather than by its own path: a disk unmounted
+/// inside a readable root leaves every claimed file on it not found, and
+/// those share a directory per torrent folder, not one entry each. Ordered,
+/// so `unmounted_dirs` comes out the same on every pass.
+type Gone = std::collections::BTreeMap<(std::path::PathBuf, u64), u64>;
+
+type Candidate = (String, i64, std::path::PathBuf, u64, Gone, bool);
 
 fn detect_among(
     store: &mut PoolStore,
@@ -230,8 +234,8 @@ fn detect_among(
     let mut probes = RootProbes::default();
     let mut devs = DevMap::default();
     // Each torrent with evidence, or with a file it could not check:
-    // (infohash, root, its root path, files changed, files not found with
-    // the device the index recorded each on, a file left unchecked). A file
+    // (infohash, root, its root path, files changed, files not found by
+    // directory and recorded device, a file left unchecked). A file
     // not found is judged only once every stat is made, below: by then
     // `devs` has learnt every renumbered filesystem it can, and the root has
     // been probed again.
@@ -260,7 +264,7 @@ fn detect_among(
             continue;
         }
 
-        let (mut changed, mut gone, mut unsure) = (0u64, Vec::new(), false);
+        let (mut changed, mut gone, mut unsure) = (0u64, Gone::new(), false);
         for f in store.torrent_files(infohash)? {
             if !f.is_on_disk() {
                 continue;
@@ -286,7 +290,8 @@ fn detect_among(
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                     ) =>
                 {
-                    gone.push((path, indexed.dev));
+                    let parent = path.parent().unwrap_or(&root_path).to_path_buf();
+                    *gone.entry((parent, indexed.dev)).or_default() += 1;
                 }
                 Err(e) => {
                     warn!(
@@ -312,9 +317,9 @@ fn detect_among(
         let mut vanished = 0u64;
         if !gone.is_empty() {
             if probes.still_readable(root_id, &root_path, &mut report) {
-                for (path, indexed_dev) in gone {
-                    match untrusted_parent(&root_path, &path, indexed_dev, &devs) {
-                        None => vanished += 1,
+                for ((parent, indexed_dev), files) in gone {
+                    match untrusted_parent(&root_path, &parent, indexed_dev, &devs) {
+                        None => vanished += files,
                         Some(dir) => {
                             unsure = true;
                             if !report.unmounted_dirs.contains(&dir) {
