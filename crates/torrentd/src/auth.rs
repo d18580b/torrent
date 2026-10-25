@@ -961,6 +961,23 @@ mod tests {
         );
     }
 
+    /// `Auth`'s Debug names how many sessions and tokens it holds, and
+    /// nothing a credential could be read from: no password hash, no token
+    /// digest, no session.
+    #[test]
+    fn auth_debugs_its_counts_and_no_credential() {
+        let (_token, digest) = generate_token();
+        let mut c = cfg(hash_password("pw").unwrap());
+        c.token.push(TokenConfig {
+            name: "prometheus".into(),
+            sha256: digest,
+            scopes: vec![Scope::Metrics],
+        });
+        let auth = Auth::new(c);
+        auth.sessions.create();
+        assert_eq!(format!("{auth:?}"), "Auth { sessions: 1, tokens: 1 }");
+    }
+
     #[test]
     fn expired_sessions_stop_being_valid() {
         let s = SessionStore::new(Duration::from_millis(1));
