@@ -165,7 +165,60 @@ pub(super) fn move_torrent(
     // path above follow it; but a file it skipped is still at the source and
     // the step is not the move the plan asked for.
     left_behind(pool, &infohash, src, dst)?;
-    arrived(&present, src, dst)
+    arrived(&present, src, dst)?;
+    // The executor journals the step done as soon as this returns, and
+    // across devices libtorrent has already removed the source.
+    make_durable(&present, src, Path::new(dst), root)
+}
+
+/// fsync every moved file at `dst`, then every directory from each file's
+/// own up to `root` (or up to `dst`'s parent where `dst` reaches `root`
+/// through a different spelling), so the payload survives a power loss
+/// before the step is journaled done.
+///
+/// Across devices libtorrent copies each file and removes the source, and
+/// nothing it does makes the copy durable: without this, a power loss after
+/// the journal write could leave the destination empty or missing while
+/// the source is gone. Inside one filesystem the move is a rename, and the
+/// files' fsyncs find nothing dirty. A failure here comes after the move
+/// happened, so it is [`StepFailure::Unknown`], never `failed`, which would
+/// invite a retry over a payload that already left the source.
+fn make_durable(
+    present: &[String],
+    src: &Path,
+    dst: &Path,
+    root: &Path,
+) -> Result<(), StepFailure> {
+    let stop = if dst.starts_with(root) {
+        root
+    } else {
+        dst.parent().unwrap_or(dst)
+    };
+    let mut dirs = std::collections::BTreeSet::new();
+    let files = present.iter().map(|rel| dst.join(rel));
+    for file in files.clone() {
+        for dir in file.ancestors().skip(1) {
+            if !dirs.insert(dir.to_path_buf()) || dir == stop {
+                break;
+            }
+        }
+    }
+    let unknown = |path: &Path, e: std::io::Error| {
+        StepFailure::Unknown(format!(
+            "outcome unknown: libtorrent moved the torrent to {}, but fsync {} failed ({e}), \
+             so the moved payload may not survive a crash. {}",
+            dst.display(),
+            path.display(),
+            unknown_outcome_remedy(&src.display().to_string(), Some(&dst.display().to_string())),
+        ))
+    };
+    // Deepest first: `BTreeSet` orders a directory before everything under it.
+    for path in files.chain(dirs.into_iter().rev()) {
+        std::fs::File::open(&path)
+            .and_then(|f| fsat::fsync(&f))
+            .map_err(|e| unknown(&path, e))?;
+    }
+    Ok(())
 }
 
 /// Whether two spellings name the same directory: component-wise equal, or
