@@ -536,7 +536,10 @@ as `verify_queue_depth` and `verify_in_flight`.
   `POST /v1/torrents/{infohash}/resume`, then re-verify it with `POST
   /v1/pool/verifications`, and `drifted` clears if the payload is good. Resume
   it first: the failure left it paused, and `POST /v1/pool/verifications`
-  skips a paused torrent, because libtorrent does not hash one.
+  skips a paused torrent, because libtorrent does not hash one. Resuming has
+  a cost: it puts the payload the piece hashes rejected back on the network
+  until the check ends. Fix the cause before you resume, and decide whether
+  that window is acceptable; nothing resumes the torrent for you.
 - **A dropped item** never reached a session: its `.torrent` could not be
   read from `library_dir`, its profile stopped, the tracker check failed at
   admission, or libtorrent rejected the add. Its registry claim is released,
