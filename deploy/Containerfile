@@ -137,6 +137,11 @@ EXPOSE 6881/tcp 6881/udp 8080/tcp
 # to bring up its tunnel; in that case run as root with `cap_add: NET_ADMIN`.
 USER 1000:1000
 
+# The image's only health check. It survives in a Docker-format image alone:
+# podman and buildah drop it from their default OCI format, so `mise run
+# container` builds with `--format docker`, and a podman build of compose.yaml
+# needs BUILDAH_FORMAT=docker (docs/running.md §8). docker and buildx, which
+# the release workflow uses, keep it.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -fsS http://localhost:8080/healthz || exit 1
 

@@ -7,7 +7,8 @@
 #      `compose run`: a bind mount of a missing file mounts a directory.
 #   2. In deploy/Caddyfile, replace torrentd.example.com with your host name.
 #   3. Create /data/torrents owned by uid 1000 (docs/running.md §4).
-#   4. podman compose -f deploy/compose.yaml build
+#   4. BUILDAH_FORMAT=docker podman compose -f deploy/compose.yaml build
+#      (podman's default OCI format drops the image's HEALTHCHECK)
 #      podman compose -f deploy/compose.yaml run --rm torrentd hash-password
 #      and paste the hash into an [auth] section of deploy/torrentd.toml.
 #   5. podman compose -f deploy/compose.yaml up -d
