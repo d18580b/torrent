@@ -339,26 +339,23 @@ fn build_delete_orphans(
     let claimed = store.claimed_identities()?;
     let mut held_back = 0usize;
     let mut aliased = 0usize;
-    let orphans: Vec<String> = store
-        .orphan_files_sized(root_id, prefix)?
-        .into_iter()
-        .filter_map(|(rel, size, identity)| {
-            // `.torrentd-trash` is where deleted files go; it is never indexed,
-            // but an index from before that rule may still list it.
-            if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
-                return None;
-            }
-            if claimed.contains(&identity) {
-                aliased += 1;
-                return None;
-            }
-            if unresolved.sizes.contains(&size) {
-                held_back += 1;
-                return None;
-            }
-            Some(rel)
-        })
-        .collect();
+    let mut orphans: Vec<String> = Vec::new();
+    for (rel, size, identity) in store.orphan_files_sized(root_id, prefix)? {
+        // `.torrentd-trash` is where deleted files go; it is never indexed,
+        // but an index from before that rule may still list it.
+        if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
+            continue;
+        }
+        if claimed.contains(&identity) && is_claimed_twin(store, &root, &rel, identity)? {
+            aliased += 1;
+            continue;
+        }
+        if unresolved.sizes.contains(&size) {
+            held_back += 1;
+            continue;
+        }
+        orphans.push(rel);
+    }
     if orphans.is_empty() {
         return Ok(Err(Refused(if held_back + aliased > 0 {
             format!(
@@ -386,6 +383,47 @@ fn build_delete_orphans(
         }
     }
     Ok(Ok(steps))
+}
+
+/// Whether the orphan at `rel` under `root`, indexed as `indexed`, is a
+/// claimed file reached by another path: a hard link, or the claimed file
+/// through an aliased root.
+///
+/// An indexed identity can be older than the disk (a rescan carries a row it
+/// could not re-read forward, and a reboot renumbers devices and inodes), so
+/// a claimed file indexed as `indexed` is only a candidate. Each one is
+/// stat'd, and the orphan is a twin only if one's live identity is the
+/// orphan's live identity, as the delete step decides it: a stale row that
+/// merely collides keeps the orphan in the plan. One gone from its path is
+/// not the orphan. Where the orphan itself, or a candidate for another
+/// reason than being gone, cannot be stat'd, the two cannot be told apart
+/// and the orphan is a twin: the delete step would refuse it, and a refused
+/// step stops the plan.
+fn is_claimed_twin(
+    store: &PoolStore,
+    root: &Path,
+    rel: &str,
+    indexed: (u64, u64),
+) -> Result<bool, PoolError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let live = match root.join(rel).symlink_metadata() {
+        Ok(md) => (md.dev(), md.ino()),
+        Err(_) => return Ok(true),
+    };
+    for (claimed_root, claimed_rel) in store.claimed_files_with_identity(indexed.0, indexed.1)? {
+        match claimed_root.join(&claimed_rel).symlink_metadata() {
+            Ok(md) if (md.dev(), md.ino()) == live => return Ok(true),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 /// Where a delete plan puts the files it removes, relative to their root.

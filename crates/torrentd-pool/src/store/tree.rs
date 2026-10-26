@@ -420,10 +420,9 @@ impl PoolStore {
     /// A path is not the only way to reach a file: a hard link, or the same
     /// directory listed twice through a bind mount, is a second path to the
     /// claimed bytes that [`PoolStore::is_orphan`] reads as unclaimed. The
-    /// delete planner leaves out any orphan whose identity is in this set,
-    /// and the delete step uses it to find the claimed files
-    /// ([`PoolStore::claimed_files_with_identity`]) whose live identity it
-    /// compares with the file's.
+    /// delete planner and the delete step both use it to find the claimed
+    /// files ([`PoolStore::claimed_files_with_identity`]) whose live identity
+    /// they compare with the orphan's.
     pub fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT DISTINCT f.dev, f.ino FROM claim c
@@ -441,8 +440,8 @@ impl PoolStore {
     /// An indexed identity can be older than the disk: a rescan carries a
     /// row it could not re-read forward unchanged, and a reboot renumbers
     /// devices and inodes. A match against [`PoolStore::claimed_identities`]
-    /// is therefore only a candidate, which the delete step confirms by
-    /// stat'ing the paths this returns.
+    /// is therefore only a candidate, which the delete planner and the
+    /// delete step confirm by stat'ing the paths this returns.
     pub fn claimed_files_with_identity(
         &self,
         dev: u64,
