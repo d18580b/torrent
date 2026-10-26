@@ -588,6 +588,58 @@ mise run bench -- pool-scan --size ci            # the pool at the size CI runs;
 `mise run vpn-check <config> [-- <flags>]` runs `vpn check` (see
 [Profiles](#profiles)) from a source checkout, against a real tunnel.
 
+## Releasing
+
+[`release-plz.yml`](.github/workflows/release-plz.yml) keeps one release
+pull request open, from the branch `release-plz-next`, and refreshes it on
+every push to `master`. Merging it cuts the release. Squash, rebase and
+"Create a merge commit" all release. With a merge commit, release-plz tags
+the pull request's head, and the workflow moves the tag to the merge commit
+only when that head is one of its parents and both have the same tree. So
+merge only once `release-plz-next` is up to date with `master`: after a
+push to `master`, wait for the workflow's `release pull request` job to
+refresh it.
+
+When the `release-plz release` job fails, nothing is built or published, and
+the tag and the draft release stay behind. The job's error says which case
+it is:
+
+- **GitHub did not verify the tagged commit, or an API call failed.** Re-run
+  the failed run. It resumes the draft release, then moves and checks the tag
+  again.
+- **The tag names a commit the merge did not release** (`... neither the
+  released commit ... nor a parent of it with the same tree`). A re-run fails
+  the same way. Delete the tag and the draft:
+
+  ```bash
+  gh release delete vX.Y.Z --repo d18580b/torrent --cleanup-tag --yes
+  ```
+
+  Then release the version from a pull request of your own. Do not wait for
+  the workflow to open one. `master` already holds version X.Y.Z, so
+  `release-plz update` treats it as already bumped. It can find nothing to
+  change, delete `release-plz-next`, and open no release pull request.
+  `release-plz release` does not need one. It releases the version
+  `Cargo.toml` holds when that version's tag is missing, on the merge of any
+  pull request from a `release-plz-` branch of this repository. Use a name
+  of your own: the workflow overwrites `release-plz-next` and deletes the
+  timestamped `release-plz-<date>T<time>Z` branches. The branch must not
+  change any version, and an empty commit is enough:
+
+  ```bash
+  git switch -c release-plz-retry-vX.Y.Z origin/master
+  git commit --allow-empty -m "chore: release vX.Y.Z again"
+  git push origin release-plz-retry-vX.Y.Z
+  gh pr create --repo d18580b/torrent --base master \
+    --head release-plz-retry-vX.Y.Z --title "chore: release vX.Y.Z" \
+    --body "Releases vX.Y.Z, whose first tag was refused and deleted."
+  ```
+
+  Squash-merge it. If the workflow did open a release pull request for
+  vX.Y.Z after all, merging that one releases it the same way.
+
+A published release is immutable. Neither path changes one.
+
 ## Contributing & license
 
 Development setup, coding standards and the commit convention are in
