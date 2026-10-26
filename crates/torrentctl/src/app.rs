@@ -532,11 +532,19 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Fatal(what) => {
             if model.fatal.is_some() {
                 // A second panic: leave now, reporting a minted token the
-                // revocation under way may not have reached.
+                // revocation under way may not have reached, or a sign-in
+                // still in flight whose token nothing will revoke.
                 if model.minted {
                     model.exit_notice.get_or_insert_with(|| {
                         "torrentctl: the session token signed in here was not revoked; it \
                          stays valid on the daemon until it expires"
+                            .to_owned()
+                    });
+                } else if model.login.busy {
+                    model.exit_notice.get_or_insert_with(|| {
+                        "torrentctl: the sign-in had not answered; if the daemon mints a \
+                         session token for it, that token stays valid on the daemon until \
+                         it expires"
                             .to_owned()
                     });
                 }
@@ -1114,6 +1122,20 @@ mod tests {
         assert!(m.quit);
         let notice = m.exit_notice.expect("a notice");
         assert!(notice.contains("was not revoked"), "{notice}");
+
+        // A second panic while the sign-in is still in flight: nothing is
+        // minted yet, but whatever the daemon mints for it goes unrevoked.
+        let mut m = model();
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        m.login.busy = true;
+        update(&mut m, Msg::Fatal("a request panicked: x".into()));
+        assert!(!m.quit, "waits for the sign-in to revoke what it mints");
+        assert!(update(&mut m, Msg::Fatal("a request panicked: y".into())).is_empty());
+        assert!(m.quit);
+        assert!(!m.minted);
+        let notice = m.exit_notice.expect("a notice");
+        assert!(notice.contains("sign-in had not answered"), "{notice}");
+        assert!(!notice.contains("was not revoked"), "{notice}");
     }
 
     /// A daemon that accepts the connection and never answers: the
