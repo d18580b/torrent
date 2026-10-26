@@ -985,6 +985,13 @@ fn a_hangup_exits_as_sighup_without_aborting_and_flushes_the_log() {
         log.contains("exiting signal=\"SIGHUP\""),
         "the exit's last log line was flushed: {log:?}"
     );
+    // The default `info` filter keeps the cause of a hangup-time failure:
+    // the terminal that could not be handed back is logged at warn.
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("could not restore the terminal")),
+        "the restore failure was logged at warn: {log:?}"
+    );
 }
 
 /// Run `torrentctl` against a closed port under a pty, with `env` (one of

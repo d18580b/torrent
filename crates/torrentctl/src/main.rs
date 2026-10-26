@@ -97,11 +97,14 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     if let Some(notice) = &ended.model.exit_notice {
         runtime::notify(notice);
     }
-    // The last line logged; the guard flushes it as `main` returns.
+    // The last line logged; the guard flushes it as `main` returns. It
+    // carries the terminal's error too: where a signal ended the run, that
+    // error decides nothing below and is reported nowhere else.
     tracing::info!(
         target: "torrentctl",
         signal = ended.signal.unwrap_or("none"),
         failed = ended.result.is_err(),
+        error = ended.result.as_ref().err().map(tracing::field::display),
         "exiting"
     );
     // A signal decides the status even where the terminal failed too: a
@@ -127,7 +130,7 @@ fn hand_back(mut terminal: ratatui::DefaultTerminal) {
     match ratatui::try_restore().and_then(|()| terminal.show_cursor()) {
         Ok(()) => drop(terminal),
         Err(e) => {
-            tracing::debug!(target: "torrentctl", error = %e, "could not restore the terminal");
+            tracing::warn!(target: "torrentctl", error = %e, "could not restore the terminal");
             std::mem::forget(terminal);
         }
     }
