@@ -72,8 +72,8 @@ pub type BuildResult = Result<Vec<PlanStep>, Refused>;
 /// then [`Prepared::finish`], both against `store`.
 ///
 /// This runs the disk checks with `store` borrowed. A caller that borrows it
-/// under the pool's writer lock calls the two halves itself, finishing on a
-/// connection that does not hold the lock.
+/// under a lock calls the two halves itself, and finishes with an
+/// [`IndexReads`] that takes a lock only for each read.
 pub fn build(
     store: &PoolStore,
     spec: &PlanSpec,
@@ -88,13 +88,15 @@ pub fn build(
 /// Every check [`build`] makes of the index that decides which steps are
 /// candidates, with the disk checks still to run.
 ///
-/// [`Prepared::finish`] runs the disk checks, and the index reads they need,
-/// on whatever connection it is handed: the daemon hands it the reader, so
-/// it never holds the writer lock. Two disk checks grow with the files
-/// involved: a relocate's walk of its source directory, and a delete's stat
-/// of every orphan under its prefix to tell a claimed file's hard link from
-/// a stranger. Holding the writer lock across either would stall every scan
-/// and every other plan for as long as it takes.
+/// [`Prepared::finish`] runs the disk checks, and makes the index reads they
+/// need through whatever [`IndexReads`] it is handed: the daemon answers
+/// each read on its reader, so the disk checks hold neither the writer lock
+/// nor the reader's. Two disk checks grow with the files involved: a
+/// relocate's walk of its source directory, and a delete's stat of every
+/// orphan under its prefix to tell a claimed file's hard link from a
+/// stranger. Holding the writer lock across either would stall every scan
+/// and every other plan, and holding the reader's every request that reads
+/// the index, for as long as it takes.
 pub fn prepare(
     store: &PoolStore,
     spec: &PlanSpec,
@@ -145,16 +147,48 @@ struct Orphan {
     wanted_size: bool,
 }
 
+/// The index reads [`Prepared::finish`] makes, each one on its own.
+///
+/// `finish` interleaves these with disk checks. A [`PoolStore`] answers them
+/// directly; the daemon answers each one on its reader, taking the reader's
+/// lock for that read alone, so the disk checks between them hold no lock
+/// and stall nothing else that reads the index.
+pub trait IndexReads {
+    /// [`PoolStore::claimed_identities`].
+    fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError>;
+    /// [`PoolStore::claimed_files_with_identity`].
+    fn claimed_files_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Vec<(PathBuf, String)>, PoolError>;
+}
+
+impl IndexReads for PoolStore {
+    fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
+        PoolStore::claimed_identities(self)
+    }
+
+    fn claimed_files_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Vec<(PathBuf, String)>, PoolError> {
+        PoolStore::claimed_files_with_identity(self, dev, ino)
+    }
+}
+
 impl Prepared {
-    /// Run the disk checks [`prepare`] left, and the index reads they need,
-    /// against `store`, and return the plan's steps or the refusal.
+    /// Run the disk checks [`prepare`] left, and the index reads they need
+    /// through `index`, and return the plan's steps or the refusal.
     ///
-    /// `store` need not be the connection [`prepare`] read, and need not
-    /// hold the writer lock: the daemon passes its reader, which reads the
-    /// index as of [`prepare`] or later. What a delete plan reads here only
-    /// leaves out a claimed file's twin, which the delete step would refuse,
-    /// and that step checks every file again before it trashes it.
-    pub fn finish(self, store: &PoolStore) -> Result<BuildResult, PoolError> {
+    /// `index` need not read the connection [`prepare`] read, and need not
+    /// hold the writer lock: the daemon reads on its reader, one read at a
+    /// time, which sees the index as of [`prepare`] or later. What a delete
+    /// plan reads here only leaves out a claimed file's twin, which the
+    /// delete step would refuse, and that step checks every file again
+    /// before it trashes it.
+    pub fn finish(self, index: &impl IndexReads) -> Result<BuildResult, PoolError> {
         // The index is a snapshot and the move is of the directory itself,
         // so the index checks see only what the last scan listed. The disk
         // is asked too.
@@ -166,7 +200,7 @@ impl Prepared {
             }
         }
         if let Some(orphans) = self.orphans {
-            return finish_delete_orphans(store, orphans);
+            return finish_delete_orphans(index, orphans);
         }
         Ok(Ok(self.steps))
     }
@@ -390,14 +424,14 @@ fn build_delete_orphans(
 /// part of the planning that stats each orphan, so it runs off the writer
 /// lock.
 fn finish_delete_orphans(
-    store: &PoolStore,
+    index: &impl IndexReads,
     Orphans { root, files }: Orphans,
 ) -> Result<BuildResult, PoolError> {
     // A file unclaimed by path can still be a claimed file reached another
     // way: a hard link, or the claimed file seen through a second root that
     // aliases the first. The executor refuses those steps, and a refused step
     // stops the plan, so they are left out here rather than emitted to fail.
-    let claimed = store.claimed_identities()?;
+    let claimed = index.claimed_identities()?;
     let mut held_back = 0usize;
     let mut aliased = 0usize;
     let mut orphans: Vec<String> = Vec::new();
@@ -407,7 +441,7 @@ fn finish_delete_orphans(
         wanted_size,
     } in files
     {
-        if is_claimed_twin(store, &claimed, &root, &rel, indexed)? {
+        if is_claimed_twin(index, &claimed, &root, &rel, indexed)? {
             aliased += 1;
             continue;
         }
@@ -466,7 +500,7 @@ fn finish_delete_orphans(
 /// step stops the plan. Where the orphan itself cannot be stat'd, it is a
 /// twin when its indexed identity is a claimed one, for the same reason.
 fn is_claimed_twin(
-    store: &PoolStore,
+    index: &impl IndexReads,
     claimed: &HashSet<(u64, u64)>,
     root: &Path,
     rel: &str,
@@ -484,7 +518,7 @@ fn is_claimed_twin(
     }
     candidates.retain(|id| claimed.contains(id));
     for (dev, ino) in candidates {
-        for (claimed_root, claimed_rel) in store.claimed_files_with_identity(dev, ino)? {
+        for (claimed_root, claimed_rel) in index.claimed_files_with_identity(dev, ino)? {
             match claimed_root.join(&claimed_rel).symlink_metadata() {
                 Ok(md) if (md.dev(), md.ino()) == live => return Ok(true),
                 Ok(_) => {}
