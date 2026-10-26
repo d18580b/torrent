@@ -71,25 +71,30 @@ pub type BuildResult = Result<Vec<PlanStep>, Refused>;
 /// Compute the steps for `spec` without touching anything: [`prepare`] and
 /// then [`Prepared::finish`], both against `store`.
 ///
-/// This runs the disk walk with `store` borrowed. A caller that borrows it
-/// under the pool's writer lock calls the two halves itself, finishing once
-/// the lock is released.
+/// This runs the disk checks with `store` borrowed. A caller that borrows it
+/// under the pool's writer lock calls the two halves itself, finishing on a
+/// connection that does not hold the lock.
 pub fn build(
     store: &PoolStore,
     spec: &PlanSpec,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
 ) -> Result<BuildResult, PoolError> {
-    Ok(prepare(store, spec, root_path_of)?.and_then(Prepared::finish))
+    match prepare(store, spec, root_path_of)? {
+        Ok(prepared) => prepared.finish(store),
+        Err(refused) => Ok(Err(refused)),
+    }
 }
 
-/// Every check [`build`] makes of the index, with the steps they admit and
-/// the disk checks still to run.
+/// Every check [`build`] makes of the index that decides which steps are
+/// candidates, with the disk checks still to run.
 ///
-/// The index is read here; [`Prepared::finish`] reads only the disk, so it
-/// runs without the store. A relocate's walk of its source directory is the
-/// one disk check whose cost grows with the directory, and holding the
-/// writer lock across it would stall every scan and every other plan for as
-/// long as it takes.
+/// [`Prepared::finish`] runs the disk checks, and the index reads they need,
+/// on whatever connection it is handed: the daemon hands it the reader, so
+/// it never holds the writer lock. Two disk checks grow with the files
+/// involved: a relocate's walk of its source directory, and a delete's stat
+/// of every orphan under its prefix to tell a claimed file's hard link from
+/// a stranger. Holding the writer lock across either would stall every scan
+/// and every other plan for as long as it takes.
 pub fn prepare(
     store: &PoolStore,
     spec: &PlanSpec,
@@ -102,8 +107,11 @@ pub fn prepare(
             dest_rel,
         } => build_relocate(store, infohash, *dest_root_id, dest_rel, root_path_of)?,
         PlanSpec::DeleteOrphans { root_id, prefix } => {
-            build_delete_orphans(store, *root_id, prefix, root_path_of)?
-                .map(|steps| Prepared { steps, walk: None })
+            build_delete_orphans(store, *root_id, prefix, root_path_of)?.map(|orphans| Prepared {
+                steps: Vec::new(),
+                walk: None,
+                orphans: Some(orphans),
+            })
         }
     })
 }
@@ -115,23 +123,52 @@ pub struct Prepared {
     /// A relocate's source directory, its root-relative path, and what the
     /// index lists there as this torrent's, as of [`prepare`].
     walk: Option<(PathBuf, String, Listed)>,
+    /// A delete's candidates, as of [`prepare`]; their steps are built by
+    /// [`Prepared::finish`].
+    orphans: Option<Orphans>,
+}
+
+/// A delete plan's root and every unclaimed file under its prefix.
+#[derive(Debug)]
+struct Orphans {
+    root: PathBuf,
+    files: Vec<Orphan>,
+}
+
+/// An unclaimed file a delete plan may take: its root-relative path, its
+/// indexed `(dev, ino)`, and whether its size is one a torrent in the
+/// library has not found.
+#[derive(Debug)]
+struct Orphan {
+    rel: String,
+    indexed: (u64, u64),
+    wanted_size: bool,
 }
 
 impl Prepared {
-    /// Run the disk checks [`prepare`] left, needing no store, and return
-    /// the plan's steps or the refusal.
-    pub fn finish(self) -> BuildResult {
+    /// Run the disk checks [`prepare`] left, and the index reads they need,
+    /// against `store`, and return the plan's steps or the refusal.
+    ///
+    /// `store` need not be the connection [`prepare`] read, and need not
+    /// hold the writer lock: the daemon passes its reader, which reads the
+    /// index as of [`prepare`] or later. What a delete plan reads here only
+    /// leaves out a claimed file's twin, which the delete step would refuse,
+    /// and that step checks every file again before it trashes it.
+    pub fn finish(self, store: &PoolStore) -> Result<BuildResult, PoolError> {
         // The index is a snapshot and the move is of the directory itself,
         // so the index checks see only what the last scan listed. The disk
         // is asked too.
         if let Some((src_dir, src_base, listed)) = &self.walk {
             if let Some(entry) = unlisted_entry(src_dir, src_base, listed) {
-                return Err(Refused(format!(
+                return Ok(Err(Refused(format!(
                     "{src_base} holds {entry}; moving the directory would take it too"
-                )));
+                ))));
             }
         }
-        Ok(self.steps)
+        if let Some(orphans) = self.orphans {
+            return finish_delete_orphans(store, orphans);
+        }
+        Ok(Ok(self.steps))
     }
 }
 
@@ -254,6 +291,7 @@ fn build_relocate(
             dst: Some(dest_dir.to_string_lossy().into_owned()),
         }],
         walk: Some((src_dir, src_base, listed)),
+        orphans: None,
     }))
 }
 
@@ -293,7 +331,7 @@ fn build_delete_orphans(
     root_id: i64,
     prefix: &str,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
-) -> Result<BuildResult, PoolError> {
+) -> Result<Result<Orphans, Refused>, PoolError> {
     let Some(root) = root_path_of(root_id) else {
         return Ok(Err(Refused("root is not configured".into())));
     };
@@ -332,6 +370,29 @@ fn build_delete_orphans(
         return Ok(Err(Refused(copies_refusal(ih, area))));
     }
 
+    let mut files = Vec::new();
+    for (rel, size, indexed) in store.orphan_files_sized(root_id, prefix)? {
+        // `.torrentd-trash` is where deleted files go; it is never indexed,
+        // but an index from before that rule may still list it.
+        if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
+            continue;
+        }
+        files.push(Orphan {
+            rel,
+            indexed,
+            wanted_size: unresolved.sizes.contains(&size),
+        });
+    }
+    Ok(Ok(Orphans { root, files }))
+}
+
+/// The delete plan's steps for `orphans`, from [`Prepared::finish`]: the
+/// part of the planning that stats each orphan, so it runs off the writer
+/// lock.
+fn finish_delete_orphans(
+    store: &PoolStore,
+    Orphans { root, files }: Orphans,
+) -> Result<BuildResult, PoolError> {
     // A file unclaimed by path can still be a claimed file reached another
     // way: a hard link, or the claimed file seen through a second root that
     // aliases the first. The executor refuses those steps, and a refused step
@@ -340,17 +401,17 @@ fn build_delete_orphans(
     let mut held_back = 0usize;
     let mut aliased = 0usize;
     let mut orphans: Vec<String> = Vec::new();
-    for (rel, size, identity) in store.orphan_files_sized(root_id, prefix)? {
-        // `.torrentd-trash` is where deleted files go; it is never indexed,
-        // but an index from before that rule may still list it.
-        if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
-            continue;
-        }
-        if is_claimed_twin(store, &claimed, &root, &rel, identity)? {
+    for Orphan {
+        rel,
+        indexed,
+        wanted_size,
+    } in files
+    {
+        if is_claimed_twin(store, &claimed, &root, &rel, indexed)? {
             aliased += 1;
             continue;
         }
-        if unresolved.sizes.contains(&size) {
+        if wanted_size {
             held_back += 1;
             continue;
         }

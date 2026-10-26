@@ -966,15 +966,20 @@ impl PoolService {
     /// drift, an occupied destination) as `Ok(Err(_))`.
     ///
     /// The index checks run on the writer, which a scan holds; the disk
-    /// checks, a relocate's walk of its whole source directory among them,
-    /// once it is released.
+    /// checks, a relocate's walk of its whole source directory and a
+    /// delete's stat of every orphan under its prefix among them, on the
+    /// reader once it is released.
     pub fn create_plan(
         &self,
         spec: &torrentd_pool::PlanSpec,
     ) -> anyhow::Result<Result<i64, torrentd_pool::plan::Refused>> {
-        let built = self
+        let prepared = match self
             .with_store(|st| torrentd_pool::plan::prepare(st, spec, |id| self.root_path_of(id)))?
-            .and_then(torrentd_pool::plan::Prepared::finish);
+        {
+            Ok(prepared) => prepared,
+            Err(refused) => return Ok(Err(refused)),
+        };
+        let built = self.with_reader(|st| prepared.finish(st))?;
         let steps = match built {
             Ok(steps) => steps,
             Err(refused) => return Ok(Err(refused)),

@@ -1204,3 +1204,48 @@ fn a_hard_link_with_a_stale_row_is_left_out_of_a_delete_plan() {
     .unwrap_err();
     assert!(aliased.contains("1 are the same file"), "{aliased}");
 }
+
+/// An orphan gone from disk since the scan cannot be stat'd, so the planner
+/// cannot tell whether it is a claimed file's twin from its live identity.
+/// It is one exactly when its indexed identity is a claimed one: a gone hard
+/// link to a claimed file is left out, and a gone unrelated file is planned.
+#[test]
+fn an_orphan_gone_since_the_scan_is_a_twin_only_by_a_claimed_indexed_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "junk/x.bin", 9);
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let claimed = store.claimed_identities().unwrap();
+    let link = store.file(root_id, "links/a.bin").unwrap().unwrap();
+    let junk = store.file(root_id, "junk/x.bin").unwrap().unwrap();
+    assert!(claimed.contains(&(link.dev, link.ino)));
+    assert!(!claimed.contains(&(junk.dev, junk.ino)));
+
+    std::fs::remove_file(root.join("links/a.bin")).unwrap();
+    std::fs::remove_file(root.join("junk/x.bin")).unwrap();
+
+    let delete = |prefix: &str| {
+        build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+    };
+    let steps = delete("").unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"), "{steps:?}");
+    let aliased = delete("links").unwrap_err();
+    assert!(aliased.contains("1 are the same file"), "{aliased}");
+}
