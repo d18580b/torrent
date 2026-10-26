@@ -4,6 +4,7 @@
 //! the sessions. The decision logic itself lives in `torrentd_pool::adopt` and
 //! is pure; this module is the part that touches engines and the filesystem.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -965,16 +966,23 @@ impl PoolService {
     /// nothing is applied. Returns its id, or the planner's refusal (overlap,
     /// drift, an occupied destination) as `Ok(Err(_))`.
     ///
-    /// The index checks run on the writer, which a scan holds; the disk
-    /// checks, a relocate's walk of its whole source directory among them,
-    /// once it is released.
+    /// The index checks run on the writer, which a scan holds. The disk
+    /// checks, a relocate's walk of its whole source directory and a
+    /// delete's stat of every orphan under its prefix among them, run once
+    /// it is released, holding no lock: the index reads among them each
+    /// take the reader for that read alone ([`ReaderIndex`]), so every other
+    /// request that reads the index goes on meanwhile.
     pub fn create_plan(
         &self,
         spec: &torrentd_pool::PlanSpec,
     ) -> anyhow::Result<Result<i64, torrentd_pool::plan::Refused>> {
-        let built = self
+        let prepared = match self
             .with_store(|st| torrentd_pool::plan::prepare(st, spec, |id| self.root_path_of(id)))?
-            .and_then(torrentd_pool::plan::Prepared::finish);
+        {
+            Ok(prepared) => prepared,
+            Err(refused) => return Ok(Err(refused)),
+        };
+        let built = prepared.finish(&ReaderIndex(self))?;
         let steps = match built {
             Ok(steps) => steps,
             Err(refused) => return Ok(Err(refused)),
@@ -1115,6 +1123,26 @@ impl PoolService {
             summary.drifted = m.drifted;
             Ok(summary)
         })
+    }
+}
+
+/// The index reads a plan's disk checks make, each on the reader with its
+/// lock held for that read alone ([`PoolService::with_reader`]), so the
+/// stats and walks between them hold no lock.
+struct ReaderIndex<'a>(&'a PoolService);
+
+impl torrentd_pool::plan::IndexReads for ReaderIndex<'_> {
+    fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, torrentd_pool::PoolError> {
+        self.0.with_reader(|st| st.claimed_identities())
+    }
+
+    fn claimed_files_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Vec<(PathBuf, String)>, torrentd_pool::PoolError> {
+        self.0
+            .with_reader(|st| st.claimed_files_with_identity(dev, ino))
     }
 }
 
