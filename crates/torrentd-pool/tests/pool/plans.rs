@@ -1056,3 +1056,90 @@ fn a_delete_plan_never_takes_a_file_from_the_trash() {
     assert_eq!(steps.len(), 1, "{steps:?}");
     assert!(steps[0].src.ends_with("junk/x.bin"));
 }
+
+/// Re-record the indexed `(dev, ino)` of each of `rels` under `root_id` as
+/// `identity` gives it, size and mtime as they were: what a reboot or
+/// remount that renumbers devices and inodes leaves in a row a rescan
+/// carried forward. `rels` is every indexed file of the root, since the
+/// staged set replaces the root's.
+fn restamp(
+    store: &mut PoolStore,
+    root_id: i64,
+    rels: &[&str],
+    identity: impl Fn(&str, (u64, u64)) -> (u64, u64),
+) {
+    let files: Vec<_> = rels
+        .iter()
+        .map(|rel| {
+            let f = store.file(root_id, rel).unwrap().unwrap();
+            let (dev, ino) = identity(rel, (f.dev, f.ino));
+            torrentd_pool::model::PoolFile { dev, ino, ..f }
+        })
+        .collect();
+    store.begin_staging().unwrap();
+    store.stage_files(&files).unwrap();
+    store.swap_staged_root(root_id, 0).unwrap();
+}
+
+/// A claimed file's indexed identity can be stale: an unrelated orphan that
+/// only collides with it stays in a delete plan, while a real hard link
+/// whose rows were renumbered alike is still left out as the claimed file.
+#[test]
+fn a_stale_claimed_identity_leaves_no_valid_orphan_out_of_a_delete_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "junk/x.bin", 9);
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+    let rels = ["T/a.bin", "junk/x.bin", "links/a.bin"];
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let delete = |store: &PoolStore, prefix: &str| {
+        build_plan(
+            store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+    };
+
+    // The claimed file's row keeps numbers from before a reboot, which the
+    // unrelated orphan now has.
+    let junk = store.file(root_id, "junk/x.bin").unwrap().unwrap();
+    let junk_id = (junk.dev, junk.ino);
+    restamp(&mut store, root_id, &rels, |rel, id| {
+        if rel == "T/a.bin" {
+            junk_id
+        } else {
+            id
+        }
+    });
+    assert!(!store.is_orphan(root_id, "T/a.bin").unwrap());
+    assert!(store.claimed_identities().unwrap().contains(&junk_id));
+    let steps = delete(&store, "junk").unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"));
+
+    // The claimed file and its hard link, renumbered alike: neither row
+    // holds the live numbers, but the two are still one file.
+    let link = store.file(root_id, "links/a.bin").unwrap().unwrap();
+    let stale = (link.dev.wrapping_add(1), link.ino.wrapping_add(1_000_000));
+    restamp(&mut store, root_id, &rels, |rel, id| {
+        if rel == "junk/x.bin" {
+            id
+        } else {
+            stale
+        }
+    });
+    assert!(store.claimed_identities().unwrap().contains(&stale));
+    let aliased = delete(&store, "links").unwrap_err();
+    assert!(aliased.contains("1 are the same file"), "{aliased}");
+}
