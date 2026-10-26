@@ -6,6 +6,7 @@
 //! the library (`lib.rs`).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::WrapErr as _;
@@ -36,6 +37,10 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 }
+
+/// How long the exit waits for the runtime's blocking threads once the loop
+/// has finished, before leaving them behind.
+const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn main() -> color_eyre::Result<std::process::ExitCode> {
     color_eyre::install()?;
@@ -69,8 +74,24 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     // However the loop ends, a session token minted from the password is
     // revoked before `run` returns (or resumes a panic in the loop),
     // including after a background task's panic.
-    let ended = runtime.block_on(runtime::run(model, &mut terminal));
-    ratatui::restore();
+    let looped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(runtime::run(model, &mut terminal))
+    }));
+    // A panic in the loop has handed the terminal back already, through the
+    // hook `ratatui::init` installed, and printed its report.
+    if looped.is_ok() {
+        ratatui::restore();
+    }
+    // Dropping the runtime would wait for every blocking thread, and one
+    // stuck resolving the daemon's host name (reqwest resolves on blocking
+    // threads) returns only when getaddrinfo gives up: over a dead tunnel,
+    // not soon. The loop has finished, so nothing on the runtime is needed
+    // any more: wait briefly, then leave such a thread behind. `run` has put
+    // the SIGINT and SIGTERM dispositions back, so Ctrl-C ends even this
+    // wait, and left SIGHUP ignored, so a hangup's repeat does not cut off
+    // the notice and the log flush below.
+    runtime.shutdown_timeout(EXIT_TIMEOUT);
+    let ended = looped.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     // Printed only now: on the alternate screen it would vanish with it.
     if let Some(notice) = &ended.model.exit_notice {
         eprintln!("{notice}");
