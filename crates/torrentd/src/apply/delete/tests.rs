@@ -451,6 +451,82 @@ fn deleting_an_orphan_that_collides_with_a_stale_claimed_identity_goes_through()
     assert!(link.exists() && claimed_file.exists());
 }
 
+/// Issue #684: when the claimed file a stale row names is gone from its
+/// path, stat'ing it fails with NotFound (the file removed) or
+/// NotADirectory (a parent replaced by a file). Either way it is not the
+/// orphan whose identity the row collides with, so the orphan's delete goes
+/// through rather than being refused as unverifiable.
+#[test]
+fn deleting_an_orphan_that_collides_with_a_stale_row_of_a_removed_claimed_file_goes_through() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("pool");
+    let second = dir.path().join("other");
+    let claimed_file = write(&first, "T/a.bin", 16);
+    let gone = write(&second, "misc/gone.bin", 8);
+    let shadowed = write(&second, "misc/shadowed.bin", 8);
+
+    let mut cfg = Config::minimal_for_tests(dir.path(), true);
+    cfg.pool.as_mut().unwrap().roots.push(second.clone());
+    let pool = PoolService::open(&cfg).unwrap().unwrap();
+    pool.scan().unwrap();
+    let first_id = pool.roots().iter().find(|(_, r)| r == &first).unwrap().0;
+    claimed(&pool, dir.path(), &"ab".repeat(20), "T/a.bin");
+
+    let current = pool
+        .with_store(|st| st.file(first_id, "T/a.bin"))
+        .unwrap()
+        .expect("indexed");
+    // Point the claimed row at `orphan`'s identity, as a stale row carried
+    // across a reboot would.
+    let collide_with = |orphan: &std::path::Path| {
+        let md = std::fs::metadata(orphan).unwrap();
+        let id = (md.dev(), md.ino());
+        pool.with_store_mut(|st| {
+            st.begin_staging()?;
+            st.stage_files(&[torrentd_pool::PoolFile {
+                dev: id.0,
+                ino: id.1,
+                ..current.clone()
+            }])?;
+            st.swap_staged_root(first_id, 0)
+        })
+        .unwrap();
+        assert!(
+            pool.with_store(|s| s.claimed_identities())
+                .unwrap()
+                .contains(&id),
+            "the stale claimed row collides with {}",
+            orphan.display()
+        );
+    };
+    let trashed = |rel: &str| {
+        second
+            .join(torrentd_pool::plan::TRASH_DIR)
+            .join("1-0")
+            .join(rel)
+            .exists()
+    };
+
+    // NotFound: the claimed file was removed from its path.
+    collide_with(&gone);
+    std::fs::remove_file(&claimed_file).unwrap();
+    delete_file(&pool, &gone, 1, "1-0", &mut DeleteGuards::default())
+        .expect("an orphan colliding with a removed claimed file is deleted");
+    assert!(!gone.exists());
+    assert!(trashed("misc/gone.bin"));
+
+    // NotADirectory: a parent of the claimed path is now a regular file.
+    collide_with(&shadowed);
+    std::fs::remove_dir(first.join("T")).unwrap();
+    std::fs::write(first.join("T"), b"not a directory").unwrap();
+    delete_file(&pool, &shadowed, 1, "1-0", &mut DeleteGuards::default())
+        .expect("an orphan colliding with a claimed path under a file is deleted");
+    assert!(!shadowed.exists());
+    assert!(trashed("misc/shadowed.bin"));
+}
+
 #[test]
 fn deleting_moves_the_file_into_the_trash_and_a_rescan_ignores_it() {
     let dir = tempfile::tempdir().unwrap();
