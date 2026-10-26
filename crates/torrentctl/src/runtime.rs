@@ -87,20 +87,24 @@ pub fn signal_exit_status(signal: &str) -> u8 {
 /// minted token still live. Installed once, before the loop starts: while
 /// it lives these signals no longer terminate the process by themselves.
 ///
-/// Dropping it puts back the dispositions the three signals had before
-/// [`Signals::install`] — the default, or the ignore `nohup` or a
-/// non-interactive shell set — because tokio never removes a handler it
-/// installed. Without that, a process whose loop has finished but whose
-/// exit is still waiting (on a blocking thread stuck in name resolution,
-/// say) would answer Ctrl-C and SIGTERM with nothing. Tokio installs its
-/// handler once per process, so a second `install` after a drop catches
-/// nothing: install it once.
+/// Dropping it puts back the dispositions SIGINT and SIGTERM had before
+/// [`Signals::install`] — the default, or the ignore a non-interactive
+/// shell set — because tokio never removes a handler it installed. Without
+/// that, a process whose loop has finished but whose exit is still waiting
+/// (on a blocking thread stuck in name resolution, say) would answer Ctrl-C
+/// and SIGTERM with nothing. SIGHUP is left ignored instead, until the
+/// process exits: a hangup's repeat (see [`REPEAT_GRACE`]) can land after
+/// the loop, and under the default it would kill the process before `main`
+/// has printed the exit notice and flushed the log. The exit after the loop
+/// is bounded, so ignoring it costs nothing. Tokio installs its handler once
+/// per process, so a second `install` after a drop catches nothing: install
+/// it once.
 pub struct Signals {
     hangup: Signal,
     interrupt: Signal,
     terminate: Signal,
-    /// Each signal with the disposition it had before tokio's handler.
-    before: [(libc::c_int, libc::sigaction); 3],
+    /// Each signal with the disposition dropping this gives it.
+    after: [(libc::c_int, libc::sigaction); 3],
 }
 
 impl Signals {
@@ -116,9 +120,13 @@ impl Signals {
                 _ => Err(std::io::Error::last_os_error()),
             }
         };
+        // SAFETY: `sigaction` is plain data, for which all zeroes is a valid
+        // value: no flags, an empty mask.
+        let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignore.sa_sigaction = libc::SIG_IGN;
         // Read before tokio replaces them.
-        let before = [
-            current(libc::SIGHUP)?,
+        let after = [
+            (libc::SIGHUP, ignore),
             current(libc::SIGINT)?,
             current(libc::SIGTERM)?,
         ];
@@ -126,17 +134,18 @@ impl Signals {
             hangup: signal(SignalKind::hangup())?,
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
-            before,
+            after,
         })
     }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        for (number, old) in &self.before {
-            // SAFETY: restores an action `sigaction` itself reported for
-            // this signal; a null out-pointer discards the current one.
-            let rc = unsafe { libc::sigaction(*number, old, std::ptr::null_mut()) };
+        for (number, action) in &self.after {
+            // SAFETY: installs an ignore, or an action `sigaction` itself
+            // reported for this signal; a null out-pointer discards the
+            // current one.
+            let rc = unsafe { libc::sigaction(*number, action, std::ptr::null_mut()) };
             if rc != 0 {
                 tracing::warn!(
                     target: "torrentctl::runtime",
@@ -1339,19 +1348,26 @@ mod tests {
         })
     }
 
-    /// Dropping the handlers puts back what the signals did before, so a
-    /// process whose loop has finished dies of Ctrl-C or SIGTERM again while
-    /// its exit waits. SIGHUP starts ignored here, as under `nohup`, and is
-    /// ignored again after, not turned into the default. The only test in
-    /// this binary that installs them: tokio installs its handler once per
+    /// Dropping the handlers puts back what SIGINT and SIGTERM did before,
+    /// so a process whose loop has finished dies of Ctrl-C or SIGTERM again
+    /// while its exit waits. SIGINT starts ignored here, as a non-interactive
+    /// shell leaves it for a background job, and is ignored again after, not
+    /// turned into the default. SIGHUP starts at the default and is ignored
+    /// after, so a hangup's repeat landing during the exit does not kill the
+    /// process before the notice and the log are out. The only test in this
+    /// binary that installs them: tokio installs its handler once per
     /// process.
     #[tokio::test]
-    async fn dropping_the_signal_handlers_restores_the_dispositions_before_them() {
-        // SAFETY: setting a signal to be ignored; no handler runs.
-        let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
-        assert_ne!(previous, libc::SIG_ERR);
+    async fn dropping_the_signal_handlers_restores_interrupt_and_terminate_and_ignores_hangup() {
+        // SAFETY: setting a signal to its default or to be ignored; no
+        // handler runs.
+        let hangup = unsafe { libc::signal(libc::SIGHUP, libc::SIG_DFL) };
+        assert_ne!(hangup, libc::SIG_ERR);
+        // SAFETY: as above.
+        let interrupt = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+        assert_ne!(interrupt, libc::SIG_ERR);
         let before = handlers();
-        assert_eq!(before[0], libc::SIG_IGN);
+        assert_eq!(before[..2], [libc::SIG_DFL, libc::SIG_IGN]);
 
         let signals = Signals::install().expect("install the signal handlers");
         let installed = handlers();
@@ -1363,9 +1379,13 @@ mod tests {
             assert_ne!(*now, was, "{name} has tokio's handler");
         }
         drop(signals);
-        assert_eq!(handlers(), before);
+        assert_eq!(handlers(), [libc::SIG_IGN, before[1], before[2]]);
 
-        // SAFETY: puts back the action SIGHUP had before this test.
-        unsafe { libc::signal(libc::SIGHUP, previous) };
+        // SAFETY: puts back the actions SIGHUP and SIGINT had before this
+        // test.
+        unsafe {
+            libc::signal(libc::SIGHUP, hangup);
+            libc::signal(libc::SIGINT, interrupt);
+        }
     }
 }

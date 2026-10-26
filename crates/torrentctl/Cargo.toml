@@ -46,8 +46,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 thiserror = { workspace = true }
-# sigaction(2), to put back the signal dispositions tokio's handlers
-# replaced once the loop has finished (`runtime::Signals`); and openpty(3),
+# sigaction(2), to put back the SIGINT and SIGTERM dispositions tokio's
+# handlers replaced, and ignore SIGHUP, once the loop has finished
+# (`runtime::Signals`); and openpty(3),
 # for the e2e test that runs the binary under a pty.
 libc = { workspace = true }
 

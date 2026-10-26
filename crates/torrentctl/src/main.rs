@@ -87,7 +87,9 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     // threads) returns only when getaddrinfo gives up: over a dead tunnel,
     // not soon. The loop has finished, so nothing on the runtime is needed
     // any more: wait briefly, then leave such a thread behind. `run` has put
-    // the signal dispositions back, so Ctrl-C ends even this wait.
+    // the SIGINT and SIGTERM dispositions back, so Ctrl-C ends even this
+    // wait, and left SIGHUP ignored, so a hangup's repeat does not cut off
+    // the notice and the log flush below.
     runtime.shutdown_timeout(EXIT_TIMEOUT);
     let ended = looped.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     // Printed only now: on the alternate screen it would vanish with it.
