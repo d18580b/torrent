@@ -1143,3 +1143,64 @@ fn a_stale_claimed_identity_leaves_no_valid_orphan_out_of_a_delete_plan() {
     let aliased = delete(&store, "links").unwrap_err();
     assert!(aliased.contains("1 are the same file"), "{aliased}");
 }
+
+/// An orphan's own indexed identity can be stale while the claimed file it
+/// is a hard link to is indexed as it is now: the delete step finds the
+/// claimed file through the orphan's live identity and refuses it, so the
+/// planner leaves it out as the claimed file rather than emitting a step
+/// that stops the plan.
+#[test]
+fn a_hard_link_with_a_stale_row_is_left_out_of_a_delete_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "junk/x.bin", 9);
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+    let rels = ["T/a.bin", "junk/x.bin", "links/a.bin"];
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    // Only the hard link's row keeps numbers from before a reboot; the
+    // claimed file's row holds the live ones.
+    let link = store.file(root_id, "links/a.bin").unwrap().unwrap();
+    let live = (link.dev, link.ino);
+    let stale = (link.dev.wrapping_add(1), link.ino.wrapping_add(1_000_000));
+    restamp(&mut store, root_id, &rels, |rel, id| {
+        if rel == "links/a.bin" {
+            stale
+        } else {
+            id
+        }
+    });
+    let claimed = store.claimed_identities().unwrap();
+    assert!(claimed.contains(&live) && !claimed.contains(&stale));
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: String::new(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"), "{steps:?}");
+    let aliased = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "links".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(aliased.contains("1 are the same file"), "{aliased}");
+}
