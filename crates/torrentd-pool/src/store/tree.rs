@@ -420,7 +420,10 @@ impl PoolStore {
     /// A path is not the only way to reach a file: a hard link, or the same
     /// directory listed twice through a bind mount, is a second path to the
     /// claimed bytes that [`PoolStore::is_orphan`] reads as unclaimed. The
-    /// delete step refuses any file whose identity is in this set.
+    /// delete planner leaves out any orphan whose identity is in this set,
+    /// and the delete step uses it to find the claimed files
+    /// ([`PoolStore::claimed_files_with_identity`]) whose live identity it
+    /// compares with the file's.
     pub fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT DISTINCT f.dev, f.ino FROM claim c
@@ -430,6 +433,35 @@ impl PoolStore {
             Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
         })?;
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+
+    /// The root directory and root-relative path of every claimed file
+    /// whose indexed identity is `(dev, ino)`, under every root.
+    ///
+    /// An indexed identity can be older than the disk: a rescan carries a
+    /// row it could not re-read forward unchanged, and a reboot renumbers
+    /// devices and inodes. A match against [`PoolStore::claimed_identities`]
+    /// is therefore only a candidate, which the delete step confirms by
+    /// stat'ing the paths this returns.
+    pub fn claimed_files_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Vec<(std::path::PathBuf, String)>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT r.path, f.rel_path FROM claim c
+             JOIN file f ON f.root_id = c.root_id AND f.rel_path = c.rel_path
+             JOIN root r ON r.id = f.root_id
+             WHERE f.dev = ?1 AND f.ino = ?2
+             ORDER BY r.path, f.rel_path",
+        )?;
+        let rows = st.query_map(params![dev as i64, ino as i64], |r| {
+            Ok((
+                std::path::PathBuf::from(r.get::<_, String>(0)?),
+                r.get::<_, String>(1)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Distinct adoption states of every torrent claiming a file under
