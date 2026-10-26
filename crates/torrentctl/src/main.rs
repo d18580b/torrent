@@ -78,9 +78,10 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
         runtime.block_on(runtime::run(model, &mut terminal))
     }));
     // A panic in the loop has handed the terminal back already, through the
-    // hook `ratatui::init` installed, and printed its report.
+    // hook `ratatui::init` installed, and printed its report; the unwinding
+    // drops the terminal, which shows the cursor.
     if looped.is_ok() {
-        ratatui::restore();
+        hand_back(terminal);
     }
     // Dropping the runtime would wait for every blocking thread, and one
     // stuck resolving the daemon's host name (reqwest resolves on blocking
@@ -94,10 +95,42 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     let ended = looped.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     // Printed only now: on the alternate screen it would vanish with it.
     if let Some(notice) = &ended.model.exit_notice {
-        eprintln!("{notice}");
+        runtime::notify(notice);
     }
-    ended.result.wrap_err("the terminal failed")?;
+    // The last line logged; the guard flushes it as `main` returns.
+    tracing::info!(
+        target: "torrentctl",
+        signal = ended.signal.unwrap_or("none"),
+        failed = ended.result.is_err(),
+        "exiting"
+    );
+    // A signal decides the status even where the terminal failed too: a
+    // hangup fails the draw or the input read with EIO, often before the
+    // SIGHUP itself arrives.
+    if ended.signal.is_none() {
+        ended.result.wrap_err("the terminal failed")?;
+    }
     exit_code(ended.model.fatal.as_deref(), ended.signal)
+}
+
+/// Hand the terminal back once the loop has ended without a panic: out of
+/// raw mode, off the alternate screen, the cursor shown.
+///
+/// Not through `ratatui::restore` or `Terminal`'s drop: each reports a
+/// failure with `eprintln!`, and on a hung-up terminal the write fails with
+/// EIO, on which `eprintln!` panics; the panic hook `ratatui::init`
+/// installed restores again, panics inside the hook, and the process aborts
+/// with the log unflushed. A terminal that cannot be restored is one nobody
+/// is reading, so the failure is only logged, and the terminal is forgotten
+/// rather than dropped so that its drop does not try again.
+fn hand_back(mut terminal: ratatui::DefaultTerminal) {
+    match ratatui::try_restore().and_then(|()| terminal.show_cursor()) {
+        Ok(()) => drop(terminal),
+        Err(e) => {
+            tracing::debug!(target: "torrentctl", error = %e, "could not restore the terminal");
+            std::mem::forget(terminal);
+        }
+    }
 }
 
 /// The exit status once the terminal is the user's again. A signal that
@@ -113,7 +146,7 @@ fn exit_code(
     match (signal, fatal) {
         (Some(signal), fatal) => {
             if let Some(what) = fatal {
-                eprintln!("torrentctl stopped: {what}");
+                runtime::notify(&format!("torrentctl stopped: {what}"));
             }
             Ok(runtime::signal_exit_status(signal).into())
         }

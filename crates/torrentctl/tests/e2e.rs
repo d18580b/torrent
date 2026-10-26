@@ -797,11 +797,19 @@ fn the_exit_does_not_wait_on_a_blocking_thread_that_never_returns() {
     assert_ne!(run.lflag & libc::ICANON, 0, "canonical mode restored");
 }
 
-/// Run `torrentctl` against a closed port under a pty, with `env` (one of
-/// the test switches in `runtime`) set, until it exits or [`STEP`] passes.
-fn run_under_pty(env: &str) -> PtyRun {
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
+/// `torrentctl` running against a closed port with a pty as its controlling
+/// terminal, the pty's master side held here.
+struct Pty {
+    child: Child,
+    master: std::fs::File,
+    /// `HOME`, holding the child's config and state (its log) directories.
+    home: tempfile::TempDir,
+    /// Held until the run is over: see [`spawn_under_pty`].
+    _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Start `torrentctl` against a closed port under a pty, with `envs` set.
+fn spawn_under_pty(envs: &[(&str, &str)]) -> Pty {
     use std::os::fd::FromRawFd as _;
     use std::os::fd::OwnedFd;
     use std::os::unix::process::CommandExt as _;
@@ -810,7 +818,7 @@ fn run_under_pty(env: &str) -> PtyRun {
     // one's descriptors are close-on-exec would hold its pty open, and a
     // binary that hangs would then fail the other run too.
     static PTY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one_at_a_time = PTY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let one_at_a_time = PTY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let (master, slave) = {
         let mut master = -1;
@@ -861,7 +869,7 @@ fn run_under_pty(env: &str) -> PtyRun {
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("TERM", "xterm-256color")
         .env("RUST_BACKTRACE", "0")
-        .env(env, "1")
+        .envs(envs.iter().copied())
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
@@ -875,9 +883,123 @@ fn run_under_pty(env: &str) -> PtyRun {
             Ok(())
         });
     }
-    let mut child = command.spawn().expect("run torrentctl");
+    let child = command.spawn().expect("run torrentctl");
     // The child holds the only copies of the pty's other end now.
     drop(command);
+    Pty {
+        child,
+        master,
+        home,
+        _one_at_a_time: one_at_a_time,
+    }
+}
+
+/// The terminal hanging up — its master side closed, as a closed terminal
+/// window does — ends the client as SIGHUP: status 129, not an abort. With
+/// the pty gone, restoring it and printing to it fail with EIO, and std's
+/// `eprintln!`, which ratatui's `restore` reports through, panics on that;
+/// the panic hook then restores again and aborts. The exit's last log line
+/// reaching the file shows the log guard was dropped and flushed. Needs no
+/// daemon, so it is not ignored.
+#[test]
+fn a_hangup_exits_as_sighup_without_aborting_and_flushes_the_log() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let Pty {
+        mut child,
+        mut master,
+        home,
+        _one_at_a_time,
+    } = spawn_under_pty(&[]);
+
+    // Wait for the first draw: the loop, and the signal handlers installed
+    // before it, are up. A hangup before then is the default SIGHUP.
+    let deadline = Instant::now() + STEP;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let drawn = String::from_utf8_lossy(&output);
+        if let Some(at) = drawn.find("\x1b[?1049h") {
+            if drawn[at..].contains("connecting") {
+                break;
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("never drew within {STEP:?}: {drawn:?}");
+        }
+        let mut poll = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: poll(2) on one descriptor this test owns, for at most
+        // `millis`.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        assert!(ready >= 0, "poll: {}", std::io::Error::last_os_error());
+        if ready > 0 {
+            let n = master.read(&mut buf).expect("read the pty");
+            assert_ne!(n, 0, "the pty closed before the first draw: {drawn:?}");
+            output.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    // Hang up: this held the master's only descriptor.
+    drop(master);
+    let (done, exited) = std::sync::mpsc::channel();
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = done.send(child.wait());
+    });
+    let log_path = home.path().join("state/torrentctl/torrentctl.log");
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let status = match exited.recv_timeout(STEP) {
+        Ok(status) => status.expect("wait for torrentctl"),
+        Err(_) => {
+            // SAFETY: kill(2) on the child this test spawned and has not
+            // reaped.
+            unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap(), libc::SIGKILL) };
+            panic!(
+                "torrentctl did not exit within {STEP:?} of the hangup: {:?}",
+                log()
+            );
+        }
+    };
+    let log = log();
+    assert_eq!(
+        status.signal(),
+        None,
+        "exited, not killed by a signal (SIGABRT is 6): {status:?}: {log:?}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(129),
+        "SIGHUP's exit status: {status:?}: {log:?}"
+    );
+    assert!(
+        log.contains("exiting signal=\"SIGHUP\""),
+        "the exit's last log line was flushed: {log:?}"
+    );
+}
+
+/// Run `torrentctl` against a closed port under a pty, with `env` (one of
+/// the test switches in `runtime`) set, until it exits or [`STEP`] passes.
+fn run_under_pty(env: &str) -> PtyRun {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    // Bound, not `..`, so the home directory and the lock outlive the run.
+    let Pty {
+        mut child,
+        master,
+        home: _home,
+        _one_at_a_time,
+    } = spawn_under_pty(&[(env, "1")]);
 
     // Read on a thread until the child closes its end (Linux reports that as
     // EIO), so a binary that neither panics nor exits fails the test at a

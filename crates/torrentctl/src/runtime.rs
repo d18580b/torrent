@@ -10,7 +10,6 @@ use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use crossterm::event::Event;
-use crossterm::event::EventStream;
 use crossterm::event::KeyEventKind;
 use futures_util::FutureExt as _;
 use futures_util::Stream;
@@ -60,6 +59,14 @@ pub const FINISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// milliseconds: the one the shell resends to its jobs, and the one the
 /// kernel sends to the foreground group when the shell exits.
 pub const REPEAT_GRACE: Duration = Duration::from_secs(1);
+
+/// How long [`finish`], once its work is done, waits for a SIGHUP after the
+/// loop ended on its own — a draw or input error, or the end of the input.
+/// A terminal that hangs up fails the draw or the read with EIO in the same
+/// instant the kernel sends the SIGHUP, and either can reach the loop
+/// first; without the wait, an exit with no token to revoke would leave
+/// before the SIGHUP was seen and report a terminal failure, not a hangup.
+pub const HANGUP_GRACE: Duration = Duration::from_millis(500);
 
 /// How the loop ended: the model as it was left (its
 /// [`Model::exit_notice`] is what to tell the user once the terminal is
@@ -182,8 +189,9 @@ impl Stream for Signals {
 
 /// Run on the terminal until the user quits or the loop otherwise ends.
 pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
-    let signals = match Signals::install() {
-        Ok(signals) => signals,
+    let started = Signals::install().and_then(|signals| Ok((signals, input()?)));
+    let (signals, keys) = match started {
+        Ok(started) => started,
         Err(e) => {
             return Ended {
                 model,
@@ -199,10 +207,38 @@ pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
                 .draw(|frame| crate::ui::view(model, frame))
                 .map(drop)
         },
-        EventStream::new(),
+        keys,
         signals,
     )
     .await
+}
+
+/// Terminal events, read on a thread of their own.
+///
+/// Not crossterm's `EventStream`, which reads crossterm's event source on
+/// the task that awaits it: once the terminal hangs up, that source spins
+/// inside the read for good, because its read loop takes the end of file a
+/// hung-up tty answers (and any error but `WouldBlock`) as a reason to read
+/// again (crossterm 0.29, `event/source/unix/mio.rs`). On the loop's task
+/// that starves everything else on it: the SIGHUP is never seen, and the
+/// process spins at full CPU with its terminal gone. On a thread, the spin
+/// is confined there and ends with the process, and the loop still sees the
+/// SIGHUP, or the next draw's EIO.
+fn input() -> std::io::Result<impl Stream<Item = std::io::Result<Event>> + Unpin> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("torrentctl-input".to_owned())
+        .spawn(move || loop {
+            let event = crossterm::event::read();
+            let failed = event.is_err();
+            if tx.send(event).is_err() || failed {
+                break;
+            }
+        })?;
+    Ok(Box::pin(futures_util::stream::unfold(
+        rx,
+        |mut rx| async move { rx.recv().await.map(|event| (event, rx)) },
+    )))
 }
 
 /// [`run`], drawing with `draw`, reading terminal events from `keys` and
@@ -256,12 +292,22 @@ where
     ))
     .catch_unwind()
     .await;
-    let signal = match &looped {
+    let mut signal = match &looped {
         Ok(Ok(signal)) => *signal,
         _ => None,
     };
     if !model.quit {
-        finish(&mut model, &tx, &mut rx, &mut signals, signal).await;
+        // The terminal, not a panic, is what ended the loop.
+        let terminal_ended = matches!(looped, Ok(Ok(None) | Err(_))) && model.fatal.is_none();
+        signal = finish(
+            &mut model,
+            &tx,
+            &mut rx,
+            &mut signals,
+            signal,
+            terminal_ended,
+        )
+        .await;
     }
     match looped {
         Ok(result) => Ended {
@@ -273,7 +319,7 @@ where
             // The panic hook has handed the terminal back already, so this
             // stays on the operator's screen.
             if let Some(notice) = &model.exit_notice {
-                eprintln!("{notice}");
+                notify(notice);
             }
             std::panic::resume_unwind(panic)
         }
@@ -359,14 +405,20 @@ where
 /// `cause` (the signal that ended the loop) again within [`REPEAT_GRACE`],
 /// which is a repeat of it. Where no signal ended the loop, the first
 /// SIGHUP is taken for its cause — the hangup behind a draw or input error
-/// — and only a signal after that is a second ask.
+/// — and only a signal after that is a second ask. Where the terminal ended
+/// the loop (`terminal_ended`) and no SIGHUP has come by the time the rest
+/// is done, waits up to [`HANGUP_GRACE`] for one. Returns the cause: the
+/// signal that ended the loop, or that hangup, so that the exit status says
+/// the terminal went away whichever of the two the loop saw first.
 async fn finish<S>(
     model: &mut Model,
     tx: &mpsc::UnboundedSender<Msg>,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     signals: &mut S,
     cause: Option<&'static str>,
-) where
+    terminal_ended: bool,
+) -> Option<&'static str>
+where
     S: Stream<Item = &'static str> + Unpin,
 {
     // A quit already under way has its revocation in flight: wait for it
@@ -404,7 +456,7 @@ async fn finish<S>(
                     )
                 };
                 model.exit_notice.get_or_insert(notice);
-                return;
+                return cause;
             }
             Some(name) = signals.next() => {
                 if cause.is_none() && name == "SIGHUP" {
@@ -423,7 +475,7 @@ async fn finish<S>(
                     continue;
                 }
                 tracing::warn!(target: "torrentctl::runtime", signal = name, "signalled again: leaving without revoking");
-                return;
+                return cause;
             }
         };
         if matches!(msg, Msg::Login(crate::screens::login::Msg::Answered(Ok(_)))) {
@@ -432,6 +484,22 @@ async fn finish<S>(
         let effects = app::update(model, msg);
         spawn(tx, effects);
     }
+    if cause.is_none() && terminal_ended {
+        if let Ok(Some("SIGHUP")) = tokio::time::timeout(HANGUP_GRACE, signals.next()).await {
+            tracing::debug!(target: "torrentctl::runtime", "a hangup after the loop ended: the same exit");
+            return Some("SIGHUP");
+        }
+    }
+    cause
+}
+
+/// Write `line` and a newline to stderr, as `eprintln!` would, ignoring a
+/// failure. Once the terminal has hung up, stderr answers EIO, and
+/// `eprintln!` panics on that (std forgives only EBADF); a panic there,
+/// during the exit, aborts the process before the log is flushed.
+pub fn notify(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 /// Run each effect on its own task, sending its message to `tx`. An effect
@@ -826,6 +894,30 @@ mod tests {
         let error = ended.result.expect_err("the draw error");
         assert_eq!(error.to_string(), "cannot draw");
         assert!(revoked(&daemon), "draw: {:?}", daemon.requests());
+        assert_eq!(ended.signal, None, "no hangup within the grace");
+    }
+
+    /// A draw error with no token to revoke, and the SIGHUP behind it
+    /// landing only once the loop has ended: the hangup is still what the
+    /// exit reports, not a terminal failure.
+    #[tokio::test]
+    async fn a_hangup_landing_just_after_a_draw_error_is_the_exits_cause() {
+        let daemon = crate::testing::Recorder::start("204 No Content", "");
+        let model = Model::new(daemon.api(), crate::testing::theme());
+        let signals = futures_util::stream::once(async {
+            tokio::time::sleep(HANGUP_GRACE / 5).await;
+            "SIGHUP"
+        });
+        let ended = bounded(run_with(
+            model,
+            |_| Err(std::io::Error::other("EIO")),
+            no_input(),
+            Box::pin(signals),
+        ))
+        .await;
+        assert_eq!(ended.signal, Some("SIGHUP"));
+        assert!(ended.result.is_err(), "the draw error is kept");
+        assert!(ended.model.quit);
     }
 
     #[tokio::test]
