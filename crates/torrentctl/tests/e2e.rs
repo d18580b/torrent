@@ -681,9 +681,11 @@ async fn a_minted_token_is_revoked_on_every_exit_path() {
     let (_daemon, base, _) = start_on(dir.path(), Some(&hash), EXIT_HTTP, EXIT_LISTEN_PORT).await;
     let no_input = futures_util::stream::pending::<std::io::Result<crossterm::event::Event>>;
 
-    // A real SIGTERM to this process. Once installed, the handlers keep
-    // SIGHUP, SIGINT and SIGTERM from killing the test process for the rest
-    // of its life; `test-torrentctl` runs these tests one at a time.
+    // A real SIGTERM to this process. Until the loop has finished and drops
+    // them, the handlers keep SIGHUP, SIGINT and SIGTERM from killing the
+    // test process, and tokio installs them once per process, so nothing
+    // after this catches them again; `test-torrentctl` runs these tests one
+    // at a time.
     let signals = runtime::Signals::install().expect("install the signal handlers");
     let model = minted_model(&base).await;
     let run = tokio::spawn(runtime::run_with(model, |_| Ok(()), no_input(), signals));
@@ -768,8 +770,35 @@ fn a_panic_on_a_background_task_exits_with_the_terminal_handed_back() {
     );
 }
 
-/// Run `torrentctl` against a closed port under a pty, with `env` set to
-/// make it panic, until it exits or [`STEP`] passes.
+/// A blocking thread that never returns, as one stuck resolving the
+/// daemon's host name over a dead tunnel does, does not hold the exit: the
+/// binary leaves soon after its loop quits, with a clean status and the
+/// terminal handed back, rather than waiting on the thread until the
+/// deadline kills it. Needs no daemon, so it is not ignored.
+#[test]
+fn the_exit_does_not_wait_on_a_blocking_thread_that_never_returns() {
+    /// Startup, the loop, the half-second exit wait, and slack for a loaded
+    /// machine; far below the [`STEP`] at which a hung exit is killed.
+    const BOUND: Duration = Duration::from_secs(10);
+    let started = Instant::now();
+    let run = run_under_pty(runtime::STALL_BLOCKING);
+    let took = started.elapsed();
+    assert!(
+        run.status.success(),
+        "a quit exits cleanly: {:?}",
+        run.output
+    );
+    assert!(took < BOUND, "exited after {took:?}, not within {BOUND:?}");
+    assert!(
+        run.output.contains("\x1b[?1049l"),
+        "left the alternate screen: {:?}",
+        run.output
+    );
+    assert_ne!(run.lflag & libc::ICANON, 0, "canonical mode restored");
+}
+
+/// Run `torrentctl` against a closed port under a pty, with `env` (one of
+/// the test switches in `runtime`) set, until it exits or [`STEP`] passes.
 fn run_under_pty(env: &str) -> PtyRun {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;

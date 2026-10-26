@@ -46,6 +46,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 thiserror = { workspace = true }
+# sigaction(2), to put back the signal dispositions tokio's handlers
+# replaced once the loop has finished (`runtime::Signals`); and openpty(3),
+# for the e2e test that runs the binary under a pty.
+libc = { workspace = true }
 
 [build-dependencies]
 spargen = { workspace = true }
@@ -53,8 +57,6 @@ spargen = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 tempfile = { workspace = true }
-# openpty(3), for the e2e test that runs the binary under a pty.
-libc = { workspace = true }
 # `test-util` pauses the clock, so a test can show a request outlasting the
 # 15-second request timeout without waiting for it.
 tokio = { workspace = true, features = ["test-util"] }

@@ -43,6 +43,12 @@ pub const PANIC_AFTER_DRAW: &str = "TORRENTCTL_TEST_PANIC";
 /// terminal the panic hook already restored.
 pub const PANIC_IN_TASK: &str = "TORRENTCTL_TEST_PANIC_IN_TASK";
 
+/// Set in the environment, the loop parks a blocking thread for good right
+/// after its first draw, then quits: how `tests/e2e.rs` proves that the
+/// process still exits within its bound when a blocking thread never
+/// returns, as one stuck in a name resolution that never answers does.
+pub const STALL_BLOCKING: &str = "TORRENTCTL_TEST_STALL_BLOCKING";
+
 /// How long [`finish`] may take after an exit the user did not ask for: long
 /// enough for a revocation to answer or reach [`app::REVOKE_TIMEOUT`], short
 /// enough that a SIGTERM is not answered with a SIGKILL first.
@@ -78,21 +84,68 @@ pub fn signal_exit_status(signal: &str) -> u8 {
 
 /// SIGHUP (the terminal went away), SIGINT and SIGTERM, caught so that they
 /// end the loop through [`finish`] rather than kill the process with a
-/// minted token still live. Installed once, before the loop starts: from
-/// then on these signals no longer terminate the process by themselves.
+/// minted token still live. Installed once, before the loop starts: while
+/// it lives these signals no longer terminate the process by themselves.
+///
+/// Dropping it puts back the dispositions the three signals had before
+/// [`Signals::install`] — the default, or the ignore `nohup` or a
+/// non-interactive shell set — because tokio never removes a handler it
+/// installed. Without that, a process whose loop has finished but whose
+/// exit is still waiting (on a blocking thread stuck in name resolution,
+/// say) would answer Ctrl-C and SIGTERM with nothing. Tokio installs its
+/// handler once per process, so a second `install` after a drop catches
+/// nothing: install it once.
 pub struct Signals {
     hangup: Signal,
     interrupt: Signal,
     terminate: Signal,
+    /// Each signal with the disposition it had before tokio's handler.
+    before: [(libc::c_int, libc::sigaction); 3],
 }
 
 impl Signals {
     pub fn install() -> std::io::Result<Self> {
+        let current = |number| {
+            // SAFETY: `sigaction` is plain data, for which all zeroes is a
+            // valid value.
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a null new action only reads the current one into
+            // `old`, which outlives the call.
+            match unsafe { libc::sigaction(number, std::ptr::null(), &mut old) } {
+                0 => Ok((number, old)),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        };
+        // Read before tokio replaces them.
+        let before = [
+            current(libc::SIGHUP)?,
+            current(libc::SIGINT)?,
+            current(libc::SIGTERM)?,
+        ];
         Ok(Self {
             hangup: signal(SignalKind::hangup())?,
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
+            before,
         })
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        for (number, old) in &self.before {
+            // SAFETY: restores an action `sigaction` itself reported for
+            // this signal; a null out-pointer discards the current one.
+            let rc = unsafe { libc::sigaction(*number, old, std::ptr::null_mut()) };
+            if rc != 0 {
+                tracing::warn!(
+                    target: "torrentctl::runtime",
+                    signal = *number,
+                    error = %std::io::Error::last_os_error(),
+                    "could not restore the signal's disposition"
+                );
+            }
+        }
     }
 }
 
@@ -234,6 +287,7 @@ where
     S: Stream<Item = &'static str> + Unpin,
 {
     let mut panic_in_task = std::env::var_os(PANIC_IN_TASK).is_some();
+    let mut stall_blocking = std::env::var_os(STALL_BLOCKING).is_some();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -250,6 +304,13 @@ where
                 tx,
                 vec![Effect::new(async { panic!("{PANIC_IN_TASK} is set") })],
             );
+        }
+        if std::mem::take(&mut stall_blocking) {
+            drop(tokio::task::spawn_blocking(|| loop {
+                std::thread::park();
+            }));
+            spawn(tx, app::update(model, Msg::Quit));
+            continue;
         }
         let msg = tokio::select! {
             event = keys.next() => match event {
@@ -1263,5 +1324,48 @@ mod tests {
             waited >= paced.first_backoff && waited < 2 * paced.first_backoff,
             "retried after {waited:?}: the backoff was not reset"
         );
+    }
+
+    /// The handler each of the three signals has now.
+    fn handlers() -> [libc::sighandler_t; 3] {
+        [libc::SIGHUP, libc::SIGINT, libc::SIGTERM].map(|number| {
+            // SAFETY: `sigaction` is plain data, for which all zeroes is a
+            // valid value.
+            let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a null new action only reads the current one.
+            let rc = unsafe { libc::sigaction(number, std::ptr::null(), &mut now) };
+            assert_eq!(rc, 0, "sigaction: {}", std::io::Error::last_os_error());
+            now.sa_sigaction
+        })
+    }
+
+    /// Dropping the handlers puts back what the signals did before, so a
+    /// process whose loop has finished dies of Ctrl-C or SIGTERM again while
+    /// its exit waits. SIGHUP starts ignored here, as under `nohup`, and is
+    /// ignored again after, not turned into the default. The only test in
+    /// this binary that installs them: tokio installs its handler once per
+    /// process.
+    #[tokio::test]
+    async fn dropping_the_signal_handlers_restores_the_dispositions_before_them() {
+        // SAFETY: setting a signal to be ignored; no handler runs.
+        let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        assert_ne!(previous, libc::SIG_ERR);
+        let before = handlers();
+        assert_eq!(before[0], libc::SIG_IGN);
+
+        let signals = Signals::install().expect("install the signal handlers");
+        let installed = handlers();
+        for ((now, was), name) in installed
+            .iter()
+            .zip(before)
+            .zip(["SIGHUP", "SIGINT", "SIGTERM"])
+        {
+            assert_ne!(*now, was, "{name} has tokio's handler");
+        }
+        drop(signals);
+        assert_eq!(handlers(), before);
+
+        // SAFETY: puts back the action SIGHUP had before this test.
+        unsafe { libc::signal(libc::SIGHUP, previous) };
     }
 }
