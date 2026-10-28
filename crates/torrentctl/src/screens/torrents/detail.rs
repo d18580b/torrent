@@ -353,15 +353,9 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+/// `2026-09-27 14:03 UTC`.
 fn date(at: time::OffsetDateTime) -> String {
-    format!(
-        "{}-{:02}-{:02} {:02}:{:02} UTC",
-        at.year(),
-        u8::from(at.month()),
-        at.day(),
-        at.hour(),
-        at.minute()
-    )
+    format!("{} UTC", fmt::when(at))
 }
 
 fn overview(
