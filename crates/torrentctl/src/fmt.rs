@@ -1,12 +1,14 @@
 //! Numbers and times as an operator reads them.
 
-/// `1.5 GiB`: bytes in binary units, one decimal past KiB.
+/// `1.5 GiB`: bytes in binary units, one decimal past KiB. A value that
+/// would round up to 1024.0 of a unit reads in the next one instead.
 pub fn bytes(n: i64) -> String {
     const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let n = n.max(0) as f64;
     let mut value = n;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
+    // Compared at the one decimal shown: 1023.96 KiB would print as 1024.0.
+    while (value * 10.0).round() >= 10_240.0 && unit + 1 < UNITS.len() {
         value /= 1024.0;
         unit += 1;
     }
@@ -26,8 +28,11 @@ pub fn rate(bytes_per_sec: i64) -> String {
     }
 }
 
-/// `87.5%` from a 0..1 fraction.
+/// `87.5%` from a 0..1 fraction, or `—` for one that is not a number.
 pub fn percent(fraction: f64) -> String {
+    if fraction.is_nan() {
+        return "—".to_owned();
+    }
     format!("{:.1}%", (fraction.clamp(0.0, 1.0) * 100.0))
 }
 
@@ -99,6 +104,12 @@ mod tests {
         assert_eq!(bytes(1023), "1023 B");
         assert_eq!(bytes(1536), "1.5 KiB");
         assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        assert_eq!(bytes(1_048_575), "1.0 MiB", "not 1024.0 KiB");
+        assert_eq!(bytes(1_048_524), "1023.9 KiB");
+        assert_eq!(bytes(1024), "1.0 KiB");
+        assert_eq!(bytes(i64::MAX), "8.0 EiB");
+        assert_eq!(percent(f64::NAN), "—");
+        assert_eq!(percent(f64::INFINITY), "100.0%");
         assert_eq!(rate(0), "—");
         assert_eq!(rate(2048), "2.0 KiB/s");
         assert_eq!(percent(0.875), "87.5%");
@@ -114,6 +125,15 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// No size reads as 1024 or more of a unit that has a larger one.
+        #[test]
+        fn a_size_never_reads_as_1024_of_a_unit(n in 0i64..) {
+            let shown = bytes(n);
+            let (number, unit) = shown.split_once(' ').unwrap();
+            let number: f64 = number.parse().unwrap();
+            proptest::prop_assert!(unit == "EiB" || number < 1024.0, "{} read as {}", n, shown);
+        }
+
         /// Any finite fraction, in range or not, reads as a percentage
         /// between 0 and 100 with one decimal.
         #[test]
