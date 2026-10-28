@@ -517,6 +517,18 @@ impl Daemon {
         );
         assert!(status.success(), "the daemon exited {status}");
     }
+
+    /// SIGKILL, and reap it: the exit a `kill -9` or the OOM killer makes,
+    /// running none of the shutdown's teardown.
+    fn crash(&mut self) {
+        self.child.kill().expect("SIGKILL the daemon");
+        let status = self.child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL),
+            "the daemon exited {status}, not on SIGKILL"
+        );
+    }
 }
 
 impl Drop for Daemon {
@@ -602,6 +614,40 @@ fn tracker(peer: &Peer) -> Arc<Mutex<Vec<SocketAddr>>> {
     seen
 }
 
+/// The info-hash of the magnet [`add_magnet`] adds.
+const IH: &str = "4e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e";
+
+/// Add [`IH`] to the profile as a magnet announcing to [`tracker`] on both
+/// of its addresses: the add's `(status, body)`.
+fn add_magnet() -> (u16, String) {
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{IH}&dn=e2e\
+         &tr=http%3A%2F%2F{PEER_TUNNEL}%3A{TRACKER_PORT}%2Fannounce\
+         &tr=http%3A%2F%2F%5B{PEER_TUNNEL_V6}%5D%3A{TRACKER_PORT}%2Fannounce"
+    );
+    http(
+        "POST",
+        "/v1/torrents",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"magnet\",\"uri\":\"{magnet}\"}}}}"
+        )),
+    )
+}
+
+/// How many of the connections `seen` recorded came from `addr`.
+fn from(seen: &Mutex<Vec<SocketAddr>>, addr: &str) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|a| a.ip().to_string().trim_start_matches("::ffff:") == addr)
+        .count()
+}
+
+/// How many of the connections `seen` recorded came through the tunnel.
+fn tunnelled(seen: &Mutex<Vec<SocketAddr>>) -> usize {
+    from(seen, TUNNEL)
+}
+
 /// Prompt the daemon to send: reannounce the torrent, whose answer hands it
 /// the peers above to connect to. Refused while the profile is fenced, which
 /// is the point of a fence; the leak check holds either way.
@@ -615,6 +661,24 @@ fn table_listed() -> bool {
         l.split_whitespace()
             .eq(["table", "inet", &format!("torrentd_ks_{UID}")])
     })
+}
+
+/// Whether the daemon's WireGuard link, [`WG`], stands.
+fn tunnel_standing() -> bool {
+    Command::new("ip")
+        .args(["link", "show", "dev", WG])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// The routing rules steering the tunnel's addresses into its table, in
+/// both families, as `ip rule` lists them; empty where there are none.
+fn tunnel_rules() -> String {
+    sh(&format!(
+        "ip rule show from {TUNNEL}; ip -6 rule show from {TUNNEL_V6}"
+    ))
 }
 
 /// Prove that only the kill switch stands between this uid — the daemon's —
@@ -712,31 +776,12 @@ fn vpn_netns_e2e_no_leak() {
     assert_eq!(metric("torrentd_kill_switch_table_present"), Some(1.0));
     assert!(table_listed(), "the kill switch table is installed");
 
-    let ih = "4e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e";
-    let magnet = format!(
-        "magnet:?xt=urn:btih:{ih}&dn=e2e\
-         &tr=http%3A%2F%2F{PEER_TUNNEL}%3A{TRACKER_PORT}%2Fannounce\
-         &tr=http%3A%2F%2F%5B{PEER_TUNNEL_V6}%5D%3A{TRACKER_PORT}%2Fannounce"
-    );
-    let (code, body) = http(
-        "POST",
-        "/v1/torrents",
-        Some(&format!(
-            "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"magnet\",\"uri\":\"{magnet}\"}}}}"
-        )),
-    );
+    let ih = IH;
+    let (code, body) = add_magnet();
     assert_eq!(code, 201, "add the torrent: {body}");
 
     // The positive control: the daemon announces and reaches a peer, both
     // through the tunnel and from its address.
-    let from = |seen: &Mutex<Vec<SocketAddr>>, addr: &str| {
-        seen.lock()
-            .unwrap()
-            .iter()
-            .filter(|a| a.ip().to_string().trim_start_matches("::ffff:") == addr)
-            .count()
-    };
-    let tunnelled = |seen: &Mutex<Vec<SocketAddr>>| from(seen, TUNNEL);
     poll(
         "an announce through the tunnel",
         Duration::from_secs(30),
@@ -882,6 +927,38 @@ fn vpn_netns_e2e_no_leak() {
     );
     assert!(!table_listed(), "the kill switch table is removed on stop");
     assert_fencing_held_through_the_drain(&daemon.log);
+    assert_torn_down_in_order(&daemon.log);
+    peer.assert_no_leak(base, "across the clean stop");
+}
+
+/// The line of the first entry in `text`, the daemon's log, that holds
+/// `needle`; a panic naming `what`, with the log, where none does.
+fn log_line(text: &str, what: &str, needle: &str) -> usize {
+    text.lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no line for {what} in the daemon's log:\n{text}"))
+}
+
+/// The stop as `daemon.log` records it took the daemon off the network in
+/// the order that leaks nothing: the sessions closed before the kill switch
+/// was removed, so no session was left to send once nothing confined it.
+///
+/// The leak counter alone cannot see this order broken: a session's sockets
+/// are bound to the tunnel's address, so while the tunnel stands they still
+/// leave by it, and once it is gone they cannot send at all.
+fn assert_torn_down_in_order(log: &std::path::Path) {
+    let text = std::fs::read_to_string(log).expect("the daemon's log");
+    let closed = log_line(&text, "the sessions closing", "sessions closed");
+    let removed = log_line(
+        &text,
+        "the kill switch's removal",
+        "network kill switch removed",
+    );
+    assert!(
+        closed < removed,
+        "the kill switch was removed at line {removed}, before the sessions closed at line \
+         {closed}:\n{text}"
+    );
 }
 
 /// The stop as `daemon.log` records it: the VPN monitor and the kill-switch
@@ -893,20 +970,13 @@ fn vpn_netns_e2e_no_leak() {
 /// still seeded through the drain would go unfenced.
 fn assert_fencing_held_through_the_drain(log: &std::path::Path) {
     let text = std::fs::read_to_string(log).expect("the daemon's log");
-    let at = |what: &str, matches: &dyn Fn(&str) -> bool| -> usize {
-        text.lines()
-            .position(matches)
-            .unwrap_or_else(|| panic!("no line for {what} in the daemon's log:\n{text}"))
-    };
-    let drained = at("the alert loop's exit", &|l| {
-        l.contains("alert loop exited")
-    });
-    let closed = at("the sessions closing", &|l| l.contains("sessions closed"));
+    let drained = log_line(&text, "the alert loop's exit", "alert loop exited");
+    let closed = log_line(&text, "the sessions closing", "sessions closed");
     for (task, line) in [
         ("the VPN monitor", "vpn monitor shutting down"),
         ("the kill-switch watch", "kill switch watch stopping"),
     ] {
-        let stopped = at(&format!("{task}'s stop"), &|l| l.contains(line));
+        let stopped = log_line(&text, &format!("{task}'s stop"), line);
         assert!(
             drained < stopped && stopped < closed,
             "{task} stopped at line {stopped}, not between the drain's end (line {drained}) \
@@ -1047,4 +1117,114 @@ fn vpn_netns_e2e_natpmp_follows_the_gateway() {
 
     peer.assert_no_leak(base, "across the NAT-PMP negotiation and its renewals");
     daemon.stop();
+    assert!(!table_listed(), "the kill switch table is removed on stop");
+    assert_torn_down_in_order(&daemon.log);
+    peer.assert_no_leak(base, "across the clean stop");
+}
+
+/// `torrentd net-cleanup` on the config [`Daemon::start`] wrote in `dir`, as
+/// the packaged unit's `ExecStopPost=` runs it, asserting it succeeds.
+fn net_cleanup(dir: &std::path::Path) {
+    let out = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(dir.join("cfg.toml"))
+        .arg("net-cleanup")
+        .output()
+        .expect("run net-cleanup");
+    assert!(
+        out.status.success(),
+        "net-cleanup exited {}:\n{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// The daemon, announcing through the tunnel under the kill switch, is
+/// SIGKILLed, so none of its teardown runs:
+///
+/// 1. the kill switch, the tunnel and its routing rules all outlive it, and
+///    the kill switch still refuses this uid the physical link;
+/// 2. `torrentd net-cleanup` removes all three, as the packaged unit's
+///    `ExecStopPost=` does after such an exit;
+/// 3. the daemon restarts on the same state directory, raises the tunnel and
+///    the kill switch again, loads the torrent back from what its add
+///    persisted, and announces through the tunnel;
+/// 4. a clean stop then takes it off the network in order.
+///
+/// Nothing reaches the physical link outside the tunnel at any point: with
+/// the daemon dead, between the cleanup and the restart, while the restart
+/// brings the tunnel and the kill switch up, or across the stop.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_no_leak_across_a_crash_and_restart() {
+    if !in_own_namespace("vpn_netns_e2e_no_leak_across_a_crash_and_restart") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let peer = topology(p);
+    let base = peer.leaks();
+    let announces = tracker(&peer);
+
+    let listen = format!("listen_port = {LISTEN_PORT}");
+    let mut daemon = Daemon::start(p, &listen);
+    let (code, body) = add_magnet();
+    assert_eq!(code, 201, "add the torrent: {body}");
+    poll(
+        "an announce through the tunnel",
+        Duration::from_secs(30),
+        || (tunnelled(&announces) > 0).then_some(()),
+    );
+    peer.assert_no_leak(base, "before the crash");
+
+    // 1. Killed outright: everything it put on the network stays.
+    daemon.crash();
+    assert!(table_listed(), "a SIGKILL leaves the kill switch installed");
+    assert!(tunnel_standing(), "a SIGKILL leaves the tunnel standing");
+    assert!(
+        !tunnel_rules().is_empty(),
+        "a SIGKILL leaves the tunnel's routing rules"
+    );
+    assert_only_the_kill_switch_stops(&[HOST_V4, HOST_V6], "with the daemon killed");
+    peer.assert_no_leak(base, "with the daemon killed");
+
+    // 2. The cleanup a crash leaves to the unit's `ExecStopPost=`.
+    net_cleanup(p);
+    assert!(!table_listed(), "net-cleanup removes the kill switch table");
+    assert!(!tunnel_standing(), "net-cleanup removes the tunnel");
+    assert_eq!(
+        tunnel_rules(),
+        "",
+        "net-cleanup removes the tunnel's routing rules"
+    );
+    peer.assert_no_leak(base, "after net-cleanup");
+
+    // 3. The restart, on the same state directory. The boot loads the torrent
+    //    back from what its add persisted before the API answers, so a
+    //    reannounce, which needs a loaded torrent and not just the registry
+    //    claim that outlived the kill, is accepted at once. `before` is read
+    //    ahead of the start, so the reloaded torrent's first announce counts
+    //    however soon it lands.
+    let before = tunnelled(&announces);
+    daemon = Daemon::start(p, &listen);
+    assert!(table_listed(), "the restart installs the kill switch again");
+    let (code, body) = http("POST", &format!("/v1/torrents/{IH}/reannounce"), None);
+    assert_eq!(code, 202, "the restart loads the torrent back: {body}");
+    poll(
+        "an announce through the tunnel after the restart",
+        Duration::from_secs(30),
+        || (tunnelled(&announces) > before).then_some(()),
+    );
+    prompt(IH);
+    thread::sleep(LEAK_WINDOW);
+    assert_only_the_kill_switch_stops(&[HOST_V4, HOST_V6], "after the restart");
+    peer.assert_no_leak(base, "across the restart");
+
+    // 4. A clean stop.
+    daemon.stop();
+    assert!(!table_listed(), "the kill switch table is removed on stop");
+    assert!(!tunnel_standing(), "the tunnel is removed on stop");
+    assert_torn_down_in_order(&daemon.log);
+    peer.assert_no_leak(base, "across the clean stop after the restart");
 }
