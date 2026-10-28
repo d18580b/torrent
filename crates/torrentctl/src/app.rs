@@ -13,8 +13,6 @@
 //! connection, toasts, the help overlay and the command palette.
 
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -26,43 +24,11 @@ use crate::api::types;
 use crate::api::Api;
 use crate::api::Failure;
 use crate::screens;
+pub use crate::screens::contract::Ctx;
+pub use crate::screens::contract::Effect;
+pub use crate::screens::contract::Toast;
+pub use crate::screens::contract::ToastKind;
 use crate::theme::Theme;
-
-/// A future whose result is a message, spawned by the runtime.
-pub struct Effect(pub Pin<Box<dyn Future<Output = Msg> + Send + 'static>>);
-
-impl std::fmt::Debug for Effect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Effect")
-    }
-}
-
-impl Effect {
-    /// An effect from a future.
-    pub fn new(future: impl Future<Output = Msg> + Send + 'static) -> Self {
-        Self(Box::pin(future))
-    }
-
-    /// A message delivered on the next turn of the loop.
-    pub fn now(msg: Msg) -> Self {
-        Self::new(async move { msg })
-    }
-
-    /// A toast.
-    pub fn toast(toast: Toast) -> Self {
-        Self::now(Msg::Toast(toast))
-    }
-}
-
-/// What a screen may read while it handles a message or draws.
-pub struct Ctx<'a> {
-    pub api: &'a Api,
-    /// What this daemon is; `None` until the first `GET /v1/server`.
-    pub server: Option<&'a types::ServerInfo>,
-    pub theme: &'a Theme,
-    /// Render ticks since start, for spinners.
-    pub tick: u64,
-}
 
 /// The screens, in tab order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,49 +109,6 @@ impl Refusal {
             Some(Self::Scope)
         } else {
             Some(Self::Forbidden)
-        }
-    }
-}
-
-/// A transient notice in the corner.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Toast {
-    pub kind: ToastKind,
-    pub text: String,
-    /// A request id to quote, when the notice is a failure.
-    pub request_id: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToastKind {
-    Info,
-    Success,
-    Error,
-}
-
-impl Toast {
-    pub fn info(text: impl Into<String>) -> Self {
-        Self {
-            kind: ToastKind::Info,
-            text: text.into(),
-            request_id: None,
-        }
-    }
-
-    pub fn success(text: impl Into<String>) -> Self {
-        Self {
-            kind: ToastKind::Success,
-            text: text.into(),
-            request_id: None,
-        }
-    }
-
-    /// A failure, with what was being attempted.
-    pub fn failure(attempt: &str, failure: &Failure) -> Self {
-        Self {
-            kind: ToastKind::Error,
-            text: format!("{attempt}: {}", failure.message()),
-            request_id: failure.request_id.clone(),
         }
     }
 }
@@ -897,16 +820,5 @@ fn revoke(api: &Api, quitting: bool) -> Effect {
         }))
     })
 }
-
-/// The message a failed request produces: a sign-out for a `401`, otherwise
-/// a toast saying what was being attempted.
-pub fn failed(attempt: &str, failure: Failure) -> Msg {
-    if failure.is_unauthenticated() {
-        Msg::SignedOut(failure)
-    } else {
-        Msg::Toast(Toast::failure(attempt, &failure))
-    }
-}
-
 #[cfg(test)]
 mod tests;

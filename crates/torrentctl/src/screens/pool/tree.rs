@@ -18,7 +18,6 @@ use ratatui::Frame;
 use super::hints;
 use super::overview::Root;
 use super::scroll;
-use super::signed_out;
 use super::title;
 use super::wrap;
 use super::Motion;
@@ -26,9 +25,10 @@ use crate::api::generated::GetPoolTreeParams;
 use crate::api::generated::ListPoolOrphansParams;
 use crate::api::types;
 use crate::api::Failure;
-use crate::app::Ctx;
-use crate::app::Effect;
 use crate::fmt;
+use crate::screens::contract::sign_out_on_401;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
 use crate::theme::Tone;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
@@ -215,7 +215,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 // the selection back to where it began.
                 state.reselect = None;
             }
-            signed_out(&failure)
+            sign_out_on_401(&failure)
         }
         Msg::Move(motion) => {
             state.selected = motion.apply(state.selected, state.entries.items.len());

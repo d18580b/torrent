@@ -38,10 +38,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::Failure;
-use crate::app::failed;
-use crate::app::Ctx;
-use crate::app::Effect;
-use crate::app::Toast;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
+use crate::screens::contract::Toast;
 use crate::theme::Theme;
 use crate::theme::Tone;
 use crate::ui::widgets::caps;
@@ -423,7 +422,7 @@ fn draw_views(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
         }
         spans.push(Span::raw(" "));
     }
-    let (mode, tone) = if mutations_allowed(ctx) {
+    let (mode, tone) = if ctx.pool_mutations_allowed() {
         ("● mutations allowed", Tone::Good)
     } else {
         ("‖ read-only plans", Tone::Warn)
@@ -440,23 +439,9 @@ fn draw_views(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(right), right_area);
 }
 
-/// Whether the daemon lets plans be created and applied.
-fn mutations_allowed(ctx: &Ctx<'_>) -> bool {
-    ctx.server.is_some_and(|s| s.pool.allow_mutations)
-}
-
 /// Wrap a pool message for the root.
 fn wrap(msg: Msg) -> crate::app::Msg {
     crate::app::Msg::Pool(msg)
-}
-
-/// A failed load shows in its panel; only a `401` needs more — a sign-out.
-fn signed_out(failure: &Failure) -> Vec<Effect> {
-    if failure.is_unauthenticated() {
-        vec![Effect::now(failed("loading the pool", failure.clone()))]
-    } else {
-        Vec::new()
-    }
 }
 
 /// A move of a list's selection.

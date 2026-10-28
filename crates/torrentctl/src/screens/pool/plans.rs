@@ -27,9 +27,7 @@ use tui_input::backend::crossterm::EventHandler as _;
 use tui_input::Input;
 
 use super::hints;
-use super::mutations_allowed;
 use super::scroll;
-use super::signed_out;
 use super::strong;
 use super::title;
 use super::when;
@@ -40,11 +38,12 @@ use crate::api::generated::ListPlanStepsParams;
 use crate::api::generated::ListPlansParams;
 use crate::api::types;
 use crate::api::Failure;
-use crate::app::failed;
-use crate::app::Ctx;
-use crate::app::Effect;
-use crate::app::Toast;
-use crate::app::ToastKind;
+use crate::screens::contract::failed;
+use crate::screens::contract::sign_out_on_401;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
+use crate::screens::contract::Toast;
+use crate::screens::contract::ToastKind;
 use crate::theme::Theme;
 use crate::theme::Tone;
 use crate::ui::widgets::centered;
@@ -497,7 +496,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 // the selection back to where it began.
                 state.reselect = None;
             }
-            signed_out(&failure)
+            sign_out_on_401(&failure)
         }
         Msg::Move(motion) => match state.detail.as_mut() {
             Some(detail) => {
@@ -555,7 +554,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 Err(failure) => {
                     detail.then_apply = false;
                     detail.error = Some(failure.message());
-                    signed_out(&failure)
+                    sign_out_on_401(&failure)
                 }
             }
         }
@@ -581,11 +580,11 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 }
                 Err(failure) => {
                     detail.steps.fail(generation, failure.message());
-                    signed_out(&failure)
+                    sign_out_on_401(&failure)
                 }
             }
         }
-        Msg::AskCreate(_) if !mutations_allowed(ctx) => {
+        Msg::AskCreate(_) if !ctx.pool_mutations_allowed() => {
             vec![Effect::toast(Toast::info(MUTATIONS_OFF))]
         }
         Msg::AskCreate(prefill) => {
@@ -624,14 +623,14 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             };
             form.sending = false;
             form.refused(&failure);
-            signed_out(&failure)
+            sign_out_on_401(&failure)
         }
         Msg::AskApply | Msg::AskDiscard if state.applying.is_some() => {
             vec![Effect::toast(Toast::info(
                 "a plan is being applied — wait for it to finish",
             ))]
         }
-        Msg::AskApply if !mutations_allowed(ctx) => {
+        Msg::AskApply if !ctx.pool_mutations_allowed() => {
             vec![Effect::toast(Toast::info(MUTATIONS_OFF))]
         }
         Msg::AskApply => match state.detail.as_mut() {
@@ -714,7 +713,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
 /// Ask to apply the open plan: typed back its token if it deletes data, a
 /// yes otherwise.
 fn ask_apply(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
-    if !mutations_allowed(ctx) {
+    if !ctx.pool_mutations_allowed() {
         return vec![Effect::toast(Toast::info(MUTATIONS_OFF))];
     }
     let Some(plan) = state.detail.as_ref().and_then(|d| d.plan.as_ref()) else {
@@ -905,12 +904,12 @@ fn plan_hints<'a>(theme: &Theme, ctx: &Ctx<'_>, in_detail: bool) -> Line<'a> {
     } else {
         vec![("Enter", "open"), ("F", "filter")]
     };
-    if mutations_allowed(ctx) {
+    if ctx.pool_mutations_allowed() {
         keys.extend([("c", "create"), ("x", "apply")]);
     }
     keys.push(("X", "discard"));
     let mut line = hints(theme, &keys);
-    if !mutations_allowed(ctx) {
+    if !ctx.pool_mutations_allowed() {
         line.spans.push(Span::styled(
             " ‖ read-only: allow_mutations is off ",
             theme.fg(Tone::Warn),

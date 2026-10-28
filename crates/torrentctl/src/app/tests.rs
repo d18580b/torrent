@@ -5,6 +5,7 @@ use crossterm::event::KeyCode;
 use serde_json::json;
 
 use super::*;
+use crate::screens::contract::failed;
 use crate::testing;
 
 fn model() -> Model {

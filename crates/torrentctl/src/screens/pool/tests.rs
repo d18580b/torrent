@@ -574,7 +574,7 @@ fn drift_report(fields: serde_json::Value) -> types::DriftReport {
 }
 
 /// The toast a drift report raises.
-fn drift_toast(report: types::DriftReport) -> crate::app::Toast {
+fn drift_toast(report: types::DriftReport) -> crate::screens::contract::Toast {
     let mut state = with_overview();
     let server = testing::server(true, true);
     let effects = testing::with_ctx(Some(&server), |ctx| {
@@ -592,7 +592,7 @@ fn drift_toast(report: types::DriftReport) -> crate::app::Toast {
 
 #[test]
 fn a_drift_check_that_could_not_read_a_root_does_not_say_nothing_drifted() {
-    use crate::app::ToastKind;
+    use crate::screens::contract::ToastKind;
 
     let clean = drift_toast(drift_report(json!({})));
     assert_eq!(

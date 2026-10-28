@@ -1,4 +1,6 @@
-//! The screens. Each module follows one contract, which `app` routes to:
+//! The screens. Each module follows one contract, which `app` routes to; the
+//! types it is written in — [`contract::Effect`], [`contract::Ctx`] and
+//! [`contract::Toast`] — live in [`contract`]:
 //!
 //! - `State: Default` — what the screen shows;
 //! - `Msg` — what can happen to it;
@@ -13,6 +15,7 @@
 //! - `view(&State, &Ctx, &mut Frame, Rect)`;
 //! - `KEYS` — the screen's keys, for the footer and the help overlay.
 
+pub mod contract;
 pub mod dashboard;
 pub mod login;
 pub mod pool;

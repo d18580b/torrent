@@ -29,12 +29,13 @@ use tui_input::Input;
 use crate::api::types;
 use crate::api::Api;
 use crate::api::Failure;
-use crate::app::failed;
-use crate::app::Ctx;
-use crate::app::Effect;
-use crate::app::Toast;
-use crate::app::ToastKind;
 use crate::fmt;
+use crate::screens::contract::failed;
+use crate::screens::contract::sign_out_on_401;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
+use crate::screens::contract::Toast;
+use crate::screens::contract::ToastKind;
 use crate::theme::Tone;
 use crate::ui::widgets::caps;
 use crate::ui::widgets::panel;
@@ -438,7 +439,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                         // snap the selection back to where it began.
                         state.restore = None;
                     }
-                    unauthenticated("loading torrents", failure)
+                    sign_out_on_401(&failure)
                 }
             }
         }
@@ -454,7 +455,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                     Vec::new()
                 }
                 Err(failure) => {
-                    let effects = unauthenticated("loading profiles", failure.clone());
+                    let effects = sign_out_on_401(&failure);
                     if effects.is_empty() && state.add.is_some() {
                         vec![Effect::now(failed("loading profiles", failure))]
                     } else {
@@ -643,7 +644,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 }
                 Err(failure) => {
                     detail.error = Some(failure.message());
-                    unauthenticated("loading the torrent", failure)
+                    sign_out_on_401(&failure)
                 }
             }
         }
@@ -681,7 +682,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 Err(failure) => {
                     detail.metadata_pending = failure.is("metadata-pending");
                     detail.files.fail(generation, failure.message());
-                    unauthenticated("loading files", failure)
+                    sign_out_on_401(&failure)
                 }
             }
         }
@@ -701,7 +702,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 }
                 Err(failure) => {
                     detail.trackers_error = Some(failure.message());
-                    unauthenticated("loading trackers", failure)
+                    sign_out_on_401(&failure)
                 }
             }
         }
@@ -1003,20 +1004,6 @@ fn active_profiles(state: &State) -> Vec<String> {
         .filter(|p| p.effective_state == types::ProfileState::Online)
         .map(|p| p.profile_id.clone())
         .collect()
-}
-
-fn mutations_allowed(ctx: &Ctx<'_>) -> bool {
-    ctx.server.is_some_and(|s| s.pool.allow_mutations)
-}
-
-/// A failure that only matters here when it signs the user out; the rest
-/// are shown in the panel.
-fn unauthenticated(attempt: &str, failure: Failure) -> Vec<Effect> {
-    if failure.is_unauthenticated() {
-        vec![Effect::now(failed(attempt, failure))]
-    } else {
-        Vec::new()
-    }
 }
 
 /// Indices into the loaded list of the rows the `/` filter shows.
@@ -1362,7 +1349,7 @@ fn act(state: &mut State, action: Action, ctx: &Ctx<'_>) -> Vec<Effect> {
             ));
             Vec::new()
         }
-        Action::RemoveFiles if !mutations_allowed(ctx) => vec![Effect::toast(Toast::info(
+        Action::RemoveFiles if !ctx.pool_mutations_allowed() => vec![Effect::toast(Toast::info(
             "deleting files needs [pool] allow_mutations in the daemon's config; `d` removes and \
              keeps them",
         ))],
@@ -1463,7 +1450,7 @@ fn bulk_toast(pause: bool, outcome: &types::BulkOutcome) -> Toast {
 pub fn view(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
     let theme = ctx.theme;
     let now = state.now.unwrap_or_else(time::OffsetDateTime::now_utc);
-    let mutations = mutations_allowed(ctx);
+    let mutations = ctx.pool_mutations_allowed();
     match &state.detail {
         Some(detail) => detail::view(detail, theme, ctx.tick, now, mutations, frame, area),
         None => list(state, ctx, frame, area),
