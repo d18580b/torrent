@@ -289,9 +289,10 @@ impl Reader {
 /// for the shell once the client had quit — and drop it. Instead the thread
 /// waits in poll(2) on the terminal and a stop pipe together, and calls into
 /// crossterm only once the terminal has input (or every [`INPUT_WAIT`], for
-/// a resize), and only while [`Keys`] is alive. Crossterm reads all the
-/// input there is when it reads, so the terminal is left unread from the
-/// moment the loop ends.
+/// a resize), and only while [`Keys`] is alive, so the terminal is left
+/// unread from the moment the loop ends. Input crossterm has left on the
+/// terminal (more than one 1024-byte read of it, at once) is waited out
+/// rather than polled for in a spin: see [`read_events`].
 fn input() -> std::io::Result<(Keys, Reader)> {
     use std::io::IsTerminal as _;
 
@@ -329,10 +330,19 @@ fn read_events(
 ) {
     use std::os::fd::AsRawFd as _;
     let millis = libc::c_int::try_from(INPUT_WAIT.as_millis()).expect("a short wait");
+    // Whether the terminal was readable last time and crossterm had no
+    // event for it. Crossterm reads at most 1024 bytes on each readiness
+    // event its edge-triggered poll reports, so the rest of a longer burst
+    // (a paste) stays on the terminal, unseen by crossterm until more input
+    // arrives, while poll(2), level-triggered, keeps reporting it readable
+    // at once. Until crossterm has an event again, the terminal is left out
+    // of the wait (poll(2) skips a negative descriptor), and crossterm is
+    // asked every [`INPUT_WAIT`] instead, as for a resize.
+    let mut stalled = false;
     loop {
         let mut fds = [
             libc::pollfd {
-                fd: tty,
+                fd: if stalled { -1 } else { tty },
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -353,13 +363,15 @@ fn read_events(
                 return;
             }
         }
-        // Checked before every call into crossterm, which reads all the
-        // input there is: the loop has ended, and what is typed now is not
-        // the client's.
+        let readable = rc > 0 && fds[0].revents & libc::POLLIN != 0;
+        let mut had_event = false;
+        // Checked before every call into crossterm, which reads input
+        // whenever it has been told of some: the loop has ended, and what is
+        // typed now is not the client's.
         while !tx.is_closed() {
             match crossterm::event::poll(Duration::ZERO) {
                 Ok(false) => break,
-                Ok(true) => {}
+                Ok(true) => had_event = true,
                 Err(e) => {
                     let _ = tx.send(Err(e));
                     return;
@@ -373,6 +385,11 @@ fn read_events(
         }
         if tx.is_closed() {
             return;
+        }
+        if had_event {
+            stalled = false;
+        } else if readable {
+            stalled = true;
         }
     }
 }

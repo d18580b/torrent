@@ -978,6 +978,56 @@ fn a_key_typed_at_the_terminal_reaches_the_loop() {
     assert!(status.success(), "Ctrl-C quits cleanly: {status:?}");
 }
 
+/// The CPU time `pid` has used so far, user and system together.
+fn cpu_time(pid: u32) -> Duration {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc/PID/stat");
+    // The command name, in parentheses, may hold spaces: count from after it.
+    let fields: Vec<&str> = stat[stat.rfind(')').expect("a comm field") + 2..]
+        .split(' ')
+        .collect();
+    // utime and stime are fields 14 and 15, the 12th and 13th after comm.
+    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    // SAFETY: sysconf(3) reads a constant.
+    let per_second = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap();
+    Duration::from_millis(ticks * 1000 / per_second)
+}
+
+/// More input than crossterm reads at once (1024 bytes), arriving together
+/// as a paste does, leaves the input thread idle rather than spinning: the
+/// rest stays readable on the terminal, which crossterm's edge-triggered
+/// poll does not report again until more arrives. A key typed after it
+/// still reaches the loop.
+#[test]
+fn a_paste_longer_than_one_read_does_not_spin_the_input_thread() {
+    const IDLE: Duration = Duration::from_secs(1);
+    let Pty {
+        mut child,
+        mut master,
+        home: _home,
+        _one_at_a_time,
+    } = spawn_under_pty(&[]);
+    read_until(&mut child, &mut master, "connecting");
+    // Whatever the client draws from here is read and dropped, so that its
+    // writes to the terminal never block. It ends as the child exits.
+    let mut drawn = master.try_clone().expect("clone the pty");
+    std::thread::spawn(move || std::io::copy(&mut drawn, &mut std::io::sink()));
+    // Keys the unreachable screen ignores.
+    master.write_all(&[b'x'; 2000]).expect("paste to the pty");
+    // Measured once the keys crossterm did read have been handled: a spin
+    // goes on for as long as the rest is left on the terminal.
+    std::thread::sleep(IDLE);
+    let before = cpu_time(child.id());
+    std::thread::sleep(IDLE);
+    let used = cpu_time(child.id()) - before;
+    master.write_all(b"\x03").expect("type to the pty");
+    let status = wait_within_step(child);
+    assert!(
+        used < IDLE / 4,
+        "the client used {used:?} of CPU in {IDLE:?} after a paste"
+    );
+    assert!(status.success(), "Ctrl-C quits cleanly: {status:?}");
+}
+
 /// What is typed once the client has quit stays in the terminal for the
 /// shell that reads it next, rather than being read and dropped by the
 /// client's input thread on its way out. The quit here is followed by the
