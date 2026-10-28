@@ -17,7 +17,6 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use ratatui::Frame;
 
-use super::strong;
 use super::wrap;
 use crate::api::types;
 use crate::api::Failure;
@@ -32,6 +31,7 @@ use crate::ui::widgets::centered;
 use crate::ui::widgets::key_hints;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::spinner;
+use crate::ui::widgets::strong;
 
 /// What to adopt.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -76,6 +76,19 @@ pub fn short_hash(hex: &str) -> &str {
     hex.char_indices().nth(12).map_or(hex, |(at, _)| &hex[..at])
 }
 
+/// `2026-09-27 14:03`: a timestamp in UTC, to the minute.
+pub fn when(at: time::OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        at.year(),
+        at.month() as u8,
+        at.day(),
+        at.hour(),
+        at.minute()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

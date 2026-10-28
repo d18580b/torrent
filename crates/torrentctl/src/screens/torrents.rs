@@ -44,12 +44,10 @@ use crate::ui::widgets::spinner;
 use crate::ui::widgets::state_span;
 use crate::ui::widgets::Confirm;
 use crate::ui::widgets::Confirmed;
+use crate::ui::widgets::Motion;
 use crate::ui::widgets::PageRequest;
 use crate::ui::widgets::Paged;
 use crate::ui::widgets::Received;
-
-/// Rows `PgUp`/`PgDn` move.
-const PAGE_STEP: usize = 10;
 
 /// The phases `F` cycles through, after "all".
 const PHASES: [types::Phase; 10] = [
@@ -135,17 +133,6 @@ impl Action {
     }
 }
 
-/// A cursor movement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Move {
-    Up,
-    Down,
-    PageUp,
-    PageDown,
-    Top,
-    Bottom,
-}
-
 /// A change to the selected file's priority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Priority {
@@ -168,7 +155,7 @@ pub enum Msg {
         result: Result<types::TorrentPage, Failure>,
     },
     Profiles(Result<Vec<types::Profile>, Failure>),
-    Move(Move),
+    Move(Motion),
     /// Open the selected torrent.
     Open,
     /// Back from the detail view to the list.
@@ -300,15 +287,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     if state.filter_input.is_some() {
         return Some(Msg::FilterKey(key));
     }
-    let movement = match key.code {
-        KeyCode::Char('j') | KeyCode::Down => Some(Move::Down),
-        KeyCode::Char('k') | KeyCode::Up => Some(Move::Up),
-        KeyCode::Char('g') | KeyCode::Home => Some(Move::Top),
-        KeyCode::Char('G') | KeyCode::End => Some(Move::Bottom),
-        KeyCode::PageUp => Some(Move::PageUp),
-        KeyCode::PageDown => Some(Move::PageDown),
-        _ => None,
-    };
+    let movement = Motion::from_key(key);
     let action = match key.code {
         KeyCode::Char('p') => Some(Action::Pause),
         KeyCode::Char('r') => Some(Action::Resume),
@@ -468,7 +447,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             Some(detail) => move_in_detail(detail, movement, ctx),
             None => {
                 let len = visible(state).len();
-                state.selected = step(state.selected, len, movement);
+                state.selected = movement.apply(state.selected, len);
                 if state.list.loading {
                     // A reload is in flight: keep what the operator chose.
                     state.restore = selected_summary(state).map(|s| s.infohash.clone());
@@ -1043,18 +1022,6 @@ fn reselect(state: &mut State, hash: Option<String>) {
     state.selected = state.selected.min(rows.len().saturating_sub(1));
 }
 
-fn step(at: usize, len: usize, movement: Move) -> usize {
-    let last = len.saturating_sub(1);
-    match movement {
-        Move::Up => at.saturating_sub(1),
-        Move::Down => (at + 1).min(last),
-        Move::PageUp => at.saturating_sub(PAGE_STEP),
-        Move::PageDown => (at + PAGE_STEP).min(last),
-        Move::Top => 0,
-        Move::Bottom => last,
-    }
-}
-
 /// Change the server-side filters and start over.
 fn set_server_filter(
     state: &mut State,
@@ -1281,20 +1248,20 @@ fn load_trackers(detail: &mut detail::Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
     })]
 }
 
-fn move_in_detail(detail: &mut detail::Detail, movement: Move, ctx: &Ctx<'_>) -> Vec<Effect> {
+fn move_in_detail(detail: &mut detail::Detail, movement: Motion, ctx: &Ctx<'_>) -> Vec<Effect> {
     match detail.tab {
         detail::Tab::Overview => Vec::new(),
         detail::Tab::Files => {
-            detail.files_selected = step(detail.files_selected, detail.files.items.len(), movement);
+            detail.files_selected = movement.apply(detail.files_selected, detail.files.items.len());
             more_files(detail, ctx)
         }
         detail::Tab::Trackers => {
             let len = detail.trackers.as_ref().map_or(0, Vec::len);
-            detail.trackers_selected = step(detail.trackers_selected, len, movement);
+            detail.trackers_selected = movement.apply(detail.trackers_selected, len);
             Vec::new()
         }
         detail::Tab::Actions => {
-            detail.action_selected = step(detail.action_selected, detail::ENTRIES.len(), movement);
+            detail.action_selected = movement.apply(detail.action_selected, detail::ENTRIES.len());
             Vec::new()
         }
     }
@@ -1924,9 +1891,9 @@ mod tests {
             let msg = page_msg(&state, false, Ok(wide_page(1000, 500, Some("k1500"))));
             update(&mut state, msg, ctx);
             assert_eq!(state.list.items.len(), 1500);
-            update(&mut state, Msg::Move(Move::Top), ctx);
+            update(&mut state, Msg::Move(Motion::Top), ctx);
             for _ in 0..140 {
-                update(&mut state, Msg::Move(Move::PageDown), ctx);
+                update(&mut state, Msg::Move(Motion::PageDown), ctx);
             }
             assert_eq!(state.selected, 1400);
             let chosen = format!("{:040x}", 1400);
@@ -1950,7 +1917,7 @@ mod tests {
             );
 
             // A key while it re-pages moves among the rows still shown.
-            update(&mut state, Msg::Move(Move::Down), ctx);
+            update(&mut state, Msg::Move(Motion::Down), ctx);
             assert_eq!(state.selected, 1401);
             let chosen_now = format!("{:040x}", 1401);
             assert_ne!(chosen, chosen_now);
@@ -2031,7 +1998,7 @@ mod tests {
 
             // The operator scrolls on, to the end: the next page is fetched
             // and settles without jumping back.
-            update(&mut state, Msg::Move(Move::Bottom), ctx);
+            update(&mut state, Msg::Move(Motion::Bottom), ctx);
             assert!(state.list.loading, "near the end: the next page");
             let msg = page_msg(&state, false, Ok(page(31..41, None)));
             update(&mut state, msg, ctx);
@@ -2049,7 +2016,7 @@ mod tests {
         let mut state = loaded(1..8, None);
         testing::with_ctx(None, |ctx| {
             state.profiles_loading = true;
-            update(&mut state, Msg::Move(Move::Down), ctx);
+            update(&mut state, Msg::Move(Motion::Down), ctx);
             refresh(&mut state, ctx);
             assert_eq!(state.restore.as_deref(), Some(hash(2).as_str()));
             let msg = page_msg(&state, true, Err(failure(500, "internal", "engine gone")));
@@ -2059,7 +2026,7 @@ mod tests {
                 "the failed refresh will not settle"
             );
 
-            update(&mut state, Msg::Move(Move::Bottom), ctx);
+            update(&mut state, Msg::Move(Motion::Bottom), ctx);
             refresh(&mut state, ctx);
             assert_eq!(state.restore.as_deref(), Some(hash(7).as_str()));
             let msg = page_msg(&state, true, Ok(page(1..8, None)));
@@ -2088,8 +2055,8 @@ mod tests {
     fn the_selection_follows_its_torrent_across_a_refresh() {
         let mut state = loaded(1..8, None);
         testing::with_ctx(None, |ctx| {
-            update(&mut state, Msg::Move(Move::Down), ctx);
-            update(&mut state, Msg::Move(Move::Down), ctx);
+            update(&mut state, Msg::Move(Motion::Down), ctx);
+            update(&mut state, Msg::Move(Motion::Down), ctx);
             assert_eq!(selected_summary(&state).unwrap().infohash, hash(3));
             refresh(&mut state, ctx);
             // Two torrents ahead of it went away and one arrived.
@@ -2124,7 +2091,7 @@ mod tests {
     fn a_vanished_torrent_leaves_the_selection_in_range() {
         let mut state = loaded(1..8, None);
         testing::with_ctx(None, |ctx| {
-            update(&mut state, Msg::Move(Move::Bottom), ctx);
+            update(&mut state, Msg::Move(Motion::Bottom), ctx);
             assert_eq!(state.selected, 6);
             refresh(&mut state, ctx);
             let msg = page_msg(&state, true, Ok(page(1..4, None)));
@@ -2142,7 +2109,7 @@ mod tests {
         keys(state, ctx, "acct_b");
         update(state, Msg::FilterKey(testing::key(KeyCode::Enter)), ctx);
         assert_eq!(visible(state).len(), 11);
-        update(state, Msg::Move(Move::Bottom), ctx);
+        update(state, Msg::Move(Motion::Bottom), ctx);
         assert_eq!(selected_summary(state).unwrap().infohash, hash(33));
         assert!(state.list.loading, "near the end: the next page");
         let msg = page_msg(state, false, Ok(page(34..34, None)));
@@ -2193,11 +2160,11 @@ mod tests {
     fn moving_is_bounded() {
         let mut state = loaded(1..8, None);
         testing::with_ctx(None, |ctx| {
-            update(&mut state, Msg::Move(Move::Up), ctx);
+            update(&mut state, Msg::Move(Motion::Up), ctx);
             assert_eq!(state.selected, 0);
-            update(&mut state, Msg::Move(Move::PageDown), ctx);
+            update(&mut state, Msg::Move(Motion::PageDown), ctx);
             assert_eq!(state.selected, 6);
-            update(&mut state, Msg::Move(Move::Top), ctx);
+            update(&mut state, Msg::Move(Motion::Top), ctx);
             assert_eq!(state.selected, 0);
         });
     }
@@ -2253,8 +2220,8 @@ mod tests {
     fn the_slash_filter_narrows_what_is_loaded_and_keeps_the_selection() {
         let mut state = loaded(1..8, None);
         testing::with_ctx(None, |ctx| {
-            update(&mut state, Msg::Move(Move::Down), ctx);
-            update(&mut state, Msg::Move(Move::Down), ctx);
+            update(&mut state, Msg::Move(Motion::Down), ctx);
+            update(&mut state, Msg::Move(Motion::Down), ctx);
             let msg = on_key(&state, testing::key(KeyCode::Char('/'))).unwrap();
             update(&mut state, msg, ctx);
             assert!(capturing(&state), "q and digits are typed into the field");
@@ -2703,7 +2670,7 @@ mod tests {
                 "put back"
             );
 
-            update(&mut state, Msg::Move(Move::Down), ctx);
+            update(&mut state, Msg::Move(Motion::Down), ctx);
             assert!(
                 update(&mut state, Msg::Priority(Priority::Up), ctx).is_empty(),
                 "7 is the top"
@@ -2790,7 +2757,7 @@ mod tests {
             let msg = on_key(&state, testing::key(KeyCode::Enter)).unwrap();
             assert_eq!(update(&mut state, msg, ctx).len(), 1, "pause");
             for _ in 0..4 {
-                update(&mut state, Msg::Move(Move::Down), ctx);
+                update(&mut state, Msg::Move(Motion::Down), ctx);
             }
             update(&mut state, Msg::RunEntry, ctx);
             assert!(
@@ -3122,16 +3089,19 @@ mod tests {
         let state = loaded(1..8, None);
         assert!(matches!(
             k(&state, KeyCode::Char('j')),
-            Some(Msg::Move(Move::Down))
+            Some(Msg::Move(Motion::Down))
         ));
-        assert!(matches!(k(&state, KeyCode::Up), Some(Msg::Move(Move::Up))));
+        assert!(matches!(
+            k(&state, KeyCode::Up),
+            Some(Msg::Move(Motion::Up))
+        ));
         assert!(matches!(
             k(&state, KeyCode::Char('G')),
-            Some(Msg::Move(Move::Bottom))
+            Some(Msg::Move(Motion::Bottom))
         ));
         assert!(matches!(
             k(&state, KeyCode::PageDown),
-            Some(Msg::Move(Move::PageDown))
+            Some(Msg::Move(Motion::PageDown))
         ));
         assert!(matches!(k(&state, KeyCode::Enter), Some(Msg::Open)));
         assert!(matches!(

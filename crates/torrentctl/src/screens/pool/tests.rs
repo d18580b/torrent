@@ -945,21 +945,6 @@ fn a_failed_tree_refresh_does_not_snap_a_later_page_back() {
     );
 }
 
-#[test]
-fn a_list_that_shrank_scrolls_back_to_fill_its_window() {
-    let offset = std::cell::Cell::new(50);
-    assert_eq!(
-        scroll(&offset, 9, 20, 10),
-        0,
-        "ten rows fit a twenty-row window from the top"
-    );
-    assert_eq!(offset.get(), 0);
-    let offset = std::cell::Cell::new(50);
-    assert_eq!(scroll(&offset, 39, 20, 40), 20, "the last twenty rows");
-    let offset = std::cell::Cell::new(5);
-    assert_eq!(scroll(&offset, 10, 20, 100), 5, "steady, not re-centred");
-}
-
 // The library.
 
 #[test]

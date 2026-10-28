@@ -1,5 +1,7 @@
 //! Building blocks every screen draws with.
 
+use std::cell::Cell;
+
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use ratatui::layout::Constraint;
@@ -371,6 +373,134 @@ impl Confirm {
     }
 }
 
+/// A move of a list's selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    Up,
+    Down,
+    Top,
+    Bottom,
+    PageUp,
+    PageDown,
+}
+
+impl Motion {
+    /// Rows a page key moves.
+    const PAGE_ROWS: usize = 10;
+
+    /// The move a key asks for: `j`/`k` and the arrows a row, `g`/`G` and
+    /// Home/End the ends, PageUp/PageDown a page.
+    pub fn from_key(key: KeyEvent) -> Option<Motion> {
+        Some(match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Motion::Down,
+            KeyCode::Char('k') | KeyCode::Up => Motion::Up,
+            KeyCode::Char('g') | KeyCode::Home => Motion::Top,
+            KeyCode::Char('G') | KeyCode::End => Motion::Bottom,
+            KeyCode::PageUp => Motion::PageUp,
+            KeyCode::PageDown => Motion::PageDown,
+            _ => return None,
+        })
+    }
+
+    /// The selection after this move, from `at` in a list of `len`.
+    pub fn apply(self, at: usize, len: usize) -> usize {
+        let last = len.saturating_sub(1);
+        match self {
+            Motion::Up => at.saturating_sub(1),
+            Motion::Down => (at + 1).min(last),
+            Motion::Top => 0,
+            Motion::Bottom => last,
+            Motion::PageUp => at.saturating_sub(Self::PAGE_ROWS),
+            Motion::PageDown => (at + Self::PAGE_ROWS).min(last),
+        }
+    }
+}
+
+/// The first row to draw, of `len`, so `selected` stays in view in a window
+/// of `rows`, moving the window only as far as it must: scrolling is steady
+/// rather than re-centred. A list that shrank pulls the window back so it
+/// stays full rather than showing its last row alone at the top.
+pub fn scroll(offset: &Cell<usize>, selected: usize, rows: usize, len: usize) -> usize {
+    let mut at = offset.get().min(len.saturating_sub(rows));
+    if selected < at {
+        at = selected;
+    } else if rows > 0 && selected >= at + rows {
+        at = selected + 1 - rows;
+    }
+    offset.set(at);
+    at
+}
+
+/// A panel title: the name, then a spinner while loading, then the last
+/// failure.
+pub fn title<'a>(
+    theme: &Theme,
+    name: String,
+    loading: bool,
+    error: Option<&str>,
+    tick: u64,
+) -> Line<'a> {
+    let mut spans = vec![Span::raw(format!(" {name} "))];
+    if loading {
+        spans.push(Span::styled(
+            format!("{} ", spinner(tick)),
+            theme.fg(Tone::Accent),
+        ));
+    }
+    if let Some(error) = error {
+        spans.push(Span::styled(format!("✖ {error} "), theme.fg(Tone::Bad)));
+    }
+    Line::from(spans)
+}
+
+/// A bar of `width` cells split between `parts` in proportion to `total`,
+/// each part drawn in its own character so it reads without colour.
+pub fn share_bar<'a>(
+    theme: &Theme,
+    parts: &[(i64, char, Tone)],
+    total: i64,
+    width: u16,
+) -> Line<'a> {
+    let width = width as i64;
+    let total = total.max(1);
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (value, symbol, tone) in parts {
+        let mut cells = (value.max(&0) * width / total).min(width - used);
+        // Anything present shows, however small its share.
+        if cells == 0 && *value > 0 && used < width {
+            cells = 1;
+        }
+        if cells > 0 {
+            spans.push(Span::styled(
+                symbol.to_string().repeat(cells as usize),
+                theme.fg(*tone),
+            ));
+            used += cells;
+        }
+    }
+    if used < width {
+        spans.push(Span::styled(
+            "·".repeat((width - used) as usize),
+            theme.fg(Tone::Muted),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// A row of key hints for a panel's bottom border.
+pub fn hints<'a>(theme: &Theme, keys: &[(&'a str, &'a str)]) -> Line<'a> {
+    let mut line = key_hints(theme, keys);
+    line.spans.insert(0, Span::raw(" "));
+    line.spans.push(Span::raw(" "));
+    line
+}
+
+/// `n` in bold, for counts inside sentences.
+pub fn strong<'a>(theme: &Theme, text: String, tone: Tone) -> Span<'a> {
+    Span::styled(text, theme.fg(tone).bold())
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
@@ -544,5 +674,20 @@ mod tests {
         p.reset();
         assert!(p.items.is_empty() && p.next_cursor.is_none());
         assert_eq!(p.reload().limit, caps::PAGE);
+    }
+
+    #[test]
+    fn a_list_that_shrank_scrolls_back_to_fill_its_window() {
+        let offset = Cell::new(50);
+        assert_eq!(
+            scroll(&offset, 9, 20, 10),
+            0,
+            "ten rows fit a twenty-row window from the top"
+        );
+        assert_eq!(offset.get(), 0);
+        let offset = Cell::new(50);
+        assert_eq!(scroll(&offset, 39, 20, 40), 20, "the last twenty rows");
+        let offset = Cell::new(5);
+        assert_eq!(scroll(&offset, 10, 20, 100), 5, "steady, not re-centred");
     }
 }

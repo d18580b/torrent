@@ -17,13 +17,7 @@ use ratatui::widgets::Table;
 use ratatui::widgets::TableState;
 use ratatui::Frame;
 
-use super::hints;
-use super::scroll;
-use super::share_bar;
-use super::strong;
-use super::title;
 use super::wrap;
-use super::Motion;
 use crate::api::types;
 use crate::api::Failure;
 use crate::fmt;
@@ -34,12 +28,18 @@ use crate::screens::contract::Effect;
 use crate::screens::contract::Toast;
 use crate::theme::Theme;
 use crate::theme::Tone;
+use crate::ui::widgets::hints;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
+use crate::ui::widgets::scroll;
+use crate::ui::widgets::share_bar;
 use crate::ui::widgets::spinner;
 use crate::ui::widgets::state_span;
+use crate::ui::widgets::strong;
+use crate::ui::widgets::title;
 use crate::ui::widgets::Confirm;
 use crate::ui::widgets::Confirmed;
+use crate::ui::widgets::Motion;
 
 /// A managed root, as the tree browses it.
 #[derive(Clone, Debug, PartialEq, Eq)]
