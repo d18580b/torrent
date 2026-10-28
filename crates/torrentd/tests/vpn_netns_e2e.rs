@@ -1148,7 +1148,8 @@ fn net_cleanup(dir: &std::path::Path) {
 /// 2. `torrentd net-cleanup` removes all three, as the packaged unit's
 ///    `ExecStopPost=` does after such an exit;
 /// 3. the daemon restarts on the same state directory, raises the tunnel and
-///    the kill switch again, and announces through it;
+///    the kill switch again, loads the torrent back from what its add
+///    persisted, and announces through the tunnel;
 /// 4. a clean stop then takes it off the network in order.
 ///
 /// Nothing reaches the physical link outside the tunnel at any point: with
@@ -1199,24 +1200,17 @@ fn vpn_netns_e2e_no_leak_across_a_crash_and_restart() {
     );
     peer.assert_no_leak(base, "after net-cleanup");
 
-    // 3. The restart, on the same state directory. A magnet killed before its
-    //    metadata arrived has no resume or `.torrent` file to come back from,
-    //    only its claim in the assignment registry, which a `DELETE` clears;
-    //    added again, it announces.
+    // 3. The restart, on the same state directory. The boot loads the torrent
+    //    back from what its add persisted before the API answers, so a
+    //    reannounce, which needs a loaded torrent and not just the registry
+    //    claim that outlived the kill, is accepted at once. `before` is read
+    //    ahead of the start, so the reloaded torrent's first announce counts
+    //    however soon it lands.
+    let before = tunnelled(&announces);
     daemon = Daemon::start(p, &listen);
     assert!(table_listed(), "the restart installs the kill switch again");
-    let (code, body) = http("DELETE", &format!("/v1/torrents/{IH}"), None);
-    assert!(
-        code == 204 || code == 404,
-        "clear the torrent's claim after the restart: {code} {body}"
-    );
-    poll(
-        "the torrent to be added again",
-        Duration::from_secs(10),
-        || (add_magnet().0 == 201).then_some(()),
-    );
-    let before = tunnelled(&announces);
-    prompt(IH);
+    let (code, body) = http("POST", &format!("/v1/torrents/{IH}/reannounce"), None);
+    assert_eq!(code, 202, "the restart loads the torrent back: {body}");
     poll(
         "an announce through the tunnel after the restart",
         Duration::from_secs(30),
