@@ -12,7 +12,7 @@ use std::pin::Pin;
 use crate::api::types;
 use crate::api::Api;
 use crate::api::Failure;
-pub use crate::app::Msg;
+use crate::app::Msg;
 use crate::theme::Theme;
 
 /// A future whose result is a message, spawned by the runtime.
