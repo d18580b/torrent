@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use generated::ExposeSecret as _;
+
 /// The client spargen generates from `docs/api/openapi.json` at build time.
 #[allow(
     clippy::all,
@@ -17,6 +19,11 @@ pub mod generated {
 
 pub use generated::types;
 pub use generated::Client;
+
+/// A plan's status, as `GET /v1/pool/plans` filters by it. spargen names
+/// this inline enum by a hash of its shape, which would change if the API
+/// document's enum did; the name is confined to this alias.
+pub type PlanStatus = types::Status4ee43c98;
 
 // `AsProblem` for every generated error enum; see build.rs.
 include!(concat!(env!("OUT_DIR"), "/problems.rs"));
@@ -89,17 +96,21 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// The daemon's `X-Request-Id` on a response, when it sent a readable one.
+pub fn request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
 impl<E: AsProblem> From<generated::Error<E>> for Failure {
     fn from(e: generated::Error<E>) -> Self {
         use generated::Error;
         match e {
             Error::Api(response) => {
                 let status = response.status().as_u16();
-                let request_id = response
-                    .headers()
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
+                let request_id = request_id(response.headers());
                 let problem = response.into_inner().problem_json().unwrap_or_default();
                 from_problem(status, &problem, request_id)
             }
@@ -108,10 +119,7 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
                 headers,
                 body,
             } => {
-                let request_id = headers
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
+                let request_id = request_id(&headers);
                 let problem = serde_json::from_slice(&body).unwrap_or_default();
                 from_problem(status.as_u16(), &problem, request_id)
             }
@@ -275,6 +283,33 @@ impl Api {
         let mut api = Self::new(&self.base_url, Some(token))?;
         api.epoch = self.epoch + 1;
         Ok(api)
+    }
+
+    /// A `POST` to the path `segments` names under the daemon's URL, built
+    /// by hand through the generated client's own HTTP client, base URL and
+    /// credential, for a request the generated client cannot send. Fails
+    /// only when the URL cannot take a path.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a Failure is built once per failed request and moved straight to the UI"
+    )]
+    pub fn post(&self, segments: &[&str]) -> Result<reqwest::RequestBuilder, Failure> {
+        let core = self.client.core();
+        let mut url = core.base_url().clone();
+        url.path_segments_mut()
+            .map_err(|()| {
+                Failure::local(
+                    "Invalid daemon URL",
+                    Some(format!("{} cannot take a path", core.base_url())),
+                )
+            })?
+            .pop_if_empty()
+            .extend(segments);
+        let mut request = core.http().post(url);
+        if let Some(generated::Credential::Bearer(token)) = core.credential("bearer") {
+            request = request.bearer_auth(token.expose_secret());
+        }
+        Ok(request)
     }
 }
 

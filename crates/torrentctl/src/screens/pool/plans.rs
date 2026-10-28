@@ -32,6 +32,7 @@ use crate::api::generated::ListPlanStepsParams;
 use crate::api::generated::ListPlansParams;
 use crate::api::types;
 use crate::api::Failure;
+use crate::api::PlanStatus;
 use crate::fmt::when;
 use crate::screens::contract::failed;
 use crate::screens::contract::sign_out_on_401;
@@ -59,18 +60,18 @@ use crate::ui::widgets::Paged;
 use crate::ui::widgets::Received;
 
 /// The filters `F` cycles through, after "all".
-const FILTERS: [types::Status4ee43c98; 5] = [
-    types::Status4ee43c98::Draft,
-    types::Status4ee43c98::Applying,
-    types::Status4ee43c98::Applied,
-    types::Status4ee43c98::Failed,
-    types::Status4ee43c98::Cancelled,
+const FILTERS: [PlanStatus; 5] = [
+    PlanStatus::Draft,
+    PlanStatus::Applying,
+    PlanStatus::Applied,
+    PlanStatus::Failed,
+    PlanStatus::Cancelled,
 ];
 
 #[derive(Debug, Default)]
 pub struct State {
     /// Only plans with this status; `None` for all.
-    pub filter: Option<types::Status4ee43c98>,
+    pub filter: Option<PlanStatus>,
     pub list: Paged<types::PlanSummary>,
     pub selected: usize,
     pub offset: Cell<usize>,
@@ -343,7 +344,7 @@ fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     }
 }
 
-fn fetch(ctx: &Ctx<'_>, filter: Option<types::Status4ee43c98>, request: PageRequest) -> Effect {
+fn fetch(ctx: &Ctx<'_>, filter: Option<PlanStatus>, request: PageRequest) -> Effect {
     let api = ctx.api.clone();
     let PageRequest {
         cursor,

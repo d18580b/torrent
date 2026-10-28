@@ -1521,7 +1521,7 @@ fn plans_open_and_close_and_a_stale_page_is_dropped() {
     assert_eq!(press(&mut state, KeyCode::Char('F'), true), 1);
     assert!(matches!(
         state.plans.filter,
-        Some(types::Status4ee43c98::Draft)
+        Some(crate::api::PlanStatus::Draft)
     ));
     send(
         &mut state,
