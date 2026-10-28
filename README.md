@@ -97,6 +97,9 @@ cosign verify-blob "$f" --bundle "$f.sigstore.json" \
 # It is an unmodified asset of the immutable release, and matches SHA256SUMS.
 gh release verify-asset "v$v" "$f" --repo d18580b/torrent
 sha256sum --check --ignore-missing SHA256SUMS
+
+# The tag is a lightweight tag on the merge commit GitHub signed: prints true.
+gh api "repos/d18580b/torrent/commits/v$v" --jq .commit.verification.verified
 ```
 
 The image, by the same two routes:
@@ -146,7 +149,7 @@ them, and reports per path:
 | `matched` | Every file resolved on disk; not yet loaded. |
 | `partial` | Only some files present. Adoption is refused — seeding it would advertise pieces the daemon cannot serve. |
 | `missing` | No payload found under any root. |
-| `drifted` | A claimed file's size, mtime, inode or device changed since the last scan. Stays so across rescans until a verification clears it. |
+| `drifted` | A claimed file's size or mtime changed since the last scan. Stays so across rescans until a verification clears it. |
 | `overlap` | Two torrents claim some of the same files, but not the same set. Blocks adoption and any mutation touching those bytes. |
 | `shared` | Another torrent claims exactly the same files — a cross-seed. Adoptable, each into its own profile; never moved or deleted for one of them. |
 
@@ -180,7 +183,9 @@ The step-by-step migration is [`docs/import.md`](docs/import.md).
 
 Adoption is tiered too: if the previous client's `.fastresume` says the
 torrent was complete and every file still matches the index, it is added in
-seed mode and seeds immediately; otherwise libtorrent hashes it first.
+seed mode and seeds immediately; otherwise libtorrent hashes it first. A
+torrent the previous client added with its hash check skipped (libtorrent's
+`seed_mode`) never counts as complete, and is hashed.
 Verifications are admitted a bounded number at a time so a bulk adopt cannot
 starve what is already seeding.
 
@@ -307,7 +312,15 @@ the current directory. `TORRENTCTL_TOKEN` and a token file are trimmed, and a
 token from any source that is not visible ASCII (a space, a control or a
 non-ASCII character) is refused at startup. With no token, it
 asks for the operator password and holds the session token it gets in memory,
-revoking it on quit.
+revoking it however the client exits: a quit, the terminal closing
+(`SIGHUP`), `SIGINT` or `SIGTERM`, an error reading the terminal or drawing
+to it, the end of its input, or a panic. A sign-in still in flight is waited
+for and its token revoked too. Outside a quit, the revocation is given five
+seconds and a second signal skips it (the same signal again within a second,
+such as the second `SIGHUP` a closing terminal sends, does not); a token that
+could not be revoked is reported once the terminal is restored, and stays
+valid until it expires. An exit a signal caused reports 128 plus the signal's
+number, as a shell does for a process the signal killed.
 
 **Config file.** `$XDG_CONFIG_HOME/torrentctl/config.toml`, or the file
 `--config` names, which must then exist. It takes `url` and `token_file`, and
@@ -574,6 +587,58 @@ mise run bench -- pool-scan --size ci            # the pool at the size CI runs;
 
 `mise run vpn-check <config> [-- <flags>]` runs `vpn check` (see
 [Profiles](#profiles)) from a source checkout, against a real tunnel.
+
+## Releasing
+
+[`release-plz.yml`](.github/workflows/release-plz.yml) keeps one release
+pull request open, from the branch `release-plz-next`, and refreshes it on
+every push to `master`. Merging it cuts the release. Squash, rebase and
+"Create a merge commit" all release. With a merge commit, release-plz tags
+the pull request's head, and the workflow moves the tag to the merge commit
+only when that head is one of its parents and both have the same tree. So
+merge only once `release-plz-next` is up to date with `master`: after a
+push to `master`, wait for the workflow's `release pull request` job to
+refresh it.
+
+When the `release-plz release` job fails, nothing is built or published, and
+the tag and the draft release stay behind. The job's error says which case
+it is:
+
+- **GitHub did not verify the tagged commit, or an API call failed.** Re-run
+  the failed run. It resumes the draft release, then moves and checks the tag
+  again.
+- **The tag names a commit the merge did not release** (`... neither the
+  released commit ... nor a parent of it with the same tree`). A re-run fails
+  the same way. Delete the tag and the draft:
+
+  ```bash
+  gh release delete vX.Y.Z --repo d18580b/torrent --cleanup-tag --yes
+  ```
+
+  Then release the version from a pull request of your own. Do not wait for
+  the workflow to open one. `master` already holds version X.Y.Z, so
+  `release-plz update` treats it as already bumped. It can find nothing to
+  change, delete `release-plz-next`, and open no release pull request.
+  `release-plz release` does not need one. It releases the version
+  `Cargo.toml` holds when that version's tag is missing, on the merge of any
+  pull request from a `release-plz-` branch of this repository. Use a name
+  of your own: the workflow overwrites `release-plz-next` and deletes the
+  timestamped `release-plz-<date>T<time>Z` branches. The branch must not
+  change any version, and an empty commit is enough:
+
+  ```bash
+  git switch -c release-plz-retry-vX.Y.Z origin/master
+  git commit --allow-empty -m "chore: release vX.Y.Z again"
+  git push origin release-plz-retry-vX.Y.Z
+  gh pr create --repo d18580b/torrent --base master \
+    --head release-plz-retry-vX.Y.Z --title "chore: release vX.Y.Z" \
+    --body "Releases vX.Y.Z, whose first tag was refused and deleted."
+  ```
+
+  Squash-merge it. If the workflow did open a release pull request for
+  vX.Y.Z after all, merging that one releases it the same way.
+
+A published release is immutable. Neither path changes one.
 
 ## Contributing & license
 

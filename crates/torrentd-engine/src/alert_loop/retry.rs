@@ -134,6 +134,24 @@ pub(super) fn execute_due_retries(
             defer_retry(state, clock, &handle.infohash);
             continue;
         }
+        // `st` was read once, before the checks above, and `retries_due`
+        // popped the deadline before that. Whatever disarmed the retry since
+        // (the daemon's check-queue worker takes it before it pauses a
+        // torrent whose verification failed, so that no retry resumes it)
+        // meant this one to do nothing. Ask the live state again, as late as
+        // possible, and give back the slot just taken.
+        if !retry_armed(state, &handle.infohash) {
+            debug!(
+                target: "torrentd_engine::alert_loop",
+                profile_id = %st.profile_id,
+                infohash = %handle.infohash,
+                "disk-error retry dropped: disarmed after it came due",
+            );
+            if let Some(c) = check_slots {
+                c.release(&handle.infohash);
+            }
+            continue;
+        }
         if !st.has_error {
             recheck_unpaused_disk_error(engine.as_ref(), state, clock, handle, &st.profile_id);
             continue;
@@ -184,6 +202,35 @@ pub(super) fn execute_due_retries(
                 }
                 defer_retry(state, clock, &handle.infohash);
             }
+            // The re-check above and this resume are not atomic either. A
+            // retry disarmed between the two was disarmed by something about
+            // to pause the torrent, or that already has: the worker takes the
+            // retry, then pauses. Backing off reads the retry and writes it in
+            // one update, so either it sees the retry still armed, and the
+            // worker's take and pause both come after this resume, or it sees
+            // it gone and pauses again whichever came first. The resume was
+            // undone and the retry stays disarmed, so it is neither an attempt
+            // nor rescheduled.
+            Ok(()) if !back_off_if_armed(state, clock, &handle.infohash) => {
+                match engine.pause_torrent(handle) {
+                    Ok(()) => warn!(
+                        target: "torrentd_engine::alert_loop",
+                        profile_id = %st.profile_id,
+                        infohash = %handle.infohash,
+                        "disk-error retry: retry was disarmed while the torrent was being resumed; paused it again",
+                    ),
+                    Err(e) => error!(
+                        target: "torrentd_engine::alert_loop",
+                        profile_id = %st.profile_id,
+                        infohash = %handle.infohash,
+                        error.cause = %e,
+                        "disk-error retry: could not pause again a torrent whose retry was disarmed while it was being resumed",
+                    ),
+                }
+                if let Some(c) = check_slots {
+                    c.release(&handle.infohash);
+                }
+            }
             Ok(()) => {
                 info!(
                     target: "torrentd_engine::alert_loop",
@@ -191,10 +238,6 @@ pub(super) fn execute_due_retries(
                     infohash = %handle.infohash,
                     "disk-error retry: resumed torrent to clear its libtorrent error",
                 );
-                state.update(&handle.infohash, |s| {
-                    let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
-                    s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
-                });
                 metrics.inc_counter(
                     "disk_error_retry_attempts_total",
                     &[("profile_id", st.profile_id.as_str())],
@@ -213,11 +256,10 @@ pub(super) fn execute_due_retries(
                     &[("profile_id", st.profile_id.as_str())],
                 );
                 // A failed resume is still an attempt: back off and schedule
-                // the next one, or the popped deadline was the last.
-                state.update(&handle.infohash, |s| {
-                    let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
-                    s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
-                });
+                // the next one, or the popped deadline was the last. Unless
+                // the retry was disarmed meanwhile: re-arming it would undo
+                // that.
+                back_off_if_armed(state, clock, &handle.infohash);
             }
         }
     }
@@ -267,9 +309,36 @@ fn recheck_unpaused_disk_error(
         if outcome.is_ok() {
             s.phase = TorrentPhase::Checking;
         }
-        let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
-        s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
+        // A retry disarmed while the re-check was starting stays disarmed.
+        if let Some(r) = s.retry.as_ref() {
+            s.retry = Some(crate::state::RetryState::next(clock.now(), r.attempts));
+        }
     });
+}
+
+/// Whether the torrent's retry is still armed in the live state.
+fn retry_armed(state: &StateMap, ih: &libtorrent_safe::InfoHash) -> bool {
+    let mut armed = false;
+    state.update(ih, |s| armed = s.retry.is_some());
+    armed
+}
+
+/// Back an armed retry off one attempt, reading and writing it in one
+/// update; return whether it was still armed. A disarmed retry is left
+/// disarmed.
+fn back_off_if_armed(
+    state: &StateMap,
+    clock: &Arc<dyn Clock>,
+    ih: &libtorrent_safe::InfoHash,
+) -> bool {
+    let mut armed = false;
+    state.update(ih, |s| {
+        if let Some(r) = s.retry.as_ref() {
+            armed = true;
+            s.retry = Some(crate::state::RetryState::next(clock.now(), r.attempts));
+        }
+    });
+    armed
 }
 
 /// Schedule another look at a due retry that was skipped without an attempt,

@@ -934,10 +934,12 @@ mod tests {
             "the prefix and 256 bits of hex"
         );
         assert_eq!(s.expiry(&a), Some(a_expires));
+        assert_eq!(s.len(), 2);
         s.revoke(&a);
         assert!(!s.is_valid(&a), "revoking must actually invalidate");
         assert!(s.is_valid(&b));
         assert!(!s.is_valid("nonsense"));
+        assert_eq!(s.len(), 1, "only the live session counts");
     }
 
     #[test]
@@ -957,6 +959,23 @@ mod tests {
             !dump.contains(token.trim_start_matches(SESSION_TOKEN_PREFIX)),
             "the store keeps a digest, not the token: {dump}"
         );
+    }
+
+    /// `Auth`'s Debug names how many sessions and tokens it holds, and
+    /// nothing a credential could be read from: no password hash, no token
+    /// digest, no session.
+    #[test]
+    fn auth_debugs_its_counts_and_no_credential() {
+        let (_token, digest) = generate_token();
+        let mut c = cfg(hash_password("pw").unwrap());
+        c.token.push(TokenConfig {
+            name: "prometheus".into(),
+            sha256: digest,
+            scopes: vec![Scope::Metrics],
+        });
+        let auth = Auth::new(c);
+        auth.sessions.create();
+        assert_eq!(format!("{auth:?}"), "Auth { sessions: 1, tokens: 1 }");
     }
 
     #[test]
@@ -1014,6 +1033,19 @@ mod tests {
             c.session_ttl_secs = good;
             assert!(c.validate().is_ok(), "ttl {good} must be accepted");
         }
+        // The bound the docs quote: 30 days, to the second.
+        let thirty_days = 30 * 86_400;
+        c.session_ttl_secs = thirty_days;
+        assert!(c.validate().is_ok(), "30 days must be accepted");
+        c.session_ttl_secs = thirty_days + 1;
+        assert!(c.validate().is_err(), "past 30 days must be refused");
+    }
+
+    /// A config that names no `session_ttl_secs` gets the documented 12 hours.
+    #[test]
+    fn an_unset_session_ttl_is_twelve_hours() {
+        let c: AuthConfig = toml::from_str("password_hash = \"x\"").unwrap();
+        assert_eq!(c.session_ttl_secs, 12 * 3600);
     }
 
     #[test]
@@ -1286,6 +1318,50 @@ mod tests {
         assert!(!t.per_client.lock().contains_key(&filler(7)));
     }
 
+    /// A lockout that ends at this very instant, or has ended, protects no
+    /// one, so the sweep for a newcomer reclaims it, as it does an idle
+    /// entry.
+    #[test]
+    fn an_ended_lockout_is_swept_for_a_newcomer() {
+        let penalty = Duration::from_millis(50);
+        for past in [Duration::ZERO, Duration::from_millis(1)] {
+            let t = LoginThrottle::with_penalty(penalty);
+            fill(&t, 5);
+            t.advance(penalty + past);
+            t.note_failure(ip(1));
+            assert!(
+                t.per_client.lock().contains_key(&ip(1).unwrap()),
+                "{past:?} past the lockouts' end, they made room for the newcomer",
+            );
+        }
+    }
+
+    /// A client's failures do not decay while the map has room: only a full
+    /// map's sweep reclaims an idle entry, so neither another client's
+    /// failure nor another client's success clears them.
+    #[test]
+    fn failures_outlast_idleness_while_the_map_has_room() {
+        let penalty = Duration::from_millis(50);
+        for other_succeeds in [false, true] {
+            let t = LoginThrottle::with_penalty(penalty);
+            for _ in 0..4 {
+                t.note_failure(ip(1));
+            }
+            t.advance(penalty * 2);
+            if other_succeeds {
+                t.note_success(ip(2));
+            } else {
+                t.note_failure(ip(2));
+            }
+            t.note_failure(ip(1));
+            assert_eq!(
+                t.retry_after(ip(1)),
+                Some(penalty),
+                "the fifth failure locks out (other succeeded: {other_succeeds})",
+            );
+        }
+    }
+
     #[test]
     fn success_clears_only_that_client() {
         let t = LoginThrottle::new();
@@ -1405,6 +1481,65 @@ mod tests {
             Err(refill),
             "ten intervals idle accrue no more than the burst",
         );
+    }
+
+    /// A bucket that still holds tokens accrues only the room it has left:
+    /// the burst caps what it holds, not what it gains.
+    #[test]
+    fn a_partly_spent_budget_refills_only_to_its_burst() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+
+        t.advance(refill * 10);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+        assert!(
+            t.admit_verification(None).is_err(),
+            "one token left and ten intervals idle make a burst of three, no more",
+        );
+    }
+
+    /// A refill that leaves the bucket short of full keeps the part of the
+    /// next interval already served, so the wait it names is what is left
+    /// of that interval.
+    #[test]
+    fn a_refill_short_of_the_burst_keeps_the_interval_already_served() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        for _ in 0..3 {
+            assert!(t.admit_verification(None).is_ok());
+        }
+
+        t.advance(refill * 2 + refill / 2);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+        assert_eq!(
+            t.admit_verification(None),
+            Err(refill / 2),
+            "two and a half intervals: two runs, and half an interval to the third",
+        );
+    }
+
+    /// Only the first take from a full bucket starts its refill clock: a
+    /// take from a bucket already part spent leaves the interval running.
+    #[test]
+    fn a_take_from_a_part_spent_budget_leaves_its_refill_clock_running() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(3, refill);
+        assert!(t.admit_verification(None).is_ok());
+        t.advance(refill * 3 / 4);
+        assert!(t.admit_verification(None).is_ok());
+
+        t.advance(refill / 4);
+        assert!(t.admit_verification(None).is_ok());
+        assert!(
+            t.admit_verification(None).is_ok(),
+            "one interval from the first take, one token back",
+        );
+        assert_eq!(t.admit_verification(None), Err(refill));
     }
 
     /// One `POST /v1/sessions` as `create_session` runs it, against `t`'s

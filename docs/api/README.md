@@ -304,8 +304,9 @@ itself:
   `delete_files` alone never reaches the files.
 - **Every file is proven first.** Each file the torrent lists that exists
   must lie under a managed root, be claimed by this torrent in the pool index
-  and by no other torrent, and still match the index's record of its size,
-  mtime, inode and device. Any file that fails is `409`
+  and by no other torrent, and still match the index's record of its size
+  and mtime (not its inode or device, which a reboot or remount can
+  renumber). Any file that fails is `409`
   [`payload-untrashable`](problems.md#payload-untrashable) or
   [`payload-shared`](problems.md#payload-shared), and nothing changes: the
   torrent keeps seeding. A torrent the matcher has not placed, or whose

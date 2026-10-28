@@ -22,6 +22,8 @@ use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
 use crate::profile_registry::ProfileStatus;
 
+mod delete;
+
 /// Matched under `movies/`, claiming both files there.
 ///
 /// The infohash of every [`metainfo`] torrent, whatever its announce URL, so
@@ -32,6 +34,8 @@ use crate::profile_registry::ProfileStatus;
 const IH_A: &str = "161198fb49b44a081ed02da0b8f4f036e5cab471";
 /// Partial, based under `movies/`, claiming nothing.
 const IH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+/// The note the match left on [`IH_B`].
+const IH_B_NOTE: &str = "0 of 1 files present";
 /// In the library, never matched.
 const IH_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
@@ -125,7 +129,7 @@ fn fixture(dir: &Path, allow_mutations: bool) -> (Arc<PoolService>, i64) {
             Some("movies"),
             None,
             None,
-            None,
+            Some(IH_B_NOTE),
         )
         .unwrap();
         st.replace_claims(
@@ -370,6 +374,10 @@ async fn reads(cov: &Arc<Coverage>) {
     assert_eq!(all["items"][0]["state"], "matched");
     assert_eq!(all["items"][0]["base_rel"], "movies");
     assert_eq!(all["items"][0]["num_files"], 2);
+    // The note the match left, and `null` where it left none.
+    assert_eq!(all["items"][0]["note"], Value::Null);
+    assert_eq!(all["items"][1]["note"], IH_B_NOTE);
+    assert_eq!(all["items"][2]["note"], Value::Null);
     assert_eq!(all["items"][2]["state"], Value::Null);
     let matched: Value = h.read("/v1/pool/torrents?state=matched").await.json();
     assert_eq!(items(&matched).len(), 1);
@@ -1013,8 +1021,13 @@ async fn adoption_refuses_payload_the_drift_check_could_not_see() {
                 .contains("could not be checked"),
             "{r}"
         );
+        // After each response, so a claim names the request that took it.
+        let claims = h.state.registry.entries();
+        assert!(
+            claims.is_empty(),
+            "nothing was claimed (dry_run: {dry_run}), yet {claims:?}: {r}"
+        );
     }
-    assert_eq!(h.state.registry.len(), 0, "nothing was claimed");
 }
 
 /// A one-file `.torrent` announcing to `announce`.
@@ -1037,9 +1050,9 @@ fn fastresume(torrent: &[u8], tracker: Option<&str>) -> Vec<u8> {
         b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
     r.extend_from_slice(&ih.0);
     // Completion is the `pieces` bitfield with every piece had: `metainfo`
-    // has one piece.
+    // has one piece. `seed_mode 0`: libtorrent checked it (issue #652).
     r.extend_from_slice(b"6:pieces1:\x01");
-    r.extend_from_slice(b"9:seed_modei1e");
+    r.extend_from_slice(b"9:seed_modei0e");
     if let Some(url) = tracker {
         r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
     }
@@ -1085,7 +1098,7 @@ async fn resume_data_keyed_otherwise_than_the_index_is_verified_instead() {
     r.extend_from_slice(info);
     r.extend_from_slice(b"9:info-hash20:");
     r.extend_from_slice(&other_ih.0);
-    r.extend_from_slice(b"6:pieces1:\x019:seed_modei1e");
+    r.extend_from_slice(b"6:pieces1:\x019:seed_modei0e");
     r.extend_from_slice(b"8:trackersll31:http://tracker.example/announceeee");
     let read = libtorrent_safe::add_info_hashes(&torrentd_engine::AddParams::resume(r.clone()))
         .expect("the resume data reads");
@@ -1356,338 +1369,6 @@ async fn an_adopt_checks_its_selection_for_drift_before_trusting_resume_data() {
     assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
 }
 
-#[tokio::test]
-async fn a_delete_clears_the_pool_index_owner_it_set() {
-    // Adoption refuses a torrent the index says another profile owns, so the
-    // record has to go with the torrent, or it refuses every later adoption
-    // into anything else.
-    let dir = tempfile::tempdir().unwrap();
-    let (pool, _) = fixture(dir.path(), false);
-    let index = Arc::clone(&pool);
-    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
-    for (ih, owner, kept) in [(IH_A, "p", None), (IH_B, "q", Some("q"))] {
-        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
-        h.state
-            .registry
-            .assign(hash, torrentd_engine::ProfileId::new("p"))
-            .unwrap();
-        h.state.unloaded_at_boot.lock().insert(hash);
-        index.with_store(|st| st.set_profile(ih, Some(owner)).unwrap());
-        let resp = h.write("DELETE", &format!("/v1/torrents/{ih}")).await;
-        resp.assert_status(StatusCode::NO_CONTENT);
-        assert_eq!(
-            index.with_store(|st| st.profile_of(ih).unwrap()).as_deref(),
-            kept,
-            "a record naming {owner} after deleting p's torrent",
-        );
-    }
-}
-
-/// How long [`hold_writer_as_a_scan`] holds the writer at most. A handler
-/// that waits on it on the test's current-thread runtime stalls every timer,
-/// so a regression shows up as an answer later than this rather than a test
-/// that never ends.
-const SCAN_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Hold the writer inside a transaction, as a running scan does, until the
-/// returned sender is used or dropped, or [`SCAN_HOLD`] passes.
-fn hold_writer_as_a_scan(
-    pool: &Arc<PoolService>,
-) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-    let held = Arc::clone(pool);
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let holder = std::thread::spawn(move || {
-        held.with_store_mut(|st| {
-            st.in_transaction(|_| {
-                locked_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(SCAN_HOLD);
-                Ok::<(), torrentd_pool::PoolError>(())
-            })
-        })
-        .unwrap();
-    });
-    locked_rx.recv().unwrap();
-    (release_tx, holder)
-}
-
-/// Issue #217: a delete of a loaded torrent answers while a scan holds the
-/// writer. It used to wait out the scan to release the index's owner record,
-/// after the torrent was already gone from the registry, so a client that
-/// timed out and retried got `404` for a delete that had succeeded. The
-/// release lands once the scan lets go.
-#[tokio::test]
-async fn a_delete_answers_while_a_scan_holds_the_writer_and_releases_the_owner_after() {
-    use std::time::Duration;
-
-    let dir = tempfile::tempdir().unwrap();
-    let (pool, _) = fixture(dir.path(), false);
-    let index = Arc::clone(&pool);
-    let h = Harness::authed(&Coverage::new(), |s| {
-        profiles(s);
-        s.pool = Some(pool);
-    });
-    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
-    let p = torrentd_engine::ProfileId::new("p");
-    h.state.registry.assign(hash, p.clone()).unwrap();
-    h.state.state.insert(
-        hash,
-        torrentd_engine::TorrentState::newly_added(
-            torrentd_engine::TorrentHandle {
-                id: 1,
-                infohash: hash,
-            },
-            p,
-            std::time::Instant::now(),
-        ),
-    );
-    index.with_store(|st| st.set_profile(IH_A, Some("p")).unwrap());
-    let owner = || index.with_reader(|st| st.profile_of(IH_A).unwrap());
-
-    let (release, holder) = hold_writer_as_a_scan(&index);
-    let asked = std::time::Instant::now();
-    let resp = h.write("DELETE", &format!("/v1/torrents/{IH_A}")).await;
-    assert!(
-        asked.elapsed() < SCAN_HOLD / 2,
-        "the delete waited {:?} on the writer",
-        asked.elapsed(),
-    );
-    resp.assert_status(StatusCode::NO_CONTENT);
-    assert_eq!(
-        h.state.registry.lookup(&hash),
-        None,
-        "the assignment is gone"
-    );
-    assert_eq!(
-        owner().as_deref(),
-        Some("p"),
-        "the owner record waits for the writer",
-    );
-
-    release.send(()).unwrap();
-    holder.join().unwrap();
-    // Nothing else takes the writer: the release lands on its own.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while owner().is_some() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the owner record was never released once the writer was free",
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Issue #217: `delete_files`' co-claimant check reads the committed index,
-/// so a refusal answers while a scan holds the writer rather than after it.
-#[tokio::test]
-async fn a_shared_payload_delete_is_refused_while_a_scan_holds_the_writer() {
-    let dir = tempfile::tempdir().unwrap();
-    let (pool, root_id) = fixture(dir.path(), true);
-    pool.with_store_mut(|st| {
-        st.replace_claims(IH_B, &[(root_id, "movies/a.bin".to_owned())])
-            .unwrap();
-    });
-    let index = Arc::clone(&pool);
-    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
-
-    let (release, holder) = hold_writer_as_a_scan(&index);
-    let asked = std::time::Instant::now();
-    let resp = h
-        .write(
-            "DELETE",
-            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
-        )
-        .await;
-    assert!(
-        asked.elapsed() < SCAN_HOLD / 2,
-        "the co-claimant check waited {:?} on the writer",
-        asked.elapsed(),
-    );
-    assert_problem(&resp, 409, "payload-shared");
-    release.send(()).unwrap();
-    holder.join().unwrap();
-}
-
-/// The handler's early co-claimant check reads the committed index, which a
-/// running scan can rewrite before it lets go of the writer. A cross-seed
-/// that commits a claim on this torrent's files after that check, and before
-/// the payload is proven, is refused there rather than having its files
-/// moved to the trash.
-#[tokio::test]
-async fn a_co_claimant_committed_after_the_early_check_is_refused_before_the_trash() {
-    let dir = tempfile::tempdir().unwrap();
-    let (pool, root_id) = fixture(dir.path(), true);
-    let index = Arc::clone(&pool);
-    let engine = Arc::new(torrentd_engine::MockEngine::new());
-    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
-    let p = torrentd_engine::ProfileId::new("p");
-    let handle = engine.register_handle(hash);
-    engine.set_torrent_details(
-        handle,
-        torrentd_engine::TorrentDetails {
-            save_path: dir
-                .path()
-                .join("pool/movies")
-                .to_string_lossy()
-                .into_owned(),
-            ..torrentd_engine::MockEngine::default_details()
-        },
-    );
-    engine.set_torrent_files(
-        handle,
-        Some(
-            ["a.bin", "b.bin"]
-                .into_iter()
-                .enumerate()
-                .map(|(i, path)| torrentd_engine::TorrentFile {
-                    index: u32::try_from(i).unwrap(),
-                    path: path.into(),
-                    size: 0,
-                    downloaded: 0,
-                    priority: 4,
-                })
-                .collect(),
-        ),
-    );
-    let session = Arc::clone(&engine);
-    let h = Harness::authed(&Coverage::new(), |s| {
-        profiles(s);
-        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
-            p.clone(),
-            session as Arc<dyn torrentd_engine::TorrentEngine>,
-        )]));
-        s.pool = Some(pool);
-    });
-    h.state.registry.assign(hash, p.clone()).unwrap();
-    h.state.state.insert(
-        hash,
-        torrentd_engine::TorrentState::newly_added(handle, p, std::time::Instant::now()),
-    );
-
-    // Park the delete just past the early check, commit the cross-seed's
-    // claim as a scan ending then would, and let it go on to the writer.
-    let held = engine.hold_next("torrent_files");
-    let commit = tokio::task::spawn_blocking(move || {
-        held.wait_entered();
-        index.with_store_mut(|st| {
-            st.replace_claims(IH_B, &[(root_id, "movies/a.bin".to_owned())])
-                .unwrap();
-        });
-        held.release();
-    });
-    let resp = h
-        .write(
-            "DELETE",
-            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
-        )
-        .await;
-    commit.await.unwrap();
-
-    assert_problem(&resp, 409, "payload-shared");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
-    assert!(
-        detail.contains(IH_B) && detail.contains("pool index"),
-        "{detail}"
-    );
-    assert!(dir.path().join("pool/movies/a.bin").exists());
-    assert!(dir.path().join("pool/movies/b.bin").exists());
-    assert_eq!(
-        h.state.registry.lookup(&hash),
-        Some(torrentd_engine::ProfileId::new("p"))
-    );
-    assert!(
-        !engine
-            .calls()
-            .iter()
-            .any(|c| matches!(c, torrentd_engine::RecordedCall::RemoveTorrent { .. })),
-        "a refused delete leaves the torrent in its session",
-    );
-}
-
-/// Issue #292: a `delete_files` delete of a torrent whose payload is
-/// provable answers while a scan holds the writer. Its proof read the claims
-/// and every file's row on the writer, so it waited out the scan before
-/// anything was removed.
-#[tokio::test]
-async fn a_provable_payload_delete_answers_while_a_scan_holds_the_writer() {
-    let dir = tempfile::tempdir().unwrap();
-    let (pool, _) = fixture(dir.path(), true);
-    let index = Arc::clone(&pool);
-    let engine = Arc::new(torrentd_engine::MockEngine::new());
-    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
-    let p = torrentd_engine::ProfileId::new("p");
-    let handle = engine.register_handle(hash);
-    let movies = dir.path().join("pool/movies");
-    engine.set_torrent_details(
-        handle,
-        torrentd_engine::TorrentDetails {
-            save_path: movies.to_string_lossy().into_owned(),
-            ..torrentd_engine::MockEngine::default_details()
-        },
-    );
-    engine.set_torrent_files(
-        handle,
-        Some(
-            ["a.bin", "b.bin"]
-                .into_iter()
-                .enumerate()
-                .map(|(i, path)| torrentd_engine::TorrentFile {
-                    index: u32::try_from(i).unwrap(),
-                    path: path.into(),
-                    size: 0,
-                    downloaded: 0,
-                    priority: 4,
-                })
-                .collect(),
-        ),
-    );
-    let session = Arc::clone(&engine);
-    let h = Harness::authed(&Coverage::new(), |s| {
-        profiles(s);
-        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
-            p.clone(),
-            session as Arc<dyn torrentd_engine::TorrentEngine>,
-        )]));
-        s.pool = Some(pool);
-    });
-    h.state.registry.assign(hash, p.clone()).unwrap();
-    h.state.state.insert(
-        hash,
-        torrentd_engine::TorrentState::newly_added(handle, p, std::time::Instant::now()),
-    );
-
-    let (release, holder) = hold_writer_as_a_scan(&index);
-    let asked = std::time::Instant::now();
-    let resp = h
-        .write(
-            "DELETE",
-            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
-        )
-        .await;
-    assert!(
-        asked.elapsed() < SCAN_HOLD / 2,
-        "the payload proof waited {:?} on the writer",
-        asked.elapsed(),
-    );
-    resp.assert_status(StatusCode::NO_CONTENT);
-    assert!(!movies.join("a.bin").exists() && !movies.join("b.bin").exists());
-    let trash = dir.path().join("pool/.torrentd-trash");
-    let bucket = std::fs::read_dir(&trash)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect::<Vec<_>>();
-    assert_eq!(bucket.len(), 1, "{bucket:?}");
-    assert!(bucket[0].join("movies/a.bin").exists());
-    assert!(bucket[0].join("movies/b.bin").exists());
-    assert_eq!(
-        h.state.registry.lookup(&hash),
-        None,
-        "the assignment is gone"
-    );
-    release.send(()).unwrap();
-    holder.join().unwrap();
-}
-
 /// Issue #111's acceptance: a torrent adopted into one profile, deleted
 /// without its files, adopts into another. The delete used to leave the
 /// index's `adopted` verdict behind, and adoption refuses `adopted` outright.
@@ -1879,6 +1560,139 @@ async fn a_same_profile_adoption_that_loses_the_claim_race_is_refused_and_keeps_
     assert!(q.calls().is_empty(), "{:?}", q.calls());
 }
 
+/// Issue #656: an adoption whose pool-index records fail to commit is
+/// refused, on either path, and leaves no registry claim, no verify-queue
+/// item, in memory or in `pool.db`, and none of its records behind. It used
+/// to be reported adopted, with the verify item only in memory.
+///
+/// `RAISE(ROLLBACK)` stands in for `SQLITE_FULL`/`SQLITE_IOERR`, which roll
+/// back the whole shared transaction; `RAISE(ABORT)` fails only the statement,
+/// after the target's first record is written, which its savepoint takes back.
+#[tokio::test]
+async fn an_adoption_whose_records_fail_to_commit_is_refused_and_leaves_nothing() {
+    const TRACKER: &str = "http://tracker.example/announce";
+    for fast_path in [true, false] {
+        for raise in ["ROLLBACK", "ABORT"] {
+            let what = format!("fast_path={fast_path} RAISE({raise})");
+            let dir = tempfile::tempdir().unwrap();
+            let (pool, _) = fixture(dir.path(), false);
+            let index = Arc::clone(&pool);
+            let library = dir.path().join("library");
+            std::fs::create_dir_all(&library).unwrap();
+            let source = metainfo(TRACKER);
+            std::fs::write(library.join(format!("{IH_A}.torrent")), &source).unwrap();
+            if fast_path {
+                let resume = library.join(format!("{IH_A}.fastresume"));
+                std::fs::write(&resume, fastresume(&source, None)).unwrap();
+                let mut row = torrent(dir.path(), IH_A, 96, 2);
+                row.fastresume_path = Some(resume);
+                index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+            }
+            // The fast path writes its adoption record first, the verify path
+            // its owner record: the second write of each fails.
+            let trigger = if fast_path {
+                "BEFORE UPDATE OF profile ON torrent"
+            } else {
+                "BEFORE INSERT ON verify_queue"
+            };
+            rusqlite::Connection::open(dir.path().join("pool.db"))
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER boom {trigger} BEGIN SELECT RAISE({raise}, 'disk full'); END;"
+                ))
+                .unwrap();
+            // The profile's torrent_dir, which a restart's torrent-dir scan
+            // re-adds from: a refused torrent must leave nothing in it.
+            let torrents = Arc::new(torrentd_engine::FsTorrentStore::new(
+                dir.path().join("torrents"),
+            ));
+            pool.set_torrent_store(torrents.clone());
+            let engine = Arc::new(torrentd_engine::MockEngine::new());
+            let h = Harness::authed(&Coverage::new(), |s| {
+                let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
+                    "p",
+                    ProfileStatus::Active,
+                )]));
+                *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p"]);
+                pool.set_state(Arc::clone(&s.state));
+                s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                    torrentd_engine::ProfileId::new("p"),
+                    engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+                )]));
+                s.pool = Some(pool);
+            });
+
+            let resp = h
+                .send(
+                    "POST",
+                    "/v1/pool/adoptions",
+                    Some(&h.tokens.write),
+                    adopt(
+                        "p",
+                        false,
+                        json!({"kind": "infohashes", "infohashes": [IH_A]}),
+                    ),
+                )
+                .await;
+            resp.assert_status(StatusCode::OK);
+            let r = resp.json::<Value>();
+
+            assert_eq!(r["fast_path"], json!([]), "{what}: {r}");
+            assert_eq!(r["queued_for_verification"], json!([]), "{what}: {r}");
+            assert_eq!(r["refused"][0]["infohash"], json!(IH_A), "{what}: {r}");
+            let reason = r["refused"][0]["reason"].as_str().unwrap();
+            assert!(
+                reason.starts_with("the pool index could not record the adoption: "),
+                "{what}: {r}"
+            );
+            let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+            assert_eq!(h.state.registry.lookup(&hash), None, "{what}");
+            let queue = index.verify_queue();
+            assert_eq!((queue.depth(), queue.held()), (0, vec![]), "{what}");
+            assert!(
+                index.with_store(|st| st.verify_queue().unwrap()).is_empty(),
+                "{what}"
+            );
+            assert_eq!(
+                index.with_store(|st| st.adoption_state(IH_A).unwrap()),
+                Some(AdoptionState::Matched),
+                "{what}"
+            );
+            assert_eq!(
+                index.with_store(|st| st.profile_of(IH_A).unwrap()),
+                None,
+                "{what}"
+            );
+            // The session that accepted the fast-path torrent gives it back.
+            let calls = engine.calls();
+            let removed = calls.iter().any(|c| {
+                matches!(
+                    c,
+                    torrentd_engine::RecordedCall::RemoveTorrent {
+                        delete_files: false,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(removed, fast_path, "{what}: {calls:?}");
+            // That removal was recorded in the state map before the session
+            // was asked, so its alert keeps what a re-add writes: settling
+            // it reports the re-add only where a removal was pending.
+            let p = torrentd_engine::ProfileId::new("p");
+            h.state.state.note_readded(&p, &hash);
+            let settled = h.state.state.settle_removal(&p, &hash, |_| {});
+            assert_eq!(settled.readded, fast_path, "{what}");
+            for path in [
+                torrents.path_for(&p, &hash),
+                torrents.save_path_path_for(&p, &hash),
+                torrents.trackers_path_for(&p, &hash),
+            ] {
+                assert!(!path.exists(), "{what}: {} was written", path.display());
+            }
+        }
+    }
+}
+
 async fn verification(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let (pool, _) = fixture(dir.path(), false);
@@ -1924,6 +1738,42 @@ async fn verification(cov: &Arc<Coverage>) {
     assert!(q.tracks_recheck(IH_A));
     assert!(!q.tracks_recheck(IH_OUTSIDE));
     assert!(!q.tracks_recheck(IH_B));
+
+    // The pool's torrent fails its check: the queue records why, and the
+    // listing carries that reason as the torrent's note.
+    let tick = || {
+        crate::check_queue::admit_tick_for_tests(
+            q,
+            Some(&watched),
+            &h.state.source,
+            &h.state.state,
+            &h.state.profiles,
+            &h.state.registry,
+        );
+    };
+    // Admitted, its check starts; it ends without seeding.
+    tick();
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    h.state.state.update(&hash, |st| {
+        st.phase = torrentd_engine::TorrentPhase::Errored;
+        st.phase_since_check = true;
+        st.checked_at = Some(std::time::Instant::now());
+    });
+    tick();
+    crate::check_queue::retire_rechecks_for_tests(
+        &watched,
+        &*h.state.source,
+        &h.state.state,
+        &h.state.profiles,
+    );
+    assert!(!q.tracks_recheck(IH_A));
+    let listed: Value = h.read("/v1/pool/torrents").await.json();
+    let row = items(&listed)
+        .into_iter()
+        .find(|t| t["infohash"] == IH_A)
+        .unwrap();
+    assert_eq!(row["state"], "drifted");
+    assert_eq!(row["note"], "libtorrent reported an unrecoverable error");
 
     let resp = h
         .send(

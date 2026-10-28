@@ -62,6 +62,9 @@ const STREAM_LISTEN_PORT: u16 = 16994;
 /// The session-loss test's daemon.
 const RESTART_HTTP: &str = "127.0.0.1:18194";
 const RESTART_LISTEN_PORT: u16 = 16995;
+/// The exit-path revocation test's daemon.
+const EXIT_HTTP: &str = "127.0.0.1:18196";
+const EXIT_LISTEN_PORT: u16 = 16997;
 const MAGNET_HEX: &str = "0505050505050505050505050505050505050505";
 /// How long the `App` is given to reach each state it is driven to.
 const STEP: Duration = Duration::from_secs(30);
@@ -586,17 +589,236 @@ async fn a_session_does_not_survive_a_daemon_restart() {
     }
 }
 
+/// What `torrentctl` left behind, run under a pty until it exited.
+struct PtyRun {
+    status: std::process::ExitStatus,
+    /// Everything it wrote to the terminal.
+    output: String,
+    /// The pty's local modes once it had exited.
+    lflag: libc::tcflag_t,
+}
+
+impl PtyRun {
+    /// Asserts it exited non-zero having entered the alternate screen and
+    /// left it ahead of `report`, shown the cursor again, and left the pty
+    /// out of raw mode. Returns where `report` starts in the output.
+    fn assert_terminal_handed_back(&self, report: &str) -> usize {
+        let output = &self.output;
+        assert!(
+            !self.status.success(),
+            "a panic is a failure exit: {output:?}"
+        );
+
+        const ENTER_ALTERNATE: &str = "\x1b[?1049h";
+        const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
+        const SHOW_CURSOR: &str = "\x1b[?25h";
+        let entered = output
+            .find(ENTER_ALTERNATE)
+            .unwrap_or_else(|| panic!("never entered the alternate screen: {output:?}"));
+        let left = output[entered..]
+            .find(LEAVE_ALTERNATE)
+            .map(|at| entered + at)
+            .unwrap_or_else(|| panic!("never left the alternate screen: {output:?}"));
+        let at = output
+            .find(report)
+            .unwrap_or_else(|| panic!("no panic report: {output:?}"));
+        assert!(
+            left < at,
+            "the alternate screen is left before the report prints, so it \
+             stays on the operator's screen: {output:?}"
+        );
+        // The cursor comes back as the unwinding drops the terminal, after
+        // the report.
+        assert!(
+            output[entered..].contains(SHOW_CURSOR),
+            "the cursor is shown again: {output:?}"
+        );
+        // And the pty is out of raw mode: line editing and echo are back.
+        assert_ne!(self.lflag & libc::ICANON, 0, "canonical mode restored");
+        assert_ne!(self.lflag & libc::ECHO, 0, "echo restored");
+        at
+    }
+}
+
+/// A session token signed in from the password, as `Msg::SignedIn` leaves
+/// the model holding it.
+async fn minted_model(base: &str) -> Model {
+    let grant = api::Client::new(base)
+        .unwrap()
+        .create_session(&types::CreateSession {
+            password: PASSWORD.to_owned(),
+        })
+        .await
+        .expect("sign in")
+        .into_inner();
+    let mut model = Model::new(
+        Api::new(base, Some(&grant.token)).unwrap(),
+        Theme::new(Depth::Mono),
+    );
+    model.minted = true;
+    torrentctl::api::call(model.api.client.get_current_session())
+        .await
+        .expect("the token works before the exit");
+    model
+}
+
+/// The daemon refuses the token `model` holds.
+async fn assert_refused(model: &Model, path: &str) {
+    let refused = torrentctl::api::call(model.api.client.get_current_session())
+        .await
+        .expect_err("a revoked token is refused");
+    assert_eq!(refused.status, Some(401), "{path}: {refused:?}");
+}
+
+/// However the client exits — a signal, the end of its input, or a quit
+/// after the daemon answered the sign-in but before `SignedIn` landed — the
+/// daemon refuses the token it minted afterwards.
+#[tokio::test]
+#[ignore = "spawns torrentd; run with `mise run test-torrentctl`"]
+async fn a_minted_token_is_revoked_on_every_exit_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = password_hash(dir.path());
+    let (_daemon, base, _) = start_on(dir.path(), Some(&hash), EXIT_HTTP, EXIT_LISTEN_PORT).await;
+    let no_input = futures_util::stream::pending::<std::io::Result<crossterm::event::Event>>;
+
+    // A real SIGTERM to this process. Until the loop has finished and drops
+    // them, the handlers keep SIGHUP, SIGINT and SIGTERM from killing the
+    // test process, and tokio installs them once per process, so nothing
+    // after this catches them again; `test-torrentctl` runs these tests one
+    // at a time.
+    let signals = runtime::Signals::install().expect("install the signal handlers");
+    let model = minted_model(&base).await;
+    let run = tokio::spawn(runtime::run_with(model, |_| Ok(()), no_input(), signals));
+    // SAFETY: kill(2) with this process's own id and a valid signal.
+    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+    let ended = tokio::time::timeout(STEP, run)
+        .await
+        .expect("the loop left on SIGTERM")
+        .expect("no panic");
+    assert!(ended.result.is_ok() && ended.model.quit);
+    assert_refused(&ended.model, "SIGTERM").await;
+
+    // The terminal's input ends.
+    let model = minted_model(&base).await;
+    let never = futures_util::stream::pending::<&'static str>();
+    let ended = tokio::time::timeout(
+        STEP,
+        runtime::run_with(model, |_| Ok(()), futures_util::stream::empty(), never),
+    )
+    .await
+    .expect("the loop left at the end of its input");
+    assert!(ended.result.is_ok() && ended.model.quit);
+    assert_refused(&ended.model, "end of input").await;
+
+    // Esc after the daemon answered the sign-in, before `SignedIn` lands.
+    let mut app = Driver::start(Api::new(&base, Some(torrentctl::api::ANONYMOUS)).unwrap());
+    app.until("the sign-in prompt", |m| {
+        matches!(m.session, Session::SignedOut)
+    })
+    .await;
+    app.type_text(PASSWORD);
+    app.key(KeyCode::Enter);
+    let deadline = tokio::time::Instant::now() + STEP;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, app.rx.recv())
+            .await
+            .expect("the daemon answers the sign-in")
+            .expect("the driver holds a sender");
+        let login = matches!(msg, Msg::Login(_));
+        app.send(msg);
+        // Answered with a token: the password is cleared, and the login
+        // stays busy until `SignedIn` lands.
+        if login && app.model.login.busy && app.model.login.password.value().is_empty() {
+            break;
+        }
+    }
+    assert!(!app.model.minted, "SignedIn has not landed yet");
+    app.key(KeyCode::Esc);
+    assert!(
+        app.model.quitting && !app.model.quit,
+        "waits for the token on its way"
+    );
+    app.until("quit", |m| m.quit).await;
+    assert!(app.model.minted, "the model holds the token it revoked");
+    assert_refused(&app.model, "quit before SignedIn").await;
+}
+
 /// A panic inside the loop hands the terminal back: run under a pty, the
 /// binary enters the alternate screen, leaves it ahead of the panic report,
 /// shows the cursor again, and leaves the pty out of raw mode. Needs no
 /// daemon, so it is not ignored.
 #[test]
 fn a_panic_hands_the_terminal_back() {
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
+    run_under_pty(runtime::PANIC_AFTER_DRAW)
+        .assert_terminal_handed_back("TORRENTCTL_TEST_PANIC is set");
+}
+
+/// A panic on a background task stops the loop too: the binary exits
+/// non-zero with the terminal handed back, and says why after the report,
+/// on the restored screen. Without that, tokio swallows the panic and the
+/// loop keeps drawing over a terminal the panic hook already restored, until
+/// the deadline kills it.
+#[test]
+fn a_panic_on_a_background_task_exits_with_the_terminal_handed_back() {
+    let run = run_under_pty(runtime::PANIC_IN_TASK);
+    let report = run.assert_terminal_handed_back("TORRENTCTL_TEST_PANIC_IN_TASK is set");
+    let stopped = "torrentctl stopped: a request panicked: TORRENTCTL_TEST_PANIC_IN_TASK is set";
+    assert!(
+        run.output[report..].contains(stopped),
+        "no exit message after the report: {:?}",
+        run.output
+    );
+}
+
+/// A blocking thread that never returns, as one stuck resolving the
+/// daemon's host name over a dead tunnel does, does not hold the exit: the
+/// binary leaves soon after its loop quits, with a clean status and the
+/// terminal handed back, rather than waiting on the thread until the
+/// deadline kills it. Needs no daemon, so it is not ignored.
+#[test]
+fn the_exit_does_not_wait_on_a_blocking_thread_that_never_returns() {
+    /// Startup, the loop, the half-second exit wait, and slack for a loaded
+    /// machine; far below the [`STEP`] at which a hung exit is killed.
+    const BOUND: Duration = Duration::from_secs(10);
+    let started = Instant::now();
+    let run = run_under_pty(runtime::STALL_BLOCKING);
+    let took = started.elapsed();
+    assert!(
+        run.status.success(),
+        "a quit exits cleanly: {:?}",
+        run.output
+    );
+    assert!(took < BOUND, "exited after {took:?}, not within {BOUND:?}");
+    assert!(
+        run.output.contains("\x1b[?1049l"),
+        "left the alternate screen: {:?}",
+        run.output
+    );
+    assert_ne!(run.lflag & libc::ICANON, 0, "canonical mode restored");
+}
+
+/// `torrentctl` running against a closed port with a pty as its controlling
+/// terminal, the pty's master side held here.
+struct Pty {
+    child: Child,
+    master: std::fs::File,
+    /// `HOME`, holding the child's config and state (its log) directories.
+    home: tempfile::TempDir,
+    /// Held until the run is over: see [`spawn_under_pty`].
+    _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Start `torrentctl` against a closed port under a pty, with `envs` set.
+fn spawn_under_pty(envs: &[(&str, &str)]) -> Pty {
     use std::os::fd::FromRawFd as _;
     use std::os::fd::OwnedFd;
     use std::os::unix::process::CommandExt as _;
+
+    // One pty run at a time: a child forked by another test before this
+    // one's descriptors are close-on-exec would hold its pty open, and a
+    // binary that hangs would then fail the other run too.
+    static PTY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let one_at_a_time = PTY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let (master, slave) = {
         let mut master = -1;
@@ -619,6 +841,14 @@ fn a_panic_hands_the_terminal_back() {
             )
         };
         assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // openpty opens both without close-on-exec, so every child another
+        // test spawns would inherit them: only the child's 0, 1 and 2, which
+        // the spawn dups in, are meant to.
+        for fd in [master, slave] {
+            // SAFETY: fcntl on a descriptor just opened and owned here.
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            assert_eq!(rc, 0, "fcntl: {}", std::io::Error::last_os_error());
+        }
         // SAFETY: both descriptors were just opened and are owned here.
         unsafe {
             (
@@ -639,7 +869,7 @@ fn a_panic_hands_the_terminal_back() {
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("TERM", "xterm-256color")
         .env("RUST_BACKTRACE", "0")
-        .env(torrentctl::runtime::PANIC_AFTER_DRAW, "1")
+        .envs(envs.iter().copied())
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
@@ -653,9 +883,130 @@ fn a_panic_hands_the_terminal_back() {
             Ok(())
         });
     }
-    let mut child = command.spawn().expect("run torrentctl");
+    let child = command.spawn().expect("run torrentctl");
     // The child holds the only copies of the pty's other end now.
     drop(command);
+    Pty {
+        child,
+        master,
+        home,
+        _one_at_a_time: one_at_a_time,
+    }
+}
+
+/// The terminal hanging up — its master side closed, as a closed terminal
+/// window does — ends the client as SIGHUP: status 129, not an abort. With
+/// the pty gone, restoring it and printing to it fail with EIO, and std's
+/// `eprintln!`, which ratatui's `restore` reports through, panics on that;
+/// the panic hook then restores again and aborts. The exit's last log line
+/// reaching the file shows the log guard was dropped and flushed. Needs no
+/// daemon, so it is not ignored.
+#[test]
+fn a_hangup_exits_as_sighup_without_aborting_and_flushes_the_log() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let Pty {
+        mut child,
+        mut master,
+        home,
+        _one_at_a_time,
+    } = spawn_under_pty(&[]);
+
+    // Wait for the first draw: the loop, and the signal handlers installed
+    // before it, are up. A hangup before then is the default SIGHUP.
+    let deadline = Instant::now() + STEP;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let drawn = String::from_utf8_lossy(&output);
+        if let Some(at) = drawn.find("\x1b[?1049h") {
+            if drawn[at..].contains("connecting") {
+                break;
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("never drew within {STEP:?}: {drawn:?}");
+        }
+        let mut poll = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: poll(2) on one descriptor this test owns, for at most
+        // `millis`.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        assert!(ready >= 0, "poll: {}", std::io::Error::last_os_error());
+        if ready > 0 {
+            let n = master.read(&mut buf).expect("read the pty");
+            assert_ne!(n, 0, "the pty closed before the first draw: {drawn:?}");
+            output.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    // Hang up: this held the master's only descriptor.
+    drop(master);
+    let (done, exited) = std::sync::mpsc::channel();
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = done.send(child.wait());
+    });
+    let log_path = home.path().join("state/torrentctl/torrentctl.log");
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let status = match exited.recv_timeout(STEP) {
+        Ok(status) => status.expect("wait for torrentctl"),
+        Err(_) => {
+            // SAFETY: kill(2) on the child this test spawned and has not
+            // reaped.
+            unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap(), libc::SIGKILL) };
+            panic!(
+                "torrentctl did not exit within {STEP:?} of the hangup: {:?}",
+                log()
+            );
+        }
+    };
+    let log = log();
+    assert_eq!(
+        status.signal(),
+        None,
+        "exited, not killed by a signal (SIGABRT is 6): {status:?}: {log:?}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(129),
+        "SIGHUP's exit status: {status:?}: {log:?}"
+    );
+    assert!(
+        log.contains("exiting signal=\"SIGHUP\""),
+        "the exit's last log line was flushed: {log:?}"
+    );
+    // The default `info` filter keeps the cause of a hangup-time failure:
+    // the terminal that could not be handed back is logged at warn.
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("could not restore the terminal")),
+        "the restore failure was logged at warn: {log:?}"
+    );
+}
+
+/// Run `torrentctl` against a closed port under a pty, with `env` (one of
+/// the test switches in `runtime`) set, until it exits or [`STEP`] passes.
+fn run_under_pty(env: &str) -> PtyRun {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    // Bound, not `..`, so the home directory and the lock outlive the run.
+    let Pty {
+        mut child,
+        master,
+        home: _home,
+        _one_at_a_time,
+    } = spawn_under_pty(&[(env, "1")]);
 
     // Read on a thread until the child closes its end (Linux reports that as
     // EIO), so a binary that neither panics nor exits fails the test at a
@@ -686,34 +1037,7 @@ fn a_panic_hands_the_terminal_back() {
         }
     };
     let status = child.wait().unwrap();
-    let output = String::from_utf8_lossy(&output);
-    assert!(!status.success(), "a panic is a failure exit: {output:?}");
-
-    const ENTER_ALTERNATE: &str = "\x1b[?1049h";
-    const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
-    const SHOW_CURSOR: &str = "\x1b[?25h";
-    let entered = output
-        .find(ENTER_ALTERNATE)
-        .unwrap_or_else(|| panic!("never entered the alternate screen: {output:?}"));
-    let left = output[entered..]
-        .find(LEAVE_ALTERNATE)
-        .map(|at| entered + at)
-        .unwrap_or_else(|| panic!("never left the alternate screen: {output:?}"));
-    let report = output
-        .find("TORRENTCTL_TEST_PANIC is set")
-        .unwrap_or_else(|| panic!("no panic report: {output:?}"));
-    assert!(
-        left < report,
-        "the alternate screen is left before the report prints, so it stays \
-         on the operator's screen: {output:?}"
-    );
-    // The cursor comes back as the unwinding drops the terminal, after the
-    // report.
-    assert!(
-        output[entered..].contains(SHOW_CURSOR),
-        "the cursor is shown again: {output:?}"
-    );
-    // And the pty is out of raw mode: line editing and echo are back.
+    let output = String::from_utf8_lossy(&output).into_owned();
     // SAFETY: `termios` is plain data, filled in by tcgetattr on a
     // descriptor this test owns.
     let lflag = unsafe {
@@ -726,8 +1050,11 @@ fn a_panic_hands_the_terminal_back() {
         );
         termios.c_lflag
     };
-    assert_ne!(lflag & libc::ICANON, 0, "canonical mode restored");
-    assert_ne!(lflag & libc::ECHO, 0, "echo restored");
+    PtyRun {
+        status,
+        output,
+        lflag,
+    }
 }
 
 /// A token no request could carry stops the binary before it takes the

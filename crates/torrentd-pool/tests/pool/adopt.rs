@@ -139,6 +139,79 @@ fn a_complete_fastresume_takes_the_fast_path() {
     }
 }
 
+/// Two copies of `T` at the same sizes, `A/T` (stale or preallocated) and
+/// `B/T`, with a complete sidecar declaring `declared` as the save path:
+/// the store, matched, and the root's id and path.
+fn two_same_size_copies(
+    dir: &Path,
+    declared: impl Fn(&Path) -> String,
+) -> (PoolStore, i64, PathBuf) {
+    let root = dir.join("data");
+    let lib = dir.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "A/T/a.bin", 4096);
+    write_file(&root, "B/T/a.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "fc",
+        "T",
+        &[("T/a.bin", 4096)],
+        Some(true),
+    );
+    let mut t = store.torrent("fc").unwrap().unwrap();
+    t.declared_save_path = Some(declared(&root));
+    store.upsert_torrent(&t, 0).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    (store, root_id, root)
+}
+
+/// Issue #613: the previous client saved outside every root (qBittorrent in
+/// a container, say), so the matcher placed the torrent by the size anchor,
+/// on one of two copies of the same sizes. The complete bitfield says
+/// nothing about which of them it described, so the torrent is verified.
+#[test]
+fn a_complete_fastresume_over_one_of_two_same_size_copies_is_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, root_id, root) = two_same_size_copies(dir.path(), |_| "/downloads".to_owned());
+    assert_eq!(state_of(&store, "fc"), AdoptionState::Matched);
+    let (_, base) = store.adoption_base("fc").unwrap().unwrap();
+
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, "fc", |id| (id == root_id).then(|| r.clone())).unwrap();
+    match plan {
+        AdoptPlan::Verify { save_path, .. } => assert_eq!(save_path, root.join(base)),
+        other => panic!("expected verify, got {other:?}"),
+    }
+}
+
+/// The same two copies, but the previous client declared one of them as its
+/// save path: the matcher adopts from it, and the bitfield is about it.
+#[test]
+fn a_complete_fastresume_over_its_declared_copy_takes_the_fast_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, root_id, root) = two_same_size_copies(dir.path(), |root| {
+        root.join("B").to_string_lossy().into_owned()
+    });
+    assert_eq!(
+        store.adoption_base("fc").unwrap(),
+        Some((root_id, "B".to_owned()))
+    );
+
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, "fc", |id| (id == root_id).then(|| r.clone())).unwrap();
+    match plan {
+        AdoptPlan::FastPath { save_path, .. } => assert_eq!(save_path, root.join("B")),
+        other => panic!("expected fast path, got {other:?}"),
+    }
+}
+
 #[test]
 fn an_incomplete_fastresume_falls_back_to_verifying() {
     // The previous client never finished it, so its piece state vouches for
@@ -505,6 +578,60 @@ fn an_unparseable_sidecar_refuses_a_renamed_torrent() {
     );
 }
 
+/// Issue #622: a multi-file torrent holding one file, under qBittorrent's
+/// `NoSubfolder` layout, sits at `<save_path>/<file>` without the torrent's
+/// top directory. The scan finds it there, and adoption refuses it as it does
+/// every `NoSubfolder` torrent: libtorrent cannot be told about a layout only
+/// qBittorrent recorded, and neither the resume data nor the `.torrent`'s own
+/// paths lead it to where the file is.
+#[test]
+fn a_one_file_no_subfolder_torrent_is_found_flat_and_refused() {
+    for (complete, reason) in [
+        (true, refusal::LAYOUT_NOT_IN_RESUME),
+        (false, refusal::RENAMED_INCOMPLETE),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        write_file(&root, "dl/ep1.mkv", 2048);
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(
+            library.join("t.torrent"),
+            v1_metainfo("Show", &[("Show/ep1.mkv", 2048)]),
+        )
+        .unwrap();
+        let mut fr = b"d6:pieces2:".to_vec();
+        fr.extend_from_slice(if complete { b"\x01\x01" } else { b"\x01\x00" });
+        fr.extend_from_slice(b"17:qBt-contentLayout");
+        fr.extend_from_slice(&bstr_of("NoSubfolder"));
+        fr.extend_from_slice(b"12:qBt-savePath");
+        fr.extend_from_slice(&bstr_of(&root.join("dl").to_string_lossy()));
+        fr.push(b'e');
+        std::fs::write(library.join("t.fastresume"), fr).unwrap();
+
+        let mut store = PoolStore::open_in_memory().unwrap();
+        torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+        let ih = store.torrents().unwrap().pop().unwrap().infohash;
+        let files = store.torrent_files(&ih).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].rel_path, "ep1.mkv");
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+        let root_id = store.root_id(&root).unwrap();
+        assert_eq!(
+            store.adoption_base(&ih).unwrap(),
+            Some((root_id, "dl".to_owned()))
+        );
+        assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+
+        let plan =
+            torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| root.clone()))
+                .unwrap();
+        assert_eq!(plan, AdoptPlan::Refuse { reason }, "complete: {complete}");
+    }
+}
+
 /// Issue #438: a known torrent moved within the library with a sidecar that
 /// no longer parses keeps what the last good read recorded, while its row
 /// points at the `.torrent` and sidecar where this scan found them. The add
@@ -764,4 +891,68 @@ fn preview_splits_a_subtree_by_what_it_would_cost() {
     // The operator needs this number to know whether a bulk adopt is minutes
     // or days of disk reads.
     assert_eq!(pv.verify_bytes, 2000);
+}
+
+#[test]
+fn preview_covers_only_the_subtree_its_prefix_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "sub/A/a.bin", 1000);
+    write_file(&root, "sub/deep/B/b.bin", 2000);
+    // `subx` shares the prefix's spelling but is not under it.
+    write_file(&root, "subx/C/c.bin", 3000);
+    write_file(&root, "other/D/d.bin", 4000);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "pa",
+        "A",
+        &[("A/a.bin", 1000)],
+        Some(true),
+    );
+    add_torrent_with_sidecar(&mut store, &lib, "pb", "B", &[("B/b.bin", 2000)], None);
+    add_torrent_with_sidecar(&mut store, &lib, "pc", "C", &[("C/c.bin", 3000)], None);
+    add_torrent_with_sidecar(&mut store, &lib, "pd", "D", &[("D/d.bin", 4000)], None);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        store.adoption_base("pa").unwrap(),
+        Some((root_id, "sub".to_string()))
+    );
+
+    let r = root.clone();
+    let root_path_of = |id| (id == root_id).then(|| r.clone());
+    // Leading and trailing slashes name the same subtree.
+    let pv = torrentd_pool::adopt::preview(&store, root_id, "/sub/", root_path_of).unwrap();
+    assert_eq!(pv.fast_path, vec!["pa".to_string()]);
+    assert_eq!(pv.verify, vec!["pb".to_string()]);
+    assert_eq!(pv.verify_bytes, 2000);
+    assert!(pv.refused.is_empty(), "{:?}", pv.refused);
+
+    // Another root's preview takes none of them.
+    let elsewhere = torrentd_pool::adopt::preview(&store, root_id + 1, "", root_path_of).unwrap();
+    assert_eq!(elsewhere, Default::default());
+
+    // The add path's lookups resolve the same torrent.
+    assert_eq!(
+        torrentd_pool::adopt::save_path_of(&store, "pa", root_path_of).unwrap(),
+        Some(root.join("sub"))
+    );
+    assert_eq!(
+        torrentd_pool::adopt::save_path_of(&store, "pa", |_| None).unwrap(),
+        None
+    );
+    assert_eq!(
+        torrentd_pool::adopt::torrent_path(&store, "pa").unwrap(),
+        Some(lib.join("pa.torrent"))
+    );
+    assert_eq!(
+        torrentd_pool::adopt::torrent_path(&store, "zz").unwrap(),
+        None
+    );
 }

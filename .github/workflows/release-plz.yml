@@ -1,19 +1,31 @@
 name: Release
 
-# Releases are cut by merging the pull request release-plz opens; nobody tags
-# or uploads anything by hand, so the only signer is this workflow.
+# Releases are cut by merging the release pull request, from the one branch
+# `release-plz-next`; nobody tags or uploads anything by hand, so the only
+# signer is this workflow.
 #
 # On every push to `master`:
 #
-# 1. `release` runs `release-plz release`. On the merge of a release pull
-#    request (release-plz.toml's `release_always = false`) it creates the
-#    `vX.Y.Z` tag and a *draft* GitHub release through the API; on any other
-#    push it does nothing.
-# 2. `release-pr` then runs `release-plz release-pr`, which opens or updates
-#    the release pull request with verified commits made through the API. It
-#    regenerates docs/api/openapi.json on that branch, whose `info.version`
-#    is the crate version, and dispatches ci.yml on it: a pull request opened
-#    with this workflow's token triggers no workflow of its own.
+# 1. `release` runs `release-plz release`, but only for the merge of a pull
+#    request from a `release-plz-*` branch of this repository (release-plz.toml's
+#    `release_always = false` alone would accept a fork's too). It creates the
+#    `vX.Y.Z` tag and a *draft* GitHub release through the API, then replaces
+#    the annotated tag object release-plz made, which nobody signed, with a
+#    lightweight tag on the merge commit GitHub signed, and checks that
+#    GitHub verifies that commit. Squash, rebase and merge-commit merges all
+#    release (README.md, Releasing). On any other push it does nothing.
+# 2. `release-pr` then runs `release-plz update` and regenerates
+#    docs/api/openapi.json (its `info.version` is the crate version) in its
+#    checkout, records the result as one verified commit on the pushed
+#    commit through the GraphQL API, and moves `release-plz-next` onto it.
+#    It opens or updates the release pull request; where GitHub refuses this
+#    workflow's token a pull request (an organisation or repository
+#    setting), the run stays green and its summary links the comparison to
+#    open it from by hand. It dispatches ci.yml and this workflow on the branch, since
+#    anything this workflow's token pushes triggers no workflow of its own,
+#    and deletes the timestamped `release-plz-*` branches `release-plz
+#    release-pr` used to leave behind. With nothing to release it deletes
+#    `release-plz-next`, which closes a stale release pull request.
 # 3. When `release` created a release, `dist`, `dist-musl` and `image` build
 #    everything the release ships, from the tagged commit, with no cache, and
 #    `publish` signs and attests the files, uploads them to the draft and
@@ -23,9 +35,10 @@ name: Release
 # A token-created tag or release triggers no further workflow, so the build
 # and publish jobs live here rather than in an `on: release` workflow.
 #
-# On a pull request that touches the release machinery, the build jobs run
-# without uploading or pushing anything, so a broken release build fails the
-# pull request rather than the next release.
+# On a pull request that touches the release machinery, and on the dispatch
+# `release-pr` makes on `release-plz-next`, the build jobs run without
+# uploading or pushing anything, so a broken release build fails that pull
+# request or the release pull request rather than the release itself.
 #
 # Every action is pinned to a commit SHA with its release in a comment, as in
 # ci.yml. Each job holds only the permissions it uses; the workflow holds
@@ -44,14 +57,18 @@ on:
       - mise.toml
       - deploy/Containerfile
       - rust-toolchain.toml
+  # The dry run of the build jobs on the release branch (`release-pr`
+  # dispatches it). Nothing is published from a dispatch.
+  workflow_dispatch:
 
 permissions: {}
 
-# A newer push to a pull request supersedes its older dry run. Pushes to
-# `master` are never grouped: a pending run cancelled by a later push could be
-# the release pull request's merge, and the later push would not release it.
+# A newer push to a pull request, or a newer dispatch on a branch, supersedes
+# its older dry run. Pushes to `master` are never grouped: a pending run
+# cancelled by a later push could be the release pull request's merge, and
+# the later push would not release it.
 concurrency:
-  group: release-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  group: release-${{ github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -88,9 +105,29 @@ jobs:
       - run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      # `release_always = false` makes release-plz release on the merge of any
+      # pull request whose head branch starts with `release-plz-`, a fork's
+      # included. Only one from this repository's own branches releases.
+      - id: origin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          prs=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+            --jq '[.[] | select(.merged_at != null and .base.ref == "master")
+                   | {number, head: .head.ref, repo: .head.repo.full_name}]')
+          echo "$prs"
+          release=$(jq -r --arg repo "$REPO" \
+            'any(.[]; (.head | startswith("release-plz-")) and .repo == $repo)' <<< "$prs")
+          echo "release=$release" >> "$GITHUB_OUTPUT"
       - id: release
+        if: steps.origin.outputs.release == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           out=$(release-plz release --git-token "$GITHUB_TOKEN" -o json)
@@ -99,15 +136,83 @@ jobs:
           # the tag and the release (release-plz.toml).
           tag=$(jq -r '[.releases[] | select(.package_name == "torrentd")][0].tag // ""' <<< "$out")
           version=$(jq -r '[.releases[] | select(.package_name == "torrentd")][0].version // ""' <<< "$out")
+          # A re-run after an earlier attempt created the tag and the draft
+          # and then failed (moving or verifying the tag, below): release-plz
+          # finds the tag and releases nothing. The release is resumed from
+          # this commit's version while its release is still a draft, so the
+          # tag step and the build and publish jobs run again; a published
+          # release, or none, leaves the run doing nothing.
+          if [ -z "$tag" ]; then
+            current=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/torrentd/Cargo.toml", "rb"))["package"]["version"])')
+            draft=$(gh api --paginate "repos/$REPO/releases" \
+              --jq ".[] | select(.draft and .tag_name == \"v$current\") | .id")
+            if [ -n "$draft" ]; then
+              echo "resuming the draft release of v$current"
+              tag=v$current
+              version=$current
+            fi
+          fi
           if [ -n "$tag" ] && [ "$tag" != "v$version" ]; then
             echo "::error::release-plz tagged $tag for version $version"
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # release-plz makes the tag an annotated tag object through the API,
+      # which nobody signs, so GitHub shows it unverified. The release is
+      # still a draft, and immutable releases freeze the tag only once it is
+      # published, so the tag is moved to the commit itself: a lightweight
+      # tag on the merge commit GitHub made and signed. A tagged commit
+      # GitHub does not verify fails the job, so nothing is built or
+      # published from it.
+      - if: steps.release.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ref=$(gh api "repos/$REPO/git/ref/tags/$TAG")
+          type=$(jq -r .object.type <<< "$ref")
+          object=$(jq -r .object.sha <<< "$ref")
+          case "$type" in
+            tag) commit=$(gh api "repos/$REPO/git/tags/$object" \
+                   --jq 'select(.object.type == "commit") | .object.sha') ;;
+            # A re-run, after an earlier attempt already moved it.
+            commit) commit=$object ;;
+            *) echo "::error::$TAG points at a $type"; exit 1 ;;
+          esac
+          # Merged with "Create a merge commit", the release pull request's
+          # head is an ancestor of the pushed commit, and release-plz tags that
+          # head rather than the merge commit. It is accepted only where it is
+          # a parent of the merge commit and has the merge commit's tree, so
+          # moving the tag to the merge commit releases exactly what the
+          # pull request held. A squash or rebase merge tags the pushed commit
+          # itself.
+          if [ "$commit" != "$SHA" ]; then
+            if git rev-list --parents -n 1 "$SHA" | tr ' ' '\n' | tail -n +2 | grep -qxF "$commit" \
+              && [ "$(git rev-parse --verify --quiet "$commit^{tree}")" = "$(git rev-parse --verify "$SHA^{tree}")" ]; then
+              echo "$TAG names $commit, the release pull request's head that $SHA merges with the same tree; moving it to $SHA"
+              commit=$SHA
+            else
+              echo "::error::$TAG names $commit, which is neither the released commit $SHA nor a parent of it with the same tree, so nothing is built or published. Re-running this run fails the same way. Recover with: gh release delete $TAG --repo $REPO --cleanup-tag --yes; then squash-merge a pull request from a release-plz-retry-$TAG branch of this repository that changes no version (an empty commit is enough), which releases $TAG again: master already holds its version, so no release pull request may return (README.md, Releasing)."
+              exit 1
+            fi
+          fi
+          if [ "$type" = tag ] || [ "$object" != "$commit" ]; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/$TAG" -f sha="$commit" -F force=true \
+              --jq '.object | "\(.type) \(.sha)"'
+          fi
+          verification=$(gh api "repos/$REPO/commits/$commit" --jq .commit.verification)
+          echo "$verification"
+          if [ "$(jq -r .verified <<< "$verification")" != true ]; then
+            echo "::error::GitHub does not verify $TAG's commit $commit ($(jq -r .reason <<< "$verification")); the draft release stays unpublished"
+            exit 1
+          fi
 
   release-pr:
-    name: release-plz release-pr
+    name: release pull request
     if: github.event_name == 'push'
     # After `release`, so a merged release pull request's tag exists before
     # the next one is computed; otherwise this run would propose the version
@@ -116,14 +221,23 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
-      contents: write # the release branch and its commits, through the API
+      # The release branch, its commit, and deleting stale release branches,
+      # all through the API.
+      contents: write
       pull-requests: write # open, update and label the release pull request
-      actions: write # `gh workflow run ci.yml` on the release branch
+      actions: write # `gh workflow run` on the release branch
     # One release pull request: a second run waits for the first to finish
     # rather than racing it on the same branch.
     concurrency:
       group: release-plz-pr
       cancel-in-progress: false
+    env:
+      # The one release branch. Its `release-plz-` prefix is what makes
+      # `release-plz release` treat the merge of its pull request as a
+      # release. This job owns it and replaces it on every run: a commit
+      # pushed to it by hand is overwritten by the next push to `master`.
+      BRANCH: release-plz-next
+      REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -137,83 +251,232 @@ jobs:
           system-deps: 'true'
           cache-prefix: cargo
       # Restore only. The key is computed from this checkout of `master`, but
-      # torrentd is built from the release branch, whose bumped
+      # torrentd is built after `release-plz update`, whose bumped
       # crates/libtorrent-sys/Cargo.toml names a different prefix: saving
       # would store, under `master`'s exact key, a cache lacking the prefix
       # that key names, and every later job would take it as a hit and skip
       # the vendor fetch. For the same reason a hit here proves nothing about
-      # the release branch, so the regeneration step below fetches the
-      # submodules itself, whatever this restored.
+      # the release, so the regeneration step below fetches the submodules
+      # itself, whatever this restored.
       - uses: ./.github/actions/native-cache
         with:
           path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
           save: 'false'
-      # release-plz commits through the API, but stashes and checks out in a
-      # scratch copy of the repository on the way, which git refuses to do
-      # without an identity.
+      # release-plz stashes and checks out in a scratch copy of the repository
+      # while it computes the update, which git refuses to do without an
+      # identity. Nothing is committed with it: the commit below is made
+      # through the API.
       - run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
-      - id: release-pr
+      # The versions and CHANGELOG.md entry the next release moves, in this
+      # checkout and staged. `release-plz release-pr` would compute the same
+      # and then push it to a new timestamped branch on every run, and fail
+      # the run where GitHub refuses it a pull request.
+      - id: update
         env:
-          GITHUB_TOKEN: ${{ github.token }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -euo pipefail
-          out=$(release-plz release-pr --git-token "$GITHUB_TOKEN" --repo-url "$REPO_URL" -o json)
-          echo "$out"
-          # Empty when release-plz neither opened nor updated a pull request.
-          echo "branch=$(jq -r '.prs[0].head_branch // ""' <<< "$out")" >> "$GITHUB_OUTPUT"
-      # The document's `info.version` is the crate version the release pull
-      # request just moved, so the committed copy is stale on that branch
-      # until it is regenerated, and ci.yml's openapi-check would fail it.
-      # Committed through the GraphQL API, so the commit is verified like
-      # release-plz's own, and only onto the head this job read.
-      - if: steps.release-pr.outputs.branch != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.release-pr.outputs.branch }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin "refs/heads/$BRANCH"
-          head=$(git rev-parse FETCH_HEAD)
-          git checkout --detach "$head"
-          # The release branch's gitlinks, unconditionally: build.rs rebuilds
-          # the prefix whenever its stamp differs from what was restored.
-          mise run native-fetch
-          mise run openapi
-          if git diff --quiet -- docs/api/openapi.json; then
-            echo "docs/api/openapi.json is current on $BRANCH"
+          release-plz update --repo-url "$REPO_URL"
+          # Tracked files only: release-plz edits manifests, Cargo.lock and
+          # CHANGELOG.md, and nothing a setup step left behind is staged.
+          git add --update
+          if git diff --cached --quiet --ignore-submodules=all HEAD; then
+            echo "nothing to release"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          version=$(jq -r .info.version docs/api/openapi.json)
+          git diff --cached --stat --ignore-submodules=all HEAD
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/torrentd/Cargo.toml", "rb"))["package"]["version"])')
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The document's `info.version` is the crate version just moved, so the
+      # committed copy is stale until it is regenerated, and ci.yml's
+      # openapi-check would fail the release pull request.
+      - if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Unconditionally: build.rs rebuilds the prefix whenever its stamp
+          # differs from what was restored.
+          mise run native-fetch
+          mise run openapi
+          git add --update -- docs/api/openapi.json
+      # The staged change becomes one commit on the pushed commit, made
+      # through the GraphQL API so GitHub signs and verifies it, and the
+      # release branch is moved onto it.
+      - id: commit
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          VERSION: ${{ steps.update.outputs.version }}
+          # Not `release-plz-*`: neither a release branch nor one the
+          # pruning below would touch.
+          SCRATCH: release-scratch-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          title="chore: release v$VERSION"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          # The pull request's body: the CHANGELOG.md entry this release adds.
+          {
+            echo "Merging this pull request releases v$VERSION: release-plz.yml tags the merge commit, then builds, signs and publishes the release."
+            echo
+            git diff --cached --unified=0 HEAD -- CHANGELOG.md | sed -n '/^+++ /d; s/^+//p'
+          } | head -c 60000 > "$RUNNER_TEMP/pr-body.md"
+          status=0
+          remote=$(git ls-remote --exit-code origin "refs/heads/$BRANCH") || status=$?
+          case $status in
+            0) head=${remote%%[[:space:]]*} ;;
+            2) head= ;;
+            *) echo "::error::git ls-remote origin exited $status"; exit 1 ;;
+          esac
+          if [ -n "$head" ]; then
+            git fetch --no-tags origin "$head"
+            # A re-run on the same commit: the branch already holds this
+            # release, so its commit is left alone. The steps below still
+            # dispatch the checks and open or update the pull request, since
+            # the attempt being re-run may have failed before either.
+            if [ "$(git rev-parse "$head^")" = "$SHA" ] \
+              && git diff --cached --quiet --ignore-submodules=all "$head"; then
+              echo "$BRANCH already holds this release of $SHA"
+              exit 0
+            fi
+          fi
+          # The commit is made on a scratch branch at the pushed commit and
+          # the release branch then moved onto it. Resetting the release
+          # branch to `master` first would, for that moment, make its open
+          # pull request's head a commit `master` contains, which GitHub
+          # takes for a merge and closes the pull request as merged.
+          gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$SCRATCH" -f sha="$SHA" --silent
+          trap 'gh api -X DELETE "repos/$REPO/git/refs/heads/$SCRATCH" || echo "::warning::could not delete $SCRATCH"' EXIT
+          echo '[]' > "$RUNNER_TEMP/additions.json"
+          git diff --cached --name-only --diff-filter=d --ignore-submodules=all -z HEAD |
+            while IFS= read -r -d '' path; do
+              jq --arg path "$path" --rawfile contents <(base64 -w0 -- "$path") \
+                '. + [{path: $path, contents: $contents}]' \
+                "$RUNNER_TEMP/additions.json" > "$RUNNER_TEMP/additions.next"
+              mv "$RUNNER_TEMP/additions.next" "$RUNNER_TEMP/additions.json"
+            done
+          git diff --cached --name-only --diff-filter=D --ignore-submodules=all -z HEAD |
+            jq -Rs 'split("\u0000") | map(select(. != "") | {path: .})' > "$RUNNER_TEMP/deletions.json"
           jq -n \
             --arg query 'mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }' \
-            --arg repo "$REPO" --arg branch "$BRANCH" --arg head "$head" \
-            --arg headline "chore(release): regenerate the OpenAPI document for v$version" \
-            --rawfile contents <(base64 -w0 docs/api/openapi.json) \
+            --arg repo "$REPO" --arg branch "$SCRATCH" --arg head "$SHA" --arg headline "$title" \
+            --slurpfile additions "$RUNNER_TEMP/additions.json" \
+            --slurpfile deletions "$RUNNER_TEMP/deletions.json" \
             '{query: $query, variables: {input: {
                branch: {repositoryNameWithOwner: $repo, branchName: $branch},
                expectedHeadOid: $head,
                message: {headline: $headline},
-               fileChanges: {additions: [{path: "docs/api/openapi.json", contents: $contents}]}
+               fileChanges: {additions: $additions[0], deletions: $deletions[0]}
              }}}' > "$RUNNER_TEMP/commit.json"
-          gh api graphql --input "$RUNNER_TEMP/commit.json" --jq .data.createCommitOnBranch.commit.oid
-      - if: steps.release-pr.outputs.branch != ''
+          commit=$(gh api graphql --input "$RUNNER_TEMP/commit.json" --jq .data.createCommitOnBranch.commit.oid)
+          echo "$commit"
+          if [ -n "$head" ]; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$commit" -F force=true --silent
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" --silent
+          fi
+      # Anything this workflow's token pushes triggers no workflow, so CI and
+      # the dry run of the build jobs (`dist`, `dist-musl`, `image`) are
+      # dispatched on the branch. Their checks land on its head commit, which
+      # is the release pull request's.
+      - if: steps.update.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.release-pr.outputs.branch }}
-          REPO: ${{ github.repository }}
-        run: gh workflow run ci.yml --repo "$REPO" --ref "$BRANCH"
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml --repo "$REPO" --ref "$BRANCH"
+          gh workflow run release-plz.yml --repo "$REPO" --ref "$BRANCH"
+      # Opens the release pull request, or retitles an open one. Where GitHub
+      # refuses this workflow's token a pull request (the setting that lets
+      # GitHub Actions create pull requests is off), the run stays green and
+      # its summary carries the link to open it by hand; the branch, its
+      # commit and its checks are already in place.
+      - if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SERVER: ${{ github.server_url }}
+          TITLE: ${{ steps.commit.outputs.title }}
+        run: |
+          set -euo pipefail
+          body=$RUNNER_TEMP/pr-body.md
+          # `owner:branch` names this repository's branch, never a fork's.
+          pr=$(gh api "repos/$REPO/pulls?state=open&base=master&head=${REPO%%/*}:$BRANCH" \
+            --jq '.[0].number // ""')
+          if [ -n "$pr" ]; then
+            gh api -X PATCH "repos/$REPO/pulls/$pr" -f title="$TITLE" -F body=@"$body" --jq .html_url
+            exit 0
+          fi
+          status=0
+          out=$(gh api -X POST "repos/$REPO/pulls" -f base=master -f head="$BRANCH" \
+            -f title="$TITLE" -F body=@"$body" --jq '"\(.number) \(.html_url)"' 2>&1) || status=$?
+          echo "$out"
+          if [ "$status" -eq 0 ]; then
+            gh api "repos/$REPO/issues/${out%% *}/labels" -f 'labels[]=release' --silent \
+              || echo "::warning::could not label the release pull request 'release'"
+            exit 0
+          fi
+          if ! grep -q 'not permitted to create or approve pull requests' <<< "$out"; then
+            echo "::error::opening the release pull request failed"
+            exit 1
+          fi
+          url="$SERVER/$REPO/compare/master...$BRANCH?expand=1&title=$(jq -rn --arg t "$TITLE" '$t | @uri')"
+          echo "::notice title=Open the release pull request by hand::GitHub refuses this workflow a pull request; $BRANCH holds $TITLE. Open it at $url"
+          {
+            echo "## Open the release pull request by hand"
+            echo
+            echo "GitHub refused this workflow's token a pull request. \`$BRANCH\` holds **$TITLE** as a verified commit on this push's \`master\`, and CI and the release dry run are dispatched on it."
+            echo
+            echo "[Open the pull request from \`$BRANCH\`]($url), with the body below. Merging it releases v${TITLE##* v}."
+            echo
+            cat "$body"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Nothing to release, as after a release pull request's merge: the
+      # branch would only restate `master`, and deleting it closes any pull
+      # request still open from it.
+      - if: steps.update.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status=0
+          git ls-remote --exit-code origin "refs/heads/$BRANCH" > /dev/null || status=$?
+          case $status in
+            0) gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH"; echo "deleted $BRANCH" ;;
+            2) echo "no $BRANCH to delete" ;;
+            *) echo "::error::git ls-remote origin exited $status"; exit 1 ;;
+          esac
+      # `release-plz release-pr` left a timestamped `release-plz-<date>T<time>Z`
+      # branch on every run. Each one with no open pull request is deleted;
+      # other `release-plz-*` branches, which a person named, are left alone.
+      - if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          open=$(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+            --jq '.[] | "\(.head.repo.full_name // "") \(.head.ref)"')
+          refs=$(gh api --paginate "repos/$REPO/git/matching-refs/heads/release-plz-" --jq '.[].ref')
+          while IFS= read -r ref; do
+            branch=${ref#refs/heads/}
+            [[ $branch =~ ^release-plz-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z$ ]] || continue
+            if grep -qxF "$REPO $branch" <<< "$open"; then
+              echo "kept $branch: a pull request is open from it"
+              continue
+            fi
+            gh api -X DELETE "repos/$REPO/git/refs/heads/$branch"
+            echo "deleted $branch"
+          done <<< "$refs"
 
   dist:
     name: dist (x86_64 glibc)
     needs: release
-    # `!cancelled()` because `release` is skipped on a pull request, and a
-    # skipped need otherwise skips this job too.
+    # `!cancelled()` because `release` is skipped on a dry run (a pull
+    # request, or a dispatch), and a skipped need otherwise skips this job too.
     if: >-
-      !cancelled() && (github.event_name == 'pull_request'
+      !cancelled() && (github.event_name != 'push'
       || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -231,7 +494,7 @@ jobs:
         with:
           system-deps: 'true'
       - run: mise run native-fetch
-      # Empty on a pull request, where there is no tag to hold the build to.
+      # Empty on a dry run, where there is no tag to hold the build to.
       - run: mise run dist
         env:
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
@@ -246,7 +509,7 @@ jobs:
     name: dist (static torrentctl, x86_64 musl)
     needs: release
     if: >-
-      !cancelled() && (github.event_name == 'pull_request'
+      !cancelled() && (github.event_name != 'push'
       || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -305,7 +568,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           # X.Y.Z, X.Y and latest, from the release's tag. Nothing is tagged
-          # on a pull request, where nothing is pushed.
+          # on a dry run, where nothing is pushed.
           tags: |
             type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
@@ -330,7 +593,7 @@ jobs:
           EXPECTED: ${{ needs.release.outputs.version }}
         run: |
           set -euo pipefail
-          # On a pull request there is no release; the checkout's version is
+          # On a dry run there is no release; the checkout's version is
           # what the image was built from.
           expected=${EXPECTED:-$(python3 -c 'import tomllib; print(tomllib.load(open("crates/torrentd/Cargo.toml", "rb"))["package"]["version"])')}
           got=$(docker run --rm --entrypoint /usr/local/bin/torrentd torrentd:release-check --version)

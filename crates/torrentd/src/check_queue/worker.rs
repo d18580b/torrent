@@ -32,6 +32,7 @@ use crate::pool_service::now_secs;
 use crate::pool_service::off_worker;
 use crate::pool_service::PoolService;
 use crate::profile_registry::ProfileStatus;
+use crate::profile_registry::Resolution;
 use crate::registry::AssignmentRegistry;
 
 /// Drive the verify queue: retire finished verifications, admit new ones.
@@ -167,6 +168,19 @@ pub(crate) fn admit_tick_for_tests(
         profiles,
         registry,
     );
+}
+
+/// One verify-queue tick's retirement of its finished re-hashes, as
+/// [`run_verify_queue`] makes it, for tests that read the recorded verdict
+/// through the HTTP API.
+#[cfg(test)]
+pub(crate) fn retire_rechecks_for_tests(
+    pool: &PoolService,
+    source: &dyn AlertSource,
+    state: &StateMap,
+    profiles: &crate::profile_registry::ProfileRegistry,
+) {
+    retire_rechecks(pool, Writer::Wait, source, state, profiles);
 }
 
 /// What one admission attempt did.
@@ -559,8 +573,9 @@ pub(super) fn admit_held_add(
 
 /// Add the adoption at the head of the queue to its session, to verify.
 ///
-/// One whose profile is fenced or set offline goes to the back and is
-/// skipped, as a held re-hash or add is: the adoptions behind it, into
+/// One whose profile is fenced, set offline, or configured but without a
+/// session (its tunnel failed at boot) goes to the back and is skipped, as a
+/// held re-hash or add is: the adoptions behind it, into
 /// profiles still on the network, are admitted this tick rather than wait
 /// for the fence to lift. The hold is logged once per profile per tick:
 /// `held_logged` names the profiles already logged.
@@ -583,25 +598,40 @@ pub(super) fn admit_adoption(
     // profile — the one thing fencing exists to prevent. Put it back and
     // wait for the operator. A profile the operator set offline is
     // held the same way: adoptions into it are refused, and what was
-    // queued before it went offline waits for it to come back.
-    let fenced = profiles
-        .resolve(&item.profile)
+    // queued before it went offline waits for it to come back. So is one
+    // for a configured profile with no session, a tunnel that failed at
+    // boot (issue #651): its queue is what a restart that brings the
+    // profile up admits, and dropping it would release every claim in it.
+    let resolution = profiles.resolve(&item.profile);
+    let configured = !matches!(resolution, Resolution::Unknown);
+    let fenced = resolution
         .active()
         .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
-    if fenced || profiles.held_offline(&item.profile) {
+    let engine = source.engine_for(&item.profile);
+    let held = if fenced {
+        Some("vpn_down")
+    } else if profiles.held_offline(&item.profile) {
+        Some("offline")
+    } else if engine.is_none() && configured {
+        Some("no_session")
+    } else {
+        None
+    };
+    if let Some(reason) = held {
         if held_logged.insert(item.profile.clone()) {
             warn!(
                 target: "torrentd::pool",
                 profile_id = %item.profile,
                 infohash = %item.infohash,
-                reason = if fenced { "vpn_down" } else { "offline" },
+                reason,
                 "verify held: profile is off the network",
             );
         }
         q.pending.lock().push_back(item);
         return Admission::Skipped;
     }
-    let Some(engine) = source.engine_for(&item.profile) else {
+    // No `[[profile]]` declares it any more: nothing will ever admit it.
+    let Some(engine) = engine else {
         warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
         release_dropped_claim(pool, Writer::Held(store), registry, &item);
         return Admission::Skipped;
@@ -620,6 +650,22 @@ pub(super) fn admit_adoption(
             return Admission::Skipped;
         }
     };
+    // The adopt held the `.torrent` to the indexed info-hash when it queued
+    // it, but the library file can be replaced while the item waits. Added,
+    // another torrent would sit under this one's claim and be persisted as
+    // its `.torrent` (issue #612).
+    if let Err(key) = crate::torrent_keys::torrent_key_mismatch(&item.infohash, &bytes) {
+        warn!(
+            target: "torrentd::pool",
+            infohash = %item.infohash,
+            torrent_infohash = key.map(|k| k.to_hex()).as_deref().unwrap_or("unreadable"),
+            path = %item.torrent_path.display(),
+            "library .torrent no longer names the queued torrent; dropping verify",
+        );
+        q.failed.fetch_add(1, Ordering::Relaxed);
+        release_dropped_claim(pool, Writer::Held(store), registry, &item);
+        return Admission::Skipped;
+    }
     // No SEED_MODE: that is what makes libtorrent hash the payload
     // against the piece hashes before it will seed. The no-download
     // invariant rides along regardless — see `torrentd_engine::policy`.
@@ -667,6 +713,7 @@ pub(super) fn admit_adoption(
                 &item.infohash,
                 &bytes,
                 &item.save_path.to_string_lossy(),
+                &item.trackers,
             );
             // A session holds it now, and a restart loads it from
             // the `.torrent` just written. Its persisted entry stays
@@ -693,6 +740,12 @@ pub(super) fn admit_adoption(
 
 /// Record the verdict of every in-flight torrent whose hashing is over, and
 /// stop waiting on one removed while it hashed.
+///
+/// Hashing is over once [`verify_outcome`] decides it, or, where its
+/// `torrent_checked_alert` was lost, once [`lost_check_outcome`] does: one
+/// paused on an error, one showing a finished check's phase unstamped, or
+/// one showing no running or held check for [`RECHECK_EXPIRY`], is recorded
+/// failed, so no adoption holds its slot for the life of the process.
 ///
 /// A removed torrent leaves the state map, and with no entry its outcome
 /// reads as still waiting; it is told apart from one whose add has not
@@ -735,7 +788,16 @@ pub(super) fn retire_in_flight(
             }
             (false, false) => {}
         }
-        let outcome = verify_outcome(entry.as_ref(), VERIFY_SETTLE);
+        let mut outcome = verify_outcome(entry.as_ref(), VERIFY_SETTLE);
+        if outcome == VerifyOutcome::Waiting {
+            outcome = lost_check_outcome(
+                entry.as_ref(),
+                &mut f.ended_unchecked,
+                &mut f.waiting_since,
+                VERIFY_SETTLE,
+                RECHECK_EXPIRY,
+            );
+        }
         if outcome == VerifyOutcome::Waiting {
             return true;
         }
@@ -986,6 +1048,10 @@ pub(super) fn release_dropped_claim(
 /// first ([`crate::profile_registry::ProfileEntry::exclude_from_resumes`]), so
 /// no lift resumes it after.
 ///
+/// Either verdict queues an immediate resume save: `Verified` so the pieces
+/// the check found reach disk before the next sweep, `Failed` (once paused)
+/// so the pause does.
+///
 /// Either verdict forgets the info-hash's persisted verify-queue entry: an
 /// adoption keeps it until here, so a restart before the verdict is recorded
 /// waits for the boot's check rather than lose it.
@@ -1006,6 +1072,11 @@ pub(super) fn record_verify_outcome(
         VerifyOutcome::Verified => {
             q.completed.fetch_add(1, Ordering::Relaxed);
             info!(target: "torrentd::pool", infohash = %ih, "verified and seeding");
+            // Saved now, before the row is dequeued: on disk is only the
+            // add-time resume file with no pieces, so a crash before the
+            // next sweep would re-hash the whole payload at boot, outside
+            // the check limit.
+            state.queue_resume_save_now(*hash);
             (AdoptionState::Adopted, Some(now_secs()), None, None)
         }
         VerifyOutcome::Failed(reason) => {
@@ -1023,6 +1094,16 @@ pub(super) fn record_verify_outcome(
                 // hold would load it unpaused at the next boot.
                 let entry = profiles.resolve(&st.profile_id).active();
                 let before = entry.map(|e| e.prepare_pause(st.handle));
+                // So would the disk-error retry. A check that fails on a
+                // disk read error arms it (`file_error`), and libtorrent's
+                // pause keeps the error, so a due retry would resume the
+                // torrent this pauses: re-checked and seeding, while its
+                // record stays drifted and no verdict follows. Disarmed
+                // before the pause, so a retry coming due in between finds
+                // nothing to do, and re-armed as it was if the pause fails,
+                // leaving the error-paused torrent with its one way back.
+                let mut retry = None;
+                state.update(hash, |s| retry = s.retry.take());
                 let paused = source
                     .engine_for(&st.profile_id)
                     .map(|e| e.pause_torrent(st.handle));
@@ -1035,6 +1116,13 @@ pub(super) fn record_verify_outcome(
                     // Its flag did not change, so the note goes back.
                     if let (Some(e), Some(before)) = (entry, before) {
                         e.restore_noted(st.handle, before);
+                    }
+                    if retry.is_some() {
+                        state.update(hash, |s| {
+                            if s.retry.is_none() {
+                                s.retry = retry;
+                            }
+                        });
                     }
                     warn!(
                         target: "torrentd::pool",
@@ -1121,6 +1209,77 @@ pub(super) fn verify_outcome(
         }
         _ => VerifyOutcome::Waiting,
     }
+}
+
+/// The reason [`lost_check_outcome`] records for an adoption libtorrent
+/// paused on an error before its check reached a verdict.
+pub(super) const ERROR_PAUSED_REASON: &str =
+    "libtorrent paused the torrent on an error before its check finished";
+
+/// Decide an in-flight adoption [`verify_outcome`] left `Waiting`, from what
+/// it shows without a `torrent_checked` stamp and how long it has waited.
+///
+/// `checked_at` comes only from `torrent_checked_alert`, which the alert
+/// overflow recovery does not replay. A torrent whose check failed and whose
+/// alert was dropped shows `Incomplete` (libtorrent's `downloading`) for good,
+/// and [`verify_outcome`] waits on it forever. `Incomplete` and `Idle` are
+/// phases only a finished check reaches: an adoption is added in `Checking`
+/// ([`TorrentPhase::on_add`]), and a status update reports `checking` until
+/// the check ends. One shown in either, unstamped, for `settle` running is
+/// therefore over and not seeding, and is failed. `ended_unchecked` carries
+/// when that began across ticks; any other phase resets it, so a healthy
+/// check passing through on its way to `Seeding` is not condemned.
+///
+/// One showing neither a running check (`Checking`) nor a held one
+/// (`Paused`) for `expiry` or longer is failed: its check, or the report its
+/// verdict waits for, was lost - one never seen in the state map, one stuck
+/// in a phase no check leads to - and it would otherwise hold a verify slot
+/// for the life of the process. `waiting_since` carries when that began
+/// across ticks, and either of those phases resets it, so a hash running
+/// longer than `expiry`, or an adoption held paused behind the held-add
+/// queue, keeps waiting as it always did.
+///
+/// Except one paused on an error ([`error_paused`]), as a disk read error
+/// during the check leaves it: that check is over, with no
+/// `torrent_checked`. It is failed at once, and [`record_verify_outcome`]
+/// disarms the disk-error retry its `file_error` armed, which would
+/// otherwise resume the torrent it pauses. Held as paused, it would reset
+/// the expiry on every tick and keep
+/// its slot for the life of the process, and `max_concurrent_verify` of them
+/// would stall every adoption, re-hash and held add.
+pub(super) fn lost_check_outcome(
+    entry: Option<&torrentd_engine::TorrentState>,
+    ended_unchecked: &mut Option<std::time::Instant>,
+    waiting_since: &mut std::time::Instant,
+    settle: Duration,
+    expiry: Duration,
+) -> VerifyOutcome {
+    if entry.is_some_and(error_paused) {
+        return VerifyOutcome::Failed(ERROR_PAUSED_REASON);
+    }
+    if entry.is_some_and(|st| matches!(st.phase, TorrentPhase::Checking | TorrentPhase::Paused)) {
+        *waiting_since = std::time::Instant::now();
+    }
+    let over = entry.is_some_and(|st| {
+        st.checked_at.is_none() && matches!(st.phase, TorrentPhase::Incomplete | TorrentPhase::Idle)
+    });
+    if over {
+        if ended_unchecked
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            >= settle
+        {
+            return VerifyOutcome::Failed(
+                "hashing ended without a torrent_checked report and the torrent is not seeding",
+            );
+        }
+    } else {
+        *ended_unchecked = None;
+    }
+    if waiting_since.elapsed() >= expiry {
+        return VerifyOutcome::Failed("no verification verdict within the check expiry");
+    }
+    VerifyOutcome::Waiting
 }
 
 /// Decide a re-hash of a loaded torrent requested at `started`, or `None`

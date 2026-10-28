@@ -315,6 +315,18 @@ pub(crate) async fn resume_paced(
     out
 }
 
+/// Run by [`resume_batch`], in the profile it names, with each torrent's
+/// index in the batch before the torrent goes through the gate, outside the
+/// gate's lock: so a test can land a pause between two resumes of one
+/// batch, which the lock held across each resume otherwise leaves to a race.
+#[cfg(test)]
+pub(super) static BEFORE_GATED_RESUME: std::sync::Mutex<Option<(ProfileId, BeforeGatedResume)>> =
+    std::sync::Mutex::new(None);
+
+/// [`BEFORE_GATED_RESUME`]'s hook.
+#[cfg(test)]
+pub(super) type BeforeGatedResume = Box<dyn Fn(usize) + Send>;
+
 /// One batch of [`resume_paced`], on the blocking pool.
 pub(super) fn resume_batch(
     profiles: &ProfileRegistry,
@@ -343,6 +355,15 @@ pub(super) fn resume_batch(
     let mut halted = None;
     let total = batch.len();
     for (i, h) in batch.into_iter().enumerate() {
+        #[cfg(test)]
+        if let Some((hooked, hook)) = &*BEFORE_GATED_RESUME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            if hooked == id {
+                hook(i);
+            }
+        }
         // Noted running before the resume, so a kill-switch fence landing
         // after it, before a state update reports it, resumes it on its
         // lift; put back if the session refuses it.

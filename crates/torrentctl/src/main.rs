@@ -6,6 +6,7 @@
 //! the library (`lib.rs`).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::WrapErr as _;
@@ -37,7 +38,11 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-fn main() -> color_eyre::Result<()> {
+/// How long the exit waits for the runtime's blocking threads once the loop
+/// has finished, before leaving them behind.
+const EXIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn main() -> color_eyre::Result<std::process::ExitCode> {
     color_eyre::install()?;
     let cli = Cli::parse();
     let cfg = config::resolve(config::Overrides {
@@ -63,15 +68,94 @@ fn main() -> color_eyre::Result<()> {
         .build()
         .wrap_err("start the async runtime")?;
     // `ratatui::init` puts the terminal in raw mode on the alternate screen
-    // and installs a panic hook that restores it first.
+    // and installs a panic hook that restores it first. A panic on a
+    // background task ends `run` with `Model::fatal` set.
     let mut terminal = ratatui::init();
-    let result = runtime.block_on(runtime::run(model, &mut terminal));
-    ratatui::restore();
-    // Printed only now: on the alternate screen it would vanish with it.
-    if let Ok(Some(notice)) = &result {
-        eprintln!("{notice}");
+    // However the loop ends, a session token minted from the password is
+    // revoked before `run` returns (or resumes a panic in the loop),
+    // including after a background task's panic.
+    let looped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(runtime::run(model, &mut terminal))
+    }));
+    // A panic in the loop has handed the terminal back already, through the
+    // hook `ratatui::init` installed, and printed its report; the unwinding
+    // drops the terminal, which shows the cursor.
+    if looped.is_ok() {
+        hand_back(terminal);
     }
-    result.map(drop).wrap_err("the terminal failed")
+    // Dropping the runtime would wait for every blocking thread, and one
+    // stuck resolving the daemon's host name (reqwest resolves on blocking
+    // threads) returns only when getaddrinfo gives up: over a dead tunnel,
+    // not soon. The loop has finished, so nothing on the runtime is needed
+    // any more: wait briefly, then leave such a thread behind. `run` has put
+    // the SIGINT and SIGTERM dispositions back, so Ctrl-C ends even this
+    // wait, and left SIGHUP ignored, so a hangup's repeat does not cut off
+    // the notice and the log flush below.
+    runtime.shutdown_timeout(EXIT_TIMEOUT);
+    let ended = looped.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // Printed only now: on the alternate screen it would vanish with it.
+    if let Some(notice) = &ended.model.exit_notice {
+        runtime::notify(notice);
+    }
+    // The last line logged; the guard flushes it as `main` returns. It
+    // carries the terminal's error too: where a signal ended the run, that
+    // error decides nothing below and is reported nowhere else.
+    tracing::info!(
+        target: "torrentctl",
+        signal = ended.signal.unwrap_or("none"),
+        failed = ended.result.is_err(),
+        error = ended.result.as_ref().err().map(tracing::field::display),
+        "exiting"
+    );
+    // A signal decides the status even where the terminal failed too: a
+    // hangup fails the draw or the input read with EIO, often before the
+    // SIGHUP itself arrives.
+    if ended.signal.is_none() {
+        ended.result.wrap_err("the terminal failed")?;
+    }
+    exit_code(ended.model.fatal.as_deref(), ended.signal)
+}
+
+/// Hand the terminal back once the loop has ended without a panic: out of
+/// raw mode, off the alternate screen, the cursor shown.
+///
+/// Not through `ratatui::restore` or `Terminal`'s drop: each reports a
+/// failure with `eprintln!`, and on a hung-up terminal the write fails with
+/// EIO, on which `eprintln!` panics; the panic hook `ratatui::init`
+/// installed restores again, panics inside the hook, and the process aborts
+/// with the log unflushed. A terminal that cannot be restored is one nobody
+/// is reading, so the failure is only logged, and the terminal is forgotten
+/// rather than dropped so that its drop does not try again.
+fn hand_back(mut terminal: ratatui::DefaultTerminal) {
+    match ratatui::try_restore().and_then(|()| terminal.show_cursor()) {
+        Ok(()) => drop(terminal),
+        Err(e) => {
+            tracing::warn!(target: "torrentctl", error = %e, "could not restore the terminal");
+            std::mem::forget(terminal);
+        }
+    }
+}
+
+/// The exit status once the terminal is the user's again. A signal that
+/// ended the loop decides it: 128 plus the signal's number, as a shell
+/// reports a process the signal killed, not a clean exit. That holds even
+/// when a background task then panicked while a minted token was being
+/// revoked; the panic's reason is still printed. A panic alone fails with
+/// its reason through color_eyre.
+fn exit_code(
+    fatal: Option<&str>,
+    signal: Option<&str>,
+) -> color_eyre::Result<std::process::ExitCode> {
+    match (signal, fatal) {
+        (Some(signal), fatal) => {
+            if let Some(what) = fatal {
+                runtime::notify(&format!("torrentctl stopped: {what}"));
+            }
+            Ok(runtime::signal_exit_status(signal).into())
+        }
+        (None, Some(what)) => color_eyre::eyre::bail!("torrentctl stopped: {what}"),
+        (None, None) => Ok(std::process::ExitCode::SUCCESS),
+    }
 }
 
 /// Log to a file in the XDG state directory, never to the terminal the UI
@@ -94,4 +178,29 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         )
         .init();
     Some(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitCode;
+
+    use super::exit_code;
+    use super::runtime::signal_exit_status;
+
+    #[test]
+    fn a_signal_decides_the_exit_status_even_after_a_panic() {
+        let status = ExitCode::from(signal_exit_status("SIGTERM"));
+        assert_eq!(exit_code(None, Some("SIGTERM")).unwrap(), status);
+        assert_eq!(
+            exit_code(Some("a request panicked: x"), Some("SIGTERM")).unwrap(),
+            status
+        );
+    }
+
+    #[test]
+    fn a_panic_alone_fails_with_its_reason() {
+        let err = exit_code(Some("a request panicked: x"), None).unwrap_err();
+        assert_eq!(err.to_string(), "torrentctl stopped: a request panicked: x");
+        assert_eq!(exit_code(None, None).unwrap(), ExitCode::SUCCESS);
+    }
 }

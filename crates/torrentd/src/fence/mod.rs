@@ -251,6 +251,9 @@ pub(crate) struct KillSwitchFence {
     /// The profiles this fence marked `vpn_down`, each with the torrents it
     /// found running and paused.
     fenced: parking_lot::Mutex<Fenced>,
+    /// Whether the watch's last check that decided anything found the table
+    /// in force ([`KillSwitchFence::in_force`]).
+    in_force: atomic::AtomicBool,
     /// Run by [`vpn::killswitch::Fence::fence_all`] for each profile it
     /// fences, after its first read of what is running and before its mark,
     /// so a test can land a resume in that window.
@@ -299,9 +302,26 @@ impl KillSwitchFence {
             metrics,
             probe,
             fenced: Default::default(),
+            // The boot verified the table it installed before the watch,
+            // and so this fence, exists.
+            in_force: atomic::AtomicBool::new(true),
             #[cfg(test)]
             before_mark: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Whether the kill switch last checked in force: false from the moment
+    /// the watch fences every vpn profile — the table found gone or changed,
+    /// or too many checks in a row unable to run — until the check whose
+    /// verdict lifts that fence. A check that cannot run, short of fencing,
+    /// changes nothing, as it changes nothing in the watch.
+    ///
+    /// Setting a fenced profile online refuses while this is false
+    /// (`PATCH /v1/profiles/{profile_id}`): the operator's lift would put the
+    /// profile back on the network with nothing confining its egress, until
+    /// the watch's next check fenced it again.
+    pub(crate) fn in_force(&self) -> bool {
+        self.in_force.load(atomic::Ordering::SeqCst)
     }
 
     /// Run `hold` with this fence's record of what its lift resumes in
@@ -371,6 +391,11 @@ impl vpn::killswitch::Fence for KillSwitchFence {
                  check finds it in force",
             ),
         };
+        // Before any mark: a set-online that reads this as still in force
+        // and lifts a profile this walk has already passed is fenced again
+        // by the watch's next check, which fences on every check until one
+        // finds the table in force.
+        self.in_force.store(false, atomic::Ordering::SeqCst);
         let mut fenced = self.fenced.lock();
         for e in self
             .profiles
@@ -441,6 +466,9 @@ impl vpn::killswitch::Fence for KillSwitchFence {
     }
 
     fn lift(&self) {
+        // Called only once the table checked in force, whatever this lift
+        // then finds of each profile's tunnel.
+        self.in_force.store(true, atomic::Ordering::SeqCst);
         // The tunnel checks run first, outside the lock: each shells out to
         // `ip` (up to its timeout), and every add alert on the alert loop's
         // one thread waits on this lock (`hold_recorded`), so probing under

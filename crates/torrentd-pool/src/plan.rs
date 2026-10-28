@@ -71,25 +71,32 @@ pub type BuildResult = Result<Vec<PlanStep>, Refused>;
 /// Compute the steps for `spec` without touching anything: [`prepare`] and
 /// then [`Prepared::finish`], both against `store`.
 ///
-/// This runs the disk walk with `store` borrowed. A caller that borrows it
-/// under the pool's writer lock calls the two halves itself, finishing once
-/// the lock is released.
+/// This runs the disk checks with `store` borrowed. A caller that borrows it
+/// under a lock calls the two halves itself, and finishes with an
+/// [`IndexReads`] that takes a lock only for each read.
 pub fn build(
     store: &PoolStore,
     spec: &PlanSpec,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
 ) -> Result<BuildResult, PoolError> {
-    Ok(prepare(store, spec, root_path_of)?.and_then(Prepared::finish))
+    match prepare(store, spec, root_path_of)? {
+        Ok(prepared) => prepared.finish(store),
+        Err(refused) => Ok(Err(refused)),
+    }
 }
 
-/// Every check [`build`] makes of the index, with the steps they admit and
-/// the disk checks still to run.
+/// Every check [`build`] makes of the index that decides which steps are
+/// candidates, with the disk checks still to run.
 ///
-/// The index is read here; [`Prepared::finish`] reads only the disk, so it
-/// runs without the store. A relocate's walk of its source directory is the
-/// one disk check whose cost grows with the directory, and holding the
-/// writer lock across it would stall every scan and every other plan for as
-/// long as it takes.
+/// [`Prepared::finish`] runs the disk checks, and makes the index reads they
+/// need through whatever [`IndexReads`] it is handed: the daemon answers
+/// each read on its reader, so the disk checks hold neither the writer lock
+/// nor the reader's. Two disk checks grow with the files involved: a
+/// relocate's walk of its source directory, and a delete's stat of every
+/// orphan under its prefix to tell a claimed file's hard link from a
+/// stranger. Holding the writer lock across either would stall every scan
+/// and every other plan, and holding the reader's every request that reads
+/// the index, for as long as it takes.
 pub fn prepare(
     store: &PoolStore,
     spec: &PlanSpec,
@@ -102,8 +109,11 @@ pub fn prepare(
             dest_rel,
         } => build_relocate(store, infohash, *dest_root_id, dest_rel, root_path_of)?,
         PlanSpec::DeleteOrphans { root_id, prefix } => {
-            build_delete_orphans(store, *root_id, prefix, root_path_of)?
-                .map(|steps| Prepared { steps, walk: None })
+            build_delete_orphans(store, *root_id, prefix, root_path_of)?.map(|orphans| Prepared {
+                steps: Vec::new(),
+                walk: None,
+                orphans: Some(orphans),
+            })
         }
     })
 }
@@ -115,23 +125,84 @@ pub struct Prepared {
     /// A relocate's source directory, its root-relative path, and what the
     /// index lists there as this torrent's, as of [`prepare`].
     walk: Option<(PathBuf, String, Listed)>,
+    /// A delete's candidates, as of [`prepare`]; their steps are built by
+    /// [`Prepared::finish`].
+    orphans: Option<Orphans>,
+}
+
+/// A delete plan's root and every unclaimed file under its prefix.
+#[derive(Debug)]
+struct Orphans {
+    root: PathBuf,
+    files: Vec<Orphan>,
+}
+
+/// An unclaimed file a delete plan may take: its root-relative path, its
+/// indexed `(dev, ino)`, and whether its size is one a torrent in the
+/// library has not found.
+#[derive(Debug)]
+struct Orphan {
+    rel: String,
+    indexed: (u64, u64),
+    wanted_size: bool,
+}
+
+/// The index reads [`Prepared::finish`] makes, each one on its own.
+///
+/// `finish` interleaves these with disk checks. A [`PoolStore`] answers them
+/// directly; the daemon answers each one on its reader, taking the reader's
+/// lock for that read alone, so the disk checks between them hold no lock
+/// and stall nothing else that reads the index.
+pub trait IndexReads {
+    /// [`PoolStore::claimed_identities`].
+    fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError>;
+    /// [`PoolStore::claimed_files_with_identity`].
+    fn claimed_files_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Vec<(PathBuf, String)>, PoolError>;
+}
+
+impl IndexReads for PoolStore {
+    fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
+        PoolStore::claimed_identities(self)
+    }
+
+    fn claimed_files_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Vec<(PathBuf, String)>, PoolError> {
+        PoolStore::claimed_files_with_identity(self, dev, ino)
+    }
 }
 
 impl Prepared {
-    /// Run the disk checks [`prepare`] left, needing no store, and return
-    /// the plan's steps or the refusal.
-    pub fn finish(self) -> BuildResult {
+    /// Run the disk checks [`prepare`] left, and the index reads they need
+    /// through `index`, and return the plan's steps or the refusal.
+    ///
+    /// `index` need not read the connection [`prepare`] read, and need not
+    /// hold the writer lock: the daemon reads on its reader, one read at a
+    /// time, which sees the index as of [`prepare`] or later. What a delete
+    /// plan reads here only leaves out a claimed file's twin, which the
+    /// delete step would refuse, and that step checks every file again
+    /// before it trashes it.
+    pub fn finish(self, index: &impl IndexReads) -> Result<BuildResult, PoolError> {
         // The index is a snapshot and the move is of the directory itself,
         // so the index checks see only what the last scan listed. The disk
         // is asked too.
         if let Some((src_dir, src_base, listed)) = &self.walk {
             if let Some(entry) = unlisted_entry(src_dir, src_base, listed) {
-                return Err(Refused(format!(
+                return Ok(Err(Refused(format!(
                     "{src_base} holds {entry}; moving the directory would take it too"
-                )));
+                ))));
             }
         }
-        Ok(self.steps)
+        if let Some(orphans) = self.orphans {
+            return finish_delete_orphans(index, orphans);
+        }
+        Ok(Ok(self.steps))
     }
 }
 
@@ -254,6 +325,7 @@ fn build_relocate(
             dst: Some(dest_dir.to_string_lossy().into_owned()),
         }],
         walk: Some((src_dir, src_base, listed)),
+        orphans: None,
     }))
 }
 
@@ -293,7 +365,7 @@ fn build_delete_orphans(
     root_id: i64,
     prefix: &str,
     root_path_of: impl Fn(i64) -> Option<PathBuf>,
-) -> Result<BuildResult, PoolError> {
+) -> Result<Result<Orphans, Refused>, PoolError> {
     let Some(root) = root_path_of(root_id) else {
         return Ok(Err(Refused("root is not configured".into())));
     };
@@ -332,33 +404,53 @@ fn build_delete_orphans(
         return Ok(Err(Refused(copies_refusal(ih, area))));
     }
 
+    let mut files = Vec::new();
+    for (rel, size, indexed) in store.orphan_files_sized(root_id, prefix)? {
+        // `.torrentd-trash` is where deleted files go; it is never indexed,
+        // but an index from before that rule may still list it.
+        if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
+            continue;
+        }
+        files.push(Orphan {
+            rel,
+            indexed,
+            wanted_size: unresolved.sizes.contains(&size),
+        });
+    }
+    Ok(Ok(Orphans { root, files }))
+}
+
+/// The delete plan's steps for `orphans`, from [`Prepared::finish`]: the
+/// part of the planning that stats each orphan, so it runs off the writer
+/// lock.
+fn finish_delete_orphans(
+    index: &impl IndexReads,
+    Orphans { root, files }: Orphans,
+) -> Result<BuildResult, PoolError> {
     // A file unclaimed by path can still be a claimed file reached another
     // way: a hard link, or the claimed file seen through a second root that
     // aliases the first. The executor refuses those steps, and a refused step
     // stops the plan, so they are left out here rather than emitted to fail.
-    let claimed = store.claimed_identities()?;
+    let claimed = index.claimed_identities()?;
     let mut held_back = 0usize;
     let mut aliased = 0usize;
-    let orphans: Vec<String> = store
-        .orphan_files_sized(root_id, prefix)?
-        .into_iter()
-        .filter_map(|(rel, size, identity)| {
-            // `.torrentd-trash` is where deleted files go; it is never indexed,
-            // but an index from before that rule may still list it.
-            if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
-                return None;
-            }
-            if claimed.contains(&identity) {
-                aliased += 1;
-                return None;
-            }
-            if unresolved.sizes.contains(&size) {
-                held_back += 1;
-                return None;
-            }
-            Some(rel)
-        })
-        .collect();
+    let mut orphans: Vec<String> = Vec::new();
+    for Orphan {
+        rel,
+        indexed,
+        wanted_size,
+    } in files
+    {
+        if is_claimed_twin(index, &claimed, &root, &rel, indexed)? {
+            aliased += 1;
+            continue;
+        }
+        if wanted_size {
+            held_back += 1;
+            continue;
+        }
+        orphans.push(rel);
+    }
     if orphans.is_empty() {
         return Ok(Err(Refused(if held_back + aliased > 0 {
             format!(
@@ -386,6 +478,60 @@ fn build_delete_orphans(
         }
     }
     Ok(Ok(steps))
+}
+
+/// Whether the orphan at `rel` under `root`, indexed as `indexed`, is a
+/// claimed file reached by another path: a hard link, or the claimed file
+/// through an aliased root.
+///
+/// `claimed` is every claimed file's indexed identity. An indexed identity
+/// can be older than the disk (a rescan carries a row it could not re-read
+/// forward, and a reboot renumbers devices and inodes), on either side: the
+/// orphan's own row can be stale, and so can a claimed file's. So, as the
+/// delete step decides it, the orphan is stat'd, and every claimed file
+/// whose indexed identity is the orphan's live or indexed one is only a
+/// candidate. Each candidate is stat'd, and the orphan is a twin only if
+/// one's live identity is the orphan's live identity: a stale claimed row
+/// that merely collides keeps the orphan in the plan, and a hard link whose
+/// own row is stale is still found through the claimed file's current row.
+/// One gone from its path is not the orphan. Where a candidate cannot be
+/// stat'd for another reason than being gone, the two cannot be told apart
+/// and the orphan is a twin: the delete step would refuse it, and a refused
+/// step stops the plan. Where the orphan itself cannot be stat'd, it is a
+/// twin when its indexed identity is a claimed one, for the same reason.
+fn is_claimed_twin(
+    index: &impl IndexReads,
+    claimed: &HashSet<(u64, u64)>,
+    root: &Path,
+    rel: &str,
+    indexed: (u64, u64),
+) -> Result<bool, PoolError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let live = match root.join(rel).symlink_metadata() {
+        Ok(md) => (md.dev(), md.ino()),
+        Err(_) => return Ok(claimed.contains(&indexed)),
+    };
+    let mut candidates = vec![live];
+    if indexed != live {
+        candidates.push(indexed);
+    }
+    candidates.retain(|id| claimed.contains(id));
+    for (dev, ino) in candidates {
+        for (claimed_root, claimed_rel) in index.claimed_files_with_identity(dev, ino)? {
+            match claimed_root.join(&claimed_rel).symlink_metadata() {
+                Ok(md) if (md.dev(), md.ino()) == live => return Ok(true),
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(_) => return Ok(true),
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Where a delete plan puts the files it removes, relative to their root.
@@ -979,6 +1125,59 @@ mod tests {
             status: "pending".into(),
             error: None,
         }
+    }
+
+    /// A destination file that cannot be examined, here for want of search
+    /// permission on its directory, is reported as in the way: nothing shows
+    /// the way is clear.
+    #[test]
+    fn a_destination_that_cannot_be_examined_is_in_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(dest.join("T")).unwrap();
+        let mut store = crate::PoolStore::open_in_memory().unwrap();
+        store
+            .upsert_torrent(
+                &crate::model::PoolTorrent {
+                    infohash: "aa".into(),
+                    infohash_v1: Some("aa".into()),
+                    infohash_v2: None,
+                    name: "T".into(),
+                    total_size: 64,
+                    num_files: 1,
+                    source_path: PathBuf::from("/library/aa.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+            .unwrap();
+        store
+            .replace_torrent_files(
+                "aa",
+                &[crate::model::TorrentFileRow {
+                    infohash: "aa".into(),
+                    idx: 0,
+                    rel_path: "T/a.bin".into(),
+                    size: 64,
+                    pieces_root: None,
+                    pad_file: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            super::existing_destination_file(&store, "aa", &dest).unwrap(),
+            None
+        );
+        crate::scan::with_unlistable(&dest.join("T"), || {
+            assert_eq!(
+                super::existing_destination_file(&store, "aa", &dest).unwrap(),
+                Some("T/a.bin".to_string())
+            );
+        });
     }
 
     /// Plans that differ only in where one field ends and the next begins, or

@@ -20,9 +20,10 @@
 //!
 //! Hashing reads every byte of the pool, so it cannot be the routine check:
 //!
-//! 1. **Cheap sweep** — `(size, mtime, inode, device)` against the recorded
-//!    snapshot. Catches essentially every real change and runs over a large
-//!    pool routinely. See [`drift`].
+//! 1. **Cheap sweep** — `(size, mtime)` against the recorded snapshot.
+//!    Catches essentially every real change and runs over a large pool
+//!    routinely. Inode and device are not compared: a reboot or a remount
+//!    renumbers them without touching a byte. See [`drift`].
 //! 2. **Authoritative verify** — libtorrent re-hashes the payload (v1 SHA-1,
 //!    v2 SHA-256 merkle). Triggered on drift, and on adopt for every torrent
 //!    but the fast path's. torrentd never reimplements piece hashing.

@@ -7,16 +7,34 @@ use tracing::warn;
 
 use crate::pool_service::AdoptRefusal;
 
+/// The key a `.torrent`'s session would report for it
+/// ([`libtorrent_safe::info_hash_from_torrent`]), where that is not
+/// `infohash`, the one it is filed under: `Ok` where the two agree, else the
+/// key read, `None` where none can be read from `bytes`.
+pub(crate) fn torrent_key_mismatch(
+    infohash: &str,
+    bytes: &[u8],
+) -> Result<(), Option<libtorrent_safe::InfoHash>> {
+    let key = libtorrent_safe::info_hash_from_torrent(bytes).ok();
+    match (key, libtorrent_safe::InfoHash::from_hex(infohash)) {
+        (Some(key), Some(filed)) if key == filed => Ok(()),
+        _ => Err(key),
+    }
+}
+
 /// Refuse an adoption whose `.torrent` its session would key by another
-/// infohash than the one the pool index records it under: a hybrid (v1+v2)
-/// torrent an index written by an earlier build keyed by its truncated v2
-/// hash. Every record the adoption keeps is under the index's key, and every
-/// alert of the torrent's would name the other.
+/// infohash than the one the pool index records it under.
 ///
-/// Only a row filed under one of the torrent's own hashes is refused here: a
-/// `.torrent` that names another torrent altogether is the library changing
-/// under the index, which the drift pass and the verify path deal with. One
-/// that cannot be read or parsed passes too: the paths after this one refuse
+/// That is a hybrid (v1+v2) torrent an index written by an earlier build
+/// keyed by its truncated v2 hash: every record the adoption keeps is under
+/// the index's key, and every alert of the torrent's would name the other.
+/// It is also a `.torrent` that names another torrent altogether, the library
+/// file replaced since the scan indexed it (issue #612): adopted, that other
+/// torrent would be added under the indexed one's claim and saved as its
+/// `.torrent`. The verify path holds the bytes it reads at admission to the
+/// same key, since the file can change again while the adoption waits.
+///
+/// One that cannot be read or parsed passes: the paths after this one refuse
 /// it on their own.
 pub(crate) fn refuse_if_rekeyed(
     infohash: &str,
@@ -32,7 +50,22 @@ pub(crate) fn refuse_if_rekeyed(
         return Ok(());
     };
     match hashes.key() {
-        Some(key) if key != filed && hashes.keys().any(|k| k == filed) => {
+        Some(key) if !hashes.keys().any(|k| k == filed) => {
+            warn!(
+                target: "torrentd::pool",
+                infohash = %infohash,
+                torrent_infohash = %key,
+                path = %torrent_path.display(),
+                "adoption refused: the library .torrent names another torrent than the one the \
+                 pool index records",
+            );
+            Err(format!(
+                "the library .torrent now names another torrent ({key}) than the one the pool \
+                 index records; rescan the library to index it"
+            )
+            .into())
+        }
+        Some(key) if key != filed => {
             warn!(
                 target: "torrentd::pool",
                 infohash = %infohash,
@@ -124,6 +157,12 @@ mod tests {
         assert!(refusal.reason.contains(&v1), "{}", refusal.reason);
         assert!(!refusal.isolation);
         assert!(super::refuse_if_rekeyed(&v1, &path).is_ok());
+        // Issue #612: a `.torrent` that names another torrent altogether, the
+        // library file replaced since the scan, is refused too.
+        let other = libtorrent_safe::InfoHash([0x05; 20]).to_hex();
+        let refusal = super::refuse_if_rekeyed(&other, &path).unwrap_err();
+        assert!(refusal.reason.contains(&v1), "{}", refusal.reason);
+        assert!(!refusal.isolation);
         let dir = tempfile::tempdir().unwrap();
         assert!(super::refuse_if_rekeyed(&v2, &dir.path().join("missing.torrent")).is_ok());
         // Issue #543: past the library read cap it is not read, so passes

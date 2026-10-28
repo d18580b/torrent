@@ -12,6 +12,7 @@ use torrentd_engine::TorrentPhase;
 use torrentd_engine::TorrentState;
 
 use super::tests::SETTLE;
+use crate::pool_service::tests::owner_of;
 use crate::pool_service::tests::padded_past_the_cap;
 use crate::pool_service::tests::pending;
 use crate::pool_service::tests::pool_with;
@@ -99,6 +100,21 @@ impl Worker {
         st.checked_at = Some(Instant::now());
         self.state.insert(ih, st);
     }
+}
+
+/// A one-file `.torrent` named `name`, written to `dir`, and the info-hash
+/// its session keys it by, which admission holds the queued item to.
+fn library_torrent(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, InfoHash) {
+    let mut t = format!(
+        "d4:infod6:lengthi1e4:name{}:{name}12:piece lengthi16384e6:pieces20:",
+        name.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    let path = dir.join(format!("{name}.torrent"));
+    std::fs::write(&path, &t).unwrap();
+    (path, libtorrent_safe::info_hash_from_torrent(&t).unwrap())
 }
 
 /// `POST /v1/pool/verifications` naming 50 torrents with
@@ -633,17 +649,12 @@ fn adoptions_and_rehashes_waiting_together_are_admitted_in_turn() {
     pool.verify = Arc::new(super::VerifyQueue::new(4));
     let w = Worker::new(dir.path());
     let q = pool.verify_queue();
-    for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
-        let mut t = format!("d4:infod6:lengthi1e4:name1:{name}12:piece lengthi16384e6:pieces20:")
-            .into_bytes();
-        t.extend_from_slice(&[0u8; 20]);
-        t.extend_from_slice(b"ee");
-        let path = dir.path().join(format!("{name}.torrent"));
-        std::fs::write(&path, t).unwrap();
+    for name in ["a", "b", "c"] {
+        let (path, ih) = library_torrent(dir.path(), name);
         q.enqueue(super::PendingVerify {
             torrent_path: path,
             save_path: dir.path().to_path_buf(),
-            ..pending(InfoHash([0xA0 + i as u8; 20]), "p")
+            ..pending(ih, "p")
         });
     }
     let rehashes = [0xB0, 0xB1, 0xB2].map(|b| InfoHash([b; 20]));
@@ -709,12 +720,7 @@ fn a_verify_tick_does_not_wait_on_a_scan_holding_the_writer() {
     w.load(rehash, 2, "p", TorrentPhase::Seeding);
     q.enqueue_recheck(rehash.to_hex(), false);
     // An adoption waiting for a slot.
-    let waiting = InfoHash([0xE2; 20]);
-    let mut t = b"d4:infod6:lengthi1e4:name1:w12:piece lengthi16384e6:pieces20:".to_vec();
-    t.extend_from_slice(&[0u8; 20]);
-    t.extend_from_slice(b"ee");
-    let path = dir.path().join("w.torrent");
-    std::fs::write(&path, t).unwrap();
+    let (path, waiting) = library_torrent(dir.path(), "w");
     q.enqueue(super::PendingVerify {
         torrent_path: path,
         save_path: dir.path().to_path_buf(),
@@ -805,21 +811,10 @@ fn a_fenced_adoption_at_the_head_does_not_hold_back_the_ones_behind_it() {
     pool.verify = Arc::new(super::VerifyQueue::new(4));
     let w = Worker::new(dir.path());
     let q = pool.verify_queue();
-    let fenced = InfoHash([0xD0; 20]);
-    for (i, (ih, profile)) in [
-        (fenced, "down"),
-        (InfoHash([0xD1; 20]), "p"),
-        (InfoHash([0xD2; 20]), "p"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut t =
-            format!("d4:infod6:lengthi1e4:name1:{i}12:piece lengthi16384e6:pieces20:").into_bytes();
-        t.extend_from_slice(&[0u8; 20]);
-        t.extend_from_slice(b"ee");
-        let path = dir.path().join(format!("{i}.torrent"));
-        std::fs::write(&path, t).unwrap();
+    let mut fenced = None;
+    for (i, profile) in ["down", "p", "p"].into_iter().enumerate() {
+        let (path, ih) = library_torrent(dir.path(), &i.to_string());
+        fenced.get_or_insert(ih);
         q.enqueue(super::PendingVerify {
             torrent_path: path,
             save_path: dir.path().to_path_buf(),
@@ -843,7 +838,11 @@ fn a_fenced_adoption_at_the_head_does_not_hold_back_the_ones_behind_it() {
         .iter()
         .map(|v| v.infohash.clone())
         .collect();
-    assert_eq!(held, [fenced.to_hex()], "the fenced one waits, queued once");
+    assert_eq!(
+        held,
+        [fenced.unwrap().to_hex()],
+        "the fenced one waits, queued once"
+    );
 
     // Still fenced on the next tick: held again, and nothing else added.
     w.tick(&pool);
@@ -921,6 +920,195 @@ fn an_adoption_whose_torrent_is_past_the_cap_is_dropped_unread() {
         .iter()
         .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
     assert_eq!((q.failed(), q.depth(), q.in_flight()), (1, 0, 0));
+}
+
+/// Issue #653: an adoption the verify worker adds records the trackers it
+/// announces to in place of the `.torrent`'s beside the `.torrent` it
+/// persists, so a restart before the session's first resume save re-adds it
+/// with them.
+#[test]
+fn an_admitted_adoption_records_its_trackers_beside_its_torrent() {
+    use torrentd_engine::TorrentStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+    let store = Arc::new(torrentd_engine::MemoryTorrentStore::new());
+    pool.set_torrent_store(store.clone());
+    let w = Worker::new(dir.path());
+    let (path, ih) = library_torrent(dir.path(), "tracked");
+    let trackers = vec![vec!["https://t.example/announce".to_owned()]];
+    pool.verify_queue().enqueue(super::PendingVerify {
+        torrent_path: path,
+        save_path: dir.path().to_path_buf(),
+        trackers: trackers.clone(),
+        ..pending(ih, "p")
+    });
+
+    w.tick(&pool);
+    let p = ProfileId::new("p");
+    assert!(store.exists(&p, &ih), "{:?}", w.engine.calls());
+    assert_eq!(store.read_trackers(&p, &ih).unwrap(), trackers);
+}
+
+/// Issue #612: an adoption whose library `.torrent` was replaced by another
+/// torrent's after it was queued is dropped at admission as a failed verify,
+/// its registry claim released. Before, the other torrent was added under
+/// this one's claim and persisted as its `.torrent`.
+#[test]
+fn an_adoption_whose_library_torrent_was_replaced_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, queued) = library_torrent(dir.path(), "a");
+    let mut pool = pool_with(dir.path(), queued, None);
+    pool.verify = Arc::new(super::VerifyQueue::new(4));
+    let w = Worker::new(dir.path());
+    w.registry.assign(queued, ProfileId::new("p")).unwrap();
+    let q = pool.verify_queue();
+    q.enqueue(super::PendingVerify {
+        torrent_path: path.clone(),
+        save_path: dir.path().to_path_buf(),
+        ..pending(queued, "p")
+    });
+    // The library file now holds another torrent.
+    let (other_path, other) = library_torrent(dir.path(), "b");
+    assert_ne!(other, queued);
+    std::fs::rename(other_path, &path).unwrap();
+
+    w.tick(&pool);
+    assert!(!w
+        .engine
+        .calls()
+        .iter()
+        .any(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_))));
+    assert_eq!((q.failed(), q.depth(), q.in_flight()), (1, 0, 0));
+    assert_eq!(w.registry.lookup(&queued), None, "the claim is released");
+}
+
+/// Issue #651: a boot whose persisted adoption queue names a profile with no
+/// session holds that profile's items, row, owner record and registry claim
+/// intact, and admits them once the profile has an engine. Before, each was
+/// dropped as though its profile were gone. An item whose profile no
+/// `[[profile]]` declares any more is still dropped.
+#[test]
+fn a_boot_holds_the_queued_adoptions_of_a_profile_without_a_session() {
+    use crate::profile_registry::test_entry;
+    use crate::profile_registry::test_failed_profile;
+    use crate::profile_registry::ProfileRegistry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let w = Worker::new(dir.path());
+    let torrents: Vec<_> = [("a", "p"), ("b", "f"), ("c", "gone")]
+        .into_iter()
+        .map(|(name, profile)| {
+            let (path, ih) = library_torrent(dir.path(), name);
+            (path, ih, profile)
+        })
+        .collect();
+    let mut pool = pool_with(dir.path(), torrents[0].1, None);
+    // The run before the restart: every profile up, each adoption claimed,
+    // recorded as its profile's, and queued in `pool.db`.
+    let before = ProfileRegistry::new(
+        ["p", "f", "gone"]
+            .into_iter()
+            .map(|id| test_entry(id, ProfileStatus::Active))
+            .collect(),
+    );
+    for (path, ih, profile) in &torrents {
+        pool.with_store(|s| {
+            s.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.to_hex(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "t".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: path.clone(),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+            .unwrap();
+        });
+        w.registry.assign(*ih, ProfileId::new(*profile)).unwrap();
+        crate::pool_service::enqueue_verify(
+            &pool,
+            &before,
+            &ih.to_hex(),
+            path.clone(),
+            dir.path().to_path_buf(),
+            None,
+            ProfileId::new(*profile),
+            false,
+        )
+        .unwrap();
+    }
+    // The restart: the in-memory queue is gone, `p` is up but its session
+    // not yet reachable, `f`'s tunnel failed, and `gone` left the config.
+    pool.verify = Arc::new(super::VerifyQueue::new(4));
+    let ihs: Vec<InfoHash> = torrents.iter().map(|t| t.1).collect();
+    assert_eq!(
+        pool.restore_verify_queue(&w.registry, &Default::default()),
+        ihs
+    );
+    let booted = Arc::new(
+        ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)])
+            .with_failed(vec![test_failed_profile("f", "tunnel failed")]),
+    );
+    let no_engine: Arc<dyn torrentd_engine::AlertSource> =
+        Arc::new(torrentd_engine::ProfileSource::new(Vec::new()));
+    let tick = |source: &Arc<dyn torrentd_engine::AlertSource>| {
+        let store = pool.lock_writer();
+        super::worker::admit(
+            pool.verify_queue(),
+            Some((&pool, &store)),
+            source,
+            &w.state,
+            &w.metrics,
+            &booted,
+            &w.registry,
+        );
+    };
+    let adds = || {
+        w.engine
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, torrentd_engine::RecordedCall::AddTorrent(_)))
+            .count()
+    };
+    let rows = || -> Vec<String> {
+        pool.with_store(|s| s.verify_queue().unwrap())
+            .into_iter()
+            .map(|r| r.infohash)
+            .collect()
+    };
+    let intact = |ih: InfoHash, profile: &str| {
+        assert!(rows().contains(&ih.to_hex()), "{profile}'s row stays");
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some(profile));
+        assert_eq!(w.registry.lookup(&ih), Some(ProfileId::new(profile)));
+    };
+
+    for _ in 0..2 {
+        tick(&no_engine);
+        assert_eq!(adds(), 0);
+        assert_eq!(pool.verify_queue().depth(), 2, "`p` and `f` wait");
+        intact(ihs[0], "p");
+        intact(ihs[1], "f");
+    }
+    // The undeclared profile's item went the first tick, with its records.
+    assert!(!rows().contains(&ihs[2].to_hex()));
+    assert_eq!(owner_of(&pool, ihs[2]), None);
+    assert_eq!(w.registry.lookup(&ihs[2]), None);
+
+    // `p`'s engine appears: its adoption is admitted, and `f`'s still waits.
+    tick(&w.source);
+    assert_eq!(adds(), 1);
+    assert_eq!(pool.verify_queue().in_flight(), 1);
+    assert_eq!(pool.verify_queue().depth(), 1);
+    intact(ihs[1], "f");
 }
 
 /// Re-hashes held for a fenced profile log the hold once per profile per

@@ -1,6 +1,7 @@
 //! The boot scans: every profile's resume files, then the `.torrent`s no
-//! resume file covered, each held to the registry, the tracker guard and the
-//! tombstones before it is handed to its session.
+//! resume file covered, then the recorded magnets neither covered, each held
+//! to the registry, the tracker guard and the tombstones before it is handed
+//! to its session.
 
 use std::collections::HashSet;
 
@@ -420,6 +421,30 @@ fn torrent_dir_save_path(
     default.to_owned()
 }
 
+/// The trackers the boot torrent-dir scan re-adds a torrent with in place of
+/// its `.torrent`'s own: those recorded beside it, which an adoption from
+/// qBittorrent 4.4 or later writes because its `.torrent` may carry none.
+///
+/// A record that cannot be read is logged, and the torrent is re-added with
+/// its `.torrent`'s own trackers, which the account-isolation guard then
+/// holds to the profile's allow-list as it does any other.
+fn torrent_dir_trackers(
+    store: &dyn TorrentStore,
+    profile: &ProfileId,
+    ih: &libtorrent_safe::InfoHash,
+) -> Vec<Vec<String>> {
+    store.read_trackers(profile, ih).unwrap_or_else(|e| {
+        warn!(
+            profile_id = %profile,
+            infohash = %ih,
+            error.cause = %e,
+            "torrent-dir scan: the trackers recorded beside a .torrent could not be read; \
+             re-adding it with the .torrent's own",
+        );
+        Vec::new()
+    })
+}
+
 /// Whether the boot torrent-dir scan must leave a torrent this profile has
 /// claimed unloaded rather than re-add it.
 ///
@@ -476,23 +501,28 @@ fn pool_holds_back(
 /// Hash-checked before it seeds: with no resume data nothing vouches for the
 /// payload, which may be missing or truncated, and `SEED_MODE` would announce
 /// it complete until a peer's request failed a piece.
+///
+/// `trackers`, where not empty, replace the `.torrent`'s own
+/// ([`torrent_dir_trackers`]).
 fn torrent_dir_scan_params(
     profile: &ProfileConfig,
     bytes: Vec<u8>,
     save_path: String,
+    trackers: Vec<Vec<String>>,
 ) -> AddParams {
     AddParams::File {
         bytes,
         save_path,
         flags: torrentd_engine::verify_flags(profile),
-        trackers: Vec::new(),
+        trackers,
     }
 }
 
 /// `params`, added paused: a `.torrent` whose first check waits for a slot
 /// in the check queue, which resumes it. A resume add is paused whatever its
 /// resume data says, and whatever `paced` cleared. A magnet is returned
-/// unchanged: the boot scans never add one.
+/// unchanged: the boot re-adds one ([`readd_magnets`]) with nothing to check
+/// before its metadata arrives, so never holds one for a check slot.
 fn with_paused(mut params: AddParams) -> AddParams {
     let paused = libtorrent_safe::TorrentFlags::PAUSED;
     match &mut params {
@@ -692,7 +722,8 @@ pub(super) async fn resume_scan(
                 Ok(t) => t,
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
-                          "could not read .torrent for resume add; continuing without metadata");
+                          "could not read .torrent for resume add; trying the pool library's, \
+                           else continuing without metadata");
                     load_failures
                         .entry(profile.clone())
                         .or_default()
@@ -701,9 +732,11 @@ pub(super) async fn resume_scan(
                 }
             };
             // A torrent the pool adopted before adoption wrote its `.torrent`
-            // to the store has none there; the library's copy the pool index
-            // names is the same metadata. Written back to the store, so the
-            // repair happens once and the library may move on.
+            // to the store has none there, and one whose stored `.torrent`
+            // cannot be read has none usable; the library's copy the pool
+            // index names is the same metadata. Written back to the store,
+            // over the unreadable one too, so the repair happens once and
+            // the library may move on.
             let torrent = match (torrent, pool.as_ref()) {
                 (None, Some(pool)) => {
                     let found = pool.library_torrent(&ih);
@@ -1019,6 +1052,9 @@ pub(super) async fn torrent_dir_scan(
             .or_default()
             .torrent_file += listing.unreadable;
         let entries = listing.names;
+        // A magnet's URI is consulted only where no `.torrent` is filed: once
+        // its metadata arrived, the `.torrent` is the record, readable or not.
+        let filed: HashSet<libtorrent_safe::InfoHash> = entries.iter().copied().collect();
         let engine = source
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
@@ -1136,7 +1172,8 @@ pub(super) async fn torrent_dir_scan(
             // allow-list like one posted to the API.
             let save_path =
                 torrent_dir_save_path(metrics, torrent_store, &profile, &ih, &scan_save_path);
-            let mut params = torrent_dir_scan_params(profile_cfg, bytes, save_path);
+            let trackers = torrent_dir_trackers(torrent_store, &profile, &ih);
+            let mut params = torrent_dir_scan_params(profile_cfg, bytes, save_path, trackers);
             if let Err(refusal) = boot_scan_guard(metrics, profile_cfg, &ih, &params, "torrent_dir")
             {
                 if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
@@ -1223,6 +1260,23 @@ pub(super) async fn torrent_dir_scan(
                 }
             }
         }
+        added += readd_magnets(
+            inputs,
+            MagnetScan {
+                profile: &profile,
+                profile_cfg,
+                engine: &*engine,
+                filed: &filed,
+                default_save_path: &scan_save_path,
+                misplaced,
+                removed_at_boot,
+            },
+            loaded,
+            load_failures,
+            scan_fence,
+            boot_shutdown,
+        )
+        .await?;
         checked_hold.hold_all();
         checked_hold.verdict()?;
         if added > 0 {
@@ -1234,6 +1288,212 @@ pub(super) async fn torrent_dir_scan(
             .or_insert(added);
     }
     Ok(())
+}
+
+/// One profile's part of the torrent-dir scan that [`readd_magnets`] reads.
+struct MagnetScan<'a> {
+    profile: &'a ProfileId,
+    profile_cfg: &'a ProfileConfig,
+    engine: &'a dyn TorrentEngine,
+    /// The info-hash of every `.torrent` filed for the profile.
+    filed: &'a HashSet<libtorrent_safe::InfoHash>,
+    default_save_path: &'a str,
+    misplaced: &'a HashSet<(ProfileId, libtorrent_safe::InfoHash)>,
+    removed_at_boot: &'a HashSet<(ProfileId, libtorrent_safe::InfoHash)>,
+}
+
+/// The torrent-dir scan's last step for one profile: re-add each magnet
+/// `POST /v1/torrents` recorded whose torrent nothing else loaded (issue
+/// #627), and return how many it added.
+///
+/// A magnet has no `.torrent` until its metadata arrives and no resume file
+/// until its first save lands, so a daemon stopped before both left only its
+/// claim, which refused the same magnet posted again as `409`. Its URI is
+/// re-added as the API added it: at the save path recorded beside it, with
+/// DHT, PEX and LSD off until its metadata says otherwise, held to the
+/// tracker guard and the registry first. One with a resume file the resume
+/// scan loaded, a `.torrent`, or a standing tombstone is skipped, and one
+/// filed under an infohash its URI does not name is refused. Nothing is
+/// queued for a check: there is nothing to check before the metadata.
+///
+/// A record that cannot be read is counted under `torrent_file`, and one its
+/// session refuses under `torrent_dir_add`, in `boot_torrent_load_failures`.
+async fn readd_magnets(
+    inputs: &ScanInputs<'_>,
+    scan: MagnetScan<'_>,
+    loaded: &mut HashSet<libtorrent_safe::InfoHash>,
+    load_failures: &mut std::collections::HashMap<ProfileId, BootLoadFailures>,
+    scan_fence: &mut ScanFence,
+    boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
+) -> anyhow::Result<usize> {
+    let ScanInputs {
+        profile_registry,
+        torrent_store,
+        registry,
+        metrics,
+        checked_hold,
+        boot_progress,
+        ..
+    } = *inputs;
+    let MagnetScan {
+        profile,
+        profile_cfg,
+        engine,
+        filed,
+        default_save_path,
+        misplaced,
+        removed_at_boot,
+    } = scan;
+    // `listing.unreadable` is not counted: it counts the directory entries
+    // that could not be read, and the `.torrent` listing of this same
+    // directory already counted each of them under `torrent_file`.
+    let listing = torrent_store
+        .list_magnets(profile)
+        .context("scan torrent dir for magnets")?;
+    let mut added = 0usize;
+    for (i, ih) in listing.names.into_iter().enumerate() {
+        between_scan_batches(i, "magnet", boot_shutdown, boot_progress, || {
+            scan_fence.enforce_all(profile_registry, metrics);
+            checked_hold.hold_all();
+            checked_hold.verdict()
+        })
+        .await?;
+        if loaded.contains(&ih)
+            || filed.contains(&ih)
+            || removed_at_boot.contains(&(profile.clone(), ih))
+        {
+            continue;
+        }
+        let uri = match torrent_store.read_magnet(profile, &ih) {
+            Ok(Some(uri)) => uri,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "skipping a recorded magnet URI that could not be read",
+                );
+                load_failures
+                    .entry(profile.clone())
+                    .or_default()
+                    .torrent_file += 1;
+                continue;
+            }
+        };
+        // The API keys a magnet by the v1 infohash it names and files it
+        // under that; a record naming another is not this torrent's.
+        let named = libtorrent_safe::info_hashes_from_magnet(&uri)
+            .ok()
+            .and_then(|h| h.v1);
+        if named != Some(ih) {
+            warn!(
+                profile_id = %profile,
+                infohash = %ih,
+                "boot scan: recorded magnet URI does not name the v1 infohash it is filed under; \
+                 not loaded (operator must reconcile: add the magnet again)",
+            );
+            load_failures
+                .entry(profile.clone())
+                .or_default()
+                .torrent_dir_add += 1;
+            continue;
+        }
+        let claimed_here = match registry.lookup(&ih) {
+            None => false,
+            Some(owner) if owner == *profile => true,
+            Some(owner) => {
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    existing_profile = %owner,
+                    "magnet record in wrong profile; skipping (operator must reconcile)",
+                );
+                if !misplaced.contains(&(profile.clone(), ih)) {
+                    metrics.inc_counter(
+                        "profile_assignment_registry_errors_total",
+                        &[("profile_id", profile.as_str())],
+                    );
+                }
+                continue;
+            }
+        };
+        // No `pool_holds_back`: the pool adopts `.torrent`s, never a magnet,
+        // so no magnet record is an adoption the verify queue owns.
+        let save_path =
+            torrent_dir_save_path(metrics, torrent_store, profile, &ih, default_save_path);
+        let params = AddParams::Magnet {
+            uri,
+            save_path,
+            flags: torrentd_engine::policy::magnet_flags(profile_cfg),
+        };
+        if let Err(refusal) = boot_scan_guard(metrics, profile_cfg, &ih, &params, "magnet") {
+            if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
+                load_failures
+                    .entry(profile.clone())
+                    .or_default()
+                    .torrent_dir_add += 1;
+            }
+            continue;
+        }
+        let claim = if claimed_here {
+            Ok(())
+        } else {
+            registry.assign(ih, profile.clone()).map(drop)
+        };
+        if let Err(e) = claim {
+            warn!(
+                profile_id = %profile,
+                infohash = %ih,
+                error.cause = %e,
+                "could not record the magnet's assignment; skipping this torrent",
+            );
+            metrics.inc_counter(
+                "profile_assignment_registry_errors_total",
+                &[("profile_id", profile.as_str())],
+            );
+            continue;
+        }
+        match engine.add_torrent(params) {
+            Ok(h) => {
+                added += 1;
+                loaded.insert(ih);
+                scan_fence.added(profile_registry, metrics, profile, h);
+            }
+            Err(e) => {
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "magnet re-add failed",
+                );
+                load_failures
+                    .entry(profile.clone())
+                    .or_default()
+                    .torrent_dir_add += 1;
+                // As the `.torrent` re-add: release only a claim made here.
+                let released = if claimed_here {
+                    Ok(())
+                } else {
+                    registry.remove(&ih).map(drop)
+                };
+                if let Err(e) = released {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        error.cause = %e,
+                        "could not release the claim of a torrent that failed to load",
+                    );
+                    metrics.inc_counter("store_write_errors_total", &[("store", "registry")]);
+                }
+            }
+        }
+    }
+    if added > 0 {
+        info!(profile_id = %profile, torrent_count = added,
+              "torrent dir scan: re-added magnets that had no resume file or .torrent");
+    }
+    Ok(added)
 }
 
 /// What one profile's boot scans could not load, by the `source` label of
@@ -1313,6 +1573,204 @@ mod tests {
         );
     }
 
+    /// Issue #627: a magnet the daemon stopped with before its metadata and
+    /// its first resume save left only its claim and its records. The
+    /// torrent-dir scan re-adds it from its recorded URI, at its recorded save
+    /// path and with discovery off, keeping the claim, so the claim no longer
+    /// refuses the same magnet as `409` with nothing loaded. What another
+    /// record covers, a tombstone removed, another profile claims, that is
+    /// filed under a hash its URI does not name, or that cannot be read is
+    /// not re-added, and each refusal is counted.
+    #[tokio::test]
+    async fn the_torrent_dir_scan_re_adds_a_magnet_stopped_before_its_first_save() {
+        use torrentd_engine::mock::AddParamsSummary;
+        use torrentd_engine::RecordedCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = ProfileId::new("p");
+        let cfg = cfg_with(dir.path(), &[]);
+        let entry = crate::profile_registry::test_entry("p", ProfileStatus::Active);
+        let engine = Arc::new(MockEngine::new());
+        let source =
+            ProfileSource::new(vec![(p.clone(), engine.clone() as Arc<dyn TorrentEngine>)]);
+        let profiles = ProfileRegistry::new(vec![entry]);
+        let registry = AssignmentRegistry::new_empty(dir.path().join("reg.db"));
+        let resume = torrentd_engine::MemoryResumeStore::new();
+        let torrents = FsTorrentStore::new(dir.path().join("torrents"));
+        let metrics = PromSink::new();
+        let state = StateMap::new();
+        let checks = crate::check_queue::VerifyQueue::for_daemon(None);
+        let checked_hold = CheckedHold::new(&source, Arc::new(|_: &ProfileId, _: &str| Ok(())));
+        let progress = sd_notify::Progress::new();
+        let (_tx, mut shutdown) = broadcast::channel::<ShutdownReason>(1);
+        let mut fence = ScanFence::new(None);
+
+        let ih = |b: u8| libtorrent_safe::InfoHash([b; 20]);
+        let uri = |b: u8| format!("magnet:?xt=urn:btih:{}", ih(b).to_hex());
+        // Claimed by `POST /v1/torrents` before the crash, with its save path.
+        let (crashed, unclaimed, resumed, removed, foreign, misfiled, garbled) = (
+            ih(0x61),
+            ih(0x62),
+            ih(0x63),
+            ih(0x64),
+            ih(0x65),
+            ih(0x66),
+            ih(0x68),
+        );
+        registry.assign(crashed, p.clone()).unwrap();
+        torrents.write_save_path(&p, &crashed, "/data/m").unwrap();
+        registry.assign(foreign, ProfileId::new("q")).unwrap();
+        for b in [0x61, 0x62, 0x63, 0x64, 0x65, 0x68] {
+            torrents.write_magnet(&p, &ih(b), &uri(b)).unwrap();
+        }
+        torrents.write_magnet(&p, &misfiled, &uri(0x67)).unwrap();
+        // Not UTF-8, so the record cannot be read.
+        std::fs::write(torrents.magnet_path_for(&p, &garbled), [0xff, 0xfe]).unwrap();
+
+        let mut tally = ScanTally::default();
+        tally.loaded.insert(resumed);
+        tally.removed_at_boot.insert((p.clone(), removed));
+        let inputs = ScanInputs {
+            cfg: &cfg,
+            source: &source,
+            profile_registry: &profiles,
+            resume_store: &resume,
+            torrent_store: &torrents,
+            registry: &registry,
+            metrics: &metrics,
+            state: &state,
+            pool: None,
+            checks: &checks,
+            checked_hold: &checked_hold,
+            boot_progress: &progress,
+        };
+        torrent_dir_scan(&inputs, &mut tally, &mut fence, &mut shutdown)
+            .await
+            .unwrap();
+
+        let mut adds: Vec<(String, String, u32)> = engine
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::AddTorrent(a) => {
+                    assert!(a.forbids_downloading(), "{a:?}");
+                    match a {
+                        AddParamsSummary::Magnet {
+                            uri,
+                            save_path,
+                            flags_bits,
+                        } => Some((uri, save_path, flags_bits)),
+                        other => panic!("not a magnet: {other:?}"),
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        adds.sort();
+        let magnet = torrentd_engine::policy::magnet_flags(profiles.config(&p).unwrap()).bits();
+        assert_eq!(
+            adds,
+            vec![
+                (uri(0x61), "/data/m".to_owned(), magnet),
+                (uri(0x62), "/data/torrents".to_owned(), magnet),
+            ],
+        );
+        assert!(tally.loaded.contains(&crashed) && tally.loaded.contains(&unclaimed));
+        assert_eq!(tally.loaded_by_profile.get(&p), Some(&2));
+        assert_eq!(registry.lookup(&crashed), Some(p.clone()));
+        assert_eq!(registry.lookup(&unclaimed), Some(p.clone()));
+        assert_eq!(registry.lookup(&foreign), Some(ProfileId::new("q")));
+        assert_eq!(registry.lookup(&misfiled), None);
+        assert_eq!(registry.lookup(&garbled), None);
+        // The misfiled record, under `torrent_dir_add`; the unreadable one,
+        // under `torrent_file`, and only once.
+        assert_eq!(tally.load_failures[&p].torrent_dir_add, 1);
+        assert_eq!(tally.load_failures[&p].torrent_file, 1);
+        // The record another profile claims, once.
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert!(
+            exported.contains("profile_assignment_registry_errors_total{profile_id=\"p\"} 1\n"),
+            "{exported}"
+        );
+    }
+
+    /// A recorded magnet its session refuses to add at boot is counted under
+    /// `torrent_dir_add`. A claim from before the crash is kept, so `DELETE`
+    /// can still clear its records; a claim the scan made for it is released.
+    #[tokio::test]
+    async fn a_magnet_its_session_refuses_at_boot_keeps_only_a_pre_crash_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = ProfileId::new("p");
+        let cfg = cfg_with(dir.path(), &[]);
+        let entry = crate::profile_registry::test_entry("p", ProfileStatus::Active);
+        let engine = Arc::new(MockEngine::new());
+        let source =
+            ProfileSource::new(vec![(p.clone(), engine.clone() as Arc<dyn TorrentEngine>)]);
+        let profiles = ProfileRegistry::new(vec![entry]);
+        let registry = AssignmentRegistry::new_empty(dir.path().join("reg.db"));
+        let resume = torrentd_engine::MemoryResumeStore::new();
+        let torrents = torrentd_engine::MemoryTorrentStore::new();
+        let metrics = PromSink::new();
+        let state = StateMap::new();
+        let checks = crate::check_queue::VerifyQueue::for_daemon(None);
+        let checked_hold = CheckedHold::new(&source, Arc::new(|_: &ProfileId, _: &str| Ok(())));
+        let progress = sd_notify::Progress::new();
+        let (_tx, mut shutdown) = broadcast::channel::<ShutdownReason>(1);
+        let inputs = ScanInputs {
+            cfg: &cfg,
+            source: &source,
+            profile_registry: &profiles,
+            resume_store: &resume,
+            torrent_store: &torrents,
+            registry: &registry,
+            metrics: &metrics,
+            state: &state,
+            pool: None,
+            checks: &checks,
+            checked_hold: &checked_hold,
+            boot_progress: &progress,
+        };
+        let refused = || torrentd_engine::EngineError::Shutdown;
+        let ih = |b: u8| libtorrent_safe::InfoHash([b; 20]);
+        let uri = |b: u8| format!("magnet:?xt=urn:btih:{}", ih(b).to_hex());
+        let (claimed, unclaimed) = (ih(0x71), ih(0x72));
+
+        // Claimed before the crash: the refusal keeps the claim.
+        registry.assign(claimed, p.clone()).unwrap();
+        torrents.write_magnet(&p, &claimed, &uri(0x71)).unwrap();
+        engine.inject_error("add_torrent", refused());
+        let mut tally = ScanTally::default();
+        torrent_dir_scan(
+            &inputs,
+            &mut tally,
+            &mut ScanFence::new(None),
+            &mut shutdown,
+        )
+        .await
+        .unwrap();
+        assert!(tally.loaded.is_empty());
+        assert_eq!(tally.load_failures[&p].torrent_dir_add, 1);
+        assert_eq!(registry.lookup(&claimed), Some(p.clone()));
+
+        // Claimed by the scan: the refusal releases the claim.
+        torrents.delete(&p, &claimed).unwrap();
+        torrents.write_magnet(&p, &unclaimed, &uri(0x72)).unwrap();
+        engine.inject_error("add_torrent", refused());
+        let mut tally = ScanTally::default();
+        torrent_dir_scan(
+            &inputs,
+            &mut tally,
+            &mut ScanFence::new(None),
+            &mut shutdown,
+        )
+        .await
+        .unwrap();
+        assert!(tally.loaded.is_empty());
+        assert_eq!(tally.load_failures[&p].torrent_dir_add, 1);
+        assert_eq!(registry.lookup(&unclaimed), None);
+        assert_eq!(registry.lookup(&claimed), Some(p.clone()));
+    }
+
     /// Issue #383: the boot's torrent-dir scan of twelve `.torrent`s with no
     /// resume data, without `[pool]`, never has more than the default check
     /// limit of four hashing at once. The scan records every torrent it may
@@ -1377,6 +1835,7 @@ mod tests {
                 &profile_cfg,
                 bytes.clone(),
                 "/data".into(),
+                Vec::new(),
             ));
             engine.add_torrent(params).unwrap();
             // The mock keys an add by its first bytes, not its info-hash.
@@ -1553,6 +2012,207 @@ mod tests {
         let other = libtorrent_safe::InfoHash([0x35; 20]);
         store.write_save_path(&p, &other, &moved_to).unwrap();
         assert_eq!(relocated_save_path(&store, Some(&pool), &p, &other), None);
+    }
+
+    /// A pool whose library holds one tracker-less `.torrent`, as qBittorrent
+    /// 4.4 and later write them, its payload under the root, and a
+    /// `.fastresume` in libtorrent's format with one piece had and `tracker`
+    /// as its only tracker: what a fast-path adopt takes. The torrent's
+    /// info-hash is returned.
+    fn pool_with_a_tracker_less_torrent(
+        dir: &std::path::Path,
+        tracker: &str,
+    ) -> (
+        Arc<crate::pool_service::PoolService>,
+        libtorrent_safe::InfoHash,
+    ) {
+        let cfg = crate::config::Config::minimal_for_tests(dir, false);
+        let pool = crate::pool_service::PoolService::open(&cfg)
+            .unwrap()
+            .unwrap();
+        std::fs::write(dir.join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.join("library/t.torrent"), &bare).unwrap();
+        let ih = libtorrent_safe::info_hash_from_torrent(&bare).unwrap();
+        let mut fastresume =
+            b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+        fastresume.extend_from_slice(&ih.0);
+        fastresume.extend_from_slice(b"6:pieces1:\x01");
+        fastresume
+            .extend_from_slice(format!("8:trackersll{}:{tracker}eee", tracker.len()).as_bytes());
+        std::fs::write(dir.join("library/t.fastresume"), &fastresume).unwrap();
+        pool.scan().unwrap();
+        (pool, ih)
+    }
+
+    /// Issue #653: a fast-path adopt of a tracker-less `.torrent` announces
+    /// to the trackers its previous client's resume data names. A daemon
+    /// stopped before its first resume save leaves only the `.torrent` to
+    /// re-add it from, and the boot re-adds it with those trackers, recorded
+    /// beside it, rather than with none, which a profile with
+    /// `allowed_tracker_domains` refused and a host profile never announced.
+    #[tokio::test]
+    async fn an_adoption_stopped_before_its_first_resume_save_re_adds_with_its_trackers() {
+        use torrentd_engine::mock::AddParamsSummary;
+        use torrentd_engine::RecordedCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://tracker.allowed.example/PASS/announce";
+        let (pool, ih) = pool_with_a_tracker_less_torrent(dir.path(), url);
+        let torrents = Arc::new(FsTorrentStore::new(dir.path().join("torrents")));
+        pool.set_torrent_store(torrents.clone());
+        let p = ProfileId::new("p");
+        let mut entry = crate::profile_registry::test_entry("p", ProfileStatus::Active);
+        entry.config.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        let profiles = ProfileRegistry::new(vec![entry]);
+
+        let adopting = Arc::new(MockEngine::new());
+        let adopting_source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![(
+            p.clone(),
+            adopting.clone() as Arc<dyn TorrentEngine>,
+        )]));
+        let adopted = pool
+            .adopt(&adopting_source, &profiles, &ih.to_hex(), p.clone(), false)
+            .unwrap_or_else(|e| panic!("{}", e.reason));
+        assert_eq!(adopted, crate::pool_service::Adopted::FastPath);
+        let want = vec![vec![url.to_owned()]];
+        assert_eq!(torrents.read_trackers(&p, &ih).unwrap(), want);
+        let save_path = torrents.read_save_path(&p, &ih).unwrap().unwrap();
+
+        // The boot after the crash: no resume file, so the torrent-dir scan
+        // re-adds it from its `.torrent`.
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let engine = Arc::new(MockEngine::new());
+        let source =
+            ProfileSource::new(vec![(p.clone(), engine.clone() as Arc<dyn TorrentEngine>)]);
+        let registry = AssignmentRegistry::new_empty(dir.path().join("reg.db"));
+        let resume = torrentd_engine::MemoryResumeStore::new();
+        let metrics = PromSink::new();
+        let state = StateMap::new();
+        let checks = crate::check_queue::VerifyQueue::for_daemon(None);
+        let checked_hold = CheckedHold::new(&source, Arc::new(|_: &ProfileId, _: &str| Ok(())));
+        let progress = sd_notify::Progress::new();
+        let (_tx, mut shutdown) = broadcast::channel::<ShutdownReason>(1);
+        let mut fence = ScanFence::new(None);
+        let mut tally = ScanTally::default();
+        let inputs = ScanInputs {
+            cfg: &cfg,
+            source: &source,
+            profile_registry: &profiles,
+            resume_store: &resume,
+            torrent_store: &*torrents,
+            registry: &registry,
+            metrics: &metrics,
+            state: &state,
+            pool: Some(&pool),
+            checks: &checks,
+            checked_hold: &checked_hold,
+            boot_progress: &progress,
+        };
+        torrent_dir_scan(&inputs, &mut tally, &mut fence, &mut shutdown)
+            .await
+            .unwrap();
+
+        let adds: Vec<_> = engine
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::AddTorrent(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        match adds.as_slice() {
+            [AddParamsSummary::File {
+                trackers,
+                save_path: at,
+                ..
+            }] => {
+                assert_eq!(trackers, &want);
+                assert_eq!(at, &save_path);
+            }
+            other => panic!("expected one .torrent add: {other:?}"),
+        }
+        assert!(tally.loaded.contains(&ih));
+        assert_eq!(registry.lookup(&ih), Some(p.clone()));
+    }
+
+    /// Issue #653: a stored `.torrent` the resume scan cannot read is
+    /// replaced, for the add, by the pool library's copy, as a missing one
+    /// is, rather than the torrent loading without metadata. The read
+    /// failure is still counted.
+    #[tokio::test]
+    async fn an_unreadable_stored_torrent_takes_the_pool_librarys() {
+        use torrentd_engine::mock::AddParamsSummary;
+        use torrentd_engine::RecordedCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, ih) = pool_with_a_tracker_less_torrent(dir.path(), "https://t.example/announce");
+        let p = ProfileId::new("p");
+        let profiles = ProfileRegistry::new(vec![crate::profile_registry::test_entry(
+            "p",
+            ProfileStatus::Active,
+        )]);
+        let torrents = FsTorrentStore::new(dir.path().join("torrents"));
+        // A directory where the `.torrent` belongs: a read fails, and not
+        // as a missing file.
+        std::fs::create_dir_all(torrents.path_for(&p, &ih)).unwrap();
+        assert!(torrents.read(&p, &ih).is_err());
+        let resume = torrentd_engine::MemoryResumeStore::new();
+        let mut data =
+            b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+        data.extend_from_slice(&ih.0);
+        data.extend_from_slice(b"e");
+        resume.write(&p, &ih, &data).unwrap();
+
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let engine = Arc::new(MockEngine::new());
+        let source =
+            ProfileSource::new(vec![(p.clone(), engine.clone() as Arc<dyn TorrentEngine>)]);
+        let registry = AssignmentRegistry::new_empty(dir.path().join("reg.db"));
+        let metrics = PromSink::new();
+        let state = StateMap::new();
+        let checks = crate::check_queue::VerifyQueue::for_daemon(None);
+        let checked_hold = CheckedHold::new(&source, Arc::new(|_: &ProfileId, _: &str| Ok(())));
+        let progress = sd_notify::Progress::new();
+        let (_tx, mut shutdown) = broadcast::channel::<ShutdownReason>(1);
+        let mut fence = ScanFence::new(None);
+        let mut tally = ScanTally::default();
+        let inputs = ScanInputs {
+            cfg: &cfg,
+            source: &source,
+            profile_registry: &profiles,
+            resume_store: &resume,
+            torrent_store: &torrents,
+            registry: &registry,
+            metrics: &metrics,
+            state: &state,
+            pool: Some(&pool),
+            checks: &checks,
+            checked_hold: &checked_hold,
+            boot_progress: &progress,
+        };
+        resume_scan(&inputs, &mut tally, &mut fence, &mut shutdown)
+            .await
+            .unwrap();
+
+        let adds: Vec<_> = engine
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::AddTorrent(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        match adds.as_slice() {
+            [AddParamsSummary::Resume { has_torrent, .. }] => {
+                assert!(has_torrent, "added without the library's metadata");
+            }
+            other => panic!("expected one resume add: {other:?}"),
+        }
+        assert!(tally.loaded.contains(&ih));
+        assert_eq!(tally.load_failures[&p].torrent_read, 1);
     }
 
     /// A boot scan gives the runtime back between batches. On a
@@ -1740,7 +2400,7 @@ mod tests {
             ),
             (
                 ih,
-                torrent_dir_scan_params(&profile, a.clone(), "/data".into()),
+                torrent_dir_scan_params(&profile, a.clone(), "/data".into(), Vec::new()),
                 "torrent_dir",
             ),
         ];
@@ -1766,7 +2426,7 @@ mod tests {
             &metrics,
             &profile,
             &ih,
-            &torrent_dir_scan_params(&profile, b, "/data".into()),
+            &torrent_dir_scan_params(&profile, b, "/data".into(), Vec::new()),
             "torrent_dir",
         )
         .unwrap();
@@ -1794,7 +2454,12 @@ mod tests {
                 .add_torrent(resume_scan_params(p, resume.to_vec(), None, None, false))
                 .unwrap();
             engine
-                .add_torrent(torrent_dir_scan_params(p, vec![2; 32], "/data".into()))
+                .add_torrent(torrent_dir_scan_params(
+                    p,
+                    vec![2; 32],
+                    "/data".into(),
+                    Vec::new(),
+                ))
                 .unwrap();
             let adds: Vec<_> = engine
                 .calls()
@@ -1848,193 +2513,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tombstone_tests {
-    use libtorrent_safe::InfoHash;
-    use torrentd_engine::resume_store::ResumeStoreError;
-    use torrentd_engine::resume_store::Scan;
-    use torrentd_engine::FsResumeStore;
-    use torrentd_engine::FsTorrentStore;
-    use torrentd_engine::MemoryResumeStore;
-    use torrentd_engine::MemoryTorrentStore;
-    use torrentd_engine::RecordingSink;
-
-    use super::*;
-
-    /// A resume store whose deletes fail and whose tombstones work.
-    #[derive(Debug, Default)]
-    struct FailingDelete(MemoryResumeStore);
-    impl ResumeStore for FailingDelete {
-        fn scan(
-            &self,
-            p: &ProfileId,
-        ) -> Result<Scan<libtorrent_safe::ResumeData>, ResumeStoreError> {
-            self.0.scan(p)
-        }
-        fn write(&self, p: &ProfileId, ih: &InfoHash, d: &[u8]) -> Result<(), ResumeStoreError> {
-            self.0.write(p, ih, d)
-        }
-        fn delete(&self, _: &ProfileId, _: &InfoHash) -> Result<(), ResumeStoreError> {
-            Err(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem).into())
-        }
-        fn write_tombstone(&self, p: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-            self.0.write_tombstone(p, ih)
-        }
-        fn clear_tombstone(&self, p: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-            self.0.clear_tombstone(p, ih)
-        }
-        fn tombstones(&self, p: &ProfileId) -> Result<Vec<InfoHash>, ResumeStoreError> {
-            self.0.tombstones(p)
-        }
-    }
-
-    /// A torrent `DELETE` answered for, whose files a crash or a failed
-    /// unlink left, is deleted and not loaded; one the registry assigns to
-    /// the profile again was re-added since, and loads.
-    #[test]
-    fn the_boot_finishes_a_removal_and_spends_the_tombstone_of_a_re_add() {
-        let dir = tempfile::tempdir().unwrap();
-        let resume = FsResumeStore::new(dir.path().join("resume"));
-        let torrents = FsTorrentStore::new(dir.path().join("torrents"));
-        let metrics = RecordingSink::new();
-        let p = ProfileId::new("p");
-        let (removed, readded, moved) = (
-            InfoHash([0x01; 20]),
-            InfoHash([0x02; 20]),
-            InfoHash([0x03; 20]),
-        );
-        for ih in [removed, readded, moved] {
-            resume.write(&p, &ih, b"resume").unwrap();
-            torrents.write(&p, &ih, b"torrent").unwrap();
-            torrents.write_save_path(&p, &ih, "/data").unwrap();
-            resume.write_tombstone(&p, &ih).unwrap();
-        }
-        // `moved` was re-added to another profile: this profile's files are
-        // still the removed torrent's.
-        let claims = |ih: &InfoHash| match ih {
-            ih if *ih == readded => Some(ProfileId::new("p")),
-            ih if *ih == moved => Some(ProfileId::new("q")),
-            _ => None,
-        };
-
-        let skip = honour_tombstones(&resume, &torrents, &metrics, &p, claims).unwrap();
-
-        assert_eq!(skip, HashSet::from([removed, moved]));
-        for ih in [removed, moved] {
-            assert!(!resume.exists(&p, &ih).unwrap());
-            assert!(!torrents.exists(&p, &ih));
-            assert_eq!(torrents.read_save_path(&p, &ih).unwrap(), None);
-        }
-        assert!(resume.exists(&p, &readded).unwrap());
-        assert!(torrents.exists(&p, &readded));
-        assert!(resume.tombstones(&p).unwrap().is_empty());
-        assert_eq!(
-            metrics.count_for(torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS),
-            0
-        );
-        // Spent: a second boot loads everything that is left.
-        let skip = honour_tombstones(&resume, &torrents, &metrics, &p, claims).unwrap();
-        assert!(skip.is_empty());
-    }
-
-    /// A delete that fails at the boot too is counted, the torrent is still
-    /// not loaded, and the tombstone stays for the next boot to retry.
-    #[test]
-    fn a_resume_file_the_boot_cannot_delete_is_not_loaded_and_its_tombstone_stays() {
-        let resume = FailingDelete::default();
-        let torrents = MemoryTorrentStore::new();
-        let metrics = RecordingSink::new();
-        let p = ProfileId::new("p");
-        let ih = InfoHash([0x04; 20]);
-        resume.write(&p, &ih, b"resume").unwrap();
-        torrents.write(&p, &ih, b"torrent").unwrap();
-        resume.write_tombstone(&p, &ih).unwrap();
-
-        let skip = honour_tombstones(&resume, &torrents, &metrics, &p, |_| None).unwrap();
-
-        assert_eq!(skip, HashSet::from([ih]));
-        assert_eq!(
-            metrics.count_for(torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS),
-            1
-        );
-        assert!(!torrents.exists(&p, &ih));
-        assert_eq!(resume.tombstones(&p).unwrap(), vec![ih]);
-    }
-
-    /// A resume store whose tombstone clears fail.
-    #[derive(Debug, Default)]
-    struct FailingClear(MemoryResumeStore);
-    impl ResumeStore for FailingClear {
-        fn scan(
-            &self,
-            p: &ProfileId,
-        ) -> Result<Scan<libtorrent_safe::ResumeData>, ResumeStoreError> {
-            self.0.scan(p)
-        }
-        fn write(&self, p: &ProfileId, ih: &InfoHash, d: &[u8]) -> Result<(), ResumeStoreError> {
-            self.0.write(p, ih, d)
-        }
-        fn delete(&self, p: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-            self.0.delete(p, ih)
-        }
-        fn exists(&self, p: &ProfileId, ih: &InfoHash) -> Result<bool, ResumeStoreError> {
-            self.0.exists(p, ih)
-        }
-        fn write_tombstone(&self, p: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-            self.0.write_tombstone(p, ih)
-        }
-        fn clear_tombstone(&self, _: &ProfileId, _: &InfoHash) -> Result<(), ResumeStoreError> {
-            Err(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem).into())
-        }
-        fn tombstones(&self, p: &ProfileId) -> Result<Vec<InfoHash>, ResumeStoreError> {
-            self.0.tombstones(p)
-        }
-    }
-
-    /// A torrent assigned to the profile again whose tombstone will not
-    /// clear still loads with its files, and the failure is counted under
-    /// `store="tombstone"`.
-    #[test]
-    fn a_re_add_whose_tombstone_will_not_clear_is_counted_and_still_loads() {
-        let resume = FailingClear::default();
-        let torrents = MemoryTorrentStore::new();
-        let metrics = RecordingSink::new();
-        let p = ProfileId::new("p");
-        let ih = InfoHash([0x05; 20]);
-        resume.write(&p, &ih, b"resume").unwrap();
-        torrents.write(&p, &ih, b"torrent").unwrap();
-        torrents.write_save_path(&p, &ih, "/data").unwrap();
-        resume.write_tombstone(&p, &ih).unwrap();
-
-        let skip = honour_tombstones(&resume, &torrents, &metrics, &p, |_| {
-            Some(ProfileId::new("p"))
-        })
-        .unwrap();
-
-        assert!(skip.is_empty(), "the re-add must load: {skip:?}");
-        assert!(resume.exists(&p, &ih).unwrap());
-        assert!(torrents.exists(&p, &ih));
-        assert_eq!(
-            torrents.read_save_path(&p, &ih).unwrap().as_deref(),
-            Some("/data")
-        );
-        let counted: Vec<_> = metrics
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                torrentd_engine::metrics::MetricCall::IncCounter { name, labels }
-                    if name == torrentd_engine::metrics::REMOVE_CLEANUP_ERRORS =>
-                {
-                    Some(labels)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            counted,
-            vec![vec![
-                ("profile_id".to_owned(), "p".to_owned()),
-                ("store".to_owned(), "tombstone".to_owned()),
-            ]]
-        );
-    }
-}
+mod tombstone_tests;

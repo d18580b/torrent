@@ -42,6 +42,13 @@ pub struct ScanStats {
     /// holds the same info-hash. Not an error: the torrent is indexed, from
     /// the first. Each is logged with the path that won.
     pub duplicate_infohashes: u64,
+    /// `.fastresume` files in the library with no `.torrent` of the same name
+    /// beside them, and so not imported: a qBittorrent entry added from a
+    /// magnet link whose metadata never arrived has resume data and no
+    /// `.torrent`, and nothing here names its files. Not an error, and not
+    /// counted against the pruning: no torrent it could name is indexed.
+    /// Each is logged at info with its path.
+    pub unpaired_fastresume: u64,
 }
 
 /// Upper bound on a `.torrent` or `.fastresume` read from the library, by the
@@ -235,7 +242,9 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
 /// [`ScanStats::duplicate_infohashes`].
 ///
 /// The walk is sorted and does not follow symlinks; only regular files named
-/// `*.torrent` are read. A `.torrent` that cannot be read, does not parse, or
+/// `*.torrent` are read. A `*.fastresume` with no `.torrent` of the same name
+/// beside it is logged and counted in [`ScanStats::unpaired_fastresume`], and
+/// not imported. A `.torrent` that cannot be read, does not parse, or
 /// names no info-hash is logged and counted in [`ScanStats::errors`] and
 /// skipped, and the scan goes on. A missing `library_dir` is logged and
 /// returns empty stats with the index untouched. A store failure ends the
@@ -289,10 +298,27 @@ pub fn scan_library(
         if let Some(e) = &entry.read_children_error {
             note_unlistable(&mut stats, &path, e);
         }
-        if !entry.file_type().is_file()
-            || path.extension().and_then(|e| e.to_str()) != Some("torrent")
-        {
+        if !entry.file_type().is_file() {
             continue;
+        }
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("torrent") => {}
+            Some("fastresume") => {
+                // Read only as a `.torrent`'s sidecar, so one with no
+                // `.torrent` beside it would otherwise vanish without a
+                // trace, and the library would simply hold fewer torrents
+                // than the client did.
+                if !path.with_extension("torrent").is_file() {
+                    info!(
+                        target: "torrentd_pool::scan",
+                        path = %path.display(),
+                        "skipping .fastresume with no .torrent beside it (a magnet link whose metadata never arrived?); not imported",
+                    );
+                    stats.unpaired_fastresume += 1;
+                }
+                continue;
+            }
+            _ => continue,
         }
 
         let bytes = match read_capped(&path) {
@@ -443,6 +469,7 @@ pub fn scan_library(
         path = %library_dir.display(),
         torrent_count = stats.torrents_indexed,
         error_count = stats.errors,
+        unpaired_fastresume_count = stats.unpaired_fastresume,
         "library scan complete",
     );
     Ok(stats)
@@ -496,10 +523,11 @@ pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// The `(size, mtime, inode, device)` the index records for a file.
 ///
-/// Public because anything comparing live metadata against the index — drift
-/// detection, and the last-moment check before a delete — has to compute it
-/// the same way the scanner did. Two copies of this encoding that disagree
-/// would either miss a change or reject every unchanged file.
+/// Public because anything comparing live metadata against the index has to
+/// compute it the same way the scanner did. Two copies of this encoding that
+/// disagree would either miss a change or reject every unchanged file. A
+/// check that a file is unchanged compares only [`content_stamp`], its
+/// `(size, mtime)` part.
 ///
 /// The device is part of it because an inode number is only unique within
 /// one filesystem: a different volume mounted over a directory after the scan
@@ -508,6 +536,20 @@ pub fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
 pub fn file_stamp(m: &std::fs::Metadata) -> (u64, i64, u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (m.len(), mtime_ns(m), m.ino(), m.dev())
+}
+
+/// The `(size, mtime)` part of [`file_stamp`]: what a check that a file
+/// still holds the bytes the index recorded compares — the drift check, and
+/// the last-moment check before a delete moves a file into the trash.
+///
+/// Device and inode are left out. Neither survives a reboot or a remount on
+/// a common storage layout (disk enumeration order, md and dm, btrfs and zfs
+/// subvolumes, NFS, FUSE layers such as mergerfs), and nothing re-stamps the
+/// index at boot, so comparing them refuses every unchanged file after a
+/// routine reboot. They stay in [`file_stamp`], which the index records,
+/// for the checks that compare one indexed identity with another.
+pub fn content_stamp(m: &std::fs::Metadata) -> (u64, i64) {
+    (m.len(), mtime_ns(m))
 }
 
 fn mtime_ns(m: &std::fs::Metadata) -> i64 {

@@ -467,6 +467,356 @@ fn a_restored_in_flight_adoption_records_its_verdict_and_a_removed_one_is_forgot
     assert!(pool.with_store(|s| s.verify_queue().unwrap()).is_empty());
 }
 
+/// An adoption whose `torrent_checked_alert` was dropped never gets
+/// `checked_at`, and one whose check failed then sits in `Incomplete`, which
+/// [`verify_outcome`] reads as still waiting: it held its verify slot for the
+/// life of the process. Shown that way past the settle, it is recorded
+/// failed - paused, `drifted`, counted - and its slot is freed.
+#[test]
+fn an_adoption_whose_checked_alert_was_lost_frees_its_slot_as_failed() {
+    use std::sync::Arc;
+
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RecordedCall;
+    use torrentd_engine::StateMap;
+    use torrentd_pool::AdoptionState;
+
+    use crate::profile_registry::test_entry;
+    use crate::profile_registry::ProfileRegistry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hash = InfoHash([0x73; 20]);
+    let pool = pool_with(dir.path(), hash, None);
+    let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+    let engine = Arc::new(MockEngine::new());
+    let source = torrentd_engine::ProfileSource::new(vec![(
+        ProfileId::new("p"),
+        engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+    )]);
+    let state = StateMap::new();
+    let q = pool.verify_queue();
+    q.track_in_flight(hash.to_hex());
+    let retire = || {
+        super::worker::retire_in_flight(
+            &pool,
+            super::worker::Writer::Wait,
+            &source,
+            &state,
+            &profiles,
+        );
+    };
+
+    // Hashing, or held paused: it keeps its slot however long that lasts,
+    // past the expiry too.
+    for phase in [TorrentPhase::Checking, TorrentPhase::Paused] {
+        state.insert(hash, st(phase, None));
+        retire();
+        q.age_in_flight(super::RECHECK_EXPIRY);
+        retire();
+        assert!(q.is_in_flight(&hash.to_hex()));
+    }
+
+    // The check ends failed and its alert is lost. Just seen, it is given
+    // the settle.
+    state.insert(hash, st(TorrentPhase::Incomplete, None));
+    retire();
+    assert!(q.is_in_flight(&hash.to_hex()));
+    assert_eq!(q.failed(), 0);
+
+    q.age_in_flight(SETTLE);
+    retire();
+    assert_eq!(q.in_flight(), 0);
+    assert_eq!(q.failed(), 1);
+    assert!(engine
+        .calls()
+        .iter()
+        .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+    let got = pool
+        .with_store(|s| s.adoption_state(&hash.to_hex()))
+        .unwrap();
+    assert_eq!(got, Some(AdoptionState::Drifted));
+}
+
+/// Issue 650: a disk read error during an adoption's check leaves the
+/// torrent paused with an error. That check is over with no verdict, yet
+/// read as held paused it reset the expiry every tick and kept its verify
+/// slot for the life of the process, and `max_concurrent_verify` of them
+/// stalled every check behind them. Through the worker's tick: one paused
+/// without an error still waits past the expiry, holding its slot, while
+/// one paused on an error is recorded failed with its reason, freeing the
+/// slot for the check queued behind it.
+#[test]
+fn an_error_paused_adoption_is_failed_and_frees_its_slot() {
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RecordedCall;
+    use torrentd_engine::StateMap;
+    use torrentd_pool::AdoptionState;
+
+    use super::worker::ERROR_PAUSED_REASON;
+    use crate::profile_registry::test_entry;
+    use crate::profile_registry::ProfileRegistry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let adopting = InfoHash([0x65; 20]);
+    let mut pool = pool_with(dir.path(), adopting, Some("p"));
+    pool.verify = Arc::new(super::VerifyQueue::new(1));
+    let engine = Arc::new(MockEngine::new());
+    let source: Arc<dyn torrentd_engine::AlertSource> =
+        Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            ProfileId::new("p"),
+            engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+    let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+        "p",
+        ProfileStatus::Active,
+    )]));
+    let registry = Arc::new(crate::registry::AssignmentRegistry::new_empty(
+        dir.path().join("reg.json"),
+    ));
+    let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+    let state = StateMap::new();
+    let q = pool.verify_queue();
+
+    // The adoption holds the only slot; a re-hash waits behind it.
+    q.track_in_flight(adopting.to_hex());
+    let queued = InfoHash([0x66; 20]);
+    let mut loaded = TorrentState::newly_added(
+        TorrentHandle {
+            id: 2,
+            infohash: queued,
+        },
+        ProfileId::new("p"),
+        Instant::now(),
+    );
+    loaded.phase = TorrentPhase::Seeding;
+    state.insert(queued, loaded);
+    q.enqueue_recheck(queued.to_hex(), false);
+    let tick = || {
+        super::worker::verify_tick(
+            q,
+            Some(&pool),
+            &source,
+            &state,
+            &metrics,
+            &profiles,
+            &registry,
+        );
+    };
+    let rechecked = || {
+        engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::ForceRecheck(h) if h.infohash == queued))
+    };
+
+    // Held paused without an error, as behind the held-add queue: it keeps
+    // waiting past the expiry, and the re-hash with it.
+    state.insert(adopting, st(TorrentPhase::Paused, None));
+    tick();
+    q.age_in_flight(super::RECHECK_EXPIRY);
+    tick();
+    assert!(q.is_in_flight(&adopting.to_hex()));
+    assert_eq!(q.failed(), 0);
+    assert!(
+        !rechecked(),
+        "the paused adoption still holds the only slot"
+    );
+
+    // Its check fails on a disk read error, which pauses it with the error
+    // and arms the disk-error retry.
+    let mut errored = st(TorrentPhase::Paused, None);
+    errored.has_error = true;
+    errored.retry = Some(torrentd_engine::RetryState::first(Instant::now()));
+    state.insert(adopting, errored);
+    tick();
+    assert!(
+        state.get(&adopting).unwrap().retry.is_none(),
+        "the retry would resume the torrent the failure paused"
+    );
+    assert!(!q.is_in_flight(&adopting.to_hex()));
+    assert_eq!(q.failed(), 1);
+    assert!(engine
+        .calls()
+        .iter()
+        .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+    let drifted = pool
+        .with_store(|s| s.torrents_page(None, Some(AdoptionState::Drifted), 10))
+        .unwrap();
+    assert_eq!(drifted.len(), 1);
+    assert_eq!(drifted[0].torrent.infohash, adopting.to_hex());
+    assert_eq!(drifted[0].note.as_deref(), Some(ERROR_PAUSED_REASON));
+    assert!(rechecked(), "the freed slot went to the queued re-hash");
+}
+
+/// The failure path disarms the disk-error retry only for a torrent it
+/// paused: where the pause fails, the retry is re-armed as it was, the one
+/// thing left that recovers the error-paused torrent.
+#[test]
+fn a_failed_verify_whose_pause_fails_keeps_its_disk_error_retry() {
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RetryState;
+    use torrentd_engine::StateMap;
+
+    use crate::profile_registry::test_host_entry;
+    use crate::profile_registry::ProfileRegistry;
+
+    let hash = InfoHash([0x67; 20]);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+    let pool = crate::pool_service::PoolService::open(&cfg)
+        .unwrap()
+        .unwrap();
+    let engine = Arc::new(MockEngine::new());
+    let source = torrentd_engine::ProfileSource::new(vec![(
+        ProfileId::new("p"),
+        engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+    )]);
+    let profiles = ProfileRegistry::new(vec![test_host_entry("p")]);
+    let state = StateMap::new();
+    let armed = RetryState::first(Instant::now());
+    let mut errored = st(TorrentPhase::Paused, None);
+    errored.has_error = true;
+    errored.retry = Some(armed.clone());
+    state.insert(hash, errored);
+    engine.inject_error("pause_torrent", torrentd_engine::EngineError::Shutdown);
+    super::worker::record_verify_outcome(
+        &pool,
+        super::worker::Writer::Wait,
+        &source,
+        &state,
+        &profiles,
+        &hash,
+        &hash.to_hex(),
+        VerifyOutcome::Failed(super::worker::ERROR_PAUSED_REASON),
+    );
+    let kept = state
+        .get(&hash)
+        .unwrap()
+        .retry
+        .expect("the retry is re-armed");
+    assert_eq!(
+        (kept.next_attempt, kept.attempts),
+        (armed.next_attempt, armed.attempts)
+    );
+    assert_eq!(
+        state.retries_due(armed.next_attempt).len(),
+        1,
+        "the re-armed retry is scheduled again",
+    );
+}
+
+/// The decision behind the test above, and its backstop: a finished check's
+/// phase shown unstamped is failed only once held for the settle, any other
+/// phase between resets it, and one showing neither a running nor a held
+/// check past the expiry is failed, while one showing either never is.
+#[test]
+fn an_adoption_with_no_verdict_is_failed_after_the_settle_or_the_expiry() {
+    use super::worker::lost_check_outcome;
+    use super::RECHECK_EXPIRY;
+
+    let young = Duration::from_secs(1);
+    for phase in [TorrentPhase::Incomplete, TorrentPhase::Idle] {
+        let s = st(phase, None);
+        let mut since = None;
+        let mut waiting = Instant::now() - young;
+        assert_eq!(
+            lost_check_outcome(Some(&s), &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Waiting,
+        );
+        assert!(since.is_some());
+        since = since.map(|t| t - SETTLE);
+        assert!(matches!(
+            lost_check_outcome(Some(&s), &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Failed(_),
+        ));
+    }
+
+    // A healthy check passing through: `Seeding` would be decided by
+    // `verify_outcome`, so any phase still undecided here resets the clock.
+    for phase in [
+        TorrentPhase::Checking,
+        TorrentPhase::Paused,
+        TorrentPhase::DiskError,
+    ] {
+        let mut since = Some(Instant::now() - SETTLE);
+        let mut waiting = Instant::now() - young;
+        assert_eq!(
+            lost_check_outcome(
+                Some(&st(phase, None)),
+                &mut since,
+                &mut waiting,
+                SETTLE,
+                RECHECK_EXPIRY,
+            ),
+            VerifyOutcome::Waiting,
+        );
+        assert_eq!(since, None);
+    }
+
+    // A stamped check is `verify_outcome`'s to decide, not this.
+    let mut since = None;
+    let mut waiting = Instant::now() - young;
+    assert_eq!(
+        lost_check_outcome(
+            Some(&st(TorrentPhase::Incomplete, Some(Duration::ZERO))),
+            &mut since,
+            &mut waiting,
+            SETTLE,
+            RECHECK_EXPIRY,
+        ),
+        VerifyOutcome::Waiting,
+    );
+
+    // A running or held check is never expired, however long it has waited:
+    // a multi-terabyte hash past a day, or an adoption held paused behind the
+    // held-add queue. Showing either restarts the clock.
+    for phase in [TorrentPhase::Checking, TorrentPhase::Paused] {
+        let mut since = None;
+        let mut waiting = Instant::now() - RECHECK_EXPIRY - young;
+        assert_eq!(
+            lost_check_outcome(
+                Some(&st(phase, None)),
+                &mut since,
+                &mut waiting,
+                SETTLE,
+                RECHECK_EXPIRY,
+            ),
+            VerifyOutcome::Waiting,
+        );
+        assert!(waiting.elapsed() < young);
+    }
+
+    // Paused on an error, as a disk read error during the check leaves it,
+    // the check is over: failed at once, however young.
+    for phase in [TorrentPhase::Paused, TorrentPhase::DiskError] {
+        let mut s = st(phase, None);
+        s.has_error = true;
+        let mut since = None;
+        let mut waiting = Instant::now();
+        assert_eq!(
+            lost_check_outcome(Some(&s), &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Failed(super::worker::ERROR_PAUSED_REASON),
+        );
+    }
+
+    // Past the expiry showing neither: never in the state map, or stuck in
+    // a phase no check leads to.
+    let stuck = st(TorrentPhase::DiskError, None);
+    for entry in [Some(&stuck), None] {
+        let mut since = None;
+        let mut waiting = Instant::now() - (RECHECK_EXPIRY - young);
+        assert_eq!(
+            lost_check_outcome(entry, &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Waiting,
+        );
+        waiting -= young;
+        assert_eq!(
+            lost_check_outcome(entry, &mut since, &mut waiting, SETTLE, RECHECK_EXPIRY),
+            VerifyOutcome::Failed("no verification verdict within the check expiry"),
+        );
+    }
+}
+
 /// An owner record the enqueue did not write, or that names another
 /// profile by the time of the drop, is not the drop's to clear.
 #[test]
@@ -756,6 +1106,79 @@ fn an_errored_torrent_retires_as_failed() {
         verify_outcome(Some(&s), SETTLE),
         VerifyOutcome::Failed(_),
     ));
+}
+
+/// A passed verification queues an unconditional resume save as it records
+/// `adopted`: on disk is only the add-time resume file, with no pieces, and
+/// the 30-minute sweep is too late for a crash in between not to re-hash
+/// the payload at boot. It pauses nothing.
+#[test]
+fn a_passed_verify_saves_resume_data_at_once() {
+    use std::sync::Arc;
+
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RecordedCall;
+    use torrentd_engine::StateMap;
+    use torrentd_pool::AdoptionState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+    let pool = crate::pool_service::PoolService::open(&cfg)
+        .unwrap()
+        .unwrap();
+    let engine = Arc::new(MockEngine::new());
+    let source = torrentd_engine::ProfileSource::new(vec![(
+        ProfileId::new("p"),
+        engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+    )]);
+    let state = StateMap::new();
+    let hash = InfoHash([0x12; 20]);
+    state.insert(hash, st(TorrentPhase::Seeding, Some(SETTLE)));
+    let ih = hash.to_hex();
+    pool.with_store(|s| {
+        s.upsert_torrent(
+            &torrentd_pool::PoolTorrent {
+                infohash: ih.clone(),
+                infohash_v1: None,
+                infohash_v2: None,
+                name: "T".into(),
+                total_size: 1,
+                num_files: 1,
+                source_path: dir.path().join("t.torrent"),
+                fastresume_path: None,
+                declared_save_path: None,
+                category: None,
+                tags: vec![],
+                profile: None,
+            },
+            0,
+        )
+    })
+    .unwrap();
+    assert!(state.dispatch_resume_saves(10).is_empty());
+
+    let profiles = crate::profile_registry::ProfileRegistry::new(vec![]);
+    super::worker::record_verify_outcome(
+        &pool,
+        super::worker::Writer::Wait,
+        &source,
+        &state,
+        &profiles,
+        &hash,
+        &ih,
+        VerifyOutcome::Verified,
+    );
+    assert_eq!(
+        state.dispatch_resume_saves(10),
+        vec![(hash, torrentd_engine::ResumeFlags::empty())],
+        "the passed verification is saved at once, not left for the sweep",
+    );
+    assert!(!engine
+        .calls()
+        .iter()
+        .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+    let got = pool.with_store(|s| s.adoption_state(&ih)).unwrap();
+    assert_eq!(got, Some(AdoptionState::Adopted));
 }
 
 /// A failed verification records `drifted` and pauses the torrent; a

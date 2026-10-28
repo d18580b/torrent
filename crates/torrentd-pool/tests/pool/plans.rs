@@ -330,6 +330,75 @@ fn delete_orphans_targets_only_unclaimed_files() {
     assert!(root.join("keep/loose.bin").exists());
 }
 
+/// Issue #657: the matcher claims no file without bytes, so a matched
+/// torrent's declared empty file has no claim row; it is still the
+/// torrent's, and a delete over its directory leaves it alone. An empty
+/// file the torrent does not declare, or the declared path once it holds
+/// bytes, is unclaimed as before.
+#[test]
+fn delete_orphans_leaves_a_matched_torrents_declared_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 128);
+    write_file(root, "T/empty.txt", 0);
+    write_file(root, "T/stray.txt", 0);
+    // A second torrent placed under a non-empty base: its declared path is
+    // root-relative only once joined to that base.
+    write_file(root, "sub/U/b.bin", 256);
+    write_file(root, "sub/U/none.txt", 0);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "e1",
+        "T",
+        None,
+        &[("T/a.bin", 128), ("T/empty.txt", 0), ("T/.pad/0", 0)],
+    );
+    add_torrent(
+        &mut store,
+        "e2",
+        "U",
+        None,
+        &[("U/b.bin", 256), ("U/none.txt", 0)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "e1"), AdoptionState::Matched);
+    assert_eq!(state_of(&store, "e2"), AdoptionState::Matched);
+    assert!(!store.is_orphan(root_id, "sub/U/none.txt").unwrap());
+    assert!(store.orphan_files(root_id, "sub").unwrap().is_empty());
+    // The directory rollups the listing reads agree with the file rows.
+    assert_eq!(store.rollup(root_id, "T").unwrap().files_orphan, 1);
+    assert_eq!(store.rollup(root_id, "sub").unwrap().files_orphan, 0);
+    assert_eq!(store.rollup(root_id, "").unwrap().files_orphan, 1);
+    let spec = PlanSpec::DeleteOrphans {
+        root_id,
+        prefix: "T".into(),
+    };
+
+    let steps = build_plan(&store, &spec, root_id, root).unwrap();
+    let srcs: Vec<&str> = steps.iter().map(|s| s.src.as_str()).collect();
+    assert_eq!(srcs.len(), 1, "{srcs:?}");
+    assert!(srcs[0].ends_with("T/stray.txt"), "{srcs:?}");
+    assert_eq!(store.orphan_files(root_id, "T").unwrap(), ["T/stray.txt"]);
+    // The executor's last-moment re-check agrees with the planner.
+    assert!(!store.is_orphan(root_id, "T/empty.txt").unwrap());
+    assert!(store.is_orphan(root_id, "T/stray.txt").unwrap());
+
+    // Bytes at the declared path are not the empty file the torrent declares.
+    write_file(root, "T/empty.txt", 5);
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    assert!(store.is_orphan(root_id, "T/empty.txt").unwrap());
+    assert_eq!(
+        store.orphan_files(root_id, "T").unwrap(),
+        ["T/empty.txt", "T/stray.txt"]
+    );
+    let rollup = store.rollup(root_id, "T").unwrap();
+    assert_eq!((rollup.files_orphan, rollup.bytes_orphan), (2, 5));
+}
+
 #[test]
 fn delete_orphans_is_scoped_to_the_named_subtree() {
     let dir = tempfile::tempdir().unwrap();
@@ -815,4 +884,368 @@ fn a_destination_behind_a_symlink_is_refused() {
         steps[0].dst.as_deref().map(Path::new),
         Some(root.join("archive/T").as_path()),
     );
+}
+
+#[test]
+fn an_adopted_torrent_whose_payload_is_all_present_is_relocated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "src/T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "ad", "T", None, &[("T/a.bin", 128)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let (rid, base) = store.adoption_base("ad").unwrap().unwrap();
+    store
+        .set_adoption(
+            "ad",
+            AdoptionState::Adopted,
+            Some(rid),
+            Some(&base),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "ad".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].op, torrentd_pool::model::ops::MOVE_TORRENT);
+}
+
+#[test]
+fn each_plan_names_its_kind() {
+    let relocate = PlanSpec::Relocate {
+        infohash: "ad".into(),
+        dest_root_id: 1,
+        dest_rel: "dest".into(),
+    };
+    let delete = PlanSpec::DeleteOrphans {
+        root_id: 1,
+        prefix: String::new(),
+    };
+    assert_eq!(
+        [relocate.kind(), delete.kind()],
+        ["relocate", "delete_orphans"]
+    );
+}
+
+/// A delete plan with no file left to delete says which guard held each
+/// one back, by count, or that there was nothing unclaimed to begin with.
+#[test]
+fn a_delete_plan_left_with_nothing_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    // The claimed file again under another name: unclaimed by path only.
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+    // The size of a file a missing torrent has not found.
+    write_file(root, "maybe/film.mkv", 4321);
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    add_torrent(&mut store, "m1", "M", None, &[("M/film.mkv", 4321)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "m1"), AdoptionState::Missing);
+
+    let refusal = |prefix: &str| {
+        build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+        .unwrap_err()
+    };
+    let aliased = refusal("links");
+    assert!(
+        aliased.contains("0 have the size") && aliased.contains("1 are the same file"),
+        "{aliased}"
+    );
+    let held_back = refusal("maybe");
+    assert!(
+        held_back.contains("1 have the size") && held_back.contains("0 are the same file"),
+        "{held_back}"
+    );
+    assert_eq!(refusal("empty"), "no unclaimed files under that path");
+}
+
+/// A torrent's own empty files are the declared ones without bytes; a
+/// padding entry is never one, whatever its size.
+#[test]
+fn a_padding_entry_is_never_a_torrents_own_empty_file() {
+    let mut store = PoolStore::open_in_memory().unwrap();
+    add_torrent(
+        &mut store,
+        "pe",
+        "T",
+        None,
+        &[
+            ("T/a.bin", 64),
+            ("T/.pad/0", 0),
+            ("T/.pad/7", 7),
+            ("T/e", 0),
+        ],
+    );
+    let listed = torrentd_pool::plan::listed_under(&store, "pe", 1, "base").unwrap();
+    assert_eq!(
+        listed.empty,
+        std::collections::HashSet::from(["base/T/e".to_string()])
+    );
+}
+
+#[test]
+fn a_relocate_source_that_is_not_a_directory_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("T");
+    std::fs::write(&file, b"x").unwrap();
+    let why = torrentd_pool::plan::unlisted_entry(&file, "T", &Default::default()).unwrap();
+    assert!(why.ends_with("itself, which is not a directory"), "{why}");
+}
+
+/// An index from before the trash was left unindexed may still list it;
+/// a delete plan never takes a file from it.
+#[test]
+fn a_delete_plan_never_takes_a_file_from_the_trash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "junk/x.bin", 9);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let junk = store.file(root_id, "junk/x.bin").unwrap().unwrap();
+    let trashed = torrentd_pool::model::PoolFile {
+        rel_path: format!("{}/old.bin", torrentd_pool::plan::TRASH_DIR),
+        ino: junk.ino + 1,
+        ..junk.clone()
+    };
+    store.begin_staging().unwrap();
+    store.stage_files(&[junk, trashed]).unwrap();
+    store.swap_staged_root(root_id, 0).unwrap();
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: String::new(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"));
+}
+
+/// Re-record the indexed `(dev, ino)` of each of `rels` under `root_id` as
+/// `identity` gives it, size and mtime as they were: what a reboot or
+/// remount that renumbers devices and inodes leaves in a row a rescan
+/// carried forward. `rels` is every indexed file of the root, since the
+/// staged set replaces the root's.
+fn restamp(
+    store: &mut PoolStore,
+    root_id: i64,
+    rels: &[&str],
+    identity: impl Fn(&str, (u64, u64)) -> (u64, u64),
+) {
+    let files: Vec<_> = rels
+        .iter()
+        .map(|rel| {
+            let f = store.file(root_id, rel).unwrap().unwrap();
+            let (dev, ino) = identity(rel, (f.dev, f.ino));
+            torrentd_pool::model::PoolFile { dev, ino, ..f }
+        })
+        .collect();
+    store.begin_staging().unwrap();
+    store.stage_files(&files).unwrap();
+    store.swap_staged_root(root_id, 0).unwrap();
+}
+
+/// A claimed file's indexed identity can be stale: an unrelated orphan that
+/// only collides with it stays in a delete plan, while a real hard link
+/// whose rows were renumbered alike is still left out as the claimed file.
+#[test]
+fn a_stale_claimed_identity_leaves_no_valid_orphan_out_of_a_delete_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "junk/x.bin", 9);
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+    let rels = ["T/a.bin", "junk/x.bin", "links/a.bin"];
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let delete = |store: &PoolStore, prefix: &str| {
+        build_plan(
+            store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+    };
+
+    // The claimed file's row keeps numbers from before a reboot, which the
+    // unrelated orphan now has.
+    let junk = store.file(root_id, "junk/x.bin").unwrap().unwrap();
+    let junk_id = (junk.dev, junk.ino);
+    restamp(&mut store, root_id, &rels, |rel, id| {
+        if rel == "T/a.bin" {
+            junk_id
+        } else {
+            id
+        }
+    });
+    assert!(!store.is_orphan(root_id, "T/a.bin").unwrap());
+    assert!(store.claimed_identities().unwrap().contains(&junk_id));
+    let steps = delete(&store, "junk").unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"));
+
+    // The claimed file and its hard link, renumbered alike: neither row
+    // holds the live numbers, but the two are still one file.
+    let link = store.file(root_id, "links/a.bin").unwrap().unwrap();
+    let stale = (link.dev.wrapping_add(1), link.ino.wrapping_add(1_000_000));
+    restamp(&mut store, root_id, &rels, |rel, id| {
+        if rel == "junk/x.bin" {
+            id
+        } else {
+            stale
+        }
+    });
+    assert!(store.claimed_identities().unwrap().contains(&stale));
+    let aliased = delete(&store, "links").unwrap_err();
+    assert!(aliased.contains("1 are the same file"), "{aliased}");
+}
+
+/// An orphan's own indexed identity can be stale while the claimed file it
+/// is a hard link to is indexed as it is now: the delete step finds the
+/// claimed file through the orphan's live identity and refuses it, so the
+/// planner leaves it out as the claimed file rather than emitting a step
+/// that stops the plan.
+#[test]
+fn a_hard_link_with_a_stale_row_is_left_out_of_a_delete_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "junk/x.bin", 9);
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+    let rels = ["T/a.bin", "junk/x.bin", "links/a.bin"];
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    // Only the hard link's row keeps numbers from before a reboot; the
+    // claimed file's row holds the live ones.
+    let link = store.file(root_id, "links/a.bin").unwrap().unwrap();
+    let live = (link.dev, link.ino);
+    let stale = (link.dev.wrapping_add(1), link.ino.wrapping_add(1_000_000));
+    restamp(&mut store, root_id, &rels, |rel, id| {
+        if rel == "links/a.bin" {
+            stale
+        } else {
+            id
+        }
+    });
+    let claimed = store.claimed_identities().unwrap();
+    assert!(claimed.contains(&live) && !claimed.contains(&stale));
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: String::new(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"), "{steps:?}");
+    let aliased = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "links".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(aliased.contains("1 are the same file"), "{aliased}");
+}
+
+/// An orphan gone from disk since the scan cannot be stat'd, so the planner
+/// cannot tell whether it is a claimed file's twin from its live identity.
+/// It is one exactly when its indexed identity is a claimed one: a gone hard
+/// link to a claimed file is left out, and a gone unrelated file is planned.
+#[test]
+fn an_orphan_gone_since_the_scan_is_a_twin_only_by_a_claimed_indexed_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 64);
+    write_file(root, "junk/x.bin", 9);
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::hard_link(root.join("T/a.bin"), root.join("links/a.bin")).unwrap();
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "t1", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let claimed = store.claimed_identities().unwrap();
+    let link = store.file(root_id, "links/a.bin").unwrap().unwrap();
+    let junk = store.file(root_id, "junk/x.bin").unwrap().unwrap();
+    assert!(claimed.contains(&(link.dev, link.ino)));
+    assert!(!claimed.contains(&(junk.dev, junk.ino)));
+
+    std::fs::remove_file(root.join("links/a.bin")).unwrap();
+    std::fs::remove_file(root.join("junk/x.bin")).unwrap();
+
+    let delete = |prefix: &str| {
+        build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+    };
+    let steps = delete("").unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/x.bin"), "{steps:?}");
+    let aliased = delete("links").unwrap_err();
+    assert!(aliased.contains("1 are the same file"), "{aliased}");
 }

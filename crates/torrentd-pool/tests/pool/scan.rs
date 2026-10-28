@@ -474,6 +474,53 @@ fn a_duplicate_infohash_resolves_to_the_same_winner_on_every_scan() {
     );
 }
 
+/// Issue #658: the scan visited only `*.torrent` files, so a `.fastresume`
+/// with no `.torrent` beside it — a qBittorrent entry added from a magnet
+/// link whose metadata never arrived — was neither logged nor counted. Each
+/// is counted, a sidecar beside its `.torrent` is not, and none of them is an
+/// error or holds back the pruning.
+#[test]
+fn a_fastresume_with_no_torrent_beside_it_is_counted_and_not_imported() {
+    let dir = tempfile::tempdir().unwrap();
+    let (library, mut store) = library_of(
+        dir.path(),
+        "pad_file.torrent",
+        &["a.torrent", "sub/c.torrent"],
+    );
+    let resume = b"d12:qBt-category1:xe";
+    for name in [
+        "a.fastresume",
+        "sub/c.fastresume",
+        "b.fastresume",
+        // Not beside `sub/c.torrent`: a `.torrent` pairs only with the
+        // sidecar in its own directory.
+        "c.fastresume",
+        "sub/deeper/d.fastresume",
+    ] {
+        let p = library.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, resume).unwrap();
+    }
+    // A directory named like a sidecar is no sidecar.
+    std::fs::create_dir_all(library.join("e.fastresume")).unwrap();
+
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(stats.unpaired_fastresume, 3, "{stats:?}");
+    assert_eq!(stats.torrents_indexed, 1, "{stats:?}");
+    assert_eq!(stats.duplicate_infohashes, 1, "{stats:?}");
+    assert_eq!(stats.errors, 0, "{stats:?}");
+    assert_eq!(store.torrents().unwrap().len(), 1);
+
+    // The pruning still runs: the indexed torrent's `.torrent` gone, it
+    // leaves the index though the unpaired sidecars remain.
+    std::fs::remove_file(library.join("a.torrent")).unwrap();
+    std::fs::remove_file(library.join("sub/c.torrent")).unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(stats.unpaired_fastresume, 5, "{stats:?}");
+    assert_eq!(stats.errors, 0, "{stats:?}");
+    assert!(store.torrents().unwrap().is_empty());
+}
+
 /// Issue #440: a `.torrent` was read whole whatever its size, so one file
 /// in the library could exhaust the daemon's memory. Past the cap it is not
 /// read: it counts a `read` error, as an unreadable one does, so the scan

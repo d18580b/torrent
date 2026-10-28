@@ -206,23 +206,10 @@ impl TableLock {
         let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
         match UnixDatagram::bind_addr(&addr) {
             Ok(socket) => Ok(Self { _socket: socket }),
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                let who = match socket_holder(name) {
-                    Some((pid, comm)) => format!("{comm} (pid {pid})"),
-                    None => "another process".to_string(),
-                };
-                Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "{who} holds the abstract unix socket @{name}, which a torrentd holds for \
-                         its life: the nftables table `inet {name}` is that daemon's kill switch \
-                         and would be this one's too, since the table is per uid, not per state \
-                         directory. Refusing before touching it. Stop that daemon first, or run \
-                         this one under a user of its own (docs/running.md §11, \"Two daemons in \
-                         one network namespace need separate uids\").",
-                    ),
-                ))
-            }
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                refusal_message(name, socket_holder(name)),
+            )),
             Err(e) => Err(io::Error::new(
                 e.kind(),
                 format!("bind the abstract unix socket @{name}: {e}"),
@@ -236,10 +223,48 @@ impl TableLock {
 /// `/proc/net/unix` (this network namespace's), then the `/proc/<pid>/fd`
 /// entry linking to it. Best effort, for the refusal's message only: a holder
 /// in another pid namespace, or owned by another uid, is not found.
+///
+/// This process is asked first. A process forking a child (to exec `nft` or
+/// `openvpn`) shares the socket with that child until its exec closes it, so
+/// for that window two processes hold it; the parent is the one that took the
+/// lock, and a walk of `/proc` in pid order would name whichever comes first.
+/// A lookup that finds nothing is retried a few times, a few milliseconds
+/// apart, so an entry that a concurrent fork or exit hid for an instant does
+/// not turn the message into "another process".
 fn socket_holder(name: &str) -> Option<(u32, String)> {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..=ATTEMPTS {
+        if let Some(holder) = find_socket_holder(name) {
+            return Some(holder);
+        }
+        if attempt < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    None
+}
+
+/// One pass of [`socket_holder`]: this process's descriptors, then every
+/// other process's.
+fn find_socket_holder(name: &str) -> Option<(u32, String)> {
     let table = std::fs::read_to_string("/proc/net/unix").ok()?;
     let inode = unix_socket_inode(&table, name)?;
     let target = std::ffi::OsString::from(format!("socket:[{inode}]"));
+    let own = std::process::id();
+    let holds = |dir: &std::path::Path| {
+        std::fs::read_dir(dir.join("fd")).is_ok_and(|fds| {
+            fds.flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == target))
+        })
+    };
+    let comm = |dir: &std::path::Path| {
+        std::fs::read_to_string(dir.join("comm"))
+            .map_or_else(|_| "a process".to_string(), |c| c.trim().to_string())
+    };
+    let own_dir = std::path::Path::new("/proc/self");
+    if holds(own_dir) {
+        return Some((own, comm(own_dir)));
+    }
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -248,19 +273,27 @@ fn socket_holder(name: &str) -> Option<(u32, String)> {
         else {
             continue;
         };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
-            continue;
-        };
-        let holds = fds
-            .flatten()
-            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == target));
-        if holds {
-            let comm = std::fs::read_to_string(entry.path().join("comm"))
-                .map_or_else(|_| "a process".to_string(), |c| c.trim().to_string());
-            return Some((pid, comm));
+        if pid != own && holds(&entry.path()) {
+            return Some((pid, comm(&entry.path())));
         }
     }
     None
+}
+
+/// The refusal [`TableLock::acquire_named`] returns for `@name`, naming
+/// `holder` (its pid and command name) where [`socket_holder`] found one.
+fn refusal_message(name: &str, holder: Option<(u32, String)>) -> String {
+    let who = match holder {
+        Some((pid, comm)) => format!("{comm} (pid {pid})"),
+        None => "another process".to_string(),
+    };
+    format!(
+        "{who} holds the abstract unix socket @{name}, which a torrentd holds for its life: the \
+         nftables table `inet {name}` is that daemon's kill switch and would be this one's too, \
+         since the table is per uid, not per state directory. Refusing before touching it. Stop \
+         that daemon first, or run this one under a user of its own (docs/running.md §11, \"Two \
+         daemons in one network namespace need separate uids\").",
+    )
 }
 
 /// The inode `/proc/net/unix`'s `table` lists for the abstract socket
@@ -1222,6 +1255,25 @@ pub(crate) enum FenceCause {
 /// How often [`watch`] checks the table is still installed.
 const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The most checks apart two reinstalls of one loss are tried: 10 checks of
+/// [`WATCH_INTERVAL`], five minutes.
+const REINSTALL_RETRY_MAX_CHECKS: u32 = 10;
+
+/// How many checks that find the table still lost pass, after the
+/// `failures`th reinstall in a row of one loss did not check intact, before
+/// the next check installs it again: the reinstalls are 1, 2, 4, 8 checks
+/// apart, then [`REINSTALL_RETRY_MAX_CHECKS`] apart for as long as the loss
+/// lasts. The first retry is the very next check, so one transient `nft`
+/// failure costs one interval of fencing, not the rest of the run; a fault
+/// that persists is retried at most every five minutes rather than every
+/// check, each retry an `nft -f -` transaction and an error in the log.
+fn retry_wait(failures: u32) -> u32 {
+    1u32.checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(REINSTALL_RETRY_MAX_CHECKS)
+        - 1
+}
+
 /// Where the watch stands between checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Watch {
@@ -1232,9 +1284,19 @@ enum Watch {
     /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE),
     /// and nothing is fenced for them.
     Unchecked(u32),
-    /// A check found it gone or changed: every vpn profile was fenced, and the
-    /// one reinstall this loss gets was tried and did not check intact.
-    Lost,
+    /// A check found it gone or changed: every vpn profile was fenced, and
+    /// the last `failures` reinstalls of this loss in a row did not check
+    /// intact. Each later check fences again until one finds the table
+    /// intact, including a check that cannot run; a check that finds it
+    /// still gone or changed installs it again once `wait` more such checks
+    /// have passed ([`retry_wait`]).
+    Lost {
+        /// Reinstalls of this loss that did not check intact, at least 1.
+        failures: u32,
+        /// Checks that find the table still lost before the next one
+        /// reinstalls it.
+        wait: u32,
+    },
     /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
     /// checks in a row could not run: every vpn profile was fenced
     /// ([`FenceCause::Unverifiable`]), and stays so until a check finds the
@@ -1253,11 +1315,14 @@ enum Watch {
 ///
 /// Each check compares the live table with the rendered one ([`verify`]) and
 /// sets `kill_switch_table_present` to whether it matched. A table gone or
-/// changed fences every vpn profile, then the table is installed again once,
-/// in one transaction, and checked again; only a reinstall that checks intact
+/// changed fences every vpn profile, then the table is installed again, in
+/// one transaction, and checked again; only a reinstall that checks intact
 /// lifts the fence. While it is not intact the check repeats each interval,
-/// fencing again any profile set online meanwhile; a later check that finds it
-/// intact — restored by the operator — lifts the fence then. A check that
+/// fencing again any profile set online meanwhile, whether or not that check
+/// can run, and a check that finds it still gone or changed installs it
+/// again with a backoff ([`retry_wait`]): the next check, then 2, 4 and 8
+/// checks on, then every 10, until one checks intact. A check that finds it
+/// intact — reinstalled, or restored by the operator — lifts the fence. A check that
 /// cannot run counts in `kill_switch_probe_errors_total` and, alone, changes
 /// nothing, since not knowing is not the same as absent; but
 /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)
@@ -1494,19 +1559,26 @@ fn refresh(
 /// leaves the watch.
 ///
 /// Each loss found from any state but [`Watch::Lost`] counts once in
-/// `kill_switch_lost_total`, by whether the one reinstall checked intact
+/// `kill_switch_lost_total`, by whether its first reinstall checked intact
 /// (`reinstalled`) or not (`lost`). The whole loss, fence and reinstall
 /// included, happens within this one call, so `kill_switch_table_present` is
 /// back at 1 before any scrape can read the 0: the counter is the only trace a
 /// loss the reinstall repaired leaves. The checks that repeat while the watch
-/// is [`Watch::Lost`] are the same loss, and are not counted again.
+/// is [`Watch::Lost`] are the same loss, and are not counted again, the
+/// reinstalls they retry included.
+///
+/// A check that finds the table still lost while the watch is
+/// [`Watch::Lost`] fences again, and reinstalls it only once the loss's
+/// `wait` has run out ([`retry_wait`]); the fence comes off only when a
+/// reinstall's own readback, or a later check, finds the table intact.
 ///
 /// A check that cannot run fences nothing until it is the
 /// [`PROBE_FAILURES_TO_FENCE`](crate::vpn_monitor::PROBE_FAILURES_TO_FENCE)th
 /// in a row, which fences every vpn profile
 /// ([`FenceCause::Unverifiable`]); each later one fences again any profile set
 /// online meanwhile. One that cannot run while the watch is [`Watch::Lost`]
-/// leaves it so: every profile is fenced already, for the loss.
+/// leaves it so, and fences again any profile set online meanwhile
+/// ([`FenceCause::NotInForce`]): the loss is the last thing a check found.
 fn tick(
     state: Watch,
     verify: impl Fn() -> io::Result<Verdict>,
@@ -1517,7 +1589,7 @@ fn tick(
     let why = match verify() {
         Ok(Verdict::Intact) => {
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
-            if matches!(state, Watch::Lost | Watch::Unverified) {
+            if matches!(state, Watch::Lost { .. } | Watch::Unverified) {
                 tracing::warn!(
                     target: "torrentd::vpn::killswitch",
                     state = ?state,
@@ -1549,45 +1621,65 @@ fn tick(
          longer confined to the tunnels; fencing every vpn profile",
     );
     fence.fence_all();
-    if state == Watch::Lost {
-        return Watch::Lost;
-    }
+    // How many reinstalls of this loss have already failed: none for a loss
+    // this check found.
+    let failed = match state {
+        Watch::Lost { failures, wait: 0 } => failures,
+        Watch::Lost { failures, wait } => {
+            return Watch::Lost {
+                failures,
+                wait: wait - 1,
+            };
+        }
+        Watch::Intact | Watch::Unchecked(_) | Watch::Unverified => 0,
+    };
+    let lost = |failures: u32| Watch::Lost {
+        failures,
+        wait: retry_wait(failures),
+    };
     let next = match reinstall().and_then(|()| verify()) {
         Ok(Verdict::Intact) => {
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
             tracing::warn!(
                 target: "torrentd::vpn::killswitch",
+                failed_reinstalls = failed,
                 "reinstalled the network kill switch and verified it; lifting the fence",
             );
             fence.lift();
             Watch::Intact
         }
         Ok(verdict) => {
+            let next = lost(failed.saturating_add(1));
             tracing::error!(
                 target: "torrentd::vpn::killswitch",
                 verdict = ?verdict,
+                state = ?next,
                 "reinstalled the network kill switch, and it still does not check as installed; \
-                 the vpn profiles stay fenced. Restart the daemon to reinstall it",
+                 the vpn profiles stay fenced, and a later check installs it again",
             );
-            Watch::Lost
+            next
         }
         Err(e) => {
+            let next = lost(failed.saturating_add(1));
             tracing::error!(
                 target: "torrentd::vpn::killswitch",
-                state = ?state,
+                state = ?next,
                 error.cause = %e,
-                "could not reinstall the network kill switch; the vpn profiles stay fenced. \
-                 Restart the daemon to reinstall it",
+                "could not reinstall the network kill switch; the vpn profiles stay fenced, and \
+                 a later check installs it again",
             );
-            Watch::Lost
+            next
         }
     };
-    let outcome = if next == Watch::Intact {
-        "reinstalled"
-    } else {
-        "lost"
-    };
-    metrics.inc_counter("kill_switch_lost_total", &[("outcome", outcome)]);
+    // A retry is the same loss, already counted when it was found.
+    if failed == 0 {
+        let outcome = if next == Watch::Intact {
+            "reinstalled"
+        } else {
+            "lost"
+        };
+        metrics.inc_counter("kill_switch_lost_total", &[("outcome", outcome)]);
+    }
     next
 }
 
@@ -1595,7 +1687,15 @@ fn tick(
 /// [`tick`].
 fn unchecked(state: Watch, fence: &dyn Fence) -> Watch {
     let failures = match state {
-        Watch::Lost => return Watch::Lost,
+        // The loss stands: nothing has found the table back. Fence again, as
+        // a check that finds it still lost does, so a profile set online
+        // meanwhile does not keep seeding for as long as `nft` cannot run.
+        // Its retry waits for a check that runs, which can read back what a
+        // reinstall installed: `wait` counts only those.
+        Watch::Lost { .. } => {
+            fence.fence_all();
+            return state;
+        }
         Watch::Intact => 1,
         Watch::Unchecked(n) => n.saturating_add(1),
         Watch::Unverified => crate::vpn_monitor::PROBE_FAILURES_TO_FENCE,

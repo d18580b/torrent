@@ -78,6 +78,9 @@ impl PoolStore {
     /// one per (directory, claimant), never the file list. Every writer of
     /// `file` or `claim` that the daemon runs ends with this: a root swap
     /// rebuilds its root, and a match rebuilds every root.
+    ///
+    /// An empty file at a declared empty path of a torrent placed in the
+    /// root is not counted as an orphan, as in [`PoolStore::orphan_files`].
     pub fn rebuild_rollups(&mut self, root_id: i64) -> Result<(), PoolError> {
         #[derive(Default)]
         struct Agg {
@@ -92,6 +95,7 @@ impl PoolStore {
             st.conn
                 .execute("DELETE FROM dir_claim WHERE root_id = ?1", params![root_id])?;
 
+            let declared = st.declared_empty_paths(root_id)?;
             let mut dirs: HashMap<String, Agg> = HashMap::new();
             {
                 let mut q = st.conn.prepare(
@@ -105,6 +109,7 @@ impl PoolStore {
                     let rel: String = r.get(0)?;
                     let size = r.get::<_, i64>(1)? as u64;
                     let claimed: bool = r.get(2)?;
+                    let orphan = !claimed && (size > 0 || !declared.contains(&rel));
                     for dir in ancestors(&rel) {
                         // Only directories new to this walk allocate a key.
                         if !dirs.contains_key(dir) {
@@ -115,7 +120,7 @@ impl PoolStore {
                         };
                         agg.bytes_total = agg.bytes_total.saturating_add(size);
                         agg.files_total += 1;
-                        if !claimed {
+                        if orphan {
                             agg.bytes_orphan = agg.bytes_orphan.saturating_add(size);
                             agg.files_orphan += 1;
                         }
@@ -194,6 +199,11 @@ impl PoolStore {
     /// This is the only query a delete plan is allowed to build from: a file is
     /// a deletion candidate solely because nothing in the library references
     /// it, never because it merely looks unused.
+    ///
+    /// An empty file at the path of a declared empty file of a torrent placed
+    /// in this root is that torrent's, and is not listed: the matcher claims
+    /// no file without bytes, so it has no claim row (see
+    /// [`PoolStore::declared_empty_paths`]).
     pub fn orphan_files(&self, root_id: i64, prefix: &str) -> Result<Vec<String>, PoolError> {
         Ok(self
             .orphan_files_sized(root_id, prefix)?
@@ -234,7 +244,66 @@ impl PoolStore {
                 (r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64),
             ))
         })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let rows = rows.collect::<Result<Vec<SizedOrphan>, _>>()?;
+        if !rows.iter().any(|(_, size, _)| *size == 0) {
+            return Ok(rows);
+        }
+        let declared = self.declared_empty_paths(root_id)?;
+        Ok(rows
+            .into_iter()
+            .filter(|(rel, size, _)| *size > 0 || !declared.contains(rel))
+            .collect())
+    }
+
+    /// The root-relative path of every declared empty file of every torrent
+    /// placed in `root_id`: its torrent-relative path under the torrent's
+    /// recorded base. Padding entries are never written, so none is listed.
+    ///
+    /// The matcher claims no file without bytes, so an empty file at one of
+    /// these paths has no claim row, yet it is that torrent's payload: a
+    /// delete that took it would take a file the torrent declares.
+    pub fn declared_empty_paths(&self, root_id: i64) -> Result<HashSet<String>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT a.base_rel, t.rel_path FROM torrent_file t
+             JOIN adoption a ON a.infohash = t.infohash
+             WHERE t.size = 0 AND t.pad_file = 0
+               AND a.root_id = ?1 AND a.base_rel IS NOT NULL",
+        )?;
+        let rows = st.query_map(params![root_id], |r| {
+            Ok(super::join_rel(
+                &r.get::<_, String>(0)?,
+                &r.get::<_, String>(1)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+
+    /// Whether `rel_path` is a declared empty file of a torrent placed in
+    /// `root_id`: the single-path form of [`PoolStore::declared_empty_paths`].
+    ///
+    /// Driven from the root's adoptions, and only a torrent whose recorded
+    /// base is an ancestor of `rel_path` has its file rows read, so the cost
+    /// never grows with the number of declared empty files in the root. The
+    /// path comparison is [`super::join_rel`]'s, written in SQL.
+    fn is_declared_empty(&self, root_id: i64, rel_path: &str) -> Result<bool, PoolError> {
+        let declared: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM adoption a CROSS JOIN torrent_file t
+                WHERE a.root_id = ?1 AND a.base_rel IS NOT NULL
+                  AND (trim(a.base_rel, '/') = ''
+                       OR substr(?2, 1, length(trim(a.base_rel, '/')) + 1)
+                          = trim(a.base_rel, '/') || '/')
+                  AND t.infohash = a.infohash
+                  AND t.size = 0 AND t.pad_file = 0
+                  AND trim(t.rel_path, '/') = CASE
+                        WHEN trim(a.base_rel, '/') = '' THEN ?2
+                        ELSE substr(?2, length(trim(a.base_rel, '/')) + 2)
+                      END
+             )",
+            params![root_id, rel_path],
+            |r| r.get(0),
+        )?;
+        Ok(declared != 0)
     }
 
     /// Files under `(root_id, prefix)` that `infohash` does **not** claim.
@@ -316,7 +385,8 @@ impl PoolStore {
     ///
     /// The single-file form of [`PoolStore::orphan_files`], for the last-moment
     /// re-check before an irreversible delete. Listing every orphan in the root
-    /// and scanning it would be O(pool) per file.
+    /// and scanning it would be O(pool) per file. An empty file that is a
+    /// placed torrent's declared empty file is not an orphan, as there.
     pub fn is_orphan(&self, root_id: i64, rel_path: &str) -> Result<bool, PoolError> {
         let claimed: i64 = self.conn.query_row(
             "SELECT EXISTS(
@@ -330,12 +400,19 @@ impl PoolStore {
         }
         // A path the index has never seen is not an orphan either — it is
         // outside the pool's knowledge, and deleting it was never sanctioned.
-        let known: i64 = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM file WHERE root_id = ?1 AND rel_path = ?2)",
-            params![root_id, rel_path],
-            |r| r.get(0),
-        )?;
-        Ok(known != 0)
+        let size: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT size FROM file WHERE root_id = ?1 AND rel_path = ?2",
+                params![root_id, rel_path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match size {
+            None => Ok(false),
+            Some(0) => Ok(!self.is_declared_empty(root_id, rel_path)?),
+            Some(_) => Ok(true),
+        }
     }
 
     /// The indexed `(dev, ino)` of every claimed file, under every root.
@@ -343,7 +420,9 @@ impl PoolStore {
     /// A path is not the only way to reach a file: a hard link, or the same
     /// directory listed twice through a bind mount, is a second path to the
     /// claimed bytes that [`PoolStore::is_orphan`] reads as unclaimed. The
-    /// delete step refuses any file whose identity is in this set.
+    /// delete planner and the delete step both use it to find the claimed
+    /// files ([`PoolStore::claimed_files_with_identity`]) whose live identity
+    /// they compare with the orphan's.
     pub fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT DISTINCT f.dev, f.ino FROM claim c
@@ -353,6 +432,35 @@ impl PoolStore {
             Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
         })?;
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+
+    /// The root directory and root-relative path of every claimed file
+    /// whose indexed identity is `(dev, ino)`, under every root.
+    ///
+    /// An indexed identity can be older than the disk: a rescan carries a
+    /// row it could not re-read forward unchanged, and a reboot renumbers
+    /// devices and inodes. A match against [`PoolStore::claimed_identities`]
+    /// is therefore only a candidate, which the delete planner and the
+    /// delete step confirm by stat'ing the paths this returns.
+    pub fn claimed_files_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Vec<(std::path::PathBuf, String)>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT r.path, f.rel_path FROM claim c
+             JOIN file f ON f.root_id = c.root_id AND f.rel_path = c.rel_path
+             JOIN root r ON r.id = f.root_id
+             WHERE f.dev = ?1 AND f.ino = ?2
+             ORDER BY r.path, f.rel_path",
+        )?;
+        let rows = st.query_map(params![dev as i64, ino as i64], |r| {
+            Ok((
+                std::path::PathBuf::from(r.get::<_, String>(0)?),
+                r.get::<_, String>(1)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Distinct adoption states of every torrent claiming a file under
@@ -469,8 +577,8 @@ impl PoolStore {
     }
 
     /// Up to `limit` library torrents in infohash order after `after`, each
-    /// with its adoption state and the base it was matched at, optionally
-    /// only those in `state`.
+    /// with its adoption state, the base it was matched at and the note the
+    /// match left, optionally only those in `state`.
     ///
     /// Keyset pagination in SQL: a page costs `limit` index steps whatever
     /// the library's size, where loading every torrent and cutting a page
@@ -489,6 +597,7 @@ impl PoolStore {
                 torrent: row_to_torrent(r)?,
                 state: state.as_deref().and_then(AdoptionState::parse),
                 base_rel: r.get(13)?,
+                note: r.get(14)?,
             })
         };
         let rows = match state {
@@ -497,7 +606,7 @@ impl PoolStore {
                     "SELECT t.infohash, t.infohash_v1, t.infohash_v2, t.name, t.total_size,
                             t.num_files, t.source_path, t.fastresume_path, t.declared_save_path,
                             t.category, t.tags, t.profile, a.state,
-                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END
+                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END, a.last_error
                      FROM torrent t
                      LEFT JOIN adoption a ON a.infohash = t.infohash
                      WHERE t.infohash > ?1
@@ -511,7 +620,7 @@ impl PoolStore {
                     "SELECT t.infohash, t.infohash_v1, t.infohash_v2, t.name, t.total_size,
                             t.num_files, t.source_path, t.fastresume_path, t.declared_save_path,
                             t.category, t.tags, t.profile, a.state,
-                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END
+                            CASE WHEN a.root_id IS NOT NULL THEN a.base_rel END, a.last_error
                      FROM adoption a
                      JOIN torrent t ON t.infohash = a.infohash
                      WHERE a.state = ?1 AND a.infohash > ?2

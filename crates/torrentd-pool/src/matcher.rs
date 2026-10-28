@@ -769,22 +769,7 @@ mod tests {
                 ),
             )
                 .prop_flat_map(|(specs, decoys)| {
-                    let mut disk: BTreeMap<(usize, String), u64> = BTreeMap::new();
-                    for s in &specs {
-                        for (root, base, present) in &s.copies {
-                            for (j, here) in present.iter().enumerate() {
-                                if *here {
-                                    let rel = s.rel(j);
-                                    let path = if BASES[*base].is_empty() {
-                                        rel
-                                    } else {
-                                        format!("{}/{rel}", BASES[*base])
-                                    };
-                                    disk.entry((*root, path)).or_insert(s.sizes[j]);
-                                }
-                            }
-                        }
-                    }
+                    let mut disk = payload(&specs);
                     for (root, rel, size) in decoys {
                         disk.entry((root, rel)).or_insert(size);
                     }
@@ -804,6 +789,28 @@ mod tests {
                         any::<u64>(),
                     )
                 })
+        }
+
+        /// The files each spec's copies put on disk, keyed by root and
+        /// root-relative path.
+        fn payload(specs: &[Spec]) -> BTreeMap<(usize, String), u64> {
+            let mut disk = BTreeMap::new();
+            for s in specs {
+                for (root, base, present) in &s.copies {
+                    for (j, here) in present.iter().enumerate() {
+                        if *here {
+                            let rel = s.rel(j);
+                            let path = if BASES[*base].is_empty() {
+                                rel
+                            } else {
+                                format!("{}/{rel}", BASES[*base])
+                            };
+                            disk.entry((*root, path)).or_insert(s.sizes[j]);
+                        }
+                    }
+                }
+            }
+            disk
         }
 
         /// Build the store, handing it roots, files and torrents in the
@@ -915,6 +922,58 @@ mod tests {
                     )
                 })
                 .collect()
+        }
+
+        /// Each torrent's note after one match of a pool holding `specs`, as
+        /// the library listing reports it, in infohash order.
+        fn notes_after_match(specs: &[Spec]) -> Vec<Option<String>> {
+            let order: Vec<usize> = (0..specs.len()).collect();
+            let mut store = build(specs, &payload(specs), &[0, 1, 2], &order, 0);
+            match_all(&mut store).unwrap();
+            store
+                .torrents_page(None, None, specs.len())
+                .unwrap()
+                .into_iter()
+                .map(|l| l.note)
+                .collect()
+        }
+
+        /// A torrent whose files sit at `copies`, each `(root, base, which
+        /// files are there)`.
+        fn show(copies: Vec<(usize, usize, Vec<bool>)>) -> Spec {
+            Spec {
+                name: "Show",
+                sizes: vec![100, 200],
+                declared: None,
+                copies,
+            }
+        }
+
+        /// The note is how an operator learns why a delete plan refuses a
+        /// torrent's payload: it says so for two complete copies, and says
+        /// nothing for one.
+        #[test]
+        fn a_second_complete_copy_is_noted_and_a_single_copy_is_not() {
+            let both = vec![true, true];
+            assert_eq!(
+                notes_after_match(&[show(vec![(0, 0, both.clone())])]),
+                [None]
+            );
+            assert_eq!(
+                notes_after_match(&[show(vec![(0, 0, both.clone()), (1, 0, both)])]),
+                [Some(
+                    "2 complete copies under the managed roots; delete plans refuse to touch \
+                     any of them until only one is left"
+                        .to_owned()
+                )],
+            );
+        }
+
+        /// A partial torrent's note counts the files that resolved.
+        #[test]
+        fn a_partial_torrent_notes_how_many_files_are_present() {
+            let notes = notes_after_match(&[show(vec![(0, 0, vec![true, false])])]);
+            assert_eq!(notes, [Some("1 of 2 files present".to_owned())]);
         }
 
         proptest! {

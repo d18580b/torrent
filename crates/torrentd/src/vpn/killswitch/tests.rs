@@ -28,7 +28,58 @@ fn a_second_table_lock_refuses_and_names_the_holder() {
         "the refusal names the socket and the table: {msg}"
     );
     drop(first);
-    TableLock::acquire_named(&name).expect("the lock is free once the holder is gone");
+    reacquire_after_drop(&name).expect("the lock is free once the holder is gone");
+}
+
+/// The refusal names the holder it is given by its command name and pid,
+/// and the socket and table either way; with no holder found it says
+/// "another process" and names no pid.
+#[test]
+fn the_refusal_names_an_injected_holder() {
+    let named = refusal_message("torrentd_ks_1000", Some((4242, "torrentd".to_string())));
+    assert!(
+        named.starts_with("torrentd (pid 4242) holds the abstract unix socket @torrentd_ks_1000,"),
+        "{named}"
+    );
+    assert!(named.contains("`inet torrentd_ks_1000`"), "{named}");
+    let unknown = refusal_message("torrentd_ks_1000", None);
+    assert!(
+        unknown.starts_with("another process holds the abstract unix socket @torrentd_ks_1000,"),
+        "{unknown}"
+    );
+    assert!(!unknown.contains("(pid "), "{unknown}");
+    assert!(unknown.contains("`inet torrentd_ks_1000`"), "{unknown}");
+}
+
+/// A lock this process holds is found in this process, whatever other
+/// process `/proc` lists first: the holder's pid is this one's.
+#[test]
+fn the_holder_of_this_processs_lock_is_this_process() {
+    let name = lock_name("holder");
+    let _held = TableLock::acquire_named(&name).expect("lock");
+    let (pid, comm) = socket_holder(&name).expect("this process's lock is found");
+    assert_eq!(pid, std::process::id());
+    assert!(!comm.is_empty());
+}
+
+/// Take the lock on `name` just after its holder was dropped. Another test
+/// in this binary that spawns a process forks a child holding a copy of
+/// every descriptor, the socket included, until that child execs and
+/// close-on-exec closes it; for that window the name is still bound. So
+/// a refusal here is retried for up to a second, and any other failure,
+/// or a refusal that outlasts the second, is returned.
+fn reacquire_after_drop(name: &str) -> io::Result<TableLock> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match TableLock::acquire_named(name) {
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrInUse && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The lock is on the table's own name, so a lock on another uid's
@@ -41,6 +92,110 @@ fn another_uids_table_lock_does_not_refuse() {
     let _a = TableLock::acquire_named(&a).expect("one uid's lock");
     TableLock::acquire_named(&b).expect("another uid's lock is not refused");
     assert_eq!(table_name(1000), "torrentd_ks_1000");
+}
+
+/// The table an operator is told to delete is this process's own.
+#[test]
+fn the_own_table_is_this_uids() {
+    assert_eq!(own_table_name(), table_name(current_uid().unwrap()));
+}
+
+/// The uid the ruleset confines is this process's effective one, as the
+/// kernel reports it.
+#[test]
+fn the_current_uid_is_the_effective_uid() {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    assert_eq!(current_uid().unwrap(), unsafe { libc::geteuid() });
+}
+
+/// `--check-config` reports nftables usable exactly when `nft --version`
+/// runs and exits zero on this host.
+#[test]
+fn nft_is_available_exactly_when_it_runs() {
+    let runs = std::process::Command::new("nft")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert_eq!(nft_available(), runs);
+}
+
+/// A link that does not exist has no listen port to exempt, whether `wg`
+/// is installed or not.
+#[test]
+fn a_link_that_does_not_exist_has_no_listen_port() {
+    listen_port("tdks-nolink0").expect_err("no such link");
+}
+
+/// Set in the process [`a_bind_failure_without_a_holder_is_no_refusal`]
+/// starts, the only one in which its half that exhausts descriptors runs.
+const EXHAUST_DESCRIPTORS: &str = "TORRENTD_TEST_KS_EXHAUST_DESCRIPTORS";
+
+/// A bind that fails for want of a descriptor keeps its own kind, and says
+/// what failed, instead of reading as another process holding the lock.
+/// The descriptor limit is shared by every test in the binary, so the half
+/// that exhausts it runs in a process of its own: this test binary again,
+/// filtered to that one test.
+#[test]
+fn a_bind_failure_without_a_holder_is_no_refusal() {
+    let name = "vpn::killswitch::tests::bind_without_a_descriptor";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(EXHAUST_DESCRIPTORS, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the filter ran no test: {stdout}"
+    );
+}
+
+#[test]
+#[ignore = "run by a_bind_failure_without_a_holder_is_no_refusal"]
+fn bind_without_a_descriptor() {
+    if std::env::var_os(EXHAUST_DESCRIPTORS).is_none() {
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit`.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+        0
+    );
+    // No descriptor above those already open.
+    let lowered = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `lowered` is a valid `rlimit` no higher than the hard limit.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) },
+        0
+    );
+    let lock = TableLock::acquire_named(&lock_name("emfile"));
+    // SAFETY: `limit` is the `rlimit` read above.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+        0
+    );
+    let err = lock.expect_err("no descriptor is left for the socket");
+    assert_ne!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("bind the abstract unix socket @"),
+        "{err}"
+    );
 }
 
 /// `/proc/net/unix`'s abstract entries are found by their exact name and
@@ -844,18 +999,31 @@ fn a_legacy_failure_after_the_own_table_is_removed_is_a_warning() {
     let listing = || Ok(format!("table inet torrentd_ks\ntable inet {TABLE}\n"));
 
     let deleted = std::cell::RefCell::new(Vec::new());
-    let removed = disable_with(
-        998,
-        listing,
-        |_| Err(io::Error::other("nft -j list table exited 1")),
-        |name| {
-            deleted.borrow_mut().push(name.to_string());
-            Ok(())
-        },
-    )
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let removed = torrentd_engine::testing::with_subscriber(subscriber, || {
+        disable_with(
+            998,
+            listing,
+            |_| Err(io::Error::other("nft -j list table exited 1")),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+    })
     .expect("the own table is gone, so the call succeeds");
     assert!(removed);
     assert_eq!(*deleted.borrow(), [TABLE], "only the own table is deleted");
+    // The warning is the only place the failure is reported, and it says how
+    // to remove the table by hand.
+    let log = log.text();
+    assert!(
+        log.contains("nft -j list table exited 1")
+            && log.contains("nft delete table inet torrentd_ks"),
+        "{log}"
+    );
 
     let deleted = std::cell::RefCell::new(Vec::new());
     let removed = disable_with(
@@ -956,6 +1124,42 @@ fn disable_against_real_nft() {
     );
     assert!(!remove_table_for(998).expect("and deleting it again is still success"));
     assert!(remove_table_for(1000).expect("uid 1000's own removal takes it"));
+}
+
+/// The renderer writes `!=` only against a set of interface names, so a
+/// listing reading `oifname != "<one name>"` is not a rule it installed.
+#[test]
+fn a_negated_single_interface_match_is_not_a_rule_the_kill_switch_installs() {
+    let set = serde_json::json!([
+        {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}},
+                   "right": {"set": ["wg0", "lo"]}}},
+        {"drop": null},
+    ]);
+    assert_eq!(
+        rule_line(&set).unwrap(),
+        "oifname != { \"lo\", \"wg0\" } drop"
+    );
+    let single = serde_json::json!([
+        {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
+        {"drop": null},
+    ]);
+    rule_line(&single).expect_err("never installed");
+}
+
+/// `remove_table` and `disable` act on this process's own uid's table, and
+/// say whether there was one.
+#[test]
+#[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+fn removing_the_own_table_against_real_nft() {
+    let own = own_table_name();
+    let table = render_ruleset(current_uid().unwrap(), &[tunnel("wg0")]).unwrap();
+    apply(&table).expect("install this uid's table");
+    assert!(remove_table().expect("remove it"), "there was a table");
+    assert!(!table_listed(&list_tables().expect("list"), &own));
+    assert!(!remove_table().expect("nothing left"), "there was none");
+    apply(&table).expect("install it again");
+    disable().expect("disable removes it");
+    assert!(!table_listed(&list_tables().expect("list"), &own));
 }
 
 /// A table an earlier release left under the shared name, against a real
@@ -1582,7 +1786,10 @@ async fn a_check_past_the_stop_neither_reinstalls_nor_fences() {
     );
     assert_eq!(
         next,
-        Watch::Lost,
+        Watch::Lost {
+            failures: 1,
+            wait: 0
+        },
         "the refused reinstall is not taken for a repair"
     );
     assert_eq!(
@@ -1701,24 +1908,73 @@ fn a_lost_table_fences_then_lifts_only_on_a_verified_reinstall() {
     }
 }
 
+/// A loss whose one reinstall failed, retried at the next check.
+const LOST_ONCE: Watch = Watch::Lost {
+    failures: 1,
+    wait: 0,
+};
+
+/// A loss whose retry is still some checks away.
+const LOST_WAITING: Watch = Watch::Lost {
+    failures: 3,
+    wait: 2,
+};
+
 /// A reinstall that fails, or that does not check intact, leaves every
-/// profile fenced. Later checks fence again — a profile set online
-/// meanwhile is fenced once more — without a second reinstall, and the
-/// fence comes off at the first check that finds the table intact.
+/// profile fenced. Each later check fences again — a profile set online
+/// meanwhile is fenced once more — and retries the reinstall when its wait
+/// has run out; the fence comes off at the first check that finds the
+/// table intact.
 #[test]
 fn a_reinstall_that_does_not_verify_keeps_the_fence() {
-    for (label, after) in [
-        ("refused", Err(io::Error::other("nft -f - exited 1"))),
-        ("still drifted", Ok(())),
-    ] {
+    for (label, refused) in [("refused", true), ("still drifted", false)] {
         let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
-        let after = std::cell::RefCell::new(Some(after));
-        let reinstall = || after.borrow_mut().take().expect("one reinstall per loss");
-        let check = verdicts(vec![Ok(Verdict::Absent), drifted()]);
-        let next = tick(Watch::Intact, &check, reinstall, &fence, &metrics);
-        assert_eq!(next, Watch::Lost, "{label}");
+        let reinstalls = std::cell::Cell::new(0);
+        let reinstall = || {
+            reinstalls.set(reinstalls.get() + 1);
+            if refused {
+                Err(io::Error::other("nft -f - exited 1"))
+            } else {
+                Ok(())
+            }
+        };
+        // A refused reinstall is not read back.
+        let after = |found: io::Result<Verdict>| {
+            if refused {
+                vec![found]
+            } else {
+                vec![found, drifted()]
+            }
+        };
+        let next = tick(
+            Watch::Intact,
+            verdicts(after(Ok(Verdict::Absent))),
+            reinstall,
+            &fence,
+            &metrics,
+        );
+        assert_eq!(next, LOST_ONCE, "{label}");
         assert_eq!(gauge(&metrics), Some(0.0), "{label}");
         assert_eq!(fence.take(), ["fence"], "{label}: fenced, not lifted");
+        assert_eq!(reinstalls.get(), 1, "{label}");
+
+        let next = tick(
+            next,
+            verdicts(after(Ok(Verdict::Absent))),
+            reinstall,
+            &fence,
+            &metrics,
+        );
+        assert_eq!(
+            next,
+            Watch::Lost {
+                failures: 2,
+                wait: 1
+            },
+            "{label}"
+        );
+        assert_eq!(fence.take(), ["fence"], "{label}: fenced again");
+        assert_eq!(reinstalls.get(), 2, "{label}: retried at the next check");
 
         let next = tick(
             next,
@@ -1727,12 +1983,16 @@ fn a_reinstall_that_does_not_verify_keeps_the_fence() {
             &fence,
             &metrics,
         );
-        assert_eq!(next, Watch::Lost, "{label}");
         assert_eq!(
-            fence.take(),
-            ["fence"],
-            "{label}: fenced again, no reinstall"
+            next,
+            Watch::Lost {
+                failures: 2,
+                wait: 0
+            },
+            "{label}"
         );
+        assert_eq!(fence.take(), ["fence"], "{label}: fenced again");
+        assert_eq!(reinstalls.get(), 2, "{label}: not retried while it waits");
 
         let next = tick(
             next,
@@ -1753,18 +2013,134 @@ fn a_reinstall_that_does_not_verify_keeps_the_fence() {
     }
 }
 
+/// A reinstall that failed is tried again at the next check, and its
+/// success returns the watch to intact; the fence comes off only after the
+/// retry's own readback finds the table intact, and a retry whose readback
+/// does not keeps it on. The loss is counted once, when it was found.
+#[test]
+fn a_retried_reinstall_lifts_the_fence_only_after_its_readback_verifies() {
+    let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+    let checks = std::cell::RefCell::new(std::collections::VecDeque::from(vec![
+        // Found lost; the reinstall is refused and nothing is read back.
+        Ok(Verdict::Absent),
+        // Still lost; the retry installs, but its readback finds it drifted.
+        Ok(Verdict::Absent),
+        drifted(),
+        // Still lost; this retry's readback finds it intact.
+        drifted(),
+        Ok(Verdict::Intact),
+    ]));
+    let verify = || {
+        fence.0.lock().unwrap().push("verify");
+        checks
+            .borrow_mut()
+            .pop_front()
+            .expect("no more checks scripted")
+    };
+    let refuse = std::cell::Cell::new(true);
+    let reinstall = || {
+        fence.0.lock().unwrap().push("reinstall");
+        if refuse.replace(false) {
+            Err(io::Error::other("nft -f - exited 1"))
+        } else {
+            Ok(())
+        }
+    };
+
+    let next = tick(Watch::Intact, verify, reinstall, &fence, &metrics);
+    assert_eq!(next, LOST_ONCE);
+    assert_eq!(fence.take(), ["verify", "fence", "reinstall"]);
+
+    let next = tick(next, verify, reinstall, &fence, &metrics);
+    assert_eq!(
+        next,
+        Watch::Lost {
+            failures: 2,
+            wait: 1
+        },
+        "a readback that does not verify is a failed retry"
+    );
+    assert_eq!(fence.take(), ["verify", "fence", "reinstall", "verify"]);
+    assert_eq!(gauge(&metrics), Some(0.0));
+
+    let next = tick(
+        Watch::Lost {
+            failures: 2,
+            wait: 0,
+        },
+        verify,
+        reinstall,
+        &fence,
+        &metrics,
+    );
+    assert_eq!(next, Watch::Intact);
+    assert_eq!(
+        fence.take(),
+        ["verify", "fence", "reinstall", "verify", "lift"],
+        "lifted only after the retry's readback"
+    );
+    assert_eq!(gauge(&metrics), Some(1.0));
+    assert_eq!(lost_for(&metrics, "lost"), 1, "one loss, counted once");
+    assert_eq!(lost_for(&metrics, "reinstalled"), 0);
+}
+
+/// The retries of a reinstall that keeps failing back off — 1, 2, 4, 8
+/// checks apart — up to [`REINSTALL_RETRY_MAX_CHECKS`] apart and no
+/// further, and every check between them fences again and lifts nothing.
+#[test]
+fn reinstall_retries_back_off_to_a_bound_and_keep_the_fence() {
+    let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+    let at = std::cell::RefCell::new(Vec::new());
+    let check = std::cell::Cell::new(0);
+    let mut state = Watch::Intact;
+    for n in 0..60 {
+        check.set(n);
+        state = tick(
+            state,
+            || Ok(Verdict::Absent),
+            || {
+                at.borrow_mut().push(check.get());
+                Err(io::Error::other("nft -f - exited 1"))
+            },
+            &fence,
+            &metrics,
+        );
+        assert!(matches!(state, Watch::Lost { .. }), "check {n}: {state:?}");
+        assert_eq!(fence.take(), ["fence"], "check {n}: fenced, never lifted");
+    }
+    let at = at.into_inner();
+    let gaps: Vec<u32> = at.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(gaps[..6], [1, 2, 4, 8, 10, 10]);
+    assert!(
+        gaps.iter().all(|&g| g <= REINSTALL_RETRY_MAX_CHECKS),
+        "{gaps:?}"
+    );
+    assert_eq!(lost_for(&metrics, "lost"), 1, "one loss, counted once");
+    assert_eq!(gauge(&metrics), Some(0.0));
+}
+
+#[test]
+fn retry_wait_doubles_then_holds_at_the_bound() {
+    let waits: Vec<u32> = (1..=7).map(retry_wait).collect();
+    assert_eq!(waits, [0, 1, 3, 7, 9, 9, 9]);
+    assert_eq!(retry_wait(u32::MAX), REINSTALL_RETRY_MAX_CHECKS - 1);
+    assert_eq!(retry_wait(0), 0, "not reached, and does not underflow");
+}
+
 fn cannot_run() -> io::Result<Verdict> {
     Err(io::Error::other("nft: permission denied"))
 }
 
 /// One check that cannot run is counted and fences nothing: not knowing
-/// is not absent. While the watch is lost, every profile is fenced
-/// already, and it stays lost.
+/// is not absent. While the watch is lost, the loss is the last thing a
+/// check found: it stays lost, and fences again for the loss any profile
+/// set online meanwhile, with neither a reinstall nor a second count.
 #[test]
 fn a_check_that_cannot_run_is_counted_and_changes_nothing() {
-    for (state, after) in [
-        (Watch::Intact, Watch::Unchecked(1)),
-        (Watch::Lost, Watch::Lost),
+    for (state, after, fenced) in [
+        (Watch::Intact, Watch::Unchecked(1), &[][..]),
+        (LOST_ONCE, LOST_ONCE, &["fence"][..]),
+        (LOST_WAITING, LOST_WAITING, &["fence"][..]),
     ] {
         let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
         let next = tick(
@@ -1776,7 +2152,7 @@ fn a_check_that_cannot_run_is_counted_and_changes_nothing() {
         );
         assert_eq!(next, after);
         assert_eq!(gauge(&metrics), None, "not knowing is not absent");
-        assert_eq!(fence.take(), Vec::<&str>::new());
+        assert_eq!(fence.take(), fenced, "{state:?}");
         assert_eq!(metrics.count_for("kill_switch_probe_errors_total"), 1);
         assert_eq!(metrics.count_for("kill_switch_lost_total"), 0);
     }
@@ -1842,6 +2218,32 @@ fn a_check_that_cannot_run_n_times_fences() {
         metrics.count_for("kill_switch_probe_errors_total"),
         u64::from(PROBE_FAILURES_TO_FENCE) * 2,
     );
+}
+
+/// The error that says the kill switch cannot be checked is logged by the
+/// check that fences, once, and not again by each later one that fences
+/// again.
+#[test]
+fn only_the_check_that_starts_fencing_logs_the_error() {
+    use crate::vpn_monitor::PROBE_FAILURES_TO_FENCE;
+    let fence = Recorded::default();
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let errors = || {
+        log.text()
+            .lines()
+            .filter(|l| l.contains("could not be checked this many times in a row"))
+            .count()
+    };
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        let fenced = unchecked(Watch::Unchecked(PROBE_FAILURES_TO_FENCE - 1), &fence);
+        assert_eq!(fenced, Watch::Unverified);
+        assert_eq!(errors(), 1, "the check that fences says so");
+        assert_eq!(unchecked(fenced, &fence), Watch::Unverified);
+        assert_eq!(errors(), 1, "a later one does not say it again");
+    });
+    assert_eq!(fence.take(), ["fence unverifiable", "fence unverifiable"]);
 }
 
 /// A table found gone while the watch is fenced for checks that could not

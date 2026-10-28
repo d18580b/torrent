@@ -10,6 +10,7 @@ use torrentd_pool::model::ops;
 use torrentd_pool::model::PlanStepRow;
 use tracing::info;
 
+use super::relocate::same_directory;
 use crate::live_torrent::read_live_torrent;
 use crate::live_torrent::LiveReadError;
 use crate::live_torrent::LiveTorrent;
@@ -33,6 +34,10 @@ mod tests;
 /// among the plan's orphans, and no scan would ever give it claims, so it
 /// does not block the plan. One no session can report on still refuses:
 /// where its files are is unknown.
+///
+/// A claimed torrent accounts for its payload only where its session saves
+/// it at its placement; one saving elsewhere is compared with `scope` the
+/// same way ([`check_claimed_torrents_save_where_placed`]).
 pub(super) fn check_index_accounts_for_live_state(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
@@ -43,6 +48,7 @@ pub(super) fn check_index_accounts_for_live_state(
     let unindexed = pool
         .with_store(|st| st.loaded_without_claims(&owned))
         .map_err(|e| e.to_string())?;
+    check_claimed_torrents_save_where_placed(pool, source, state, scope, &owned, &unindexed)?;
     if unindexed.is_empty() {
         return Ok(());
     }
@@ -82,6 +88,201 @@ pub(super) fn check_index_accounts_for_live_state(
         ));
     }
     Ok(())
+}
+
+/// Whether every claimed torrent a session holds saves where the index
+/// places it.
+///
+/// A claim accounts for the copy the matcher placed, and the matcher
+/// prefers a complete copy to an incomplete one: a torrent still
+/// downloading into one directory while a complete copy of its files lies
+/// elsewhere under the roots is placed at that complete copy, and the
+/// files its session is writing read as orphans. The placement is where its
+/// claims sit, not its adoption base: a held `adopted` torrent that reads as
+/// partial keeps the base it is served from while its claims follow the
+/// best partial copy, which may be elsewhere. So a claimed torrent whose
+/// session save path is not the directory every one of its claims lies
+/// under, compared as spelled and with symlinks resolved
+/// ([`same_directory`]), is compared with `scope` as an unclaimed one is,
+/// and refuses where it may hold a file the plan deletes.
+///
+/// Costs one index read of its claims and files and one session read per
+/// claimed torrent a session holds, and a file listing only for one saving
+/// away from its placement. A torrent no
+/// session holds is writing nothing and is skipped; one whose session
+/// cannot be read refuses, since where it writes is then unknown.
+fn check_claimed_torrents_save_where_placed(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    scope: &DeleteScope,
+    owned: &[String],
+    unindexed: &[String],
+) -> Result<(), String> {
+    let unindexed: std::collections::HashSet<&String> = unindexed.iter().collect();
+    let held: Vec<(&String, torrentd_engine::TorrentState)> = owned
+        .iter()
+        .filter(|ih| !unindexed.contains(ih))
+        .filter_map(|ih| {
+            let st = libtorrent_safe::InfoHash::from_hex(ih).and_then(|h| state.get(&h))?;
+            Some((ih, st))
+        })
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    // Started before the index read, so the logged time includes it.
+    let started = std::time::Instant::now();
+    let placements: Vec<ClaimSites> = pool
+        .with_store(|st| {
+            held.iter()
+                .map(|(ih, _)| claim_sites(st, ih, |id| pool.root_path_of(id)))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| e.to_string())?;
+    let mut away = 0usize;
+    let mut blocking: Vec<String> = Vec::new();
+    for ((ih, st), placed) in held.iter().zip(&placements) {
+        let Some(engine) = source.engine_for(&st.profile_id) else {
+            continue;
+        };
+        let save_path: std::path::PathBuf = match engine.torrent_details(st.handle) {
+            Ok(d) => d.save_path.into(),
+            Err(e) => {
+                blocking.push(format!(
+                    "torrent {ih}, which the daemon owns, could not be read from its session \
+                     ({e}), so whether it saves where the index places it is unknown"
+                ));
+                continue;
+            }
+        };
+        if placed.all_under(&save_path) {
+            continue;
+        }
+        away += 1;
+        let placed_at = placed.describe();
+        let why = match read_live_torrent(source, st) {
+            Err(LiveReadError::NoSession) => continue,
+            Err(LiveReadError::Engine(e)) => Some(format!(
+                "could not be read from its session ({e}), so where its files lie is unknown"
+            )),
+            Ok(live) => scope.reached_by(&live),
+        };
+        if let Some(why) = why {
+            blocking.push(format!(
+                "torrent {ih}, which the daemon owns, is placed in the index at {placed_at}, \
+                 but its session saves it at {}, and {why}",
+                save_path.display(),
+            ));
+        }
+    }
+    info!(
+        target: "torrentd::pool::apply",
+        claimed = held.len(),
+        away_from_placement = away,
+        blocking = blocking.len(),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "compared where the claimed torrents the daemon owns are saved with their placements",
+    );
+    if let Some(first) = blocking.first() {
+        return Err(format!(
+            "{} torrent(s) the daemon owns are saved somewhere other than where the index \
+             places them and may hold files under this plan's root: the files their sessions \
+             write read as orphans, so this plan cannot prove what is unclaimed. The first is \
+             {first}. Remove it with DELETE /v1/torrents/{{infohash}} without delete_files and \
+             add it again with its placement as save_path, or remove the copy you do not want \
+             by hand and rescan, then rebuild this plan.",
+            blocking.len(),
+        ));
+    }
+    Ok(())
+}
+
+/// Where a torrent's claims sit: for each file it claims, every directory
+/// that file lies at as one of the torrent's files, since a claim records the
+/// root-relative path and not the base it was resolved under.
+struct ClaimSites {
+    per_claim: Vec<Vec<std::path::PathBuf>>,
+}
+
+impl ClaimSites {
+    /// Whether every claim lies under `save_path` as one of the torrent's
+    /// files, which is where its session writes it. No claims at all is not
+    /// a placement.
+    fn all_under(&self, save_path: &Path) -> bool {
+        let mut seen: std::collections::HashMap<&Path, bool> = std::collections::HashMap::new();
+        !self.per_claim.is_empty()
+            && self.per_claim.iter().all(|bases| {
+                bases.iter().any(|b| {
+                    *seen
+                        .entry(b.as_path())
+                        .or_insert_with(|| same_directory(b, save_path))
+                })
+            })
+    }
+
+    /// The directory every claim shares, or each one's where they differ.
+    fn describe(&self) -> String {
+        let Some((first, rest)) = self.per_claim.split_first() else {
+            return "no claims".to_owned();
+        };
+        if let Some(common) = first
+            .iter()
+            .find(|b| rest.iter().all(|other| other.contains(b)))
+        {
+            return common.display().to_string();
+        }
+        let mut all: Vec<String> = self
+            .per_claim
+            .iter()
+            .flatten()
+            .map(|b| b.display().to_string())
+            .collect();
+        all.sort();
+        all.dedup();
+        all.join(", ")
+    }
+}
+
+/// [`ClaimSites`] for `infohash`, its roots resolved with `root_path_of`.
+///
+/// A claim lies at a base for each of the torrent's on-disk files its path
+/// ends with at a `/` boundary. Each such tail of the claim is looked up in
+/// a set of the file paths, so a claim costs one lookup per path component
+/// rather than a comparison with every file.
+fn claim_sites(
+    st: &torrentd_pool::PoolStore,
+    infohash: &str,
+    root_path_of: impl Fn(i64) -> Option<std::path::PathBuf>,
+) -> Result<ClaimSites, torrentd_pool::PoolError> {
+    let files = st.torrent_files(infohash)?;
+    let on_disk: std::collections::HashSet<&str> = files
+        .iter()
+        .filter(|f| f.is_on_disk())
+        .map(|f| f.rel_path.trim_matches('/'))
+        .collect();
+    let per_claim = st
+        .claims_of(infohash)?
+        .into_iter()
+        .map(|(root_id, rel)| {
+            let Some(root) = root_path_of(root_id) else {
+                return Vec::new();
+            };
+            std::iter::once(0)
+                .chain(rel.match_indices('/').map(|(i, _)| i + 1))
+                .filter(|&at| on_disk.contains(&rel[at..]))
+                .map(|at| {
+                    let base = rel[..at].trim_matches('/');
+                    if base.is_empty() {
+                        root.clone()
+                    } else {
+                        root.join(base)
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    Ok(ClaimSites { per_claim })
 }
 
 /// Why the unclaimed torrent `infohash` may hold a file in `scope`, or

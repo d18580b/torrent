@@ -647,7 +647,7 @@
           "server"
         ],
         "summary": "Re-read the configuration file.",
-        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
+        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. One reload is queued at a time: a request made\nwhile one is queued and has not started is `409 reload-pending`, since the\nqueued reload will read the same file, and one made while a reload is\nrunning is queued behind it. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
         "operationId": "reload_config",
         "responses": {
           "401": {
@@ -3882,7 +3882,7 @@
           "profiles"
         ],
         "summary": "Set one profile online or offline.",
-        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says: those that were running are started again 100\na second, going on after the response, since each one started announces\nto its trackers. Setting it offline meanwhile stops that, and the next\n`online` starts the rest; a restart starts them at boot. The setting is\nwritten to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
+        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says: those that were running are started again 100\na second, going on after the response, since each one started announces\nto its trackers. Setting it offline meanwhile stops that, and the next\n`online` starts the rest; a restart starts them at boot. The setting is\nwritten to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. Where\n`network_kill_switch` is on, the fence stays unless the kill switch last\nchecked in force: while its watch has the vpn profiles fenced, for a table\nfound gone or changed or for checks that could not run, setting a fenced\nprofile online answers `409 kill-switch-not-in-force` and nothing changes,\nbefore its tunnel is checked. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
         "operationId": "set_profile_state",
         "parameters": [
           {
@@ -4121,21 +4121,42 @@
             }
           },
           "409": {
-            "description": "The profile is unavailable",
+            "description": "The profile is unavailable; The network kill switch is not in force",
             "content": {
               "application/problem+json": {
                 "schema": {
-                  "allOf": [
+                  "oneOf": [
                     {
-                      "$ref": "#/components/schemas/Problem"
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The profile is unavailable"
                     },
                     {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#kill-switch-not-in-force"
+                            }
+                          }
                         }
-                      }
+                      ],
+                      "title": "The network kill switch is not in force"
                     }
                   ]
                 }
@@ -11123,6 +11144,13 @@
               "null"
             ],
             "description": "The directory, relative to its root, the payload was matched at;\n`null` when unmatched."
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why its state is what it is, where the state alone does not say,\nfrom whichever last set it: a scan's match (for example how many of\nits files are present, that its on-disk stats changed since it was\nverified, that another torrent claims the same files, or that it has\nmore than one complete copy, which makes a delete plan refuse to\ntouch any of them), or a verification that failed (why its payload\ndid not check out). `null` when there is nothing to add."
           },
           "profile_id": {
             "type": [

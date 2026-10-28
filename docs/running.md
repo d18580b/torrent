@@ -1250,7 +1250,7 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/v1/config/relo
 | Status | Meaning |
 | --- | --- |
 | `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. It is also the answer when every change in the file needs a restart, and a reload never applies a restart-only key — among them `[auth]` (including a removed `[[auth.token]]`), `allow_unauthenticated`, `http_listen`, `trusted_proxies` and `allowed_hosts`. |
-| `409` | `reload-pending`: the reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run; they read the same file. |
+| `409` | `reload-pending`: a reload is already queued and has not started. The queue, which `SIGHUP` shares, holds one reload, and the queued one reads the file as it stands when it runs, so this request adds nothing to it; a `SIGHUP` sent then is likewise folded into it. |
 | `503` | `reload-unavailable`: the daemon is shutting down, or was built without the reload channel wired up. |
 
 It needs a token with the `write` scope — a session token has it — where
@@ -1303,10 +1303,20 @@ the same arguments as `podman compose`.
    if a Prometheus will scrape through the proxy:
 
    ```bash
-   podman compose -f deploy/compose.yaml build
+   BUILDAH_FORMAT=docker podman compose -f deploy/compose.yaml build
    podman compose -f deploy/compose.yaml run --rm torrentd hash-password
    podman compose -f deploy/compose.yaml run --rm torrentd new-token --name prometheus --scopes metrics
    ```
+
+   `BUILDAH_FORMAT=docker` keeps the image's health check. It is the
+   `HEALTHCHECK` in `deploy/Containerfile`, which curls
+   `localhost:8080/healthz` every 30 s, and it lives only in a Docker-format
+   image: podman builds the OCI format by default, which has no field for it,
+   and drops it with the warning `HEALTHCHECK is not supported for OCI image
+   format`. `mise run container` builds Docker format for the same reason;
+   `docker compose build` and the published release image keep it already.
+   An image built without it has no health status at all, so nothing marks
+   the container unhealthy.
 
 5. **Start it**, and check it from inside the container (§9):
 
@@ -2377,6 +2387,7 @@ run it by hand instead, start the service again afterwards:
 | --- | --- |
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
+| Container reports no health status at all | The image was built in podman's default OCI format, which drops the `HEALTHCHECK`; rebuild it with `mise run container` or `BUILDAH_FORMAT=docker` (§8, "On the compose stack"). |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, then recover each fenced profile as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes; fenced profiles do not resume themselves by design. A profile counted by `profiles_failed` (`status: "failed"`) never came up and has no session for `PATCH` to lift: bring its tunnel back, then restart. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
@@ -2388,5 +2399,6 @@ run it by hand instead, start the service again afterwards:
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced, and it does not lift the fence itself by design. Recover it as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes. |
 | Delete plan refuses, "no claims in the index" | A torrent the daemon owns - loaded, assigned in the registry, or queued for verification - that the matcher has not placed, and that may hold a file under the plan's root: its session saves it under or above that root, one of its files resolves into it or is the same file (device and inode) as one the plan deletes, or no session can say where it is. One a session holds entirely outside the root never refuses. If its `.torrent` is in the library, run `pool scan` and rebuild the plan. If it was added through `POST /v1/torrents`, a scan never claims it: copy its `.torrent` into the library and rescan, move its payload out of the root, or remove it. A torrent whose profile is down keeps refusing until its profile loads it or it is removed. |
+| Delete plan refuses, "saved somewhere other than where the index places them" | A torrent the daemon owns whose claims in the index sit at one copy of its files while its session saves it at another, and that may hold a file under the plan's root: typically one still downloading into this root while a complete copy of the same files lies under another root, which the matcher prefers. The files its session writes read as orphans. Either `DELETE /v1/torrents/<infohash>` without `delete_files` and add it again with `save_path` set to the placement the message names, so it seeds from that copy, or delete the copy you do not want by hand and run `pool scan`; then rebuild the plan. One whose session cannot be read refuses too. |
 | Relocate step fails, "is not loaded, but the registry assigns it" | The torrent belongs to a profile that did not load it, so its resume data and save path name the source directory. Bring the profile up and apply the plan again. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `GET /v1/profiles`, then `POST /v1/profiles/<id>/resume-all`. |

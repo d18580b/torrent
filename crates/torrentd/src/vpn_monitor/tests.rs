@@ -130,6 +130,33 @@ fn an_aged_handshake_on_a_profile_with_nothing_to_carry_is_healthy() {
     );
 }
 
+/// The threshold is a ceiling the handshake may reach, not one it must
+/// stay under: a handshake exactly `max_age` old, or a tunnel that has
+/// gone exactly `max_age` without one, is still healthy.
+#[test]
+fn a_handshake_exactly_at_the_threshold_is_not_yet_stale() {
+    let at_threshold = Observation {
+        handshake: Handshake::Age(MAX),
+        unanswered_for: MAX + Duration::from_secs(1),
+        ..healthy()
+    };
+    assert_eq!(
+        evaluate(&at_threshold, MAX),
+        Ok(()),
+        "a handshake exactly max_age old"
+    );
+    let never_at_threshold = Observation {
+        handshake: Handshake::Never,
+        unanswered_for: MAX,
+        ..healthy()
+    };
+    assert_eq!(
+        evaluate(&never_at_threshold, MAX),
+        Ok(()),
+        "exactly max_age without a handshake",
+    );
+}
+
 #[test]
 fn ip_change_beats_stale_handshake() {
     // IP mismatch is reported even if the handshake is also stale.
@@ -951,6 +978,90 @@ async fn a_dropped_fencing_stop_stops_the_monitor() {
         .unwrap();
 }
 
+/// `run` is the poll loop on the host's probes: it seeds every vpn
+/// profile's series as it starts, and keeps watching until its stop.
+#[tokio::test(start_paused = true)]
+async fn run_seeds_the_series_and_watches_until_its_stop() {
+    let profiles = Arc::new(ProfileRegistry::new(vec![
+        crate::profile_registry::test_entry("acct_a", ProfileStatus::Active),
+    ]));
+    let metrics = Arc::new(PromSink::new());
+    let stop = FencingStop::new();
+    let task = tokio::spawn(run(
+        profiles,
+        Arc::new(StateMap::new()),
+        metrics.clone(),
+        MAX,
+        stop.subscribe(),
+    ));
+    // Short of the first poll, so no host probe runs.
+    tokio::time::sleep(POLL_INTERVAL / 2).await;
+    assert!(!task.is_finished(), "the monitor runs until its stop");
+    let exported = String::from_utf8(metrics.render()).expect("utf-8");
+    assert!(
+        exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+        "seeded as it starts; got:\n{exported}",
+    );
+    assert!(
+        stop.stop(Duration::from_secs(5)).await,
+        "the monitor returned"
+    );
+    task.await.unwrap();
+}
+
+/// A kill-switch fence that lands while a poll's probes run sets
+/// `profile_vpn_tunnel_up` to 0 with its mark. The healthy verdict that
+/// poll reaches afterwards was taken on probes from before the fence, and
+/// leaves the 0 standing.
+#[tokio::test(start_paused = true)]
+async fn a_healthy_verdict_leaves_a_fence_landed_during_its_probes_reading_down() {
+    use crate::profile_registry::test_entry;
+
+    let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+        "acct_a",
+        ProfileStatus::Active,
+    )]));
+    let exported = Recorded::default();
+    let probe: Prober = {
+        let (profiles, sink) = (profiles.clone(), exported.0.clone());
+        Arc::new(move |_iface: &str, is_wg: bool| {
+            crate::fence::mark_fenced(
+                profiles.iter().next().unwrap(),
+                ip(2),
+                KILL_SWITCH_FENCE_REASON,
+                sink.as_ref(),
+            );
+            TunnelProbes {
+                ip: Ok(ip(2)),
+                route: Some(Ok(RouteProbe::ViaTunnel)),
+                handshake: is_wg.then_some(Ok(Some(Duration::from_secs(5)))),
+            }
+        })
+    };
+    let stop = FencingStop::new();
+    let task = tokio::spawn(run_with(
+        profiles.clone(),
+        Arc::new(StateMap::new()),
+        exported.0.clone(),
+        MAX,
+        stop.subscribe(),
+        probe,
+        no_counters(),
+    ));
+    tokio::time::sleep(POLL_INTERVAL + Duration::from_secs(1)).await;
+    assert!(stop.stop(Duration::from_secs(5)).await);
+    task.await.unwrap();
+    assert_eq!(
+        profiles.iter().next().unwrap().health().status,
+        ProfileStatus::VpnDown
+    );
+    assert_eq!(
+        exported.gauge("profile_vpn_tunnel_up"),
+        Some(0.0),
+        "{exported}"
+    );
+}
+
 /// The route probe as `run` calls it: its answer reaches the verdict,
 /// and `profile_vpn_route_probe_ok` says whether it could be asked.
 #[tokio::test(start_paused = true)]
@@ -966,6 +1077,14 @@ async fn the_poll_loop_fences_on_the_route_probe_and_reports_whether_it_ran() {
         "{exported}"
     );
     assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
+    assert_eq!(
+        exported.counter(
+            "profile_vpn_tunnel_ip_changes_total",
+            &[("profile_id", "acct_a")]
+        ),
+        0,
+        "a route fence is not an address change: {exported}"
+    );
 
     let unavailable = Some(Err(vpn::route::RouteProbeUnavailable::NoTool));
     let (status, exported) =
@@ -1073,6 +1192,14 @@ async fn the_poll_loop_does_not_fence_on_an_address_probe_that_could_not_run() {
     assert!(
         fenced_once_for(&exported, "ip_lost_or_changed"),
         "{exported}"
+    );
+    assert_eq!(
+        exported.counter(
+            "profile_vpn_tunnel_ip_changes_total",
+            &[("profile_id", "acct_a")]
+        ),
+        1,
+        "an address lost is counted as a change: {exported}"
     );
     assert!(
         exported.gauge("profile_vpn_addr_probe_ok") == Some(1.0),
@@ -1779,6 +1906,31 @@ fn the_recovery_check_wants_the_bound_address_routed_by_the_tunnel() {
         recovery_check(&host, &answering(None, None, None)),
         Ok(()),
         "a host profile has no tunnel to check",
+    );
+}
+
+/// The recovery check probes a profile's tunnel as the poll loop does: on
+/// its interface, as the tunnel type it is.
+#[test]
+fn the_recovery_check_probes_the_tunnel_as_its_type() {
+    let entry = crate::profile_registry::test_vpn_entry("acct_a", ProfileStatus::VpnDown);
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let probe: Prober = {
+        let asked = asked.clone();
+        Arc::new(move |iface: &str, is_wg: bool| {
+            asked.lock().unwrap().push((iface.to_string(), is_wg));
+            TunnelProbes {
+                ip: Ok(ip(2)),
+                route: Some(Ok(RouteProbe::ViaTunnel)),
+                handshake: None,
+            }
+        })
+    };
+    assert_eq!(recovery_check(&entry, &probe), Ok(()));
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [("wg-acct_a".to_string(), true)],
+        "one probe of the WireGuard link",
     );
 }
 

@@ -167,10 +167,32 @@ member says why:
   It stays fenced until the operator sets it online
   (`PATCH /v1/profiles/{profile_id}` with `{"state": "online"}`) and its
   tunnel passes the check that request runs; nothing else un-quarantines it.
-  That request answers this problem too, when the tunnel still fails.
+  That request answers this problem too, when the tunnel still fails, and
+  [`kill-switch-not-in-force`](#kill-switch-not-in-force) while the kill
+  switch is not in force.
 - **`offline`**: the operator set the profile offline, or every profile with
   `POST /v1/profiles/offline-all`. Adds, adoptions and resumes are refused
   until it is set online.
+
+## `kill-switch-not-in-force`
+
+**409**, from `PATCH /v1/profiles/{profile_id}` with `{"state": "online"}` on a
+fenced (`vpn_down`) profile, where `network_kill_switch` is on. The kill
+switch's watch has every vpn profile fenced, because a check found its
+nftables table gone or changed, or because too many checks in a row could not
+run, and no check has found the table in force since. Lifting the fence then
+would put the profile back on the network with nothing confining its egress,
+so the profile stays fenced and its state is unchanged; the tunnel is not
+checked. The watch installs the table again on its own: a check that finds it
+still gone or changed reinstalls it, the next check after a failed reinstall,
+then 2, 4 and 8 checks on, then every 10 checks (five minutes) for as long as
+it stays lost, counting only checks `nft` can run. When a reinstall does not
+take, fix what removes the table or what makes the reinstall fail (the error
+log names it), restore the table yourself, or restart the daemon, which
+installs it again; fix whatever keeps `nft` from running. Retry once a check
+finds the table in force, which the daemon logs as lifting the fence it put on
+the vpn profiles: from then on the request checks the tunnel and lifts the
+fence as before.
 
 ## `torrent-exists`
 
@@ -204,7 +226,8 @@ there. `detail` names the first file and which of these failed:
 - it lies outside every managed root, so there is no trash to move it to;
 - the pool index does not record it, or does not record this torrent
   claiming it, so the co-claimant check cannot see it;
-- it changed since the scan that indexed it (size, mtime, inode or device).
+- it changed since the scan that indexed it (size or mtime; a reboot or
+  remount that renumbered its inode or device does not count).
 
 Nothing was changed: the torrent is still in its session. Rescan
 (`POST /v1/pool/scan`) and retry, or retry without `delete_files` to remove
@@ -337,7 +360,8 @@ files should go, then re-send with `confirm={infohash}`.
 ## `reload-pending`
 
 **409**, from `POST /v1/config/reload`. A reload is already queued and has not
-run yet. The queued reload will read the same file.
+run yet. The queue, which `SIGHUP` shares, holds one reload, and the queued one
+will read the same file. A request made once it has started is queued.
 
 ## `reload-unavailable`
 
