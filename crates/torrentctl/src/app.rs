@@ -7,7 +7,7 @@
 //! the UI follows is testable by feeding messages to `update` and reading the
 //! model, with no terminal and no daemon.
 //!
-//! Each tab's screen follows the contract [`crate::screens`] states, in its
+//! Each tab's screen follows the contract the `screens` module states, in its
 //! own module. The sign-in screen is the exception, as that module says: it
 //! is shown in place of the tabs while signed out, and takes every key. The
 //! root routes to the screen on screen, and owns what they share: the

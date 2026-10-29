@@ -84,7 +84,7 @@ pub(super) fn set_server_filter(
 }
 
 /// Reload the list from its first page, as many rows as are loaded (see
-/// [`Paged`]), keeping the selection.
+/// [`crate::ui::widgets::Paged`]), keeping the selection.
 pub(super) fn load_list(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     if state.restore.is_none() {
         state.restore = selected_summary(state).map(|s| s.infohash.clone());
