@@ -21,8 +21,8 @@ use serde::Deserialize;
 /// The daemon's default `http_listen`.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8080";
 
-/// The socket path the daemon's docs and sample config name for
-/// `http_listen = "unix:…"`, as a URL. Preferred over [`DEFAULT_URL`] when it
+/// The socket path `docs/running.md` §6 and `deploy/torrentd.sample.toml`
+/// name for `http_listen = "unix:…"`, as a URL. Preferred over [`DEFAULT_URL`] when it
 /// exists: a socket's permissions say who may connect, and nobody else can
 /// take its path over while the daemon is down, as any local user can take
 /// over a TCP port.
