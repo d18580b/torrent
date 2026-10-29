@@ -187,10 +187,24 @@ impl Stream for Signals {
     }
 }
 
+/// How long the input thread waits on the terminal at a time before it
+/// checks for a resize, which arrives as SIGWINCH rather than as input.
+const INPUT_WAIT: Duration = Duration::from_millis(50);
+
+/// How long [`run`] waits, once the loop has ended, for the input thread to
+/// stop. It stops at once unless it is inside crossterm's read on a hung-up
+/// terminal, which it never leaves (see [`input`]); then it is left behind,
+/// and the terminal it would have read from is gone anyway.
+const INPUT_STOP_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Run on the terminal until the user quits or the loop otherwise ends.
+///
+/// Returns only once the input thread has stopped (or [`INPUT_STOP_TIMEOUT`]
+/// has passed), so that nothing reads the terminal while, or after, it is
+/// handed back: what the user types from then on is the shell's.
 pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
     let started = Signals::install().and_then(|signals| Ok((signals, input()?)));
-    let (signals, keys) = match started {
+    let (signals, (keys, reader)) = match started {
         Ok(started) => started,
         Err(e) => {
             return Ended {
@@ -200,7 +214,9 @@ pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
             };
         }
     };
-    run_with(
+    // The loop drops `keys` as it ends, which stops the reader before
+    // `finish` waits on a revocation: keys typed meanwhile stay in the tty.
+    let ended = run_with(
         model,
         |model| {
             terminal
@@ -210,10 +226,53 @@ pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
         keys,
         signals,
     )
-    .await
+    .await;
+    reader.stopped().await;
+    ended
 }
 
-/// Terminal events, read on a thread of their own.
+/// Terminal events, read by the input thread [`input`] starts. Dropping it
+/// stops the thread: the receiver closes first, then the stop pipe's write
+/// end, whose closing wakes the thread wherever it waits.
+struct Keys {
+    rx: mpsc::UnboundedReceiver<std::io::Result<Event>>,
+    _stop: std::io::PipeWriter,
+}
+
+impl Stream for Keys {
+    type Item = std::io::Result<Event>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.get_mut().rx.poll_recv(cx)
+    }
+}
+
+/// The input thread, for [`run`] to wait on once [`Keys`] is dropped.
+struct Reader {
+    /// Closes as the thread returns.
+    stopped: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl Reader {
+    /// Wait up to [`INPUT_STOP_TIMEOUT`] for the thread to return.
+    async fn stopped(self) {
+        if tokio::time::timeout(INPUT_STOP_TIMEOUT, self.stopped)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "torrentctl::runtime",
+                "the input thread did not stop within {INPUT_STOP_TIMEOUT:?}; leaving it behind"
+            );
+        }
+    }
+}
+
+/// Terminal events, read on a thread of their own until the [`Keys`] this
+/// returns is dropped.
 ///
 /// Not crossterm's `EventStream`, which reads crossterm's event source on
 /// the task that awaits it: once the terminal hangs up, that source spins
@@ -224,21 +283,115 @@ pub async fn run(model: Model, terminal: &mut DefaultTerminal) -> Ended {
 /// process spins at full CPU with its terminal gone. On a thread, the spin
 /// is confined there and ends with the process, and the loop still sees the
 /// SIGHUP, or the next draw's EIO.
-fn input() -> std::io::Result<impl Stream<Item = std::io::Result<Event>> + Unpin> {
+///
+/// Nor a thread blocked in `crossterm::event::read`, which cannot be told to
+/// stop: after the loop it would read one more batch — what the user typed
+/// for the shell once the client had quit — and drop it. Instead the thread
+/// waits in poll(2) on the terminal and a stop pipe together, and calls into
+/// crossterm only once the terminal has input (or every [`INPUT_WAIT`], for
+/// a resize), and only while [`Keys`] is alive, so the terminal is left
+/// unread from the moment the loop ends. Input crossterm has left on the
+/// terminal (more than one 1024-byte read of it, at once) is waited out
+/// rather than polled for in a spin: see [`read_events`].
+fn input() -> std::io::Result<(Keys, Reader)> {
+    use std::io::IsTerminal as _;
+
+    // The descriptor crossterm reads events from: stdin where it is a
+    // terminal, the controlling terminal otherwise.
+    let tty = if std::io::stdin().is_terminal() {
+        None
+    } else {
+        Some(std::fs::File::open("/dev/tty")?)
+    };
+    let (stop_rx, stop_tx) = std::io::pipe()?;
     let (tx, rx) = mpsc::unbounded_channel();
+    let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("torrentctl-input".to_owned())
-        .spawn(move || loop {
+        .spawn(move || {
+            use std::os::fd::AsRawFd as _;
+            let fd = tty
+                .as_ref()
+                .map_or(libc::STDIN_FILENO, std::fs::File::as_raw_fd);
+            read_events(fd, &stop_rx, &tx);
+            drop(stopped_tx);
+        })?;
+    Ok((Keys { rx, _stop: stop_tx }, Reader { stopped }))
+}
+
+/// The input thread's loop: wait for input on `tty`, or for `stop` to
+/// close, or for [`INPUT_WAIT`] to pass; then, while `tx`'s receiver is
+/// open, send every event crossterm has. Returns once the receiver has
+/// closed, or after sending an error.
+fn read_events(
+    tty: std::os::fd::RawFd,
+    stop: &std::io::PipeReader,
+    tx: &mpsc::UnboundedSender<std::io::Result<Event>>,
+) {
+    use std::os::fd::AsRawFd as _;
+    let millis = libc::c_int::try_from(INPUT_WAIT.as_millis()).expect("a short wait");
+    // Whether the terminal was readable last time and crossterm had no
+    // event for it. Crossterm reads at most 1024 bytes on each readiness
+    // event its edge-triggered poll reports, so the rest of a longer burst
+    // (a paste) stays on the terminal, unseen by crossterm until more input
+    // arrives, while poll(2), level-triggered, keeps reporting it readable
+    // at once. Until crossterm has an event again, the terminal is left out
+    // of the wait (poll(2) skips a negative descriptor), and crossterm is
+    // asked every [`INPUT_WAIT`] instead, as for a resize.
+    let mut stalled = false;
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: if stalled { -1 } else { tty },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: poll(2) only reads and writes `fds`, which outlives the
+        // call, and waits at most `millis`; a descriptor that has closed
+        // is reported in `revents`, not misused.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        }
+        let readable = rc > 0 && fds[0].revents & libc::POLLIN != 0;
+        let mut had_event = false;
+        // Checked before every call into crossterm, which reads input
+        // whenever it has been told of some: the loop has ended, and what is
+        // typed now is not the client's.
+        while !tx.is_closed() {
+            match crossterm::event::poll(Duration::ZERO) {
+                Ok(false) => break,
+                Ok(true) => had_event = true,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
             let event = crossterm::event::read();
             let failed = event.is_err();
             if tx.send(event).is_err() || failed {
-                break;
+                return;
             }
-        })?;
-    Ok(Box::pin(futures_util::stream::unfold(
-        rx,
-        |mut rx| async move { rx.recv().await.map(|event| (event, rx)) },
-    )))
+        }
+        if tx.is_closed() {
+            return;
+        }
+        if had_event {
+            stalled = false;
+        } else if readable {
+            stalled = true;
+        }
+    }
 }
 
 /// [`run`], drawing with `draw`, reading terminal events from `keys` and

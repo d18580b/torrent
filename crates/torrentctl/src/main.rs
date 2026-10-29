@@ -79,7 +79,9 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     }));
     // A panic in the loop has handed the terminal back already, through the
     // hook `ratatui::init` installed, and printed its report; the unwinding
-    // drops the terminal, which shows the cursor.
+    // drops the terminal, which shows the cursor. Otherwise `run` has
+    // stopped its input thread, so what is typed from here on is left in
+    // the terminal for the shell.
     if looped.is_ok() {
         hand_back(terminal);
     }

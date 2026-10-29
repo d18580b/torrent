@@ -810,6 +810,14 @@ struct Pty {
 
 /// Start `torrentctl` against a closed port under a pty, with `envs` set.
 fn spawn_under_pty(envs: &[(&str, &str)]) -> Pty {
+    // The child holds the only copies of the pty's other end now.
+    spawn_under_pty_holding_tty(envs).0
+}
+
+/// [`spawn_under_pty`], also returning a descriptor for the pty's terminal
+/// side: held, it keeps the terminal open after the child exits, so what
+/// was typed to it and never read is still there to read.
+fn spawn_under_pty_holding_tty(envs: &[(&str, &str)]) -> (Pty, std::os::fd::OwnedFd) {
     use std::os::fd::FromRawFd as _;
     use std::os::fd::OwnedFd;
     use std::os::unix::process::CommandExt as _;
@@ -858,6 +866,7 @@ fn spawn_under_pty(envs: &[(&str, &str)]) -> Pty {
         }
     };
 
+    let tty = slave.try_clone().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_torrentctl"));
     command
@@ -884,14 +893,188 @@ fn spawn_under_pty(envs: &[(&str, &str)]) -> Pty {
         });
     }
     let child = command.spawn().expect("run torrentctl");
-    // The child holds the only copies of the pty's other end now.
     drop(command);
-    Pty {
-        child,
-        master,
-        home,
-        _one_at_a_time: one_at_a_time,
+    (
+        Pty {
+            child,
+            master,
+            home,
+            _one_at_a_time: one_at_a_time,
+        },
+        tty,
+    )
+}
+
+/// Read from `master` until `wanted` has appeared in what it wrote, or
+/// [`STEP`] passes (killing the child and failing the test). Returns all
+/// of it.
+fn read_until(child: &mut Child, master: &mut std::fs::File, wanted: &str) -> String {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    let deadline = Instant::now() + STEP;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let drawn = String::from_utf8_lossy(&output);
+        if drawn.contains(wanted) {
+            return drawn.into_owned();
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("never wrote {wanted:?} within {STEP:?}: {drawn:?}");
+        }
+        let mut poll = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: poll(2) on one descriptor the caller owns, for at most
+        // `millis`.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        assert!(ready >= 0, "poll: {}", std::io::Error::last_os_error());
+        if ready > 0 {
+            let n = master.read(&mut buf).expect("read the pty");
+            assert_ne!(n, 0, "the pty closed before {wanted:?}: {drawn:?}");
+            output.extend_from_slice(&buf[..n]);
+        }
     }
+}
+
+/// Wait for `child` to exit, killing it and failing the test if it has not
+/// within [`STEP`].
+fn wait_within_step(mut child: Child) -> std::process::ExitStatus {
+    let (done, exited) = std::sync::mpsc::channel();
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = done.send(child.wait());
+    });
+    let Ok(status) = exited.recv_timeout(STEP) else {
+        // SAFETY: kill(2) on the child this test spawned and has not reaped.
+        unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap(), libc::SIGKILL) };
+        panic!("torrentctl did not exit within {STEP:?}");
+    };
+    status.expect("wait for torrentctl")
+}
+
+/// A key typed at the terminal reaches the loop through the input thread:
+/// Ctrl-C, typed once the first frame is drawn, quits with a clean status.
+/// Needs no daemon, so it is not ignored.
+#[test]
+fn a_key_typed_at_the_terminal_reaches_the_loop() {
+    let Pty {
+        mut child,
+        mut master,
+        home: _home,
+        _one_at_a_time,
+    } = spawn_under_pty(&[]);
+    read_until(&mut child, &mut master, "connecting");
+    // Raw mode: Ctrl-C is the byte 0x03, read as a key, not a SIGINT.
+    master.write_all(b"\x03").expect("type to the pty");
+    let status = wait_within_step(child);
+    assert!(status.success(), "Ctrl-C quits cleanly: {status:?}");
+}
+
+/// The CPU time `pid` has used so far, user and system together.
+fn cpu_time(pid: u32) -> Duration {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read /proc/PID/stat");
+    // The command name, in parentheses, may hold spaces: count from after it.
+    let fields: Vec<&str> = stat[stat.rfind(')').expect("a comm field") + 2..]
+        .split(' ')
+        .collect();
+    // utime and stime are fields 14 and 15, the 12th and 13th after comm.
+    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+    // SAFETY: sysconf(3) reads a constant.
+    let per_second = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap();
+    Duration::from_millis(ticks * 1000 / per_second)
+}
+
+/// More input than crossterm reads at once (1024 bytes), arriving together
+/// as a paste does, leaves the input thread idle rather than spinning: the
+/// rest stays readable on the terminal, which crossterm's edge-triggered
+/// poll does not report again until more arrives. A key typed after it
+/// still reaches the loop.
+#[test]
+fn a_paste_longer_than_one_read_does_not_spin_the_input_thread() {
+    const IDLE: Duration = Duration::from_secs(1);
+    let Pty {
+        mut child,
+        mut master,
+        home: _home,
+        _one_at_a_time,
+    } = spawn_under_pty(&[]);
+    read_until(&mut child, &mut master, "connecting");
+    // Whatever the client draws from here is read and dropped, so that its
+    // writes to the terminal never block. It ends as the child exits.
+    let mut drawn = master.try_clone().expect("clone the pty");
+    std::thread::spawn(move || std::io::copy(&mut drawn, &mut std::io::sink()));
+    // Keys the unreachable screen ignores.
+    master.write_all(&[b'x'; 2000]).expect("paste to the pty");
+    // Measured once the keys crossterm did read have been handled: a spin
+    // goes on for as long as the rest is left on the terminal.
+    std::thread::sleep(IDLE);
+    let before = cpu_time(child.id());
+    std::thread::sleep(IDLE);
+    let used = cpu_time(child.id()) - before;
+    master.write_all(b"\x03").expect("type to the pty");
+    let status = wait_within_step(child);
+    assert!(
+        used < IDLE / 4,
+        "the client used {used:?} of CPU in {IDLE:?} after a paste"
+    );
+    assert!(status.success(), "Ctrl-C quits cleanly: {status:?}");
+}
+
+/// What is typed once the client has quit stays in the terminal for the
+/// shell that reads it next, rather than being read and dropped by the
+/// client's input thread on its way out. The quit here is followed by the
+/// exit's wait on a blocking thread that never returns, so the client is
+/// still running with its terminal handed back when the line is typed.
+/// Needs no daemon, so it is not ignored.
+#[test]
+fn input_typed_after_the_quit_is_left_in_the_terminal() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    const TYPED: &[u8] = b"typed after the quit\n";
+    let (
+        Pty {
+            mut child,
+            mut master,
+            home: _home,
+            _one_at_a_time,
+        },
+        tty,
+    ) = spawn_under_pty_holding_tty(&[(runtime::STALL_BLOCKING, "1")]);
+
+    // Leaving the alternate screen is the last of handing the terminal back:
+    // raw mode is already off.
+    read_until(&mut child, &mut master, "\x1b[?1049l");
+    master.write_all(TYPED).expect("type to the pty");
+    let status = wait_within_step(child);
+    assert!(status.success(), "a quit exits cleanly: {status:?}");
+
+    // The line is still in the terminal's input, for whoever reads it next.
+    let mut poll = libc::pollfd {
+        fd: tty.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll(2) on one descriptor this test owns, for at most 5 s.
+    let ready = unsafe { libc::poll(&mut poll, 1, 5_000) };
+    assert!(ready >= 0, "poll: {}", std::io::Error::last_os_error());
+    assert_eq!(ready, 1, "nothing left to read: the client consumed it");
+    let mut line = vec![0u8; 256];
+    let n = std::fs::File::from(tty)
+        .read(&mut line)
+        .expect("read the tty");
+    assert_eq!(
+        String::from_utf8_lossy(&line[..n]),
+        String::from_utf8_lossy(TYPED)
+    );
 }
 
 /// The terminal hanging up — its master side closed, as a closed terminal
