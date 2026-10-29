@@ -4,6 +4,24 @@ Every release of torrentd and torrentctl, newest first. Both binaries share
 one version and one `vX.Y.Z` tag; README.md § *Install* says how to download
 a release and verify what you downloaded.
 
+## [0.2.1](https://github.com/d18580b/torrent/compare/v0.2.0...v0.2.1) - 2026-10-29
+
+### Fixed
+
+- **torrentctl:** Stop the input thread before the terminal is handed back ([#697](https://github.com/d18580b/torrent/pull/697))
+
+### Refactored
+
+- **torrentctl:** Split the oversized screens and give screens a contract module ([#698](https://github.com/d18580b/torrent/pull/698))
+
+### Documentation
+
+- **torrentctl:** Make the doc comments match the code after the screens split ([#700](https://github.com/d18580b/torrent/pull/700))
+
+### Tests
+
+- **torrentd:** Check the netns leak counter after shutdown and across a crash ([#626](https://github.com/d18580b/torrent/pull/626))
+
 ## [0.2.0](https://github.com/d18580b/torrent/releases/tag/v0.2.0) - 2026-10-26
 
 ### Added
