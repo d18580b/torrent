@@ -316,7 +316,11 @@ impl Api {
 /// The bearer presented when no token is configured: see `main`.
 pub const ANONYMOUS: &str = "anonymous";
 
-/// Every `/v1` operation that is not a stream is answered within this.
+/// How long [`call`] waits for the daemon to answer. Not every request that
+/// is not a stream runs under it: work that may take minutes goes through
+/// [`call_unbounded`] with no timeout, a `.torrent` upload has a longer one
+/// of its own, and revoking a session token gives up sooner, at
+/// [`crate::app::REVOKE_TIMEOUT`].
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Run a request under [`REQUEST_TIMEOUT`], flattening every failure into a
@@ -339,8 +343,9 @@ pub async fn call<T, E: AsProblem>(
 }
 
 /// Run a request that may legitimately take minutes — a pool scan, a drift
-/// check, applying a plan, an adoption or its preview — with no timeout: the daemon answers when the work
-/// is done, and giving up early would report a failure for work that went on.
+/// check, applying a plan, an adoption or its preview — with no timeout: the
+/// daemon answers when the work is done, and giving up early would report a
+/// failure for work that went on.
 #[allow(
     clippy::result_large_err,
     reason = "a Failure is built once per failed request and moved straight to the UI"

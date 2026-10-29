@@ -7,10 +7,12 @@
 //! the UI follows is testable by feeding messages to `update` and reading the
 //! model, with no terminal and no daemon.
 //!
-//! Each screen follows the same contract in its own module: a `State`, a
-//! `Msg`, `update`, `on_key`, `refresh` and `view`. The root routes to the
-//! screen on screen, and owns what they share: the session, the live
-//! connection, toasts, the help overlay and the command palette.
+//! Each tab's screen follows the contract [`crate::screens`] states, in its
+//! own module. The sign-in screen is the exception, as that module says: it
+//! is shown in place of the tabs while signed out, and takes every key. The
+//! root routes to the screen on screen, and owns what they share: the
+//! session, the live connection, toasts, the help overlay and the command
+//! palette.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -531,8 +533,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
     }
 }
 
-/// Run a screen's handler with a context built from the model, turning a
-/// 401 among its results into a sign-out.
+/// Run a screen's handler with a context built from the model. A `401` is
+/// not handled here: the screen turns it into a [`Msg::SignedOut`] effect
+/// itself, through [`screens::contract::failed`] or
+/// [`screens::contract::sign_out_on_401`].
 fn route(model: &mut Model, f: impl FnOnce(&mut Model, &Ctx<'_>) -> Vec<Effect>) -> Vec<Effect> {
     let (api, server, theme, tick) = model.ctx();
     let ctx = Ctx {
