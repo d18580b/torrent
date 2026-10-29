@@ -18,11 +18,12 @@ use ratatui::Frame;
 
 use crate::api::types;
 use crate::api::Failure;
-use crate::app::failed;
-use crate::app::Ctx;
-use crate::app::Effect;
-use crate::app::Toast;
 use crate::fmt;
+use crate::screens::contract::failed;
+use crate::screens::contract::sign_out_on_401;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
+use crate::screens::contract::Toast;
 use crate::theme::Tone;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
@@ -114,11 +115,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         Msg::Loaded(Err(failure)) => {
             state.loading = false;
             state.error = Some(failure.message());
-            if failure.is_unauthenticated() {
-                vec![Effect::now(failed("loading status", failure))]
-            } else {
-                Vec::new()
-            }
+            sign_out_on_401(&failure)
         }
         Msg::AskReload => {
             state.confirm_reload = Some(Confirm::new(

@@ -17,10 +17,10 @@ use tui_input::Input;
 
 use crate::api::types;
 use crate::api::Failure;
-use crate::app::Ctx;
-use crate::app::Effect;
 use crate::app::Refusal;
 use crate::app::Session;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
 use crate::theme::Tone;
 use crate::ui::widgets::centered;
 use crate::ui::widgets::key_hints;

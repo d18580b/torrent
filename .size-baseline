@@ -4,4 +4,3 @@
 # the limit, and on any entry here that is now within it or no longer exists:
 # when a split brings a file under the limit, delete its line in the same
 # change. Never add a line.
-crates/torrentctl/src/screens/torrents.rs

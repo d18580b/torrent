@@ -18,16 +18,24 @@ use ratatui::Frame;
 use tui_input::Input;
 
 use super::Action;
+use super::Msg;
+use super::State;
 use crate::api::types;
+use crate::api::Api;
 use crate::fmt;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
 use crate::theme::Theme;
 use crate::theme::Tone;
+use crate::ui::widgets::caps;
 use crate::ui::widgets::centered;
 use crate::ui::widgets::key_hints;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
 use crate::ui::widgets::spinner;
 use crate::ui::widgets::state_span;
+use crate::ui::widgets::Motion;
+use crate::ui::widgets::PageRequest;
 use crate::ui::widgets::Paged;
 
 /// The detail view's tabs, in order.
@@ -345,15 +353,9 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+/// `2026-09-27 14:03 UTC`.
 fn date(at: time::OffsetDateTime) -> String {
-    format!(
-        "{}-{:02}-{:02} {:02}:{:02} UTC",
-        at.year(),
-        u8::from(at.month()),
-        at.day(),
-        at.hour(),
-        at.minute()
-    )
+    format!("{} UTC", fmt::when(at))
 }
 
 fn overview(
@@ -737,4 +739,118 @@ fn actions(detail: &Detail, theme: &Theme, mutations: bool, frame: &mut Frame, a
         });
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The open torrent, when it is `hash`: an answer for another is stale.
+pub(super) fn open_detail<'a>(state: &'a mut State, hash: &str) -> Option<&'a mut Detail> {
+    state.detail.as_mut().filter(|d| d.hash == hash)
+}
+
+/// Reload the open torrent and its current tab.
+pub(super) fn load_detail(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    if !detail.loading {
+        detail.loading = true;
+        let api = ctx.api.clone();
+        let hash = detail.hash.clone();
+        effects.push(Effect::new(async move {
+            let result = crate::api::call(api.client.get_torrent(hash.clone())).await;
+            crate::app::Msg::Torrents(Msg::Torrent { hash, result })
+        }));
+    }
+    if rereads_files(detail) && !detail.files.loading {
+        effects.extend(load_files(detail, ctx));
+    } else if rereads_trackers(detail) && !detail.trackers_loading {
+        effects.extend(load_trackers(detail, ctx));
+    }
+    effects
+}
+
+/// Whether [`load_detail`] re-reads the open torrent's files: only on the
+/// Files tab, and only a list that fits one request. A longer list would take
+/// a request per thousand files on every change, and files do not change
+/// while a torrent seeds (a priority edit updates its row in place). Such a
+/// list is left as it is; reopening the torrent reloads it, in as many
+/// requests as it needs.
+pub(super) fn rereads_files(detail: &Detail) -> bool {
+    detail.tab == Tab::Files && detail.files.items.len() <= caps::PAGE_MAX
+}
+
+/// Whether [`load_detail`] re-reads the open torrent's trackers: only on the
+/// Trackers tab.
+pub(super) fn rereads_trackers(detail: &Detail) -> bool {
+    detail.tab == Tab::Trackers
+}
+
+/// Reload the open torrent's files from the first page.
+pub(super) fn load_files(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
+    let request = detail.files.reload();
+    vec![fetch_files(ctx.api, detail.hash.clone(), request)]
+}
+
+/// The next page of files, when the selection is near the end of them.
+pub(super) fn more_files(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
+    if !detail.files.wants_more(detail.files_selected) {
+        return Vec::new();
+    }
+    match detail.files.begin_more() {
+        Some(request) => vec![fetch_files(ctx.api, detail.hash.clone(), request)],
+        None => Vec::new(),
+    }
+}
+
+/// One page of the torrent `hash`'s files.
+pub(super) fn fetch_files(api: &Api, hash: String, request: PageRequest) -> Effect {
+    let api = api.clone();
+    let PageRequest {
+        cursor,
+        limit,
+        generation,
+    } = request;
+    Effect::new(async move {
+        let first = cursor.is_none();
+        let params = crate::api::generated::ListTorrentFilesParams {
+            cursor,
+            limit: Some(limit as i64),
+        };
+        let result = crate::api::call(api.client.list_torrent_files(hash.clone(), params)).await;
+        crate::app::Msg::Torrents(Msg::FilesPage {
+            hash,
+            generation,
+            first,
+            result,
+        })
+    })
+}
+
+/// Re-read the open torrent's trackers.
+pub(super) fn load_trackers(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
+    detail.trackers_loading = true;
+    detail.trackers_asked = Some(Instant::now());
+    let api = ctx.api.clone();
+    let hash = detail.hash.clone();
+    vec![Effect::new(async move {
+        let result = crate::api::call(api.client.list_torrent_trackers(hash.clone())).await;
+        crate::app::Msg::Torrents(Msg::Trackers { hash, result })
+    })]
+}
+
+/// Move the selection of the open tab.
+pub(super) fn move_in_detail(detail: &mut Detail, movement: Motion, ctx: &Ctx<'_>) -> Vec<Effect> {
+    match detail.tab {
+        Tab::Overview => Vec::new(),
+        Tab::Files => {
+            detail.files_selected = movement.apply(detail.files_selected, detail.files.items.len());
+            more_files(detail, ctx)
+        }
+        Tab::Trackers => {
+            let len = detail.trackers.as_ref().map_or(0, Vec::len);
+            detail.trackers_selected = movement.apply(detail.trackers_selected, len);
+            Vec::new()
+        }
+        Tab::Actions => {
+            detail.action_selected = movement.apply(detail.action_selected, ENTRIES.len());
+            Vec::new()
+        }
+    }
 }

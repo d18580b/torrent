@@ -17,29 +17,29 @@ use ratatui::widgets::Table;
 use ratatui::widgets::TableState;
 use ratatui::Frame;
 
-use super::hints;
-use super::scroll;
-use super::share_bar;
-use super::signed_out;
-use super::strong;
-use super::title;
 use super::wrap;
-use super::Motion;
 use crate::api::types;
 use crate::api::Failure;
-use crate::app::failed;
-use crate::app::Ctx;
-use crate::app::Effect;
-use crate::app::Toast;
 use crate::fmt;
+use crate::screens::contract::failed;
+use crate::screens::contract::sign_out_on_401;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
+use crate::screens::contract::Toast;
 use crate::theme::Theme;
 use crate::theme::Tone;
+use crate::ui::widgets::hints;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::placeholder;
+use crate::ui::widgets::scroll;
+use crate::ui::widgets::share_bar;
 use crate::ui::widgets::spinner;
 use crate::ui::widgets::state_span;
+use crate::ui::widgets::strong;
+use crate::ui::widgets::title;
 use crate::ui::widgets::Confirm;
 use crate::ui::widgets::Confirmed;
+use crate::ui::widgets::Motion;
 
 /// A managed root, as the tree browses it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +122,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         Msg::Loaded(_, Err(failure)) => {
             state.loading = false;
             state.error = Some(failure.message());
-            signed_out(&failure)
+            sign_out_on_401(&failure)
         }
         Msg::Move(motion) => {
             let len = state.pool.as_ref().map_or(0, |p| p.roots.len());

@@ -18,8 +18,6 @@ use ratatui::Frame;
 use tui_input::backend::crossterm::EventHandler as _;
 use tui_input::Input;
 
-use crate::api::generated::Credential;
-use crate::api::generated::ExposeSecret as _;
 use crate::api::types;
 use crate::api::Api;
 use crate::api::Failure;
@@ -466,7 +464,7 @@ async fn read_metainfo(path: &std::path::Path) -> Result<Vec<u8>, AddFailure> {
 /// serializes as a JSON array of numbers rather than the base64 string the
 /// API document declares, so the typed `add_torrent` cannot send a
 /// `.torrent`. This sends the same request with the data base64-encoded,
-/// through the client's own HTTP client, base URL and credential.
+/// through [`Api::post`].
 #[allow(
     clippy::result_large_err,
     reason = "an AddFailure is built once per failed add and moved straight to the dialog"
@@ -487,19 +485,13 @@ async fn post_metainfo(
     if let Some(save_path) = save_path {
         body["save_path"] = serde_json::Value::from(save_path);
     }
-    let core = api.client.core();
-    let mut url = core.base_url().clone();
-    url.path_segments_mut()
-        .map_err(|()| AddFailure::Api {
-            failure: Failure::local("Invalid daemon URL", Some(url_error(core.base_url()))),
+    let request = api
+        .post(&["v1", "torrents"])
+        .map_err(|failure| AddFailure::Api {
+            failure,
             errors: Vec::new(),
         })?
-        .pop_if_empty()
-        .extend(["v1", "torrents"]);
-    let mut request = core.http().post(url).json(&body);
-    if let Some(Credential::Bearer(token)) = core.credential("bearer") {
-        request = request.bearer_auth(token.expose_secret());
-    }
+        .json(&body);
     let exchange = async move {
         let response = request.send().await.map_err(|e| AddFailure::Api {
             failure: Failure::local("Cannot reach the daemon", Some(e.to_string())),
@@ -518,11 +510,7 @@ async fn post_metainfo(
                     errors: Vec::new(),
                 });
         }
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        let request_id = crate::api::request_id(response.headers());
         let problem: serde_json::Value = response.json().await.unwrap_or_default();
         Err(problem_failure(status.as_u16(), &problem, request_id))
     };
@@ -545,10 +533,6 @@ async fn post_metainfo(
 /// How long a `.torrent` upload may take: up to ~85 MiB of base64 on a slow
 /// link, far past the ordinary request timeout.
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
-fn url_error(url: &reqwest::Url) -> String {
-    format!("{url} cannot take a path")
-}
 
 /// A problem document as a failure, with a `validation-failed`'s `errors`.
 fn problem_failure(

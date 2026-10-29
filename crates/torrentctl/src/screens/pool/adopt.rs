@@ -17,21 +17,21 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use ratatui::Frame;
 
-use super::strong;
 use super::wrap;
 use crate::api::types;
 use crate::api::Failure;
-use crate::app::failed;
-use crate::app::Ctx;
-use crate::app::Effect;
-use crate::app::Toast;
 use crate::fmt;
+use crate::screens::contract::failed;
+use crate::screens::contract::Ctx;
+use crate::screens::contract::Effect;
+use crate::screens::contract::Toast;
 use crate::theme::Theme;
 use crate::theme::Tone;
 use crate::ui::widgets::centered;
 use crate::ui::widgets::key_hints;
 use crate::ui::widgets::panel;
 use crate::ui::widgets::spinner;
+use crate::ui::widgets::strong;
 
 /// What to adopt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,7 +189,7 @@ pub fn update(dialog: &mut Option<Dialog>, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effec
         } => {
             d.error = Some(format!("cannot list profiles: {}", failure.message()));
             d.profiles = Some(Vec::new());
-            super::signed_out(&failure)
+            crate::screens::contract::sign_out_on_401(&failure)
         }
         Msg::Answered {
             dry_run,
@@ -229,7 +229,7 @@ pub fn update(dialog: &mut Option<Dialog>, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effec
                     .is_none_or(|status| status == 408 || status >= 500)
             {
                 *dialog = None;
-                return vec![Effect::toast(crate::app::Toast::failure(
+                return vec![Effect::toast(Toast::failure(
                     "adopting — it may still have gone through; refresh the library before retrying",
                     &failure,
                 ))];
