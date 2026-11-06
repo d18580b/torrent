@@ -30,6 +30,9 @@ bytes = { version = "1.12.1", features = ["serde"] }
 secrecy = { workspace = true }
 futures-core = { workspace = true }
 time = { workspace = true }
+# spargen 0.6's client speaks `http::Request`/`http::Response` to its backend.
+http = "1.4.2"
+http-body = "1.0.1"
 
 # The terminal UI.
 ratatui = { workspace = true }
