@@ -542,7 +542,7 @@ pub enum TreeError {
         summary: String,
         /// Every violated constraint.
         #[problem(extension)]
-        errors: serde_json::Value,
+        errors: Vec<crate::http::validate::Violation>,
     },
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
@@ -809,7 +809,7 @@ pub enum ListError {
         summary: String,
         /// Every violated constraint.
         #[problem(extension)]
-        errors: serde_json::Value,
+        errors: Vec<crate::http::validate::Violation>,
     },
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
@@ -1033,7 +1033,7 @@ pub enum AdoptError {
         detail: String,
         /// `failed`, `vpn_down` or `offline`.
         #[problem(extension)]
-        profile_status: &'static str,
+        profile_status: crate::http::v1::common::ProfileUnavailableReason,
     },
     /// The body breaks a documented constraint.
     #[error("{summary}")]
@@ -1042,7 +1042,7 @@ pub enum AdoptError {
         summary: String,
         /// Every violated constraint.
         #[problem(extension)]
-        errors: serde_json::Value,
+        errors: Vec<crate::http::validate::Violation>,
     },
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
@@ -1424,7 +1424,7 @@ pub enum VerifyError {
         summary: String,
         /// Every violated constraint.
         #[problem(extension)]
-        errors: serde_json::Value,
+        errors: Vec<crate::http::validate::Violation>,
     },
 }
 from_invalid!(VerifyError);
@@ -2049,12 +2049,7 @@ fn create_plan_blocking(
         "plan created (nothing applied)",
     );
     Ok(Created::at(
-        // `relative_uri` knows the route, not the group it is mounted under.
-        format!(
-            "{}{}",
-            crate::http::v1::PREFIX,
-            get_plan::relative_uri(PlanPath { plan_id: id })
-        ),
+        crate::http::v1::mounted(get_plan::relative_uri(PlanPath { plan_id: id })),
         Json(plan),
     ))
 }
@@ -2120,7 +2115,7 @@ pub enum ListPlanStepsError {
         summary: String,
         /// Every violated constraint.
         #[problem(extension)]
-        errors: serde_json::Value,
+        errors: Vec<crate::http::validate::Violation>,
     },
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]

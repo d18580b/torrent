@@ -44,26 +44,26 @@ pub struct ListTorrentsQuery {
     pub limit: Option<PageLimit>,
 }
 
-torrent_error! {
-    /// Why the torrents could not be listed.
-    pub enum ListTorrentsError {
-        /// The cursor is not one this listing issued.
-        #[error("the cursor is not one this listing issued; start again without it")]
-        #[problem(status = 400, title = "Invalid cursor")]
-        InvalidCursor,
-        /// No profile with this `profile_id` is configured.
-        #[error("unknown profile_id")]
-        #[problem(status = 404, title = "Profile not found")]
-        ProfileNotFound,
-        /// A query parameter is out of range.
-        #[error("{summary}")]
-        #[problem(status = 422, title = "The request is invalid")]
-        ValidationFailed {
-            summary: String,
-            #[problem(extension)]
-            errors: serde_json::Value,
-        },
-    }
+/// Why the torrents could not be listed.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum ListTorrentsError {
+    /// The cursor is not one this listing issued.
+    #[error("the cursor is not one this listing issued; start again without it")]
+    #[problem(status = 400, title = "Invalid cursor")]
+    InvalidCursor,
+    /// No profile with this `profile_id` is configured.
+    #[error("unknown profile_id")]
+    #[problem(status = 404, title = "Profile not found")]
+    ProfileNotFound,
+    /// A query parameter is out of range.
+    #[error("{summary}")]
+    #[problem(status = 422, title = "The request is invalid")]
+    ValidationFailed {
+        summary: String,
+        #[problem(extension)]
+        errors: Vec<crate::http::validate::Violation>,
+    },
 }
 from_invalid!(ListTorrentsError);
 
@@ -191,14 +191,14 @@ fn first_after(
         .collect()
 }
 
-torrent_error! {
-    /// Why a torrent could not be read.
-    pub enum GetTorrentError {
-        /// No torrent with this infohash is assigned to any profile.
-        #[error("no torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-    }
+/// Why a torrent could not be read.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum GetTorrentError {
+    /// No torrent with this infohash is assigned to any profile.
+    #[error("no torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
 }
 
 /// Read one torrent.

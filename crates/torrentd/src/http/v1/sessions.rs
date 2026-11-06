@@ -263,12 +263,7 @@ pub async fn create_session(
         "session issued",
     );
     Ok(Created::at(
-        // `relative_uri` knows the route, not the group it is mounted under.
-        format!(
-            "{}{}",
-            crate::http::v1::PREFIX,
-            get_current_session::relative_uri()
-        ),
+        crate::http::v1::mounted(get_current_session::relative_uri()),
         Json(SessionGrant {
             token,
             token_type: "Bearer".to_owned(),

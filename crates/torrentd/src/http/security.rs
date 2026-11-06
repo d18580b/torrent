@@ -577,11 +577,31 @@ impl<R> Authorized<R> {
 /// What [`Authorized`] answers with: exactly what `Scoped<Bearer, _>` would
 /// have, and described as it describes it, so that the document is the same
 /// with this mounted or not.
-pub struct Refused<R>(AuthRejection, std::marker::PhantomData<fn() -> R>);
+pub struct Refused<R> {
+    rejection: AuthRejection,
+    /// Whether `authorize` refused a scope, rather than `authenticate` the
+    /// credential.
+    scope: bool,
+    _scopes: std::marker::PhantomData<fn() -> R>,
+}
 
 impl<R> kynos::response::IntoResponse for Refused<R> {
+    /// A scope refusal carries `Bearer`'s `insufficient_scope` challenge
+    /// (RFC 6750 section 3.1), as the guard's does. kynos attaches it only on
+    /// the guard's own path, and offers no public way to set it on an
+    /// `AuthRejection`, so it is added to the response here.
     fn into_response(self) -> kynos::http::Response {
-        self.0.into_response()
+        let mut response = self.rejection.into_response();
+        let challenge = <Bearer as SecurityScheme>::insufficient_scope_challenge()
+            .and_then(|c| kynos::http::HeaderValue::from_str(c).ok());
+        if let (true, kynos::http::StatusCode::FORBIDDEN, Some(challenge)) =
+            (self.scope, response.status(), challenge)
+        {
+            response
+                .headers_mut()
+                .insert(kynos::http::header::WWW_AUTHENTICATE, challenge);
+        }
+        response
     }
 }
 
@@ -590,10 +610,51 @@ impl<R: Scopes> kynos::response::ShortCircuit for Refused<R> {
 }
 
 impl<R: Scopes> kynos::response::Responses for Refused<R> {
+    /// `ScopedRejection`'s `401` and `403`, with the `WWW-Authenticate`
+    /// challenges the `Scoped` guard declares on them.
+    ///
+    /// kynos merges an operation's descriptions of one status and keeps a
+    /// header `required` only where every description requires it, and
+    /// `ScopedRejection`'s own omits the header. Without the challenges here,
+    /// every operation this is mounted on would lose `required` on its `401`.
     fn responses(registry: &mut kynos::schema::registry::Registry) -> kynos::openapi::Responses {
-        <kynos::error::rejection::ScopedRejection<R> as kynos::response::Responses>::responses(
-            registry,
-        )
+        use kynos::openapi::model::schema::types::SchemaType;
+        use kynos::openapi::Header;
+        use kynos::openapi::RefOr;
+        use kynos::openapi::Schema;
+
+        let mut responses =
+            <kynos::error::rejection::ScopedRejection<R> as kynos::response::Responses>::responses(
+                registry,
+            );
+        let mut challenge = |status: &str, value: Option<&'static str>, header: Header| {
+            if let (Some(value), Some(RefOr::Item(response))) =
+                (value, responses.responses.get_mut(status))
+            {
+                response.headers.insert(
+                    "WWW-Authenticate".to_owned(),
+                    RefOr::Item(header.with_example(value)),
+                );
+            }
+        };
+        // The same two headers, in the same words, as kynos' guard declares.
+        challenge(
+            "401",
+            <Bearer as SecurityScheme>::challenge(),
+            Header::new(Schema::of_type(SchemaType::String))
+                .required(true)
+                .with_description(
+                    "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                ),
+        );
+        challenge(
+            "403",
+            <Bearer as SecurityScheme>::insufficient_scope_challenge(),
+            Header::new(Schema::of_type(SchemaType::String)).with_description(
+                "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+            ),
+        );
+        responses
     }
 }
 
@@ -613,12 +674,14 @@ impl<R: Scopes<Scope = Scope>> kynos::middleware::Interceptor<crate::http::ctx::
     ) -> Result<kynos::middleware::Continued<()>, Refused<R>> {
         use kynos::security::Authenticates;
 
-        let refused = |rejection: AuthRejection| {
-            Refused(
-                rejection.with_challenge(<Bearer as SecurityScheme>::challenge()),
-                std::marker::PhantomData,
-            )
+        let refusal = |scope: bool| {
+            move |rejection: AuthRejection| Refused {
+                rejection: rejection.with_challenge(<Bearer as SecurityScheme>::challenge()),
+                scope,
+                _scopes: std::marker::PhantomData,
+            }
         };
+        let refused = refusal(false);
         let (parts, body) = request.into_parts();
         let presented = Bearer::present(&parts)
             .map_err(refused)?
@@ -631,7 +694,7 @@ impl<R: Scopes<Scope = Scope>> kynos::middleware::Interceptor<crate::http::ctx::
         // `Bearer` declares none, so `R`'s are the whole demand.
         Authenticator::<Bearer, _>::authorize(gate, &caller, R::REQUIRED, context)
             .await
-            .map_err(refused)?;
+            .map_err(refusal(true))?;
         Ok(next
             .run(kynos::http::Request::from_parts(parts, body))
             .await)

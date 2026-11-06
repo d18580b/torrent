@@ -18,16 +18,7 @@ use crate::app_state::AppState;
 use crate::http::v1::common::engine_for;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::ProfileProblem;
-
-/// The problem base every error here shares.
-macro_rules! torrent_error {
-    ($(#[$meta:meta])* pub enum $name:ident { $($body:tt)* }) => {
-        $(#[$meta])*
-        #[derive(Debug, thiserror::Error, ApiError)]
-        #[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
-        pub enum $name { $($body)* }
-    };
-}
+use crate::http::v1::common::ProfileUnavailableReason;
 
 /// A loaded torrent's state and its session, or why there is none.
 ///
@@ -55,7 +46,7 @@ fn loaded_unfenced(
         ProfileProblem::NotFound => Lookup::NoSession,
         ProfileProblem::Unavailable { reason, detail } => Lookup::Fenced {
             detail,
-            profile_status: reason.as_str(),
+            profile_status: reason,
         },
     })?;
     Ok((st, engine))
@@ -68,7 +59,7 @@ enum Lookup {
     NoSession,
     Fenced {
         detail: String,
-        profile_status: &'static str,
+        profile_status: ProfileUnavailableReason,
     },
 }
 

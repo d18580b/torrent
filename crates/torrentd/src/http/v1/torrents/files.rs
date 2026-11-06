@@ -83,34 +83,34 @@ fn file_key(index: u32) -> String {
 /// Digits in a file cursor key: enough for every `u32`.
 const FILE_KEY_WIDTH: usize = 10;
 
-torrent_error! {
-    /// Why a torrent's files could not be listed.
-    pub enum ListFilesError {
-        /// The cursor is not one this listing issued.
-        #[error("the cursor is not one this listing issued; start again without it")]
-        #[problem(status = 400, title = "Invalid cursor")]
-        InvalidCursor,
-        /// No loaded torrent has this infohash.
-        #[error("no loaded torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-        /// The torrent was added from a magnet and has no metadata yet.
-        #[error("the torrent has no metadata yet; retry once it has a name")]
-        #[problem(status = 409, title = "Metadata pending")]
-        MetadataPending,
-        /// A query parameter is out of range.
-        #[error("{summary}")]
-        #[problem(status = 422, title = "The request is invalid")]
-        ValidationFailed {
-            summary: String,
-            #[problem(extension)]
-            errors: serde_json::Value,
-        },
-        /// The session could not be asked.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+/// Why a torrent's files could not be listed.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum ListFilesError {
+    /// The cursor is not one this listing issued.
+    #[error("the cursor is not one this listing issued; start again without it")]
+    #[problem(status = 400, title = "Invalid cursor")]
+    InvalidCursor,
+    /// No loaded torrent has this infohash.
+    #[error("no loaded torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
+    /// The torrent was added from a magnet and has no metadata yet.
+    #[error("the torrent has no metadata yet; retry once it has a name")]
+    #[problem(status = 409, title = "Metadata pending")]
+    MetadataPending,
+    /// A query parameter is out of range.
+    #[error("{summary}")]
+    #[problem(status = 422, title = "The request is invalid")]
+    ValidationFailed {
+        summary: String,
+        #[problem(extension)]
+        errors: Vec<crate::http::validate::Violation>,
+    },
+    /// The session could not be asked.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 from_lookup!(ListFilesError);
 from_invalid!(ListFilesError);
@@ -198,34 +198,34 @@ impl Validate for FilePriority {
     }
 }
 
-torrent_error! {
-    /// Why a file's priority was not set.
-    pub enum SetFilePriorityError {
-        /// No loaded torrent has this infohash.
-        #[error("no loaded torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-        /// The torrent has no file at this index.
-        #[error("the torrent has no file at this index")]
-        #[problem(status = 404, title = "File not found")]
-        FileNotFound,
-        /// The torrent was added from a magnet and has no metadata yet.
-        #[error("the torrent has no metadata yet; retry once it has a name")]
-        #[problem(status = 409, title = "Metadata pending")]
-        MetadataPending,
-        /// A constraint the schema declares is broken.
-        #[error("{summary}")]
-        #[problem(status = 422, title = "The request is invalid")]
-        ValidationFailed {
-            summary: String,
-            #[problem(extension)]
-            errors: serde_json::Value,
-        },
-        /// The session refused the request.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+/// Why a file's priority was not set.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum SetFilePriorityError {
+    /// No loaded torrent has this infohash.
+    #[error("no loaded torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
+    /// The torrent has no file at this index.
+    #[error("the torrent has no file at this index")]
+    #[problem(status = 404, title = "File not found")]
+    FileNotFound,
+    /// The torrent was added from a magnet and has no metadata yet.
+    #[error("the torrent has no metadata yet; retry once it has a name")]
+    #[problem(status = 409, title = "Metadata pending")]
+    MetadataPending,
+    /// A constraint the schema declares is broken.
+    #[error("{summary}")]
+    #[problem(status = 422, title = "The request is invalid")]
+    ValidationFailed {
+        summary: String,
+        #[problem(extension)]
+        errors: Vec<crate::http::validate::Violation>,
+    },
+    /// The session refused the request.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 from_lookup!(SetFilePriorityError);
 from_invalid!(SetFilePriorityError);

@@ -18,12 +18,10 @@ pub mod generated {
 }
 
 pub use generated::types;
+/// A plan's status, as `GET /v1/pool/plans` filters by it: the document's
+/// `PlanStatus` component, which the filter parameter references directly.
+pub use generated::types::PlanStatus;
 pub use generated::Client;
-
-/// A plan's status, as `GET /v1/pool/plans` filters by it. spargen names
-/// this inline enum by a hash of its shape, which would change if the API
-/// document's enum did; the name is confined to this alias.
-pub type PlanStatus = types::Status4ee43c98;
 
 // `AsProblem` for every generated error enum; see build.rs.
 include!(concat!(env!("OUT_DIR"), "/problems.rs"));
@@ -123,8 +121,9 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
                 let problem = serde_json::from_slice(&body).unwrap_or_default();
                 from_problem(status.as_u16(), &problem, request_id)
             }
+            // A refused connection, as well as a dropped one, arrives here.
             Error::Transport(e) | Error::InterruptedBody(e) => {
-                Failure::local("Cannot reach the daemon", Some(e.to_string()))
+                Failure::local("Cannot reach the daemon", Some(root_cause(&e)))
             }
             Error::Timeout(kind) => {
                 Failure::local("The daemon did not answer", Some(format!("{kind:?}")))
@@ -142,16 +141,20 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
                 Failure::local("The daemon's answer was malformed", Some(e.to_string()))
             }
             Error::Redirect(e) => Failure::local("Too many redirects", Some(e.to_string())),
+            // Only spargen's `Link`-header paginator raises this; the API
+            // pages by cursor, so nothing here reaches it.
+            Error::PaginationCycle { url } => Failure::local(
+                "The daemon's pages led back to one already read",
+                Some(url.to_string()),
+            ),
         }
     }
 }
 
-/// A [`generated::RequestError::Other`] as the UI shows it. spargen reports a
-/// refused connection there, as reqwest's own request-error class, rather
-/// than as `Transport` (gap S12); the same variant carries a request that
+/// A [`generated::RequestError::Other`] as the UI shows it: a request that
 /// could not be built — a header value no header can carry, an unparseable
-/// URL, a body that did not serialize. Only a failed connect is an
-/// unreachable daemon.
+/// URL, a body that did not serialize. spargen 0.6 reports a refused
+/// connection as `Transport`; one still found here is an unreachable daemon.
 fn request_failure(e: &generated::RequestError) -> Failure {
     let connect = std::error::Error::source(e)
         .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
@@ -475,12 +478,17 @@ mod tests {
         let api = Api::new(&closed_port(), Some("tdp_valid")).unwrap();
         let f = call(api.client.get_status()).await.unwrap_err();
         assert_eq!(f.title, "Cannot reach the daemon", "{f:?}");
+        // The detail is the OS's reason, not reqwest's "error sending request".
+        let detail = f.detail.clone().unwrap_or_default();
+        assert!(detail.contains("refused"), "{f:?}");
 
         let dir = tempfile::tempdir().unwrap();
         let socket = format!("unix:{}", dir.path().join("absent.sock").display());
         let api = Api::new(&socket, Some("tdp_valid")).unwrap();
         let f = call(api.client.get_status()).await.unwrap_err();
         assert_eq!(f.title, "Cannot reach the daemon", "{f:?}");
+        let detail = f.detail.clone().unwrap_or_default();
+        assert!(detail.contains("No such file"), "{f:?}");
     }
 
     /// A token no header can carry fails before anything is sent, and says

@@ -137,58 +137,58 @@ impl Validate for AddTorrentRequest {
     }
 }
 
-torrent_error! {
-    /// Why a torrent was not added.
-    pub enum AddTorrentError {
-        /// A member of the request breaks a constraint the schema declares.
-        #[error("{summary}")]
-        #[problem(status = 422, title = "The request is invalid")]
-        ValidationFailed {
-            summary: String,
-            #[problem(extension)]
-            errors: serde_json::Value,
-        },
-        /// No profile with this `profile_id` is configured.
-        #[error("unknown profile_id")]
-        #[problem(status = 404, title = "Profile not found")]
-        ProfileNotFound,
-        /// The profile failed to come up, the VPN monitor fenced it, or the
-        /// operator set it offline: a torrent added there would land paused
-        /// and make the profile look healthy.
-        #[error("{detail}")]
-        #[problem(status = 409, title = "The profile is unavailable")]
-        ProfileUnavailable {
-            detail: String,
-            #[problem(extension)]
-            profile_status: &'static str,
-        },
-        /// A path in the request is outside the directories the daemon may
-        /// use. Never says whether the path exists.
-        #[error("{0}")]
-        #[problem(status = 422, title = "Path not confined")]
-        PathNotConfined(&'static str),
-        /// The magnet URI or `.torrent` could not be parsed or read.
-        #[error("{0}")]
-        #[problem(status = 422, title = "Invalid metainfo")]
-        InvalidMetainfo(String),
-        /// The profile sets `allowed_tracker_domains`, and the torrent
-        /// announces to a tracker outside them, to one under none of the
-        /// profile's `allowed_tracker_urls` (another account's passkey), or
-        /// to none. The detail says which.
-        #[error("{0}")]
-        #[problem(status = 422, title = "Tracker not allowed")]
-        TrackerNotAllowed(String),
-        /// A torrent with this infohash is already assigned, to this profile
-        /// or another.
-        #[error("{0}")]
-        #[problem(status = 409, title = "Torrent exists")]
-        TorrentExists(String),
-        /// The session refused the torrent, or the assignment registry could
-        /// not record it.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+/// Why a torrent was not added.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum AddTorrentError {
+    /// A member of the request breaks a constraint the schema declares.
+    #[error("{summary}")]
+    #[problem(status = 422, title = "The request is invalid")]
+    ValidationFailed {
+        summary: String,
+        #[problem(extension)]
+        errors: Vec<crate::http::validate::Violation>,
+    },
+    /// No profile with this `profile_id` is configured.
+    #[error("unknown profile_id")]
+    #[problem(status = 404, title = "Profile not found")]
+    ProfileNotFound,
+    /// The profile failed to come up, the VPN monitor fenced it, or the
+    /// operator set it offline: a torrent added there would land paused
+    /// and make the profile look healthy.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The profile is unavailable")]
+    ProfileUnavailable {
+        detail: String,
+        #[problem(extension)]
+        profile_status: crate::http::v1::common::ProfileUnavailableReason,
+    },
+    /// A path in the request is outside the directories the daemon may
+    /// use. Never says whether the path exists.
+    #[error("{0}")]
+    #[problem(status = 422, title = "Path not confined")]
+    PathNotConfined(&'static str),
+    /// The magnet URI or `.torrent` could not be parsed or read.
+    #[error("{0}")]
+    #[problem(status = 422, title = "Invalid metainfo")]
+    InvalidMetainfo(String),
+    /// The profile sets `allowed_tracker_domains`, and the torrent
+    /// announces to a tracker outside them, to one under none of the
+    /// profile's `allowed_tracker_urls` (another account's passkey), or
+    /// to none. The detail says which.
+    #[error("{0}")]
+    #[problem(status = 422, title = "Tracker not allowed")]
+    TrackerNotAllowed(String),
+    /// A torrent with this infohash is already assigned, to this profile
+    /// or another.
+    #[error("{0}")]
+    #[problem(status = 409, title = "Torrent exists")]
+    TorrentExists(String),
+    /// The session refused the torrent, or the assignment registry could
+    /// not record it.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 from_invalid!(AddTorrentError);
 from_profile_problem!(AddTorrentError);
@@ -473,14 +473,9 @@ pub async fn add_torrent(
         .ok();
     let torrent = Torrent::build(&s, &infohash, &profile_id, details);
     Ok(Created::at(
-        // `relative_uri` knows the route, not the group it is mounted under.
-        format!(
-            "{}{}",
-            crate::http::v1::PREFIX,
-            get_torrent::relative_uri(TorrentPath {
-                infohash: InfoHashHex::new(infohash),
-            })
-        ),
+        crate::http::v1::mounted(get_torrent::relative_uri(TorrentPath {
+            infohash: InfoHashHex::new(infohash),
+        })),
         Json(torrent),
     ))
 }

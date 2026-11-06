@@ -340,11 +340,14 @@ impl Harness {
                 .listener(listener)
                 // No head deadline: the paused clock below would jump to it
                 // before the operation's deadline is armed, and arm that one
-                // late. Every head here is sent whole before the pause.
+                // late. Every head here is sent whole before the pause. kynos
+                // bounds a connection's first head by the earlier of HTTP/1's
+                // header-read timeout and HTTP/2's idle timeout, so both go.
                 .http1(
                     kynos::server::protocol::http1::Http1Config::default()
                         .header_read_timeout(None),
                 )
+                .http2(kynos::server::protocol::http2::Http2Config::default().idle_timeout(None))
                 .serve(),
         );
 
@@ -449,4 +452,17 @@ pub fn assert_problem(resp: &TestResponse, status: u16, slug: &str) {
         resp.text()
     );
     resp.assert_problem_type(&format!("{}{slug}", crate::http::security::PROBLEM_BASE));
+}
+
+/// Assert `resp` refused a valid credential for a scope it lacks: a `403`
+/// `insufficient-scope` carrying RFC 6750's `insufficient_scope` challenge,
+/// whether the operation's `Scoped` argument or the head-time
+/// `Authorized` interceptor refused it.
+pub fn assert_scope_refused(resp: &TestResponse) {
+    assert_problem(resp, 403, "insufficient-scope");
+    assert_eq!(
+        resp.header("www-authenticate"),
+        Some("Bearer error=\"insufficient_scope\""),
+        "a scope refusal carries the insufficient_scope challenge",
+    );
 }

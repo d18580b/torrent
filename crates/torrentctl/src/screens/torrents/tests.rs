@@ -557,11 +557,11 @@ fn capital_f_cycles_every_phase_then_all() {
     let mut state = loaded(1..8, None);
     testing::with_ctx(None, |ctx| {
         update(&mut state, Msg::CyclePhase, ctx);
-        assert_eq!(state.phase, Some(types::Phase::Checking));
+        assert_eq!(state.phase, Some(types::TorrentPhase::Checking));
         for _ in 1..PHASES.len() {
             update(&mut state, Msg::CyclePhase, ctx);
         }
-        assert_eq!(state.phase, Some(types::Phase::Unknown));
+        assert_eq!(state.phase, Some(types::TorrentPhase::Unknown));
         update(&mut state, Msg::CyclePhase, ctx);
         assert_eq!(state.phase, None);
     });

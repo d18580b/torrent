@@ -42,13 +42,21 @@ impl<T: kynos::schema::Schema> kynos::schema::Schema for Unenforced<T> {
 }
 
 /// One violated constraint.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, kynos::Schema)]
 pub struct Violation {
     /// RFC 6901 JSON Pointer to the offending member of the request body, or
     /// the name of the query parameter prefixed with `#/query/`.
     pub pointer: String,
     /// What is wrong with it.
     pub detail: String,
+}
+
+/// The `errors` extension member's element, which kynos attaches as JSON.
+/// Through serde, so the wire and the `Schema` derive read the same shape.
+impl From<Violation> for serde_json::Value {
+    fn from(v: Violation) -> Self {
+        serde_json::to_value(v).expect("a Violation is two strings")
+    }
 }
 
 /// Every constraint a request violated.
@@ -99,11 +107,6 @@ impl Invalid {
             ),
         }
     }
-
-    /// The `errors` extension member.
-    pub fn errors(&self) -> serde_json::Value {
-        serde_json::to_value(&self.violations).unwrap_or_default()
-    }
 }
 
 /// A request type whose schema declares constraints serde does not check.
@@ -116,7 +119,7 @@ pub trait Validate {
 /// ```ignore
 /// #[error("{summary}")]
 /// #[problem(status = 422, title = "The request is invalid")]
-/// ValidationFailed { summary: String, #[problem(extension)] errors: serde_json::Value },
+/// ValidationFailed { summary: String, #[problem(extension)] errors: Vec<Violation> },
 /// ```
 macro_rules! from_invalid {
     ($($error:ty),+ $(,)?) => {$(
@@ -124,7 +127,7 @@ macro_rules! from_invalid {
             fn from(invalid: $crate::http::validate::Invalid) -> Self {
                 Self::ValidationFailed {
                     summary: invalid.summary(),
-                    errors: invalid.errors(),
+                    errors: invalid.violations,
                 }
             }
         }
@@ -150,7 +153,7 @@ mod tests {
         invalid.push("/b", "too small");
         assert_eq!(invalid.summary(), "/a: too big (and 1 more; see `errors`)");
         assert_eq!(
-            invalid.errors(),
+            serde_json::Value::from(invalid.violations),
             serde_json::json!([
                 {"pointer": "/a", "detail": "too big"},
                 {"pointer": "/b", "detail": "too small"},

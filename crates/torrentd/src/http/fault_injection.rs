@@ -336,7 +336,7 @@ pub enum FaultError {
         summary: String,
         /// Every violated constraint.
         #[problem(extension)]
-        errors: serde_json::Value,
+        errors: Vec<crate::http::validate::Violation>,
     },
     /// No live profile has this id.
     #[error("no live profile {0:?}")]

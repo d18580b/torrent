@@ -68,17 +68,12 @@ declaration is what the daemon checks:
 Refusals:
 
 - A missing, unknown, expired or revoked token is a `401` with
-  `WWW-Authenticate: Bearer`. The API never says which of those it was.
-  `openapi.json` declares that header on every operation's `401` but does
-  not mark it `required`, though every `401` carries it: kynos 0.4 merges
-  the guard's own description of the `401`, which omits the header, with
-  the one that requires it, and keeps a header `required` only where every
-  description of the response requires it. A client generated from the
-  document may read the header as optional; the daemon always sends it.
-  The upstream fix is tracked in
-  [issue 508](https://github.com/d18580b/torrent/issues/508).
+  `WWW-Authenticate: Bearer`, which `openapi.json` marks `required` on the
+  `401` of every operation that takes a token. The API never says which of
+  those it was.
 - A valid token without the scope is a `403`
-  [`insufficient-scope`](problems.md#insufficient-scope).
+  [`insufficient-scope`](problems.md#insufficient-scope) with
+  `WWW-Authenticate: Bearer error="insufficient_scope"` (RFC 6750 §3.1).
 - `POST /v1/sessions` is throttled per client (per /64 for IPv6), and against a daemon-wide
   budget for its memory-hard password check. A throttled attempt is a `429`
   [`login-throttled`](problems.md#login-throttled) with `Retry-After`.
@@ -246,7 +241,8 @@ described in [`problems.md`](problems.md):
   which failures each call can produce.
 - **Failures the framework detects** before a handler runs — malformed input,
   an unknown route, a wrong method — use `"type": "about:blank"`. For those,
-  the status is the whole message.
+  the status is the message; input that does not match its schema also
+  lists where in `errors` ([problems.md](problems.md#failures-the-framework-reports)).
 
 ## Live updates
 

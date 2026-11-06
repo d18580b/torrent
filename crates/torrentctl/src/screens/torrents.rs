@@ -61,17 +61,17 @@ use crate::ui::widgets::Paged;
 use crate::ui::widgets::Received;
 
 /// The phases `F` cycles through, after "all".
-const PHASES: [types::Phase; 10] = [
-    types::Phase::Checking,
-    types::Phase::AwaitingMetadata,
-    types::Phase::Incomplete,
-    types::Phase::Idle,
-    types::Phase::Seeding,
-    types::Phase::Paused,
-    types::Phase::DiskError,
-    types::Phase::Errored,
-    types::Phase::Removed,
-    types::Phase::Unknown,
+const PHASES: [types::TorrentPhase; 10] = [
+    types::TorrentPhase::Checking,
+    types::TorrentPhase::AwaitingMetadata,
+    types::TorrentPhase::Incomplete,
+    types::TorrentPhase::Idle,
+    types::TorrentPhase::Seeding,
+    types::TorrentPhase::Paused,
+    types::TorrentPhase::DiskError,
+    types::TorrentPhase::Errored,
+    types::TorrentPhase::Removed,
+    types::TorrentPhase::Unknown,
 ];
 
 /// The id the last add request was sent with; each one takes the next.
@@ -85,7 +85,7 @@ pub struct State {
     /// Only this profile's torrents (server-side).
     pub profile: Option<String>,
     /// Only torrents in this phase (server-side).
-    pub phase: Option<types::Phase>,
+    pub phase: Option<types::TorrentPhase>,
     /// The `/` filter over what is loaded: an infohash prefix or part of a
     /// profile id, as typed. It matches in any case.
     pub filter: String,

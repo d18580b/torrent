@@ -79,6 +79,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -107,6 +108,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -242,6 +252,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -270,6 +281,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -365,6 +385,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -393,6 +414,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -488,6 +518,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -516,6 +547,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -655,6 +695,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -683,6 +724,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -815,6 +865,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -843,6 +894,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -936,6 +996,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -964,6 +1025,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1075,10 +1145,7 @@
             "description": "Only the torrents assigned to this profile. A profile that failed to\ncome up is still listed; an id no profile declares is\n`404 profile-not-found`, not an empty page.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -1087,14 +1154,7 @@
             "description": "Only the torrents in this phase.",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "$ref": "#/components/schemas/TorrentPhase"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+              "$ref": "#/components/schemas/TorrentPhase"
             }
           },
           {
@@ -1103,10 +1163,7 @@
             "description": "Resume after the page this cursor ended.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -1115,10 +1172,7 @@
             "description": "Torrents per page, 1 to 1000; 100 when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000.0,
               "minimum": 1.0,
               "format": "uint32"
@@ -1131,6 +1185,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1159,6 +1214,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1214,6 +1278,25 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
                           }
                         }
@@ -1307,8 +1390,17 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        },
+                        "errors": {
+                          "items": {
+                            "$ref": "#/components/schemas/Violation"
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -1347,6 +1439,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1375,6 +1468,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1496,8 +1598,30 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     },
@@ -1511,8 +1635,17 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            },
+                            "errors": {
+                              "items": {
+                                "$ref": "#/components/schemas/Violation"
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ],
                       "title": "The request is invalid"
@@ -1647,8 +1780,14 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                            },
+                            "profile_status": {
+                              "$ref": "#/components/schemas/ProfileUnavailableReason"
                             }
-                          }
+                          },
+                          "required": [
+                            "profile_status"
+                          ]
                         }
                       ],
                       "title": "The profile is unavailable"
@@ -1753,6 +1892,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1781,6 +1921,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1834,6 +1983,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -1928,10 +2096,7 @@
             "description": "Also move the payload into the trash of the managed root it lies in\n(`<root>/.torrentd-trash/torrent-<infohash>-<unix seconds>/`). Needs\n`[pool] allow_mutations` and `confirm`; `false` when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             }
           },
           {
@@ -1940,10 +2105,7 @@
             "description": "With `delete_files=true`: this torrent's infohash, repeated, to confirm\nthat its payload is the one to delete. Ignored otherwise.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           }
         ],
@@ -1953,6 +2115,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -1981,6 +2144,15 @@
           },
           "403": {
             "description": "Forbidden; Mutations are disabled",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2049,6 +2221,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -2206,8 +2397,14 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                            },
+                            "profile_status": {
+                              "$ref": "#/components/schemas/ProfileUnavailableReason"
                             }
-                          }
+                          },
+                          "required": [
+                            "profile_status"
+                          ]
                         }
                       ],
                       "title": "The profile is unavailable"
@@ -2274,6 +2471,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2302,6 +2500,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2355,6 +2562,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -2467,6 +2693,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2495,6 +2722,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2548,6 +2784,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -2617,8 +2872,14 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                        },
+                        "profile_status": {
+                          "$ref": "#/components/schemas/ProfileUnavailableReason"
                         }
-                      }
+                      },
+                      "required": [
+                        "profile_status"
+                      ]
                     }
                   ]
                 }
@@ -2682,6 +2943,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2710,6 +2972,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2763,6 +3034,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -2832,8 +3122,14 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                        },
+                        "profile_status": {
+                          "$ref": "#/components/schemas/ProfileUnavailableReason"
                         }
-                      }
+                      },
+                      "required": [
+                        "profile_status"
+                      ]
                     }
                   ]
                 }
@@ -2897,6 +3193,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -2925,6 +3222,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2978,6 +3284,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -3047,8 +3372,14 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                        },
+                        "profile_status": {
+                          "$ref": "#/components/schemas/ProfileUnavailableReason"
                         }
-                      }
+                      },
+                      "required": [
+                        "profile_status"
+                      ]
                     }
                   ]
                 }
@@ -3111,10 +3442,7 @@
             "description": "Resume after the page this cursor ended.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -3123,10 +3451,7 @@
             "description": "Files per page, 1 to 1000; 100 when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000.0,
               "minimum": 1.0,
               "format": "uint32"
@@ -3139,6 +3464,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3167,6 +3493,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3222,6 +3557,25 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
                           }
                         }
@@ -3337,8 +3691,17 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        },
+                        "errors": {
+                          "items": {
+                            "$ref": "#/components/schemas/Violation"
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -3402,6 +3765,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3430,6 +3794,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3483,6 +3856,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -3591,6 +3983,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3619,6 +4012,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3725,6 +4127,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3753,6 +4156,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3806,6 +4218,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -3911,6 +4342,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -3939,6 +4371,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3992,6 +4433,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -4058,8 +4518,30 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -4136,8 +4618,14 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                            },
+                            "profile_status": {
+                              "$ref": "#/components/schemas/ProfileUnavailableReason"
                             }
-                          }
+                          },
+                          "required": [
+                            "profile_status"
+                          ]
                         }
                       ],
                       "title": "The profile is unavailable"
@@ -4231,6 +4719,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4259,6 +4748,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4376,6 +4874,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4404,6 +4903,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4532,6 +5040,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4560,6 +5069,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4613,6 +5131,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -4689,8 +5226,14 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                        },
+                        "profile_status": {
+                          "$ref": "#/components/schemas/ProfileUnavailableReason"
                         }
-                      }
+                      },
+                      "required": [
+                        "profile_status"
+                      ]
                     }
                   ]
                 }
@@ -4732,6 +5275,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4760,6 +5304,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4813,6 +5366,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -4889,8 +5461,14 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                        },
+                        "profile_status": {
+                          "$ref": "#/components/schemas/ProfileUnavailableReason"
                         }
-                      }
+                      },
+                      "required": [
+                        "profile_status"
+                      ]
                     }
                   ]
                 }
@@ -4921,6 +5499,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -4949,6 +5528,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5044,6 +5632,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5072,6 +5661,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5167,6 +5765,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5195,6 +5794,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5345,10 +5953,7 @@
             "description": "The directory to list, relative to the root and `/`-separated. Empty\nor absent lists the root itself; leading and trailing `/` are ignored.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -5357,10 +5962,7 @@
             "description": "Resume after the last entry of the previous page.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -5369,10 +5971,7 @@
             "description": "Entries per page; 100 when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000.0,
               "minimum": 1.0,
               "format": "uint32"
@@ -5385,6 +5984,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5413,6 +6013,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5468,6 +6077,25 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
                           }
                         }
@@ -5582,8 +6210,17 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        },
+                        "errors": {
+                          "items": {
+                            "$ref": "#/components/schemas/Violation"
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -5647,10 +6284,7 @@
             "description": "The directory to list, relative to the root and `/`-separated. Empty\nor absent lists the root itself; leading and trailing `/` are ignored.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -5659,10 +6293,7 @@
             "description": "Resume after the last entry of the previous page.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -5671,10 +6302,7 @@
             "description": "Entries per page; 100 when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000.0,
               "minimum": 1.0,
               "format": "uint32"
@@ -5687,6 +6315,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -5715,6 +6344,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5770,6 +6408,25 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
                           }
                         }
@@ -5884,8 +6541,17 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        },
+                        "errors": {
+                          "items": {
+                            "$ref": "#/components/schemas/Violation"
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -5939,14 +6605,7 @@
             "description": "Only torrents in this adoption state. A torrent never matched has no\nstate and is listed only without this filter.",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "$ref": "#/components/schemas/AdoptionState"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+              "$ref": "#/components/schemas/AdoptionState"
             }
           },
           {
@@ -5955,10 +6614,7 @@
             "description": "Resume after the last torrent of the previous page.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -5967,10 +6623,7 @@
             "description": "Torrents per page; 100 when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000.0,
               "minimum": 1.0,
               "format": "uint32"
@@ -5983,6 +6636,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6011,6 +6665,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6066,6 +6729,25 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
                           }
                         }
@@ -6159,8 +6841,17 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        },
+                        "errors": {
+                          "items": {
+                            "$ref": "#/components/schemas/Violation"
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -6213,6 +6904,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6241,6 +6933,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6380,6 +7081,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6408,6 +7110,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6548,14 +7259,7 @@
             "description": "Only plans with this status.",
             "required": false,
             "schema": {
-              "anyOf": [
-                {
-                  "$ref": "#/components/schemas/PlanStatus"
-                },
-                {
-                  "type": "null"
-                }
-              ]
+              "$ref": "#/components/schemas/PlanStatus"
             }
           },
           {
@@ -6564,10 +7268,7 @@
             "description": "Resume after the last plan of the previous page.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -6576,10 +7277,7 @@
             "description": "Plans per page; 100 when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000.0,
               "minimum": 1.0,
               "format": "uint32"
@@ -6592,6 +7290,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6620,6 +7319,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6675,6 +7383,25 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
                           }
                         }
@@ -6768,8 +7495,17 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        },
+                        "errors": {
+                          "items": {
+                            "$ref": "#/components/schemas/Violation"
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -6830,6 +7566,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -6858,6 +7595,15 @@
           },
           "403": {
             "description": "Forbidden; Pool mutations are disabled",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6992,8 +7738,30 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -7163,6 +7931,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -7191,6 +7960,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7244,6 +8022,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -7383,6 +8180,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -7411,6 +8209,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7464,6 +8271,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -7619,10 +8445,7 @@
             "description": "Resume after the last step of the previous page, or after a plan's\ninline `steps`, with its `steps_next_cursor`.",
             "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
@@ -7631,10 +8454,7 @@
             "description": "Steps per page; 100 when absent.",
             "required": false,
             "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
+              "type": "integer",
               "maximum": 1000.0,
               "minimum": 1.0,
               "format": "uint32"
@@ -7647,6 +8467,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -7675,6 +8496,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7730,6 +8560,25 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
                           }
                         }
@@ -7844,8 +8693,17 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                        },
+                        "errors": {
+                          "items": {
+                            "$ref": "#/components/schemas/Violation"
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -7983,8 +8841,30 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
-                      }
+                      },
+                      "required": [
+                        "errors"
+                      ]
                     }
                   ]
                 }
@@ -8037,10 +8917,7 @@
                 "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
                 "required": false,
                 "schema": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
+                  "type": "integer",
                   "minimum": 0.0,
                   "format": "uint64"
                 }
@@ -8073,10 +8950,7 @@
                 "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
                 "required": false,
                 "schema": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
+                  "type": "integer",
                   "minimum": 0.0,
                   "format": "uint64"
                 }
@@ -8109,10 +8983,7 @@
                 "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
                 "required": false,
                 "schema": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
+                  "type": "integer",
                   "minimum": 0.0,
                   "format": "uint64"
                 }
@@ -8130,8 +9001,16 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#login-throttled"
+                        },
+                        "retry_after_secs": {
+                          "type": "integer",
+                          "minimum": 0.0,
+                          "format": "uint64"
                         }
-                      }
+                      },
+                      "required": [
+                        "retry_after_secs"
+                      ]
                     }
                   ]
                 }
@@ -8198,6 +9077,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -8226,6 +9106,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8279,6 +9168,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -8347,8 +9255,30 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     },
@@ -8362,8 +9292,17 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            },
+                            "errors": {
+                              "items": {
+                                "$ref": "#/components/schemas/Violation"
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     }
@@ -8520,6 +9459,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -8548,6 +9488,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8601,6 +9550,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -8669,8 +9637,30 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     },
@@ -8684,8 +9674,17 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            },
+                            "errors": {
+                              "items": {
+                                "$ref": "#/components/schemas/Violation"
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     }
@@ -8862,6 +9861,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -8890,6 +9890,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9011,8 +10020,30 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     },
@@ -9026,8 +10057,17 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            },
+                            "errors": {
+                              "items": {
+                                "$ref": "#/components/schemas/Violation"
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     }
@@ -9146,6 +10186,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -9174,6 +10215,15 @@
           },
           "403": {
             "description": "Forbidden",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9295,8 +10345,30 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     },
@@ -9310,8 +10382,17 @@
                             "type": {
                               "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            },
+                            "errors": {
+                              "items": {
+                                "$ref": "#/components/schemas/Violation"
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     }
@@ -9425,8 +10506,14 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                        },
+                        "profile_status": {
+                          "$ref": "#/components/schemas/ProfileUnavailableReason"
                         }
-                      }
+                      },
+                      "required": [
+                        "profile_status"
+                      ]
                     }
                   ]
                 }
@@ -9523,6 +10610,7 @@
             "headers": {
               "WWW-Authenticate": {
                 "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
                 "schema": {
                   "type": "string"
                 },
@@ -9551,6 +10639,15 @@
           },
           "403": {
             "description": "Forbidden; Pool mutations are disabled",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Sent when the credential lacks a required scope, per RFC 6750 section 3.1.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer error=\"insufficient_scope\""
+              }
+            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9619,6 +10716,25 @@
                         "type": {
                           "type": "string",
                           "const": "about:blank"
+                        },
+                        "errors": {
+                          "items": {
+                            "properties": {
+                              "pointer": {
+                                "type": "string",
+                                "format": "json-pointer"
+                              },
+                              "detail": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object",
+                            "required": [
+                              "pointer",
+                              "detail"
+                            ]
+                          },
+                          "type": "array"
                         }
                       }
                     }
@@ -9687,8 +10803,30 @@
                             "type": {
                               "type": "string",
                               "const": "about:blank"
+                            },
+                            "errors": {
+                              "items": {
+                                "properties": {
+                                  "pointer": {
+                                    "type": "string",
+                                    "format": "json-pointer"
+                                  },
+                                  "detail": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object",
+                                "required": [
+                                  "pointer",
+                                  "detail"
+                                ]
+                              },
+                              "type": "array"
                             }
-                          }
+                          },
+                          "required": [
+                            "errors"
+                          ]
                         }
                       ]
                     },
@@ -10370,6 +11508,24 @@
         ],
         "description": "One page of torrents, ordered by infohash."
       },
+      "Violation": {
+        "properties": {
+          "pointer": {
+            "type": "string",
+            "description": "RFC 6901 JSON Pointer to the offending member of the request body, or\nthe name of the query parameter prefixed with `#/query/`."
+          },
+          "detail": {
+            "type": "string",
+            "description": "What is wrong with it."
+          }
+        },
+        "type": "object",
+        "required": [
+          "pointer",
+          "detail"
+        ],
+        "description": "One violated constraint."
+      },
       "TorrentSession": {
         "properties": {
           "name": {
@@ -10438,6 +11594,15 @@
         },
         "type": "object",
         "description": "One torrent: its summary, and what its session reports."
+      },
+      "ProfileUnavailableReason": {
+        "type": "string",
+        "enum": [
+          "failed",
+          "vpn_down",
+          "offline"
+        ],
+        "description": "A profile's state, as far as a request needing it is concerned."
       },
       "TorrentFile": {
         "properties": {
@@ -10771,15 +11936,6 @@
           "port_forward_ok"
         ],
         "description": "One profile, with its tunnel and tracker configuration."
-      },
-      "ProfileUnavailableReason": {
-        "type": "string",
-        "enum": [
-          "failed",
-          "vpn_down",
-          "offline"
-        ],
-        "description": "A profile's state, as far as a request needing it is concerned."
       },
       "SkippedProfile": {
         "properties": {

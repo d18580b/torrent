@@ -127,6 +127,14 @@ impl ProfileUnavailableReason {
     }
 }
 
+/// The `profile_status` extension member, which kynos attaches as JSON.
+/// Through serde, so the wire and the `Schema` derive read the same spelling.
+impl From<ProfileUnavailableReason> for serde_json::Value {
+    fn from(r: ProfileUnavailableReason) -> Self {
+        serde_json::to_value(r).expect("a unit variant serializes")
+    }
+}
+
 /// Why a request naming a profile cannot proceed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProfileProblem {
@@ -238,7 +246,7 @@ pub fn unfenced_engine(
 /// ProfileNotFound,
 /// #[error("{detail}")]
 /// #[problem(status = 409, title = "The profile is unavailable")]
-/// ProfileUnavailable { detail: String, #[problem(extension)] profile_status: &'static str },
+/// ProfileUnavailable { detail: String, #[problem(extension)] profile_status: ProfileUnavailableReason },
 /// ```
 macro_rules! from_profile_problem {
     ($($error:ty),+ $(,)?) => {$(
@@ -249,7 +257,7 @@ macro_rules! from_profile_problem {
                     $crate::http::v1::common::ProfileProblem::Unavailable { reason, detail } => {
                         Self::ProfileUnavailable {
                             detail,
-                            profile_status: reason.as_str(),
+                            profile_status: reason,
                         }
                     }
                 }

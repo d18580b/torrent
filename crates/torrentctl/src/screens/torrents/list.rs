@@ -67,7 +67,7 @@ pub(super) fn reselect(state: &mut State, hash: Option<String>) {
 pub(super) fn set_server_filter(
     state: &mut State,
     profile: Option<String>,
-    phase: Option<types::Phase>,
+    phase: Option<types::TorrentPhase>,
     ctx: &Ctx<'_>,
 ) -> Vec<Effect> {
     state.profile = profile;
@@ -101,7 +101,7 @@ pub(super) fn load_list(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
 pub(super) fn fetch_page(
     api: &Api,
     profile: Option<String>,
-    phase: Option<types::Phase>,
+    phase: Option<types::TorrentPhase>,
     request: PageRequest,
 ) -> Effect {
     let api = api.clone();

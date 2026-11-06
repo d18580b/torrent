@@ -36,72 +36,72 @@ pub struct DeleteTorrentQuery {
     pub confirm: Option<String>,
 }
 
-torrent_error! {
-    /// Why a torrent was not removed.
-    pub enum DeleteTorrentError {
-        /// `delete_files=true` without `[pool] allow_mutations`.
-        #[error("deleting payload requires a [pool] section with `allow_mutations = true`")]
-        #[problem(status = 403, title = "Mutations are disabled")]
-        MutationsDisabled,
-        /// `delete_files=true` without `confirm` repeating the infohash.
-        #[error(
-            "deleting payload needs `confirm` set to this torrent's infohash; re-send with \
+/// Why a torrent was not removed.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum DeleteTorrentError {
+    /// `delete_files=true` without `[pool] allow_mutations`.
+    #[error("deleting payload requires a [pool] section with `allow_mutations = true`")]
+    #[problem(status = 403, title = "Mutations are disabled")]
+    MutationsDisabled,
+    /// `delete_files=true` without `confirm` repeating the infohash.
+    #[error(
+        "deleting payload needs `confirm` set to this torrent's infohash; re-send with \
              `confirm={infohash}` once it is the torrent whose payload should go"
-        )]
-        #[problem(status = 422, title = "The delete is not confirmed")]
-        DeleteUnconfirmed { infohash: String },
-        /// No torrent with this infohash is assigned to any profile.
-        #[error("no torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-        /// The torrent is still being added to its session.
-        #[error(
-            "this torrent is still being added to its session; retry the delete once its phase \
+    )]
+    #[problem(status = 422, title = "The delete is not confirmed")]
+    DeleteUnconfirmed { infohash: String },
+    /// No torrent with this infohash is assigned to any profile.
+    #[error("no torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
+    /// The torrent is still being added to its session.
+    #[error(
+        "this torrent is still being added to its session; retry the delete once its phase \
              is no longer \"unknown\""
-        )]
-        #[problem(status = 409, title = "The torrent is still being added")]
-        TorrentAdding,
-        /// `delete_files=true` for a torrent whose files the pool index has
-        /// another torrent claiming too — a cross-seed, or a conflict — or
-        /// one of whose files another torrent a session holds lists at the
-        /// same path, however it was added. Deleting them would take the
-        /// other torrent's payload with them.
-        #[error("{detail}")]
-        #[problem(status = 409, title = "The payload is shared")]
-        PayloadShared { detail: String },
-        /// `delete_files=true` for a torrent whose payload cannot be proven
-        /// safe to move to the trash: a file outside every managed root, one
-        /// the index does not record this torrent claiming, one that changed
-        /// since the scan, or another assigned torrent whose files no session
-        /// can report to compare against; or the torrent itself is one no
-        /// session holds: the boot left it unloaded, or a delete that did not
-        /// move its payload removed it from its session and could not clear
-        /// its assignment. Nothing was changed.
-        #[error("{detail}")]
-        #[problem(status = 409, title = "The payload cannot be trashed")]
-        PayloadUntrashable { detail: String },
-        /// A plain delete of a torrent the boot left unloaded while its
-        /// profile's stores still hold its resume file or `.torrent`: they
-        /// are what the next boot loads it from. `detail` names them.
-        /// Nothing was changed.
-        #[error("{detail}")]
-        #[problem(status = 409, title = "The torrent did not load")]
-        TorrentUnloaded { detail: String },
-        /// `delete_files=true` for a torrent whose profile has no running
-        /// session: its payload is reachable only through one.
-        #[error("{detail}")]
-        #[problem(status = 409, title = "The profile is unavailable")]
-        ProfileUnavailable {
-            detail: String,
-            #[problem(extension)]
-            profile_status: &'static str,
-        },
-        /// The session or a store could not complete the removal; `detail`
-        /// says which half and whether to retry.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+    )]
+    #[problem(status = 409, title = "The torrent is still being added")]
+    TorrentAdding,
+    /// `delete_files=true` for a torrent whose files the pool index has
+    /// another torrent claiming too — a cross-seed, or a conflict — or
+    /// one of whose files another torrent a session holds lists at the
+    /// same path, however it was added. Deleting them would take the
+    /// other torrent's payload with them.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The payload is shared")]
+    PayloadShared { detail: String },
+    /// `delete_files=true` for a torrent whose payload cannot be proven
+    /// safe to move to the trash: a file outside every managed root, one
+    /// the index does not record this torrent claiming, one that changed
+    /// since the scan, or another assigned torrent whose files no session
+    /// can report to compare against; or the torrent itself is one no
+    /// session holds: the boot left it unloaded, or a delete that did not
+    /// move its payload removed it from its session and could not clear
+    /// its assignment. Nothing was changed.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The payload cannot be trashed")]
+    PayloadUntrashable { detail: String },
+    /// A plain delete of a torrent the boot left unloaded while its
+    /// profile's stores still hold its resume file or `.torrent`: they
+    /// are what the next boot loads it from. `detail` names them.
+    /// Nothing was changed.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The torrent did not load")]
+    TorrentUnloaded { detail: String },
+    /// `delete_files=true` for a torrent whose profile has no running
+    /// session: its payload is reachable only through one.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The profile is unavailable")]
+    ProfileUnavailable {
+        detail: String,
+        #[problem(extension)]
+        profile_status: crate::http::v1::common::ProfileUnavailableReason,
+    },
+    /// The session or a store could not complete the removal; `detail`
+    /// says which half and whether to retry.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 
 /// Remove a torrent.
@@ -627,7 +627,7 @@ fn clear_sessionless(
                 "profile {profile} has no running session, so its payload cannot be deleted; \
                  retry without `delete_files` to clear the assignment alone"
             ),
-            profile_status: crate::http::v1::common::ProfileUnavailableReason::Failed.as_str(),
+            profile_status: crate::http::v1::common::ProfileUnavailableReason::Failed,
         });
     }
     clear_unheld(s, ih, profile)?;
