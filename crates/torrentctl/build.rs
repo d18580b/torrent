@@ -4,18 +4,21 @@
 //! handlers, so this client is regenerated from the same contract the daemon
 //! serves on every build. Nothing generated is committed.
 //!
-//! spargen gives every documented error status its own anonymous body type,
-//! so there is no one `Problem` to read a failure's `title` and `detail` from
-//! (spargen gap S8 in the pull request). Every such body is an RFC 9457
-//! problem document and serializes back to one, so this also writes
-//! `problems.rs`: an `AsProblem` impl per generated error enum, found by
-//! scanning the generated module, that serializes whichever body arrived.
+//! spargen gives every documented error status its own anonymous body type.
+//! Its `Error::problem()` reads the RFC 9457 members across all of them, but
+//! only the five standard ones: a failure here also needs the `errors` and
+//! `profile_status` extension members, which `ProblemDetails` drops. Every
+//! such body is a problem document and serializes back to one, so this also
+//! writes `problems.rs`: an `AsProblem` impl per generated error enum, found
+//! by scanning the generated module, that serializes whichever body arrived
+//! whole.
 
 use std::fmt::Write as _;
 
 fn main() {
+    // spargen names every input it reads (the spec included), its output,
+    // and the manifests it audits to Cargo as `rerun-if-changed` paths.
     let spec = "../../docs/api/openapi.json";
-    println!("cargo:rerun-if-changed={spec}");
     println!("cargo:rerun-if-changed=build.rs");
     let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
     let api = format!("{out_dir}/api.rs");
