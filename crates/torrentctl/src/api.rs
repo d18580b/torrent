@@ -136,7 +136,13 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
                 e @ (generated::RequestError::MissingCredential { .. }
                 | generated::RequestError::CredentialProvider { .. }),
             ) => Failure::local("No credential for this request", Some(e.to_string())),
-            Error::RequestConstruction(e) => request_failure(&e),
+            // A request that could not be built: a header value no header
+            // can carry, an unparseable URL, a body that did not serialize.
+            // spargen classifies a refused connection as `Transport` before
+            // it can land here, so none of these is an unreachable daemon.
+            Error::RequestConstruction(e) => {
+                Failure::local("The request could not be sent", Some(root_cause(&e)))
+            }
             Error::Protocol(e) => {
                 Failure::local("The daemon's answer was malformed", Some(e.to_string()))
             }
@@ -149,22 +155,6 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
             ),
         }
     }
-}
-
-/// A [`generated::RequestError::Other`] as the UI shows it: a request that
-/// could not be built — a header value no header can carry, an unparseable
-/// URL, a body that did not serialize. spargen 0.6 reports a refused
-/// connection as `Transport`; one still found here is an unreachable daemon.
-fn request_failure(e: &generated::RequestError) -> Failure {
-    let connect = std::error::Error::source(e)
-        .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
-        .is_some_and(reqwest::Error::is_connect);
-    let title = if connect {
-        "Cannot reach the daemon"
-    } else {
-        "The request could not be sent"
-    };
-    Failure::local(title, Some(root_cause(e)))
 }
 
 /// The innermost cause of `e`: reqwest wraps "connection refused" several
@@ -456,8 +446,8 @@ mod tests {
             Failure::from(missing).title,
             "No credential for this request"
         );
-        // A cause that is not a failed connect is not called one, whatever
-        // its message says.
+        // A request that could not be built is never called an unreachable
+        // daemon, whatever its cause's message says.
         let other =
             generated::Error::<generated::GetStatusError>::request_message("connection refused");
         let f = Failure::from(other);
