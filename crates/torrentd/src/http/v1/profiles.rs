@@ -439,7 +439,7 @@ pub enum SetProfileStateError {
         detail: String,
         /// `vpn_down`.
         #[problem(extension)]
-        profile_status: &'static str,
+        profile_status: ProfileUnavailableReason,
     },
     /// The profile is fenced (`vpn_down`) and the network kill switch did
     /// not last check in force, so the fence stays and its state is
@@ -549,7 +549,7 @@ fn set_state(
                          tunnel back on the address the session is bound to, then retry.",
                         reason.as_str()
                     ),
-                    profile_status: ProfileUnavailableReason::VpnDown.as_str(),
+                    profile_status: ProfileUnavailableReason::VpnDown,
                 });
             }
             Some(entry)
@@ -705,7 +705,7 @@ pub enum ProfileBulkError {
         detail: String,
         /// `failed`, `vpn_down` or `offline`.
         #[problem(extension)]
-        profile_status: &'static str,
+        profile_status: ProfileUnavailableReason,
     },
 }
 from_profile_problem!(ProfileBulkError);

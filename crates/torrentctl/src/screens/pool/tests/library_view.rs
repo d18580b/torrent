@@ -27,7 +27,7 @@ fn the_library_filter_cycles_through_every_state_and_back_to_all() {
     let mut state = with_library(6, None);
     let before = state.library.items.generation;
     assert_eq!(press(&mut state, KeyCode::Char('F'), true), 1);
-    assert_eq!(state.library.filter, Some(types::State::Missing));
+    assert_eq!(state.library.filter, Some(types::AdoptionState::Missing));
     assert!(state.library.items.items.is_empty());
     send(
         &mut state,

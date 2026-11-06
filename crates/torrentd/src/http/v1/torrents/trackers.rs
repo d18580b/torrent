@@ -117,18 +117,18 @@ pub struct TrackerList {
     pub items: Vec<Tracker>,
 }
 
-torrent_error! {
-    /// Why a torrent's trackers could not be listed.
-    pub enum ListTrackersError {
-        /// No loaded torrent has this infohash.
-        #[error("no loaded torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-        /// The session could not be asked.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+/// Why a torrent's trackers could not be listed.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum ListTrackersError {
+    /// No loaded torrent has this infohash.
+    #[error("no loaded torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
+    /// The session could not be asked.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 from_lookup!(ListTrackersError);
 

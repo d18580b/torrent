@@ -12,6 +12,7 @@ use torrentd_pool::PoolFile;
 use torrentd_pool::PoolTorrent;
 
 use super::support::assert_problem;
+use super::support::assert_scope_refused;
 use super::support::Coverage;
 use super::support::Harness;
 use crate::config::Config;
@@ -2228,12 +2229,12 @@ async fn unconfigured_and_unauthorised(cov: &Arc<Coverage>) {
         let resp = h
             .send(method, path, Some(&h.tokens.metrics.clone()), body.clone())
             .await;
-        assert_problem(&resp, 403, "insufficient-scope");
+        assert_scope_refused(&resp);
         if *method != "GET" {
             let resp = h
                 .send(method, path, Some(&h.tokens.read.clone()), body)
                 .await;
-            assert_problem(&resp, 403, "insufficient-scope");
+            assert_scope_refused(&resp);
         }
     }
     h.assert_conformance();

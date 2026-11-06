@@ -18,12 +18,10 @@ pub mod generated {
 }
 
 pub use generated::types;
+/// A plan's status, as `GET /v1/pool/plans` filters by it: the document's
+/// `PlanStatus` component, which the filter parameter references directly.
+pub use generated::types::PlanStatus;
 pub use generated::Client;
-
-/// A plan's status, as `GET /v1/pool/plans` filters by it. spargen names
-/// this inline enum by a hash of its shape, which would change if the API
-/// document's enum did; the name is confined to this alias.
-pub type PlanStatus = types::Status4ee43c98;
 
 // `AsProblem` for every generated error enum; see build.rs.
 include!(concat!(env!("OUT_DIR"), "/problems.rs"));

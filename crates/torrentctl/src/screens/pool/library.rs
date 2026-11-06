@@ -47,19 +47,19 @@ use crate::ui::widgets::Paged;
 use crate::ui::widgets::Received;
 
 /// The filters `F` cycles through, after "all".
-const FILTERS: [types::State; 6] = [
-    types::State::Missing,
-    types::State::Partial,
-    types::State::Matched,
-    types::State::Adopted,
-    types::State::Drifted,
-    types::State::Overlap,
+const FILTERS: [types::AdoptionState; 6] = [
+    types::AdoptionState::Missing,
+    types::AdoptionState::Partial,
+    types::AdoptionState::Matched,
+    types::AdoptionState::Adopted,
+    types::AdoptionState::Drifted,
+    types::AdoptionState::Overlap,
 ];
 
 #[derive(Debug, Default)]
 pub struct State {
     /// Only torrents in this adoption state; `None` for all.
-    pub filter: Option<types::State>,
+    pub filter: Option<types::AdoptionState>,
     pub items: Paged<types::PoolTorrent>,
     pub selected: usize,
     pub offset: Cell<usize>,
@@ -138,7 +138,7 @@ fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     }
 }
 
-fn fetch(ctx: &Ctx<'_>, filter: Option<types::State>, request: PageRequest) -> Effect {
+fn fetch(ctx: &Ctx<'_>, filter: Option<types::AdoptionState>, request: PageRequest) -> Effect {
     let api = ctx.api.clone();
     let PageRequest {
         cursor,

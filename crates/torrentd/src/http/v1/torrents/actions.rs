@@ -19,48 +19,50 @@ use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::ProfileProblem;
+use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::Torrents;
 use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
+use crate::http::validate::Violation;
 
-torrent_error! {
-    /// Why a torrent's upload limit was not set.
-    pub enum SetUploadLimitError {
-        /// No loaded torrent has this infohash.
-        #[error("no loaded torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-        /// A constraint the schema declares is broken.
-        #[error("{summary}")]
-        #[problem(status = 422, title = "The request is invalid")]
-        ValidationFailed {
-            summary: String,
-            #[problem(extension)]
-            errors: serde_json::Value,
-        },
-        /// The session refused the request.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+/// Why a torrent's upload limit was not set.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum SetUploadLimitError {
+    /// No loaded torrent has this infohash.
+    #[error("no loaded torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
+    /// A constraint the schema declares is broken.
+    #[error("{summary}")]
+    #[problem(status = 422, title = "The request is invalid")]
+    ValidationFailed {
+        summary: String,
+        #[problem(extension)]
+        errors: Vec<Violation>,
+    },
+    /// The session refused the request.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 from_lookup!(SetUploadLimitError);
 from_invalid!(SetUploadLimitError);
 
-torrent_error! {
-    /// Why a torrent was not paused.
-    pub enum PauseTorrentError {
-        /// No loaded torrent has this infohash.
-        #[error("no loaded torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-        /// The session refused the request.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+/// Why a torrent was not paused.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum PauseTorrentError {
+    /// No loaded torrent has this infohash.
+    #[error("no loaded torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
+    /// The session refused the request.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 from_lookup!(PauseTorrentError);
 
@@ -95,28 +97,28 @@ pub async fn pause_torrent(
     Ok(NoContent)
 }
 
-torrent_error! {
-    /// Why a torrent was not resumed, rechecked or reannounced.
-    pub enum UnfencedControlError {
-        /// No loaded torrent has this infohash.
-        #[error("no loaded torrent with this infohash")]
-        #[problem(status = 404, title = "Torrent not found")]
-        TorrentNotFound,
-        /// The VPN monitor fenced the torrent's profile, or the operator set
-        /// it offline; nothing may put its torrents back on the network until
-        /// the profile is set online.
-        #[error("{detail}")]
-        #[problem(status = 409, title = "The profile is unavailable")]
-        ProfileUnavailable {
-            detail: String,
-            #[problem(extension)]
-            profile_status: &'static str,
-        },
-        /// The session refused the request.
-        #[error("{detail}")]
-        #[problem(status = 500, title = "Internal error")]
-        Internal { detail: String },
-    }
+/// Why a torrent was not resumed, rechecked or reannounced.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum UnfencedControlError {
+    /// No loaded torrent has this infohash.
+    #[error("no loaded torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
+    /// The VPN monitor fenced the torrent's profile, or the operator set
+    /// it offline; nothing may put its torrents back on the network until
+    /// the profile is set online.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The profile is unavailable")]
+    ProfileUnavailable {
+        detail: String,
+        #[problem(extension)]
+        profile_status: ProfileUnavailableReason,
+    },
+    /// The session refused the request.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 from_lookup!(UnfencedControlError, fenced);
 
@@ -179,7 +181,7 @@ pub async fn resume_torrent(
     };
     Err(UnfencedControlError::ProfileUnavailable {
         detail,
-        profile_status: reason.as_str(),
+        profile_status: reason,
     })
 }
 

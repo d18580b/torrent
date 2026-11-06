@@ -68,17 +68,11 @@ declaration is what the daemon checks:
 Refusals:
 
 - A missing, unknown, expired or revoked token is a `401` with
-  `WWW-Authenticate: Bearer`. The API never says which of those it was.
-  `openapi.json` declares that header on every operation's `401` but does
-  not mark it `required`, though every `401` carries it: kynos 0.4 merges
-  the guard's own description of the `401`, which omits the header, with
-  the one that requires it, and keeps a header `required` only where every
-  description of the response requires it. A client generated from the
-  document may read the header as optional; the daemon always sends it.
-  The upstream fix is tracked in
-  [issue 508](https://github.com/d18580b/torrent/issues/508).
+  `WWW-Authenticate: Bearer`, which `openapi.json` marks `required` on every
+  operation's `401`. The API never says which of those it was.
 - A valid token without the scope is a `403`
-  [`insufficient-scope`](problems.md#insufficient-scope).
+  [`insufficient-scope`](problems.md#insufficient-scope) with
+  `WWW-Authenticate: Bearer error="insufficient_scope"` (RFC 6750 §3.1).
 - `POST /v1/sessions` is throttled per client (per /64 for IPv6), and against a daemon-wide
   budget for its memory-hard password check. A throttled attempt is a `429`
   [`login-throttled`](problems.md#login-throttled) with `Retry-After`.

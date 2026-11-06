@@ -55,8 +55,9 @@ constraint and where.
 ## `insufficient-scope`
 
 **403.** The credential is valid, but it was not issued the scope this
-operation needs. Every operation names its scope in its `security`
-requirement:
+operation needs. The response carries
+`WWW-Authenticate: Bearer error="insufficient_scope"`, per RFC 6750 §3.1.
+Every operation names its scope in its `security` requirement:
 
 - **`read`** covers every safe operation.
 - **`write`** covers every operation that changes state, and implies `read`.
