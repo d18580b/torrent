@@ -14,8 +14,9 @@
 use std::fmt::Write as _;
 
 fn main() {
+    // spargen names every input it reads (the spec included), its output,
+    // and the manifests it audits to Cargo as `rerun-if-changed` paths.
     let spec = "../../docs/api/openapi.json";
-    println!("cargo:rerun-if-changed={spec}");
     println!("cargo:rerun-if-changed=build.rs");
     let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
     let api = format!("{out_dir}/api.rs");
