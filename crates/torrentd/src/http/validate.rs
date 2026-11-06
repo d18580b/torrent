@@ -52,9 +52,10 @@ pub struct Violation {
 }
 
 /// The `errors` extension member's element, which kynos attaches as JSON.
+/// Through serde, so the wire and the `Schema` derive read the same shape.
 impl From<Violation> for serde_json::Value {
     fn from(v: Violation) -> Self {
-        serde_json::json!({ "pointer": v.pointer, "detail": v.detail })
+        serde_json::to_value(v).expect("a Violation is two strings")
     }
 }
 

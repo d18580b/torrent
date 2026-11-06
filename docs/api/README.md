@@ -68,8 +68,9 @@ declaration is what the daemon checks:
 Refusals:
 
 - A missing, unknown, expired or revoked token is a `401` with
-  `WWW-Authenticate: Bearer`, which `openapi.json` marks `required` on every
-  operation's `401`. The API never says which of those it was.
+  `WWW-Authenticate: Bearer`, which `openapi.json` marks `required` on the
+  `401` of every operation that takes a token. The API never says which of
+  those it was.
 - A valid token without the scope is a `403`
   [`insufficient-scope`](problems.md#insufficient-scope) with
   `WWW-Authenticate: Bearer error="insufficient_scope"` (RFC 6750 §3.1).
@@ -240,7 +241,8 @@ described in [`problems.md`](problems.md):
   which failures each call can produce.
 - **Failures the framework detects** before a handler runs — malformed input,
   an unknown route, a wrong method — use `"type": "about:blank"`. For those,
-  the status is the whole message.
+  the status is the message; input that does not match its schema also
+  lists where in `errors` ([problems.md](problems.md#failures-the-framework-reports)).
 
 ## Live updates
 

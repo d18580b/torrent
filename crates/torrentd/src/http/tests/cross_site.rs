@@ -60,6 +60,9 @@ fn assert_refused(resp: &TestResponse, case: &str) {
         "{case}: {}",
         resp.text()
     );
+    // Not a scope refusal, so no `insufficient_scope` challenge: repeating
+    // the request with any credential would not change the answer.
+    assert_eq!(resp.header("www-authenticate"), None, "{case}");
 }
 
 fn assert_admitted(resp: &TestResponse, case: &str) {
@@ -102,6 +105,12 @@ async fn a_foreign_host_is_refused_on_every_operation() {
                 .await;
             assert_refused(&resp, &format!("POST {path} with Host {host}"));
         }
+        // An operation with a body is refused from its head, by
+        // `security::Authorized`, before the handler's own guard.
+        let resp = h
+            .send_with("POST", "/v1/torrents", None, None, &[("host", host)])
+            .await;
+        assert_refused(&resp, &format!("POST /v1/torrents with Host {host}"));
     }
     h.assert_conformance();
 }

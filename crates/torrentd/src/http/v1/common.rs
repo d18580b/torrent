@@ -128,9 +128,10 @@ impl ProfileUnavailableReason {
 }
 
 /// The `profile_status` extension member, which kynos attaches as JSON.
+/// Through serde, so the wire and the `Schema` derive read the same spelling.
 impl From<ProfileUnavailableReason> for serde_json::Value {
     fn from(r: ProfileUnavailableReason) -> Self {
-        Self::from(r.as_str())
+        serde_json::to_value(r).expect("a unit variant serializes")
     }
 }
 

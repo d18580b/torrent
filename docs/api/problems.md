@@ -48,6 +48,13 @@ says everything there is to say:
 | `415` | A body whose `Content-Type` is not `application/json`. |
 | `422` | A JSON body of the wrong shape: a missing field, an unknown field, or a value of the wrong type. |
 
+A `400` or `422` for input that does not match its schema also carries an
+`errors` member, `[{ "pointer": …, "detail": … }]`, which the document
+declares. Each `pointer` is an RFC 6901 JSON Pointer into the input the
+`detail` names (the body, or the query or path parameters), such as `/limit`;
+unlike [`validation-failed`](#validation-failed)'s, it has no `#/query/`
+prefix.
+
 A body that parses but breaks a documented constraint, such as a value out of
 range, is a [`validation-failed`](#validation-failed) instead, which says which
 constraint and where.
