@@ -606,6 +606,133 @@ mod tests {
         assert_eq!(finding(&out, Requirement::Nft), Some(Finding::Met));
     }
 
+    fn profile(id: &str, network: torrentd_engine::ProfileNetwork) -> ProfileConfig {
+        ProfileConfig {
+            id: torrentd_engine::ProfileId::new(id),
+            network,
+            peer_fingerprint: None,
+            user_agent: None,
+            resume_dir: None,
+            torrent_dir: None,
+            allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
+            upload_rate_limit: None,
+        }
+    }
+
+    fn tunnel(id: &str, vpn_type: VpnType) -> ProfileConfig {
+        profile(
+            id,
+            torrentd_engine::ProfileNetwork::Vpn {
+                vpn_type,
+                vpn_config: std::path::PathBuf::from(format!("/etc/wireguard/{id}.conf")),
+                vpn_interface: id.into(),
+                listen_port: Some(6881),
+                port_forward: Default::default(),
+                port_forward_gateway: None,
+            },
+        )
+    }
+
+    fn host(id: &str) -> ProfileConfig {
+        profile(
+            id,
+            torrentd_engine::ProfileNetwork::Host {
+                listen_interfaces: "127.0.0.1:6881".into(),
+                dht: false,
+            },
+        )
+    }
+
+    /// Each profile type asks for its own facility and only that one: a
+    /// WireGuard profile the kernel module, an OpenVPN profile `/dev/net/tun`,
+    /// a host profile nothing. Only the kill switch asks for `nft`.
+    #[test]
+    fn each_profile_type_needs_its_own_facility() {
+        let wg = tunnel("wg0", VpnType::Wireguard);
+        let ovpn = tunnel("tun0", VpnType::Openvpn);
+        let public = host("public");
+
+        assert_eq!(Needs::of([&public], false), Needs::default());
+        assert_eq!(
+            Needs::of([&public], true),
+            Needs {
+                net_admin: true,
+                nft: true,
+                ..Needs::default()
+            }
+        );
+        assert_eq!(
+            Needs::of([&wg, &public], false),
+            Needs {
+                net_admin: true,
+                wireguard: true,
+                ..Needs::default()
+            }
+        );
+        assert_eq!(
+            Needs::of([&ovpn, &public], false),
+            Needs {
+                net_admin: true,
+                tun: true,
+                ..Needs::default()
+            }
+        );
+        assert_eq!(Needs::of([&wg, &ovpn], true), ALL);
+    }
+
+    /// A WireGuard profile is failed for a missing WireGuard kernel and spared
+    /// a missing `/dev/net/tun`; an OpenVPN profile the other way round; a
+    /// host profile is failed for neither. The reason is the outcome's text.
+    #[test]
+    fn a_profile_is_refused_only_for_its_own_facility() {
+        let wg = tunnel("wg0", VpnType::Wireguard);
+        let ovpn = tunnel("tun0", VpnType::Openvpn);
+        let public = host("public");
+
+        let no_wireguard = run(
+            &ALL,
+            &Scripted {
+                wireguard: || Ok(false),
+                ..Scripted::healthy()
+            },
+        );
+        let reason = refusal_for(&no_wireguard, &wg).expect("the WireGuard profile is refused");
+        assert!(
+            reason.starts_with("preflight wireguard_kernel: "),
+            "{reason}"
+        );
+        assert_eq!(refusal_for(&no_wireguard, &ovpn), None);
+        assert_eq!(refusal_for(&no_wireguard, &public), None);
+
+        let no_tun = run(
+            &ALL,
+            &Scripted {
+                tun: || Err(io::Error::from(io::ErrorKind::NotFound)),
+                ..Scripted::healthy()
+            },
+        );
+        let reason = refusal_for(&no_tun, &ovpn).expect("the OpenVPN profile is refused");
+        assert!(reason.starts_with("preflight tun_device: "), "{reason}");
+        assert_eq!(refusal_for(&no_tun, &wg), None);
+        assert_eq!(refusal_for(&no_tun, &public), None);
+
+        // Neither a failed `nft` nor an unanswered question fails a profile:
+        // the first fails the boot, the second refuses nothing.
+        let other = run(
+            &ALL,
+            &Scripted {
+                nft: || Err(io::Error::other("exited 1")),
+                wireguard: || Err(io::Error::from(io::ErrorKind::TimedOut)),
+                tun: || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                ..Scripted::healthy()
+            },
+        );
+        for p in [&wg, &ovpn, &public] {
+            assert_eq!(refusal_for(&other, p), None, "{}", p.id.as_str());
+        }
+    }
+
     #[test]
     fn the_request_is_a_getfamily_for_the_name() {
         let req = getfamily_request("wireguard", 7);
