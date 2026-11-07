@@ -173,7 +173,10 @@ logged at `WARN` (target `torrentd::auth`) with its `reason`, the kind of token
 neither, and `none` where no token was read, which is every `malformed`
 refusal; never the token itself) and `client_ip`, at most once a minute per
 client, each line saying how many of that client's refusals went unlogged
-since its last.
+since its last (`refused_unlogged_since_last`). The log tracks at most 1024
+clients; when it is full, a client whose last line is a minute old is
+dropped from it, and its next line counts from 0. That count is a hint, not a
+total: `torrentd_auth_rejections_total` counts every refusal.
 
 Alerts on them:
 
