@@ -27,7 +27,8 @@
 //! namespace, per family: those counts are the leaks, and they must stay 0.
 //!
 //! Needs `ip`, `wg`, `nft`, `unshare` (util-linux 2.38 or later, for
-//! `--map-user`) and `nsenter`, an `/etc/wireguard` directory to mount a
+//! `--map-user`), `nsenter` and `setpriv`, `setcap` (libcap) for the
+//! file-capability case, an `/etc/wireguard` directory to mount a
 //! tmpfs over (`wireguard-tools` ships one), and a kernel that lets this user
 //! create user namespaces and WireGuard links; so they are ignored by
 //! default.
@@ -129,6 +130,81 @@ fn in_own_namespace(test: &str) -> bool {
         String::from_utf8_lossy(&out.stderr),
     );
     false
+}
+
+/// Where the re-run [`in_file_capability_namespace`] makes finds the copy of
+/// the daemon that carries the file capability.
+const CAP_BIN: &str = "TORRENTD_TEST_CAP_BIN";
+
+/// [`in_own_namespace`], one user namespace deeper, with a copy of the
+/// daemon carrying the file capability `cap_net_admin+p`, as
+/// `deploy/Containerfile` sets it. Returns that copy's path in the re-run.
+///
+/// The outer namespace maps this user to root, and there mounts a tmpfs,
+/// copies the daemon onto it and runs `setcap`; the test then runs as uid
+/// [`UID`] in a namespace that outer root created. Both levels are needed: a
+/// file capability is honoured only in a namespace whose root, or an
+/// ancestor's, owns it, and the one [`in_own_namespace`] makes maps no root.
+/// The test keeps its own capabilities as before, to build the topology, but
+/// an `execve` of a binary with a file capability clears the ambient set, so
+/// the daemon holds `CAP_NET_ADMIN` from the file and from nothing else.
+fn in_file_capability_namespace(test: &str) -> Option<std::path::PathBuf> {
+    if std::env::var_os(IN_NAMESPACE).is_some() {
+        let bin = std::env::var_os(CAP_BIN).expect("set by the launcher");
+        return Some(bin.into());
+    }
+    let capdir = tempfile::tempdir().unwrap();
+    let setup = "set -eu\n\
+                 mount -t tmpfs -o mode=0755 torrentd-cap \"$1\"\n\
+                 cp \"$2\" \"$1/torrentd\"\n\
+                 setcap cap_net_admin+p \"$1/torrentd\"\n\
+                 shift 2\n\
+                 exec \"$@\"\n";
+    let out = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "--"])
+        .args(["sh", "-c", setup, "sh"])
+        .arg(capdir.path())
+        .arg(env!("CARGO_BIN_EXE_torrentd"))
+        .args([
+            "unshare",
+            "--user",
+            &format!("--map-user={UID}"),
+            &format!("--map-group={UID}"),
+            "--net",
+            "--mount",
+            "--keep-caps",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(IN_NAMESPACE, "1")
+        .env(CAP_BIN, capdir.path().join("torrentd"))
+        .output()
+        .expect("run unshare");
+    assert!(
+        out.status.success(),
+        "the run inside the namespace failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    None
+}
+
+/// One capability set of process `pid`, from its `/proc/<pid>/status`.
+fn cap_set(pid: u32, line: &str) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix(line))
+        .unwrap_or_else(|| panic!("no {line} in {status}"))
+        .trim();
+    u64::from_str_radix(hex, 16).unwrap()
 }
 
 /// Run `cmd` through `sh -c`, asserting it succeeds; its trimmed stdout.
@@ -447,43 +523,22 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Write `dir/cfg.toml` — the kill switch on, and one vpn profile on
-    /// [`WG`] carrying `profile_extra` — spawn the daemon on it, and wait for
-    /// the profile to come up on its tunnel.
+    /// Write `dir/cfg.toml` ([`write_config`]), spawn the daemon on it, and
+    /// wait for the profile to come up on its tunnel.
     fn start(dir: &std::path::Path, profile_extra: &str) -> Self {
-        for sub in ["data", "resume", "torrents"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
-        let cfg = dir.join("cfg.toml");
-        std::fs::write(
-            &cfg,
-            format!(
-                "default_save_path = \"{d}/data\"\n\
-                 resume_dir = \"{d}/resume\"\n\
-                 torrent_dir = \"{d}/torrents\"\n\
-                 http_listen = \"{HTTP}\"\n\
-                 log_level = \"info\"\n\
-                 allow_unauthenticated = true\n\
-                 network_kill_switch = true\n\
-                 \n\
-                 [[profile]]\n\
-                 id = \"{PROFILE}\"\n\
-                 network = \"vpn\"\n\
-                 vpn_type = \"wireguard\"\n\
-                 vpn_config = \"{wg}\"\n\
-                 vpn_interface = \"{WG}\"\n\
-                 peer_fingerprint = \"-qB5030-\"\n\
-                 user_agent = \"qBittorrent/5.0.3\"\n\
-                 allowed_tracker_domains = [\"{PEER_TUNNEL}\", \"{PEER_TUNNEL_V6}\"]\n\
-                 {profile_extra}\n",
-                d = dir.display(),
-                wg = wg_config(),
-            ),
+        Self::start_from(
+            std::path::Path::new(env!("CARGO_BIN_EXE_torrentd")),
+            dir,
+            profile_extra,
         )
-        .unwrap();
+    }
+
+    /// [`Daemon::start`], running the daemon from `bin`.
+    fn start_from(bin: &std::path::Path, dir: &std::path::Path, profile_extra: &str) -> Self {
+        let cfg = write_config(dir, profile_extra);
         let log = dir.join("daemon.log");
         let out = std::fs::File::create(&log).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        let child = Command::new(bin)
             .arg("--config")
             .arg(&cfg)
             .stdout(out.try_clone().unwrap())
@@ -506,7 +561,46 @@ impl Daemon {
         );
         daemon
     }
+}
 
+/// Write `dir/cfg.toml` — the kill switch on, and one vpn profile on [`WG`]
+/// carrying `profile_extra` — with the directories it names, and return its
+/// path.
+fn write_config(dir: &std::path::Path, profile_extra: &str) -> std::path::PathBuf {
+    for sub in ["data", "resume", "torrents"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let cfg = dir.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "default_save_path = \"{d}/data\"\n\
+                 resume_dir = \"{d}/resume\"\n\
+                 torrent_dir = \"{d}/torrents\"\n\
+                 http_listen = \"{HTTP}\"\n\
+                 log_level = \"info\"\n\
+                 allow_unauthenticated = true\n\
+                 network_kill_switch = true\n\
+                 \n\
+                 [[profile]]\n\
+                 id = \"{PROFILE}\"\n\
+                 network = \"vpn\"\n\
+                 vpn_type = \"wireguard\"\n\
+                 vpn_config = \"{wg}\"\n\
+                 vpn_interface = \"{WG}\"\n\
+                 peer_fingerprint = \"-qB5030-\"\n\
+                 user_agent = \"qBittorrent/5.0.3\"\n\
+                 allowed_tracker_domains = [\"{PEER_TUNNEL}\", \"{PEER_TUNNEL_V6}\"]\n\
+                 {profile_extra}\n",
+            d = dir.display(),
+            wg = wg_config(),
+        ),
+    )
+    .unwrap();
+    cfg
+}
+
+impl Daemon {
     /// SIGTERM, and wait for the exit.
     fn stop(&mut self) {
         sh(&format!("kill -TERM {}", self.child.id()));
@@ -1227,4 +1321,88 @@ fn vpn_netns_e2e_no_leak_across_a_crash_and_restart() {
     assert!(!tunnel_standing(), "the tunnel is removed on stop");
     assert_torn_down_in_order(&daemon.log);
     peer.assert_no_leak(base, "across the clean stop after the restart");
+}
+
+/// The container's privilege model: the daemon runs as a non-root uid with
+/// `CAP_NET_ADMIN` from its binary's file capability alone, no ambient grant
+/// from outside, and still raises its WireGuard link and installs its kill
+/// switch, because it hands the capability to the `ip`, `wg` and `nft` it
+/// runs. Without that hand-off each of them runs with nothing, and the
+/// profile never comes up.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare, nsenter and setcap, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_file_capability_alone_raises_the_tunnel_and_the_kill_switch() {
+    let Some(bin) = in_file_capability_namespace(
+        "vpn_netns_e2e_file_capability_alone_raises_the_tunnel_and_the_kill_switch",
+    ) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let _peer = topology(p);
+
+    let mut daemon = Daemon::start_from(&bin, p, &format!("listen_port = {LISTEN_PORT}"));
+    let pid = daemon.child.id();
+    let net_admin = 1u64 << 12;
+    assert_eq!(
+        cap_set(pid, "CapPrm:"),
+        net_admin,
+        "the daemon holds CAP_NET_ADMIN and nothing else, from the file"
+    );
+    assert_eq!(
+        cap_set(pid, "CapAmb:"),
+        0,
+        "no ambient grant: the tools get it only through the daemon's own raise"
+    );
+    assert_eq!(metric("torrentd_kill_switch_active"), Some(1.0));
+    assert!(table_listed(), "the kill switch table is installed");
+    assert!(tunnel_standing(), "the daemon raised its WireGuard link");
+    let log = std::fs::read_to_string(&daemon.log).unwrap();
+    assert!(
+        log.contains("came from the binary's file capability"),
+        "the boot says how it holds the capability: {log}"
+    );
+
+    daemon.stop();
+    assert!(!table_listed(), "the kill switch table is removed on stop");
+    assert!(!tunnel_standing(), "the tunnel is removed on stop");
+}
+
+/// Without `CAP_NET_ADMIN` a vpn profile with the kill switch exits 78, the
+/// status `RestartPreventExitStatus=78` and a container's restart policy read
+/// as the configuration's, naming both ways to grant it, before anything is
+/// raised.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_without_the_capability_exits_78_naming_both_fixes() {
+    if !in_own_namespace("vpn_netns_e2e_without_the_capability_exits_78_naming_both_fixes") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_config(dir.path(), &format!("listen_port = {LISTEN_PORT}"));
+    // The test holds every capability as ambient; the daemon is run with
+    // none, as a pod without `add: [NET_ADMIN]` runs it.
+    let out = Command::new("setpriv")
+        .args(["--inh-caps=-all", "--ambient-caps=-all", "--"])
+        .arg(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .expect("run setpriv");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(78), "{text}");
+    for needle in [
+        "CAP_NET_ADMIN",
+        "AmbientCapabilities=CAP_NET_ADMIN",
+        "securityContext",
+        "allowPrivilegeEscalation: true",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    assert!(!tunnel_standing(), "nothing was raised");
+    assert!(!table_listed(), "nothing was installed");
 }
