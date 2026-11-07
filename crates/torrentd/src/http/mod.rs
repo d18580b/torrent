@@ -7,7 +7,8 @@
 //! `docs/api/openapi.json`, where CI fails if it goes stale.
 //!
 //! [`v1`] holds the versioned operations, and `healthz` and `metrics` the
-//! two root routes. What every operation shares sits beside them: [`ctx`]
+//! two root routes; `metrics` also holds the observer that counts and times
+//! every request by route and logs every 5xx at `ERROR`. What every operation shares sits beside them: [`ctx`]
 //! is the context a handler runs against, [`security`] the bearer scheme and
 //! the unauthenticated posture's gate, [`forwarded`] the real client behind
 //! a trusted proxy, `headers` the headers every response carries, [`page`]
@@ -97,11 +98,22 @@ macro_rules! daemon_router {
 
 /// The running service for `state`, serving `openapi` at
 /// `GET /v1/openapi.json`.
+///
+/// Its requests are counted and timed in `state.metrics` by route, every
+/// route the service has written at zero before it is returned, so before
+/// it serves.
 pub fn service(
     state: crate::app_state::AppState,
     openapi: OpenApiJson,
 ) -> kynos::Result<kynos::router::service::Service<AppCtx>> {
-    daemon_router!().build(AppCtx::new(state, openapi))
+    // Here rather than in `daemon_router!`, which the document shares: it
+    // holds the sink, and an observer describes nothing.
+    let requests = metrics::HttpMetrics::new(Arc::clone(&state.metrics));
+    let service = daemon_router!()
+        .observe(requests.clone())
+        .build(AppCtx::new(state, openapi))?;
+    requests.seed(service.openapi());
+    Ok(service)
 }
 
 /// The published document, with the document-level members kynos has no
