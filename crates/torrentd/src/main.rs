@@ -505,7 +505,8 @@ impl std::fmt::Display for NetAdminRefusal {
 /// kill switch judges is the invoking process's, not the unit's `User=`:
 /// under `sudo torrentd --check-config` that is root even where the daemon
 /// runs as `torrentd`. So the flag's uid refusal says so, and names the
-/// invocation that judges the daemon's own account. The daemon's pre-flight
+/// `systemd-run` invocation that judges the daemon's own account with the
+/// unit's `CAP_NET_ADMIN`, which the kill switch also needs. The daemon's pre-flight
 /// does not add this: there the uid judged *is* the daemon's, and the remedy
 /// is to stop running it as root, which the refusal itself already says.
 ///
@@ -529,10 +530,15 @@ fn explain_invoking_uid(e: anyhow::Error) -> anyhow::Error {
     if !uid_refusal {
         return e;
     }
+    // Only the kill switch reads the uid, and the kill switch needs
+    // CAP_NET_ADMIN, which `sudo -u torrentd` would not carry: so the remedy is
+    // the invocation that gives the unit's account the unit's grant.
     e.context(
         "this process runs as uid 0, and the uid judged is the invoking process's, \
-         not the unit's User=; to pre-flight the daemon's own account, run the check \
-         as that user: `sudo -u torrentd torrentd --config <path> --check-config`",
+         not the unit's User=; to pre-flight the daemon as the unit runs it: \
+         `sudo systemd-run --pipe --wait -p User=torrentd \
+         -p AmbientCapabilities=CAP_NET_ADMIN -p CapabilityBoundingSet=CAP_NET_ADMIN \
+         /usr/bin/torrentd --config <path> --check-config`",
     )
 }
 
@@ -1139,7 +1145,7 @@ http_listen = "127.0.0.1:8080"
         assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
         // The daemon's pre-flight is judged as the daemon itself, so its
         // refusal does not send a root daemon to re-run a pre-flight.
-        assert!(!format!("{e:#}").contains("sudo -u torrentd"), "got: {e:#}");
+        assert!(!format!("{e:#}").contains("systemd-run"), "got: {e:#}");
 
         // `sudo torrentd --check-config` is judged as root, not as the unit's
         // `User=`; the flag's message says which uid it judged and how to
@@ -1148,7 +1154,9 @@ http_listen = "127.0.0.1:8080"
         assert!(startup::is_config_refusal(&e), "got: {e:#}");
         assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
         assert!(format!("{e:#}").contains("invoking process"), "got: {e:#}");
-        assert!(format!("{e:#}").contains("sudo -u torrentd"), "got: {e:#}");
+        assert!(format!("{e:#}").contains("systemd-run"), "got: {e:#}");
+        assert!(format!("{e:#}").contains("-p User=torrentd"), "got: {e:#}");
+        assert!(!format!("{e:#}").contains("sudo -u torrentd"), "got: {e:#}");
 
         // Any other pre-flight failure is left as it was.
         let other = explain_invoking_uid(anyhow::anyhow!("no nft"));
