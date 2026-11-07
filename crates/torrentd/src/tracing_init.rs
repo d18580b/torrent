@@ -50,8 +50,8 @@
 //! subscriber install (exit 70) before [`init`] has installed anything, and
 //! those are the lines that explain a crash loop. [`early_error`] writes each
 //! as one JSON line on stdout with the subscriber's own keys, in its order:
-//! `timestamp` (the same RFC3339 timer), `level`, `message`, `target`, plus
-//! `error.kind`, and the message passes through the same redaction. The
+//! `timestamp` (the same RFC3339 timer), `level`, `message`, `error.kind`,
+//! then `target`, and the message passes through the same redaction. The
 //! operator subcommands do not use it; they keep their human stderr.
 
 use std::fmt;
@@ -199,13 +199,15 @@ fn early_line(kind: EarlyErrorKind, message: &str) -> String {
     let _ = ChronoUtc::rfc_3339().format_time(&mut Writer::new(&mut timestamp));
     let json = |s: &str| serde_json::Value::from(s).to_string();
     // Built by hand rather than from a `serde_json::Map`, which sorts its keys
-    // without the `preserve_order` feature: the order is the subscriber's.
+    // without the `preserve_order` feature. The order is the subscriber's for
+    // `error!(error.kind = .., "..")`: `flatten_event` writes the event's
+    // fields, `message` first, before `target`.
     let line = format!(
-        "{{\"timestamp\":{},\"level\":\"ERROR\",\"message\":{},\"target\":{},\"error.kind\":{}}}",
+        "{{\"timestamp\":{},\"level\":\"ERROR\",\"message\":{},\"error.kind\":{},\"target\":{}}}",
         json(&timestamp),
         json(message),
-        json(env!("CARGO_CRATE_NAME")),
         json(kind.as_str()),
+        json(env!("CARGO_CRATE_NAME")),
     );
     redact_urls(&line).into_owned()
 }
@@ -290,12 +292,37 @@ mod tests {
         let msg = "failed to load config: \"x\"\nsecond line";
         let line = early_line(EarlyErrorKind::ConfigRefused, msg);
         assert!(!line.contains('\n'), "{line}");
-        let keys: Vec<&str> = ["timestamp", "level", "message", "target", "error.kind"].into();
-        let positions: Vec<usize> = keys
-            .iter()
-            .map(|k| line.find(&format!("\"{k}\":")).expect(k))
-            .collect();
-        assert!(positions.is_sorted(), "{line}");
+        // The order the subscriber itself writes for the same event.
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::registry().with(fmt_layer(buf.clone()));
+        torrentd_engine::testing::with_subscriber(subscriber, || {
+            tracing::event!(
+                target: "torrentd",
+                tracing::Level::ERROR,
+                error.kind = "config_refused",
+                "x"
+            );
+        });
+        let real = buf.text();
+        let key_order = |l: &str, keys: &[&str]| -> Vec<String> {
+            let mut found: Vec<(usize, String)> = keys
+                .iter()
+                .map(|k| (l.find(&format!("\"{k}\":")).expect(k), (*k).to_owned()))
+                .collect();
+            found.sort();
+            found.into_iter().map(|(_, k)| k).collect()
+        };
+        let keys = ["timestamp", "level", "message", "target", "error.kind"];
+        assert_eq!(
+            key_order(&line, &keys),
+            key_order(&real, &keys),
+            "{line}\n{real}"
+        );
+        assert_eq!(
+            key_order(&line, &keys),
+            ["timestamp", "level", "message", "error.kind", "target"],
+            "{line}"
+        );
         let v: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
         assert_eq!(
             v.as_object().expect("an object").len(),
