@@ -61,6 +61,7 @@ use anyhow::Context;
 use clap::Parser;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 use crate::cli::Cli;
 use crate::cli::Command;
@@ -429,20 +430,27 @@ fn openapi_cmd(out: Option<&std::path::Path>) -> anyhow::Result<()> {
 /// daemon runs as root is not in the file. Made here, it refuses before any
 /// tunnel is raised; left to `killswitch::enable`, it came after every
 /// profile's tunnel and session were up, as a boot failure the unit restarts.
+///
+/// So is `CAP_NET_ADMIN`: a vpn profile or the kill switch without it is
+/// refused here, with both ways to grant it, rather than failing every
+/// tunnel's `ip link add` into a restart loop that names nothing.
 fn check_config(cfg: &config::Config) -> anyhow::Result<()> {
     check_config_as(
         cfg,
         vpn::killswitch::current_uid,
         vpn::killswitch::nft_available,
+        vpn::caps::CapSets::current,
     )
 }
 
-/// [`check_config`], with the effective uid and the `nft` probe handed in, so
-/// a test can be root, or judge a host with or without nftables.
+/// [`check_config`], with the effective uid, the `nft` probe and the
+/// capability sets handed in, so a test can be root, judge a host with or
+/// without nftables, or hold `CAP_NET_ADMIN` or not.
 fn check_config_as(
     cfg: &config::Config,
     uid: impl FnOnce() -> std::io::Result<u32>,
     nft_available: impl FnOnce() -> bool,
+    cap_sets: impl FnOnce() -> Option<vpn::caps::CapSets>,
 ) -> anyhow::Result<()> {
     if cfg.network_kill_switch {
         let uid = uid().context("read this process's uid for the kill switch")?;
@@ -470,7 +478,27 @@ fn check_config_as(
             anyhow::bail!("[[profile]] id = \"{}\": {refusal}", p.id.as_str());
         }
     }
+    // Sets that cannot be read refuse nothing: the boot's preflight reports
+    // them as unknown, and a tool that lacks the capability still fails on
+    // its own.
+    let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
+    if needs.net_admin && cap_sets().is_some_and(|s| !s.permits(vpn::caps::CAP_NET_ADMIN)) {
+        return Err(
+            anyhow::Error::msg(vpn::preflight::net_admin_missing()).context(NetAdminRefusal)
+        );
+    }
     Ok(())
+}
+
+/// Marks [`check_config`]'s refusal for want of `CAP_NET_ADMIN`, so
+/// `--check-config` can say whose capability it judged.
+#[derive(Debug)]
+struct NetAdminRefusal;
+
+impl std::fmt::Display for NetAdminRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("refused for want of CAP_NET_ADMIN")
+    }
 }
 
 /// `--check-config`'s reading of a [`check_config`] failure. The uid the
@@ -480,7 +508,20 @@ fn check_config_as(
 /// invocation that judges the daemon's own account. The daemon's pre-flight
 /// does not add this: there the uid judged *is* the daemon's, and the remedy
 /// is to stop running it as root, which the refusal itself already says.
+///
+/// `CAP_NET_ADMIN` is judged for the invoking process the same way, and
+/// `sudo -u` does not carry the unit's `AmbientCapabilities=`, so that
+/// refusal names the invocation that does.
 fn explain_invoking_uid(e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<NetAdminRefusal>().is_some() {
+        return e.context(
+            "CAP_NET_ADMIN is judged for this process, not for the daemon: `sudo -u torrentd` \
+             does not carry the unit's AmbientCapabilities=. To pre-flight the daemon as the \
+             unit runs it: `sudo systemd-run --pipe --wait -p User=torrentd \
+             -p AmbientCapabilities=CAP_NET_ADMIN -p CapabilityBoundingSet=CAP_NET_ADMIN \
+             /usr/bin/torrentd --config <path> --check-config`",
+        );
+    }
     let uid_refusal = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(vpn::killswitch::is_uid_refusal)
@@ -493,6 +534,15 @@ fn explain_invoking_uid(e: anyhow::Error) -> anyhow::Error {
          not the unit's User=; to pre-flight the daemon's own account, run the check \
          as that user: `sudo -u torrentd torrentd --config <path> --check-config`",
     )
+}
+
+/// Log what [`vpn::caps::prepare_children`] did, once the logger is up.
+fn log_prepared(prepared: Option<&vpn::caps::Prepared>) {
+    match prepared {
+        None => {}
+        Some(p @ vpn::caps::Prepared::Failed(_)) => warn!(capabilities = %p, "capabilities"),
+        Some(p) => info!(capabilities = %p, "capabilities"),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -536,9 +586,33 @@ fn main() -> anyhow::Result<()> {
         Err(e) => refuse_config(&e),
     };
 
+    // Before any thread starts, for everything that runs `ip`, `wg`, `nft` or
+    // `openvpn`: a capability set is per thread, and only threads created
+    // after this carry what it sets. See `vpn::caps`.
+    let runs_vpn_tools = !matches!(
+        cli.command,
+        Some(Command::Pool { .. } | Command::HashPassword | Command::NewToken { .. })
+    );
+    let prepared = runs_vpn_tools.then(vpn::caps::prepare_children);
+
     if cli.check_config {
         if let Err(e) = check_config(&cfg).map_err(explain_invoking_uid) {
             refuse_config(&e);
+        }
+        // What the boot checks before any profile comes up, judged the same
+        // way; a requirement the host does not meet stops the pre-flight.
+        let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
+        let outcomes = vpn::preflight::run(&needs, &vpn::preflight::Host);
+        for o in &outcomes {
+            eprintln!("{o}");
+        }
+        let missing: Vec<String> = outcomes
+            .iter()
+            .filter(|o| o.finding == vpn::preflight::Finding::Missing)
+            .map(ToString::to_string)
+            .collect();
+        if !missing.is_empty() {
+            refuse_config(&anyhow::anyhow!("{}", missing.join("; ")));
         }
         eprintln!("config OK");
         return Ok(());
@@ -548,6 +622,7 @@ fn main() -> anyhow::Result<()> {
     // on this thread and never construct a session.
     if let Some(command) = cli.command {
         tracing_init::init(cfg.log_level);
+        log_prepared(prepared.as_ref());
         return match command {
             Command::Pool { cmd } => match cmd {
                 PoolCmd::Scan => pool_cmd::scan(&cfg),
@@ -588,6 +663,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let log_handle = tracing_init::init(cfg.log_level);
+    log_prepared(prepared.as_ref());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -953,6 +1029,14 @@ http_listen = "127.0.0.1:8080"
         config::Config::load(&p).expect("the file is valid on any host")
     }
 
+    /// The sets of a daemon holding `CAP_NET_ADMIN` from its file capability.
+    fn permitted() -> Option<vpn::caps::CapSets> {
+        Some(vpn::caps::CapSets {
+            permitted: 1 << vpn::caps::CAP_NET_ADMIN,
+            ..vpn::caps::CapSets::default()
+        })
+    }
+
     #[test]
     fn check_config_passes_a_vpn_kill_switch_config_as_non_root_with_nft() {
         let dir = tempfile::tempdir().unwrap();
@@ -965,9 +1049,56 @@ http_listen = "127.0.0.1:8080"
                 probed = true;
                 true
             },
+            permitted,
         )
         .expect("a non-root daemon on a host with nft passes");
         assert!(probed, "the kill switch asks whether nft is there");
+    }
+
+    /// A vpn profile, or the kill switch, without `CAP_NET_ADMIN` permitted
+    /// is refused before anything is raised, with both ways to grant it; a
+    /// host-only config is never asked about it, and sets that cannot be
+    /// read refuse nothing. `--check-config` adds whose capability it judged.
+    #[test]
+    fn check_config_refuses_a_tunnel_without_cap_net_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = kill_switch_over_wireguard(dir.path());
+        let none = || Some(vpn::caps::CapSets::default());
+        let e = check_config_as(&ks, || Ok(998), || true, none).expect_err("refused");
+        let msg = format!("{e:#}");
+        for needle in [
+            "CAP_NET_ADMIN",
+            "AmbientCapabilities=CAP_NET_ADMIN",
+            "cap_net_admin+p",
+            "securityContext",
+            "allowPrivilegeEscalation: true",
+        ] {
+            assert!(msg.contains(needle), "{needle}: {msg}");
+        }
+        assert!(!msg.contains("systemd-run"), "the daemon's own: {msg}");
+        let explained = format!("{:#}", explain_invoking_uid(e));
+        assert!(explained.contains("systemd-run"), "{explained}");
+        assert!(explained.contains("AmbientCapabilities=CAP_NET_ADMIN"));
+
+        // A vpn profile alone needs it too.
+        let mut tunnel = ks.clone();
+        tunnel.network_kill_switch = false;
+        check_config_as(&tunnel, || unreachable!(), || unreachable!(), none)
+            .expect_err("a vpn profile without the capability is refused");
+        check_config_as(&tunnel, || unreachable!(), || unreachable!(), || None)
+            .expect("unreadable sets refuse nothing");
+
+        let host = cfg_from(&format!(
+            "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\n"
+        ));
+        check_config_as(
+            &host,
+            || unreachable!(),
+            || unreachable!(),
+            || unreachable!("a host-only config is not asked about capabilities"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -982,7 +1113,7 @@ http_listen = "127.0.0.1:8080"
         let cfg = kill_switch_over_wireguard(dir.path());
         let msg = format!(
             "{:#}",
-            check_config_as(&cfg, || Ok(998), || false).expect_err("no nft is refused")
+            check_config_as(&cfg, || Ok(998), || false, permitted).expect_err("no nft is refused")
         );
         assert!(
             msg.contains("network_kill_switch") && msg.contains("`nft`"),
@@ -1004,6 +1135,7 @@ http_listen = "127.0.0.1:8080"
             &cfg,
             || Ok(0),
             || unreachable!("refused before the nft probe"),
+            || unreachable!("refused before the capability is read"),
         )
         .expect_err("uid 0 is refused");
         assert!(startup::is_config_refusal(&e), "got: {e:#}");
@@ -1034,6 +1166,7 @@ http_listen = "127.0.0.1:8080"
             &off,
             || unreachable!("no kill switch, no uid"),
             || unreachable!("no kill switch, no nft probe"),
+            || unreachable!("no tunnel, no capability"),
         )
         .unwrap();
     }
@@ -1067,6 +1200,7 @@ http_listen = "127.0.0.1:8080"
                     &profile(&ovpn),
                     || unreachable!("no kill switch"),
                     || unreachable!("no kill switch"),
+                    permitted,
                 )
                 .expect_err(line)
             );
@@ -1077,8 +1211,11 @@ http_listen = "127.0.0.1:8080"
 
         let clean = dir.path().join("clean.ovpn");
         std::fs::write(&clean, "client\ndev tun\nremote 203.0.113.7 1194\n").unwrap();
-        check_config(&profile(&clean)).expect("a file with no hook passes");
-        check_config(&profile(&dir.path().join("missing.ovpn")))
+        let check = |cfg: &config::Config| {
+            check_config_as(cfg, || unreachable!(), || unreachable!(), permitted)
+        };
+        check(&profile(&clean)).expect("a file with no hook passes");
+        check(&profile(&dir.path().join("missing.ovpn")))
             .expect("an unreadable file is the profile's bring-up's to refuse");
     }
 
