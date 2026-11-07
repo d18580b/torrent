@@ -102,9 +102,14 @@ sha256sum --check --ignore-missing SHA256SUMS
 gh api "repos/d18580b/torrent/commits/v$v" --jq .commit.verification.verified
 ```
 
-The image, by the same two routes:
+The image is public: pulling and verifying it needs no registry login, and
+no `imagePullSecret` in a cluster. The release workflow proves it on every
+release, pulling each platform of the release tag as an anonymous client,
+and does not publish the release when it cannot. Pull it, then verify it by
+the same two routes:
 
 ```bash
+docker pull ghcr.io/d18580b/torrent:X.Y.Z
 gh attestation verify oci://ghcr.io/d18580b/torrent:X.Y.Z --repo d18580b/torrent \
   --signer-workflow d18580b/torrent/.github/workflows/release-plz.yml
 cosign verify ghcr.io/d18580b/torrent:X.Y.Z \
@@ -639,6 +644,12 @@ it is:
   vX.Y.Z after all, merging that one releases it the same way.
 
 A published release is immutable. Neither path changes one.
+
+When the `image (ghcr.io)` job fails at `Anyone can pull the release's
+image, with no login`, the image is pushed, but anonymous clients cannot
+pull it, and the release stays a draft. The usual cause is a private
+package: set the `torrent` package's visibility to public (the package's
+settings on GitHub, Danger Zone), then re-run the failed jobs.
 
 ## Contributing & license
 
