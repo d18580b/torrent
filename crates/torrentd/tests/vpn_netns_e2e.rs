@@ -1406,3 +1406,75 @@ fn vpn_netns_e2e_without_the_capability_exits_78_naming_both_fixes() {
     assert!(!tunnel_standing(), "nothing was raised");
     assert!(!table_listed(), "nothing was installed");
 }
+
+/// An `nft` that is installed but whose `nft list tables` fails, as one
+/// without the kernel's nf_tables does: `--check-config` refuses it with 78,
+/// and the boot fails with 70 at the preflight, naming `nft_runs`, before it
+/// raises the tunnel the topology is ready for. Without the preflight the
+/// boot raised every tunnel and only then failed to install the kill switch.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_a_kill_switch_whose_nft_does_not_run_is_refused_before_any_tunnel() {
+    if !in_own_namespace(
+        "vpn_netns_e2e_a_kill_switch_whose_nft_does_not_run_is_refused_before_any_tunnel",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let _peer = topology(p);
+    let cfg = write_config(p, &format!("listen_port = {LISTEN_PORT}"));
+
+    // First on the daemon's `PATH`: answers `--version`, so `nft` counts as
+    // installed, and fails everything else.
+    let fake = p.join("fake-nft");
+    std::fs::create_dir_all(&fake).unwrap();
+    let nft = fake.join("nft");
+    std::fs::write(
+        &nft,
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && { echo 'nftables v1.0.9'; exit 0; }\n\
+         echo 'netlink: Error: cache initialization failed: Operation not supported' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&nft, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    for (check, code) in [(true, 78), (false, 70)] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_torrentd"));
+        cmd.arg("--config").arg(&cfg).env("PATH", &path);
+        if check {
+            cmd.arg("--check-config");
+        }
+        let out = cmd.output().expect("run the daemon");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "--check-config: {check}; {text}"
+        );
+        for needle in ["preflight nft_runs", "Operation not supported"] {
+            assert!(
+                text.contains(needle),
+                "--check-config: {check}; {needle}: {text}"
+            );
+        }
+        assert!(
+            !tunnel_standing(),
+            "--check-config: {check}; no tunnel was raised"
+        );
+        assert!(
+            !table_listed(),
+            "--check-config: {check}; nothing was installed"
+        );
+    }
+}
