@@ -600,19 +600,16 @@ fn main() -> anyhow::Result<()> {
             refuse_config(&e);
         }
         // What the boot checks before any profile comes up, judged the same
-        // way; a requirement the host does not meet stops the pre-flight.
+        // way and refused where the boot refuses: a kill switch `nft` cannot
+        // install fails the boot, while a profile the host cannot carry fails
+        // alone and the daemon starts without it, so it is reported only.
         let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
         let outcomes = vpn::preflight::run(&needs, &vpn::preflight::Host);
         for o in &outcomes {
             eprintln!("{o}");
         }
-        let missing: Vec<String> = outcomes
-            .iter()
-            .filter(|o| o.finding == vpn::preflight::Finding::Missing)
-            .map(ToString::to_string)
-            .collect();
-        if !missing.is_empty() {
-            refuse_config(&anyhow::anyhow!("{}", missing.join("; ")));
+        if let Some(nft) = vpn::preflight::missing(&outcomes, vpn::preflight::Requirement::Nft) {
+            refuse_config(&anyhow::anyhow!("{nft}"));
         }
         eprintln!("config OK");
         return Ok(());
