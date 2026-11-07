@@ -49,15 +49,10 @@ use crate::vpn;
 use crate::vpn::ReleasedOpenvpn;
 use crate::vpn::ReleasedWireguard;
 
-/// `CAP_NET_ADMIN`'s bit in the capability sets (`linux/capability.h`).
-const CAP_NET_ADMIN: u32 = 12;
-
 /// Run the cleanup. `Err` names every step that failed, after every step has
 /// been tried.
 pub fn cleanup(cfg: &Config) -> anyhow::Result<()> {
-    let net_admin = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| holds_net_admin(&status));
+    let net_admin = vpn::caps::holds_net_admin();
     let state_dir = cfg.state_dir();
     // Every tunnel interface this config names, as the boot computes it: an
     // OpenVPN record under any other name is a retired profile's.
@@ -107,7 +102,7 @@ fn kill_switch_uid(euid: Option<u32>, state_dir_owner: Option<u32>) -> Option<u3
 }
 
 /// [`cleanup`] with the host calls handed in: `net_admin` is what
-/// [`holds_net_admin`] read, `table_lock` takes the table's uid's
+/// [`vpn::caps::holds_net_admin`] read, `table_lock` takes the table's uid's
 /// [`vpn::killswitch::TableLock`] (`None` where that uid is unknown, and the
 /// table step fails on its own), and `steps` is [`run_steps`] over the real
 /// host.
@@ -208,36 +203,9 @@ fn run_steps(
     failures
 }
 
-/// Whether the `CapEff:` line of a `/proc/<pid>/status` holds
-/// `CAP_NET_ADMIN`, or `None` where there is no such line to read.
-fn holds_net_admin(status: &str) -> Option<bool> {
-    let hex = status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:"))?
-        .trim();
-    let caps = u64::from_str_radix(hex, 16).ok()?;
-    Some(caps & (1 << CAP_NET_ADMIN) != 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_effective_set_is_read_for_cap_net_admin() {
-        // Root's full set, and the unit's `CapabilityBoundingSet=CAP_NET_ADMIN`.
-        assert_eq!(
-            holds_net_admin("Name:\ttorrentd\nCapEff:\t000001ffffffffff\n"),
-            Some(true)
-        );
-        assert_eq!(holds_net_admin("CapEff:\t0000000000001000\n"), Some(true));
-        // The packaged unit's default, `CapabilityBoundingSet=` empty.
-        assert_eq!(holds_net_admin("CapEff:\t0000000000000000\n"), Some(false));
-        // CAP_NET_RAW (13) alone is not it.
-        assert_eq!(holds_net_admin("CapEff:\t0000000000002000\n"), Some(false));
-        assert_eq!(holds_net_admin("Name:\ttorrentd\n"), None);
-        assert_eq!(holds_net_admin("CapEff:\tnot-hex\n"), None);
-    }
 
     /// The scenario in #105, after the daemon was killed: its link and its
     /// table are both removed, and a clean run reports nothing.

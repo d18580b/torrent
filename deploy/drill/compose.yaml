@@ -35,6 +35,12 @@ services:
       # A fault-injection build exits 78 at startup without this: the opt-in
       # that keeps one which reached a real host from running there.
       TORRENTD_FAULT_INJECTION: "1"
+    # The config's vpn profile needs CAP_NET_ADMIN permitted, or the daemon
+    # exits 78 before any profile comes up; the image's file capability grants
+    # it only where the container's set holds it. The profile still fails at
+    # boot, as the drill intends: its tunnel config does not exist.
+    cap_add:
+      - NET_ADMIN
     volumes:
       # Rewritten in place by run.sh to make a reload fail, so a file mount
       # rather than :ro.

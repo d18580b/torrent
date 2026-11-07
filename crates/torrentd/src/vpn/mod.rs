@@ -6,13 +6,17 @@
 //! a netlink-based implementation later without changing any caller.
 //!
 //! Every host tool this subsystem runs goes through [`exec::run`]: one
-//! timeout, one locale, one rule for interface names.
+//! timeout, one locale, one rule for interface names, and the one place
+//! `CAP_NET_ADMIN` is handed to a child ([`caps`]). What the host must provide
+//! is checked before any profile comes up ([`preflight`]).
 
+pub mod caps;
 pub(crate) mod exec;
 mod ip_lookup;
 pub mod killswitch;
 mod natpmp;
 mod openvpn;
+pub mod preflight;
 pub mod route;
 mod shared_exit;
 mod wireguard;

@@ -298,6 +298,36 @@ pub async fn boot(
         sd_notify::TimeoutExtender::start_while_progressing(BOOT_STALL_BOUND, &boot_progress);
 
     warn_if_descriptors_are_short(&cfg);
+
+    // What the host must provide for the configured tunnels and kill switch,
+    // asked before any of them is attempted, each named. `main` has already
+    // refused a missing CAP_NET_ADMIN (exit 78). A profile whose tunnel the
+    // host cannot carry is failed with its reason, and the others go on; a
+    // kill switch `nft` cannot install fails the boot here rather than after
+    // every tunnel is up.
+    let preflight = {
+        let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
+        tokio::task::spawn_blocking(move || vpn::preflight::run(&needs, &vpn::preflight::Host))
+            .await
+            .context("host preflight")?
+    };
+    for o in &preflight {
+        match o.finding {
+            vpn::preflight::Finding::Met => {
+                info!(requirement = o.requirement.name(), "{}", o.detail);
+            }
+            vpn::preflight::Finding::Missing => {
+                error!(requirement = o.requirement.name(), "{}", o.detail);
+            }
+            vpn::preflight::Finding::NeedsCapability | vpn::preflight::Finding::Unknown => {
+                warn!(requirement = o.requirement.name(), "{}", o.detail);
+            }
+        }
+    }
+    if let Some(nft) = vpn::preflight::missing(&preflight, vpn::preflight::Requirement::Nft) {
+        anyhow::bail!("{nft}");
+    }
+
     {
         let profiles = cfg.profile.clone();
         tokio::task::spawn_blocking(move || vpn::warn_if_exits_are_shared(&profiles))
@@ -552,6 +582,7 @@ pub async fn boot(
         &*metrics,
         &mut boot_shutdown,
         &desired_states.current(),
+        |p| vpn::preflight::refusal_for(&preflight, p),
         boot_engine,
     )
     .await?;
