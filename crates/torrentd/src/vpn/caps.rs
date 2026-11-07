@@ -19,9 +19,10 @@
 //!   [`prepare_children`] raises it to effective and inheritable once, at
 //!   boot, before any thread starts, and arms [`raise_ambient_in_child`],
 //!   which `vpn::exec` installs as the `pre_exec` hook of every tool it runs.
-//!   The ambient raise happens in the forked child only, so the tools
-//!   `vpn::exec` runs get the capability and no other child of the daemon
-//!   does.
+//!   The ambient raise happens in the forked child only, so every tool
+//!   `vpn::exec` runs gets the capability (`ip`, `wg`, `nft`, `openvpn`, and
+//!   the `kill` that signals an `openvpn`, which does not need it) and no
+//!   other child of the daemon does.
 //!
 //! Capability sets are per thread, and a thread starts with its creator's:
 //! [`prepare_children`] runs on the main thread before the runtime, the
@@ -130,7 +131,7 @@ impl std::fmt::Display for Prepared {
             }
             Self::RaisedForTools => {
                 "CAP_NET_ADMIN came from the binary's file capability; raised to effective and \
-                 inheritable, and to ambient in each ip, wg, nft and openvpn the daemon runs"
+                 inheritable, and to ambient in each ip, wg, nft, openvpn and kill the daemon runs"
             }
             Self::Failed(why) => return write!(f, "CAP_NET_ADMIN could not be prepared: {why}"),
         })

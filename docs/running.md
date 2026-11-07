@@ -1361,8 +1361,9 @@ The image's `/usr/local/bin/torrentd` carries the file capability
 the unprivileged uid the kill switch matches on, and still holds the
 `CAP_NET_ADMIN` its tunnels and its nftables table need. At boot it raises
 the capability to effective, and hands it as an ambient capability to each
-`ip`, `wg`, `nft` and `openvpn` it runs, and to no other process. A Kubernetes
-pod running the image needs this `securityContext` on the container:
+`ip`, `wg`, `nft`, `openvpn` and `kill` it runs, and to no other process. A
+Kubernetes pod running the image needs this `securityContext` on the
+container:
 
 ```yaml
 securityContext:

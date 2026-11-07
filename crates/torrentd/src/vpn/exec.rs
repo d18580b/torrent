@@ -24,8 +24,10 @@
 //! * **`CAP_NET_ADMIN` where it would not be inherited.** A daemon that holds
 //!   it only from its binary's file capability passes nothing on across
 //!   `execve`, so each tool's child raises it to ambient between `fork` and
-//!   `execve` ([`super::caps::raise_ambient_in_child`]). This is the only
-//!   place that hook is installed: no other child of the daemon gets it.
+//!   `execve` ([`super::caps::raise_ambient_in_child`]). Every child [`run`]
+//!   spawns gets it, `kill` included, although `kill` signals an `openvpn` of
+//!   the daemon's own uid and needs no capability. This is the only place
+//!   that hook is installed: no child the daemon spawns any other way gets it.
 //!
 //! Every tool is still resolved through the daemon's `PATH`; see
 //! `vpn::ip_lookup` for why that is deliberate.

@@ -138,7 +138,7 @@ COPY --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
 # full, so every container started without NET_ADMIN (a host-only
 # deployment, `hash-password`, the alert drill) would fail to start torrentd
 # at all. The daemon raises the capability to effective itself at boot, and to
-# ambient only in the ip, wg, nft and openvpn it runs (`vpn::caps`).
+# ambient only in the ip, wg, nft, openvpn and kill it runs (`vpn::caps`).
 RUN setcap cap_net_admin+p /usr/local/bin/torrentd
 # Checked in a step of its own, so it reads the committed layer: an image
 # format or storage driver that drops the `security.capability` xattr fails
