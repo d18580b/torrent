@@ -326,8 +326,12 @@ impl RejectionLog {
         let mut key = client;
         if !clients.contains_key(&key) && clients.len() >= REJECTION_LOG_CLIENTS {
             // A client whose last line is a full interval old would be logged
-            // anyway, and has nothing suppressed worth reporting.
-            clients.retain(|_, state| !state.due(now) || state.suppressed > 0);
+            // at its next refusal anyway, so its entry is dropped. Refusals it
+            // held back go unreported in the line, never uncounted:
+            // `auth_rejections_total` has every one. Keeping such entries
+            // instead would let one burst from 1024 clients fill the map for
+            // good and push every later client onto the overflow's one line.
+            clients.retain(|_, state| !state.due(now));
             if clients.len() >= REJECTION_LOG_CLIENTS {
                 key = None;
             }
@@ -954,5 +958,26 @@ mod tests {
         let later = start + 2 * REFUSAL_LOG_INTERVAL;
         assert_eq!(log.admit(ip(100_002), later), Some(0));
         assert!(log.0.lock().contains_key(&ip(100_002)), "held on its own");
+    }
+
+    #[test]
+    fn the_rejection_log_makes_room_once_a_held_back_burst_is_a_minute_old() {
+        let log = RejectionLog::default();
+        let start = Instant::now();
+        let ip = |n: u32| Some(IpAddr::from(std::net::Ipv4Addr::from(n)));
+        // One burst fills the map, and every client in it has a refusal held
+        // back.
+        for n in 0..REJECTION_LOG_CLIENTS as u32 {
+            assert_eq!(log.admit(ip(n), start), Some(0));
+            assert_eq!(log.admit(ip(n), start), None);
+        }
+        assert_eq!(log.0.lock().len(), REJECTION_LOG_CLIENTS);
+        // A minute on, a new client is paced on its own, not as the overflow.
+        let later = start + REFUSAL_LOG_INTERVAL;
+        assert_eq!(log.admit(ip(200_000), later), Some(0));
+        assert_eq!(log.admit(ip(200_001), later), Some(0), "and so is another");
+        let clients = log.0.lock();
+        assert!(clients.contains_key(&ip(200_000)), "held on its own");
+        assert!(!clients.contains_key(&None), "nothing went to the overflow");
     }
 }
