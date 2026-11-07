@@ -38,7 +38,7 @@ says everything there is to say:
 
 | Status | When |
 | --- | --- |
-| `400` | A path parameter, a query parameter or a JSON body that does not parse. |
+| `400` | A path parameter, a query parameter or a JSON body that does not parse, or a request body that did not arrive whole: the client closed the connection mid-message, its stream was reset, or it sent less than its `Content-Length` declared. Adopting (`POST /v1/pool/adoptions`), creating a plan (`POST /v1/pool/plans`) and applying one refuse such a body before anything is started, even where what did arrive would parse. |
 | `401` | No bearer token, or one that is unknown, expired or revoked. `WWW-Authenticate: Bearer` accompanies it. |
 | `403` | A daemon without `[auth]` refused a request a browser sent on another site's behalf: a `Host` that is not loopback or in `allowed_hosts`, or a state change whose `Sec-Fetch-Site`, `Origin` or `Content-Type` marks it cross-site. See [the README](README.md#authentication). |
 | `404` | No route matches the path. |

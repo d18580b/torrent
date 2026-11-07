@@ -69,8 +69,9 @@ pub const BODY_DEADLINE: Duration = REQUEST_DEADLINE;
 /// of work — applying a plan — cannot take the first and must not be left
 /// with only the second, or a body that stalls holds its connection for as
 /// long as the peer keeps it open. So this reads the whole body itself,
-/// declared length or not, refusing it with `413` past `limit` and `408`
-/// past `deadline`, and hands the handler the bytes. The limits it is used
+/// declared length or not, refusing it with `413` past `limit`, `408` past
+/// `deadline`, and `400` when its transfer fails part-way, and hands the
+/// handler the bytes only of a body that arrived whole. The limits it is used
 /// with are 64 KiB, so holding the body costs no more than `BodySize` already
 /// spends on a chunked one.
 pub struct TimedBody {
@@ -82,12 +83,21 @@ pub struct TimedBody {
 pub enum BodyRefused {
     TooLarge(kynos::middleware::limits::body_size::BodySizeExceeded),
     TooSlow(Duration),
+    /// The body's transfer failed part-way: the client closed the connection
+    /// mid-message, its stream was reset, or it sent less than its
+    /// `Content-Length` declared. Holds what the read failed with.
+    Incomplete(String),
 }
 
 impl kynos::response::IntoResponse for BodyRefused {
     fn into_response(self) -> kynos::http::Response {
         match self {
             Self::TooLarge(exceeded) => exceeded.into_response(),
+            Self::Incomplete(error) => {
+                kynos::error::problem::Problem::new(kynos::http::StatusCode::BAD_REQUEST)
+                    .with_detail(format!("the request body could not be read: {error}"))
+                    .into_response()
+            }
             Self::TooSlow(after) => {
                 kynos::error::problem::Problem::new(kynos::http::StatusCode::REQUEST_TIMEOUT)
                     .with_detail(format!(
@@ -101,7 +111,7 @@ impl kynos::response::IntoResponse for BodyRefused {
 }
 
 impl kynos::response::ShortCircuit for BodyRefused {
-    const STATUSES: &'static [u16] = &[408, 413];
+    const STATUSES: &'static [u16] = &[400, 408, 413];
 }
 
 impl kynos::response::Responses for BodyRefused {
@@ -109,12 +119,22 @@ impl kynos::response::Responses for BodyRefused {
         let mut responses =
             kynos::middleware::limits::body_size::BodySizeExceeded::<()>::responses(registry);
         let timed_out = kynos::middleware::limits::timeout::TimedOut::<()>::responses(registry);
-        for (status, mut response) in timed_out.responses {
-            if let kynos::openapi::RefOr::Item(item) = &mut response {
-                item.description =
-                    Some("the request body did not arrive within the configured limit".to_owned());
+        for (status, response) in timed_out.responses {
+            // kynos keeps the helper that builds an `about:blank` refusal to
+            // itself, so the 400 is the 408's entry with its own description.
+            for (status, description) in [
+                (
+                    status,
+                    "the request body did not arrive within the configured limit",
+                ),
+                ("400".to_owned(), "the request body did not arrive whole"),
+            ] {
+                let mut response = response.clone();
+                if let kynos::openapi::RefOr::Item(item) = &mut response {
+                    item.description = Some(description.to_owned());
+                }
+                responses.responses.insert(status, response);
             }
-            responses.responses.insert(status, response);
         }
         responses
     }
@@ -131,28 +151,37 @@ fn declared_length(headers: &kynos::http::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Reads `body` while the running total stays within `limit`; `None` once it
-/// passes it. A read that fails yields what arrived before it did, as
-/// `BodySize` does: the extractor then rejects the truncated payload with the
-/// status it already declares.
-async fn read_capped(mut body: kynos::http::body::Body, limit: u64) -> Option<bytes::Bytes> {
+/// Reads `body` whole while the running total stays within `limit`.
+///
+/// Refuses it with `413` once it passes `limit`, and with `400` when a read
+/// fails part-way. What arrived before the failure is never handed on: kynos'
+/// `BodySize` passes the failure through to the extractor, which refuses it,
+/// but the primitive it does that with (`Body::failed_after`) is not public,
+/// so this refuses it itself rather than hand the handler a payload that
+/// would parse as a whole one when only its tail was lost.
+async fn read_capped(
+    mut body: kynos::http::body::Body,
+    limit: u64,
+) -> Result<bytes::Bytes, BodyRefused> {
     use http_body::Body as _;
 
     let mut collected = bytes::BytesMut::new();
     while let Some(frame) =
         std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
     {
-        let Ok(frame) = frame else { break };
+        let frame = frame.map_err(|error| BodyRefused::Incomplete(error.to_string()))?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
         let total = collected.len().saturating_add(data.len());
         if u64::try_from(total).unwrap_or(u64::MAX) > limit {
-            return None;
+            return Err(BodyRefused::TooLarge(
+                kynos::middleware::limits::body_size::BodySizeExceeded::new(limit),
+            ));
         }
         collected.extend_from_slice(&data);
     }
-    Some(collected.freeze())
+    Ok(collected.freeze())
 }
 
 impl<C: Sync + 'static> kynos::middleware::Interceptor<C> for TimedBody {
@@ -167,19 +196,15 @@ impl<C: Sync + 'static> kynos::middleware::Interceptor<C> for TimedBody {
         _context: &C,
         next: kynos::middleware::Next<'_, C>,
     ) -> Result<kynos::middleware::Continued<()>, BodyRefused> {
-        let too_large = || {
-            BodyRefused::TooLarge(kynos::middleware::limits::body_size::BodySizeExceeded::new(
-                self.limit,
-            ))
-        };
         if declared_length(request.headers()).is_some_and(|declared| declared > self.limit) {
-            return Err(too_large());
+            return Err(BodyRefused::TooLarge(
+                kynos::middleware::limits::body_size::BodySizeExceeded::new(self.limit),
+            ));
         }
         let (parts, body) = request.into_parts();
         let bytes = tokio::time::timeout(self.deadline, read_capped(body, self.limit))
             .await
-            .map_err(|_| BodyRefused::TooSlow(self.deadline))?
-            .ok_or_else(too_large)?;
+            .map_err(|_| BodyRefused::TooSlow(self.deadline))??;
         let body = kynos::http::body::Body::from_bytes(bytes);
         Ok(next
             .run(kynos::http::Request::from_parts(parts, body))
