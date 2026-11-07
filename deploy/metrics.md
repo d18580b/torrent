@@ -169,8 +169,10 @@ Every 5xx is also logged at `ERROR` (`server error response`, target
 `torrentd::http`) with the `request_id` the client received in `X-Request-Id`;
 a 4xx stays at `INFO`. Every refusal `torrentd_auth_rejections_total` counts is
 logged at `WARN` (target `torrentd::auth`) with its `reason`, the kind of token
-(`static` or `session`, never the token) and `client_ip`, at most once a minute
-per client, each line saying how many of that client's refusals went unlogged
+(`token_kind`: `static` or `session` by its prefix, `other` for a token with
+neither, and `none` where no token was read, which is every `malformed`
+refusal; never the token itself) and `client_ip`, at most once a minute per
+client, each line saying how many of that client's refusals went unlogged
 since its last.
 
 Alerts on them:
