@@ -1231,7 +1231,16 @@ Uncomment `AmbientCapabilities=CAP_NET_ADMIN` and
 `CapabilityBoundingSet=CAP_NET_ADMIN` for a deployment **with** a `vpn`
 profile; they are only needed to manage tunnels. A deployment without one
 takes the unit as shipped, which grants no capability and bounds the set to
-empty.
+empty. A `vpn` profile or `network_kill_switch = true` under a unit that
+grants no `CAP_NET_ADMIN` exits 78 at boot, naming the two directives.
+`sudo -u torrentd torrentd --check-config` judges its own capabilities, which
+`sudo` does not give the unit's; pre-flight such a config as the unit runs it:
+
+```bash
+sudo systemd-run --pipe --wait -p User=torrentd \
+  -p AmbientCapabilities=CAP_NET_ADMIN -p CapabilityBoundingSet=CAP_NET_ADMIN \
+  /usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config
+```
 
 **Signals:** `SIGHUP` reloads the six keys the
 [README lists as reloadable](../README.md#http-api); every other key takes a
@@ -1326,11 +1335,66 @@ the same arguments as `podman compose`.
    curl -s https://<your host>/healthz
    ```
 
-A `vpn` profile in this container needs the `user`, `cap_add` and `devices`
-lines and the `/etc/wireguard` volume that `compose.yaml` carries commented,
-and runs **without** the kill
-switch: the comment above them says why the two cannot be combined here. A
-deployment that needs both runs from `deploy/torrentd.service` instead.
+A `vpn` profile in this container needs the `cap_add` line, the `devices`
+line for an OpenVPN profile, and the `/etc/wireguard` volume that
+`compose.yaml` carries commented. It runs as the image's uid 1000, so the
+kill switch can run beside it; the next section says how.
+
+### In a container
+
+The image's `/usr/local/bin/torrentd` carries the file capability
+`cap_net_admin+p` (`deploy/Containerfile`). That is how a `vpn` profile and
+`network_kill_switch = true` run together in a container: the daemon stays
+the unprivileged uid the kill switch matches on, and still holds the
+`CAP_NET_ADMIN` its tunnels and its nftables table need. At boot it raises
+the capability to effective, and hands it as an ambient capability to each
+`ip`, `wg`, `nft` and `openvpn` it runs, and to no other process. A Kubernetes
+pod running the image needs this `securityContext` on the container:
+
+```yaml
+securityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop: [ALL]
+    add: [NET_ADMIN]
+  allowPrivilegeEscalation: true
+```
+
+- **`runAsUser: 1000`.** The kill switch confines the daemon's own uid to
+  loopback and its tunnels, and refuses uid 0, whose rule would drop every
+  root-owned socket in the pod's network namespace. 1000 is the uid the image
+  owns its state directories as.
+- **`capabilities: {drop: [ALL], add: [NET_ADMIN]}`.** `add` puts
+  `CAP_NET_ADMIN` in the container's bounding set, which is the most a file
+  capability can grant: without it the daemon holds nothing. For a non-root
+  uid, `add` alone grants nothing effective, which is why the file
+  capability is there. `drop: [ALL]` leaves `CAP_NET_ADMIN` as the only one.
+- **`allowPrivilegeEscalation: true`.** `false` sets `no_new_privs`, under
+  which the kernel ignores file capabilities, and the daemon holds nothing.
+  Kubernetes defaults it to `true`, except where a `restricted` Pod Security
+  Standard or a policy engine sets it `false`; set it explicitly so neither
+  does. compose's `security_opt: [no-new-privileges:true]` is the same
+  setting and has the same effect.
+
+An OpenVPN profile also needs the host's `/dev/net/tun` in the container,
+and a WireGuard profile needs the host kernel's `wireguard` module, which a
+container cannot load itself (`modprobe wireguard` on the host).
+
+The capability is checked before any profile comes up. Where a `vpn` profile
+or the kill switch is configured and `CAP_NET_ADMIN` is not permitted, the
+daemon exits 78 and names the two ways to grant it: this `securityContext`,
+and the unit's `AmbientCapabilities=` (§8). The same boot preflight then
+checks that the kernel has WireGuard (its `wireguard` generic-netlink family
+is registered, asked without raising a link), that `nft list tables` runs
+when the kill switch is on, and that `/dev/net/tun` exists for an OpenVPN
+profile. A kill switch whose `nft` does not run fails the boot before any
+tunnel is raised. A profile whose tunnel the host cannot carry is failed
+with a reason that starts `preflight wireguard_kernel:` or
+`preflight tun_device:`: that is the profile's `failure_reason` in
+`GET /v1/profiles/{id}` and the `reason` on the boot's log line, and
+`torrentd_profile_boot_failed` is `1` for it. `torrentd --check-config` and
+`torrentd vpn check` report the same verdicts, run in the same container.
 
 ## 9. First-run checks
 

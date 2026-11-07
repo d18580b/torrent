@@ -543,7 +543,7 @@ With no subcommand, `torrentd` runs the daemon.
 
 | Invocation | What it does |
 | --- | --- |
-| `torrentd --config … --check-config` | Validate the file and exit, `78` on a refusal, without starting anything. With `network_kill_switch = true` it also checks that `nft` runs and that it is not uid 0, judged for the invoking process, so run it as the daemon's user: `sudo -u torrentd torrentd --config … --check-config`. |
+| `torrentd --config … --check-config` | Validate the file and exit, `78` on a refusal, without starting anything. With `network_kill_switch = true` it also checks that `nft` runs and that it is not uid 0, judged for the invoking process, so run it as the daemon's user: `sudo -u torrentd torrentd --config … --check-config`. With a `vpn` profile or the kill switch it also refuses a process without `CAP_NET_ADMIN`, which `sudo -u` does not carry over from the unit, and prints the boot's VPN preflight; [docs/running.md §8](docs/running.md#8-start-it) gives the `systemd-run` invocation that judges the daemon as the unit runs it. |
 | `torrentd --config … vpn check` | Check every `vpn` profile's tunnel without seeding anything. `--profile ID` checks one, `--json` prints JSON, `--egress IP:PORT` requires a reply from a socket bound to the tunnel, `--bring-up` raises a tunnel that is not up (needs `CAP_NET_ADMIN`), and `--as-uid UID` renders and dry-runs the kill-switch ruleset for that uid, the daemon's, rather than the invoker's. |
 | `torrentd --config … pool scan \| status \| check \| orphans [--limit N]` | The managed pool ([Managed pool](#managed-pool)). |
 | `torrentd --config … hash-password`, `new-token --name N --scopes S` | Generate `[auth]` values ([Authentication](#authentication)). |
