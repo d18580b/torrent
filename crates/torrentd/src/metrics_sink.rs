@@ -81,6 +81,10 @@ pub struct Series {
     pub name: &'static str,
     pub kind: MetricType,
     pub scope: Scope,
+    /// Labels besides `profile_id` and [`label`](Series::label) whose values
+    /// the series' owner writes, from a set it holds rather than this table:
+    /// the HTTP API's routes and methods. Listed before `label`.
+    pub keys: &'static [&'static str],
     /// The label besides `profile_id`, if any, and every value it takes.
     /// An empty value list means the values are not a fixed set.
     pub label: Option<(&'static str, &'static [&'static str])>,
@@ -89,14 +93,16 @@ pub struct Series {
 }
 
 /// Builds [`CATALOGUE`], one row per series:
-/// `name Type Scope [(label: values)] seed => help;`.
+/// `name Type Scope [[keys]] [(label: values)] seed => help;`.
 macro_rules! catalogue {
-    ($($name:literal $kind:ident $scope:ident $(($label:literal: $values:expr))?
+    ($($name:literal $kind:ident $scope:ident $([$($key:literal),*])?
+       $(($label:literal: $values:expr))?
        $seed:ident $(($when:literal))? => $help:expr;)*) => {
         &[$(Series {
             name: $name,
             kind: MetricType::$kind,
             scope: Scope::$scope,
+            keys: &[$($($key),*)?],
             label: catalogue!(@label $(($label, $values))?),
             seed: Seed::$seed $(($when))?,
             help: $help,
@@ -115,6 +121,12 @@ pub const TASKS: &[&str] = &[
     "verify_queue",
     "kill_switch_watch",
 ];
+
+/// The `reason` values of `auth_rejections_total`.
+pub const AUTH_REJECTION_REASONS: &[&str] = &["malformed", "unknown", "expired"];
+
+/// The `status_class` values of `http_requests_total`.
+pub const HTTP_STATUS_CLASSES: &[&str] = &["1xx", "2xx", "3xx", "4xx", "5xx"];
 
 /// Every series `/metrics` can contain. See the module docs.
 pub const CATALOGUE: &[Series] = catalogue! {
@@ -373,6 +385,19 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Requests a daemon without [auth] refused as sent by a browser from another site, by \
          the header that refused them: a Host neither loopback nor in allowed_hosts, a \
          cross-site Sec-Fetch-Site, a foreign Origin, or a body type an HTML form can send.";
+    "auth_rejections_total" Counter Daemon ("reason": AUTH_REJECTION_REASONS) Zero =>
+        "Requests refused 401 for the bearer credential they carried: malformed when it is \
+         not a well-formed bearer token, unknown when no static or live session token \
+         matches it (a revoked session included), expired when it names a session past its \
+         lifetime.";
+    "http_requests_total" Counter Daemon ["route", "method"]
+        ("status_class": HTTP_STATUS_CLASSES) Owner("each route, before the API serves") =>
+        "Responses the HTTP API sent, by route (the OpenAPI path template, or unmatched where \
+         no operation matched the request), method and status class.";
+    "http_request_duration_seconds" Histogram Daemon ["route", "method"]
+        Owner("each route, before the API serves") =>
+        "Seconds from a request arriving to its response head being ready, by route and \
+         method; a streamed body's delivery is not included.";
     "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings"]) Zero =>
         "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
     // kill switch
@@ -734,7 +759,13 @@ impl PromSink {
     /// label. Called once at boot, before the alert loop starts, so no real
     /// sample can be overwritten. See the module docs for why.
     pub fn seed(&self, profiles: &[&str]) {
-        for s in CATALOGUE.iter().filter(|s| s.seed == Seed::Zero) {
+        // A series with keys takes values only its owner knows, so it is
+        // never `Seed::Zero` (a test holds that); skipped rather than written
+        // with a label set its owner's samples would then be dropped for.
+        for s in CATALOGUE
+            .iter()
+            .filter(|s| s.seed == Seed::Zero && s.keys.is_empty())
+        {
             let values: &[&str] = match s.label {
                 Some((_, values)) => values,
                 None => &[""],
@@ -766,6 +797,12 @@ impl PromSink {
                 }
             }
         }
+    }
+
+    /// Export `name`'s histogram for `labels` with no observation in it, so
+    /// the series exists, at a count of 0, before its first event.
+    pub fn seed_histogram(&self, name: &str, labels: &[(&str, &str)]) {
+        let _ = self.histogram(name, labels);
     }
 
     pub fn render(&self) -> Vec<u8> {
@@ -878,6 +915,16 @@ impl PromSink {
         })
     }
 
+    fn histogram(&self, name: &str, labels: &[(&str, &str)]) -> Option<prometheus::Histogram> {
+        self.child(&self.histos, "histogram", name, labels, |name, names| {
+            register_histogram_vec_with_registry!(
+                prometheus::HistogramOpts::new(name, help_for(name, "torrentd histogram")),
+                names,
+                self.registry,
+            )
+        })
+    }
+
     /// Log a registration failure and count the sample it costs.
     ///
     /// Re-attempted and re-warned on every emission — registration is cheap
@@ -941,14 +988,7 @@ impl MetricsSink for PromSink {
     }
 
     fn observe_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
-        let histogram = self.child(&self.histos, "histogram", name, labels, |name, names| {
-            register_histogram_vec_with_registry!(
-                prometheus::HistogramOpts::new(name, help_for(name, "torrentd histogram")),
-                names,
-                self.registry,
-            )
-        });
-        if let Some(h) = histogram {
+        if let Some(h) = self.histogram(name, labels) {
             h.observe(value);
         }
     }
@@ -974,6 +1014,7 @@ mod tests {
         if s.scope != Scope::Daemon {
             labels.push("`profile_id`".to_string());
         }
+        labels.extend(s.keys.iter().map(|key| format!("`{key}`")));
         if let Some((name, values)) = s.label {
             if values.is_empty() {
                 labels.push(format!("`{name}`"));
@@ -1039,9 +1080,23 @@ mod tests {
         }
     }
 
-    /// Every `torrentd_*` name in `text`. `_bucket`-style suffixes are not
-    /// stripped: no alert rule reads the daemon's one histogram.
+    /// Every `torrentd_*` name in `text`, a catalogued histogram's
+    /// `_bucket`, `_sum` and `_count` series read as the histogram itself.
     fn referenced(text: &str) -> BTreeSet<String> {
+        named(text)
+            .into_iter()
+            .map(|name| {
+                ["_bucket", "_sum", "_count"]
+                    .iter()
+                    .filter_map(|suffix| name.strip_suffix(suffix))
+                    .find(|base| catalogued(base).is_some_and(|s| s.kind == MetricType::Histogram))
+                    .map_or(name.clone(), str::to_string)
+            })
+            .collect()
+    }
+
+    /// Every `torrentd_*` name in `text`, as written.
+    fn named(text: &str) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         let bytes = text.as_bytes();
         let mut i = 0;
@@ -1579,6 +1634,55 @@ mod tests {
         assert!(text.contains(&format!(
             "# HELP torrentd_config_reload_failures_total {help}"
         )));
+    }
+
+    #[test]
+    fn a_series_with_keys_is_seeded_by_its_owner() {
+        for s in CATALOGUE.iter().filter(|s| !s.keys.is_empty()) {
+            assert!(
+                matches!(s.seed, Seed::Owner(_)),
+                "{}: its keys' values are its owner's, so the owner seeds it",
+                s.name,
+            );
+        }
+    }
+
+    #[test]
+    fn a_seeded_histogram_is_exported_empty_and_then_counts() {
+        let sink = PromSink::new();
+        let labels = [("route", "/v1/status"), ("method", "GET")];
+        sink.seed_histogram("http_request_duration_seconds", &labels);
+        let series = "{method=\"GET\",route=\"/v1/status\"}";
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert_eq!(
+            sample(&text, "http_request_duration_seconds_count", series).as_deref(),
+            Some("0"),
+            "{text}"
+        );
+        sink.observe_histogram("http_request_duration_seconds", 0.2, &labels);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert_eq!(
+            sample(&text, "http_request_duration_seconds_count", series).as_deref(),
+            Some("1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_rule_reading_a_histogram_bucket_reads_the_histogram() {
+        let names = referenced(
+            "torrentd_http_request_duration_seconds_bucket torrentd_task_up_count \
+             torrentd_auth_rejections_total",
+        );
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            [
+                "auth_rejections_total",
+                "http_request_duration_seconds",
+                "task_up_count"
+            ],
+            "only a catalogued histogram's suffix is stripped",
+        );
     }
 
     #[test]
