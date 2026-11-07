@@ -43,8 +43,19 @@
 //! implements both rules, for this layer and for the API.
 //! `CONTRIBUTING.md` § Reporting bugs promises this to bug reporters; change
 //! the two together.
+//!
+//! # Before the subscriber exists
+//!
+//! The daemon refuses a config (exit 78), a usage error (exit 2) and a failed
+//! subscriber install (exit 70) before [`init`] has installed anything, and
+//! those are the lines that explain a crash loop. [`early_error`] writes each
+//! as one JSON line on stdout with the subscriber's own keys, in its order:
+//! `timestamp` (the same RFC3339 timer), `level`, `message`, `target`, plus
+//! `error.kind`, and the message passes through the same redaction. The
+//! operator subcommands do not use it; they keep their human stderr.
 
 use std::fmt;
+use std::io::Write as _;
 
 use tracing::Event;
 use tracing::Subscriber;
@@ -131,16 +142,72 @@ fn level_filter(level: LogLevel) -> EnvFilter {
     ))
 }
 
-pub fn init(level: LogLevel) -> LogReloadHandle {
+/// Install the global subscriber. An install that fails (a global subscriber
+/// or `log` logger already set) is an error rather than ignored: ignoring it
+/// lost every later log line without a word.
+pub fn init(level: LogLevel) -> anyhow::Result<LogReloadHandle> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| level_filter(level));
     let (filter_layer, handle) = reload::Layer::new(filter);
 
-    let _ = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer(std::io::stdout))
-        .try_init();
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("install the tracing subscriber: {e}"))?;
 
-    LogReloadHandle { inner: handle }
+    Ok(LogReloadHandle { inner: handle })
+}
+
+/// The `error.kind` of a line [`early_error`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyErrorKind {
+    /// A configuration the daemon or `--check-config` refuses (exit 78).
+    ConfigRefused,
+    /// An invocation the daemon cannot run as given (exit 2).
+    Usage,
+    /// The subscriber [`init`] installs could not be installed (exit 70).
+    TracingInitFailed,
+}
+
+impl EarlyErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigRefused => "config_refused",
+            Self::Usage => "usage",
+            Self::TracingInitFailed => "tracing_init_failed",
+        }
+    }
+}
+
+/// Write `message` to stdout as one ERROR line in the subscriber's JSON shape,
+/// for an error raised before [`init`] installed it, or because it could not.
+/// A failed write is ignored: the caller is about to exit with the status that
+/// carries the outcome, and there is nowhere left to report it.
+pub fn early_error(kind: EarlyErrorKind, message: &str) {
+    let line = early_line(kind, message);
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// The line [`early_error`] writes, without the newline.
+fn early_line(kind: EarlyErrorKind, message: &str) -> String {
+    use tracing_subscriber::fmt::time::FormatTime as _;
+
+    let mut timestamp = String::new();
+    // `ChronoUtc` only fails where its writer does, and a `String` does not.
+    let _ = ChronoUtc::rfc_3339().format_time(&mut Writer::new(&mut timestamp));
+    let json = |s: &str| serde_json::Value::from(s).to_string();
+    // Built by hand rather than from a `serde_json::Map`, which sorts its keys
+    // without the `preserve_order` feature: the order is the subscriber's.
+    let line = format!(
+        "{{\"timestamp\":{},\"level\":\"ERROR\",\"message\":{},\"target\":{},\"error.kind\":{}}}",
+        json(&timestamp),
+        json(message),
+        json(env!("CARGO_CRATE_NAME")),
+        json(kind.as_str()),
+    );
+    redact_urls(&line).into_owned()
 }
 
 /// `init`'s subscriber, reloadable filter and daemon layer included, writing
@@ -217,6 +284,68 @@ mod tests {
     use super::*;
     use crate::redact::test_support::redacted;
     use crate::redact::test_support::PASSKEY;
+
+    #[test]
+    fn an_early_error_has_the_subscribers_keys_in_its_order() {
+        let msg = "failed to load config: \"x\"\nsecond line";
+        let line = early_line(EarlyErrorKind::ConfigRefused, msg);
+        assert!(!line.contains('\n'), "{line}");
+        let keys: Vec<&str> = ["timestamp", "level", "message", "target", "error.kind"].into();
+        let positions: Vec<usize> = keys
+            .iter()
+            .map(|k| line.find(&format!("\"{k}\":")).expect(k))
+            .collect();
+        assert!(positions.is_sorted(), "{line}");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
+        assert_eq!(
+            v.as_object().expect("an object").len(),
+            keys.len(),
+            "{line}"
+        );
+        assert_eq!(v["level"], "ERROR");
+        assert_eq!(v["message"], msg);
+        assert_eq!(v["target"], "torrentd");
+        assert_eq!(v["error.kind"], "config_refused");
+        // RFC3339 in UTC, `YYYY-MM-DDTHH:MM:SS[.frac]+00:00`, as the
+        // subscriber's own timer writes it.
+        let ts = v["timestamp"].as_str().expect("timestamp");
+        let b = ts.as_bytes();
+        assert!(
+            b.len() >= 20
+                && b[4] == b'-'
+                && b[7] == b'-'
+                && b[10] == b'T'
+                && b[13] == b':'
+                && b[16] == b':'
+                && ts.ends_with("+00:00"),
+            "{ts}"
+        );
+    }
+
+    #[test]
+    fn an_early_error_names_each_kind() {
+        for (kind, name) in [
+            (EarlyErrorKind::ConfigRefused, "config_refused"),
+            (EarlyErrorKind::Usage, "usage"),
+            (EarlyErrorKind::TracingInitFailed, "tracing_init_failed"),
+        ] {
+            let v: serde_json::Value =
+                serde_json::from_str(&early_line(kind, "m")).expect("one JSON object");
+            assert_eq!(v["error.kind"], name);
+        }
+    }
+
+    #[test]
+    fn an_early_error_is_redacted_like_every_other_line() {
+        let url = format!("https://t.example/announce?passkey={PASSKEY}");
+        let line = early_line(EarlyErrorKind::ConfigRefused, &format!("bad tracker {url}"));
+        assert!(!line.contains(PASSKEY), "{line}");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
+        assert_eq!(
+            v["message"],
+            format!("bad tracker {}", redacted(&url)).as_str()
+        );
+    }
 
     #[test]
     fn the_daemon_layer_holds_libtorrent_messages_to_the_host_only_rule() {
