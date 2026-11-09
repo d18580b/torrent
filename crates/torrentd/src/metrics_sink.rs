@@ -145,13 +145,16 @@ macro_rules! catalogue {
 }
 
 /// The `task` values of `task_up`: every long-running task the daemon
-/// supervises.
+/// supervises. A test in `startup::tasks` holds this equal to the tasks the
+/// daemon's source spawns under the supervisor.
 pub const TASKS: &[&str] = &[
+    "signals",
     "vpn_monitor",
     "port_forward_monitor",
     "reload",
     "verify_queue",
     "kill_switch_watch",
+    "watchdog",
 ];
 
 /// The `reason` values of `auth_rejections_total`.
@@ -339,6 +342,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
         ("target": crate::tracing_init::LOG_EVENT_TARGETS) Owner("always") =>
         "log_events_total for these levels as of the first scrape, which already holds what \
          the boot counted; fixed for the life of the process.";
+    "boot_panics" Gauge Daemon ("thread": crate::panic_hook::PANIC_THREADS) Owner("always") =>
+        "panics_total as of the first scrape, which already holds what the boot counted; fixed \
+         for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -410,6 +416,15 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "task_up" Gauge Daemon ("task": TASKS) Owner("always") =>
         "1 while a supervised background task runs; 0 once it has exited or panicked. \
          Only the tasks this configuration starts are present.";
+    "panics_total" Counter Daemon ("thread": crate::panic_hook::PANIC_THREADS) Zero =>
+        "Panics on any thread, by the thread's name (other for a thread with any other name, \
+         or none), caught or not: a kynos handler's and a supervised task's included. Each is \
+         also logged at ERROR, target torrentd::panic_hook, with its location, message and \
+         backtrace.";
+    "batch_writer_deaths_total" Counter Daemon Zero =>
+        "Batch writer threads (the resume and .torrent stores') that died by a panic. A dead \
+         writer's queued writes reach the disk only at the shutdown drain, so resume saves \
+         stop until the daemon restarts.";
     // control plane
     "auth_login_failures_total" Counter Daemon ("reason": &["bad_password", "throttled", "verification_budget"]) Zero =>
         "Refused logins: a wrong password, a client locked out by the throttle, or the \
@@ -738,6 +753,11 @@ pub const BOOT_COUNTS: &[BootCount] = &[
         gauge: "boot_log_events",
         only: Some(("level", BOOT_LOG_EVENT_LEVELS)),
     },
+    BootCount {
+        counter: PANICS,
+        gauge: "boot_panics",
+        only: None,
+    },
     // Last, so its gauge also holds any sample the rows above dropped as
     // they wrote theirs, which the first render's sample of the counter holds.
     BootCount {
@@ -783,12 +803,21 @@ pub struct PromSink {
     /// exported, in `LogEventCounts::snapshot`'s order. See
     /// [`PromSink::export_log_events`].
     log_events_exported: Mutex<Vec<u64>>,
+    /// The process-wide panic counts as of the last time they were
+    /// exported, in `PanicCounts::snapshot`'s order. See
+    /// [`PromSink::export_panics`].
+    panics_exported: Mutex<Vec<u64>>,
+    /// The engine's process-wide batch-writer death count as of the last
+    /// time it was exported.
+    writer_deaths_exported: Mutex<u64>,
     /// Run by the first render. See [`PromSink::export_boot_counts`].
     boot_counts: Once,
 }
 
 const DROPPED: &str = "metrics_dropped_samples_total";
 const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
+const PANICS: &str = "panics_total";
+const WRITER_DEATHS: &str = "batch_writer_deaths_total";
 const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
 
 impl PromSink {
@@ -813,6 +842,8 @@ impl PromSink {
             dropped,
             dir_fsync_exported: Mutex::new(0),
             log_events_exported: Mutex::new(Vec::new()),
+            panics_exported: Mutex::new(Vec::new()),
+            writer_deaths_exported: Mutex::new(0),
             boot_counts: Once::new(),
         };
         // A property of the binary, so it is known before anything else is.
@@ -877,8 +908,10 @@ impl PromSink {
     pub fn render(&self) -> Vec<u8> {
         self.export_dir_fsync_errors(torrentd_engine::batch_writer::dir_fsync_errors());
         self.export_log_events(&crate::tracing_init::log_events().snapshot());
-        // After the fsync and log counts are brought up to date, so their
-        // boot gauges hold what this very render exports.
+        self.export_panics(&crate::panic_hook::panics().snapshot());
+        self.export_writer_deaths(torrentd_engine::batch_writer::writer_deaths());
+        // After the fsync, log and panic counts are brought up to date, so
+        // their boot gauges hold what this very render exports.
         self.boot_counts.call_once(|| self.export_boot_counts());
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();
@@ -921,6 +954,35 @@ impl PromSink {
                 );
                 *done = *total;
             }
+        }
+    }
+
+    /// Bring `panics_total` up to `counts`, the process-wide panic counts as
+    /// `PanicCounts::snapshot` returns them, by the panics since the last
+    /// export.
+    ///
+    /// Read at scrape time for the reason the log counts are: the hook that
+    /// counts them is installed first in `main`, long before this sink
+    /// exists, and holds none.
+    fn export_panics(&self, counts: &[(&'static str, u64)]) {
+        let mut exported = self.panics_exported.lock();
+        exported.resize(counts.len(), 0);
+        for ((thread, total), done) in counts.iter().zip(exported.iter_mut()) {
+            if *total > *done {
+                self.add_counter(PANICS, *total - *done, &[("thread", thread)]);
+                *done = *total;
+            }
+        }
+    }
+
+    /// Bring `batch_writer_deaths_total` up to `total`, the engine's
+    /// process-wide count of batch writer threads that died, read at scrape
+    /// time because the writers hold no sink.
+    fn export_writer_deaths(&self, total: u64) {
+        let mut exported = self.writer_deaths_exported.lock();
+        if total > *exported {
+            self.add_counter(WRITER_DEATHS, total - *exported, &[]);
+            *exported = total;
         }
     }
 
@@ -1086,7 +1148,7 @@ impl MetricsSink for PromSink {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -1906,7 +1968,7 @@ mod tests {
     /// module path its untargeted events log under cut to the crate and
     /// top-level module, and its code up to an inline `#[cfg(test)] mod`,
     /// comment lines left out.
-    fn daemon_sources() -> Vec<(String, String, String)> {
+    pub(crate) fn daemon_sources() -> Vec<(String, String, String)> {
         fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
             let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?}: {e}"));
             for entry in entries {
@@ -1958,7 +2020,8 @@ mod tests {
                         lines[i].trim() == "#[cfg(test)]"
                             && lines.get(i + 1).is_some_and(|next| {
                                 let next = next.trim();
-                                next.starts_with("mod ") && next.ends_with('{')
+                                (next.starts_with("mod ") || next.starts_with("pub(crate) mod "))
+                                    && next.ends_with('{')
                             })
                     })
                     .unwrap_or(lines.len());
@@ -1993,7 +2056,7 @@ mod tests {
     }
 
     /// The string literal `rest` opens with.
-    fn literal(rest: &str) -> Option<&str> {
+    pub(crate) fn literal(rest: &str) -> Option<&str> {
         let rest = rest.trim_start().strip_prefix('"')?;
         rest.find('"').map(|end| &rest[..end])
     }

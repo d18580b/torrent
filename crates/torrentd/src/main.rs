@@ -39,6 +39,7 @@ mod live_torrent;
 mod metrics_sink;
 mod net_cmd;
 mod pacing;
+mod panic_hook;
 mod pool_cmd;
 mod pool_service;
 mod pool_trash;
@@ -567,6 +568,9 @@ fn log_prepared(prepared: Option<&vpn::caps::Prepared>) {
 }
 
 fn main() -> anyhow::Result<()> {
+    // First, so a panic on any thread from here on is one JSON line and a
+    // count in `torrentd_panics_total`, not plain text on stderr alone.
+    panic_hook::install();
     let cli = Cli::parse();
 
     // Exit 2, the usage-error status, rather than 1: nothing about the

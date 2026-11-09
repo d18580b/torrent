@@ -205,6 +205,7 @@ pub const LOG_EVENT_TARGETS: &[&str] = &[
     "torrentd::auth",
     "torrentd::http",
     "torrentd::metrics",
+    "torrentd::panic_hook",
     "torrentd::pool",
     "torrentd::port_forward_monitor",
     "torrentd::profile_registry",

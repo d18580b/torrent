@@ -91,7 +91,8 @@ hold.
 | `torrentd_boot_kill_switch_lost` | gauge | `outcome`: `reinstalled`, `lost` | daemon | from boot: always | kill_switch_lost_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_kill_switch_probe_errors` | gauge | — | daemon | from boot: always | kill_switch_probe_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_metrics_dropped_samples` | gauge | `reason`: `registration`, `labels` | daemon | from boot: always | metrics_dropped_samples_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
-| `torrentd_boot_log_events` | gauge | `level`: `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot: always | log_events_total for these levels as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_log_events` | gauge | `level`: `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot: always | log_events_total for these levels as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_panics` | gauge | `thread`: `main`, `torrentd-tokio`, `torrentd-alert-loop`, `torrentd-resume-writer`, `torrentd-torrent-writer`, `pool-release`, `other` | daemon | from boot: always | panics_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |
@@ -124,7 +125,9 @@ hold.
 | `torrentd_profile_port_forward_udp_mapped` | gauge | `profile_id` | each natpmp profile | on first event | 1 while the UDP (uTP) mapping sits on the forwarded port; 0 while the gateway mapped TCP only. |
 | `torrentd_profile_port_change_reannounce_seconds` | histogram | `profile_id` | each natpmp profile | on first event | Seconds from the gateway naming a new port to the last reannounce being handed to the session. |
 | `torrentd_alert_loop_heartbeat_age_seconds` | gauge | — | daemon | from boot: always | Seconds since the alert loop last completed an iteration; computed at scrape. |
-| `torrentd_task_up` | gauge | `task`: `vpn_monitor`, `port_forward_monitor`, `reload`, `verify_queue`, `kill_switch_watch` | daemon | from boot: always | 1 while a supervised background task runs; 0 once it has exited or panicked. Only the tasks this configuration starts are present. |
+| `torrentd_task_up` | gauge | `task`: `signals`, `vpn_monitor`, `port_forward_monitor`, `reload`, `verify_queue`, `kill_switch_watch`, `watchdog` | daemon | from boot: always | 1 while a supervised background task runs; 0 once it has exited or panicked. Only the tasks this configuration starts are present. |
+| `torrentd_panics_total` | counter | `thread`: `main`, `torrentd-tokio`, `torrentd-alert-loop`, `torrentd-resume-writer`, `torrentd-torrent-writer`, `pool-release`, `other` | daemon | from boot, at 0 | Panics on any thread, by the thread's name (other for a thread with any other name, or none), caught or not: a kynos handler's and a supervised task's included. Each is also logged at ERROR, target torrentd::panic_hook, with its location, message and backtrace. |
+| `torrentd_batch_writer_deaths_total` | counter | — | daemon | from boot, at 0 | Batch writer threads (the resume and .torrent stores') that died by a panic. A dead writer's queued writes reach the disk only at the shutdown drain, so resume saves stop until the daemon restarts. |
 | `torrentd_auth_login_failures_total` | counter | `reason`: `bad_password`, `throttled`, `verification_budget` | daemon | from boot, at 0 | Refused logins: a wrong password, a client locked out by the throttle, or the daemon-wide verification budget spent. |
 | `torrentd_auth_token_scope_denials_total` | counter | — | daemon | from boot, at 0 | Requests carrying a valid token without the scope the route needs. |
 | `torrentd_auth_cross_site_refusals_total` | counter | `reason`: `host`, `sec_fetch_site`, `origin`, `content_type` | daemon | from boot, at 0 | Requests a daemon without [auth] refused as sent by a browser from another site, by the header that refused them: a Host neither loopback nor in allowed_hosts, a cross-site Sec-Fetch-Site, a foreign Origin, or a body type an HTML form can send. |
@@ -155,7 +158,7 @@ hold.
 | `torrentd_dir_fsync_errors_total` | counter | — | daemon | from boot, at 0 | Directory fsyncs after a rename that failed, every one rather than only the logged first; the renamed file is on disk, but a power loss may revert its name. |
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |
 | `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, or an emission whose labels differ from the series' first use. |
-| `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
+| `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
 | `torrentd_build_fault_injection` | gauge | — | daemon | from boot: always | 1 if this binary was built with the fault-injection feature, which mounts POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a deployment. |
 
 ## The HTTP API
@@ -212,3 +215,27 @@ Alerts on it:
 | --- | --- | --- |
 | `TorrentdErrorsLogged` | warning | A line was logged at `ERROR` in the last 15 minutes, or during the boot (`torrentd_boot_log_events`), by `target`. |
 | `TorrentdWarningsElevated` | warning | `WARN` lines over 15 minutes came at more than three times the daemon's rate over the day before, and at least 10 of them, held for 15 minutes. |
+
+## Panics
+
+A panic on any thread, from the first line of `main` on, is logged as one
+`ERROR` line (target `torrentd::panic_hook`, message `thread panicked`)
+carrying `thread`, `panic.location`, `panic.message` (redacted like every
+other line) and `panic.backtrace`, and counted in `torrentd_panics_total` by
+the thread's name. A panic that something catches — a kynos handler's, a
+supervised task's — is logged and counted too. The standard library's own
+plain-text message still follows it on stderr.
+
+Every long-lived task the daemon spawns is supervised, and in
+`torrentd_task_up`; `cargo test -p torrentd` fails on one that is not. A batch
+writer thread (the resume and `.torrent` stores') that dies is logged at
+`ERROR` (target `torrentd_engine::batch_writer`) and counted in
+`torrentd_batch_writer_deaths_total`: its queued writes then reach the disk
+only at the shutdown drain, so restart the daemon.
+
+Alerts on them:
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdPanicked` | critical | A thread panicked in the last 15 minutes, or during the boot (`torrentd_boot_panics`), by `thread`. |
+| `TorrentdTaskDown` | critical | A supervised task (`task`) has exited or panicked. |

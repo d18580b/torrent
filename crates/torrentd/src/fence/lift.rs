@@ -117,71 +117,79 @@ pub(crate) fn spawn_run(
     lift: Lift,
 ) -> tokio::task::JoinHandle<Resumed> {
     let (profiles, metrics, id) = (profiles.clone(), metrics.clone(), entry.id().clone());
-    tokio::runtime::Handle::current().spawn(async move {
-        let mut failed = std::collections::HashSet::new();
-        let resumed = resume_paced(
-            profiles.clone(),
-            id.clone(),
-            run.handles(),
-            REANNOUNCE_PACE,
-            {
-                let run = run.clone();
-                move || run.cancelled()
-            },
-            run.gate().clone(),
-            metrics,
-            |h, err| {
-                failed.insert(h);
-                error!(
-                    target: "torrentd::vpn_monitor",
-                    profile_id = %id,
-                    lift = lift.as_str(),
-                    infohash = %h.infohash,
-                    error.cause = %err,
-                    "could not resume a torrent while lifting the profile's fence",
-                )
-            },
-        )
-        .await;
-        // The run goes in order, so what it reached is the front of its
-        // list: resumed, left out for a pause, or refused. A refused one is
-        // still paused by the pace, so it stays held.
-        let reached: Vec<TorrentHandle> = run.handles()
-            [..run.handles().len() - resumed.not_reached]
-            .iter()
-            .filter(|h| !failed.contains(*h))
-            .copied()
-            .collect();
-        // Released only while the run is still the profile's: one a
-        // set-offline, fence, pause or newer lift stopped leaves what is held
-        // to whatever stopped it ([`ProfileEntry::end_resume`]).
-        let release = {
-            let (profiles, id, run) = (profiles.clone(), id.clone(), run.clone());
-            tokio::task::spawn_blocking(move || {
-                if let Some(entry) = profiles.resolve(&id).active() {
-                    entry.end_resume(&run, &reached);
+    // Transient, not supervised: a lift ends once its torrents are resumed,
+    // and several can run at once. Every caller but a test drops the handle,
+    // so a panic here would otherwise leave the profile's torrents paused
+    // with nothing but the panic line to say so.
+    crate::startup::spawn_transient(
+        "fence_lift",
+        "the lifted profile's torrents not yet resumed stay paused",
+        async move {
+            let mut failed = std::collections::HashSet::new();
+            let resumed = resume_paced(
+                profiles.clone(),
+                id.clone(),
+                run.handles(),
+                REANNOUNCE_PACE,
+                {
+                    let run = run.clone();
+                    move || run.cancelled()
+                },
+                run.gate().clone(),
+                metrics,
+                |h, err| {
+                    failed.insert(h);
+                    error!(
+                        target: "torrentd::vpn_monitor",
+                        profile_id = %id,
+                        lift = lift.as_str(),
+                        infohash = %h.infohash,
+                        error.cause = %err,
+                        "could not resume a torrent while lifting the profile's fence",
+                    )
+                },
+            )
+            .await;
+            // The run goes in order, so what it reached is the front of its
+            // list: resumed, left out for a pause, or refused. A refused one is
+            // still paused by the pace, so it stays held.
+            let reached: Vec<TorrentHandle> = run.handles()
+                [..run.handles().len() - resumed.not_reached]
+                .iter()
+                .filter(|h| !failed.contains(*h))
+                .copied()
+                .collect();
+            // Released only while the run is still the profile's: one a
+            // set-offline, fence, pause or newer lift stopped leaves what is held
+            // to whatever stopped it ([`ProfileEntry::end_resume`]).
+            let release = {
+                let (profiles, id, run) = (profiles.clone(), id.clone(), run.clone());
+                tokio::task::spawn_blocking(move || {
+                    if let Some(entry) = profiles.resolve(&id).active() {
+                        entry.end_resume(&run, &reached);
+                    }
+                })
+            };
+            if let Err(e) = release.await {
+                if e.is_panic() {
+                    std::panic::resume_unwind(e.into_panic());
                 }
-            })
-        };
-        if let Err(e) = release.await {
-            if e.is_panic() {
-                std::panic::resume_unwind(e.into_panic());
             }
-        }
-        info!(
-            target: "torrentd::vpn_monitor",
-            profile_id = %id,
-            lift = lift.as_str(),
-            torrent_count = resumed.resumed,
-            failed_count = resumed.refused,
-            not_reached = resumed.not_reached,
-            excluded_count = resumed.excluded,
-            halted = resumed.halted,
-            "finished resuming the torrents of a lifted fence; any not reached were stopped \
-             by a fence, a newer lift or a pause of the profile that landed first",
-        );
-        resumed
-    })
+            info!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %id,
+                lift = lift.as_str(),
+                torrent_count = resumed.resumed,
+                failed_count = resumed.refused,
+                not_reached = resumed.not_reached,
+                excluded_count = resumed.excluded,
+                halted = resumed.halted,
+                "finished resuming the torrents of a lifted fence; any not reached were stopped \
+                 by a fence, a newer lift or a pause of the profile that landed first",
+            );
+            resumed
+        },
+    )
 }
 
 /// What a [`resume_paced`] run reached.

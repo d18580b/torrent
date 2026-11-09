@@ -111,6 +111,7 @@ use shutdown_report::take_shutdown_report;
 use shutdown_report::write_shutdown_report;
 use shutdown_report::ShutdownReport;
 use tasks::spawn_supervised;
+pub(crate) use tasks::spawn_transient;
 use teardown::stop_fencing;
 use teardown::teardown_network;
 use teardown::wait_for_pool_work;
@@ -297,7 +298,12 @@ pub async fn boot(
     let shutdown_tx = channels.shutdown_tx.clone();
     // Before the listener that can send to them: see `boot_shutdown_receivers`.
     let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
-    signals::run(channels.clone()).await;
+    // Metrics sink — created here, before the signal listener it supervises,
+    // the stores, whose batched writers count their failures in it, and the
+    // startup scans, which record registry rejections
+    // (profile_assignment_registry_errors_total).
+    let metrics = Arc::new(PromSink::new());
+    spawn_supervised("signals", metrics.clone(), signals::run(channels.clone()));
 
     // Tunnel bring-up (up to 30 s a profile) and the resume and torrent-dir
     // scans (minutes at 100K torrents) can outrun any fixed
@@ -429,10 +435,6 @@ pub async fn boot(
 
     let mut cleanup = BootCleanup::new(run_dir.clone());
 
-    // Metrics sink — created before the stores, whose batched writers count
-    // their failures in it, and the startup scans, which record registry
-    // rejections (profile_assignment_registry_errors_total).
-    let metrics = Arc::new(PromSink::new());
     metrics.set_gauge(
         "state_fs_unsupported",
         if unsupported_state_fs.is_empty() {
@@ -658,24 +660,26 @@ pub async fn boot(
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
     // session if the forwarded port changes, and reannounces. Started as soon
     // as the profiles are built, so a 60 s lease is not left unrenewed through
-    // the scans, and supervised only where a profile negotiates a port. It
-    // confirms a rebind against the listen outcomes the alert loop publishes
-    // into `listen_events`.
+    // the scans, and started only where a profile negotiates a port: without
+    // one it has nothing to renew and returns at once, so there is no task to
+    // run, unsupervised or otherwise. It confirms a rebind against the listen
+    // outcomes the alert loop publishes into `listen_events`.
     let listen_events = Arc::new(torrentd_engine::port_forward::ListenEvents::new());
-    let pf = crate::port_forward_monitor::run(
-        profile_registry.clone(),
-        state.clone(),
-        metrics.clone(),
-        listen_events.clone(),
-        shutdown_tx.subscribe(),
-    );
     if profile_registry
         .iter()
         .any(|e| e.config.port_forward() == PortForwardMode::Natpmp)
     {
-        spawn_supervised("port_forward_monitor", metrics.clone(), pf);
-    } else {
-        tokio::spawn(pf);
+        spawn_supervised(
+            "port_forward_monitor",
+            metrics.clone(),
+            crate::port_forward_monitor::run(
+                profile_registry.clone(),
+                state.clone(),
+                metrics.clone(),
+                listen_events.clone(),
+                shutdown_tx.subscribe(),
+            ),
+        );
     }
     // VPN health monitor, started here for the same reason: the scans below
     // run for minutes on a large pool, and a tunnel that drops during them
@@ -1296,12 +1300,12 @@ impl DaemonHandle {
         // the background tasks to stop.
         let listener = bind_api_listener(&cfg).await;
         let posture = unauthenticated_posture(&cfg);
-        let (tx, alert, gate) = (&shutdown_tx, &alert_loop, &work);
+        let (tx, alert, gate, sink) = (&shutdown_tx, &alert_loop, &work, &metrics);
         let mut exit_code = run_http_stage(
             listener,
             app,
             |listener, app| async move {
-                announce_ready(&http_listen, posture, tx, alert);
+                announce_ready(&http_listen, posture, tx, alert, sink);
                 match listener {
                     ApiListener::Tcp(listener) => {
                         serve_until_shutdown(listener, app, shutdown_rx, gate).await
