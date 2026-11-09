@@ -123,7 +123,10 @@ RUN microdnf install -y \
         coreutils libcap tini \
     && microdnf clean all
 
-COPY --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
+# 0755 whatever mode the build left: a builder whose umask or default ACL
+# drops "other" (a checkout on a setgid, ACL'd filesystem does) would
+# otherwise leave a binary that uid 1000 cannot execute.
+COPY --chmod=0755 --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
 
 # CAP_NET_ADMIN for a `network = "vpn"` profile and the kill switch, as a file
 # capability, so the daemon runs as the unprivileged uid below and the kill
