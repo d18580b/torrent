@@ -241,3 +241,27 @@ Alerts on them:
 | --- | --- | --- |
 | `TorrentdPanicked` | critical | A thread panicked in the last 15 minutes, or during the boot (`torrentd_boot_panics`), by `thread`. |
 | `TorrentdTaskDown` | critical | A supervised task (`task`) has exited or panicked. |
+
+## The build and the process
+
+`torrentd_build_info` is 1, and its labels say which binary is running:
+`version` is the `torrentd` crate's, `arch` the CPU architecture it was built
+for, and `revision` the commit it was built from, which the build reads from
+`TORRENTD_REVISION` (`TORRENTD_REVISION=$(git rev-parse HEAD) cargo build
+--release`) and records as `unknown` where that is unset. `features` names the
+cargo features beyond the default the binary was built with, comma-separated:
+`fault-injection` for the alert drill's build, and empty for every build a
+deployment runs. Join it onto another series to split that series by build
+across an upgrade:
+`torrentd_libtorrent_num_seeding_torrents * on (instance) group_left (version) torrentd_build_info`.
+
+`torrentd_process_start_time_seconds` is when the process started, fixed
+before it reads its configuration. `time() - torrentd_process_start_time_seconds`
+is its uptime, and each change in it is a restart that lived long enough to be
+scraped.
+
+Alerts on them:
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdRestarted` | warning | The process started more than twice in an hour (`changes(torrentd_process_start_time_seconds[1h]) > 2`): it is crash-looping. A process that dies before its first scrape changes nothing here, and is `TorrentdDown`'s. |

@@ -31,6 +31,29 @@ tests:
             exp_annotations:
               summary: "torrentd on seedbox:8080 is not answering scrapes"
 
+  # Restarts at 10m, 20m and 30m: two in an hour (a deploy and a retry) stay
+  # quiet, the third fires, and an hour without one resolves it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_process_start_time_seconds{job="torrentd", instance="seedbox:8080"}'
+        values: '1000x9 1600x9 2200x9 2800x80'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: TorrentdRestarted
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: TorrentdRestarted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: torrentd
+              instance: seedbox:8080
+            exp_annotations:
+              summary: "torrentd on seedbox:8080 restarted 3 times in the last hour; it is crash-looping"
+      - eval_time: 95m
+        alertname: TorrentdRestarted
+        exp_alerts: []
+
   - interval: 1m
     input_series:
       - series: 'torrentd_alert_loop_heartbeat_age_seconds'
