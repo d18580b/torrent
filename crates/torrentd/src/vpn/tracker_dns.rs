@@ -131,8 +131,15 @@ impl TunnelResolver {
                 return Ok(addrs.clone());
             }
         }
-        let mut last = io::Error::other("no tunnel resolver configured");
-        'servers: for server in &self.servers {
+        let mut last = io::Error::other("no tunnel resolver of the tunnel address's family");
+        // A resolver of the other family could only be asked from an unbound
+        // source, which leaves by the main routing table where
+        // `SO_BINDTODEVICE` is refused, so it is passed over.
+        'servers: for server in self
+            .servers
+            .iter()
+            .filter(|s| s.is_ipv4() == self.bind.is_ipv4())
+        {
             for qtype in [dns::TYPE_A, dns::TYPE_AAAA] {
                 match self.ask(*server, &key, qtype).await {
                     Ok(answer) if answer.addrs.is_empty() => continue,
@@ -162,14 +169,7 @@ impl TunnelResolver {
     }
 
     async fn ask(&self, server: SocketAddr, name: &str, qtype: u16) -> io::Result<dns::Answer> {
-        let local = match (self.bind, server) {
-            (IpAddr::V4(_), SocketAddr::V4(_)) | (IpAddr::V6(_), SocketAddr::V6(_)) => {
-                SocketAddr::new(self.bind, 0)
-            }
-            (_, SocketAddr::V4(_)) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-            (_, SocketAddr::V6(_)) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-        };
-        let sock = UdpSocket::bind(local).await?;
+        let sock = UdpSocket::bind(SocketAddr::new(self.bind, 0)).await?;
         bind_device(&sock, self.device.as_deref());
         let id = rand::thread_rng().next_u32() as u16;
         sock.send_to(&dns::query(id, name, qtype)?, server).await?;
@@ -202,17 +202,24 @@ impl TunnelResolver {
                 .map(|ip| SocketAddr::new(ip, *port))
                 .collect(),
         };
-        let mut last = io::Error::new(io::ErrorKind::NotFound, "no address to connect to");
-        for addr in addrs {
+        let mut last = io::Error::new(
+            io::ErrorKind::NotFound,
+            "no address of the tunnel's family to connect to",
+        );
+        // Only the tunnel address's family: a socket of the other family
+        // cannot be bound to it, and where `SO_BINDTODEVICE` is refused it
+        // would follow the main routing table off the tunnel.
+        for addr in addrs
+            .into_iter()
+            .filter(|a| a.is_ipv4() == self.bind.is_ipv4())
+        {
             let sock = if addr.is_ipv4() {
                 TcpSocket::new_v4()?
             } else {
                 TcpSocket::new_v6()?
             };
             bind_device(&sock, self.device.as_deref());
-            if addr.is_ipv4() == self.bind.is_ipv4() {
-                sock.bind(SocketAddr::new(self.bind, 0))?;
-            }
+            sock.bind(SocketAddr::new(self.bind, 0))?;
             match tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(addr)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => last = e,
