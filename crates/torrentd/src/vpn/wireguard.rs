@@ -556,23 +556,15 @@ pub fn tunnel_holding(text: &str, addr: std::net::IpAddr) -> Option<String> {
     if let Some(prefix) = parsed.addresses.iter().find(|a| native::covers(a, addr)) {
         return Some(format!("Address = {prefix}"));
     }
-    let mut in_interface = false;
-    for line in text.lines() {
-        let stripped = line.split('#').next().unwrap_or_default();
-        let Some((key, value)) = stripped.split_once('=') else {
-            in_interface = stripped.trim().eq_ignore_ascii_case("[Interface]");
-            continue;
-        };
-        if in_interface && key.trim().eq_ignore_ascii_case("DNS") {
-            let named = value
+    parsed
+        .dns
+        .iter()
+        .find(|value| {
+            value
                 .split(',')
-                .any(|v| v.trim().parse::<std::net::IpAddr>() == Ok(addr));
-            if named {
-                return Some(format!("DNS = {}", value.trim()));
-            }
-        }
-    }
-    None
+                .any(|v| v.trim().parse::<std::net::IpAddr>() == Ok(addr))
+        })
+        .map(|value| format!("DNS = {value}"))
 }
 
 #[derive(Debug)]
@@ -1166,6 +1158,9 @@ mod native {
         pub(super) mtu: Option<u32>,
         /// `false` for `Table = off`.
         pub(super) route: bool,
+        /// Each `[Interface]` `DNS` line's value, as written. The link never
+        /// applies it ([`Parsed::ignored`]); [`super::tunnel_holding`] reads it.
+        pub(super) dns: Vec<String>,
         /// `wg-quick`-only keys this path cannot honour and ignores.
         pub(super) ignored: Vec<String>,
         /// The config with every `wg-quick`-only line removed, for `wg setconf`.
@@ -1341,6 +1336,9 @@ mod native {
                         continue;
                     }
                     "dns" | "saveconfig" => {
+                        if lower == "dns" {
+                            p.dns.push(value.to_string());
+                        }
                         p.ignored.push(key.to_string());
                         continue;
                     }
