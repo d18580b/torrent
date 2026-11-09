@@ -727,6 +727,21 @@ mod tests {
             &[(XFF, "198.51.100.7, 104.16.0.5")],
         );
         assert_eq!(c.ip, Some("104.16.0.5".parse().unwrap()));
+        // An unspecified hop stops the walk even where a listed range
+        // contains it: the walk tests `is_proxy`, not the bare trust list.
+        let with_unspecified: Vec<&str> = CHAIN_PROXIES
+            .iter()
+            .copied()
+            .chain(["0.0.0.0/8", "::/8"])
+            .collect();
+        for (chain, ip) in [
+            ("198.51.100.7, 0.0.0.0, 104.16.0.5", "0.0.0.0"),
+            ("198.51.100.7, ::ffff:0.0.0.0, 104.16.0.5", "0.0.0.0"),
+            ("2001:db8::7, ::, 104.16.0.5", "::"),
+        ] {
+            let c = resolve_from(INGRESS, &with_unspecified, &[(XFF, chain)]);
+            assert_eq!(c.ip, Some(ip.parse().unwrap()), "{chain}");
+        }
     }
 
     /// The walk skips at most `MAX_HOPS` trusted hops; the element beyond
