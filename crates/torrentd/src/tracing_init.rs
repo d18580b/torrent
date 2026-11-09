@@ -44,6 +44,19 @@
 //! `CONTRIBUTING.md` § Reporting bugs promises this to bug reporters; change
 //! the two together.
 //!
+//! # Counting WARN and ERROR events
+//!
+//! Beside the JSON layer, [`init`] installs a layer that counts every event
+//! at `WARN` and `ERROR` into [`LogEventCounts`], a process-wide store the
+//! metrics sink reads at scrape time as `torrentd_log_events_total{level,
+//! target}`. The subscriber is installed before the sink exists, which is why
+//! the counts live here rather than in it. The log filter is the JSON layer's
+//! own (a per-layer filter), so an event is counted whatever `log_level` or
+//! `RUST_LOG` lets through to the log. `target` is the event's target cut to
+//! its first two `::` segments (the crate and its top-level module), and one
+//! [`LOG_EVENT_TARGETS`] does not list is counted as `other`, so the series'
+//! cardinality is fixed.
+//!
 //! # Before the subscriber exists
 //!
 //! The daemon refuses a config (exit 78), a usage error (exit 2) and a failed
@@ -56,16 +69,21 @@
 
 use std::fmt;
 use std::io::Write as _;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use tracing::Event;
+use tracing::Level;
 use tracing::Subscriber;
 use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::ChronoUtc;
 use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::fmt::FormatEvent;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::reload;
@@ -147,15 +165,136 @@ fn level_filter(level: LogLevel) -> EnvFilter {
 /// lost every later log line without a word.
 pub fn init(level: LogLevel) -> anyhow::Result<LogReloadHandle> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| level_filter(level));
-    let (filter_layer, handle) = reload::Layer::new(filter);
-
-    tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(fmt_layer(std::io::stdout))
+    let (handle, subscriber) = subscriber(filter, std::io::stdout, &LOG_EVENTS);
+    subscriber
         .try_init()
         .map_err(|e| anyhow::anyhow!("install the tracing subscriber: {e}"))?;
+    Ok(handle)
+}
 
-    Ok(LogReloadHandle { inner: handle })
+/// The daemon's subscriber: the JSON layer behind the reloadable `filter`,
+/// and beside it the layer counting WARN and ERROR events into `counts`,
+/// which `filter` does not hold back.
+fn subscriber<W>(
+    filter: EnvFilter,
+    writer: W,
+    counts: &'static LogEventCounts,
+) -> (LogReloadHandle, impl Subscriber + Send + Sync + 'static)
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let (filter, handle) = reload::Layer::new(filter);
+    let subscriber = tracing_subscriber::registry()
+        .with(fmt_layer(writer).with_filter(filter))
+        .with(CountLogEvents(counts).with_filter(LevelFilter::WARN));
+    (LogReloadHandle { inner: handle }, subscriber)
+}
+
+/// The `level` values of `torrentd_log_events_total`, in the order
+/// [`LogEventCounts`] holds them.
+pub const LOG_EVENT_LEVELS: &[&str] = &["warn", "error"];
+
+/// The `target` values of `torrentd_log_events_total`: every crate and
+/// top-level module of the daemon that logs at WARN or ERROR, by explicit
+/// target or by its module path, then `other` for any target outside them
+/// (a dependency's, or a module added since). A test in `metrics_sink` holds
+/// this list equal to what the daemon's source logs under.
+pub const LOG_EVENT_TARGETS: &[&str] = &[
+    "torrentd",
+    "torrentd::api_socket",
+    "torrentd::auth",
+    "torrentd::http",
+    "torrentd::metrics",
+    "torrentd::pool",
+    "torrentd::port_forward_monitor",
+    "torrentd::profile_registry",
+    "torrentd::reload",
+    "torrentd::sd_notify",
+    "torrentd::signals",
+    "torrentd::startup",
+    "torrentd::vpn",
+    "torrentd::vpn_monitor",
+    "torrentd_engine::alert_loop",
+    "torrentd_engine::batch_writer",
+    "torrentd_engine::handler",
+    "torrentd_engine::registry",
+    "torrentd_engine::store",
+    "torrentd_pool::adopt",
+    "torrentd_pool::drift",
+    "torrentd_pool::scan",
+    "torrentd_pool::store",
+    "other",
+];
+
+const LOG_EVENT_TARGET_COUNT: usize = LOG_EVENT_TARGETS.len();
+
+/// WARN and ERROR events counted since the process started, by level and
+/// target. Process-wide because [`init`] installs the layer that writes it
+/// before the metrics sink that reads it exists.
+pub struct LogEventCounts([[AtomicU64; LOG_EVENT_TARGET_COUNT]; 2]);
+
+static LOG_EVENTS: LogEventCounts = LogEventCounts::new();
+
+/// The counts the subscriber [`init`] installs writes.
+pub fn log_events() -> &'static LogEventCounts {
+    &LOG_EVENTS
+}
+
+impl LogEventCounts {
+    const fn new() -> Self {
+        Self([const { [const { AtomicU64::new(0) }; LOG_EVENT_TARGET_COUNT] }; 2])
+    }
+
+    fn count(&self, level: &Level, target: &str) {
+        let row = match *level {
+            Level::WARN => 0,
+            Level::ERROR => 1,
+            _ => return,
+        };
+        self.0[row][log_event_target_index(target)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Every `(level, target, count)`, each level's targets in
+    /// [`LOG_EVENT_TARGETS`]' order, levels in [`LOG_EVENT_LEVELS`]'.
+    pub fn snapshot(&self) -> Vec<(&'static str, &'static str, u64)> {
+        LOG_EVENT_LEVELS
+            .iter()
+            .zip(&self.0)
+            .flat_map(|(level, row)| {
+                LOG_EVENT_TARGETS
+                    .iter()
+                    .zip(row)
+                    .map(move |(target, n)| (*level, *target, n.load(Ordering::Relaxed)))
+            })
+            .collect()
+    }
+}
+
+/// `target` cut to its first two `::` segments.
+pub(crate) fn log_event_module(target: &str) -> &str {
+    match target.match_indices("::").nth(1) {
+        Some((at, _)) => &target[..at],
+        None => target,
+    }
+}
+
+/// The index in [`LOG_EVENT_TARGETS`] `target` is counted under.
+fn log_event_target_index(target: &str) -> usize {
+    let module = log_event_module(target);
+    LOG_EVENT_TARGETS
+        .iter()
+        .position(|t| *t == module)
+        .unwrap_or(LOG_EVENT_TARGET_COUNT - 1)
+}
+
+/// Counts each event it sees into its [`LogEventCounts`].
+struct CountLogEvents(&'static LogEventCounts);
+
+impl<S: Subscriber> Layer<S> for CountLogEvents {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let meta = event.metadata();
+        self.0.count(meta.level(), meta.target());
+    }
 }
 
 /// The `error.kind` of a line [`early_error`] writes.
@@ -215,6 +354,7 @@ fn early_line(kind: EarlyErrorKind, message: &str) -> String {
 /// `init`'s subscriber, reloadable filter and daemon layer included, writing
 /// to `writer` and installed nowhere, so a test can scope it with
 /// `tracing::subscriber::set_default` and drive a real `LogReloadHandle`.
+/// It counts into counts of its own, not the process-wide ones.
 #[cfg(test)]
 pub(crate) fn for_tests<W>(
     level: LogLevel,
@@ -223,11 +363,8 @@ pub(crate) fn for_tests<W>(
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    let (filter_layer, handle) = reload::Layer::new(level_filter(level));
-    let subscriber = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(fmt_layer(writer));
-    (LogReloadHandle { inner: handle }, subscriber)
+    let counts: &'static LogEventCounts = Box::leak(Box::new(LogEventCounts::new()));
+    subscriber(level_filter(level), writer, counts)
 }
 
 /// An in-memory log a test hands to `fmt_layer` and reads back.
@@ -346,6 +483,58 @@ mod tests {
                 && b[16] == b':'
                 && ts.ends_with("+00:00"),
             "{ts}"
+        );
+    }
+
+    #[test]
+    fn warn_and_error_events_are_counted_by_module_whatever_the_log_level() {
+        let counts: &'static LogEventCounts = Box::leak(Box::new(LogEventCounts::new()));
+        let buf = Buf::default();
+        let (_handle, subscriber) = subscriber(level_filter(LogLevel::Error), buf.clone(), counts);
+        torrentd_engine::testing::with_subscriber(subscriber, || {
+            tracing::warn!(target: "torrentd::vpn::wireguard", "w1");
+            tracing::warn!(target: "torrentd::vpn", "w2");
+            tracing::error!(target: "torrentd_engine::handler::listen", "e1");
+            tracing::warn!(target: "hyper::proto::h1", "w3");
+            tracing::info!(target: "torrentd::vpn", "i1");
+            tracing::debug!(target: "torrentd::vpn", "d1");
+        });
+        let n = |level: &str, target: &str| {
+            counts
+                .snapshot()
+                .into_iter()
+                .find(|(l, t, _)| *l == level && *t == target)
+                .map(|(_, _, n)| n)
+                .unwrap_or_else(|| panic!("no {level}/{target} in the snapshot"))
+        };
+        assert_eq!(n("warn", "torrentd::vpn"), 2);
+        assert_eq!(n("error", "torrentd_engine::handler"), 1);
+        assert_eq!(n("warn", "other"), 1);
+        let total: u64 = counts.snapshot().iter().map(|(_, _, n)| n).sum();
+        assert_eq!(total, 4, "INFO and DEBUG are not counted");
+        // The log's own filter held the WARN lines back from the log, not
+        // from the count.
+        let out = buf.text();
+        assert!(out.contains("e1"), "{out}");
+        assert!(!out.contains("w1"), "{out}");
+        assert_eq!(
+            counts.snapshot().len(),
+            LOG_EVENT_LEVELS.len() * LOG_EVENT_TARGETS.len()
+        );
+    }
+
+    #[test]
+    fn a_log_event_target_is_cut_to_its_crate_and_module() {
+        assert_eq!(
+            log_event_module("torrentd::vpn::wireguard"),
+            "torrentd::vpn"
+        );
+        assert_eq!(log_event_module("torrentd::vpn"), "torrentd::vpn");
+        assert_eq!(log_event_module("torrentd"), "torrentd");
+        assert_eq!(LOG_EVENT_TARGETS.last(), Some(&"other"));
+        assert_eq!(
+            LOG_EVENT_TARGETS[log_event_target_index("not_ours::x")],
+            "other"
         );
     }
 

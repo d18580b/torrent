@@ -91,6 +91,7 @@ hold.
 | `torrentd_boot_kill_switch_lost` | gauge | `outcome`: `reinstalled`, `lost` | daemon | from boot: always | kill_switch_lost_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_kill_switch_probe_errors` | gauge | — | daemon | from boot: always | kill_switch_probe_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_metrics_dropped_samples` | gauge | `reason`: `registration`, `labels` | daemon | from boot: always | metrics_dropped_samples_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_log_events` | gauge | `level`: `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot: always | log_events_total for these levels as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |
@@ -151,6 +152,7 @@ hold.
 | `torrentd_dir_fsync_errors_total` | counter | — | daemon | from boot, at 0 | Directory fsyncs after a rename that failed, every one rather than only the logged first; the renamed file is on disk, but a power loss may revert its name. |
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |
 | `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, or an emission whose labels differ from the series' first use. |
+| `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
 | `torrentd_build_fault_injection` | gauge | — | daemon | from boot: always | 1 if this binary was built with the fault-injection feature, which mounts POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a deployment. |
 
 ## The HTTP API
@@ -185,3 +187,25 @@ Alerts on them:
 | `TorrentdHttp5xx` | warning | More than 5% of the API's responses over 10 minutes, and at least 3, were 5xx, held for 5 minutes. `/healthz` (its 503 is `TorrentdUnready`'s) and `/metrics` are left out. |
 | `TorrentdHttpSlow` | warning | A route's 99th-percentile time to the response head over 15 minutes stayed above 5s for 15 minutes. |
 | `TorrentdAuthRejections` | warning | Bearer tokens of one `reason` were refused in every 5-minute window for 15 minutes: a client — usually a scraper whose token was rotated — keeps presenting one that does not work. |
+
+## The log
+
+`torrentd_log_events_total` counts every line logged at `WARN` or `ERROR`,
+whatever `log_level` or `RUST_LOG` lets through to the log itself. `target`
+is the line's `target` cut to its crate and top-level module
+(`torrentd::vpn::wireguard` counts as `torrentd::vpn`); a target outside the
+listed set, a dependency's included, counts as `other`. The listed set is
+every module the daemon logs at `WARN` or `ERROR` under, and
+`cargo test -p torrentd` fails if it drifts from the source. A line a refused
+start writes before logging is set up (exit 78, 2 or 70) is not counted.
+
+Every `error.kind` the daemon logs is either counted by a series of its own
+present from boot, or logged at `WARN` or `ERROR` so that this counter counts
+it; `cargo test -p torrentd` fails on one that is neither.
+
+Alerts on it:
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdErrorsLogged` | warning | A line was logged at `ERROR` in the last 15 minutes, or during the boot (`torrentd_boot_log_events`), by `target`. |
+| `TorrentdWarningsElevated` | warning | `WARN` lines over 15 minutes came at more than three times the daemon's rate over the day before, and at least 10 of them, held for 15 minutes. |

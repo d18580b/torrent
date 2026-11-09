@@ -53,6 +53,40 @@ groups:
         annotations:
           summary: "The exporter dropped samples ({{ $labels.reason }}); some series are missing or stale"
 
+      - alert: TorrentdErrorsLogged
+        # Any line logged at ERROR, by the module that logged it: the
+        # catch-all for an error path no series of its own reports. Many
+        # ERROR lines also fire an alert of their own; this one names whose
+        # log to read. An ERROR the boot logged is in the first sample, so
+        # the boot gauge carries it.
+        expr: >
+          increase(torrentd_log_events_total{level="error"}[15m]) > 0
+          or torrentd_boot_log_events{level="error"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "torrentd logged ERROR lines under {{ $labels.target }}; read its log for them"
+
+      - alert: TorrentdWarningsElevated
+        # WARN lines over the last 15 minutes at more than three times the
+        # daemon's own rate over the day before them, and at least 10 of
+        # them, held for 15 minutes. Some WARN lines are routine (a tracker
+        # that stops answering), so the baseline is the daemon's own rather
+        # than a fixed number, and the floor keeps a quiet daemon's first
+        # few warnings from firing it. Without the day before (a daemon not
+        # scraped for 15 minutes yet) there is no baseline and no alert.
+        expr: |
+          sum by (instance, job) (rate(torrentd_log_events_total{level="warn"}[15m]))
+            >
+          3 * sum by (instance, job) (rate(torrentd_log_events_total{level="warn"}[1d] offset 15m))
+            and on (instance, job)
+          sum by (instance, job) (increase(torrentd_log_events_total{level="warn"}[15m])) >= 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "torrentd is logging WARN lines at over three times its rate of the day before; torrentd_log_events_total by target names the module"
+
       - alert: TorrentdUnready
         # The `no_sessions` and `all_profiles_fenced` cases of /healthz's 503,
         # from the scrape rather than a probe: every configured profile either

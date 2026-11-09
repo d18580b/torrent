@@ -109,6 +109,97 @@ tests:
             exp_annotations:
               summary: "The exporter dropped samples (labels); some series are missing or stale"
 
+  # One ERROR under torrentd::vpn at 2m fires for that target alone, and
+  # resolves 15 minutes on; the seeded zero under torrentd::http, and WARN
+  # lines, never fire it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_log_events_total{level="error", target="torrentd::vpn"}'
+        values: '0 0 1x30'
+      - series: 'torrentd_log_events_total{level="error", target="torrentd::http"}'
+        values: '0x32'
+      - series: 'torrentd_log_events_total{level="warn", target="torrentd::http"}'
+        values: '0+5x32'
+      - series: 'torrentd_boot_log_events{level="error", target="torrentd::vpn"}'
+        values: '0x32'
+      - series: 'torrentd_boot_log_events{level="error", target="torrentd::http"}'
+        values: '0x32'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdErrorsLogged
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdErrorsLogged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              level: error
+              target: torrentd::vpn
+            exp_annotations:
+              summary: "torrentd logged ERROR lines under torrentd::vpn; read its log for them"
+      - eval_time: 30m
+        alertname: TorrentdErrorsLogged
+        exp_alerts: []
+
+  # An ERROR the boot logged: 1 at the first sample, flat. The boot gauge
+  # fires it, past the 15-minute window.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_log_events_total{level="error", target="torrentd::startup"}'
+        values: '1x40'
+      - series: 'torrentd_boot_log_events{level="error", target="torrentd::startup"}'
+        values: '1x40'
+      - series: 'torrentd_log_events_total{level="error", target="other"}'
+        values: '0x40'
+      - series: 'torrentd_boot_log_events{level="error", target="other"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TorrentdErrorsLogged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              level: error
+              target: torrentd::startup
+            exp_annotations:
+              summary: "torrentd logged ERROR lines under torrentd::startup; read its log for them"
+
+  # A day of one WARN line a minute, then ten a minute from 24h: over three
+  # times the day's rate, pending at first and firing once it has held for
+  # 15 minutes. The steady day before never fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_log_events_total{level="warn", target="torrentd::vpn"}'
+        values: '0+1x1440 1450+10x59'
+      - series: 'torrentd_log_events_total{level="warn", target="other"}'
+        values: '0x1500'
+    alert_rule_test:
+      - eval_time: 1440m
+        alertname: TorrentdWarningsElevated
+        exp_alerts: []
+      - eval_time: 1450m
+        alertname: TorrentdWarningsElevated
+        exp_alerts: []
+      - eval_time: 1490m
+        alertname: TorrentdWarningsElevated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "torrentd is logging WARN lines at over three times its rate of the day before; torrentd_log_events_total by target names the module"
+
+  # One WARN line every 2 minutes after a day without one is over three times
+  # nothing, held for an hour, but under the floor of 10 in 15 minutes, so it
+  # never fires.
+  - interval: 2m
+    input_series:
+      - series: 'torrentd_log_events_total{level="warn", target="torrentd::vpn"}'
+        values: '0x720 1+1x30'
+    alert_rule_test:
+      - eval_time: 1490m
+        alertname: TorrentdWarningsElevated
+        exp_alerts: []
+
   # acct_a never came up; acct_b's tunnel drops at 2m, leaving nothing serving.
   - interval: 1m
     input_series:
