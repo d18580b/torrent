@@ -46,7 +46,7 @@ pub struct ListTorrentsQuery {
 
 /// Why the torrents could not be listed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListTorrentsError {
     /// The cursor is not one this listing issued.
     #[error("the cursor is not one this listing issued; start again without it")]
@@ -193,7 +193,7 @@ fn first_after(
 
 /// Why a torrent could not be read.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetTorrentError {
     /// No torrent with this infohash is assigned to any profile.
     #[error("no torrent with this infohash")]

@@ -29,7 +29,7 @@ use crate::http::validate::Violation;
 
 /// Why a torrent's upload limit was not set.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetUploadLimitError {
     /// No loaded torrent has this infohash.
     #[error("no loaded torrent with this infohash")]
@@ -53,7 +53,7 @@ from_invalid!(SetUploadLimitError);
 
 /// Why a torrent was not paused.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum PauseTorrentError {
     /// No loaded torrent has this infohash.
     #[error("no loaded torrent with this infohash")]
@@ -99,7 +99,7 @@ pub async fn pause_torrent(
 
 /// Why a torrent was not resumed, rechecked or reannounced.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum UnfencedControlError {
     /// No loaded torrent has this infohash.
     #[error("no loaded torrent with this infohash")]

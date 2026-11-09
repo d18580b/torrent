@@ -364,7 +364,7 @@ fn profile_list(s: &AppState) -> ProfileList {
 
 /// Why a profile could not be described.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetProfileError {
     /// No profile with this id is configured.
     #[error("unknown profile_id")]
@@ -425,7 +425,7 @@ pub struct SetProfileState {
 
 /// Why a profile's state was not set.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetProfileStateError {
     /// No profile with this id is configured.
     #[error("unknown profile_id")]
@@ -621,7 +621,7 @@ fn online_pace(s: &AppState) -> crate::fence::OnlinePace<'_> {
 
 /// Why offline-all or online-all did not fully apply.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum StateSwitchError {
     /// The switch could not be recorded, or a session refused it.
     #[error("{detail}")]
@@ -691,7 +691,7 @@ pub async fn set_online_all(
 
 /// Why a profile's torrents could not all be paused or resumed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ProfileBulkError {
     /// No profile with this id is configured.
     #[error("unknown profile_id")]

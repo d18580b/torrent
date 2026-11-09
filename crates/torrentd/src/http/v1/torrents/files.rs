@@ -85,7 +85,7 @@ const FILE_KEY_WIDTH: usize = 10;
 
 /// Why a torrent's files could not be listed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListFilesError {
     /// The cursor is not one this listing issued.
     #[error("the cursor is not one this listing issued; start again without it")]
@@ -200,7 +200,7 @@ impl Validate for FilePriority {
 
 /// Why a file's priority was not set.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetFilePriorityError {
     /// No loaded torrent has this infohash.
     #[error("no loaded torrent with this infohash")]

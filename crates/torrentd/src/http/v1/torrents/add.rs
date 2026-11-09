@@ -139,7 +139,7 @@ impl Validate for AddTorrentRequest {
 
 /// Why a torrent was not added.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum AddTorrentError {
     /// A member of the request breaks a constraint the schema declares.
     #[error("{summary}")]

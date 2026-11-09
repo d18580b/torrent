@@ -230,7 +230,7 @@ fn check_infohashes(invalid: &mut Invalid, pointer: &str, infohashes: &[InfoHash
 
 /// Why an operation on the whole pool failed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum PoolFailure {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -521,7 +521,7 @@ pub async fn check_pool_drift(
 
 /// Why a directory listing failed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum TreeError {
     /// The cursor is not one this listing issued.
     #[error("the cursor is not one this listing issued; start again without one")]
@@ -792,7 +792,7 @@ pub async fn list_pool_orphans(
 
 /// Why a paged pool listing failed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListError {
     /// The cursor is not one this listing issued.
     #[error("the cursor is not one this listing issued; start again without one")]
@@ -1011,7 +1011,7 @@ pub struct AdoptionResult {
 
 /// Why an adoption could not start.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum AdoptError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -1411,7 +1411,7 @@ pub struct VerifyResult {
 
 /// Why a verification could not start.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum VerifyError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -1972,7 +1972,7 @@ const MUTATIONS_DISABLED: &str = "pool mutations are disabled; set `allow_mutati
 
 /// Why a plan was not created.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum CreatePlanError {
     /// `[pool] allow_mutations` is off.
     #[error("{MUTATIONS_DISABLED}")]
@@ -2056,7 +2056,7 @@ fn create_plan_blocking(
 
 /// Why a plan could not be read.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetPlanError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -2094,7 +2094,7 @@ pub async fn get_plan(
 
 /// Why a plan's steps could not be listed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListPlanStepsError {
     /// The cursor is not one this plan's steps listing issued.
     #[error("the cursor is not one this listing issued; start again without one")]
@@ -2206,7 +2206,7 @@ pub async fn list_plan_steps(
 
 /// Why a plan was not discarded.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum DeletePlanError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -2293,7 +2293,7 @@ pub struct ApplyOutcome {
 
 /// Why a plan was not applied.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ApplyPlanError {
     /// `[pool] allow_mutations` is off.
     #[error("{MUTATIONS_DISABLED}")]

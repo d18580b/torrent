@@ -89,7 +89,7 @@ pub struct RetryAfter {
 
 /// Why a session was not issued.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum CreateSessionError {
     /// The password is wrong. Which part is never said.
     #[error("invalid password")]
@@ -305,7 +305,7 @@ pub async fn get_current_session(caller: Scoped<Bearer, Read>) -> Json<Principal
 
 /// Why a credential could not be revoked.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum RevokeSessionError {
     /// The credential is a static token from the config (or authentication is
     /// disabled). A static token is revoked by removing it from the config and

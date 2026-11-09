@@ -119,7 +119,7 @@ pub struct TrackerList {
 
 /// Why a torrent's trackers could not be listed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListTrackersError {
     /// No loaded torrent has this infohash.
     #[error("no loaded torrent with this infohash")]

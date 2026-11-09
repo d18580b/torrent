@@ -327,7 +327,7 @@ pub enum Fault {
 
 /// Why a fault was not injected.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum FaultError {
     /// A value is outside what the fault accepts.
     #[error("{summary}")]
