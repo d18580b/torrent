@@ -186,6 +186,50 @@ async fn a_resolver_that_does_not_answer_is_passed_over_for_the_next() {
     assert_eq!(got, vec![IpAddr::from([192, 0, 2, 9])]);
 }
 
+#[tokio::test]
+async fn a_resolver_or_tracker_of_the_other_family_is_never_reached_off_the_tunnel() {
+    // An IPv6 resolver ahead of the IPv4 one is passed over, unasked.
+    let v6 = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .await
+        .ok();
+    let (dns, asked) = fake_dns("tracker.test", Ipv4Addr::new(192, 0, 2, 9)).await;
+    let mut servers = vec![dns];
+    if let Some(s) = &v6 {
+        servers.insert(0, s.local_addr().unwrap());
+    }
+    let r = TunnelResolver::with_servers(LOOPBACK, None, servers);
+    assert_eq!(
+        r.resolve("tracker.test").await.unwrap(),
+        vec![IpAddr::from([192, 0, 2, 9])]
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    if let Some(s) = &v6 {
+        let mut buf = [0u8; 512];
+        assert!(
+            s.try_recv_from(&mut buf).is_err(),
+            "the IPv6 resolver was asked from an unbound source"
+        );
+    }
+
+    // Only IPv6 resolvers: nothing to ask.
+    let only_v6 = TunnelResolver::with_servers(
+        LOOPBACK,
+        None,
+        vec![SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), 53)],
+    );
+    assert!(only_v6.resolve("tracker.test").await.is_err());
+
+    // An IPv6 tracker is never connected to from an IPv4 tunnel address,
+    // even where one listens.
+    if let Ok(listener) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await {
+        let e = r
+            .connect(&Target::Addr(listener.local_addr().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    }
+}
+
 /// Greet, authenticate and send `request` (`CMD RSV ATYP ADDR PORT`); the
 /// reply's `REP` and bound address.
 async fn socks(
