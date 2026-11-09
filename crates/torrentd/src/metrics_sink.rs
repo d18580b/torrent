@@ -438,6 +438,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
     // kill switch
     "kill_switch_active" Gauge Daemon Owner("always") => "1 while the daemon holds the nftables kill switch installed.";
+    "kill_switch_dns_exempt" Gauge Daemon Owner("always") =>
+        "1 while the kill switch lets the daemon's DNS out to kill_switch_dns_servers outside \
+         the tunnels, so every tracker hostname it looks up is visible to those resolvers.";
     "kill_switch_table_present" Gauge Daemon Owner("kill switch on") =>
         "1 if the kill switch's nftables table was present and matched the rendered ruleset at \
          the last check; 0 if it was missing or had drifted.";

@@ -39,6 +39,7 @@ pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::release_recorded as release_recorded_wireguard;
 pub use wireguard::sweep_raised_records;
 pub use wireguard::transfer as wireguard_transfer;
+pub use wireguard::tunnel_holding as wireguard_tunnel_holding;
 pub use wireguard::ProbeUnavailable as HandshakeProbeUnavailable;
 pub use wireguard::Released as ReleasedWireguard;
 pub use wireguard::Transfer as WireguardTransfer;

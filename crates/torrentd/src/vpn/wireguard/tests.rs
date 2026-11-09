@@ -1712,7 +1712,8 @@ fn live_link_the_kill_switch_carries_a_link_the_daemon_raised_and_drops_the_bare
         "without the exemption the tunnel's encrypted traffic is dropped",
     );
 
-    let installed = killswitch::enable(&[iface.to_string()]).expect("enable");
+    let installed = killswitch::enable(&killswitch::Carveouts::default(), &[iface.to_string()])
+        .expect("enable");
     assert_eq!(installed.uid, uid);
     let before = delivered();
     send_into_tunnel();

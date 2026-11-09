@@ -453,12 +453,25 @@ EOF",
 /// Minimal blocking HTTP/1.1 client: `(status, body)`, or the error that
 /// kept an answer from arriving.
 fn try_http(method: &str, path: &str, body: Option<&str>) -> std::io::Result<(u16, String)> {
-    let mut stream = TcpStream::connect(HTTP)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    try_http_at(HTTP, method, path, body, "", Duration::from_secs(10))
+}
+
+/// [`try_http`] to `addr`, with `headers` (each line ending `\r\n`) added and
+/// `wait` as the read timeout.
+fn try_http_at(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    headers: &str,
+    wait: Duration,
+) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(wait))?;
     let body = body.unwrap_or("");
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )?;
@@ -536,16 +549,7 @@ impl Daemon {
     /// [`Daemon::start`], running the daemon from `bin`.
     fn start_from(bin: &std::path::Path, dir: &std::path::Path, profile_extra: &str) -> Self {
         let cfg = write_config(dir, profile_extra);
-        let log = dir.join("daemon.log");
-        let out = std::fs::File::create(&log).unwrap();
-        let child = Command::new(bin)
-            .arg("--config")
-            .arg(&cfg)
-            .stdout(out.try_clone().unwrap())
-            .stderr(out)
-            .spawn()
-            .expect("spawn the daemon");
-        let mut daemon = Self { child, log };
+        let mut daemon = Self::spawn(bin, dir, &cfg);
         poll(
             "the profile to come up on its tunnel",
             Duration::from_secs(60),
@@ -561,12 +565,37 @@ impl Daemon {
         );
         daemon
     }
+
+    /// Spawn the daemon from `bin` on `cfg`, its output in `dir/daemon.log`,
+    /// and wait for nothing.
+    fn spawn(bin: &std::path::Path, dir: &std::path::Path, cfg: &std::path::Path) -> Self {
+        let log = dir.join("daemon.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let child = Command::new(bin)
+            .arg("--config")
+            .arg(cfg)
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .spawn()
+            .expect("spawn the daemon");
+        Self { child, log }
+    }
 }
 
 /// Write `dir/cfg.toml` — the kill switch on, and one vpn profile on [`WG`]
 /// carrying `profile_extra` — with the directories it names, and return its
 /// path.
 fn write_config(dir: &std::path::Path, profile_extra: &str) -> std::path::PathBuf {
+    write_config_top(
+        dir,
+        &format!("http_listen = \"{HTTP}\"\nallow_unauthenticated = true"),
+        profile_extra,
+    )
+}
+
+/// [`write_config`], with `top` in place of its `http_listen` and
+/// authentication lines.
+fn write_config_top(dir: &std::path::Path, top: &str, profile_extra: &str) -> std::path::PathBuf {
     for sub in ["data", "resume", "torrents"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
@@ -577,10 +606,9 @@ fn write_config(dir: &std::path::Path, profile_extra: &str) -> std::path::PathBu
             "default_save_path = \"{d}/data\"\n\
                  resume_dir = \"{d}/resume\"\n\
                  torrent_dir = \"{d}/torrents\"\n\
-                 http_listen = \"{HTTP}\"\n\
                  log_level = \"info\"\n\
-                 allow_unauthenticated = true\n\
                  network_kill_switch = true\n\
+                 {top}\n\
                  \n\
                  [[profile]]\n\
                  id = \"{PROFILE}\"\n\
@@ -1477,4 +1505,211 @@ fn vpn_netns_e2e_a_kill_switch_whose_nft_does_not_run_is_refused_before_any_tunn
             "--check-config: {check}; nothing was installed"
         );
     }
+}
+
+/// The scrape credential the cluster test's `[auth]` holds, shaped as
+/// `new-token` prints one.
+const METRICS_TOKEN: &str = "tdp_e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0";
+/// A second physical link, which no carve-out names.
+const OTHER_HOST_V4: &str = "10.10.0.1";
+const OTHER_PEER_V4: &str = "10.10.0.2";
+/// An address on the peer's side of the physical link that is no resolver
+/// the config names, though it answers on port 53.
+const UNNAMED_RESOLVER: &str = "10.9.0.3";
+
+/// `f`'s result, run on a thread of its own inside the peer namespace.
+fn in_peer<T: Send + 'static>(peer: &Peer, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    peer.spawn(move || tx.send(f()).unwrap());
+    rx.recv().unwrap()
+}
+
+/// Answer every UDP datagram to port `port` on any address of the peer
+/// namespace with its own bytes, and every TCP connection to it with `ok`.
+fn resolver(peer: &Peer, port: u16) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    peer.spawn(move || {
+        let sock = UdpSocket::bind(("0.0.0.0", port));
+        tx.send(sock.as_ref().map(|_| ()).map_err(|e| e.to_string()))
+            .unwrap();
+        let Ok(sock) = sock else { return };
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let _ = sock.send_to(&buf[..n], from);
+        }
+    });
+    rx.recv()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("bind udp {port} in the peer namespace: {e}"));
+    peer.serve_tcp(SocketAddr::from(([0, 0, 0, 0], port)), |mut conn| {
+        let _ = conn.write_all(b"ok");
+    });
+}
+
+/// Whether this uid's datagram to `to` is answered within two seconds.
+fn udp_answered(to: &str) -> bool {
+    let sock = UdpSocket::bind((HOST_V4, 0)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let _ = sock.send_to(b"q", to);
+    let mut buf = [0u8; 8];
+    sock.recv_from(&mut buf).is_ok()
+}
+
+/// Whether this uid's TCP connection to `to` is answered with `ok` within
+/// two seconds. The kernel answers a SYN with no socket of the uid's
+/// attached, so only the bytes after it say whether the uid's own packets
+/// leave.
+fn tcp_answered(to: &str) -> bool {
+    let Ok(mut conn) = TcpStream::connect_timeout(&to.parse().unwrap(), Duration::from_secs(2))
+    else {
+        return false;
+    };
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 2];
+    conn.read_exact(&mut buf).is_ok() && &buf == b"ok"
+}
+
+/// The kill switch's carve-outs for a cluster, in a real kernel: with
+/// `kill_switch_api_interfaces = ["veth-ks"]` and `kill_switch_dns_servers`
+/// naming the peer's address,
+///
+/// (a) a probe of `/healthz` and a scrape of `/metrics` from outside the
+///     daemon's namespace, on `veth-ks`, are answered, and both report the
+///     DNS carve-out;
+/// (b) this uid's DNS to the named resolver is answered, over UDP and TCP;
+/// (c) every other egress of the uid outside the tunnel is still dropped:
+///     the API's replies on an interface no carve-out names, port 53 to an
+///     address the config does not name, another port to the named
+///     resolver, and any other datagram, none of which reach the physical
+///     link.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_cluster_carve_outs_let_out_the_api_and_dns_and_nothing_else() {
+    if !in_own_namespace(
+        "vpn_netns_e2e_cluster_carve_outs_let_out_the_api_and_dns_and_nothing_else",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let peer = topology(p);
+    sh(&format!(
+        "ip link add veth-ks2 type veth peer name veth-peer2 netns {} && \
+         ip addr add {OTHER_HOST_V4}/24 dev veth-ks2 && ip link set veth-ks2 up",
+        peer.pid
+    ));
+    peer.sh(&format!(
+        "ip addr add {OTHER_PEER_V4}/24 dev veth-peer2; ip link set veth-peer2 up; \
+         ip addr add {UNNAMED_RESOLVER}/24 dev veth-peer"
+    ));
+    resolver(&peer, 53);
+    resolver(&peer, 5353);
+
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        METRICS_TOKEN.as_bytes(),
+    ));
+    // A routable bind takes `[auth]`; no test logs in, so any password does.
+    let password_hash = argon2::PasswordHasher::hash_password(
+        &argon2::Argon2::default(),
+        b"unused",
+        &argon2::password_hash::SaltString::from_b64("dnBuLW5ldG5zLWUyZQ").unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    let top = format!(
+        "http_listen = \"0.0.0.0:8080\"\n\
+         kill_switch_api_interfaces = [\"veth-ks\"]\n\
+         kill_switch_dns_servers = [\"{PEER_V4}\"]\n\
+         [auth]\n\
+         password_hash = \"{password_hash}\"\n\
+         [[auth.token]]\n\
+         name = \"scrape\"\n\
+         sha256 = \"{sha}\"\n\
+         scopes = [\"metrics\"]"
+    );
+    let cfg = write_config_top(p, &top, &format!("listen_port = {LISTEN_PORT}"));
+    let mut daemon = Daemon::spawn(
+        std::path::Path::new(env!("CARGO_BIN_EXE_torrentd")),
+        p,
+        &cfg,
+    );
+    poll(
+        "the daemon to report ready",
+        Duration::from_secs(60),
+        || {
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                panic!("the daemon exited {status} before it was ready");
+            }
+            let (code, _) = try_http("GET", "/healthz", None).ok()?;
+            (code == 200).then_some(())
+        },
+    );
+    assert!(table_listed(), "the kill switch table is installed");
+    let log = std::fs::read_to_string(&daemon.log).unwrap();
+    assert!(
+        log.contains("tracker hostname") && log.contains(PEER_V4),
+        "the boot warns, naming the resolver: {log}"
+    );
+
+    // (a) From the peer, over veth-ks: the probe and the scrape.
+    let api = format!("{HOST_V4}:8080");
+    let auth = format!("Authorization: Bearer {METRICS_TOKEN}\r\n");
+    let (health, metrics) = in_peer(&peer, move || {
+        let wait = Duration::from_secs(10);
+        (
+            try_http_at(&api, "GET", "/healthz", None, "", wait),
+            try_http_at(&api, "GET", "/metrics", None, &auth, wait),
+        )
+    });
+    let (code, body) = health.expect("the probe is answered over veth-ks");
+    assert_eq!(code, 200, "{body}");
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["kill_switch_dns_exempt"], true, "{body}");
+    let (code, text) = metrics.expect("the scrape is answered over veth-ks");
+    assert_eq!(code, 200, "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.trim() == "torrentd_kill_switch_dns_exempt 1"),
+        "{text}"
+    );
+
+    // (c) The API's reply on veth-ks2, which no carve-out names: the
+    // connection opens, as the kernel answers the SYN, and the reply from
+    // the daemon's socket never leaves.
+    let other = format!("{OTHER_HOST_V4}:8080");
+    let unnamed = in_peer(&peer, move || {
+        try_http_at(&other, "GET", "/healthz", None, "", Duration::from_secs(3))
+    });
+    assert!(
+        unnamed.as_ref().map_or(true, |(code, _)| *code == 0),
+        "the API answered on an interface no carve-out names: {unnamed:?}"
+    );
+
+    // (b) This uid's DNS to the named resolver, both protocols.
+    assert!(
+        udp_answered(&format!("{PEER_V4}:53")),
+        "DNS over UDP to the named resolver"
+    );
+    assert!(
+        tcp_answered(&format!("{PEER_V4}:53")),
+        "DNS over TCP to the named resolver"
+    );
+
+    // (c) Everything else the uid sends outside the tunnel: dropped before
+    // the physical link, so the peer counts none of it.
+    let base = peer.leaks();
+    for to in [
+        format!("{UNNAMED_RESOLVER}:53"),
+        format!("{PEER_V4}:5353"),
+        format!("{PEER_V4}:9"),
+    ] {
+        assert!(!udp_answered(&to), "udp to {to} left by the physical link");
+    }
+    for to in [format!("{UNNAMED_RESOLVER}:53"), format!("{PEER_V4}:5353")] {
+        assert!(!tcp_answered(&to), "tcp to {to} left by the physical link");
+    }
+    peer.assert_no_leak(base, "the uid's other egress under the carve-outs");
+
+    daemon.stop();
+    assert!(!table_listed(), "the kill switch table is removed on stop");
 }

@@ -37,6 +37,8 @@ impl Config {
             vpn_handshake_max_age_secs: new_vpn_handshake_max_age_secs,
             shutdown_drain_secs: new_shutdown_drain_secs,
             network_kill_switch: new_network_kill_switch,
+            kill_switch_api_interfaces: new_kill_switch_api_interfaces,
+            kill_switch_dns_servers: new_kill_switch_dns_servers,
             profile: new_profile,
             auth: new_auth,
             pool: new_pool,
@@ -134,6 +136,14 @@ impl Config {
         }
         if old.network_kill_switch != *new_network_kill_switch {
             d.non_reloadable_changes.push("network_kill_switch");
+        }
+        // The carve-outs are rendered into the ruleset at install, and the
+        // watch reinstalls that same ruleset; a reload never re-renders it.
+        if old.kill_switch_api_interfaces != *new_kill_switch_api_interfaces {
+            d.non_reloadable_changes.push("kill_switch_api_interfaces");
+        }
+        if old.kill_switch_dns_servers != *new_kill_switch_dns_servers {
+            d.non_reloadable_changes.push("kill_switch_dns_servers");
         }
         if old.pool != *new_pool {
             d.non_reloadable_changes.push("pool");

@@ -270,6 +270,7 @@ authentication posture, and at least one `[[profile]]`:
 | `vpn_handshake_max_age_secs` | `180` — how long a WireGuard profile with torrents that can send may go with no handshake answering them before it is fenced. An aged handshake fences only once the link has sent bytes that nothing answered for this long, so neither an idle profile nor a quiet seeding one is fenced on its handshake (§11, drill 5). |
 | `shutdown_drain_secs` | `60` — how long a stop waits for outstanding resume saves (`1`–`3600`). `deploy/torrentd.service`'s `TimeoutStopSec=120` is sized to the default. A larger value is covered by the `EXTEND_TIMEOUT_USEC` the daemon sends while it stops, so `TimeoutStopSec` needs raising only for a stop that must fit without those extensions. |
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
+| `kill_switch_api_interfaces`, `kill_switch_dns_servers` | empty — the kill switch's carve-outs for a cluster: the API's replies on the named interfaces, and DNS to the named resolvers. Restart-only, and refused without `network_kill_switch`; see §11, "In a cluster" |
 | `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
 | `unchoke_slots_limit` | unset: libtorrent's rate-based choker, which unchokes as many peers as the achieved upload rate supports. Set, it unchokes exactly that many per session (fixed-slots choker). Read once, at startup. |
 | `peer_fingerprint`, `user_agent` | libtorrent's own; a profile may override. Only the prefix and the strings change; the wire behaviour stays libtorrent's, so name a libtorrent-based client — see the `vpn` profile row below. |
@@ -1421,7 +1422,7 @@ These address the daemon directly, so they are written for a deployment that
 publishes the API — the systemd path of §8, and any run bound to loopback.
 
 ```bash
-curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"ok":true,"profiles":1,"profiles_failed":0,"profiles_fenced":0}
+curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"kill_switch_dns_exempt":false,"ok":true,"profiles":1,"profiles_failed":0,"profiles_fenced":0}
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/v1/status | jq   # counts by phase, rates, peers
 curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics | head   # torrentd_* series
 ```
@@ -1451,6 +1452,11 @@ the start is visible in the payload rather than only in the startup log.
 | `no_sessions` | No session is up — before startup completes, or because every configured profile failed to come up. |
 | `alert_loop_stalled` | The alert loop stopped advancing for 15 seconds. |
 | `all_profiles_fenced` | Every live profile is fenced: its tunnel is down and its torrents are paused. With any failed profiles, that is every configured profile out of service. Some-but-not-all stays **200** — the remaining profiles are still serving — with the count in `profiles_fenced`. |
+
+`kill_switch_dns_exempt` is true while the kill switch lets the daemon's DNS
+out to the resolvers kill_switch_dns_servers names, outside the tunnels (§11,
+"In a cluster"), so tracker hostnames are visible to them. It never makes the
+daemon unready.
 
 Confirm settings actually applied rather than trusting the config parsed:
 
@@ -2307,6 +2313,32 @@ On a scratch pool, not your real one.
    the response leaves from a socket the daemon's uid owns. Over loopback, or
    through a tunnel, it works. With the kill switch on, reach the API through
    a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
+
+   **In a cluster** neither is to hand: kubelet probes `/healthz`, Prometheus
+   scrapes `/metrics` and Ingress reaches the API on the pod's `eth0`, and the
+   pod's `/etc/resolv.conf` names the cluster resolver, also on `eth0`. Two
+   restart-only keys carve exactly those out, and nothing else:
+
+   ```toml
+   network_kill_switch = true
+   http_listen = "0.0.0.0:8080"
+   kill_switch_api_interfaces = ["eth0"]   # meta skuid <uid> oifname "eth0" tcp sport 8080 accept
+   kill_switch_dns_servers = ["10.43.0.10"]  # ip daddr 10.43.0.10 udp/tcp dport 53 accept
+   ```
+
+   The API carve-out lets out the daemon's TCP from the `http_listen` port
+   by the named interfaces only; it is refused for a profile's
+   `vpn_interface` and beside a `unix:` `http_listen`. The DNS carve-out lets
+   the daemon's queries reach the named resolvers only; it is refused for an
+   address inside a WireGuard profile's `Address` prefixes or named by its
+   `DNS` line, which a tunnel reaches. Every peer and tracker connection,
+   the API port by any other interface, and port 53 to any other address
+   still meet the drop. **The cost of the DNS carve-out**: every tracker
+   hostname the daemon looks up is visible to these resolvers and to
+   whatever they forward to. The boot logs a WARN naming them,
+   `torrentd_kill_switch_dns_exempt` is `1`, and `vpn check` and the
+   `/healthz` body (`kill_switch_dns_exempt`) report it. `vpn check
+   --as-uid` dry-runs both carve-outs in the ruleset it hands to `nft`.
 8. **The kill switch's edges, and a fence during a renewal.** Four scripted
    drills, each in a private user, network and mount namespace that it
    creates and that disappears when it exits. None needs root, and none

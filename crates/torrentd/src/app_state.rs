@@ -108,6 +108,10 @@ pub struct AppState {
     /// the fence's lift resumes that too. Setting a fenced profile online
     /// refuses while it says the kill switch did not last check in force.
     pub kill_switch: Option<Arc<crate::fence::KillSwitchFence>>,
+    /// Whether the kill switch lets the daemon's DNS out to
+    /// `kill_switch_dns_servers` outside the tunnels, as the readiness
+    /// report and `kill_switch_dns_exempt` say. Fixed at boot.
+    pub kill_switch_dns_exempt: bool,
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
@@ -340,6 +344,7 @@ pub(crate) fn build_test_state_with_sessions(
             handshake: None,
         }),
         kill_switch: None,
+        kill_switch_dns_exempt: false,
     }
 }
 
