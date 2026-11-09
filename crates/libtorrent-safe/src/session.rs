@@ -963,6 +963,28 @@ pub(crate) mod tests {
         s
     }
 
+    /// The keys a tunnel-DNS profile's session is built with are settings
+    /// libtorrent knows: the shim refuses a name `setting_by_name` does not,
+    /// so a misspelt one fails the session rather than going unapplied.
+    #[test]
+    fn a_session_takes_the_tracker_proxy_settings() {
+        let mut s = loopback_settings();
+        s.proxy_type = Some(3);
+        s.proxy_hostname = Some("127.0.0.1".into());
+        s.proxy_port = Some(1080);
+        s.proxy_username = Some("u".into());
+        s.proxy_password = Some("p".into());
+        s.proxy_hostnames = Some(true);
+        s.proxy_peer_connections = Some(false);
+        s.proxy_tracker_connections = Some(true);
+        s.enable_outgoing_utp = Some(false);
+        s.enable_incoming_utp = Some(false);
+        let session = Session::new(&s).expect("a session with the tracker proxy settings");
+        session
+            .apply_settings(&s)
+            .expect("and the same settings applied again");
+    }
+
     /// A single-file `.torrent` whose piece hashes are filler: serving its
     /// metadata over `ut_metadata` never reads a piece, so nothing verifies
     /// them.
