@@ -731,6 +731,14 @@ it, and adds into it answer `409 profile-unavailable`. Setting the profile
 online lifts the fence without a restart, and the other profiles stay on the
 network throughout.
 
+Nothing restarts the daemon for a fence on its own. With every profile
+fenced, `/readyz` (and `/healthz`) answers 503 `all_profiles_fenced`, which
+takes the daemon out of rotation, while `/livez` and the systemd watchdog
+stay healthy, so neither a kubelet's `livenessProbe` nor systemd restarts it
+(running.md §9, "Probes: Kubernetes and the systemd watchdog"). A liveness
+probe pointed at `/readyz` would restart it, with the costs the last
+paragraph of this section describes.
+
 1. Find out why its tunnel failed. The reason is on
    `torrentd_profile_vpn_fenced_total` and in the `VPN tunnel unhealthy` log
    line. Fix the cause, whether that is the provider, the endpoint, the

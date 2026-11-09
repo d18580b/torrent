@@ -1266,8 +1266,9 @@ or torrent directory read, every 256 entries a scan gets through — and stops
 being extended 15 minutes after its last such step, so a 100K-torrent scan on
 slow storage is not cut off however long it takes. A stop is extended up to
 the sum of its stages' own bounds. The watchdog ping is withheld if
-the alert loop stops advancing, so a wedged daemon gets restarted rather than
-reported healthy.
+the alert loop stops advancing or a batch writer thread dies - the checks
+`/livez` makes (§9) - so a wedged daemon gets restarted rather than reported
+healthy.
 
 A configuration the daemon or `--check-config` refuses exits `78`
 (`EX_CONFIG`); an operator subcommand such as `vpn check` keeps its own exit
@@ -1481,17 +1482,34 @@ docker compose exec torrentd curl -s localhost:8080/healthz
 curl -s https://your.host/healthz         # through `proxy`, once TLS is up
 ```
 
+The daemon answers three probes, none of which needs a credential or checks
+the `Host` header:
+
+- `/livez` asks whether the process is wedged, which a restart fixes. It
+  answers 503 only when the alert loop's heartbeat is older than 15 seconds
+  (`alert_loop_stalled`), a batch writer thread - the one that writes resume
+  data - has died (`batch_writer_dead`), or the HTTP runtime did not run a
+  trivial task within 2 seconds (`runtime_stalled`), and its body's `failed`
+  names which. It never fails for a fenced, offline or failed profile, or for
+  no session at all: those are not fixed by a restart, and a fence holds until
+  an operator lifts it (operations.md, "Recovering a fenced profile").
+- `/readyz` asks whether the daemon should take traffic; the rest of this
+  section is its report.
+- `/healthz` is `/readyz` under its older name, kept so scripts, the
+  container `HEALTHCHECK` and existing probes keep working.
+
 `profiles` is the number of **live** sessions, and `profiles_fenced` is how
 many of those the VPN monitor has fenced. `profiles_failed` is how many
 configured profiles never got a session at all — a tunnel that did not come up
 at boot — and is reported in every response, so an account that is dark from
 the start is visible in the payload rather than only in the startup log.
 
-`/healthz` returns 503 with one of three reasons:
+`/readyz` (and `/healthz`) returns 503 with one of four reasons:
 
 | `reason` | Meaning |
 | --- | --- |
-| `no_sessions` | No session is up — before startup completes, or because every configured profile failed to come up. |
+| `starting` | The boot has not finished: a torrent it loaded has not reached the state map yet. It stops after ten minutes even if one never does. |
+| `no_sessions` | No session is up, because every configured profile failed to come up. |
 | `alert_loop_stalled` | The alert loop stopped advancing for 15 seconds. |
 | `all_profiles_fenced` | Every live profile is fenced: its tunnel is down and its torrents are paused. With any failed profiles, that is every configured profile out of service. Some-but-not-all stays **200** — the remaining profiles are still serving — with the count in `profiles_fenced`. |
 
@@ -1558,6 +1576,45 @@ refused to start it. A restart drops the queued rechecks that had not
 started. For a torrent that is paused or has no metadata yet, libtorrent is
 asked at once; a paused torrent's check starts when it is resumed.
 `torrentd_checks_started_total` counts every check started, by `source`.
+
+### Probes: Kubernetes and the systemd watchdog
+
+In Kubernetes, give each probe the route that asks its question:
+
+```yaml
+startupProbe:          # covers the boot: scans, then `starting`
+  httpGet: { path: /readyz, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 180      # 30 minutes; raise it for a very large library
+livenessProbe:         # restarts only a wedged process
+  httpGet: { path: /livez, port: 8080 }
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:        # takes it out of rotation, fenced or starting
+  httpGet: { path: /readyz, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 1
+```
+
+The API does not listen until the boot's scans are done, so for a large
+library the startup probe sees refused connections for a while and then
+`starting` while the loaded torrents reach their sessions; `starting` ends at
+the latest ten minutes after the API comes up. Size `failureThreshold` for the
+whole of that, since the kubelet kills a container whose startup probe never
+passes. Never point `livenessProbe` at `/readyz` or `/healthz`: every profile
+fenced makes them answer 503, and the restart that follows undoes the fence.
+`timeoutSeconds` matters for `/livez`: a runtime wedged too hard to run its
+handler gives no answer at all, which the kubelet counts as a failure. With
+`network_kill_switch` on, the kubelet's probes need the API carve-out (§11,
+"In a cluster").
+
+Under systemd there is no probe: the unit's `WatchdogSec=60s` is the liveness
+check. The daemon pings the watchdog while `/livez`'s heartbeat and batch
+writer checks pass, and withholds the ping once either fails, so systemd
+restarts a wedged process; it never withholds it for a fenced profile.
+Outside systemd, with no `NOTIFY_SOCKET`, nothing pings and nothing restarts
+a wedged daemon except a probe of `/livez`.
 
 ### Monitoring: Prometheus alerts and a Grafana dashboard
 
@@ -2356,7 +2413,7 @@ On a scratch pool, not your real one.
    through a tunnel, it works. With the kill switch on, reach the API through
    a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
 
-   **In a cluster** neither is to hand: kubelet probes `/healthz`, Prometheus
+   **In a cluster** neither is to hand: kubelet probes `/livez` and `/readyz`, Prometheus
    scrapes `/metrics` and Ingress reaches the API on the pod's `eth0`, and the
    pod's `/etc/resolv.conf` names the cluster resolver, also on `eth0`. Two
    restart-only keys carve exactly those out, and nothing else:
@@ -2549,7 +2606,8 @@ run it by hand instead, start the service again afterwards:
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | Container reports no health status at all | The image was built in podman's default OCI format, which drops the `HEALTHCHECK`; rebuild it with `mise run container` or `BUILDAH_FORMAT=docker` (§8, "On the compose stack"). |
-| `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
+| `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. `/livez` fails for it too, so a kubelet restarts the pod. |
+| `/livez` 503 `batch_writer_dead` | A batch writer thread died by a panic, so resume data stops reaching the disk until a restart; `torrentd_batch_writer_deaths_total` counts it. systemd's watchdog and a kubelet's `livenessProbe` both restart the daemon; the panic's ERROR line says why it died. |
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, then recover each fenced profile as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes; fenced profiles do not resume themselves by design. A profile counted by `profiles_failed` (`status: "failed"`) never came up and has no session for `PATCH` to lift: bring its tunnel back, then restart. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
