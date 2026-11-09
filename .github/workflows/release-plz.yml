@@ -647,6 +647,45 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           sbom-path: ${{ runner.temp }}/image.spdx.json
           push-to-registry: true
+      # The README tells anyone to pull the image, so pull it as anyone: the
+      # release tag, through a fresh, empty Docker config that holds none of
+      # the login above, with no token in the environment. Every platform
+      # the pushed manifest lists is pulled, so a platform added to the
+      # build is covered with no change here. A private package, or a tag
+      # that does not name what this job pushed, fails the job, and
+      # `publish` then leaves the release a draft (README.md, Releasing).
+      - name: Anyone can pull the release's image, with no login
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN GH_TOKEN
+          DOCKER_CONFIG=$(mktemp -d)
+          export DOCKER_CONFIG
+          ref="$IMAGE:$VERSION"
+          if ! raw=$(docker buildx imagetools inspect --raw "$ref"); then
+            echo "::error::an anonymous client cannot read $ref; is the ghcr.io package public?"
+            exit 1
+          fi
+          # An index lists its platforms; attestation manifests list
+          # unknown/unknown. A single manifest has one platform, its own.
+          mapfile -t platforms < <(jq -r '.manifests[]?.platform
+            | select(. != null and .os != "unknown")
+            | [.os, .architecture, .variant // empty] | join("/")' <<<"$raw")
+          [ "${#platforms[@]}" -gt 0 ] || platforms=("")
+          for platform in "${platforms[@]}"; do
+            if ! docker pull ${platform:+--platform "$platform"} "$ref"; then
+              echo "::error::an anonymous client cannot pull $ref${platform:+ for $platform}; is the ghcr.io package public?"
+              exit 1
+            fi
+          done
+          got=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$ref")
+          if ! grep -qxF "$IMAGE@$DIGEST" <<<"$got"; then
+            echo "::error::$ref resolves to '$got', not the pushed $IMAGE@$DIGEST"
+            exit 1
+          fi
+          echo "pulled $ref anonymously (${platforms[*]:-its one platform}), $DIGEST"
 
   publish:
     name: sign, attest and publish the release
