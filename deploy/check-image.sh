@@ -52,8 +52,8 @@ done
 tmp=$(mktemp -d)
 cleanup() {
   podman rm -f -t 0 "$name" >/dev/null 2>&1 || true
-  # Rootful, the tree is chowned to 1000 below; rootless, keep-id maps it to
-  # this user. Either way this user, or podman's own namespace, can remove it.
+  # Part of the tree is chowned to uid 1000 below: rootless, only podman's
+  # own user namespace can remove that part.
   rm -rf "$tmp" 2>/dev/null || podman unshare rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -115,25 +115,28 @@ network = "vpn"
 vpn_type = "wireguard"
 vpn_config = "/etc/wireguard/$iface.conf"
 vpn_interface = "$iface"
+listen_port = 6881
+allowed_tracker_domains = ["tracker.example.com"]
 peer_fingerprint = "-qB5030-"
 user_agent = "qBittorrent/5.0.3"
 EOF
 chmod 0644 "$tmp/torrentd.toml"
 
 # uid 1000 in the container must own the state, the payload and the
-# WireGuard config. Rootless, keep-id maps this user to it; rootful, chown.
-userns=()
+# WireGuard config. Rootless, that uid is one of this user's subordinate ids,
+# which only podman's own user namespace can chown to.
+owned=(chown -R 1000:1000 "$tmp/state" "$tmp/data" "$tmp/wireguard")
 if [ "$(podman info --format '{{.Host.Security.Rootless}}')" = true ]; then
-  userns=("--userns=keep-id:uid=1000,gid=1000")
+  podman unshare "${owned[@]}"
 else
-  chown -R 1000:1000 "$tmp/state" "$tmp/data" "$tmp/wireguard"
+  "${owned[@]}"
 fi
 
 # ---- boot it, as a pod would --------------------------------------------
 # --read-only plus exactly the Containerfile audit's mounts: the two volumes
 # and a tmpfs at /tmp. The config and the WireGuard file are read-only, as a
 # ConfigMap and a Secret are.
-podman run -d --name "$name" "${userns[@]}" \
+podman run -d --name "$name" \
   --read-only --read-only-tmpfs=false --tmpfs /tmp \
   --cap-drop=ALL --cap-add=NET_ADMIN --user 1000:1000 \
   -v "$tmp/torrentd.toml:/etc/torrentd/torrentd.toml:ro,Z" \
@@ -173,7 +176,7 @@ pid1=$(in_ctr cat /proc/1/comm)
 
 code=$(in_ctr curl -sS -o /dev/null -w '%{http_code}' -X POST \
   -H 'content-type: application/json' \
-  -d "{\"profile_id\":\"$profile\",\"source\":{\"kind\":\"magnet\",\"uri\":\"magnet:?xt=urn:btih:$ih&dn=image-check\"}}" \
+  -d "{\"profile_id\":\"$profile\",\"source\":{\"kind\":\"magnet\",\"uri\":\"magnet:?xt=urn:btih:$ih&dn=image-check&tr=http%3A%2F%2Ftracker.example.com%2Fannounce\"}}" \
   localhost:8080/v1/torrents)
 [ "$code" = 201 ] || error "adding a magnet answered $code, not 201"
 
