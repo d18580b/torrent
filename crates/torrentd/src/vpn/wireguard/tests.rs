@@ -937,6 +937,29 @@ fn a_hooked_config_is_refused_before_bring_up() {
     assert!(refused.to_string().contains("PostUp"), "got {refused}");
 }
 
+#[test]
+fn the_dns_servers_are_the_addresses_on_the_interface_s_dns_lines() {
+    assert_eq!(
+        dns_servers(PROVIDER_CONF).unwrap(),
+        vec!["10.2.0.1".parse::<std::net::IpAddr>().unwrap()]
+    );
+    // Search domains are skipped, a repeat is named once, and a second line
+    // adds to the first.
+    let two = PROVIDER_CONF.replace(
+        "DNS = 10.2.0.1",
+        "DNS = 10.2.0.1, vpn.example, fd00::1\nDNS = 10.2.0.1, 10.2.0.3",
+    );
+    assert_eq!(
+        dns_servers(&two).unwrap(),
+        ["10.2.0.1", "fd00::1", "10.2.0.3"]
+            .map(|s| s.parse::<std::net::IpAddr>().unwrap())
+            .to_vec()
+    );
+    let none = PROVIDER_CONF.replace("DNS = 10.2.0.1", "");
+    assert!(dns_servers(&none).unwrap().is_empty());
+    assert!(dns_servers("not a config").is_err());
+}
+
 const PROVIDER_CONF: &str = "\
 # a provider's config
 [Interface]

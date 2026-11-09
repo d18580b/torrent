@@ -304,6 +304,8 @@ where
     let mut forwarded_port: Option<u16> = None;
     let mut forwarded_epoch: u32 = 0;
     let mut session_state: Option<Vec<u8>> = None;
+    // Dropped, and so stopped, on every path that fails the profile.
+    let mut tracker_proxy: Option<crate::vpn::tracker_dns::TrackerProxy> = None;
 
     match &p.network {
         ProfileNetwork::Host {
@@ -330,6 +332,7 @@ where
             let iface = p.vpn_interface().expect("vpn profile has an interface");
             let vpn_type = p.vpn_type().expect("vpn profile has a type");
             let tunnel = p.vpn_tunnel().expect("vpn profile has a tunnel");
+            let vpn_config = tunnel.config_path.clone();
 
             // Bring the tunnel up first. Safety Rule 1: if it fails, this
             // profile's session is never constructed — no bare-IP
@@ -501,6 +504,54 @@ where
             settings.enable_lsd = Some(false);
             settings.enable_upnp = Some(false);
             settings.enable_natpmp = Some(false);
+            // Tracker hostnames resolved through this tunnel rather than by
+            // libc through the host's resolver (`vpn::tracker_dns`).
+            if let torrentd_engine::TrackerDns::Tunnel { servers } = p.tracker_dns() {
+                let servers = match servers.as_slice() {
+                    [] => match wireguard_dns(&vpn_config).await {
+                        Ok(servers) if !servers.is_empty() => servers,
+                        Ok(_) => {
+                            error!(profile_id = %p.id, "tracker_dns = \"tunnel\" names no resolver and the WireGuard config has no DNS = address; profile disabled");
+                            tear_down_or_warn!(iface);
+                            fail_profile!("tracker_dns = \"tunnel\" needs a resolver: set \
+                                 tracker_dns_servers, or a DNS = address in the WireGuard \
+                                 config"
+                                .to_string());
+                        }
+                        Err(e) => {
+                            error!(profile_id = %p.id, error.cause = %e, "could not read the tunnel's resolvers from the WireGuard config; profile disabled");
+                            tear_down_or_warn!(iface);
+                            fail_profile!(format!(
+                                "could not read DNS = from the WireGuard config: {e}"
+                            ));
+                        }
+                    },
+                    named => named.to_vec(),
+                };
+                let resolver = crate::vpn::tracker_dns::TunnelResolver::new(
+                    ip,
+                    Some(iface.to_string()),
+                    &servers,
+                );
+                match crate::vpn::tracker_dns::TrackerProxy::start(resolver).await {
+                    Ok(proxy) => {
+                        proxy.configure(&mut settings);
+                        info!(
+                            profile_id = %p.id,
+                            tunnel_ip = %ip,
+                            dns_servers = ?servers,
+                            proxy = %proxy.addr(),
+                            "tracker hostnames resolve through the tunnel; uTP is off for this profile",
+                        );
+                        tracker_proxy = Some(proxy);
+                    }
+                    Err(e) => {
+                        error!(profile_id = %p.id, tunnel_ip = %ip, error.cause = %e, "could not start the tunnel's tracker proxy; profile disabled");
+                        tear_down_or_warn!(iface);
+                        fail_profile!(format!("could not start the tracker proxy: {e}"));
+                    }
+                }
+            }
             tunnel_ip = Some(ip);
         }
     }
@@ -534,8 +585,14 @@ where
                 network = if p.is_vpn() { "vpn" } else { "host" },
                 tunnel_ip = tunnel_ip.map(|i| i.to_string()).unwrap_or_default(),
                 dht = p.dht_enabled(),
+                tracker_dns = if tracker_proxy.is_some() { "tunnel" } else { "host" },
                 "profile engine up",
             );
+            // The session lives as long as the process, and so does the
+            // proxy its trackers go through.
+            if let Some(proxy) = tracker_proxy {
+                proxy.keep();
+            }
             Ok((
                 ProfileEntry::new(
                     p.clone(),
@@ -564,6 +621,14 @@ where
             fail_profile!(format!("session construction failed: {e}"));
         }
     }
+}
+
+/// The resolvers a WireGuard config's `DNS =` lines name.
+async fn wireguard_dns(config: &std::path::Path) -> Result<Vec<IpAddr>, String> {
+    let text = tokio::fs::read_to_string(config)
+        .await
+        .map_err(|e| format!("{}: {e}", config.display()))?;
+    crate::vpn::wireguard_dns_servers(&text)
 }
 
 /// Read the persisted DHT/session-state blob, or `None` if absent/empty.
@@ -970,6 +1035,69 @@ mod profile_construction_tests {
             vpn.bring_down_calls().is_empty(),
             "a tunnel that came up for a live session is left standing",
         );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_dns_profile_sends_its_trackers_through_a_proxy_on_its_tunnel_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = format!(
+            "{}tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"10.2.0.1\"]\n",
+            vpn("acct_a", "wg-a", 1)
+        );
+        let cfg = cfg_with(dir.path(), &[profile]);
+        let mock = MockVpn::new();
+        // An address this host holds, so the proxy can bind it as it binds
+        // a real tunnel's.
+        let tunnel = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        mock.set_ip("wg-a", tunnel);
+
+        let out = build(&cfg, &mock, &MockForwarder::new(), None).await;
+
+        assert_eq!(out.up_ids(), vec!["acct_a"]);
+        let (settings, _) = &out.built[0];
+        assert_eq!(settings.proxy_type, Some(3), "SOCKS5 with a password");
+        assert_eq!(settings.proxy_hostname.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            settings.proxy_hostnames,
+            Some(true),
+            "names go to the proxy"
+        );
+        assert_eq!(settings.proxy_tracker_connections, Some(true));
+        assert_eq!(settings.proxy_peer_connections, Some(false));
+        assert_eq!(settings.enable_outgoing_utp, Some(false));
+        let port = settings.proxy_port.expect("a proxy port");
+        assert!(
+            tokio::net::TcpStream::connect((tunnel, port)).await.is_ok(),
+            "the proxy outlives the boot that started it, as the session does",
+        );
+        assert!(mock.bring_down_calls().is_empty());
+
+        // The default posture is untouched.
+        let host_dns = cfg_with(dir.path(), &[vpn("acct_b", "wg-b", 2)]);
+        mock.set_ip("wg-b", TUNNEL_IP);
+        let out = build(&host_dns, &mock, &MockForwarder::new(), None).await;
+        let (settings, _) = &out.built[0];
+        assert_eq!(settings.proxy_type, None);
+        assert_eq!(settings.enable_outgoing_utp, None);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_dns_profile_with_no_resolver_to_ask_is_failed_and_its_tunnel_lowered() {
+        let dir = tempfile::tempdir().unwrap();
+        // No tracker_dns_servers, and a WireGuard config that cannot be read
+        // for its DNS = line.
+        let profile = format!("{}tracker_dns = \"tunnel\"\n", vpn("acct_a", "wg-a", 1));
+        let cfg = cfg_with(dir.path(), &[profile]);
+        let mock = MockVpn::new();
+        mock.set_ip("wg-a", TUNNEL_IP);
+
+        let out = build(&cfg, &mock, &MockForwarder::new(), None).await;
+
+        assert!(out.up_ids().is_empty());
+        assert!(out.built.is_empty(), "no session was built");
+        let reason = &out.failed("acct_a").reason;
+        assert!(reason.contains("DNS ="), "got {reason}");
+        assert_eq!(mock.bring_down_calls(), vec!["wg-a".to_string()]);
     }
 
     #[tokio::test]
