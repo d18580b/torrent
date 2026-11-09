@@ -116,9 +116,18 @@ impl PoolStore {
 
     /// Run `statement`, a rollback, and log and count it where it fails.
     ///
+    /// Nothing to do where the connection is already out of every
+    /// transaction: SQLite rolls the whole one back by itself after a
+    /// statement fails with `SQLITE_FULL`, `SQLITE_IOERR` or `SQLITE_NOMEM`,
+    /// and a `ROLLBACK` after that fails only because nothing is left to roll
+    /// back. The failure that caused it is the caller's to report.
+    ///
     /// The caller carries on either way: it is already reporting the failure
     /// or the panic that made it roll back, and that stays what it reports.
     fn roll_back(&self, statement: &str) {
+        if self.conn.is_autocommit() {
+            return;
+        }
         if let Err(e) = self.conn.execute_batch(statement) {
             ROLLBACK_ERRORS.fetch_add(1, Ordering::Relaxed);
             warn!(
@@ -397,16 +406,41 @@ mod rollback_tests {
     fn a_rollback_that_fails_is_counted_and_the_callers_error_is_kept() {
         let mut store = PoolStore::open_in_memory().unwrap();
         let before = PoolStore::rollback_errors();
-        // Ending the transaction under `in_transaction` makes its own
-        // ROLLBACK fail: there is no transaction left to roll back.
+        // Releasing the savepoint under a nested `in_transaction` makes its
+        // own `ROLLBACK TO` fail, inside the outer transaction: there is no
+        // such savepoint left.
+        let out: Result<(), PoolError> = store.in_transaction(|s| {
+            let inner: Result<(), PoolError> = s.in_transaction(|s| {
+                s.conn.execute_batch("RELEASE pool_tx_1").unwrap();
+                Err(PoolError::Busy)
+            });
+            assert!(matches!(inner, Err(PoolError::Busy)), "{inner:?}");
+            // Another test in this process may fail one too, so at least one.
+            assert!(PoolStore::rollback_errors() > before);
+            Ok(())
+        });
+        out.unwrap();
+        // The depth was restored, so the next transaction is a real one.
+        store
+            .in_transaction(|s| {
+                assert!(s.in_open_transaction());
+                Ok::<_, PoolError>(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_transaction_sqlite_already_ended_is_not_a_failed_rollback() {
+        let mut store = PoolStore::open_in_memory().unwrap();
+        // What SQLite does by itself after SQLITE_FULL or SQLITE_IOERR.
         let out: Result<(), PoolError> = store.in_transaction(|s| {
             s.conn.execute_batch("ROLLBACK").unwrap();
             Err(PoolError::Busy)
         });
         assert!(matches!(out, Err(PoolError::Busy)), "{out:?}");
-        // Another test in this process may fail one too, so at least one.
-        assert!(PoolStore::rollback_errors() > before);
-        // The depth was restored, so the next transaction is a real one.
+        // Nothing to assert about the process-wide count, which another test
+        // may move; the connection must simply be usable again.
+        assert!(!store.in_open_transaction());
         store
             .in_transaction(|s| {
                 assert!(s.in_open_transaction());
