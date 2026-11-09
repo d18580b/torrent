@@ -9,7 +9,7 @@
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check|msrv|rustfmt-toolchain
 #   mise run test-shim|test-shim-asan|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|release-features|deny
-#   mise run lint-tracing|lint-workflows|size-check|container|commit-lint <file-or-range>
+#   mise run lint-tracing|lint-workflows|size-check|container|image-check|commit-lint <file-or-range>
 #   mise run dist|dist-musl
 #   mise run unit-check [unit]
 #   mise run native|native-fetch|native-clean
@@ -179,6 +179,17 @@ fi
 [tasks.container]
 description = "Build the container image from deploy/Containerfile (needs podman and the vendor submodules)"
 run = "podman build --format docker -f deploy/Containerfile -t torrentd:dev ."
+
+# The image `container` builds, run as a Kubernetes pod runs it: read-only
+# root, NET_ADMIN only, uid 1000, a vpn profile in its own network namespace.
+# Needs podman and the host's wireguard and nf_tables modules loaded.
+# deploy/check-image.sh lists every refusal.
+[tasks.image-check]
+description = "Boot the image read-only with a vpn profile, check tini reaps orphans and it stops cleanly"
+usage = '''
+arg "[image]" default="localhost/torrentd:dev" help="The image to check"
+'''
+run = 'deploy/check-image.sh "$usage_image"'
 
 [tasks.test]
 description = "Workspace tests (default features; parity with CI)"
