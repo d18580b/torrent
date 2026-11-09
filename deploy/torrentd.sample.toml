@@ -183,7 +183,7 @@ enable_lsd = false
 # DNS service /etc/resolv.conf names. The cost: every tracker hostname the
 # daemon looks up is visible to these resolvers and whatever they forward to.
 # The boot logs a WARN saying so, `kill_switch_dns_exempt` is 1, and `vpn check`
-# and /readyz report it. Refused for an address inside a WireGuard profile's
+# and /healthz report it. Refused for an address inside a WireGuard profile's
 # Address prefixes or named by its DNS line.
 # kill_switch_dns_servers = ["10.43.0.10"]
 
