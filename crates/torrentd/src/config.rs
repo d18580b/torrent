@@ -360,6 +360,20 @@ impl Config {
         HttpListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 8080)))
     }
 
+    /// The kill switch's named exceptions: the API's replies from the
+    /// `http_listen` port by `kill_switch_api_interfaces`, and DNS to
+    /// `kill_switch_dns_servers`. Empty with the kill switch off.
+    pub fn kill_switch_carveouts(&self) -> crate::vpn::killswitch::Carveouts {
+        if !self.network_kill_switch {
+            return crate::vpn::killswitch::Carveouts::default();
+        }
+        crate::vpn::killswitch::Carveouts::new(
+            self.http_listen.tcp().map(|a| a.port()),
+            &self.kill_switch_api_interfaces,
+            &self.kill_switch_dns_servers,
+        )
+    }
+
     /// The mode a `unix:` `http_listen` socket is created with.
     pub fn http_socket_mode(&self) -> u32 {
         self.http_socket_mode.unwrap_or(DEFAULT_HTTP_SOCKET_MODE)

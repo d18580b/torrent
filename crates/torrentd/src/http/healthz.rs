@@ -35,6 +35,11 @@ pub struct HealthReport {
     /// Seconds since the alert loop last stamped its heartbeat; `null` when
     /// there is no live session to run one.
     pub heartbeat_age_secs: Option<u64>,
+    /// Whether the kill switch lets the daemon's DNS out to
+    /// `kill_switch_dns_servers` outside the tunnels, so every tracker
+    /// hostname it looks up is visible to those resolvers. Never a reason to
+    /// be unready: the operator chose it.
+    pub kill_switch_dns_exempt: bool,
 }
 
 /// Why the daemon reports unready.
@@ -97,6 +102,7 @@ fn evaluate(s: &AppState) -> HealthReport {
             profiles_fenced: 0,
             profiles_failed: n_failed,
             heartbeat_age_secs: None,
+            kill_switch_dns_exempt: s.kill_switch_dns_exempt,
         };
     }
 
@@ -113,6 +119,7 @@ fn evaluate(s: &AppState) -> HealthReport {
             profiles_fenced: count(fenced),
             profiles_failed: n_failed,
             heartbeat_age_secs: Some(age.as_secs()),
+            kill_switch_dns_exempt: s.kill_switch_dns_exempt,
         };
     }
 
@@ -136,6 +143,7 @@ fn evaluate(s: &AppState) -> HealthReport {
             profiles_fenced: count(fenced),
             profiles_failed: n_failed,
             heartbeat_age_secs: Some(age.as_secs()),
+            kill_switch_dns_exempt: s.kill_switch_dns_exempt,
         };
     }
 
@@ -146,6 +154,7 @@ fn evaluate(s: &AppState) -> HealthReport {
         profiles_fenced: count(fenced),
         profiles_failed: n_failed,
         heartbeat_age_secs: Some(age.as_secs()),
+        kill_switch_dns_exempt: s.kill_switch_dns_exempt,
     }
 }
 
@@ -379,6 +388,7 @@ mod tests {
             profiles_fenced: 0,
             profiles_failed: 0,
             heartbeat_age_secs: None,
+            kill_switch_dns_exempt: false,
         })
         .unwrap();
         let keys: Vec<&str> = report
@@ -444,6 +454,26 @@ mod tests {
                 "the note does not name the `reason` value `{reason}`: {note}"
             );
         }
+    }
+
+    /// The DNS carve-out is in the body, ready or not, and never makes the
+    /// daemon unready: it is a cost the operator chose, reported so a probe
+    /// or a person reading it sees the lookups leave outside the tunnels.
+    #[test]
+    fn the_dns_carve_out_is_reported_and_never_unready() {
+        let mut s = build_test_state(None);
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        assert_eq!(probe(&s).1["kill_switch_dns_exempt"], false);
+        s.kill_switch_dns_exempt = true;
+        let (status, body) = probe(&s);
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["kill_switch_dns_exempt"], true);
+        s.alert_heartbeat
+            .store(millis_ago(MAX_HEARTBEAT_AGE * 2), Ordering::Relaxed);
+        let (status, body) = probe(&s);
+        assert_eq!(status, 503);
+        assert_eq!(body["kill_switch_dns_exempt"], true, "unready too");
     }
 
     #[test]

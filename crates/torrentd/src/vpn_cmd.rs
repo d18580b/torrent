@@ -798,7 +798,8 @@ fn host_checks(
                 // Boot reads each one off the live link and refuses to
                 // install without it; a link that is not up yet has neither
                 // to read, so what is missing is named rather than guessed at.
-                let (ruleset, unread) = boot_install_script(uid, &tunnels, host);
+                let (ruleset, unread) =
+                    boot_install_script(uid, &cfg.kill_switch_carveouts(), &tunnels, host);
                 // A name the renderer refuses is the same boot abort as a
                 // ruleset `nft` rejects, reported before any `nft` runs.
                 let verdict = match ruleset {
@@ -813,6 +814,7 @@ fn host_checks(
                 note_unread(verdict, &unread)
             }
         });
+        out.extend(carveout_checks(&cfg.kill_switch_carveouts()));
     } else {
         out.push(Check::skip("kill_switch", "network_kill_switch = false"));
     }
@@ -847,6 +849,7 @@ struct Unread {
 /// boot whether or not its link is up.
 fn boot_install_script(
     uid: u32,
+    carveouts: &vpn::killswitch::Carveouts,
     tunnels: &[String],
     host: &dyn CheckHost,
 ) -> (std::io::Result<String>, Unread) {
@@ -869,9 +872,41 @@ fn boot_install_script(
         }
     }
     (
-        vpn::killswitch::install_script(uid, &paired, &transports),
+        vpn::killswitch::install_script(uid, carveouts, &paired, &transports),
         unread,
     )
+}
+
+/// What the kill switch's carve-outs let out, a line each where one is
+/// configured. Both are rendered into the ruleset the check above dry-runs;
+/// these say so in words, and the DNS one names the privacy cost, as the
+/// boot's WARN does.
+fn carveout_checks(carveouts: &vpn::killswitch::Carveouts) -> Vec<Check> {
+    let mut out = Vec::new();
+    if let Some((port, ifaces)) = carveouts.api() {
+        let ifaces: Vec<&str> = ifaces.collect();
+        out.push(Check::pass(
+            "kill_switch_api_carveout",
+            format!(
+                "the API's replies from tcp port {port} may leave by {} \
+                 (kill_switch_api_interfaces); nothing else of the daemon's leaves by them",
+                ifaces.join(", "),
+            ),
+        ));
+    }
+    if carveouts.dns_exempt() {
+        let servers: Vec<String> = carveouts.dns_servers().map(|s| s.to_string()).collect();
+        out.push(Check::pass(
+            "kill_switch_dns_exempt",
+            format!(
+                "kill_switch_dns_exempt = 1: DNS (udp and tcp port 53) may reach {} outside the \
+                 tunnels (kill_switch_dns_servers), so every tracker hostname the daemon looks up \
+                 is visible to these resolvers and to whatever they forward to",
+                servers.join(", "),
+            ),
+        ));
+    }
+    out
 }
 
 /// Say which tunnel addresses and transport exemptions the dry-run could not

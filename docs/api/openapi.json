@@ -11097,6 +11097,10 @@
             "minimum": 0.0,
             "format": "uint64",
             "description": "Seconds since the alert loop last stamped its heartbeat; `null` when\nthere is no live session to run one."
+          },
+          "kill_switch_dns_exempt": {
+            "type": "boolean",
+            "description": "Whether the kill switch lets the daemon's DNS out to\n`kill_switch_dns_servers` outside the tunnels, so every tracker\nhostname it looks up is visible to those resolvers. Never a reason to\nbe unready: the operator chose it."
           }
         },
         "type": "object",
@@ -11104,7 +11108,8 @@
           "ok",
           "profiles",
           "profiles_fenced",
-          "profiles_failed"
+          "profiles_failed",
+          "kill_switch_dns_exempt"
         ],
         "description": "The daemon's readiness, and the counts behind it."
       },

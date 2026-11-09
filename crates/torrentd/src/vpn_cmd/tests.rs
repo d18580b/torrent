@@ -968,6 +968,49 @@ fn an_excluded_profile_s_interface_does_not_decide_a_scoped_run() {
     );
 }
 
+/// `vpn check --as-uid` dry-runs the carve-outs boot would install, in the
+/// ruleset it hands to `nft --check`, and says what each lets out, the DNS
+/// one with its cost. Without them neither line is printed.
+#[test]
+fn the_carve_outs_are_dry_run_and_reported() {
+    let mut cfg = cfg_with_two_profiles();
+    let host = FakeHost::new().with_nft([(0, "")]);
+    let checks = host_checks(&cfg, Some(2000), None, &host);
+    assert!(find(&checks, "kill_switch_api_carveout").is_none());
+    assert!(find(&checks, "kill_switch_dns_exempt").is_none());
+
+    cfg.kill_switch_api_interfaces = vec!["eth0".into()];
+    cfg.kill_switch_dns_servers = vec!["10.43.0.10".parse().unwrap()];
+    let host = FakeHost::new().with_nft([(0, "")]);
+    let checks = host_checks(&cfg, Some(2000), None, &host);
+    let nft_calls: Vec<String> = host
+        .events()
+        .into_iter()
+        .filter(|e| e.starts_with("nft_check"))
+        .collect();
+    assert_eq!(nft_calls.len(), 1, "{nft_calls:?}");
+    let port = cfg.http_listen.tcp().unwrap().port();
+    assert!(
+        nft_calls[0].contains(&format!(
+            "meta skuid 2000 oifname \"eth0\" tcp sport {port} accept"
+        )) && nft_calls[0].contains("meta skuid 2000 ip daddr 10.43.0.10 udp dport 53 accept")
+            && nft_calls[0].contains("meta skuid 2000 ip daddr 10.43.0.10 tcp dport 53 accept"),
+        "the dry-run carries the carve-outs: {nft_calls:?}",
+    );
+    let api = find(&checks, "kill_switch_api_carveout").expect("the API carve-out is reported");
+    assert!(
+        api.detail.contains("eth0") && api.detail.contains(&port.to_string()),
+        "{}",
+        api.detail
+    );
+    let dns = find(&checks, "kill_switch_dns_exempt").expect("the DNS carve-out is reported");
+    assert!(
+        dns.detail.contains("10.43.0.10") && dns.detail.contains("tracker hostname"),
+        "{}",
+        dns.detail
+    );
+}
+
 #[test]
 fn a_uid_mismatch_is_reported_without_colouring_the_exit_status() {
     // `--as-uid` names a uid the invoker is not, which no invocation can
@@ -2178,6 +2221,7 @@ fn the_kill_switch_ruleset_renders_identically_in_vpn_check_and_at_boot() {
         .collect();
     vpn::killswitch::enable_for_uid(
         998,
+        &cfg.kill_switch_carveouts(),
         &tunnels,
         |iface| {
             Ok(match iface {

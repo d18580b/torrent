@@ -702,6 +702,10 @@ pub async fn boot(
     // backstop the metric was simply absent, and an alert for exactly that
     // condition could never fire.
     metrics.set_gauge("kill_switch_active", 0.0, &[]);
+    // Seeded for the same reason: `kill_switch_dns_exempt == 1` is the
+    // series that says tracker lookups leave outside the tunnels.
+    metrics.set_gauge("kill_switch_dns_exempt", 0.0, &[]);
+    let carveouts = cfg.kill_switch_carveouts();
     if cfg.network_kill_switch {
         let tunnels: Vec<String> = profile_registry
             .iter()
@@ -718,7 +722,8 @@ pub async fn boot(
                  above, or unset network_kill_switch.",
             );
         }
-        let installed = vpn::killswitch::enable(&tunnels).map_err(kill_switch_enable_failure)?;
+        let installed =
+            vpn::killswitch::enable(&carveouts, &tunnels).map_err(kill_switch_enable_failure)?;
         cleanup.note_kill_switch();
         // Read back as the watch will read it. A table this host's nft lists
         // in a shape the check does not read as the one rendered would read
@@ -739,6 +744,10 @@ pub async fn boot(
         }
         metrics.set_gauge("kill_switch_active", 1.0, &[]);
         info!(uid = installed.uid, tunnels = ?tunnels, "network kill switch active");
+        warn_kill_switch_carveouts(&carveouts);
+        if carveouts.dns_exempt() {
+            metrics.set_gauge("kill_switch_dns_exempt", 1.0, &[]);
+        }
         // The watch, started here for the reason the monitors above are: the
         // scans below run for minutes on a large pool, and a firewall reload
         // that flushes the ruleset during them has to fence every vpn profile
@@ -1196,6 +1205,8 @@ impl DaemonHandle {
             events: Arc::default(),
             tunnel_probe: crate::vpn_monitor::host_prober(),
             kill_switch: kill_switch.clone(),
+            kill_switch_dns_exempt: kill_switch.is_some()
+                && cfg.kill_switch_carveouts().dns_exempt(),
         };
 
         // The trust set the process runs with, once: effective blocks, and
@@ -1421,6 +1432,32 @@ impl DaemonHandle {
 
         info!("torrentd: clean exit");
         exit_code
+    }
+}
+
+/// Say what the kill switch's carve-outs let out, once it is installed: the
+/// API's replies at INFO, since only its listener's port leaves and only by
+/// the named interfaces; the DNS carve-out at WARN, naming the resolvers,
+/// because every tracker hostname the daemon looks up is then visible to
+/// them and to whatever they forward to, which is a privacy cost the operator
+/// chose and should be reminded of on every boot.
+fn warn_kill_switch_carveouts(carveouts: &vpn::killswitch::Carveouts) {
+    if let Some((port, ifaces)) = carveouts.api() {
+        let ifaces: Vec<&str> = ifaces.collect();
+        info!(
+            api_port = port,
+            interfaces = ?ifaces,
+            "the kill switch lets the API's replies out by kill_switch_api_interfaces",
+        );
+    }
+    if carveouts.dns_exempt() {
+        let servers: Vec<String> = carveouts.dns_servers().map(|s| s.to_string()).collect();
+        warn!(
+            resolvers = %servers.join(", "),
+            "the kill switch lets DNS out to kill_switch_dns_servers outside the tunnels: every \
+             tracker hostname this daemon looks up is visible to these resolvers and to whatever \
+             they forward to",
+        );
     }
 }
 
