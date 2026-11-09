@@ -647,3 +647,14 @@ groups:
           severity: info
         annotations:
           summary: "The pool index and the assignment registry still disagree about {{ $value }} torrents because the boot could not rewrite the index; read the pool index write warning in the boot log, then restart"
+
+      - alert: TorrentdPoolRootMutationsDisabled
+        # The boot's probe found the root's filesystem without
+        # renameat2(RENAME_NOREPLACE) or directory fsync (NFS, CIFS, many
+        # FUSE filesystems): every plan touching it is refused until the root
+        # is moved and the daemon restarted. Read-only use goes on.
+        expr: torrentd_pool_root_mutations_disabled == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pool mutations are disabled for root {{ $labels.root }} ({{ $labels.reason }}): its filesystem failed the boot's probe, and plans touching it are refused; see docs/operations.md, Storage the daemon runs on"

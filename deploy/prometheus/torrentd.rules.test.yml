@@ -2073,6 +2073,27 @@ tests:
             exp_annotations:
               summary: "The pool index and the assignment registry still disagree about 2 torrents because the boot could not rewrite the index; read the pool index write warning in the boot log, then restart"
 
+  # One root on a filesystem without RENAME_NOREPLACE fires for that root and
+  # reason alone; its other reasons, and a root that passed, stay at 0.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_root_mutations_disabled{root="/srv/nfs",reason="rename_noreplace"}'
+        values: '1 1'
+      - series: 'torrentd_pool_root_mutations_disabled{root="/srv/nfs",reason="dir_fsync"}'
+        values: '0 0'
+      - series: 'torrentd_pool_root_mutations_disabled{root="/srv/local",reason="rename_noreplace"}'
+        values: '0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdPoolRootMutationsDisabled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              root: /srv/nfs
+              reason: rename_noreplace
+            exp_annotations:
+              summary: "Pool mutations are disabled for root /srv/nfs (rename_noreplace): its filesystem failed the boot's probe, and plans touching it are refused; see docs/operations.md, Storage the daemon runs on"
+
   # ---- a freshly booted, healthy daemon is silent -----------------------
   # Every counter seeded at zero, every gauge at its healthy value.
   - interval: 1m
