@@ -264,6 +264,7 @@ authentication posture, and at least one `[[profile]]`:
 | `http_socket_group` | The daemon's own group. The group, by name or number, a `unix:` `http_listen` socket is given, so its members reach the API through the group bits. Refused beside a TCP `http_listen`. Read once, at startup. |
 | `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `allowed_hosts` | `[]`, so a daemon without `[auth]` answers only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`). List the names a reverse proxy passes through as `Host`, as bare names or addresses with no scheme, port or path. Refused beside `[auth]` — §6. Read once, at startup. |
+| `allow_unsupported_state_fs` | `false`, so a state directory (that of `resume_dir`, `registry_path` or `[pool] db_path`) on overlayfs, NFS, CIFS/SMB or FUSE refuses the start with exit 78. `true` starts anyway, with a WARN and `torrentd_state_fs_unsupported` at 1 — [operations.md, Storage the daemon runs on](operations.md#storage-the-daemon-runs-on). Read once, at startup. |
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |

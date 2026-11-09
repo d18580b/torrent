@@ -54,6 +54,9 @@ pub struct PoolService {
     pub(crate) verify: Arc<VerifyQueue>,
     /// `[pool] allow_mutations`. Every path that can destroy data checks this.
     allow_mutations: bool,
+    /// The roots whose filesystem failed the boot's mutation probe, each
+    /// with what failed: see [`PoolService::disable_root_mutations`].
+    mutations_disabled: Mutex<Vec<(PathBuf, String)>>,
     /// Set once by the daemon after opening; absent for `torrentd pool …`,
     /// which is a one-shot CLI with nothing to scrape it.
     metrics: std::sync::OnceLock<Arc<dyn MetricsSink>>,
@@ -109,6 +112,43 @@ impl PoolService {
         self.allow_mutations
     }
 
+    /// Refuse, for the life of the process, every plan with a step inside
+    /// `root`, whose filesystem failed the boot's mutation probe; `why` says
+    /// what failed. The other roots keep taking mutations.
+    pub(crate) fn disable_root_mutations(&self, root: PathBuf, why: String) {
+        self.mutations_disabled.lock().push((root, why));
+    }
+
+    /// Why a plan whose steps touch `paths` is refused: the first path
+    /// inside a root [`PoolService::disable_root_mutations`] disabled.
+    /// `None` where none is. Roots are compared by components.
+    pub(crate) fn root_mutation_refusal<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        let disabled = self.mutations_disabled.lock();
+        if disabled.is_empty() {
+            return None;
+        }
+        paths.into_iter().find_map(|p| {
+            let p = std::path::Path::new(p);
+            disabled
+                .iter()
+                .find(|(root, _)| p.starts_with(root))
+                .map(|(root, why)| {
+                    format!(
+                        "mutations are disabled for pool root {}, which this plan touches at \
+                         {}: its filesystem failed the boot's probe ({why}). Move the root to \
+                         a local filesystem that supports renameat2(RENAME_NOREPLACE) and \
+                         directory fsync, and restart; see docs/operations.md, \"Storage the \
+                         daemon runs on\"",
+                        root.display(),
+                        p.display(),
+                    )
+                })
+        })
+    }
+
     pub fn open(cfg: &Config) -> anyhow::Result<Option<Arc<Self>>> {
         let Some(pool_cfg) = cfg.pool.as_ref() else {
             return Ok(None);
@@ -144,6 +184,7 @@ impl PoolService {
             library_dir: pool_cfg.library_dir.clone(),
             verify: Arc::new(VerifyQueue::new(pool_cfg.max_concurrent_verify)),
             allow_mutations: pool_cfg.allow_mutations,
+            mutations_disabled: Mutex::new(Vec::new()),
             metrics: std::sync::OnceLock::new(),
             loaded: std::sync::OnceLock::new(),
             source: std::sync::OnceLock::new(),
@@ -987,6 +1028,12 @@ impl PoolService {
             Ok(steps) => steps,
             Err(refused) => return Ok(Err(refused)),
         };
+        let touched = steps
+            .iter()
+            .flat_map(|s| std::iter::once(s.src.as_str()).chain(s.dst.as_deref()));
+        if let Some(why) = self.root_mutation_refusal(touched) {
+            return Ok(Err(torrentd_pool::plan::Refused(why)));
+        }
         let spec_json = serde_json::to_string(spec)?;
         let id = self.with_store(|st| st.create_plan(spec.kind(), &spec_json, now_secs()))?;
         self.with_store_mut(|st| st.add_plan_steps(id, &steps))?;

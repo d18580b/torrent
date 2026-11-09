@@ -23,6 +23,7 @@ impl Config {
             http_socket_group: new_http_socket_group,
             allow_unauthenticated: new_allow_unauthenticated,
             allowed_hosts: new_allowed_hosts,
+            allow_unsupported_state_fs: new_allow_unsupported_state_fs,
             log_level: new_log_level,
             registry_path: new_registry_path,
             connections_limit: new_connections_limit,
@@ -112,6 +113,10 @@ impl Config {
         }
         if old.allowed_hosts != *new_allowed_hosts {
             d.non_reloadable_changes.push("allowed_hosts");
+        }
+        // The state directory's filesystem is checked once, at boot.
+        if old.allow_unsupported_state_fs != *new_allow_unsupported_state_fs {
+            d.non_reloadable_changes.push("allow_unsupported_state_fs");
         }
         if old.http_listen != *new_http_listen {
             d.non_reloadable_changes.push("http_listen");

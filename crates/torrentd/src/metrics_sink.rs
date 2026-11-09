@@ -501,7 +501,16 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
         "Torrents whose pool-index profile still disagrees with the assignment registry once \
          the boot has rewritten it to the registry's: nonzero only where that write failed.";
+    "pool_root_mutations_disabled" Gauge Daemon ["root"]
+        ("reason": crate::apply::ProbeFailure::ALL) Owner("[pool] allow_mutations, each root") =>
+        "1 while mutations are disabled for a pool root because its filesystem failed the \
+         boot's probe, by what failed: the scratch directory could not be made or removed, \
+         renameat2(RENAME_NOREPLACE) failed, or a directory fsync failed. Plans touching that \
+         root are refused; the other roots keep taking them.";
     // persistence and the exporter itself
+    "state_fs_unsupported" Gauge Daemon Owner("always") =>
+        "1 while allow_unsupported_state_fs let the daemon start with a state directory on \
+         overlayfs, NFS, CIFS/SMB or FUSE, which the boot otherwise refuses.";
     "dir_fsync_errors_total" Counter Daemon Zero =>
         "Directory fsyncs after a rename that failed, every one rather than only the logged \
          first; the renamed file is on disk, but a power loss may revert its name.";
