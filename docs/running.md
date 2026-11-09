@@ -553,7 +553,10 @@ What it costs:
   listen socket, and the proxy is on the tunnel's IPv4 address, so the
   announce from an IPv6 listen socket cannot reach it: a tracker learns the
   profile's IPv4 address alone, and logs of tracker errors show the IPv6
-  endpoint failing.
+  endpoint failing. For the same reason the proxy asks only the IPv4
+  resolvers and connects only to a tracker's IPv4 addresses: an IPv6
+  resolver is passed over, and a tracker with no IPv4 address fails its
+  announce, rather than either leaving by the host's own route.
 - The resolvers must answer within 3 s over UDP. A name none of them knows
   fails the announce; it is never handed to the host's resolver.
 - A profile with `tracker_dns = "tunnel"` and no resolver to ask (no
