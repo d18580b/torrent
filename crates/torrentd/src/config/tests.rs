@@ -124,6 +124,7 @@ fn vpn_profile() -> ProfileConfig {
             listen_port: Some(6881),
             port_forward: Default::default(),
             port_forward_gateway: None,
+            tracker_dns: torrentd_engine::TrackerDns::Host,
         },
         peer_fingerprint: Some("-AA1000-".into()),
         user_agent: Some("qB/5.0".into()),
@@ -994,6 +995,7 @@ fn any_change_inside_the_network_block_is_one_identity_change() {
         listen_port: Some(6881),
         port_forward: Default::default(),
         port_forward_gateway: None,
+        tracker_dns: torrentd_engine::TrackerDns::Host,
     };
 
     let edits: Vec<(&str, &Config, ProfileNetwork)> = vec![
@@ -1024,6 +1026,7 @@ fn any_change_inside_the_network_block_is_one_identity_change() {
                 listen_port: Some(6881),
                 port_forward: Default::default(),
                 port_forward_gateway: None,
+                tracker_dns: torrentd_engine::TrackerDns::Host,
             },
         ),
         (
@@ -1036,6 +1039,7 @@ fn any_change_inside_the_network_block_is_one_identity_change() {
                 listen_port: Some(51413),
                 port_forward: Default::default(),
                 port_forward_gateway: None,
+                tracker_dns: torrentd_engine::TrackerDns::Host,
             },
         ),
         ("vpn to host", &vpn, host.profile[0].network.clone()),
@@ -1626,6 +1630,91 @@ fn a_listen_port_under_natpmp_is_refused_rather_than_ignored() {
     );
 }
 
+/// A vpn profile `acct_a` on `vpn_type`, with `extra` appended to its table.
+fn load_vpn_profile(vpn_type: &str, extra: &str) -> Result<Config, String> {
+    let dir = tempdir().unwrap();
+    let config = if vpn_type == "openvpn" {
+        "/etc/openvpn/a.ovpn"
+    } else {
+        "/etc/wireguard/wg0.conf"
+    };
+    let body = format!(
+        "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
+         vpn_type = \"{vpn_type}\"\nvpn_config = \"{config}\"\n\
+         vpn_interface = \"wg0\"\nlisten_port = 6891\n\
+         peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n\
+         allowed_tracker_domains = [\"t.example\"]\n{extra}\n"
+    );
+    let p = write_cfg(dir.path(), &body);
+    Config::load(&p).map_err(|e| format!("{e:#}"))
+}
+
+#[test]
+fn tracker_dns_is_the_host_s_unless_the_profile_says_tunnel() {
+    let cfg = load_vpn_profile("wireguard", "").unwrap();
+    assert_eq!(
+        cfg.profile[0].tracker_dns(),
+        &torrentd_engine::TrackerDns::Host
+    );
+
+    let cfg = load_vpn_profile("wireguard", "tracker_dns = \"tunnel\"").unwrap();
+    assert_eq!(
+        cfg.profile[0].tracker_dns(),
+        &torrentd_engine::TrackerDns::Tunnel { servers: vec![] },
+        "with no servers, the WireGuard config's DNS = lines are read at bring-up",
+    );
+
+    let cfg = load_vpn_profile(
+        "openvpn",
+        "tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"10.8.0.1\", \"fd00::53\"]",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.profile[0].tracker_dns(),
+        &torrentd_engine::TrackerDns::Tunnel {
+            servers: vec!["10.8.0.1".parse().unwrap(), "fd00::53".parse().unwrap()],
+        },
+    );
+}
+
+#[test]
+fn tracker_dns_settings_that_could_not_take_are_refused() {
+    for (vpn_type, extra, needle) in [
+        // Servers nobody would ask.
+        (
+            "wireguard",
+            "tracker_dns_servers = [\"10.2.0.1\"]",
+            "tracker_dns_servers",
+        ),
+        // OpenVPN has no config line naming its resolver to fall back on.
+        ("openvpn", "tracker_dns = \"tunnel\"", "OpenVPN"),
+        // The host's own stub, which is the lookup this exists to avoid.
+        (
+            "wireguard",
+            "tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"127.0.0.53\"]",
+            "127.0.0.53",
+        ),
+        (
+            "wireguard",
+            "tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"::\"]",
+            "::",
+        ),
+    ] {
+        let msg = load_vpn_profile(vpn_type, extra).unwrap_err();
+        assert!(msg.contains(needle), "{extra}: got {msg}");
+    }
+
+    // Wrong posture: a host profile has no tunnel to resolve through.
+    let dir = tempdir().unwrap();
+    let body = format!(
+        "{TOP_LEVEL}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\ntracker_dns = \"tunnel\"\n"
+    );
+    let p = write_cfg(dir.path(), &body);
+    let msg = format!("{:#}", Config::load(&p).unwrap_err());
+    assert!(msg.contains("tracker_dns"), "got: {msg}");
+}
+
 #[test]
 fn a_natpmp_profile_without_a_listen_port_is_accepted() {
     // The shape the rule above exists to leave alone.
@@ -1921,6 +2010,7 @@ fn a_kill_switch_with_a_vpn_profile_passes_the_pre_flight() {
             listen_port: Some(6891),
             port_forward: torrentd_engine::PortForwardMode::Static,
             port_forward_gateway: None,
+            tracker_dns: torrentd_engine::TrackerDns::Host,
         },
     );
     assert_eq!(profile.peer_fingerprint.as_deref(), Some("-AA1000-"));
@@ -2275,6 +2365,7 @@ fn an_http_listen_port_a_profile_listens_on_is_refused() {
             listen_port: Some(8080),
             port_forward: Default::default(),
             port_forward_gateway: None,
+            tracker_dns: torrentd_engine::TrackerDns::Host,
         },
         peer_fingerprint: Some("-AA1000-".into()),
         user_agent: Some("qB/5.0".into()),

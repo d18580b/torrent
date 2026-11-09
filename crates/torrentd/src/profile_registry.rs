@@ -734,6 +734,7 @@ pub(crate) fn test_vpn_entry(id: &str, status: ProfileStatus) -> ProfileEntry {
             listen_port: Some(6881),
             port_forward: PortForwardMode::Static,
             port_forward_gateway: None,
+            tracker_dns: torrentd_engine::TrackerDns::Host,
         },
         peer_fingerprint: Some("-AA1000-".to_string()),
         user_agent: Some(format!("ua-{id}")),

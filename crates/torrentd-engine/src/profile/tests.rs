@@ -15,6 +15,7 @@ fn cfg(id: &str, port: u16, iface: &str, fp: &str, ua: &str) -> ProfileConfig {
             listen_port: Some(port),
             port_forward: PortForwardMode::Static,
             port_forward_gateway: None,
+            tracker_dns: crate::TrackerDns::Host,
         },
         peer_fingerprint: Some(fp.to_string()),
         user_agent: Some(ua.to_string()),

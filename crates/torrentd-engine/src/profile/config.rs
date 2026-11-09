@@ -48,7 +48,39 @@ pub enum ProfileNetwork {
         /// NAT-PMP gateway to negotiate against. Defaults to `10.2.0.1`, the
         /// ProtonVPN WireGuard gateway.
         port_forward_gateway: Option<String>,
+        /// Which resolver this profile's tracker hostnames are looked up
+        /// through (default: the host's).
+        tracker_dns: TrackerDns,
     },
+}
+
+/// Where a vpn profile's tracker hostnames are resolved.
+///
+/// libtorrent resolves a hostname with libc, through the process's one
+/// `/etc/resolv.conf`, so whichever tunnel a session sends from, the
+/// question of which trackers it uses goes to the host's resolver and on to
+/// that resolver's upstream. `Tunnel` takes the lookup away from libc: the
+/// daemon puts a SOCKS5 proxy for the profile's tracker connections on the
+/// tunnel address, which resolves each tracker's name by asking `servers`
+/// from that address, through that tunnel, and connects from there too.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TrackerDns {
+    /// The host's resolver, as libc reads it.
+    #[default]
+    Host,
+    /// Resolvers reached through the profile's own tunnel. Empty means the
+    /// WireGuard config's `[Interface]` `DNS =` lines, read when the tunnel
+    /// comes up; an OpenVPN profile, whose resolver is pushed at runtime,
+    /// must name them.
+    Tunnel { servers: Vec<std::net::IpAddr> },
+}
+
+/// `tracker_dns` as written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TrackerDnsMode {
+    Host,
+    Tunnel,
 }
 
 /// Per-profile configuration, mirroring one `[[profile]]` table.
@@ -147,6 +179,10 @@ struct RawProfile {
     port_forward: Option<PortForwardMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     port_forward_gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tracker_dns: Option<TrackerDnsMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tracker_dns_servers: Option<Vec<std::net::IpAddr>>,
 
     // either
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +258,13 @@ impl TryFrom<RawProfile> for ProfileConfig {
                     "port_forward_gateway",
                     "vpn",
                 )?;
+                r.reject(&id, r.tracker_dns.is_some(), "tracker_dns", "vpn")?;
+                r.reject(
+                    &id,
+                    r.tracker_dns_servers.is_some(),
+                    "tracker_dns_servers",
+                    "vpn",
+                )?;
                 ProfileNetwork::Host {
                     listen_interfaces: r.listen_interfaces.clone().ok_or_else(|| {
                         format!(
@@ -264,8 +307,10 @@ impl TryFrom<RawProfile> for ProfileConfig {
                         id.as_str(),
                     ));
                 }
+                let vpn_type = r.vpn_type.ok_or_else(|| missing("vpn_type"))?;
+                let tracker_dns = Self::read_tracker_dns(&id, vpn_type, &r)?;
                 ProfileNetwork::Vpn {
-                    vpn_type: r.vpn_type.ok_or_else(|| missing("vpn_type"))?,
+                    vpn_type,
                     vpn_config: r.vpn_config.clone().ok_or_else(|| missing("vpn_config"))?,
                     vpn_interface: r
                         .vpn_interface
@@ -274,6 +319,7 @@ impl TryFrom<RawProfile> for ProfileConfig {
                     listen_port: r.listen_port,
                     port_forward: r.port_forward.unwrap_or_default(),
                     port_forward_gateway: r.port_forward_gateway.clone(),
+                    tracker_dns,
                 }
             }
         };
@@ -292,6 +338,44 @@ impl TryFrom<RawProfile> for ProfileConfig {
 }
 
 impl ProfileConfig {
+    /// A vpn profile's `tracker_dns` and `tracker_dns_servers`, read
+    /// together: the servers only mean anything with `tracker_dns =
+    /// "tunnel"`, and each one is a resolver the tunnel reaches.
+    fn read_tracker_dns(
+        id: &ProfileId,
+        vpn_type: VpnType,
+        r: &RawProfile,
+    ) -> Result<TrackerDns, String> {
+        let id = id.as_str();
+        match (r.tracker_dns, &r.tracker_dns_servers) {
+            (None | Some(TrackerDnsMode::Host), None) => Ok(TrackerDns::Host),
+            (None | Some(TrackerDnsMode::Host), Some(_)) => Err(format!(
+                "profile {id:?} sets tracker_dns_servers without tracker_dns = \"tunnel\"; \
+                 the servers are only asked when the lookups go through the tunnel"
+            )),
+            (Some(TrackerDnsMode::Tunnel), servers) => {
+                let servers = servers.clone().unwrap_or_default();
+                if let Some(bad) = servers
+                    .iter()
+                    .find(|s| s.is_unspecified() || s.is_loopback() || s.is_multicast())
+                {
+                    return Err(format!(
+                        "profile {id:?}: tracker_dns_servers names {bad}, which no tunnel \
+                         reaches; name the provider's resolver inside the tunnel"
+                    ));
+                }
+                if servers.is_empty() && vpn_type == VpnType::Openvpn {
+                    return Err(format!(
+                        "profile {id:?} sets tracker_dns = \"tunnel\" on an OpenVPN tunnel \
+                         without tracker_dns_servers; OpenVPN's server pushes its resolver \
+                         at runtime, so name it here"
+                    ));
+                }
+                Ok(TrackerDns::Tunnel { servers })
+            }
+        }
+    }
+
     /// The flat TOML shape this profile deserialized from.
     ///
     /// Private, and reachable only through `Serialize` below. It shipped as a
@@ -312,6 +396,8 @@ impl ProfileConfig {
             listen_port: None,
             port_forward: None,
             port_forward_gateway: None,
+            tracker_dns: None,
+            tracker_dns_servers: None,
             peer_fingerprint: c.peer_fingerprint.clone(),
             peer_fingerprint_hex: None,
             user_agent: c.user_agent.clone(),
@@ -336,8 +422,13 @@ impl ProfileConfig {
                 listen_port,
                 port_forward,
                 port_forward_gateway,
+                tracker_dns,
             } => {
                 raw.network = NetworkKind::Vpn;
+                if let TrackerDns::Tunnel { servers } = tracker_dns {
+                    raw.tracker_dns = Some(TrackerDnsMode::Tunnel);
+                    raw.tracker_dns_servers = (!servers.is_empty()).then(|| servers.clone());
+                }
                 raw.vpn_type = Some(*vpn_type);
                 raw.vpn_config = Some(vpn_config.clone());
                 raw.vpn_interface = Some(vpn_interface.clone());
@@ -472,6 +563,16 @@ impl ProfileConfig {
                 .as_deref()
                 .unwrap_or(Self::DEFAULT_NATPMP_GATEWAY),
             ProfileNetwork::Host { .. } => Self::DEFAULT_NATPMP_GATEWAY,
+        }
+    }
+
+    /// Where this profile's tracker hostnames are resolved: `Host` for a
+    /// host profile, which has no tunnel to resolve through.
+    pub fn tracker_dns(&self) -> &TrackerDns {
+        static HOST: TrackerDns = TrackerDns::Host;
+        match &self.network {
+            ProfileNetwork::Vpn { tracker_dns, .. } => tracker_dns,
+            ProfileNetwork::Host { .. } => &HOST,
         }
     }
 
