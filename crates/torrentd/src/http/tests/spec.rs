@@ -320,6 +320,40 @@ fn only_operations_with_a_body_declare_a_deadline() {
 }
 
 #[test]
+fn an_untimed_operation_declares_the_400_for_a_body_that_did_not_arrive_whole() {
+    // `TimedBody` reads the body of these three itself and refuses one whose
+    // transfer failed part-way (issue #703); the document and the catalogue
+    // both say so.
+    let doc = doc();
+    let paths = [
+        "/v1/pool/adoptions",
+        "/v1/pool/plans",
+        "/v1/pool/plans/{plan_id}/apply",
+    ];
+    for path in paths {
+        let described = doc["paths"][path]["post"]["responses"]["400"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            described.contains("did not arrive whole"),
+            "POST {path}: 400 is {described:?}"
+        );
+    }
+    let catalogue = reference("problems.md");
+    let row = catalogue
+        .lines()
+        .find(|line| line.starts_with("| `400` |"))
+        .expect("problems.md has a `400` row");
+    for needle in [
+        "did not arrive whole",
+        "`POST /v1/pool/adoptions`",
+        "`POST /v1/pool/plans`",
+    ] {
+        assert!(row.contains(needle), "{needle}: {row}");
+    }
+}
+
+#[test]
 fn no_operation_answers_with_a_top_level_array() {
     let doc = doc();
     for (method, path, op) in operations(&doc) {
