@@ -316,6 +316,68 @@ async fn the_login_throttle_keys_on_the_client_a_trusted_proxy_names() {
 }
 
 #[tokio::test]
+async fn the_login_throttle_keys_on_the_client_behind_a_chain_of_trusted_proxies() {
+    // A CDN in front of an ingress controller: the socket peer is the
+    // ingress, the CDN's edge is the last X-Forwarded-For element, and both
+    // sit in the trusted range, as a Kubernetes pod CIDR would. The throttle
+    // has to key on the client in front of the CDN, or everyone behind it
+    // shares one bucket.
+    let ingress = "192.0.2.10"; // the harness's socket peer
+    let edge = "192.0.2.20";
+    let h = Harness::authed(&Coverage::new(), |s| {
+        s.trusted_proxies =
+            crate::http::forwarded::TrustedProxies::parse(&["192.0.2.0/24".to_owned()])
+                .expect("a literal block parses");
+    });
+    // The client rotates a spoofed leftmost entry on every attempt; the walk
+    // stops at the address the CDN wrote, so every attempt is one client's.
+    for i in 1..=5 {
+        let chain = format!("198.51.100.{i}, 203.0.113.7, {edge}");
+        let resp = h
+            .send_with(
+                "POST",
+                "/v1/sessions",
+                None,
+                Some(json!({"password": "nope"})),
+                &[("x-forwarded-for", chain.as_str())],
+            )
+            .await;
+        assert_problem(&resp, 401, "invalid-credentials");
+    }
+    let resp = h
+        .send_with(
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(json!({"password": PASSWORD})),
+            &[("x-forwarded-for", &format!("203.0.113.7, {edge}"))],
+        )
+        .await;
+    assert_problem(&resp, 429, "login-throttled");
+    // Another client behind the same CDN is not locked out.
+    let resp = h
+        .send_with(
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(json!({"password": PASSWORD})),
+            &[("x-forwarded-for", &format!("203.0.113.8, {edge}"))],
+        )
+        .await;
+    resp.assert_status(kynos::http::StatusCode::CREATED);
+    // Neither proxy, nor any spoofed entry, holds a bucket.
+    let auth = h.state.auth.as_ref().unwrap();
+    for addr in [ingress, edge, "198.51.100.1", "198.51.100.5"] {
+        assert!(
+            auth.throttle
+                .retry_after(Some(addr.parse().unwrap()))
+                .is_none(),
+            "{addr} holds no bucket",
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_client_that_logged_in_before_gets_past_a_spent_verification_budget() {
     // Addresses polling in a loop can keep the daemon-wide budget spent.
     // A client that has logged in since the daemon started falls back on a
