@@ -17,7 +17,7 @@
           "operations"
         ],
         "summary": "Liveness.",
-        "description": "503 only for what a restart fixes: the alert loop's heartbeat older than\nfifteen seconds, a batch writer thread dead, or the HTTP runtime unable\nto run a trivial task within two seconds. Never for a fenced, offline,\nfailed or missing profile: those are `/readyz`'s, and a fence in\nparticular holds until an operator lifts it, which a restart would undo.\nA runtime wedged hard enough not to run this handler at all gives no\nanswer, which a probe's own timeout counts as a failure. Unauthenticated,\nas every probe is.",
+        "description": "503 only for what a restart fixes: the alert loop's heartbeat older than\nfifteen seconds, a batch writer thread dead, or the runtime's tick - a\ntask stamping the time twice a second - older than two seconds. Never for\na fenced, offline, failed or missing profile: those are `/readyz`'s, and\na fence in particular holds until an operator lifts it, which a restart\nwould undo. A runtime wedged hard enough not to run this handler at all\ngives no answer, which a probe's own timeout counts as a failure.\nUnauthenticated, as every probe is.",
         "operationId": "get_live",
         "responses": {
           "200": {

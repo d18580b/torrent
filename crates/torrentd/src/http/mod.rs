@@ -22,7 +22,7 @@ pub mod ctx;
 pub(crate) mod fault_injection;
 pub mod forwarded;
 mod headers;
-mod healthz;
+pub(crate) mod healthz;
 mod metrics;
 pub(crate) mod page;
 pub mod security;

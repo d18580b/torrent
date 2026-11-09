@@ -57,6 +57,10 @@ pub struct AppState {
     /// `/livez` and `/readyz` so a wedged loop makes the daemon report both
     /// wedged and unready.
     pub alert_heartbeat: Arc<AtomicU64>,
+    /// The runtime's liveness stamp (Unix millis), which the supervised task
+    /// `runtime_tick` refreshes twice a second. Read by `/livez`: stale, the
+    /// runtime's scheduler or timer is starved.
+    pub runtime_tick: Arc<AtomicU64>,
     /// How far the boot has got: `/readyz` answers `starting` until it says
     /// the boot is done.
     pub boot: Arc<BootProgress>,
@@ -409,6 +413,12 @@ pub(crate) fn build_test_state_with_sessions(
         pool: None,
         checks: crate::check_queue::VerifyQueue::for_daemon(None),
         alert_heartbeat: Arc::new(AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )),
+        runtime_tick: Arc::new(AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

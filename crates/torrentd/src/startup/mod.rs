@@ -1217,6 +1217,20 @@ impl DaemonHandle {
             ),
         );
 
+        // Runtime tick: the stamp `/livez` reads to tell a starved scheduler
+        // or timer, which the probe's own handler running does not show.
+        let runtime_tick = Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        ));
+        spawn_supervised(
+            "runtime_tick",
+            metrics.clone(),
+            crate::http::healthz::run_runtime_tick(Arc::clone(&runtime_tick)),
+        );
+
         let trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
             .expect("validated at startup");
         let app_state = AppState {
@@ -1231,6 +1245,7 @@ impl DaemonHandle {
             pool,
             checks,
             alert_heartbeat: alert_loop.heartbeat(),
+            runtime_tick,
             boot: Arc::clone(&boot),
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),

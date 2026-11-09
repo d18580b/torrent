@@ -101,7 +101,8 @@ pub enum LivenessCheck {
     AlertLoopStalled,
     /// A batch writer thread died: resume data no longer reaches the disk.
     BatchWriterDead,
-    /// The HTTP runtime did not run a trivial task within two seconds.
+    /// The runtime's tick, stamped twice a second, is older than two
+    /// seconds: its scheduler or timer is starved.
     RuntimeStalled,
 }
 
@@ -117,28 +118,47 @@ pub enum Liveness {
     Wedged(LivenessReport),
 }
 
-/// How long the HTTP runtime may take to run a trivial task before `/livez`
-/// calls it stalled.
-const RUNTIME_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often the supervised task `runtime_tick` stamps
+/// [`AppState::runtime_tick`].
+const RUNTIME_TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How stale the runtime's tick stamp may get before `/livez` calls the
+/// runtime stalled: four periods.
+const MAX_RUNTIME_TICK_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stamp `stamp` with the time every [`RUNTIME_TICK_PERIOD`], forever. Run as
+/// the supervised task `runtime_tick`.
+///
+/// Each stamp needs the runtime's timer to fire and a worker to poll this
+/// task, so a starved scheduler or a timer that stopped firing lets it go
+/// stale. `/livez` only reads it: a handler that runs on a free worker does
+/// not refresh it, and so reports a stall on the others.
+pub(crate) async fn run_runtime_tick(stamp: Arc<std::sync::atomic::AtomicU64>) {
+    let mut every = tokio::time::interval(RUNTIME_TICK_PERIOD);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        stamp.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Liveness.
 ///
 /// 503 only for what a restart fixes: the alert loop's heartbeat older than
-/// fifteen seconds, a batch writer thread dead, or the HTTP runtime unable
-/// to run a trivial task within two seconds. Never for a fenced, offline,
-/// failed or missing profile: those are `/readyz`'s, and a fence in
-/// particular holds until an operator lifts it, which a restart would undo.
-/// A runtime wedged hard enough not to run this handler at all gives no
-/// answer, which a probe's own timeout counts as a failure. Unauthenticated,
-/// as every probe is.
+/// fifteen seconds, a batch writer thread dead, or the runtime's tick - a
+/// task stamping the time twice a second - older than two seconds. Never for
+/// a fenced, offline, failed or missing profile: those are `/readyz`'s, and
+/// a fence in particular holds until an operator lifts it, which a restart
+/// would undo. A runtime wedged hard enough not to run this handler at all
+/// gives no answer, which a probe's own timeout counts as a failure.
+/// Unauthenticated, as every probe is.
 #[kynos::get("/livez", tag = Operations)]
 pub async fn get_live(Inject(s): Inject<Arc<AppState>>) -> Liveness {
-    let runtime_ok = runtime_schedules(RUNTIME_PROBE_BOUND).await;
-    let report = evaluate_live(
-        &s,
-        torrentd_engine::batch_writer::writer_deaths(),
-        runtime_ok,
-    );
+    let report = evaluate_live(&s, torrentd_engine::batch_writer::writer_deaths());
     if report.ok {
         Liveness::Live(report)
     } else {
@@ -146,23 +166,8 @@ pub async fn get_live(Inject(s): Inject<Arc<AppState>>) -> Liveness {
     }
 }
 
-/// Whether the runtime runs a task spawned now within `bound`. Past it the
-/// task is aborted, so a probe that times out leaves nothing behind.
-async fn runtime_schedules(bound: std::time::Duration) -> bool {
-    let task = tokio::spawn(async {});
-    let abort = task.abort_handle();
-    match tokio::time::timeout(bound, task).await {
-        Ok(joined) => joined.is_ok(),
-        Err(_) => {
-            abort.abort();
-            false
-        }
-    }
-}
-
-/// The liveness of `s`, given the process's batch writer deaths and whether
-/// the runtime ran the probe's task in time.
-fn evaluate_live(s: &AppState, writer_deaths: u64, runtime_ok: bool) -> LivenessReport {
+/// The liveness of `s`, given the process's batch writer deaths.
+fn evaluate_live(s: &AppState, writer_deaths: u64) -> LivenessReport {
     // With no live session there is no alert loop to judge; no session is a
     // readiness answer, and a restart does not bring a tunnel up.
     let age = (!s.source.profiles().is_empty()).then(|| heartbeat_age(&s.alert_heartbeat));
@@ -170,7 +175,7 @@ fn evaluate_live(s: &AppState, writer_deaths: u64, runtime_ok: bool) -> Liveness
         Some(LivenessCheck::AlertLoopStalled)
     } else if writer_deaths > 0 {
         Some(LivenessCheck::BatchWriterDead)
-    } else if !runtime_ok {
+    } else if heartbeat_age(&s.runtime_tick) > MAX_RUNTIME_TICK_AGE {
         Some(LivenessCheck::RuntimeStalled)
     } else {
         None
@@ -633,14 +638,14 @@ mod tests {
         assert_eq!(status, 503);
     }
 
-    /// The status `/livez` would answer for `s` with no writer dead and the
-    /// runtime scheduling, and the body as JSON.
+    /// The status `/livez` would answer for `s` with no writer dead, and the
+    /// body as JSON.
     fn live(s: &AppState) -> (u16, serde_json::Value) {
-        live_with(s, 0, true)
+        live_with(s, 0)
     }
 
-    fn live_with(s: &AppState, deaths: u64, runtime_ok: bool) -> (u16, serde_json::Value) {
-        let report = evaluate_live(s, deaths, runtime_ok);
+    fn live_with(s: &AppState, deaths: u64) -> (u16, serde_json::Value) {
+        let report = evaluate_live(s, deaths);
         let status = if report.ok { 200 } else { 503 };
         (status, serde_json::to_value(&report).unwrap())
     }
@@ -694,28 +699,41 @@ mod tests {
         assert_eq!(body["reason"], "alert_loop_stalled");
     }
 
-    /// A dead batch writer and a runtime that did not run the probe's task
-    /// each fail liveness, naming themselves; neither moves readiness.
+    /// A dead batch writer and a stale runtime tick each fail liveness,
+    /// naming themselves; neither moves readiness.
     #[test]
     fn a_dead_batch_writer_or_a_stalled_runtime_is_wedged() {
         let s = build_test_state(None);
         s.alert_heartbeat
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
-        let (status, body) = live_with(&s, 1, true);
+        let (status, body) = live_with(&s, 1);
         assert_eq!(status, 503);
         assert_eq!(body["failed"], "batch_writer_dead");
         assert_eq!(body["batch_writer_deaths"], 1);
-        let (status, body) = live_with(&s, 0, false);
+        s.runtime_tick
+            .store(millis_ago(MAX_RUNTIME_TICK_AGE * 2), Ordering::Relaxed);
+        let (status, body) = live_with(&s, 0);
         assert_eq!(status, 503);
         assert_eq!(body["failed"], "runtime_stalled");
         assert_eq!(probe(&s).0, 200);
     }
 
-    /// A runtime with a free worker runs the probe's task well within the
-    /// bound.
+    /// The tick task stamps a stale stamp fresh as soon as the runtime
+    /// polls it, so a running runtime is live by it.
     #[tokio::test]
-    async fn a_running_runtime_schedules_the_probe_task() {
-        assert!(runtime_schedules(RUNTIME_PROBE_BOUND).await);
+    async fn the_runtime_tick_refreshes_a_stale_stamp() {
+        let s = build_test_state(None);
+        s.runtime_tick
+            .store(millis_ago(MAX_RUNTIME_TICK_AGE * 2), Ordering::Relaxed);
+        assert_eq!(live(&s).1["failed"], "runtime_stalled");
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_runtime_tick(Arc::clone(&s.runtime_tick)),
+        )
+        .await;
+        assert!(ran.is_err(), "the tick runs until stopped");
+        assert!(heartbeat_age(&s.runtime_tick) < RUNTIME_TICK_PERIOD);
+        assert_eq!(live(&s).1["failed"], serde_json::Value::Null);
     }
 
     /// Until the boot is done, readiness is `starting` whatever else holds;

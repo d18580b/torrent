@@ -155,6 +155,7 @@ pub const TASKS: &[&str] = &[
     "verify_queue",
     "kill_switch_watch",
     "watchdog",
+    "runtime_tick",
 ];
 
 /// The `reason` values of `auth_rejections_total`.

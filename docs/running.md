@@ -1488,8 +1488,9 @@ the `Host` header:
 - `/livez` asks whether the process is wedged, which a restart fixes. It
   answers 503 only when the alert loop's heartbeat is older than 15 seconds
   (`alert_loop_stalled`), a batch writer thread - the one that writes resume
-  data - has died (`batch_writer_dead`), or the HTTP runtime did not run a
-  trivial task within 2 seconds (`runtime_stalled`), and its body's `failed`
+  data - has died (`batch_writer_dead`), or the async runtime's tick - a task
+  that stamps the time twice a second - is older than 2 seconds, so its
+  scheduler or timer is starved (`runtime_stalled`), and its body's `failed`
   names which. It never fails for a fenced, offline or failed profile, or for
   no session at all: those are not fixed by a restart, and a fence holds until
   an operator lifts it (operations.md, "Recovering a fenced profile").
