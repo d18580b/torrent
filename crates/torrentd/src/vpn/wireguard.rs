@@ -1067,7 +1067,9 @@ impl WireguardManager {
 ///
 /// **What does not carry over.** `DNS` needs `resolvconf` and root, and
 /// `SaveConfig` writes the config back as root; both are ignored with a
-/// warning. `PreUp`/`PostUp`/`PreDown`/`PostDown` hooks are refused rather
+/// warning. (A `DNS` address is still what `tracker_dns = "tunnel"` asks
+/// when the profile names no resolver of its own: [`dns_servers`].)
+/// `PreUp`/`PostUp`/`PreDown`/`PostDown` hooks are refused rather
 /// than run: they are shell the operator wrote for `wg-quick`, and running
 /// them from the daemon — under its own uid, or as root inside its sandbox —
 /// would either fail part-way or do something different from what they were
@@ -1180,7 +1182,8 @@ mod native {
         /// `false` for `Table = off`.
         pub(super) route: bool,
         /// Each `[Interface]` `DNS` line's value, as written. The link never
-        /// applies it ([`Parsed::ignored`]); [`super::tunnel_holding`] reads it.
+        /// applies it ([`Parsed::ignored`]); [`super::tunnel_holding`] and
+        /// [`super::dns_servers`] read it.
         pub(super) dns: Vec<String>,
         /// `wg-quick`-only keys this path cannot honour and ignores.
         pub(super) ignored: Vec<String>,
