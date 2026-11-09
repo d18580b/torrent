@@ -3,6 +3,8 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use rusqlite::Connection;
 use tracing::warn;
@@ -95,7 +97,40 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolE
     }
 }
 
+/// Every `ROLLBACK` (or `ROLLBACK TO` a savepoint) that failed in this
+/// process. See [`PoolStore::rollback_errors`].
+static ROLLBACK_ERRORS: AtomicU64 = AtomicU64::new(0);
+
 impl PoolStore {
+    /// How many rollbacks have failed in this process, on any connection.
+    ///
+    /// Process-wide, because a store holds no metrics sink; the daemon's
+    /// exporter reads it at scrape time into
+    /// `store_write_errors_total{store="pool_index"}`. A failed rollback can
+    /// leave the connection inside the transaction its caller believes
+    /// ended, so the writes after it may land in that transaction or be lost
+    /// with it.
+    pub fn rollback_errors() -> u64 {
+        ROLLBACK_ERRORS.load(Ordering::Relaxed)
+    }
+
+    /// Run `statement`, a rollback, and log and count it where it fails.
+    ///
+    /// The caller carries on either way: it is already reporting the failure
+    /// or the panic that made it roll back, and that stays what it reports.
+    fn roll_back(&self, statement: &str) {
+        if let Err(e) = self.conn.execute_batch(statement) {
+            ROLLBACK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target: "torrentd_pool::store",
+                statement,
+                error.cause = %e,
+                "pool index rollback failed; the connection may still be inside the \
+                 transaction it was ending",
+            );
+        }
+    }
+
     /// Open (creating if needed) the pool database at `path` as one of any
     /// number of concurrent writers: the daemon, or a short CLI command such
     /// as `pool check`.
@@ -227,7 +262,7 @@ impl PoolStore {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         // A read transaction has nothing to keep; ending it releases the
         // snapshot so the WAL can be checkpointed past it.
-        let _ = self.conn.execute_batch("ROLLBACK");
+        self.roll_back("ROLLBACK");
         match out {
             Ok(v) => v,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -303,7 +338,7 @@ impl PoolStore {
         let out = match out {
             Ok(v) => v,
             Err(panic) => {
-                let _ = self.conn.execute_batch(&rollback);
+                self.roll_back(&rollback);
                 self.tx_depth = depth;
                 std::panic::resume_unwind(panic);
             }
@@ -323,7 +358,7 @@ impl PoolStore {
                     // `BEGIN IMMEDIATE` fails with "cannot start a
                     // transaction within a transaction" for the life of the
                     // process. Roll back explicitly, then restore.
-                    let _ = self.conn.execute_batch(&rollback);
+                    self.roll_back(&rollback);
                     self.tx_depth = depth;
                     Err(E::from(PoolError::Sqlite(e)))
                 }
@@ -331,7 +366,7 @@ impl PoolStore {
             Err(e) => {
                 // Report the original failure; a rollback that itself fails
                 // means the connection is already unusable either way.
-                let _ = self.conn.execute_batch(&rollback);
+                self.roll_back(&rollback);
                 self.tx_depth = depth;
                 Err(e)
             }
@@ -351,5 +386,32 @@ impl PoolStore {
             false
         }));
         counter
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn a_rollback_that_fails_is_counted_and_the_callers_error_is_kept() {
+        let mut store = PoolStore::open_in_memory().unwrap();
+        let before = PoolStore::rollback_errors();
+        // Ending the transaction under `in_transaction` makes its own
+        // ROLLBACK fail: there is no transaction left to roll back.
+        let out: Result<(), PoolError> = store.in_transaction(|s| {
+            s.conn.execute_batch("ROLLBACK").unwrap();
+            Err(PoolError::Busy)
+        });
+        assert!(matches!(out, Err(PoolError::Busy)), "{out:?}");
+        // Another test in this process may fail one too, so at least one.
+        assert!(PoolStore::rollback_errors() > before);
+        // The depth was restored, so the next transaction is a real one.
+        store
+            .in_transaction(|s| {
+                assert!(s.in_open_transaction());
+                Ok::<_, PoolError>(())
+            })
+            .unwrap();
     }
 }
