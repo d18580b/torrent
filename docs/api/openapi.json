@@ -8909,17 +8909,6 @@
           },
           "401": {
             "description": "Invalid credentials",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
-                "required": false,
-                "schema": {
-                  "type": "integer",
-                  "minimum": 0.0,
-                  "format": "uint64"
-                }
-              }
-            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8942,17 +8931,6 @@
           },
           "409": {
             "description": "Authentication is not configured",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
-                "required": false,
-                "schema": {
-                  "type": "integer",
-                  "minimum": 0.0,
-                  "format": "uint64"
-                }
-              }
-            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8977,8 +8955,8 @@
             "description": "Too many login attempts",
             "headers": {
               "Retry-After": {
-                "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
-                "required": false,
+                "description": "Seconds to wait before trying again.",
+                "required": true,
                 "schema": {
                   "type": "integer",
                   "minimum": 0.0,
