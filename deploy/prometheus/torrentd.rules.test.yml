@@ -63,6 +63,60 @@ tests:
             exp_annotations:
               summary: "Background task vpn_monitor has exited or panicked; what it watched is no longer watched"
 
+  # One panic on the resume writer at 2m fires for that thread alone, and
+  # resolves 15 minutes on; the seeded zero on the tokio threads never fires.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_panics_total{thread="torrentd-resume-writer"}'
+        values: '0 0 1x30'
+      - series: 'torrentd_boot_panics{thread="torrentd-resume-writer"}'
+        values: '0x32'
+      - series: 'torrentd_panics_total{thread="torrentd-tokio"}'
+        values: '0x32'
+      - series: 'torrentd_boot_panics{thread="torrentd-tokio"}'
+        values: '0x32'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdPanicked
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdPanicked
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              thread: torrentd-resume-writer
+            exp_annotations:
+              summary: "A torrentd thread (torrentd-resume-writer) panicked; read the panic line in its log"
+      - eval_time: 30m
+        alertname: TorrentdPanicked
+        exp_alerts: []
+
+  # A panic during the boot, before the first scrape: 1 at the first sample,
+  # flat. The boot gauge fires it, past the 15-minute window.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_panics_total{thread="torrentd-tokio"}'
+        values: '1x40'
+      - series: 'torrentd_boot_panics{thread="torrentd-tokio"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdPanicked
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              thread: torrentd-tokio
+            exp_annotations:
+              summary: "A torrentd thread (torrentd-tokio) panicked; read the panic line in its log"
+      - eval_time: 30m
+        alertname: TorrentdPanicked
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              thread: torrentd-tokio
+            exp_annotations:
+              summary: "A torrentd thread (torrentd-tokio) panicked; read the panic line in its log"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_metrics_dropped_samples_total{reason="labels"}'

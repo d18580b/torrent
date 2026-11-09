@@ -44,6 +44,20 @@ groups:
         annotations:
           summary: "Background task {{ $labels.task }} has exited or panicked; what it watched is no longer watched"
 
+      - alert: TorrentdPanicked
+        # Any panic, on any thread, caught or not. Whatever it stopped may
+        # have no series of its own (a batch writer, a fence lift), so the
+        # panic is the alert; its ERROR line (target torrentd::panic_hook)
+        # names the location. A panic during the boot is in the first
+        # sample, so the boot gauge carries it.
+        expr: >
+          increase(torrentd_panics_total[15m]) > 0
+          or torrentd_boot_panics > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A torrentd thread ({{ $labels.thread }}) panicked; read the panic line in its log"
+
       - alert: TorrentdMetricsDropped
         expr: >
           increase(torrentd_metrics_dropped_samples_total[15m]) > 0

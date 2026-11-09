@@ -183,12 +183,14 @@ pub(super) async fn bind_api_listener(cfg: &Config) -> Option<ApiListener> {
 }
 
 /// Log the listener and the authentication posture, tell systemd the daemon
-/// is ready, and start the watchdog pings. Runs once the listener is bound.
+/// is ready, and start the watchdog pings, as the supervised task `watchdog`.
+/// Runs once the listener is bound.
 pub(super) fn announce_ready(
     http_listen: &crate::config::HttpListen,
     posture: Option<String>,
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
     alert_loop: &torrentd_engine::AlertLoopHandle,
+    metrics: &Arc<crate::metrics_sink::PromSink>,
 ) {
     info!(addr = %http_listen, "HTTP server listening");
     if let Some(posture) = posture {
@@ -206,7 +208,7 @@ pub(super) fn announce_ready(
         );
         let mut wd_shutdown = shutdown_tx.subscribe();
         let wd_heartbeat = alert_loop.heartbeat();
-        tokio::spawn(async move {
+        super::tasks::spawn_supervised("watchdog", Arc::clone(metrics), async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
