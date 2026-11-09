@@ -142,6 +142,47 @@ tests:
 
   - interval: 1m
     input_series:
+      - series: 'torrentd_ffi_errors_total{call="post_session_stats"}'
+        values: '0 0 2 2x40'
+      - series: 'torrentd_ffi_errors_total{call="session_destroy"}'
+        values: '0x40'
+      - series: 'torrentd_boot_ffi_errors{call="post_session_stats"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdFfiErrors
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdFfiErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              call: post_session_stats
+            exp_annotations:
+              summary: "libtorrent threw in post_session_stats and the shim swallowed it; read the WARN line naming the exception"
+      - eval_time: 30m
+        alertname: TorrentdFfiErrors
+        exp_alerts: []
+
+  # One the boot caught, before the first scrape: the boot gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_ffi_errors_total{call="post_torrent_updates"}'
+        values: '1x40'
+      - series: 'torrentd_boot_ffi_errors{call="post_torrent_updates"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TorrentdFfiErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              call: post_torrent_updates
+            exp_annotations:
+              summary: "libtorrent threw in post_torrent_updates and the shim swallowed it; read the WARN line naming the exception"
+
+  - interval: 1m
+    input_series:
       - series: 'torrentd_metrics_dropped_samples_total{reason="labels"}'
         values: '0 0 1 1'
       - series: 'torrentd_metrics_dropped_samples_total{reason="registration"}'

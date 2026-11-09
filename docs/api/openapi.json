@@ -71,7 +71,7 @@
           "operations"
         ],
         "summary": "Scrape the daemon's metrics.",
-        "description": "Prometheus text format. Needs the `metrics` scope, which no other\noperation accepts and no session token carries, so a scrape credential can\nnever reach the control plane. `deploy/metrics.md` catalogues every\nseries.",
+        "description": "Prometheus text format. Needs the `metrics` scope, which no other\noperation accepts and no session token carries, so a scrape credential can\nnever reach the control plane. `deploy/metrics.md` catalogues every\nseries. `500 internal` where the exposition cannot be encoded, rather\nthan a partial one that reads as series having vanished; the failure is\ncounted in `metrics_dropped_samples_total{reason=\"encode\"}`.",
         "operationId": "get_metrics",
         "responses": {
           "401": {
@@ -183,6 +183,28 @@
             "content": {
               "text/plain; version=0.0.4": {
                 "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
               }
             }
           }

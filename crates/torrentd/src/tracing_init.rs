@@ -222,6 +222,7 @@ pub const LOG_EVENT_TARGETS: &[&str] = &[
     "torrentd_engine::store",
     "torrentd_pool::adopt",
     "torrentd_pool::drift",
+    "torrentd_pool::plan",
     "torrentd_pool::scan",
     "torrentd_pool::store",
     "other",

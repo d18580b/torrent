@@ -89,6 +89,21 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     resp.assert_header("content-type", "text/plain; version=0.0.4");
     assert!(resp.text().contains("alert_loop_heartbeat_age_seconds"));
 
+    // A scrape that cannot be encoded is a 500, never a partial exposition,
+    // and the next one counts it.
+    h.state.metrics.fail_next_encode();
+    let resp = h
+        .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
+        .await;
+    assert_problem(&resp, 500, "internal");
+    let resp = h
+        .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
+        .await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    assert!(resp
+        .text()
+        .contains("torrentd_metrics_dropped_samples_total{reason=\"encode\"} 1\n"));
+
     // The document, unauthenticated and byte-identical to the committed one's
     // source.
     let resp = h.send("GET", "/v1/openapi.json", None, None).await;

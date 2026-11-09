@@ -23,6 +23,8 @@
 //! beside the counter.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -338,7 +340,7 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_kill_switch_probe_errors" Gauge Daemon Owner("always") =>
         "kill_switch_probe_errors_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
-    "boot_metrics_dropped_samples" Gauge Daemon ("reason": &["registration", "labels"]) Owner("always") =>
+    "boot_metrics_dropped_samples" Gauge Daemon ("reason": DROP_REASONS) Owner("always") =>
         "metrics_dropped_samples_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
     "boot_log_events" Gauge Daemon ("level": BOOT_LOG_EVENT_LEVELS)
@@ -348,6 +350,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_panics" Gauge Daemon ("thread": crate::panic_hook::PANIC_THREADS) Owner("always") =>
         "panics_total as of the first scrape, which already holds what the boot counted; fixed \
          for the life of the process.";
+    "boot_ffi_errors" Gauge Daemon ("call": libtorrent_safe::ffi_errors::CALLS) Owner("always") =>
+        "ffi_errors_total as of the first scrape, which already holds what the boot counted; \
+         fixed for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -428,6 +433,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Batch writer threads (the resume and .torrent stores') that died by a panic. A dead \
          writer's queued writes reach the disk only at the shutdown drain, so resume saves \
          stop until the daemon restarts.";
+    "ffi_errors_total" Counter Daemon ("call": libtorrent_safe::ffi_errors::CALLS) Zero =>
+        "C++ exceptions the libtorrent shim caught in an entry point that returns nothing, so \
+         could not report them: posting torrent updates or session stats, or destroying a \
+         session. Each rise is logged at WARN, target torrentd::metrics, with the last \
+         exception's message, by the scrape that exports it.";
     // control plane
     "auth_login_failures_total" Counter Daemon ("reason": &["bad_password", "throttled", "verification_budget"]) Zero =>
         "Refused logins: a wrong password, a client locked out by the throttle, or the \
@@ -535,9 +545,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "store_write_errors_total" Counter Daemon ("store": &["registry", "pool_index"]) Zero =>
         "Writes to the assignment registry or the pool index that failed where nothing \
          else reports them.";
-    "metrics_dropped_samples_total" Counter Daemon ("reason": &["registration", "labels"]) Zero =>
-        "Samples the exporter dropped: a series that could not be registered, or an emission \
-         whose labels differ from the series' first use.";
+    "metrics_dropped_samples_total" Counter Daemon ("reason": DROP_REASONS) Zero =>
+        "Samples the exporter dropped: a series that could not be registered, an emission \
+         whose labels differ from the series' first use, or a whole scrape whose encoding \
+         failed (encode), which was answered 500.";
     // the log
     "log_events_total" Counter Daemon ("level": crate::tracing_init::LOG_EVENT_LEVELS)
         ("target": crate::tracing_init::LOG_EVENT_TARGETS) Zero =>
@@ -801,6 +812,11 @@ pub const BOOT_COUNTS: &[BootCount] = &[
         gauge: "boot_panics",
         only: None,
     },
+    BootCount {
+        counter: FFI_ERRORS,
+        gauge: "boot_ffi_errors",
+        only: None,
+    },
     // Last, so its gauge also holds any sample the rows above dropped as
     // they wrote theirs, which the first render's sample of the counter holds.
     BootCount {
@@ -853,13 +869,40 @@ pub struct PromSink {
     /// The engine's process-wide batch-writer death count as of the last
     /// time it was exported.
     writer_deaths_exported: Mutex<u64>,
+    /// The pool index's process-wide failed-rollback count as of the last
+    /// time it was exported. See [`PromSink::export_pool_rollback_errors`].
+    pool_rollbacks_exported: Mutex<u64>,
+    /// The shim's process-wide swallowed-exception counts as of the last
+    /// time they were exported, in `ffi_errors::CALLS` order. See
+    /// [`PromSink::export_ffi_errors`].
+    ffi_errors_exported: Mutex<Vec<u64>>,
     /// Run by the first render. See [`PromSink::export_boot_counts`].
     boot_counts: Once,
+    /// See [`PromSink::fail_next_encode`].
+    #[cfg(test)]
+    fail_next_encode: std::sync::atomic::AtomicBool,
 }
+
+/// Why `metrics_dropped_samples_total` dropped a sample.
+const DROP_REASONS: &[&str] = &["registration", "labels", "encode"];
 
 const DROPPED: &str = "metrics_dropped_samples_total";
 const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
+const FFI_ERRORS: &str = "ffi_errors_total";
+const STORE_WRITE_ERRORS: &str = "store_write_errors_total";
 const PANICS: &str = "panics_total";
+
+/// Directory fsyncs the daemon itself ran, outside the engine's
+/// `sync_dir`, that failed. Added to the engine's count when
+/// `dir_fsync_errors_total` is exported. See [`note_dir_fsync_error`].
+static DAEMON_DIR_FSYNC_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a failed directory fsync the daemon ran itself, into
+/// `dir_fsync_errors_total`. Process-wide, read at scrape time, for the
+/// reason the engine's count is: the code that syncs holds no sink.
+pub fn note_dir_fsync_error() {
+    DAEMON_DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
 const WRITER_DEATHS: &str = "batch_writer_deaths_total";
 const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
 const BUILD_INFO: &str = "build_info";
@@ -889,7 +932,11 @@ impl PromSink {
             log_events_exported: Mutex::new(Vec::new()),
             panics_exported: Mutex::new(Vec::new()),
             writer_deaths_exported: Mutex::new(0),
+            pool_rollbacks_exported: Mutex::new(0),
+            ffi_errors_exported: Mutex::new(Vec::new()),
             boot_counts: Once::new(),
+            #[cfg(test)]
+            fail_next_encode: std::sync::atomic::AtomicBool::new(false),
         };
         // A property of the binary, so it is known before anything else is.
         sink.set_gauge(
@@ -962,24 +1009,107 @@ impl PromSink {
         let _ = self.histogram(name, labels);
     }
 
-    pub fn render(&self) -> Vec<u8> {
-        self.export_dir_fsync_errors(torrentd_engine::batch_writer::dir_fsync_errors());
+    /// Every series, in the Prometheus text format.
+    ///
+    /// `Err` where encoding failed, which is counted in
+    /// `metrics_dropped_samples_total{reason="encode"}`: the text written up
+    /// to the failure is a partial scrape, which would read as every series
+    /// after it having vanished, so none of it is returned.
+    pub fn try_render(&self) -> prometheus::Result<Vec<u8>> {
+        self.export_dir_fsync_errors(
+            torrentd_engine::batch_writer::dir_fsync_errors()
+                + DAEMON_DIR_FSYNC_ERRORS.load(Ordering::Relaxed),
+        );
         self.export_log_events(&crate::tracing_init::log_events().snapshot());
         self.export_panics(&crate::panic_hook::panics().snapshot());
         self.export_writer_deaths(torrentd_engine::batch_writer::writer_deaths());
-        // After the fsync, log and panic counts are brought up to date, so
-        // their boot gauges hold what this very render exports.
+        self.export_pool_rollback_errors(torrentd_pool::PoolStore::rollback_errors());
+        self.export_ffi_errors(&libtorrent_safe::ffi_errors::swallowed());
+        // After the process-wide counts are brought up to date, so their
+        // boot gauges hold what this very render exports.
         self.boot_counts.call_once(|| self.export_boot_counts());
-        let metric_families = self.registry.gather();
-        let encoder = TextEncoder::new();
-        let mut buf = Vec::new();
-        let _ = encoder.encode(&metric_families, &mut buf);
-        buf
+        let families = self.registry.gather();
+        // The text encoder refuses a family with no name and no metric,
+        // which the registry itself never yields.
+        #[cfg(test)]
+        let families = if self.fail_next_encode.swap(false, Ordering::Relaxed) {
+            vec![prometheus::proto::MetricFamily::default()]
+        } else {
+            families
+        };
+        self.encode(&families)
     }
 
-    /// Bring `dir_fsync_errors_total` up to `total`, the engine's
-    /// process-wide count of failed directory fsyncs, by the failures since
-    /// the last export.
+    /// [`PromSink::try_render`], for a test that expects it to succeed.
+    #[cfg(test)]
+    pub fn render(&self) -> Vec<u8> {
+        self.try_render()
+            .expect("the registry's own families encode")
+    }
+
+    /// Make the next [`PromSink::try_render`] fail to encode, as a test of
+    /// what a scrape answers then.
+    #[cfg(test)]
+    pub fn fail_next_encode(&self) {
+        self.fail_next_encode.store(true, Ordering::Relaxed);
+    }
+
+    /// `families` in the text format, counting a failure.
+    fn encode(&self, families: &[prometheus::proto::MetricFamily]) -> prometheus::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(families, &mut buf)
+            .inspect_err(|_| self.dropped.with_label_values(&["encode"]).inc())?;
+        Ok(buf)
+    }
+
+    /// Bring `store_write_errors_total{store="pool_index"}` up to `total`,
+    /// the pool index's process-wide count of failed rollbacks, read at
+    /// scrape time because a store holds no sink.
+    fn export_pool_rollback_errors(&self, total: u64) {
+        let mut exported = self.pool_rollbacks_exported.lock();
+        if total > *exported {
+            self.add_counter(
+                STORE_WRITE_ERRORS,
+                total - *exported,
+                &[("store", "pool_index")],
+            );
+            *exported = total;
+        }
+    }
+
+    /// Bring `ffi_errors_total` up to `swallowed`, the shim's process-wide
+    /// counts of the exceptions its void entry points caught, and log each
+    /// call's rise with the last exception's message.
+    ///
+    /// Logged here rather than where the exception was caught, which is C++
+    /// with no logger: once per scrape that sees a rise, however many there
+    /// were, so a call that throws on every tick logs once per scrape
+    /// interval rather than once per tick.
+    fn export_ffi_errors(&self, swallowed: &[libtorrent_safe::ffi_errors::Swallowed]) {
+        let mut exported = self.ffi_errors_exported.lock();
+        exported.resize(swallowed.len(), 0);
+        for (s, done) in swallowed.iter().zip(exported.iter_mut()) {
+            if s.count > *done {
+                let new = s.count - *done;
+                self.add_counter(FFI_ERRORS, new, &[("call", s.call)]);
+                *done = s.count;
+                tracing::warn!(
+                    target: "torrentd::metrics",
+                    call = s.call,
+                    new,
+                    total = s.count,
+                    error.cause = %s.last_what,
+                    "the libtorrent shim caught an exception it could not return, and the \
+                     call stopped where it threw (error.cause is the last one's message)",
+                );
+            }
+        }
+    }
+
+    /// Bring `dir_fsync_errors_total` up to `total`, the process-wide count
+    /// of failed directory fsyncs (the engine's and
+    /// [`note_dir_fsync_error`]'s), by the failures since the last export.
     ///
     /// Read at scrape time rather than pushed: the writes that sync a
     /// directory (`write_atomic` and every `BatchWriter`) hold no sink. A
@@ -1498,6 +1628,85 @@ pub(crate) mod tests {
         sink.export_dir_fsync_errors(total + 2);
         let text = String::from_utf8(sink.render()).unwrap();
         assert!(text.contains(&sample(total + 2)), "counted once: {text}");
+    }
+
+    #[test]
+    fn pool_rollback_failures_are_exported_as_pool_index_write_errors() {
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        let total = torrentd_pool::PoolStore::rollback_errors() + 2;
+        let sample =
+            |n: u64| format!("torrentd_store_write_errors_total{{store=\"pool_index\"}} {n}\n");
+        sink.export_pool_rollback_errors(total);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(text.contains(&sample(total)), "{text}");
+        sink.export_pool_rollback_errors(total);
+        sink.export_pool_rollback_errors(total + 1);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(text.contains(&sample(total + 1)), "counted once: {text}");
+    }
+
+    #[test]
+    fn swallowed_ffi_exceptions_are_exported_by_call_since_the_last_scrape() {
+        use libtorrent_safe::ffi_errors::Swallowed;
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        // Above anything this process has really counted, as the fsync test
+        // does, so the scrape's own read of the shim does not move it.
+        let real = libtorrent_safe::ffi_errors::swallowed();
+        let at = |n: u64| -> Vec<Swallowed> {
+            real.iter()
+                .map(|s| Swallowed {
+                    count: if s.call == "post_session_stats" {
+                        s.count + n
+                    } else {
+                        s.count
+                    },
+                    ..s.clone()
+                })
+                .collect()
+        };
+        let sample =
+            |call: &str, n: u64| format!("torrentd_ffi_errors_total{{call=\"{call}\"}} {n}\n");
+        let base = real
+            .iter()
+            .find(|s| s.call == "post_session_stats")
+            .unwrap()
+            .count;
+        sink.export_ffi_errors(&at(100));
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(
+            text.contains(&sample("post_session_stats", base + 100)),
+            "{text}"
+        );
+        for s in &real {
+            if s.call != "post_session_stats" {
+                assert!(text.contains(&sample(s.call, s.count)), "{text}");
+            }
+        }
+        sink.export_ffi_errors(&at(100));
+        sink.export_ffi_errors(&at(101));
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(
+            text.contains(&sample("post_session_stats", base + 101)),
+            "counted once: {text}"
+        );
+    }
+
+    #[test]
+    fn a_scrape_that_cannot_be_encoded_is_an_error_and_counted() {
+        let sink = PromSink::new();
+        let dropped = |sink: &PromSink| sink.dropped.with_label_values(&["encode"]).get();
+        assert_eq!(dropped(&sink), 0.0);
+        // A family with no name and no metric, which the encoder refuses.
+        let bad = prometheus::proto::MetricFamily::default();
+        assert!(sink.encode(&[bad]).is_err());
+        assert_eq!(dropped(&sink), 1.0);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(
+            text.contains("torrentd_metrics_dropped_samples_total{reason=\"encode\"} 1\n"),
+            "{text}"
+        );
     }
 
     #[test]
