@@ -166,6 +166,27 @@ enable_lsd = false
 #   torrentd --config /etc/torrentd/torrentd.toml vpn check
 # network_kill_switch = false
 
+# Kill-switch carve-outs for a cluster (Kubernetes pod), where the switch
+# otherwise drops two things the pod cannot run without. Both are read at
+# start only (a reload reports a change and applies nothing), and both are
+# refused without `network_kill_switch = true`.
+#
+# kill_switch_api_interfaces: interfaces the API's replies may leave by.
+# Kubelet's probes, a Prometheus scrape and Ingress reach `http_listen` on the
+# pod's eth0, and the switch drops every reply. Each entry lets out the daemon's
+# TCP from the http_listen port, and nothing else, on that interface. Refused
+# for a profile's vpn_interface and beside a `unix:` http_listen.
+# kill_switch_api_interfaces = ["eth0"]
+#
+# kill_switch_dns_servers: resolvers the daemon's DNS may reach outside the
+# tunnels (UDP and TCP port 53 to these addresses only), such as the cluster
+# DNS service /etc/resolv.conf names. The cost: every tracker hostname the
+# daemon looks up is visible to these resolvers and whatever they forward to.
+# The boot logs a WARN saying so, `kill_switch_dns_exempt` is 1, and `vpn check`
+# and /readyz report it. Refused for an address inside a WireGuard profile's
+# Address prefixes or named by its DNS line.
+# kill_switch_dns_servers = ["10.43.0.10"]
+
 # ---------------------------------------------------------------------------
 # Profiles — at least one is required
 # ---------------------------------------------------------------------------

@@ -1176,6 +1176,12 @@ fn each_non_reloadable_top_level_key_changed_alone_is_reported_alone() {
         ("network_kill_switch", |c| {
             c.network_kill_switch = !c.network_kill_switch
         }),
+        ("kill_switch_api_interfaces", |c| {
+            c.kill_switch_api_interfaces = vec!["eth0".into()]
+        }),
+        ("kill_switch_dns_servers", |c| {
+            c.kill_switch_dns_servers = vec![[10, 43, 0, 10].into()]
+        }),
         ("pool", |c| {
             c.pool = Some(PoolConfig {
                 roots: vec!["/data/pool".into()],
