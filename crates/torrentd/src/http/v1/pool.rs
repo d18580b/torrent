@@ -31,10 +31,10 @@ use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
+use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::server::count;
 use crate::http::v1::Pool;
 use crate::http::validate::Invalid;
@@ -985,24 +985,15 @@ pub enum AdoptError {
     #[error("{NO_POOL}")]
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
-    /// No profile with this id is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
     /// The subtree selector names no managed root.
     #[error("unknown root_id")]
     #[problem(status = 404, title = "Root not found")]
     RootNotFound,
-    /// The profile failed to start, is fenced, or is set offline, so it
-    /// cannot receive torrents.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        /// `failed`, `vpn_down` or `offline`.
-        #[problem(extension)]
-        profile_status: crate::http::v1::common::ProfileUnavailableReason,
-    },
+    /// No profile with this id is configured; or it failed to start, is
+    /// fenced, or is set offline, so it cannot receive torrents.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Profile(#[from] ProfileProblem),
     /// The body breaks a documented constraint.
     #[error(transparent)]
     #[problem(transparent)]
@@ -1012,7 +1003,6 @@ pub enum AdoptError {
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_profile_problem!(AdoptError);
 
 /// Adopt existing payload.
 ///
@@ -1430,11 +1420,13 @@ pub async fn verify_pool_torrents(
             // verify queue checks again when it starts the re-hash.
             match unfenced_engine(&s, &st.profile_id) {
                 Ok(_) => {}
-                Err(crate::http::v1::common::ProfileProblem::Unavailable { detail, .. }) => {
+                Err(crate::http::v1::common::ProfileProblem::ProfileUnavailable {
+                    detail, ..
+                }) => {
                     skip(&mut resp, detail);
                     continue;
                 }
-                Err(crate::http::v1::common::ProfileProblem::NotFound) => {
+                Err(crate::http::v1::common::ProfileProblem::ProfileNotFound) => {
                     skip(&mut resp, "engine missing".to_owned());
                     continue;
                 }

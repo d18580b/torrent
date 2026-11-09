@@ -170,12 +170,16 @@ pub async fn resume_torrent(
     if resumed == crate::fence::SingleResume::Resumed {
         return Ok(NoContent);
     }
-    let ProfileProblem::Unavailable { reason, detail } = ProfileProblem::vpn_down() else {
+    let ProfileProblem::ProfileUnavailable {
+        detail,
+        profile_status,
+    } = ProfileProblem::vpn_down()
+    else {
         unreachable!("vpn_down is an unavailable profile");
     };
     Err(UnfencedControlError::ProfileUnavailable {
         detail,
-        profile_status: reason,
+        profile_status,
     })
 }
 

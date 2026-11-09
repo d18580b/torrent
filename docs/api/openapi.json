@@ -1741,34 +1741,27 @@
               }
             }
           },
-          "404": {
-            "description": "Profile not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "409": {
-            "description": "The profile is unavailable; Torrent exists",
+            "description": "Torrent exists; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
                   "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-exists"
+                            }
+                          }
+                        }
+                      ]
+                    },
                     {
                       "allOf": [
                         {
@@ -1788,24 +1781,7 @@
                             "profile_status"
                           ]
                         }
-                      ],
-                      "title": "The profile is unavailable"
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-exists"
-                            }
-                          }
-                        }
-                      ],
-                      "title": "Torrent exists"
+                      ]
                     }
                   ]
                 }
@@ -1826,6 +1802,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
                         }
                       }
                     }
@@ -10433,7 +10431,7 @@
             }
           },
           "404": {
-            "description": "The pool is not configured; Profile not found; Root not found",
+            "description": "The pool is not configured; Root not found; Profile not found",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10463,12 +10461,12 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
                             }
                           }
                         }
                       ],
-                      "title": "Profile not found"
+                      "title": "Root not found"
                     },
                     {
                       "allOf": [
@@ -10479,12 +10477,33 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
                             }
                           }
                         }
-                      ],
-                      "title": "Root not found"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
                     }
                   ]
                 }
@@ -10513,28 +10532,6 @@
                       "required": [
                         "profile_status"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }

@@ -43,10 +43,13 @@ fn loaded_unfenced(
 ) -> Result<(TorrentState, Arc<dyn TorrentEngine>), Lookup> {
     let st = s.state.get(&ih).ok_or(Lookup::NotFound)?;
     let engine = unfenced_engine(s, &st.profile_id).map_err(|p| match p {
-        ProfileProblem::NotFound => Lookup::NoSession,
-        ProfileProblem::Unavailable { reason, detail } => Lookup::Fenced {
+        ProfileProblem::ProfileNotFound => Lookup::NoSession,
+        ProfileProblem::ProfileUnavailable {
             detail,
-            profile_status: reason,
+            profile_status,
+        } => Lookup::Fenced {
+            detail,
+            profile_status,
         },
     })?;
     Ok((st, engine))

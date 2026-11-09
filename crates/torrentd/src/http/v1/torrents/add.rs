@@ -28,7 +28,6 @@ use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
@@ -145,20 +144,13 @@ pub enum AddTorrentError {
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// No profile with this `profile_id` is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
-    /// The profile failed to come up, the VPN monitor fenced it, or the
-    /// operator set it offline: a torrent added there would land paused
-    /// and make the profile look healthy.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        #[problem(extension)]
-        profile_status: crate::http::v1::common::ProfileUnavailableReason,
-    },
+    /// No profile with this `profile_id` is configured; or it failed to
+    /// come up, the VPN monitor fenced it, or the operator set it offline: a
+    /// torrent added there would land paused and make the profile look
+    /// healthy.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Profile(#[from] ProfileProblem),
     /// A path in the request is outside the directories the daemon may
     /// use. Never says whether the path exists.
     #[error("{0}")]
@@ -186,7 +178,6 @@ pub enum AddTorrentError {
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_profile_problem!(AddTorrentError);
 
 /// The add source once read: what the infohash is computed from, and what
 /// the session is handed after the registry reservation succeeds.
@@ -271,7 +262,7 @@ pub async fn add_torrent(
         }
     };
     let Some(profile_cfg) = s.profile_config(&profile_id) else {
-        return Err(ProfileProblem::NotFound.into());
+        return Err(ProfileProblem::ProfileNotFound.into());
     };
 
     let source = match source {
