@@ -889,7 +889,7 @@ fn carveout_checks(carveouts: &vpn::killswitch::Carveouts) -> Vec<Check> {
             "kill_switch_api_carveout",
             format!(
                 "the API's replies from tcp port {port} may leave by {} \
-                 (kill_switch_api_interfaces); nothing else of the daemon's leaves by them",
+                 (kill_switch_api_interfaces); this carve-out lets nothing else out by them",
                 ifaces.join(", "),
             ),
         ));
