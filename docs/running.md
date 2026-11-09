@@ -973,8 +973,8 @@ overridden by a `proto=https` the client may have sent.
 
 **All are read only from a peer listed in `trusted_proxies`.** That key is
 empty by default, and with it empty no forwarding header is read at all — the
-socket's peer address is the client. Set it to the address your proxy connects
-from and nothing else: anything in that list can claim to be any client.
+socket's peer address is the client. Set it to the addresses your proxies
+connect from and nothing else: anything in that list can claim to be any client.
 
 Getting it wrong fails safe rather than open. An unset `trusted_proxies` means
 no header is read and the socket's peer address is the client. Behind a proxy
@@ -1053,14 +1053,53 @@ standardised `Forwarded` work at all, and that proxy is fully supported. The
 price is that the fallback is live in every deployment that sets only some of
 the three, and stripping the ones you do not set is what pays it.
 
-**One hop, not a chain walk.** torrentd reads the entry the peer it is
-talking to contributed and stops there. It does not walk back along the chain
-past hops that are themselves listed in `trusted_proxies`, so listing a range
-does not mean "believe the chain as far as my own edge" — `10.0.0.0/8` is a
-valid value and it does not buy that. Put two proxies in series and the
-address torrentd resolves is the **inner** one's, which gives every client
-behind that edge one shared throttle bucket and one `client_ip`. List the one
-address your proxy connects from, which is what this section asks for anyway.
+**A chain of proxies is walked back to the client.** Every hop appends the
+address it received the request from, so the forwarding header reads, left to
+right, from the furthest hop to the nearest. When the socket peer is in
+`trusted_proxies`, torrentd reads the address chain (`X-Forwarded-For`, or
+`Forwarded`'s `for=` where `X-Forwarded-For` is absent) **right to left**:
+
+1. Each element that is itself in `trusted_proxies` is a proxy, and is skipped.
+2. The first element that is not is the client.
+3. If every element is trusted, the client is the leftmost one.
+4. An element that carries no readable address — empty, unparseable, an
+   obfuscated `for=_hidden` or `for=unknown`, a `Forwarded` element with no
+   `for=`, or a field line that is not UTF-8 — stops the walk, and the client
+   is the trusted hop that wrote it (the socket peer, if that element was the
+   last). Nothing to its left was vouched for by anyone you trust.
+5. The walk skips at most 16 trusted hops. In a longer header, the element
+   beyond them is the client whatever its address, and nothing further left
+   is read.
+
+An unspecified address (`0.0.0.0`, `::`) is never a trusted hop, whatever the
+list holds, exactly as it is never a trusted socket peer.
+
+So with a CDN in front of an ingress controller, list both — the CDN's
+published edge ranges and the controller's addresses — and `X-Forwarded-For:
+198.51.100.7, 104.16.0.5` from the controller resolves to `198.51.100.7`. A
+client cannot get past this by writing its own entries: they sit to the left
+of the address your outermost proxy appended for it, which is untrusted and
+stops the walk first. List only the controller and the same request resolves
+to the CDN edge, so every client behind that CDN shares one throttle bucket
+and one `client_ip`.
+
+The cost of listing a range is that every host in it is believed. A host
+inside a trusted range that reaches the daemon directly can name any client,
+and one that is the *client* of a proxy is walked past like a proxy. Keep the
+range to what your proxies actually run on, and keep everything else in it
+from reaching the API.
+
+**Kubernetes.** The ingress controller's pod address is not fixed, so trust
+the cluster's pod CIDR (and, behind a CDN, the CDN's ranges), for example
+`trusted_proxies = ["10.42.0.0/16"]`. Every pod in that CIDR can then name any
+client, so a NetworkPolicy must admit traffic to torrentd's API port **only
+from the ingress controller's pods** — otherwise any workload in the cluster
+picks its own throttle bucket and writes what it likes into `client_ip`. Set
+`externalTrafficPolicy: Local` on the ingress controller's `LoadBalancer` or
+`NodePort` Service: with the default `Cluster`, a node forwarding the
+connection to a controller pod on another node rewrites its source address,
+so the controller sees a node address instead of the client's and every
+client shares whatever bucket that node's address keys.
 
 A v4-mapped address is folded to its v4 form, so `::ffff:198.51.100.9` and
 `198.51.100.9` are one client: one throttle bucket, one spelling in the log.
@@ -1075,9 +1114,10 @@ same host named through your proxy are one throttle bucket rather than two.
 The default is still `127.0.0.1:8080`, and a non-loopback bind of either
 family still requires `[auth]` (§6).
 
-Each of these headers is a chain every hop appends to, so torrentd reads the
-*last* entry — the one the trusted proxy added — rather than the first, which
-is whatever the original client chose to send. Whether your proxy appends by
+Each of these headers is a chain every hop appends to, so torrentd starts from
+the *last* entry — the one the trusted proxy added — and walks left only past
+hops it trusts, rather than reading the first, which is whatever the original
+client chose to send. Whether your proxy appends by
 extending the existing field line (nginx, Caddy) or by adding a second one
 (HAProxy's `option forwardfor`) makes no difference: repeated field lines are
 joined in order first, exactly as RFC 9110 §5.2-5.3 defines them. A proxy that
@@ -1085,7 +1125,8 @@ forwards client-supplied values intact is a proxy that cannot be trusted about
 anything.
 
 **The scheme is the exception, and it reads the whole chain.** "Which client
-is this" is answered by the nearest hop and by no other; "was the original
+is this" is answered by walking back from the nearest hop past trusted ones
+only; "was the original
 request over TLS" is answered by **any** hop that says `https`, because TLS is
 terminated at the edge and every hop behind it honestly reports plain HTTP. So
 `X-Forwarded-Proto: https, http` — a TLS edge in front of a plain-HTTP inner

@@ -9,6 +9,10 @@
 //! `trusted_proxies`; from anyone else it is ignored, because anyone else can
 //! write whatever they like in it. With no trusted proxies — the default — no
 //! header is ever read and the socket peer is the client.
+//!
+//! From a trusted peer the address chain is walked right to left, skipping
+//! every hop that is itself trusted, so a chain of proxies (a CDN, then an
+//! ingress controller) resolves to the client in front of the outermost one.
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -136,14 +140,15 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 
 /// The set of peers whose forwarding headers are believed.
 ///
-/// A peer listed here can claim to be any client, so it has to be the address
-/// the reverse proxy connects from, and the proxy must strip or overwrite all
-/// three client-supplied headers: `X-Forwarded-For`, `X-Forwarded-Proto` and
-/// RFC 7239 `Forwarded` (`deploy/Caddyfile` shows how).
+/// A peer listed here can claim to be any client, so it has to cover the
+/// addresses the reverse proxies connect from and nothing else, and the
+/// outermost proxy must strip or overwrite all three client-supplied headers:
+/// `X-Forwarded-For`, `X-Forwarded-Proto` and RFC 7239 `Forwarded`
+/// (`deploy/Caddyfile` shows how).
 ///
-/// **One hop.** `resolve` takes the element the immediate peer contributed;
-/// it does not walk past hops that are themselves listed. In a two-hop chain
-/// the inner proxy's address is the client.
+/// **A chain.** `resolve` walks the address chain right to left past every
+/// hop listed here, up to [`MAX_HOPS`], so in a two-hop chain whose hops are
+/// both listed the client in front of the outer one is the client.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedProxies(Vec<Cidr>);
 
@@ -165,8 +170,8 @@ impl TrustedProxies {
                          forwarding header \
                          client-controlled: the login throttle keys on a value the caller \
                          picks, and the client_ip on the failed-login line is whatever the \
-                         caller wrote. List the address your reverse proxy connects from, and \
-                         only that."
+                         caller wrote. List the addresses your reverse proxies connect from, \
+                         and only those."
                     ));
                 }
                 Ok(cidr)
@@ -181,6 +186,17 @@ impl TrustedProxies {
 
     fn trusts(&self, peer: IpAddr) -> bool {
         self.0.iter().any(|c| c.contains(peer))
+    }
+
+    /// Whether `ip` is a proxy whose forwarding headers are believed: listed,
+    /// and not the unspecified address. No TCP peer connects from an
+    /// unspecified address, and it is the address every unix-socket request
+    /// carries (`api_socket::SOCKET_PEER`), so it is refused here rather than
+    /// in the trust list: no entry - `0.0.0.0`, `0.0.0.0/8`, `::` - lets a
+    /// socket caller forge a forwarding header past the login throttle, or
+    /// lets an unspecified hop in a chain be walked past.
+    fn is_proxy(&self, ip: IpAddr) -> bool {
+        !ip.is_unspecified() && self.trusts(ip)
     }
 }
 
@@ -361,6 +377,63 @@ fn elements<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &
         .filter(|s| !s.is_empty())
 }
 
+/// How many trusted hops [`resolve`] walks past. The element beyond them is
+/// the client whatever its address, so a header of any length costs at most
+/// `MAX_HOPS + 1` element reads.
+pub const MAX_HOPS: usize = 16;
+
+/// The elements of `name`'s value across every field line, **last first**,
+/// at most `limit` of them: `Some` for a readable element, `None` for an
+/// empty one or a field line that is not UTF-8. Nothing left of a `None` can
+/// be believed, so the collection stops there.
+fn elements_rev<'a>(headers: &'a HeaderMap, name: &'a str, limit: usize) -> Vec<Option<&'a str>> {
+    let mut out = Vec::new();
+    for line in headers.get_all(name).iter().rev() {
+        let Ok(line) = line.to_str() else {
+            out.push(None);
+            return out;
+        };
+        let line: Vec<&str> = split_elements(name, line, ',').collect();
+        for element in line.into_iter().rev() {
+            let element = element.trim();
+            let element = (!element.is_empty()).then_some(element);
+            out.push(element);
+            if element.is_none() || out.len() == limit {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Walk an address chain, last element first, from a trusted `peer`.
+///
+/// Every element is the address the hop to its right connected from, so each
+/// trusted one is skipped and the first untrusted one is the client. An
+/// unreadable element (`None`: empty, unparseable, obfuscated) stops the walk
+/// at the nearest trusted hop, the one that wrote it: anything to its left is
+/// unvouched for. A chain whose every element is trusted resolves to its
+/// leftmost, and past [`MAX_HOPS`] trusted hops the next element is the
+/// client without a trust test.
+fn walk(
+    chain: impl IntoIterator<Item = Option<IpAddr>>,
+    peer: IpAddr,
+    trusted: &TrustedProxies,
+) -> IpAddr {
+    let mut nearest = peer;
+    for (skipped, hop) in chain.into_iter().enumerate() {
+        // A header-supplied address can arrive mapped too.
+        let Some(ip) = hop.map(unmap) else {
+            return nearest;
+        };
+        if skipped == MAX_HOPS || !trusted.is_proxy(ip) {
+            return ip;
+        }
+        nearest = ip;
+    }
+    nearest
+}
+
 /// The value of `key` in one RFC 7239 element, e.g. `proto` in
 /// `for=203.0.113.9;proto=https`: unquoted, and matched case-insensitively.
 /// A name is a token, so the first `=` always separates it from the value.
@@ -400,12 +473,8 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
             secure: false,
         };
     };
-    // An unspecified peer is never a proxy: no TCP peer connects from one,
-    // and it is the address every unix-socket request carries
-    // (`api_socket::SOCKET_PEER`). Refused here rather than in the trust
-    // list, so no entry - `0.0.0.0`, `0.0.0.0/8`, `::` - lets a socket caller
-    // forge a forwarding header past the login throttle.
-    if trusted.is_empty() || peer.is_unspecified() || !trusted.trusts(peer) {
+    // An unspecified peer is never a proxy (see `TrustedProxies::is_proxy`).
+    if !trusted.is_proxy(peer) {
         // Not a proxy we know. Its headers are worth nothing, and its socket
         // address is the truth.
         return Client {
@@ -418,18 +487,26 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
 
     // `X-Forwarded-For` decides wherever it is present; `Forwarded` only where
     // it is absent. Present but unreadable — empty, unparseable, not UTF-8 —
-    // falls back to the socket peer, never to `Forwarded`: the proxy wrote
+    // stops the walk at the trusted hop that wrote the unreadable element
+    // (the socket peer, where it is the last), never falling back to
+    // `Forwarded`: the proxy wrote
     // the one and may be passing the other through from the client. Both
-    // arms parse addresses with `node_addr`.
+    // arms parse addresses with `node_addr` and walk them with `walk`.
     let xff = last_element(headers, "x-forwarded-for");
     let ip = if xff.present {
-        xff.last.and_then(node_addr).or(Some(peer))
+        let chain = elements_rev(headers, "x-forwarded-for", MAX_HOPS + 1);
+        walk(
+            chain.into_iter().map(|e| e.and_then(node_addr)),
+            peer,
+            trusted,
+        )
     } else {
-        forwarded
-            .last
-            .and_then(|f| param(f, "for"))
-            .and_then(|node| node_addr(&node))
-            .or(Some(peer))
+        let chain = elements_rev(headers, "forwarded", MAX_HOPS + 1);
+        let chain = chain.into_iter().map(|e| {
+            e.and_then(|e| param(e, "for"))
+                .and_then(|node| node_addr(&node))
+        });
+        walk(chain, peer, trusted)
     };
 
     // The same precedence and presence rule for the scheme; `last` decides
@@ -446,9 +523,8 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
                 .any(|p| p.eq_ignore_ascii_case("https"))
     };
 
-    // A header-supplied address can arrive mapped too.
     Client {
-        ip: ip.map(unmap),
+        ip: Some(ip),
         secure,
     }
 }
@@ -589,6 +665,106 @@ mod tests {
             assert_eq!(c.ip, Some(ip.parse().unwrap()), "{headers:?}");
             assert_eq!(c.secure, *secure, "{headers:?}");
         }
+    }
+
+    /// Traefik's pod CIDR and a CDN's edge range, both trusted.
+    const CHAIN_PROXIES: &[&str] = &["10.42.0.0/16", "104.16.0.0/13", "2001:db8:cafe::/48"];
+    /// The ingress controller's pod, the daemon's socket peer.
+    const INGRESS: &str = "10.42.0.7";
+
+    /// Header sets from a trusted ingress behind a trusted CDN, and the
+    /// client each must resolve to.
+    #[rustfmt::skip]
+    const CHAIN_CASES: &[(&[(&str, &str)], &str)] = &[
+        // CDN -> Traefik -> daemon: the CDN named the client, Traefik
+        // appended the CDN edge, and both hops are walked past.
+        (&[(XFF, "198.51.100.7, 104.16.0.5")], "198.51.100.7"),
+        (&[(XFF, "198.51.100.7, 104.16.0.5, 10.42.3.9")], "198.51.100.7"),
+        // The client's own entries sit left of the one the CDN wrote, so a
+        // spoofed leftmost entry is never reached, trusted-looking or not.
+        (&[(XFF, "6.6.6.6, 198.51.100.7, 104.16.0.5")], "198.51.100.7"),
+        (&[(XFF, "10.42.0.1, 198.51.100.7, 104.16.0.5")], "198.51.100.7"),
+        (&[(XFF, "10.42.0.1, 104.16.0.9, 198.51.100.7, 104.16.0.5")], "198.51.100.7"),
+        // Split over several field lines, joined in order first.
+        (&[(XFF, "198.51.100.7"), (XFF, "104.16.0.5")], "198.51.100.7"),
+        (&[(XFF, "6.6.6.6, 198.51.100.7"), (XFF, "104.16.0.5, 10.42.3.9")], "198.51.100.7"),
+        (&[(XFF, "6.6.6.6"), (XFF, "198.51.100.7, 104.16.0.5"), (XFF, "10.42.3.9")], "198.51.100.7"),
+        // Every hop trusted: the leftmost is the client.
+        (&[(XFF, "10.42.1.1, 104.16.0.5")], "10.42.1.1"),
+        (&[(XFF, "104.16.0.5")], "104.16.0.5"),
+        // An unreadable element stops the walk at the trusted hop that
+        // wrote it; nothing to its left is vouched for.
+        (&[(XFF, "198.51.100.7, , 104.16.0.5")], "104.16.0.5"),
+        (&[(XFF, "198.51.100.7, garbage, 104.16.0.5")], "104.16.0.5"),
+        (&[(XFF, "198.51.100.7"), (XFF, NON_UTF8), (XFF, "104.16.0.5")], "104.16.0.5"),
+        (&[(XFF, "198.51.100.7, 104.16.0.5,")], INGRESS),
+        // An unspecified hop is never walked past, whatever is trusted.
+        (&[(XFF, "198.51.100.7, 0.0.0.0")], "0.0.0.0"),
+        // A mapped hop is trusted, and a mapped client returned, as its v4
+        // form.
+        (&[(XFF, "::ffff:198.51.100.7, ::ffff:104.16.0.5")], "198.51.100.7"),
+        // Forwarded, walked the same way, quoted IPv6 and ports included.
+        (&[(FWD, r#"for="[2001:db8::7]:4711", for=104.16.0.5"#)], "2001:db8::7"),
+        (&[(FWD, r#"for="[2001:db8::7]", for="[2001:db8:cafe::1]:443";proto=https"#)], "2001:db8::7"),
+        (&[(FWD, r#"for=6.6.6.6, for="[2001:db8::7]""#), (FWD, r#"for="[2001:db8:cafe::1]""#)], "2001:db8::7"),
+        (&[(FWD, r#"for=198.51.100.7;host="a,for=10.42.0.1", for=104.16.0.5"#)], "198.51.100.7"),
+        (&[(FWD, "for=198.51.100.7, for=_hidden, for=104.16.0.5")], "104.16.0.5"),
+        (&[(FWD, "for=198.51.100.7, proto=https, for=104.16.0.5")], "104.16.0.5"),
+        // X-Forwarded-For still decides wherever it is present.
+        (&[(XFF, "198.51.100.7, 104.16.0.5"), (FWD, "for=6.6.6.6")], "198.51.100.7"),
+    ];
+
+    #[test]
+    fn a_chain_of_trusted_proxies_is_walked_to_the_client() {
+        for (headers, ip) in CHAIN_CASES {
+            let c = resolve_from(INGRESS, CHAIN_PROXIES, headers);
+            assert_eq!(c.ip, Some(ip.parse().unwrap()), "{headers:?}");
+        }
+        // Trusting only the pod CIDR stops the walk at the CDN edge.
+        let c = resolve_from(
+            INGRESS,
+            &["10.42.0.0/16"],
+            &[(XFF, "198.51.100.7, 104.16.0.5")],
+        );
+        assert_eq!(c.ip, Some("104.16.0.5".parse().unwrap()));
+        // An unspecified hop stops the walk even where a listed range
+        // contains it: the walk tests `is_proxy`, not the bare trust list.
+        let with_unspecified: Vec<&str> = CHAIN_PROXIES
+            .iter()
+            .copied()
+            .chain(["0.0.0.0/8", "::/8"])
+            .collect();
+        for (chain, ip) in [
+            ("198.51.100.7, 0.0.0.0, 104.16.0.5", "0.0.0.0"),
+            ("198.51.100.7, ::ffff:0.0.0.0, 104.16.0.5", "0.0.0.0"),
+            ("2001:db8::7, ::, 104.16.0.5", "::"),
+        ] {
+            let c = resolve_from(INGRESS, &with_unspecified, &[(XFF, chain)]);
+            assert_eq!(c.ip, Some(ip.parse().unwrap()), "{chain}");
+        }
+    }
+
+    /// The walk skips at most `MAX_HOPS` trusted hops; the element beyond
+    /// them is the client without a trust test, and nothing further left is
+    /// read.
+    #[test]
+    fn the_walk_is_bounded() {
+        let hops = |n: usize| (1..=n).map(|i| format!("10.42.0.{i}")).collect::<Vec<_>>();
+        // Exactly MAX_HOPS trusted elements: all trusted, so the leftmost.
+        let exact = hops(MAX_HOPS).join(", ");
+        let c = resolve_from(INGRESS, CHAIN_PROXIES, &[(XFF, exact.as_str())]);
+        assert_eq!(c.ip, Some("10.42.0.1".parse().unwrap()));
+        // One more trusted element: it is past the bound, so it is the client.
+        let over = hops(MAX_HOPS + 1).join(", ");
+        let c = resolve_from(INGRESS, CHAIN_PROXIES, &[(XFF, over.as_str())]);
+        assert_eq!(c.ip, Some("10.42.0.1".parse().unwrap()));
+        let far = format!("198.51.100.7, {}", hops(MAX_HOPS + 3).join(", "));
+        let c = resolve_from(INGRESS, CHAIN_PROXIES, &[(XFF, far.as_str())]);
+        assert_eq!(c.ip, Some("10.42.0.3".parse().unwrap()));
+        // An unreadable element past the bound is never reached.
+        let garbage = format!("garbage, {}", hops(MAX_HOPS + 1).join(", "));
+        let c = resolve_from(INGRESS, CHAIN_PROXIES, &[(XFF, garbage.as_str())]);
+        assert_eq!(c.ip, Some("10.42.0.1".parse().unwrap()));
     }
 
     /// Whatever the headers say, an untrusted peer is itself and never
