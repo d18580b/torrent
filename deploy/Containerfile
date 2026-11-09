@@ -110,6 +110,7 @@ FROM registry.fedoraproject.org/fedora-minimal:43@sha256:faf83ebf1612b5c8da396dc
 #   curl        HEALTHCHECK below.
 #   coreutils   `stty`, which `torrentd hash-password` needs to hide the
 #               password; already in the base, declared rather than inherited.
+#   libcap      `setcap` and `getcap`, for torrentd's file capability below.
 #   procps-ng   `sysctl`, without which a by-hand `wg-quick` of a full-tunnel
 #               (`AllowedIPs = 0.0.0.0/0`) config inside the image deletes the
 #               link it just raised; also `ps`, `pgrep`, `pkill` for an
@@ -118,10 +119,32 @@ FROM registry.fedoraproject.org/fedora-minimal:43@sha256:faf83ebf1612b5c8da396dc
 #               repository: check `ip`, `wg` and `nft` before removing it.
 RUN microdnf install -y \
         openssl ca-certificates curl iproute wireguard-tools nftables procps-ng \
-        coreutils \
+        coreutils libcap \
     && microdnf clean all
 
 COPY --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
+
+# CAP_NET_ADMIN for a `network = "vpn"` profile and the kill switch, as a file
+# capability, so the daemon runs as the unprivileged uid below and the kill
+# switch (which refuses uid 0) can run beside a tunnel. It takes effect only
+# where the container's capability set holds NET_ADMIN (`cap_add: NET_ADMIN`,
+# or a pod's `capabilities: {add: [NET_ADMIN]}`) and privilege escalation is
+# allowed; elsewhere the daemon holds nothing, and exits 78 naming both if a
+# vpn profile is configured. docs/running.md, "In a container", says why each
+# part is needed.
+#
+# Permitted (`+p`), not `+ep`: with the effective bit set, the kernel refuses
+# to execute a binary whose file capability the bounding set cannot grant in
+# full, so every container started without NET_ADMIN (a host-only
+# deployment, `hash-password`, the alert drill) would fail to start torrentd
+# at all. The daemon raises the capability to effective itself at boot, and to
+# ambient only in the ip, wg, nft, openvpn and kill it runs (`vpn::caps`).
+RUN setcap cap_net_admin+p /usr/local/bin/torrentd
+# Checked in a step of its own, so it reads the committed layer: an image
+# format or storage driver that drops the `security.capability` xattr fails
+# the build here rather than every vpn profile at runtime.
+RUN getcap /usr/local/bin/torrentd | grep -q 'cap_net_admin=p' \
+    || { echo "the file capability on torrentd did not survive into the image" >&2; exit 1; }
 COPY deploy/torrentd.sample.toml /etc/torrentd/torrentd.toml.sample
 
 # State directories (persisted via a volume mount in compose.yaml).
@@ -133,8 +156,9 @@ RUN mkdir -p /var/lib/torrentd/resume /var/lib/torrentd/torrents /data/torrents 
 
 EXPOSE 6881/tcp 6881/udp 8080/tcp
 
-# Drop privileges. A `network = "vpn"` profile needs CAP_NET_ADMIN at runtime
-# to bring up its tunnel; in that case run as root with `cap_add: NET_ADMIN`.
+# Drop privileges. A `network = "vpn"` profile gets CAP_NET_ADMIN from the
+# file capability above, not from root: keep this uid and add NET_ADMIN to the
+# container's capabilities.
 USER 1000:1000
 
 # The image's only health check. It survives in a Docker-format image alone:

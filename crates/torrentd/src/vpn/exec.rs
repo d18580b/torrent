@@ -21,12 +21,21 @@
 //!   daemon's own stdin. Stdin carries private keys in one caller, so it never
 //!   appears in an error.
 //!
+//! * **`CAP_NET_ADMIN` where it would not be inherited.** A daemon that holds
+//!   it only from its binary's file capability passes nothing on across
+//!   `execve`, so each tool's child raises it to ambient between `fork` and
+//!   `execve` ([`super::caps::raise_ambient_in_child`]). Every child [`run`]
+//!   spawns gets it, `kill` included, although `kill` signals an `openvpn` of
+//!   the daemon's own uid and needs no capability. This is the only place
+//!   that hook is installed: no child the daemon spawns any other way gets it.
+//!
 //! Every tool is still resolved through the daemon's `PATH`; see
 //! `vpn::ip_lookup` for why that is deliberate.
 
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
@@ -85,7 +94,8 @@ pub(crate) fn run(
     timeout: Duration,
 ) -> io::Result<Output> {
     let shown = shown(program, args);
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env("LC_ALL", "C")
         .stdin(if stdin.is_some() {
@@ -94,7 +104,15 @@ pub(crate) fn run(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if super::caps::ambient_raise_armed() {
+        // SAFETY: the hook makes one `prctl` call and allocates nothing,
+        // which is what may run in a child forked from a threaded process.
+        unsafe {
+            command.pre_exec(super::caps::raise_ambient_in_child);
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| io::Error::new(e.kind(), format!("`{shown}` could not run: {e}")))?;
 
@@ -268,6 +286,38 @@ mod tests {
         let out = run("sh", &["-c", "echo up; sleep 30 & exit 0"], None, CHANGE).unwrap();
         assert!(out.status.success());
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// The hook raises the capability in the child, or fails the spawn with
+    /// the kernel's refusal: the kernel allows the raise only where the
+    /// capability is both permitted and inheritable, which a test runner
+    /// started with it ambient has and an ordinary one does not.
+    #[test]
+    fn the_ambient_raise_runs_in_the_child_and_a_refusal_fails_the_spawn() {
+        let sets = super::super::caps::CapSets::current().unwrap();
+        let cap = super::super::caps::CAP_NET_ADMIN;
+        let can_raise = sets.permits(cap) && (sets.inheritable & (1 << cap)) != 0;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "grep ^CapAmb: /proc/self/status"])
+            .stdout(Stdio::piped());
+        // SAFETY: the hook is the one `vpn::exec::run` installs.
+        unsafe {
+            cmd.pre_exec(super::super::caps::raise_ambient_in_child);
+        }
+        match cmd.output() {
+            Ok(out) => {
+                assert!(can_raise, "the kernel allowed a raise it should refuse");
+                let amb = String::from_utf8_lossy(&out.stdout);
+                let mask = u64::from_str_radix(amb.trim_start_matches("CapAmb:").trim(), 16);
+                assert_eq!(mask.unwrap() & (1 << cap), 1 << cap, "{amb}");
+            }
+            Err(e) => {
+                assert!(!can_raise, "the raise was refused: {e}");
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            }
+        }
+        // Unarmed in an ordinary process: nothing called `prepare_children`.
+        assert!(!super::super::caps::ambient_raise_armed());
     }
 
     #[test]

@@ -61,6 +61,9 @@ struct FakeHost {
         IpAddr,
         Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
     )>,
+    /// What `preflight` answers. Empty by default, so the checks around it
+    /// read as they did before it existed.
+    preflight: Vec<vpn::preflight::Outcome>,
 }
 
 impl FakeHost {
@@ -83,7 +86,14 @@ impl FakeHost {
             ports: Vec::new(),
             route: Ok(vpn::route::RouteProbe::ViaTunnel),
             route_from: Vec::new(),
+            preflight: Vec::new(),
         }
+    }
+
+    /// Script what the preflight answers, whatever it is asked.
+    fn with_preflight(mut self, outcomes: Vec<vpn::preflight::Outcome>) -> Self {
+        self.preflight = outcomes;
+        self
     }
 
     /// Script what a route lookup from `src` answers.
@@ -265,6 +275,11 @@ impl CheckHost for FakeHost {
 
     fn has_cap_net_admin(&self) -> bool {
         self.privileged
+    }
+
+    fn preflight(&self, needs: &vpn::preflight::Needs) -> Vec<vpn::preflight::Outcome> {
+        self.record(format!("preflight {needs:?}"));
+        self.preflight.clone()
     }
 
     fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
@@ -1812,23 +1827,94 @@ fn nft_check_is_classified_by_what_nft_reported_not_by_who_asked() {
     assert!(!c.needs_capability, "detail: {}", c.detail);
 }
 
+fn outcome(
+    requirement: vpn::preflight::Requirement,
+    finding: vpn::preflight::Finding,
+    detail: &str,
+) -> vpn::preflight::Outcome {
+    vpn::preflight::Outcome {
+        requirement,
+        finding,
+        detail: detail.to_string(),
+    }
+}
+
+/// The boot's preflight is asked for what the scoped profiles need, and
+/// each verdict lands in the host block under the name the boot logs it by.
 #[test]
-fn the_capability_mask_is_read_from_the_kernel_not_guessed() {
-    // CAP_NET_ADMIN is bit 12. The two masks below are a real `CapEff` for
-    // a process that has it and one that does not.
-    let has = "Name:\tnft\nUid:\t0\t0\t0\t0\nCapEff:\t000001ffffffffff\n";
-    let hasnt = "Name:\tnft\nUid:\t998\t998\t998\t998\nCapEff:\t0000000000000000\n";
-    assert_eq!(cap_eff_has(has, CAP_NET_ADMIN_BIT), Some(true));
-    assert_eq!(cap_eff_has(hasnt, CAP_NET_ADMIN_BIT), Some(false));
-    // Exactly bit 12 and nothing adjacent.
-    assert_eq!(cap_eff_has("CapEff:\t0000000000001000\n", 12), Some(true));
-    assert_eq!(cap_eff_has("CapEff:\t0000000000000800\n", 12), Some(false));
-    // No line, or one that cannot be parsed, classifies nothing.
-    assert_eq!(cap_eff_has("Uid:\t0\t0\t0\t0\n", CAP_NET_ADMIN_BIT), None);
+fn the_boot_s_preflight_verdicts_are_reported_in_the_host_block() {
+    use vpn::preflight::Finding;
+    use vpn::preflight::Requirement;
+    let host = FakeHost::new().with_preflight(vec![
+        outcome(Requirement::NetAdmin, Finding::Met, "permitted"),
+        outcome(Requirement::WireguardKernel, Finding::Missing, "no wg"),
+        outcome(Requirement::Nft, Finding::Unknown, "no answer"),
+    ]);
+    let cfg = cfg_with_two_profiles();
+    let checks = host_checks(&cfg, Some(2000), Some("acct_b"), &host);
     assert_eq!(
-        cap_eff_has("CapEff:\tnot-a-mask\n", CAP_NET_ADMIN_BIT),
-        None
+        find(&checks, "cap_net_admin").unwrap().verdict,
+        Verdict::Pass
     );
+    let wg = find(&checks, "wireguard_kernel").unwrap();
+    assert_eq!((wg.verdict, wg.detail.as_str()), (Verdict::Fail, "no wg"));
+    let nft = find(&checks, "nft_runs").unwrap();
+    assert_eq!(nft.verdict, Verdict::Unknown);
+    assert!(!nft.needs_capability);
+    let asked = host.events();
+    assert!(
+        asked.iter().any(|e| e
+            == &format!(
+                "preflight {:?}",
+                vpn::preflight::Needs {
+                    net_admin: true,
+                    wireguard: true,
+                    nft: true,
+                    tun: false
+                }
+            )),
+        "{asked:?}"
+    );
+
+    // A host-only config with the kill switch off needs nothing.
+    let host = FakeHost::new();
+    host_checks(&cfg_with_tables(HOST_TABLE), None, None, &host);
+    assert!(
+        host.events()
+            .contains(&format!("preflight {:?}", vpn::preflight::Needs::default())),
+        "{:?}",
+        host.events()
+    );
+}
+
+/// A missing capability is the boot's refusal, but this command runs from a
+/// shell that does not hold what the unit grants the daemon: it is reported
+/// with the boot's words and does not colour the exit status, as every other
+/// verdict resting on the invoker's capability does.
+#[test]
+fn a_missing_capability_is_reported_without_colouring_the_exit_status() {
+    use vpn::preflight::Finding;
+    use vpn::preflight::Requirement;
+    let host = FakeHost::new().with_preflight(vec![
+        outcome(
+            Requirement::NetAdmin,
+            Finding::Missing,
+            &vpn::preflight::net_admin_missing(),
+        ),
+        outcome(Requirement::Nft, Finding::NeedsCapability, "not run"),
+    ]);
+    let checks = host_checks(&cfg_with_profile(""), Some(2000), None, &host);
+    let cap = find(&checks, "cap_net_admin").unwrap();
+    assert_eq!(cap.verdict, Verdict::Unknown);
+    assert!(cap.needs_capability);
+    assert!(cap.detail.contains("AmbientCapabilities=CAP_NET_ADMIN"));
+    assert!(cap.detail.contains("exits 78"));
+    assert!(find(&checks, "nft_runs").unwrap().needs_capability);
+    let report = Report {
+        host: checks,
+        profiles: Vec::new(),
+    };
+    assert_eq!(report.exit_code(), EXIT_OK);
 }
 
 #[test]

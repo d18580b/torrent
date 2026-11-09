@@ -31,33 +31,23 @@ services:
     # a graceful shutdown flushes resume data for every torrent, which at tens
     # of thousands of torrents takes longer. A SIGKILL mid-drain leaves resume
     # saves unwritten (torrentd_last_shutdown_unsaved_resumes on the next
-    # boot). The kill switch cannot run in this container (below), so there
-    # is no nftables table here for a SIGKILL to leave behind.
+    # boot). A SIGKILL also leaves the kill switch's nftables table, if it is
+    # on; the next boot replaces it.
     stop_grace_period: 180s
     # Only a `network = "vpn"` profile needs these: bringing up WireGuard
     # tunnels, and installing the nftables table when
     # network_kill_switch = true. Granted by default is granted to deployments
-    # that do not need it, so uncomment them when you add a vpn profile —
-    # together with `user: "0:0"` below. The image runs as `USER 1000:1000`,
-    # and `cap_add` only fills the container's bounding and permitted sets: a
-    # non-root uid with no ambient and no file capabilities gets nothing
-    # effective from it, so the tunnel still fails with EPERM.
+    # that do not need it, so uncomment them when you add a vpn profile.
     #
-    # **A vpn profile and `network_kill_switch = true` cannot be combined in
-    # this container.** The two requirements exclude each other:
-    #
-    # - the tunnel needs CAP_NET_ADMIN *effective*, which a compose file can
-    #   only deliver by running as root (`user: "0:0"`), for the reason above;
-    # - the kill switch matches the daemon's traffic by uid and refuses uid 0,
-    #   because `meta skuid 0 drop` would drop every other root-owned socket in
-    #   the namespace (`vpn::killswitch::refusal_for_uid`).
-    #
-    # Neither half is fixable here: compose has no key that raises an ambient
-    # capability for a non-root user. Run a vpn profile in this container
-    # without the kill switch, or run the daemon from deploy/torrentd.service,
-    # which grants CAP_NET_ADMIN to its own non-root user with
-    # `AmbientCapabilities=` and supports both together.
-    # user: "0:0"
+    # Keep the image's `USER 1000:1000`. `cap_add` puts NET_ADMIN in the
+    # container's bounding set, and the image's file capability on torrentd
+    # (`cap_net_admin+p`, deploy/Containerfile) then grants it to the daemon;
+    # the daemon hands it to the ip, wg and nft it runs and to nothing else.
+    # Running as root instead is refused by the kill switch, which matches the
+    # daemon's traffic by uid and would drop every root-owned socket in the
+    # namespace (`vpn::killswitch::refusal_for_uid`). Do not set
+    # `security_opt: [no-new-privileges:true]`: it makes the kernel ignore the
+    # file capability, and the daemon exits 78 naming CAP_NET_ADMIN.
     # cap_add:
     #   - NET_ADMIN
     # devices:

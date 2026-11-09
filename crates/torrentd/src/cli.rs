@@ -31,12 +31,23 @@ pub struct Cli {
     /// directory is not yet provisioned, which is the pre-flight case this
     /// flag exists for.
     ///
-    /// Of the host, it probes two things, both only when
-    /// `network_kill_switch = true`: that this process is not uid 0, which the
-    /// kill switch refuses, and that `nft` runs. The uid judged is the
-    /// invoking process's, not the unit's `User=`, so run it as the daemon's
-    /// user (`sudo -u torrentd torrentd --config <path> --check-config`), not
-    /// as root. It does not check VPN prerequisites — that profile files are
+    /// Of the host, with `network_kill_switch = true` it refuses uid 0, which
+    /// the kill switch refuses, and an `nft` that is missing or whose
+    /// `nft list tables` does not run. With a `vpn` profile or the kill
+    /// switch it refuses a process without `CAP_NET_ADMIN` permitted, and
+    /// prints the boot's VPN preflight: `cap_net_admin`, `wireguard_kernel`,
+    /// `nft_runs` and `tun_device`, as the configuration needs them. A
+    /// missing WireGuard kernel or `/dev/net/tun` is printed, not refused,
+    /// because the daemon starts without that profile.
+    ///
+    /// The uid and the capability judged are the invoking process's, not the
+    /// unit's: `sudo` judges root, and `sudo -u torrentd` lacks the unit's
+    /// `AmbientCapabilities=`. Pre-flight such a config as the unit runs it:
+    /// `sudo systemd-run --pipe --wait -p User=torrentd
+    /// -p AmbientCapabilities=CAP_NET_ADMIN -p CapabilityBoundingSet=CAP_NET_ADMIN
+    /// /usr/bin/torrentd --config <path> --check-config`.
+    ///
+    /// It does not check the rest of the VPN: that profile files are
     /// readable, or that `ip`, `wg` or `openvpn` are installed. Run
     /// `torrentd --config <path> vpn check` for those. That command is kept
     /// out of this flag on purpose: its checks can come back "could not be

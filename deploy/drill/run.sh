@@ -155,8 +155,8 @@ network = "host"
 listen_interfaces = "eth0:6881"
 dht = false
 
-# No such tunnel config exists, and the daemon's uid could not raise one if it
-# did: the profile fails at boot and the daemon carries on without it.
+# No such tunnel config exists: the profile fails at boot and the daemon
+# carries on without it.
 [[profile]]
 id = "drill_vpn"
 network = "vpn"
@@ -172,8 +172,9 @@ EOF
 # dependency on an exited service can wait indefinitely. A fault-injection
 # build refuses --check-config, as it refuses to start, without the opt-in
 # compose.yaml gives the daemon; the operator subcommands `tool` runs need none.
+# NET_ADMIN as compose.yaml adds it: the vpn profile is refused without it.
 tool_check() {
-  "$engine" run --rm -e TORRENTD_FAULT_INJECTION=1 -v "$DRILL_DIR:/drill:z" \
+  "$engine" run --rm -e TORRENTD_FAULT_INJECTION=1 --cap-add NET_ADMIN -v "$DRILL_DIR:/drill:z" \
     --entrypoint /usr/local/bin/torrentd \
     "$TORRENTD_IMAGE" --config /drill/torrentd.toml --check-config
 }

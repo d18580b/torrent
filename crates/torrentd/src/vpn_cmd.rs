@@ -180,31 +180,39 @@ impl Report {
     }
 }
 
-/// `CAP_NET_ADMIN`'s bit in a capability mask (`linux/capability.h`).
-const CAP_NET_ADMIN_BIT: u32 = 12;
-
-/// Whether `CapEff` in a `/proc/<pid>/status` body carries `bit`.
-///
-/// `None` when the file carried no `CapEff` line or an unparseable one, which
-/// the caller reads as "do not classify anything from this".
-fn cap_eff_has(status: &str, bit: u32) -> Option<bool> {
-    let rest = status
-        .lines()
-        .find_map(|l| l.strip_prefix("CapEff:"))?
-        .trim();
-    let mask = u64::from_str_radix(rest, 16).ok()?;
-    Some(mask & (1u64 << bit) != 0)
-}
-
 /// Whether this process holds `CAP_NET_ADMIN`, which `nft --check` and
-/// `wg show … latest-handshakes` both need, read from `/proc/self/status`.
+/// `wg show … latest-handshakes` both need ([`vpn::caps::holds_net_admin`]).
 /// `true` when the mask cannot be read, so a genuine rejection stays a
 /// failure.
 fn has_cap_net_admin() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| cap_eff_has(&s, CAP_NET_ADMIN_BIT))
-        .unwrap_or(true)
+    vpn::caps::holds_net_admin().unwrap_or(true)
+}
+
+/// The boot's preflight verdict ([`vpn::preflight`]) as a check.
+///
+/// A missing `CAP_NET_ADMIN` is a refusal at boot, which exits 78; here it is
+/// an `Unknown` nothing this invocation could settle, like every other
+/// verdict that rests on the invoker's capability: the documented invocation
+/// runs as the daemon's user from a shell, which does not hold what the unit
+/// grants the daemon. Its detail is the boot's refusal, word for word.
+fn preflight_check(o: vpn::preflight::Outcome) -> Check {
+    use vpn::preflight::Finding;
+    use vpn::preflight::Requirement;
+    let name = o.requirement.name();
+    match o.finding {
+        Finding::Met => Check::pass(name, o.detail),
+        Finding::Missing if o.requirement == Requirement::NetAdmin => Check::unknown_unsettleable(
+            name,
+            format!(
+                "{}. The daemon exits 78 for this at boot; this check judges the invoking \
+                     process",
+                o.detail
+            ),
+        ),
+        Finding::Missing => Check::fail(name, o.detail),
+        Finding::NeedsCapability => Check::unknown_unsettleable(name, o.detail),
+        Finding::Unknown => Check::unknown(name, o.detail),
+    }
 }
 
 /// The host-touching operations a profile's checks perform, behind a trait so the
@@ -264,6 +272,9 @@ pub trait CheckHost {
 
     /// Whether this process holds `CAP_NET_ADMIN`.
     fn has_cap_net_admin(&self) -> bool;
+
+    /// The boot's preflight ([`vpn::preflight::run`]) for `needs`.
+    fn preflight(&self, needs: &vpn::preflight::Needs) -> Vec<vpn::preflight::Outcome>;
 
     /// Dry-run a ruleset through `nft --check --file -`.
     ///
@@ -354,6 +365,10 @@ impl CheckHost for RealHost {
 
     fn has_cap_net_admin(&self) -> bool {
         has_cap_net_admin()
+    }
+
+    fn preflight(&self, needs: &vpn::preflight::Needs) -> Vec<vpn::preflight::Outcome> {
+        vpn::preflight::run(needs, &vpn::preflight::Host)
     }
 
     fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
@@ -728,6 +743,16 @@ fn host_checks(
             "`ip` is not executable; every tunnel IP lookup in the daemon shells out to it",
         )
     });
+
+    // What the daemon's boot checks before any profile comes up, for the
+    // profiles this run is scoped to.
+    let needs = vpn::preflight::Needs::of(
+        cfg.profile
+            .iter()
+            .filter(|p| only.is_none_or(|id| p.id.as_str() == id)),
+        cfg.network_kill_switch,
+    );
+    out.extend(host.preflight(&needs).into_iter().map(preflight_check));
 
     if cfg.network_kill_switch {
         out.push(if host.tool_available("nft", "--version") {
