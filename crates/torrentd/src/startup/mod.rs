@@ -59,6 +59,7 @@ use crate::signals::{self};
 use crate::vpn;
 
 mod cleanup;
+mod fs_check;
 mod http_stage;
 mod limits;
 mod listen_check;
@@ -255,6 +256,17 @@ pub async fn boot(
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
 
+    // The filesystems the state lives on, asked before the instance lock,
+    // which over NFS is a lease rather than a lock: overlayfs, NFS, CIFS and
+    // FUSE refuse the boot (exit 78) unless allow_unsupported_state_fs.
+    let unsupported_state_fs = {
+        let dirs = fs_check::state_dirs(&cfg);
+        let allow = cfg.allow_unsupported_state_fs;
+        tokio::task::spawn_blocking(move || fs_check::check_state_fs(&dirs, allow, &fs_check::Host))
+            .await
+            .context("state directory filesystem check")??
+    };
+
     // One daemon per state directory, decided before anything with an effect
     // outside this process. Declared before `cleanup`, so a failed boot's
     // teardown runs while the lock is still held.
@@ -421,6 +433,15 @@ pub async fn boot(
     // their failures in it, and the startup scans, which record registry
     // rejections (profile_assignment_registry_errors_total).
     let metrics = Arc::new(PromSink::new());
+    metrics.set_gauge(
+        "state_fs_unsupported",
+        if unsupported_state_fs.is_empty() {
+            0.0
+        } else {
+            1.0
+        },
+        &[],
+    );
 
     // Empty until the alert loop sees each torrent added. Created before the
     // stores, because a resume write that fails on the batch writer has to
@@ -805,6 +826,14 @@ pub async fn boot(
         if let Some(fence) = kill_switch.as_ref() {
             pool.set_kill_switch(Arc::clone(fence));
         }
+        // Before the boot re-drive and the API, either of which can apply a
+        // plan: a root whose filesystem cannot take one has it refused.
+        let (pool, metrics) = (Arc::clone(pool), metrics.clone());
+        tokio::task::spawn_blocking(move || {
+            fs_check::probe_pool_roots(&pool, metrics.as_ref(), crate::apply::probe_mutations)
+        })
+        .await
+        .context("pool root mutation probe")?;
     }
     // The daemon's one bound on hash checks, and the record of the
     // `.torrent`s it held paused for a slot when the daemon stopped: the

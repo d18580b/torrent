@@ -73,6 +73,16 @@ pub(super) fn apply_inner(
     // `resume_unfinished` refuses, and `delete_plan` refuses — permanently
     // stuck with no way out short of editing the database by hand.
 
+    // A root whose filesystem failed the boot's mutation probe takes no step.
+    // A re-driven plan stays `applying`, as with `allow_mutations` off, and
+    // the boot after the root is moved re-drives it.
+    let touched = steps
+        .iter()
+        .flat_map(|s| std::iter::once(s.src.as_str()).chain(s.dst.as_deref()));
+    if let Some(why) = pool.root_mutation_refusal(touched) {
+        return Err(why);
+    }
+
     if let Some(stuck) = steps.iter().find(|s| s.status == step_status::IN_PROGRESS) {
         // Written before the attempt and cleared by the outcome, so finding
         // one here means a previous run died mid-batch. Whether each step

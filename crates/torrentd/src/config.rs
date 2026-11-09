@@ -191,6 +191,15 @@ pub struct Config {
     /// Refused beside `[auth]`, where nothing reads it.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+
+    /// Start even though a state directory (that of `resume_dir`,
+    /// `registry_path` or `[pool] db_path`) is on overlayfs, NFS, CIFS/SMB or
+    /// FUSE, which the boot otherwise refuses with exit 78: overlayfs loses
+    /// the state with the container, and SQLite's WAL and the instance lock
+    /// are unsafe over the others. Set, the boot logs a WARN and
+    /// `state_fs_unsupported` is 1. For a setup known to be safe anyway.
+    #[serde(default)]
+    pub allow_unsupported_state_fs: bool,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
 
@@ -565,6 +574,7 @@ impl Config {
             http_socket_group: None,
             allow_unauthenticated: true,
             allowed_hosts: vec![],
+            allow_unsupported_state_fs: false,
             log_level: Self::default_log_level(),
             registry_path: None,
             connections_limit: None,
