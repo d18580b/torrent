@@ -170,7 +170,7 @@ pub struct Config {
     pub http_socket_group: Option<String>,
 
     /// Peers whose forwarding headers are believed, as IPs or CIDR blocks:
-    /// the address the reverse proxy connects from, and only that, since
+    /// the addresses the reverse proxies connect from, and only those, since
     /// anything listed can claim to be any client. Empty by default, so no
     /// forwarding header is read and the socket peer is the client. See
     /// `http::forwarded` and `LoginThrottle`.
