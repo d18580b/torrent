@@ -493,6 +493,54 @@ groups:
         annotations:
           summary: "A valid API token was used for a route outside its scope"
 
+      - alert: TorrentdAuthRejections
+        # A client that keeps presenting a token that no longer works: most
+        # often a scraper whose token was rotated, or a session that expired
+        # under a script. One mistyped token refuses for a moment and never
+        # holds this for 15 minutes; the daemon's WARN line, once a minute per
+        # client, names the client_ip.
+        expr: increase(torrentd_auth_rejections_total[5m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bearer tokens have been refused ({{ $labels.reason }}) for 15 minutes; a client keeps presenting one that does not work"
+
+      - alert: TorrentdHttp5xx
+        # Over 5% of the API's responses in 10 minutes were 5xx, and at least
+        # three of them, so one failure among a handful of requests does not
+        # page. /healthz answers 503 by design while the daemon is unready,
+        # which TorrentdUnready reports, and /metrics is the scrape's own
+        # traffic, so neither is in the ratio. Each 5xx is logged at ERROR
+        # with the request id the client received.
+        expr: |
+          (
+            sum by (instance, job) (rate(torrentd_http_requests_total{status_class="5xx", route!~"/healthz|/metrics"}[10m]))
+              /
+            sum by (instance, job) (rate(torrentd_http_requests_total{route!~"/healthz|/metrics"}[10m]))
+          ) > 0.05
+            and on (instance, job)
+          sum by (instance, job) (increase(torrentd_http_requests_total{status_class="5xx", route!~"/healthz|/metrics"}[10m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of API responses in the last 10 minutes were 5xx; each is logged at ERROR with its request id"
+
+      - alert: TorrentdHttpSlow
+        # The p99 of one route's responses, over 15 minutes, held above 5s
+        # for 15 more. The time is to the response head, so an event stream
+        # or a large download is timed by how long it took to start.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (instance, job, route, method, le) (rate(torrentd_http_request_duration_seconds_bucket[15m]))
+          ) > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.method }} {{ $labels.route }} has answered in over 5s at the 99th percentile for 15 minutes"
+
       - alert: TorrentdReloadFailed
         expr: increase(torrentd_config_reload_failures_total[15m]) > 0
         labels:

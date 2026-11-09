@@ -181,6 +181,100 @@ fn a_config_that_fails_to_load_exits_ex_config() {
     );
 }
 
+/// The JSON lines on `stdout`, each parsed, with the keys every one carries
+/// checked: the shape the daemon's subscriber writes, so a log pipeline reads
+/// a refusal raised before the subscriber existed like any later line.
+fn json_lines(stdout: &[u8]) -> Vec<serde_json::Value> {
+    let text = String::from_utf8_lossy(stdout);
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not a JSON line ({e}): {l}")))
+        .collect();
+    assert!(!lines.is_empty(), "no line on stdout");
+    for line in &lines {
+        for key in ["timestamp", "level", "message", "target", "error.kind"] {
+            assert!(line.get(key).is_some(), "no `{key}`: {line}");
+        }
+        assert_eq!(line["level"], "ERROR", "{line}");
+        assert_eq!(line["target"], "torrentd", "{line}");
+    }
+    lines
+}
+
+/// A refusal made before tracing starts is a JSON line on stdout, as every
+/// later log line is, with nothing on stderr; the exit statuses are those the
+/// unit reads. The operator subcommands keep their human stderr.
+#[test]
+#[ignore = "spawns the real daemon; run with --ignored"]
+fn early_refusals_are_json_lines_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), &free_http());
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("shutdown_drain_secs = 0\n{text}")).unwrap();
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .args(args)
+            .output()
+            .expect("spawn torrentd")
+    };
+    let flag = |s: &'static str| std::ffi::OsStr::new(s);
+
+    // The daemon and its pre-flight, refusing the config: 78.
+    for args in [
+        vec![flag("--config"), cfg.as_os_str()],
+        vec![flag("--config"), cfg.as_os_str(), flag("--check-config")],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(78), "{args:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines = json_lines(&out.stdout);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["error.kind"], "config_refused");
+        let msg = lines[0]["message"].as_str().expect("message");
+        assert!(msg.contains("shutdown_drain_secs"), "names the key: {msg}");
+    }
+
+    // The daemon's usage errors: 2.
+    for args in [
+        vec![],
+        vec![
+            flag("--config"),
+            cfg.as_os_str(),
+            flag("--check-config"),
+            flag("hash-password"),
+        ],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines = json_lines(&out.stdout);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["error.kind"], "usage");
+    }
+
+    // An operator subcommand without `--config` is still told so in prose.
+    let out = run(&[flag("hash-password")]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: --config <PATH> is required\n"
+    );
+}
+
 /// `--check-config`'s host probe (`nft` present under
 /// `network_kill_switch = true`) exits 78 when it fails, and so does the
 /// daemon, which makes the same probe itself before it raises anything. `nft`

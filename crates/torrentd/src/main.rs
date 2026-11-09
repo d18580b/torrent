@@ -66,6 +66,7 @@ use tracing::warn;
 use crate::cli::Cli;
 use crate::cli::Command;
 use crate::cli::PoolCmd;
+use crate::tracing_init::EarlyErrorKind;
 
 /// Terminal echo, switched off for as long as this guard lives.
 ///
@@ -330,9 +331,23 @@ const EX_CONFIG: i32 = 78;
 /// one line that said what to fix under the restarts. The unit sets
 /// `RestartPreventExitStatus=78`, so a refused config stops the unit and
 /// leaves the reason as the last thing in the journal.
+///
+/// The reason is a JSON line on stdout, in the shape every later log line
+/// takes ([`tracing_init::early_error`]): it is written before the subscriber
+/// exists, and a log pipeline that parses JSON dropped or mangled the plain
+/// `error: …` line that used to go to stderr, which was the one line that
+/// explained a crash loop.
 fn refuse_config(e: &anyhow::Error) -> ! {
-    eprintln!("error: {e:#}");
+    tracing_init::early_error(EarlyErrorKind::ConfigRefused, &format!("{e:#}"));
     std::process::exit(EX_CONFIG);
+}
+
+/// Exit 2, clap's status for a usage error, for an invocation the daemon
+/// cannot run as given: nothing about the configuration is wrong. Written as
+/// [`refuse_config`] writes its reason.
+fn refuse_usage(msg: &str) -> ! {
+    tracing_init::early_error(EarlyErrorKind::Usage, msg);
+    std::process::exit(2);
 }
 
 /// The variable a `fault-injection` build needs set to `1` before the daemon
@@ -555,10 +570,11 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Exit 2, the usage-error status, rather than 1: nothing about the
-    // configuration is wrong, the invocation is.
+    // configuration is wrong, the invocation is. `--check-config` is the
+    // daemon's pre-flight and runs no subcommand, so this is written as the
+    // daemon writes its refusals.
     if let Some(msg) = check_config_with_subcommand(&cli) {
-        eprintln!("error: {msg}");
-        std::process::exit(2);
+        refuse_usage(&msg);
     }
 
     // The one subcommand that reads no configuration: it describes the API
@@ -569,8 +585,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     let Some(config_path) = cli.config.clone() else {
-        // A usage error, like the one above.
-        eprintln!("error: --config <PATH> is required");
+        // A usage error, like the one above. An operator subcommand keeps its
+        // human stderr; only the daemon's line is JSON.
+        const MSG: &str = "--config <PATH> is required";
+        if cli.command.is_none() {
+            refuse_usage(MSG);
+        }
+        eprintln!("error: {MSG}");
         std::process::exit(2);
     };
     // The daemon and its pre-flight, before the config is read: a
@@ -624,7 +645,8 @@ fn main() -> anyhow::Result<()> {
     // Subcommands are operator tools, not the daemon: they run to completion
     // on this thread and never construct a session.
     if let Some(command) = cli.command {
-        tracing_init::init(cfg.log_level);
+        // A subcommand's failure to install it is its own human error, exit 1.
+        tracing_init::init(cfg.log_level)?;
         log_prepared(prepared.as_ref());
         return match command {
             Command::Pool { cmd } => match cmd {
@@ -665,7 +687,16 @@ fn main() -> anyhow::Result<()> {
         refuse_config(&e);
     }
 
-    let log_handle = tracing_init::init(cfg.log_level);
+    // A daemon whose subscriber did not install would run with every log
+    // line lost, so it stops here, 70 (EX_SOFTWARE) as for any other startup
+    // failure, saying why in the shape the lost lines would have had.
+    let log_handle = match tracing_init::init(cfg.log_level) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing_init::early_error(EarlyErrorKind::TracingInitFailed, &format!("{e:#}"));
+            std::process::exit(70);
+        }
+    };
     log_prepared(prepared.as_ref());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

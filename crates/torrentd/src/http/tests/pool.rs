@@ -944,6 +944,83 @@ async fn adoption_ignores_allow_mutations() {
     assert_eq!(r["queued_for_verification"], json!([IH_A]));
 }
 
+/// Issue #703: `TimedBody` reads the body of the three untimed operations
+/// itself, and a read that failed part-way — a connection closed
+/// mid-message, a reset stream, a `Content-Length` not met — is refused,
+/// not handed on as a whole body. Every body here is complete JSON declared
+/// one octet longer than what is sent, so a server that passed on what
+/// arrived would parse it and run the operation.
+#[tokio::test]
+async fn an_untimed_operation_refuses_a_body_that_did_not_arrive_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), true);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.pool = Some(pool);
+    });
+    let w = h.tokens.write.clone();
+    let short = |path: &str, body: &Value| {
+        let body = serde_json::to_vec(body).unwrap();
+        let declared = u64::try_from(body.len()).unwrap() + 1;
+        h.client
+            .post(path)
+            .peer("192.0.2.10:40000".parse().unwrap())
+            .header("authorization", &format!("Bearer {w}"))
+            .body("application/json", body)
+            .content_length(declared)
+            .send()
+    };
+
+    for (method, path) in UNTIMED {
+        assert_eq!(*method, "POST");
+        let resp = short(path, &body_for(method, path).unwrap()).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "{method} {path}: {}",
+            resp.text()
+        );
+        resp.assert_problem_type("about:blank");
+        let detail: Value = resp.json();
+        assert!(
+            detail["detail"]
+                .as_str()
+                .unwrap()
+                .contains("1 octet(s) short"),
+            "{method} {path}: {detail}"
+        );
+    }
+
+    // The adoption's handler never ran: nothing was claimed, where the same
+    // body sent whole claims IH_A for the profile.
+    let selector = json!({"kind": "infohashes", "infohashes": [IH_A]});
+    let resp = short(
+        "/v1/pool/adoptions",
+        &adopt("p", false, selector.clone()).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400, "{}", resp.text());
+    assert_eq!(
+        h.state.registry.len(),
+        0,
+        "a refused adoption claims nothing"
+    );
+    let resp = h
+        .send(
+            "POST",
+            "/v1/pool/adoptions",
+            Some(&w),
+            adopt("p", false, selector),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let a = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    assert_eq!(
+        h.state.registry.lookup(&a),
+        Some(torrentd_engine::ProfileId::new("p"))
+    );
+}
+
 /// Issue #507: the targets of one request are adopted side by side, and the
 /// response still lists each where it went in the order named. An infohash
 /// named twice meets its first occurrence's claim exactly as one target at a
