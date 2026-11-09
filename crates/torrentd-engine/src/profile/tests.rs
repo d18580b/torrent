@@ -872,3 +872,126 @@ fn gateway_defaults_to_proton() {
     });
     assert_eq!(s2.port_forward_gateway_or_default(), "10.9.9.1");
 }
+
+/// A vpn profile on `vpn_type`, with `extra`'s keys added, as read from its
+/// on-disk shape.
+fn parse_vpn(vpn_type: &str, extra: serde_json::Value) -> Result<ProfileConfig, String> {
+    let mut v = serde_json::json!({
+        "id": "acct_a",
+        "network": "vpn",
+        "vpn_type": vpn_type,
+        "vpn_config": "/etc/wireguard/wg0.conf",
+        "vpn_interface": "wg0",
+        "listen_port": 6891,
+    });
+    for (k, val) in extra.as_object().unwrap() {
+        v[k] = val.clone();
+    }
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+#[test]
+fn tracker_dns_is_the_host_s_unless_the_profile_says_tunnel() {
+    let p = parse_vpn("wireguard", serde_json::json!({})).unwrap();
+    assert_eq!(p.tracker_dns(), &TrackerDns::Host);
+    let p = parse_vpn("wireguard", serde_json::json!({"tracker_dns": "host"})).unwrap();
+    assert_eq!(p.tracker_dns(), &TrackerDns::Host);
+
+    let p = parse_vpn("wireguard", serde_json::json!({"tracker_dns": "tunnel"})).unwrap();
+    assert_eq!(
+        p.tracker_dns(),
+        &TrackerDns::Tunnel { servers: vec![] },
+        "with no servers, the WireGuard config's DNS = lines are read at bring-up",
+    );
+
+    let p = parse_vpn(
+        "openvpn",
+        serde_json::json!({
+            "tracker_dns": "tunnel",
+            "tracker_dns_servers": ["10.8.0.1", "fd00::53"],
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        p.tracker_dns(),
+        &TrackerDns::Tunnel {
+            servers: vec!["10.8.0.1".parse().unwrap(), "fd00::53".parse().unwrap()],
+        },
+    );
+
+    // Written back the way it was read.
+    for p in [
+        p,
+        parse_vpn("wireguard", serde_json::json!({"tracker_dns": "tunnel"})).unwrap(),
+    ] {
+        let back: ProfileConfig =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    // A host profile has no tunnel to resolve through.
+    assert_eq!(
+        host("public", "0.0.0.0:6881", false).tracker_dns(),
+        &TrackerDns::Host
+    );
+}
+
+#[test]
+fn tracker_dns_settings_that_could_not_take_are_refused() {
+    for (vpn_type, extra, needle) in [
+        // Servers nobody would ask.
+        (
+            "wireguard",
+            serde_json::json!({"tracker_dns_servers": ["10.2.0.1"]}),
+            "tracker_dns_servers",
+        ),
+        // OpenVPN has no config line naming its resolver to fall back on.
+        (
+            "openvpn",
+            serde_json::json!({"tracker_dns": "tunnel"}),
+            "OpenVPN",
+        ),
+        // The host's own stub, which is the lookup this exists to avoid.
+        (
+            "wireguard",
+            serde_json::json!({"tracker_dns": "tunnel", "tracker_dns_servers": ["127.0.0.53"]}),
+            "127.0.0.53",
+        ),
+        (
+            "wireguard",
+            serde_json::json!({"tracker_dns": "tunnel", "tracker_dns_servers": ["::"]}),
+            "::",
+        ),
+        (
+            "wireguard",
+            serde_json::json!({"tracker_dns": "tunnel", "tracker_dns_servers": ["224.0.0.251"]}),
+            "224.0.0.251",
+        ),
+        (
+            "wireguard",
+            serde_json::json!({"tracker_dns": "dhcp"}),
+            "dhcp",
+        ),
+    ] {
+        let msg = parse_vpn(vpn_type, extra.clone()).unwrap_err();
+        assert!(msg.contains(needle), "{extra}: got {msg}");
+    }
+
+    // Wrong posture: refused on presence, like every other vpn-only key.
+    for key in ["tracker_dns", "tracker_dns_servers"] {
+        let mut v = serde_json::json!({
+            "id": "public",
+            "network": "host",
+            "listen_interfaces": "0.0.0.0:6881",
+        });
+        v[key] = if key == "tracker_dns" {
+            serde_json::json!("host")
+        } else {
+            serde_json::json!(["10.2.0.1"])
+        };
+        let msg = serde_json::from_value::<ProfileConfig>(v)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(key), "got {msg}");
+    }
+}

@@ -985,17 +985,26 @@ fn any_change_inside_the_network_block_is_one_identity_change() {
     // field it already has reaches the comparison, and if switching the
     // variant does too: which tunnel, which port, whether DHT runs.
     use torrentd_engine::ProfileNetwork;
+    use torrentd_engine::TrackerDns;
     let dir = tempdir().unwrap();
     let host = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
     let mut vpn = host.clone();
-    vpn.profile[0].network = ProfileNetwork::Vpn {
-        vpn_type: torrentd_engine::VpnType::Wireguard,
-        vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
-        vpn_interface: "wg0".into(),
-        listen_port: Some(6881),
-        port_forward: Default::default(),
-        port_forward_gateway: None,
-        tracker_dns: torrentd_engine::TrackerDns::Host,
+    // wg0, port 6881, static, the host's tracker DNS.
+    vpn.profile[0].network = vpn_profile().network;
+    // `vpn`'s network with one of its fields edited.
+    type Edit<'a> = &'a dyn Fn(&mut String, &mut Option<u16>, &mut TrackerDns);
+    let vpn_edit = |edit: Edit<'_>| {
+        let mut n = vpn.profile[0].network.clone();
+        if let ProfileNetwork::Vpn {
+            vpn_interface,
+            listen_port,
+            tracker_dns,
+            ..
+        } = &mut n
+        {
+            edit(vpn_interface, listen_port, tracker_dns);
+        }
+        n
     };
 
     let edits: Vec<(&str, &Config, ProfileNetwork)> = vec![
@@ -1019,28 +1028,17 @@ fn any_change_inside_the_network_block_is_one_identity_change() {
         (
             "vpn interface",
             &vpn,
-            ProfileNetwork::Vpn {
-                vpn_type: torrentd_engine::VpnType::Wireguard,
-                vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
-                vpn_interface: "wg1".into(),
-                listen_port: Some(6881),
-                port_forward: Default::default(),
-                port_forward_gateway: None,
-                tracker_dns: torrentd_engine::TrackerDns::Host,
-            },
+            vpn_edit(&|i, _, _| *i = "wg1".into()),
         ),
         (
             "vpn listen_port",
             &vpn,
-            ProfileNetwork::Vpn {
-                vpn_type: torrentd_engine::VpnType::Wireguard,
-                vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
-                vpn_interface: "wg0".into(),
-                listen_port: Some(51413),
-                port_forward: Default::default(),
-                port_forward_gateway: None,
-                tracker_dns: torrentd_engine::TrackerDns::Host,
-            },
+            vpn_edit(&|_, p, _| *p = Some(51413)),
+        ),
+        (
+            "vpn tracker_dns",
+            &vpn,
+            vpn_edit(&|_, _, d| *d = TrackerDns::Tunnel { servers: vec![] }),
         ),
         ("vpn to host", &vpn, host.profile[0].network.clone()),
     ];
@@ -1628,91 +1626,6 @@ fn a_listen_port_under_natpmp_is_refused_rather_than_ignored() {
         msg.contains("listen_port") && msg.contains("natpmp"),
         "got: {msg}",
     );
-}
-
-/// A vpn profile `acct_a` on `vpn_type`, with `extra` appended to its table.
-fn load_vpn_profile(vpn_type: &str, extra: &str) -> Result<Config, String> {
-    let dir = tempdir().unwrap();
-    let config = if vpn_type == "openvpn" {
-        "/etc/openvpn/a.ovpn"
-    } else {
-        "/etc/wireguard/wg0.conf"
-    };
-    let body = format!(
-        "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
-         vpn_type = \"{vpn_type}\"\nvpn_config = \"{config}\"\n\
-         vpn_interface = \"wg0\"\nlisten_port = 6891\n\
-         peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n\
-         allowed_tracker_domains = [\"t.example\"]\n{extra}\n"
-    );
-    let p = write_cfg(dir.path(), &body);
-    Config::load(&p).map_err(|e| format!("{e:#}"))
-}
-
-#[test]
-fn tracker_dns_is_the_host_s_unless_the_profile_says_tunnel() {
-    let cfg = load_vpn_profile("wireguard", "").unwrap();
-    assert_eq!(
-        cfg.profile[0].tracker_dns(),
-        &torrentd_engine::TrackerDns::Host
-    );
-
-    let cfg = load_vpn_profile("wireguard", "tracker_dns = \"tunnel\"").unwrap();
-    assert_eq!(
-        cfg.profile[0].tracker_dns(),
-        &torrentd_engine::TrackerDns::Tunnel { servers: vec![] },
-        "with no servers, the WireGuard config's DNS = lines are read at bring-up",
-    );
-
-    let cfg = load_vpn_profile(
-        "openvpn",
-        "tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"10.8.0.1\", \"fd00::53\"]",
-    )
-    .unwrap();
-    assert_eq!(
-        cfg.profile[0].tracker_dns(),
-        &torrentd_engine::TrackerDns::Tunnel {
-            servers: vec!["10.8.0.1".parse().unwrap(), "fd00::53".parse().unwrap()],
-        },
-    );
-}
-
-#[test]
-fn tracker_dns_settings_that_could_not_take_are_refused() {
-    for (vpn_type, extra, needle) in [
-        // Servers nobody would ask.
-        (
-            "wireguard",
-            "tracker_dns_servers = [\"10.2.0.1\"]",
-            "tracker_dns_servers",
-        ),
-        // OpenVPN has no config line naming its resolver to fall back on.
-        ("openvpn", "tracker_dns = \"tunnel\"", "OpenVPN"),
-        // The host's own stub, which is the lookup this exists to avoid.
-        (
-            "wireguard",
-            "tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"127.0.0.53\"]",
-            "127.0.0.53",
-        ),
-        (
-            "wireguard",
-            "tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"::\"]",
-            "::",
-        ),
-    ] {
-        let msg = load_vpn_profile(vpn_type, extra).unwrap_err();
-        assert!(msg.contains(needle), "{extra}: got {msg}");
-    }
-
-    // Wrong posture: a host profile has no tunnel to resolve through.
-    let dir = tempdir().unwrap();
-    let body = format!(
-        "{TOP_LEVEL}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
-             listen_interfaces = \"0.0.0.0:6881\"\ntracker_dns = \"tunnel\"\n"
-    );
-    let p = write_cfg(dir.path(), &body);
-    let msg = format!("{:#}", Config::load(&p).unwrap_err());
-    assert!(msg.contains("tracker_dns"), "got: {msg}");
 }
 
 #[test]
