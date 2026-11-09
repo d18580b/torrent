@@ -487,7 +487,9 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
 
     // `X-Forwarded-For` decides wherever it is present; `Forwarded` only where
     // it is absent. Present but unreadable — empty, unparseable, not UTF-8 —
-    // falls back to the socket peer, never to `Forwarded`: the proxy wrote
+    // stops the walk at the trusted hop that wrote the unreadable element
+    // (the socket peer, where it is the last), never falling back to
+    // `Forwarded`: the proxy wrote
     // the one and may be passing the other through from the client. Both
     // arms parse addresses with `node_addr` and walk them with `walk`.
     let xff = last_element(headers, "x-forwarded-for");
