@@ -1,4 +1,12 @@
-//! `GET /healthz` — readiness probe for systemd / load balancers.
+//! The probes: `GET /livez` (is the process wedged?), `GET /readyz` (should
+//! it take traffic?), and `GET /healthz`, the readiness probe under the name
+//! it had before the two were split, kept for the scripts and the container
+//! `HEALTHCHECK` that already use it.
+//!
+//! Liveness and readiness are different questions. A fenced profile is held
+//! out of service on purpose until an operator lifts the fence, so a probe
+//! that restarts the process for it - Kubernetes' `livenessProbe` - undoes
+//! the fence. `/livez` therefore fails only for what a restart fixes.
 
 use std::sync::Arc;
 
@@ -11,7 +19,7 @@ use crate::app_state::AppState;
 use crate::http::v1::Operations;
 
 /// How stale the alert loop's heartbeat may get before the daemon reports
-/// unready.
+/// itself wedged and unready.
 ///
 /// The loop stamps it at the top of every iteration and sleeps at most 100ms
 /// when idle, so anything approaching this is pathological. Kept well under the
@@ -46,6 +54,9 @@ pub struct HealthReport {
 #[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthReason {
+    /// The boot has not finished: a torrent it loaded has not yet reached
+    /// the state map, and ten minutes have not passed since.
+    Starting,
     /// No profile has a live session.
     NoSessions,
     /// The alert loop has not run for longer than fifteen seconds.
@@ -54,7 +65,8 @@ pub enum HealthReason {
     AllProfilesFenced,
 }
 
-/// The two answers `/healthz` gives, with one body shape between them.
+/// The two answers `/readyz` and `/healthz` give, with one body shape
+/// between them.
 #[derive(Reply)]
 pub enum Health {
     #[reply(status = 200, description = "The daemon is ready.")]
@@ -66,7 +78,121 @@ pub enum Health {
     Unready(HealthReport),
 }
 
+/// Whether the process is wedged, and the readings behind it.
+#[derive(Debug, Schema, Serialize)]
+pub struct LivenessReport {
+    /// Whether the process is live. `true` exactly when the status is 200.
+    pub ok: bool,
+    /// The check that failed; `null` when live.
+    pub failed: Option<LivenessCheck>,
+    /// Seconds since the alert loop last stamped its heartbeat; `null` when
+    /// there is no live session to run one.
+    pub heartbeat_age_secs: Option<u64>,
+    /// Batch writer threads - the ones that write resume data - that have
+    /// died by a panic in this process.
+    pub batch_writer_deaths: u64,
+}
+
+/// The check `/livez` failed.
+#[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LivenessCheck {
+    /// The alert loop has not run for longer than fifteen seconds.
+    AlertLoopStalled,
+    /// A batch writer thread died: resume data no longer reaches the disk.
+    BatchWriterDead,
+    /// The runtime's tick, stamped twice a second, is older than two
+    /// seconds: its scheduler or timer is starved.
+    RuntimeStalled,
+}
+
+/// The two answers `/livez` gives, with one body shape between them.
+#[derive(Reply)]
+pub enum Liveness {
+    #[reply(status = 200, description = "The process is live.")]
+    Live(LivenessReport),
+    #[reply(
+        status = 503,
+        description = "The process is wedged; `failed` names the check. Restart it."
+    )]
+    Wedged(LivenessReport),
+}
+
+/// How often the supervised task `runtime_tick` stamps
+/// [`AppState::runtime_tick`].
+const RUNTIME_TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How stale the runtime's tick stamp may get before `/livez` calls the
+/// runtime stalled: four periods.
+const MAX_RUNTIME_TICK_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stamp `stamp` with the time every [`RUNTIME_TICK_PERIOD`], forever. Run as
+/// the supervised task `runtime_tick`.
+///
+/// Each stamp needs the runtime's timer to fire and a worker to poll this
+/// task, so a starved scheduler or a timer that stopped firing lets it go
+/// stale. `/livez` only reads it: a handler that runs on a free worker does
+/// not refresh it, and so reports a stall on the others.
+pub(crate) async fn run_runtime_tick(stamp: Arc<std::sync::atomic::AtomicU64>) {
+    let mut every = tokio::time::interval(RUNTIME_TICK_PERIOD);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        stamp.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Liveness.
+///
+/// 503 only for what a restart fixes: the alert loop's heartbeat older than
+/// fifteen seconds, a batch writer thread dead, or the runtime's tick - a
+/// task stamping the time twice a second - older than two seconds. Never for
+/// a fenced, offline, failed or missing profile: those are `/readyz`'s, and
+/// a fence in particular holds until an operator lifts it, which a restart
+/// would undo. A runtime wedged hard enough not to run this handler at all
+/// gives no answer, which a probe's own timeout counts as a failure.
+/// Unauthenticated, as every probe is.
+#[kynos::get("/livez", tag = Operations)]
+pub async fn get_live(Inject(s): Inject<Arc<AppState>>) -> Liveness {
+    let report = evaluate_live(&s, torrentd_engine::batch_writer::writer_deaths());
+    if report.ok {
+        Liveness::Live(report)
+    } else {
+        Liveness::Wedged(report)
+    }
+}
+
+/// The liveness of `s`, given the process's batch writer deaths.
+fn evaluate_live(s: &AppState, writer_deaths: u64) -> LivenessReport {
+    // With no live session there is no alert loop to judge; no session is a
+    // readiness answer, and a restart does not bring a tunnel up.
+    let age = (!s.source.profiles().is_empty()).then(|| heartbeat_age(&s.alert_heartbeat));
+    let failed = if age.is_some_and(|a| a > MAX_HEARTBEAT_AGE) {
+        Some(LivenessCheck::AlertLoopStalled)
+    } else if writer_deaths > 0 {
+        Some(LivenessCheck::BatchWriterDead)
+    } else if heartbeat_age(&s.runtime_tick) > MAX_RUNTIME_TICK_AGE {
+        Some(LivenessCheck::RuntimeStalled)
+    } else {
+        None
+    };
+    LivenessReport {
+        ok: failed.is_none(),
+        failed,
+        heartbeat_age_secs: age.map(|a| a.as_secs()),
+        batch_writer_deaths: writer_deaths,
+    }
+}
+
 /// Readiness.
+///
+/// 503 `starting` until the boot has finished: the API is up and every
+/// torrent the boot loaded has reached the state map, or ten minutes have
+/// passed since the API state was built. A startup probe reads that.
 ///
 /// `profiles` is the **live** count — sessions that came up — and
 /// `profiles_failed` is how many configured profiles never got one. They are
@@ -80,9 +206,22 @@ pub enum Health {
 /// `torrentd_profile_vpn_tunnel_up` are what to alert on for that. The route is
 /// unauthenticated: a probe that needs a credential is a probe that breaks
 /// during the incident it exists to detect.
+#[kynos::get("/readyz", tag = Operations)]
+pub async fn get_ready(Inject(s): Inject<Arc<AppState>>) -> Health {
+    readiness(&s)
+}
+
+/// Readiness, under its original name.
+///
+/// The same answer as `GET /readyz`, kept so the scripts, the container
+/// `HEALTHCHECK` and the probes already pointed at it keep working.
 #[kynos::get("/healthz", tag = Operations)]
 pub async fn get_health(Inject(s): Inject<Arc<AppState>>) -> Health {
-    let report = evaluate(&s);
+    readiness(&s)
+}
+
+fn readiness(s: &AppState) -> Health {
+    let report = evaluate(s);
     if report.ok {
         Health::Ready(report)
     } else {
@@ -94,6 +233,19 @@ fn evaluate(s: &AppState) -> HealthReport {
     let count = crate::http::v1::server::count;
     let n_profiles = s.source.profiles().len();
     let n_failed = count(s.profiles.failed().len());
+    if s.boot.is_starting(&s.state) {
+        let (fenced, _) = s.fenced_profiles();
+        return HealthReport {
+            ok: false,
+            reason: Some(HealthReason::Starting),
+            profiles: count(n_profiles),
+            profiles_fenced: count(fenced),
+            profiles_failed: n_failed,
+            heartbeat_age_secs: (n_profiles > 0)
+                .then(|| heartbeat_age(&s.alert_heartbeat).as_secs()),
+            kill_switch_dns_exempt: s.kill_switch_dns_exempt,
+        };
+    }
     if n_profiles == 0 {
         return HealthReport {
             ok: false,
@@ -398,6 +550,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         let reasons: Vec<String> = [
+            HealthReason::Starting,
             HealthReason::NoSessions,
             HealthReason::AlertLoopStalled,
             HealthReason::AllProfilesFenced,
@@ -483,5 +636,127 @@ mod tests {
             .store(millis_ago(MAX_HEARTBEAT_AGE * 2), Ordering::Relaxed);
         let (status, _) = probe(&s);
         assert_eq!(status, 503);
+    }
+
+    /// The status `/livez` would answer for `s` with no writer dead, and the
+    /// body as JSON.
+    fn live(s: &AppState) -> (u16, serde_json::Value) {
+        live_with(s, 0)
+    }
+
+    fn live_with(s: &AppState, deaths: u64) -> (u16, serde_json::Value) {
+        let report = evaluate_live(s, deaths);
+        let status = if report.ok { 200 } else { 503 };
+        (status, serde_json::to_value(&report).unwrap())
+    }
+
+    /// A fence is held until an operator lifts it: every profile fenced
+    /// takes the daemon out of rotation and never restarts it.
+    #[test]
+    fn a_daemon_with_every_profile_fenced_is_live_and_unready() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+        use crate::profile_registry::ProfileStatus;
+
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("a", ProfileStatus::VpnDown),
+            test_entry("b", ProfileStatus::VpnDown),
+        ]));
+        let s = build_test_state(Some(reg));
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let (status, body) = live(&s);
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["failed"], serde_json::Value::Null);
+        let (status, body) = probe(&s);
+        assert_eq!(status, 503);
+        assert_eq!(body["reason"], "all_profiles_fenced");
+    }
+
+    /// No live session, and so no alert loop to judge, is a readiness
+    /// answer: a restart brings no tunnel up.
+    #[test]
+    fn a_daemon_with_no_session_is_live_and_unready() {
+        let s = crate::app_state::build_test_state_with_sessions(None, &[]);
+        s.alert_heartbeat.store(0, Ordering::Relaxed);
+        let (status, body) = live(&s);
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["heartbeat_age_secs"], serde_json::Value::Null);
+        assert_eq!(probe(&s).1["reason"], "no_sessions");
+    }
+
+    #[test]
+    fn a_stalled_alert_loop_is_wedged_and_unready() {
+        let s = build_test_state(None);
+        s.alert_heartbeat
+            .store(millis_ago(MAX_HEARTBEAT_AGE * 2), Ordering::Relaxed);
+        let (status, body) = live(&s);
+        assert_eq!(status, 503);
+        assert_eq!(body["failed"], "alert_loop_stalled");
+        assert!(body["heartbeat_age_secs"].as_u64().unwrap() >= 30, "{body}");
+        let (status, body) = probe(&s);
+        assert_eq!(status, 503);
+        assert_eq!(body["reason"], "alert_loop_stalled");
+    }
+
+    /// A dead batch writer and a stale runtime tick each fail liveness,
+    /// naming themselves; neither moves readiness.
+    #[test]
+    fn a_dead_batch_writer_or_a_stalled_runtime_is_wedged() {
+        let s = build_test_state(None);
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let (status, body) = live_with(&s, 1);
+        assert_eq!(status, 503);
+        assert_eq!(body["failed"], "batch_writer_dead");
+        assert_eq!(body["batch_writer_deaths"], 1);
+        s.runtime_tick
+            .store(millis_ago(MAX_RUNTIME_TICK_AGE * 2), Ordering::Relaxed);
+        let (status, body) = live_with(&s, 0);
+        assert_eq!(status, 503);
+        assert_eq!(body["failed"], "runtime_stalled");
+        assert_eq!(probe(&s).0, 200);
+    }
+
+    /// The tick task stamps a stale stamp fresh as soon as the runtime
+    /// polls it, so a running runtime is live by it.
+    #[tokio::test]
+    async fn the_runtime_tick_refreshes_a_stale_stamp() {
+        let s = build_test_state(None);
+        s.runtime_tick
+            .store(millis_ago(MAX_RUNTIME_TICK_AGE * 2), Ordering::Relaxed);
+        assert_eq!(live(&s).1["failed"], "runtime_stalled");
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_runtime_tick(Arc::clone(&s.runtime_tick)),
+        )
+        .await;
+        assert!(ran.is_err(), "the tick runs until stopped");
+        assert!(heartbeat_age(&s.runtime_tick) < RUNTIME_TICK_PERIOD);
+        assert_eq!(live(&s).1["failed"], serde_json::Value::Null);
+    }
+
+    /// Until the boot is done, readiness is `starting` whatever else holds;
+    /// liveness does not wait for it.
+    #[test]
+    fn a_daemon_still_starting_is_live_and_unready() {
+        let mut s = build_test_state(None);
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        s.boot = Arc::new(crate::app_state::BootProgress::new(
+            vec![libtorrent_safe::InfoHash([9; 20])],
+            std::time::Duration::from_secs(600),
+        ));
+        assert_eq!(live(&s).0, 200);
+        let (status, body) = probe(&s);
+        assert_eq!(status, 503);
+        assert_eq!(body["reason"], "starting");
+        assert_eq!(body["profiles"], 1);
+        s.boot.mark_serving();
+        assert_eq!(
+            probe(&s).1["reason"],
+            "starting",
+            "the torrent is not loaded"
+        );
     }
 }

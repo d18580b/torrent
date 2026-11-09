@@ -110,16 +110,25 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     resp.assert_status(kynos::http::StatusCode::OK);
     assert_eq!(resp.text(), crate::http::document_json().unwrap());
 
-    // The probe: ready, then unready once the heartbeat is stale.
-    let resp = h.send("GET", "/healthz", None, None).await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    // The probes, unauthenticated: live and ready, then wedged and unready
+    // once the heartbeat is stale, `/healthz` answering as `/readyz` does.
+    for path in ["/livez", "/readyz", "/healthz"] {
+        let resp = h.send("GET", path, None, None).await;
+        resp.assert_status(kynos::http::StatusCode::OK);
+    }
     h.state
         .alert_heartbeat
         .store(0, std::sync::atomic::Ordering::Relaxed);
-    let resp = h.send("GET", "/healthz", None, None).await;
+    let resp = h.send("GET", "/livez", None, None).await;
     resp.assert_status(kynos::http::StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = resp.json();
-    assert_eq!(body["reason"], "alert_loop_stalled");
+    assert_eq!(body["failed"], "alert_loop_stalled");
+    for path in ["/readyz", "/healthz"] {
+        let resp = h.send("GET", path, None, None).await;
+        resp.assert_status(kynos::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["reason"], "alert_loop_stalled", "{path}");
+    }
 
     h.assert_conformance();
 
@@ -304,11 +313,41 @@ async fn an_events_stream_opened_after_the_shutdown_ends_at_once() {
     assert!(resp.events().is_empty(), "nothing is sent once shut down");
 }
 
+/// The probes need no credential and answer whatever `Host` a kubelet or a
+/// load balancer sends: a daemon without `[auth]` refuses a foreign `Host`
+/// on every `/v1` operation, never on a probe.
+#[tokio::test]
+async fn the_probes_answer_a_foreign_host_without_a_credential() {
+    let h = Harness::new(
+        &Coverage::new(),
+        crate::app_state::build_test_state(None),
+        Default::default(),
+    );
+    let refused = h
+        .send_with(
+            "GET",
+            "/v1/status",
+            None,
+            None,
+            &[("host", "10.0.0.7:8080")],
+        )
+        .await;
+    assert_eq!(refused.status().as_u16(), 403, "the check is on");
+    for path in ["/livez", "/readyz", "/healthz"] {
+        let resp = h
+            .send_with("GET", path, None, None, &[("host", "10.0.0.7:8080")])
+            .await;
+        resp.assert_status(kynos::http::StatusCode::OK);
+    }
+}
+
 #[tokio::test]
 async fn every_response_carries_the_shared_headers_and_its_own_request_id() {
     let h = Harness::authed(&Coverage::new(), |_| {});
     let mut ids = std::collections::BTreeSet::new();
     for (method, path, token) in [
+        ("GET", "/livez", None),
+        ("GET", "/readyz", None),
         ("GET", "/healthz", None),
         ("GET", "/v1/openapi.json", None),
         ("GET", "/metrics", Some(h.tokens.metrics.clone())),
