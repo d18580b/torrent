@@ -388,6 +388,9 @@ impl Config {
                 let Some(tunnel) = p.vpn_tunnel() else {
                     continue;
                 };
+                // Unreachable for OpenVPN: `check_boot_rules`, run first,
+                // refuses the kill switch beside any OpenVPN profile, and
+                // these keys are refused without the kill switch.
                 if tunnel.r#type != torrentd_engine::VpnType::Wireguard {
                     continue;
                 }
@@ -748,5 +751,32 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    /// A provider's config, as ProtonVPN ships it: a comment line and a blank
+    /// line inside `[Interface]` ahead of its `DNS` line. Both are skipped as
+    /// the link's own parser skips them, so the `DNS` line is still in
+    /// `[Interface]` and its resolver is still refused.
+    #[test]
+    fn a_dns_server_after_a_comment_or_blank_line_in_interface_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = kill_switch(dir.path());
+        let conf = dir.path().join("wg0.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[Interface]\n# Key for acct_a\n# Bouncing = 1\nPrivateKey = {KEY}\n\
+                 Address = 10.2.0.2/32\n\n  # NetShield = 0\nDNS = 10.2.0.1\n\n\
+                 [Peer]\n# NL#1\nPublicKey = 9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=\n\
+                 AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.7:51820\n"
+            ),
+        )
+        .unwrap();
+        cfg.kill_switch_dns_servers = vec!["10.2.0.1".parse().unwrap()];
+        let msg = refusal(&cfg);
+        assert!(
+            msg.contains("10.2.0.1") && msg.contains("DNS = 10.2.0.1") && msg.contains("acct_a"),
+            "{msg}"
+        );
     }
 }
