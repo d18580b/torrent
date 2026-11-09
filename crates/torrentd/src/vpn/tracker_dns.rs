@@ -38,6 +38,11 @@
 //! included, so a profile with tunnel DNS runs its peers over TCP alone
 //! ([`TrackerProxy::configure`] turns uTP off rather than leave it broken).
 //! Peer connections never go through the proxy.
+//!
+//! **IPv4 announces only.** libtorrent takes one proxy for the session, and
+//! a vpn profile's tunnel address ([`torrentd_engine::VpnManager::current_ip`])
+//! is IPv4, so an IPv6 listen socket's announce, bound to an IPv6 address,
+//! cannot reach the proxy and fails.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
