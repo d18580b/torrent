@@ -13,13 +13,13 @@ use super::loaded;
 use super::loaded_unfenced;
 use super::model::TorrentPath;
 use super::Lookup;
+use super::UnfencedLookup;
 use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::ProfileProblem;
-use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::Torrents;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
@@ -30,10 +30,10 @@ use crate::http::validate::ValidationFailed;
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetUploadLimitError {
-    /// No loaded torrent has this infohash.
-    #[error("no loaded torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    /// No loaded torrent has this infohash, or its profile has no session.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Lookup(#[from] Lookup),
     /// A constraint the schema declares is broken.
     #[error(transparent)]
     #[problem(transparent)]
@@ -43,22 +43,20 @@ pub enum SetUploadLimitError {
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_lookup!(SetUploadLimitError);
 
 /// Why a torrent was not paused.
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum PauseTorrentError {
-    /// No loaded torrent has this infohash.
-    #[error("no loaded torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    /// No loaded torrent has this infohash, or its profile has no session.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Lookup(#[from] Lookup),
     /// The session refused the request.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_lookup!(PauseTorrentError);
 
 /// Pause a torrent.
 ///
@@ -95,26 +93,16 @@ pub async fn pause_torrent(
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum UnfencedControlError {
-    /// No loaded torrent has this infohash.
-    #[error("no loaded torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
-    /// The VPN monitor fenced the torrent's profile, or the operator set
-    /// it offline; nothing may put its torrents back on the network until
-    /// the profile is set online.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        #[problem(extension)]
-        profile_status: ProfileUnavailableReason,
-    },
+    /// No loaded torrent has this infohash, its profile has no session, or
+    /// the VPN monitor fenced the profile or the operator set it offline.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Lookup(#[from] UnfencedLookup),
     /// The session refused the request.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_lookup!(UnfencedControlError, fenced);
 
 /// Resume a torrent.
 ///
@@ -177,10 +165,11 @@ pub async fn resume_torrent(
     else {
         unreachable!("vpn_down is an unavailable profile");
     };
-    Err(UnfencedControlError::ProfileUnavailable {
+    Err(UnfencedLookup::ProfileUnavailable {
         detail,
         profile_status,
-    })
+    }
+    .into())
 }
 
 /// Re-verify a torrent's payload.

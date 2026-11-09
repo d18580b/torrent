@@ -16,6 +16,7 @@ use torrentd_engine::TorrentState;
 
 use crate::app_state::AppState;
 use crate::http::v1::common::engine_for;
+use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::common::ProfileUnavailableReason;
@@ -25,8 +26,8 @@ use crate::http::v1::common::ProfileUnavailableReason;
 /// Keyed on the state map: these act through a handle, and a torrent with no
 /// state entry has none.
 fn loaded(s: &AppState, ih: InfoHash) -> Result<(TorrentState, Arc<dyn TorrentEngine>), Lookup> {
-    let st = s.state.get(&ih).ok_or(Lookup::NotFound)?;
-    let engine = engine_for(s, &st.profile_id).map_err(|_| Lookup::NoSession)?;
+    let st = s.state.get(&ih).ok_or(Lookup::TorrentNotFound)?;
+    let engine = engine_for(s, &st.profile_id).map_err(|_| Lookup::no_session())?;
     Ok((st, engine))
 }
 
@@ -40,14 +41,14 @@ fn loaded(s: &AppState, ih: InfoHash) -> Result<(TorrentState, Arc<dyn TorrentEn
 fn loaded_unfenced(
     s: &AppState,
     ih: InfoHash,
-) -> Result<(TorrentState, Arc<dyn TorrentEngine>), Lookup> {
-    let st = s.state.get(&ih).ok_or(Lookup::NotFound)?;
+) -> Result<(TorrentState, Arc<dyn TorrentEngine>), UnfencedLookup> {
+    let st = s.state.get(&ih).ok_or(Lookup::TorrentNotFound)?;
     let engine = unfenced_engine(s, &st.profile_id).map_err(|p| match p {
-        ProfileProblem::ProfileNotFound => Lookup::NoSession,
+        ProfileProblem::ProfileNotFound => UnfencedLookup::Lookup(Lookup::no_session()),
         ProfileProblem::ProfileUnavailable {
             detail,
             profile_status,
-        } => Lookup::Fenced {
+        } => UnfencedLookup::ProfileUnavailable {
             detail,
             profile_status,
         },
@@ -55,57 +56,48 @@ fn loaded_unfenced(
     Ok((st, engine))
 }
 
-/// Why [`loaded`] found no session to act through.
-enum Lookup {
-    NotFound,
+/// Why [`loaded`] found no torrent to act on.
+///
+/// An operation's error enum holds it as
+/// `#[problem(transparent)] Lookup(#[from] Lookup)`.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+pub enum Lookup {
+    /// No loaded torrent has this infohash.
+    #[error("no loaded torrent with this infohash")]
+    #[problem(status = 404, title = "Torrent not found")]
+    TorrentNotFound,
     /// A state entry whose profile has no engine: a bug, not a request error.
-    NoSession,
-    Fenced {
-        detail: String,
-        profile_status: ProfileUnavailableReason,
-    },
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
 }
 
-/// `From<Lookup>` for an error enum with `TorrentNotFound` and `Internal`,
-/// and `ProfileUnavailable` where named.
-macro_rules! from_lookup {
-    ($error:ty) => {
-        impl From<Lookup> for $error {
-            fn from(l: Lookup) -> Self {
-                match l {
-                    Lookup::NotFound => Self::TorrentNotFound,
-                    Lookup::NoSession | Lookup::Fenced { .. } => Self::Internal {
-                        detail: internal(
-                            "finding the torrent's session",
-                            "no engine for its profile",
-                        ),
-                    },
-                }
-            }
+impl Lookup {
+    fn no_session() -> Self {
+        Self::Internal {
+            detail: internal("finding the torrent's session", "no engine for its profile"),
         }
-    };
-    ($error:ty, fenced) => {
-        impl From<Lookup> for $error {
-            fn from(l: Lookup) -> Self {
-                match l {
-                    Lookup::NotFound => Self::TorrentNotFound,
-                    Lookup::NoSession => Self::Internal {
-                        detail: internal(
-                            "finding the torrent's session",
-                            "no engine for its profile",
-                        ),
-                    },
-                    Lookup::Fenced {
-                        detail,
-                        profile_status,
-                    } => Self::ProfileUnavailable {
-                        detail,
-                        profile_status,
-                    },
-                }
-            }
-        }
-    };
+    }
+}
+
+/// Why [`loaded_unfenced`] found no torrent to act on.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+pub enum UnfencedLookup {
+    #[error(transparent)]
+    #[problem(transparent)]
+    Lookup(#[from] Lookup),
+    /// The VPN monitor fenced the torrent's profile, or the operator set
+    /// it offline; nothing may put its torrents back on the network until
+    /// the profile is set online.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The profile is unavailable")]
+    ProfileUnavailable {
+        detail: String,
+        #[problem(extension)]
+        profile_status: ProfileUnavailableReason,
+    },
 }
 
 /// Whether `e` says the session no longer knows the handle.
@@ -117,7 +109,6 @@ fn is_gone(e: &EngineError) -> bool {
     )
 }
 
-// Declared after the macros above, which they use.
 mod actions;
 mod add;
 mod delete;
