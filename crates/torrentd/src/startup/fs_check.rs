@@ -455,6 +455,53 @@ mod tests {
         assert_eq!(gauge(&sink, &root, "rename_noreplace"), "0");
     }
 
+    /// A root the probe cannot make its scratch directory in fails closed:
+    /// a missing root, or one the daemon's user cannot write, has its
+    /// mutations disabled for `scratch_dir`.
+    #[test]
+    fn a_root_without_a_usable_scratch_directory_is_disabled_for_scratch_dir() {
+        let (dir, pool) = pool_on_tmpfs(true);
+        let root = dir.path().join("pool");
+        std::fs::remove_dir_all(&root).unwrap();
+        let sink = crate::metrics_sink::PromSink::new();
+        probe_pool_roots(&pool, &sink, crate::apply::probe_mutations);
+        assert_eq!(gauge(&sink, &root, "scratch_dir"), "1");
+        assert_eq!(gauge(&sink, &root, "rename_noreplace"), "0");
+        assert_eq!(gauge(&sink, &root, "dir_fsync"), "0");
+        let inside = root.join("x").display().to_string();
+        let why = pool
+            .root_mutation_refusal([inside.as_str()])
+            .expect("a step inside the missing root is refused");
+        assert!(why.contains("scratch_dir"), "{why}");
+
+        // Root ignores permission bits, so only an unprivileged run can
+        // see an unwritable root.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let ro = dir.path().join("ro");
+            std::fs::create_dir(&ro).unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let (reason, _) = crate::apply::probe_mutations(&ro).unwrap_err();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(reason, ProbeFailure::ScratchDir);
+        }
+    }
+
+    /// A scratch directory a crashed probe left behind is removed before
+    /// the probe runs, so it neither fails the probe nor outlives it.
+    #[test]
+    fn a_leftover_scratch_directory_is_removed_and_the_probe_passes() {
+        let (dir, _pool) = pool_on_tmpfs(true);
+        let root = dir.path().join("pool");
+        let leftover = root.join(crate::apply::PROBE_DIR);
+        std::fs::create_dir_all(leftover.join("nested")).unwrap();
+        for name in ["a", "b", "c", "nested/d"] {
+            std::fs::write(leftover.join(name), b"stale").unwrap();
+        }
+        crate::apply::probe_mutations(&root).expect("the probe passes over a leftover");
+        assert!(!leftover.exists());
+    }
+
     /// A plan touching a disabled root is refused where it is created and
     /// where it is applied, naming the root, and nothing moves.
     #[test]
