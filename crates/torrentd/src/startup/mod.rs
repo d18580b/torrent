@@ -1162,6 +1162,22 @@ impl DaemonHandle {
         // teardown below waits for it before stopping the alert loop.
         let work: Arc<crate::app_state::WorkGate> = Arc::default();
 
+        // What the boot handed to sessions: the re-drive below waits for
+        // every one to reach the state map before acting on what is loaded,
+        // and `/readyz` answers `starting` until they have. A requeued
+        // adoption is not one: the queue adds it when its turn comes, which
+        // can be hours away.
+        let loaded: Vec<_> = registry
+            .entries()
+            .into_iter()
+            .map(|(ih, _)| ih)
+            .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
+            .collect();
+        let boot = Arc::new(crate::app_state::BootProgress::new(
+            loaded.clone(),
+            crate::app_state::BOOT_SETTLE_DEADLINE,
+        ));
+
         // Re-drive any plan a crash or a kill left mid-apply. A half-applied
         // reorganisation is exactly the state an operator cannot reason about.
         // Started before the server, but not awaited: it first waits for every
@@ -1169,16 +1185,6 @@ impl DaemonHandle {
         // the API rather than ahead of it. Held in the work gate like an API
         // apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
-            // What the boot handed to sessions: the re-drive waits for every
-            // one to reach the state map before acting on what is loaded. A
-            // requeued adoption is not one: the queue adds it when its turn
-            // comes, which can be hours away.
-            let loaded: Vec<_> = registry
-                .entries()
-                .into_iter()
-                .map(|(ih, _)| ih)
-                .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
-                .collect();
             // Read here, before the server below serves: a plan an API apply
             // claims during the wait is that apply's, not the re-drive's.
             let plans = crate::apply::unfinished_at_boot(&pool);
@@ -1225,6 +1231,7 @@ impl DaemonHandle {
             pool,
             checks,
             alert_heartbeat: alert_loop.heartbeat(),
+            boot: Arc::clone(&boot),
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
             reload_tx: Some(reload_tx.clone()),
@@ -1300,12 +1307,12 @@ impl DaemonHandle {
         // the background tasks to stop.
         let listener = bind_api_listener(&cfg).await;
         let posture = unauthenticated_posture(&cfg);
-        let (tx, alert, gate, sink) = (&shutdown_tx, &alert_loop, &work, &metrics);
+        let (tx, alert, gate, sink, boot) = (&shutdown_tx, &alert_loop, &work, &metrics, &boot);
         let mut exit_code = run_http_stage(
             listener,
             app,
             |listener, app| async move {
-                announce_ready(&http_listen, posture, tx, alert, sink);
+                announce_ready(&http_listen, posture, tx, alert, sink, boot);
                 match listener {
                     ApiListener::Tcp(listener) => {
                         serve_until_shutdown(listener, app, shutdown_rx, gate).await

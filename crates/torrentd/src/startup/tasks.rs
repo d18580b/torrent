@@ -111,6 +111,11 @@ mod tests {
             "the /v1/events feed, which runs only while a stream listens to it",
         ),
         (
+            "http/healthz.rs",
+            1,
+            "/livez's scheduling check, awaited within its bound and aborted past it",
+        ),
+        (
             "http/v1/profiles.rs",
             1,
             "a bulk resume's paced run, which the request awaits",
