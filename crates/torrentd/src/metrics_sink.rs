@@ -1649,6 +1649,10 @@ pub(crate) mod tests {
     #[test]
     fn swallowed_ffi_exceptions_are_exported_by_call_since_the_last_scrape() {
         use libtorrent_safe::ffi_errors::Swallowed;
+        let log = crate::tracing_init::Buf::default();
+        let (_reload, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
         let sink = PromSink::new();
         sink.seed(&[]);
         // Above anything this process has really counted, as the fsync test
@@ -1656,14 +1660,26 @@ pub(crate) mod tests {
         let real = libtorrent_safe::ffi_errors::swallowed();
         let at = |n: u64| -> Vec<Swallowed> {
             real.iter()
-                .map(|s| Swallowed {
-                    count: if s.call == "post_session_stats" {
-                        s.count + n
+                .map(|s| {
+                    if s.call == "post_session_stats" {
+                        Swallowed {
+                            count: s.count + n,
+                            last_what: format!("injected throw {n}"),
+                            ..s.clone()
+                        }
                     } else {
-                        s.count
-                    },
-                    ..s.clone()
+                        s.clone()
+                    }
                 })
+                .collect()
+        };
+        // The WARN lines for `post_session_stats`; the other calls' counts
+        // never move here, so they log nothing.
+        let warned = || -> Vec<serde_json::Value> {
+            log.text()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|l| l["level"] == "WARN" && l["target"] == "torrentd::metrics")
                 .collect()
         };
         let sample =
@@ -1684,13 +1700,24 @@ pub(crate) mod tests {
                 assert!(text.contains(&sample(s.call, s.count)), "{text}");
             }
         }
+        let lines = warned();
+        assert_eq!(lines.len(), 1, "one line for the rise: {lines:?}");
+        assert_eq!(lines[0]["call"], "post_session_stats", "{lines:?}");
+        assert_eq!(lines[0]["new"], 100, "{lines:?}");
+        assert_eq!(lines[0]["total"], base + 100, "{lines:?}");
+        assert_eq!(lines[0]["error.cause"], "injected throw 100", "{lines:?}");
         sink.export_ffi_errors(&at(100));
+        assert_eq!(warned().len(), 1, "no rise, no line: {:?}", warned());
         sink.export_ffi_errors(&at(101));
         let text = String::from_utf8(sink.render()).unwrap();
         assert!(
             text.contains(&sample("post_session_stats", base + 101)),
             "counted once: {text}"
         );
+        let lines = warned();
+        assert_eq!(lines.len(), 2, "one line per rise: {lines:?}");
+        assert_eq!(lines[1]["new"], 1, "{lines:?}");
+        assert_eq!(lines[1]["error.cause"], "injected throw 101", "{lines:?}");
     }
 
     #[test]
