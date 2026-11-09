@@ -571,6 +571,9 @@ fn main() -> anyhow::Result<()> {
     // First, so a panic on any thread from here on is one JSON line and a
     // count in `torrentd_panics_total`, not plain text on stderr alone.
     panic_hook::install();
+    // Fixes `torrentd_process_start_time_seconds` here, not when the first
+    // metrics sink is built after the config is read.
+    metrics_sink::process_start_time();
     let cli = Cli::parse();
 
     // Exit 2, the usage-error status, rather than 1: nothing about the

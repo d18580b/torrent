@@ -160,6 +160,8 @@ hold.
 | `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, or an emission whose labels differ from the series' first use. |
 | `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
 | `torrentd_build_fault_injection` | gauge | — | daemon | from boot: always | 1 if this binary was built with the fault-injection feature, which mounts POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a deployment. |
+| `torrentd_build_info` | gauge | `version`; `revision`; `arch`; `features` | daemon | from boot: always | Always 1, labelled with this binary's version, the commit it was built from (TORRENTD_REVISION at build time, unknown where it was unset), its CPU architecture, and the cargo features beyond the default it was built with: fault-injection for the alert drill's build, empty on every deployment. |
+| `torrentd_process_start_time_seconds` | gauge | — | daemon | from boot: always | When this process started, in seconds since the Unix epoch: time() minus it is the uptime, and a change in it is a restart. |
 
 ## The HTTP API
 
@@ -239,3 +241,27 @@ Alerts on them:
 | --- | --- | --- |
 | `TorrentdPanicked` | critical | A thread panicked in the last 15 minutes, or during the boot (`torrentd_boot_panics`), by `thread`. |
 | `TorrentdTaskDown` | critical | A supervised task (`task`) has exited or panicked. |
+
+## The build and the process
+
+`torrentd_build_info` is 1, and its labels say which binary is running:
+`version` is the `torrentd` crate's, `arch` the CPU architecture it was built
+for, and `revision` the commit it was built from, which the build reads from
+`TORRENTD_REVISION` (`TORRENTD_REVISION=$(git rev-parse HEAD) cargo build
+--release`) and records as `unknown` where that is unset. `features` names the
+cargo features beyond the default the binary was built with, comma-separated:
+`fault-injection` for the alert drill's build, and empty for every build a
+deployment runs. Join it onto another series to split that series by build
+across an upgrade:
+`torrentd_libtorrent_num_seeding_torrents * on (instance) group_left (version) torrentd_build_info`.
+
+`torrentd_process_start_time_seconds` is when the process started, fixed
+before it reads its configuration. `time() - torrentd_process_start_time_seconds`
+is its uptime, and each change in it is a restart that lived long enough to be
+scraped.
+
+Alerts on them:
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdRestarted` | warning | The process started more than twice in an hour (`changes(torrentd_process_start_time_seconds[1h]) > 2`): it is crash-looping. A process that dies before its first scrape changes nothing here, and is `TorrentdDown`'s. |

@@ -24,6 +24,9 @@
 
 use std::collections::HashMap;
 use std::sync::Once;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use parking_lot::Mutex;
 use prometheus::core::Collector;
@@ -546,7 +549,47 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "1 if this binary was built with the fault-injection feature, which mounts \
          POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a \
          deployment.";
+    "build_info" Gauge Daemon ("version": &[]) ("revision": &[]) ("arch": &[])
+        ("features": &[]) Owner("always") =>
+        "Always 1, labelled with this binary's version, the commit it was built from \
+         (TORRENTD_REVISION at build time, unknown where it was unset), its CPU architecture, \
+         and the cargo features beyond the default it was built with: fault-injection for the \
+         alert drill's build, empty on every deployment.";
+    // the process
+    "process_start_time_seconds" Gauge Daemon Owner("always") =>
+        "When this process started, in seconds since the Unix epoch: time() minus it is the \
+         uptime, and a change in it is a restart.";
 };
+
+/// The commit this binary was built from, as `build_info`'s `revision`:
+/// `TORRENTD_REVISION` in the build's environment, `unknown` where that was
+/// unset or empty.
+pub const BUILD_REVISION: &str = match option_env!("TORRENTD_REVISION") {
+    Some(revision) if !revision.is_empty() => revision,
+    _ => "unknown",
+};
+
+/// The cargo features beyond the default this binary was built with, as
+/// `build_info`'s `features`: comma-separated, and empty for every build but
+/// the alert drill's.
+pub const BUILD_FEATURES: &str = if cfg!(feature = "fault-injection") {
+    "fault-injection"
+} else {
+    ""
+};
+
+static PROCESS_START: OnceLock<f64> = OnceLock::new();
+
+/// When the process started, in seconds since the Unix epoch, as
+/// `process_start_time_seconds`: the time of the first call, which `main`
+/// makes before anything else but the panic hook.
+pub fn process_start_time() -> f64 {
+    *PROCESS_START.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |since| since.as_secs_f64())
+    })
+}
 
 /// The `kind` values of `session_alerts_total` that `TorrentdSessionErrors`
 /// reads, and so the ones `boot_session_alerts` carries.
@@ -819,6 +862,8 @@ const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
 const PANICS: &str = "panics_total";
 const WRITER_DEATHS: &str = "batch_writer_deaths_total";
 const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
+const BUILD_INFO: &str = "build_info";
+const PROCESS_START_TIME: &str = "process_start_time_seconds";
 
 impl PromSink {
     pub fn new() -> Self {
@@ -856,6 +901,18 @@ impl PromSink {
             },
             &[],
         );
+        sink.set_gauge(
+            BUILD_INFO,
+            1.0,
+            &[
+                ("version", env!("CARGO_PKG_VERSION")),
+                ("revision", BUILD_REVISION),
+                ("arch", std::env::consts::ARCH),
+                ("features", BUILD_FEATURES),
+            ],
+        );
+        // A property of the process, which every sink in it shares.
+        sink.set_gauge(PROCESS_START_TIME, process_start_time(), &[]);
         sink
     }
 
@@ -1783,6 +1840,46 @@ pub(crate) mod tests {
             Some(expected),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_sink_exports_which_build_this_is() {
+        // Run in both builds: only the drill's names a feature.
+        let text = String::from_utf8(PromSink::new().render()).unwrap();
+        let features = if cfg!(feature = "fault-injection") {
+            "fault-injection"
+        } else {
+            ""
+        };
+        let labels = format!(
+            "{{arch=\"{}\",features=\"{features}\",revision=\"{BUILD_REVISION}\",version=\"{}\"}}",
+            std::env::consts::ARCH,
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert_eq!(
+            sample(&text, "build_info", &labels).as_deref(),
+            Some("1"),
+            "{text}"
+        );
+        assert!(!BUILD_REVISION.is_empty());
+    }
+
+    #[test]
+    fn every_sink_exports_the_one_process_start_time() {
+        let start = process_start_time();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(start > 0.0 && start <= now, "{start} vs {now}");
+        for _ in 0..2 {
+            let text = String::from_utf8(PromSink::new().render()).unwrap();
+            let exported: f64 = sample(&text, "process_start_time_seconds", "")
+                .expect("exported")
+                .parse()
+                .unwrap();
+            assert_eq!(exported, start, "{text}");
+        }
     }
 
     #[test]

@@ -28,6 +28,18 @@ groups:
         annotations:
           summary: "torrentd on {{ $labels.instance }} is not answering scrapes"
 
+      - alert: TorrentdRestarted
+        # A crash loop: the process started more than twice in an hour. One
+        # restart is a deploy or an upgrade, and two an operator retrying
+        # one; a third is not. A process that dies before its first scrape
+        # leaves no start time to change, so a loop that fast is
+        # TorrentdDown's. The panic and ERROR-line alerts name the cause.
+        expr: changes(torrentd_process_start_time_seconds[1h]) > 2
+        labels:
+          severity: warning
+        annotations:
+          summary: "torrentd on {{ $labels.instance }} restarted {{ $value }} times in the last hour; it is crash-looping"
+
       - alert: TorrentdAlertLoopStalled
         expr: torrentd_alert_loop_heartbeat_age_seconds > 15
         for: 1m
