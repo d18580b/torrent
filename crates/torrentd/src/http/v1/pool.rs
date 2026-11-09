@@ -10,11 +10,9 @@
 //! and `GET /v1/server` says so up front.
 
 use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use kynos::prelude::*;
-use kynos::schema::ParamValue;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
@@ -57,7 +55,7 @@ const NO_POOL: &str = "no [pool] section is configured on this daemon";
 // ---------------------------------------------------------------------------
 
 /// Where a torrent in the library stands relative to the payload on disk.
-#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdoptionState {
     /// No file of this torrent was found under any managed root.
@@ -114,24 +112,6 @@ impl From<AdoptionState> for torrentd_pool::AdoptionState {
         }
     }
 }
-
-impl FromStr for AdoptionState {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        torrentd_pool::AdoptionState::parse(s)
-            .map(Self::from)
-            .ok_or("not an adoption state")
-    }
-}
-
-impl fmt::Display for AdoptionState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(torrentd_pool::AdoptionState::from(*self).as_str())
-    }
-}
-
-impl ParamValue for AdoptionState {}
 
 /// Byte accounting for one directory subtree — what makes the pool legible at
 /// petabyte scale, where a file listing is useless but "this subtree is 8 TB
@@ -1546,7 +1526,7 @@ pub enum PlanKind {
 }
 
 /// Where a plan stands.
-#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     /// Computed and not applied; nothing on disk has changed.
@@ -1636,22 +1616,6 @@ wire_enum_from_str!(StepStatus {
     "failed" => Failed,
     "skipped" => Skipped,
 });
-
-impl FromStr for PlanStatus {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s).ok_or("not a plan status")
-    }
-}
-
-impl fmt::Display for PlanStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl ParamValue for PlanStatus {}
 
 /// A string the pool index holds that this build has no name for.
 fn unknown(what: &str, value: &str) -> String {
