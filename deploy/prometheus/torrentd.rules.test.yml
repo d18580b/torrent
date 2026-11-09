@@ -1699,6 +1699,102 @@ tests:
             exp_annotations:
               summary: "A valid API token was used for a route outside its scope"
 
+  # A scraper's rotated token, refused every minute: pending at first, firing
+  # once it has held for 15 minutes. One expired session refused once, and the
+  # seeded zero for malformed, never fire.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_auth_rejections_total{reason="unknown"}'
+        values: '0+1x40'
+      - series: 'torrentd_auth_rejections_total{reason="expired"}'
+        values: '0 0 1x38'
+      - series: 'torrentd_auth_rejections_total{reason="malformed"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TorrentdAuthRejections
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: TorrentdAuthRejections
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: unknown
+            exp_annotations:
+              summary: "Bearer tokens have been refused (unknown) for 15 minutes; a client keeps presenting one that does not work"
+
+  # 2xx at 10 a minute throughout; from 5m, 2 5xx a minute: about 17% of the
+  # responses. Unready probes' 503s on /healthz and the scrape's own 2xx on
+  # /metrics are outside the ratio, so neither holds the alert off nor fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_http_requests_total{route="/v1/status", method="GET", status_class="2xx"}'
+        values: '0+10x30'
+      - series: 'torrentd_http_requests_total{route="/v1/status", method="GET", status_class="5xx"}'
+        values: '0x4 2+2x25'
+      - series: 'torrentd_http_requests_total{route="/metrics", method="GET", status_class="2xx"}'
+        values: '0+1000x30'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: TorrentdHttp5xx
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdHttp5xx
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "More than 5% of API responses in the last 10 minutes were 5xx; each is logged at ERROR with its request id"
+
+  # /healthz answering 503 to every probe while the daemon is unready is
+  # TorrentdUnready's to report, and one 5xx among a few requests pages no one.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_http_requests_total{route="/healthz", method="GET", status_class="5xx"}'
+        values: '0+6x30'
+      - series: 'torrentd_http_requests_total{route="/v1/torrents", method="GET", status_class="2xx"}'
+        values: '0x9 1x20'
+      - series: 'torrentd_http_requests_total{route="/v1/torrents", method="GET", status_class="5xx"}'
+        values: '0x9 1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: TorrentdHttp5xx
+        exp_alerts: []
+
+  # Every GET /v1/status response took between 5s and 10s; GET /v1/server's
+  # all took under 100ms.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/status", method="GET", le="0.1"}'
+        values: '0x40'
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/status", method="GET", le="5"}'
+        values: '0x40'
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/status", method="GET", le="10"}'
+        values: '0+10x40'
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/status", method="GET", le="+Inf"}'
+        values: '0+10x40'
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/server", method="GET", le="0.1"}'
+        values: '0+10x40'
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/server", method="GET", le="5"}'
+        values: '0+10x40'
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/server", method="GET", le="10"}'
+        values: '0+10x40'
+      - series: 'torrentd_http_request_duration_seconds_bucket{route="/v1/server", method="GET", le="+Inf"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TorrentdHttpSlow
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: TorrentdHttpSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              route: /v1/status
+              method: GET
+            exp_annotations:
+              summary: "GET /v1/status has answered in over 5s at the 99th percentile for 15 minutes"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_config_reload_failures_total{stage="load"}'

@@ -31,6 +31,7 @@
 //! changes state is refused when `Sec-Fetch-Site` or `Origin` says another
 //! site sent it, or when it carries a body a plain HTML form can send.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,7 @@ use tracing::warn;
 
 use crate::auth::Auth;
 use crate::auth::Scope;
+use crate::http::forwarded::TrustedProxies;
 use crate::metrics_sink::PromSink;
 
 /// Prefix of every problem `type` URI this API publishes. Each slug is a
@@ -88,11 +90,44 @@ pub struct Bearer;
 /// What the carrier found in the request head.
 pub struct Presented {
     /// A syntactically valid bearer token, not yet checked, or `None` where
-    /// the request had no `Authorization` header at all.
-    token: Option<carrier::BearerToken>,
+    /// the request had no `Authorization` header at all; the refusal where
+    /// the header was not a well-formed bearer credential, which [`Gate`]
+    /// counts before returning it.
+    token: Result<Option<carrier::BearerToken>, AuthRejection>,
     /// Where the request says it came from, which only the unauthenticated
     /// posture reads.
     site: Site,
+    /// Who sent it, for the log line of a refused token.
+    from: Origin,
+}
+
+/// The socket peer and the forwarding headers a trusted proxy writes, which
+/// [`Gate`] resolves to the client against `trusted_proxies`.
+struct Origin {
+    peer: Option<std::net::SocketAddr>,
+    forwarding: kynos::http::HeaderMap,
+}
+
+impl Origin {
+    fn of(parts: &Parts) -> Self {
+        let connection = parts
+            .extensions
+            .get::<kynos::extract::connection::Connection>();
+        let mut forwarding = kynos::http::HeaderMap::new();
+        for name in ["forwarded", "x-forwarded-for", "x-forwarded-proto"] {
+            for value in parts.headers.get_all(name) {
+                forwarding.append(name, value.clone());
+            }
+        }
+        Self {
+            peer: connection.map(|c| c.peer_addr()),
+            forwarding,
+        }
+    }
+
+    fn client(&self, trusted: &TrustedProxies) -> Option<IpAddr> {
+        crate::http::forwarded::resolve(self.peer, &self.forwarding, trusted).ip
+    }
 }
 
 /// The request-head fields a browser sets and a page cannot forge, as the
@@ -248,16 +283,60 @@ impl RefusalLog {
     /// Whether a refusal at `now` is logged, and if so, how many refusals
     /// went unlogged before it.
     fn admit(&self, now: Instant) -> Option<u64> {
-        let mut state = self.0.lock();
-        let due = state
-            .last
-            .is_none_or(|at| now.saturating_duration_since(at) >= REFUSAL_LOG_INTERVAL);
-        if !due {
-            state.suppressed += 1;
+        self.0.lock().admit(now)
+    }
+}
+
+impl RefusalLogState {
+    /// As [`RefusalLog::admit`], for the refusals this state paces.
+    fn admit(&mut self, now: Instant) -> Option<u64> {
+        if !self.due(now) {
+            self.suppressed += 1;
             return None;
         }
-        state.last = Some(now);
-        Some(std::mem::take(&mut state.suppressed))
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.last
+            .is_none_or(|at| now.saturating_duration_since(at) >= REFUSAL_LOG_INTERVAL)
+    }
+}
+
+/// How many clients [`RejectionLog`] paces apart. Past this, a client it
+/// has not seen shares one pace with every other such client, so a flood
+/// from many addresses costs bounded memory and still bounded log lines.
+const REJECTION_LOG_CLIENTS: usize = 1024;
+
+/// The refused token's `warn` line, written at most once per
+/// [`REFUSAL_LOG_INTERVAL`] for each client, as [`RefusalLog`] does for all.
+///
+/// Per client rather than daemon-wide, so that one client looping a dead
+/// token does not hide another's line. `None` is a client the daemon could
+/// not name, and the shared pace of the overflow.
+#[derive(Debug, Default)]
+pub struct RejectionLog(parking_lot::Mutex<HashMap<Option<IpAddr>, RefusalLogState>>);
+
+impl RejectionLog {
+    /// Whether a refusal from `client` at `now` is logged, and if so, how
+    /// many of that client's refusals went unlogged before it.
+    fn admit(&self, client: Option<IpAddr>, now: Instant) -> Option<u64> {
+        let mut clients = self.0.lock();
+        let mut key = client;
+        if !clients.contains_key(&key) && clients.len() >= REJECTION_LOG_CLIENTS {
+            // A client whose last line is a full interval old would be logged
+            // at its next refusal anyway, so its entry is dropped. Refusals it
+            // held back go unreported in the line, never uncounted:
+            // `auth_rejections_total` has every one. Keeping such entries
+            // instead would let one burst from 1024 clients fill the map for
+            // good and push every later client onto the overflow's one line.
+            clients.retain(|_, state| !state.due(now));
+            if clients.len() >= REJECTION_LOG_CLIENTS {
+                key = None;
+            }
+        }
+        clients.entry(key).or_default().admit(now)
     }
 }
 
@@ -421,11 +500,15 @@ impl Carries for Bearer {
     type Presented = Presented;
 
     fn present(parts: &Parts) -> Result<Option<Presented>, AuthRejection> {
-        // Malformed stays a 401 whatever the deployment: a client that sent a
-        // broken credential is not an anonymous one.
+        // A malformed credential is handed to `Gate` rather than refused
+        // here, so that its refusal is counted and logged as an unknown
+        // token's is. `Gate` refuses it before anything else, whatever the
+        // deployment: a client that sent a broken credential is not an
+        // anonymous one.
         Ok(Some(Presented {
-            token: carrier::bearer(parts)?,
+            token: carrier::bearer(parts),
             site: Site::of(parts),
+            from: Origin::of(parts),
         }))
     }
 }
@@ -467,6 +550,64 @@ pub struct Gate {
     pub allowed_hosts: HostAllowlist,
     /// Paces the cross-site refusal's log line; shared by every clone.
     pub refusal_log: Arc<RefusalLog>,
+    /// Resolves the client a refused token's log line names and is paced by.
+    pub trusted_proxies: TrustedProxies,
+    /// Paces the refused token's log line, per client; shared by every clone.
+    pub rejection_log: Arc<RejectionLog>,
+}
+
+/// Why a bearer credential was refused, as `auth_rejections_total`'s
+/// `reason` label names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rejected {
+    Malformed,
+    Unknown,
+    Expired,
+}
+
+impl Rejected {
+    fn label(self) -> &'static str {
+        match self {
+            Rejected::Malformed => "malformed",
+            Rejected::Unknown => "unknown",
+            Rejected::Expired => "expired",
+        }
+    }
+}
+
+impl Gate {
+    /// Count a refused credential, and log it where `from`'s client has not
+    /// had a line in the last [`REFUSAL_LOG_INTERVAL`].
+    ///
+    /// A client retrying a dead token — a scraper whose token was rotated
+    /// fires one every scrape interval — would otherwise write a line per
+    /// request; one per client per minute names it, and the counter has
+    /// every one.
+    fn reject(&self, reason: Rejected, token: Option<&str>, from: &Origin) {
+        self.metrics
+            .inc_counter("auth_rejections_total", &[("reason", reason.label())]);
+        let client = from.client(&self.trusted_proxies);
+        if let Some(unlogged) = self.rejection_log.admit(client, Instant::now()) {
+            // The kind, never the token: the prefix says whether a static or
+            // a session token stopped working, which is what the operator
+            // needs to find the client.
+            let token_kind = match token {
+                Some(t) if t.starts_with(crate::auth::STATIC_TOKEN_PREFIX) => "static",
+                Some(t) if t.starts_with(crate::auth::SESSION_TOKEN_PREFIX) => "session",
+                Some(_) => "other",
+                None => "none",
+            };
+            warn!(
+                target: "torrentd::auth",
+                reason = reason.label(),
+                token_kind,
+                client_ip = ?client,
+                refused_unlogged_since_last = unlogged,
+                "refused a request's bearer token; further refusals from this client are \
+                 logged at most once a minute and all are counted in auth_rejections_total",
+            );
+        }
+    }
 }
 
 impl<C: Sync> Authenticator<Bearer, C> for Gate {
@@ -475,6 +616,13 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
         presented: Presented,
         _context: &C,
     ) -> Result<Caller, AuthRejection> {
+        let token = match presented.token {
+            Ok(token) => token,
+            Err(rejection) => {
+                self.reject(Rejected::Malformed, None, &presented.from);
+                return Err(rejection);
+            }
+        };
         let Some(auth) = self.auth.as_ref() else {
             // No `[auth]`: access control belongs to whatever sits in front
             // of the daemon, and the startup posture check has already
@@ -504,7 +652,8 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
             }
             return Ok(Caller::Anonymous);
         };
-        let Some(token) = presented.token else {
+        // No credential at all is not a refused one: it is not counted.
+        let Some(token) = token else {
             return Err(AuthRejection::unauthenticated());
         };
         let token = token.into_inner();
@@ -517,8 +666,15 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
                 scopes: scopes.to_vec(),
             });
         }
-        // Unknown, expired and revoked all look alike: telling a caller which
-        // it was tells them which tokens once existed.
+        // Unknown, expired and revoked all look alike to the caller: telling
+        // a caller which it was tells them which tokens once existed. The
+        // operator's counter and log line tell them apart.
+        let reason = if auth.sessions.is_expired(&token) {
+            Rejected::Expired
+        } else {
+            Rejected::Unknown
+        };
+        self.reject(reason, Some(&token), &presented.from);
         Err(AuthRejection::unauthenticated())
     }
 
@@ -765,5 +921,63 @@ mod tests {
         );
         assert_eq!(log.admit(start + REFUSAL_LOG_INTERVAL), None);
         assert_eq!(log.admit(start + 3 * REFUSAL_LOG_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn the_rejection_log_paces_each_client_apart_and_bounds_how_many_it_holds() {
+        let log = RejectionLog::default();
+        let start = Instant::now();
+        let ip = |n: u32| Some(IpAddr::from(std::net::Ipv4Addr::from(n)));
+        assert_eq!(log.admit(ip(1), start), Some(0));
+        assert_eq!(log.admit(ip(1), start), None, "the same client, at once");
+        assert_eq!(
+            log.admit(ip(2), start),
+            Some(0),
+            "another client is not held off"
+        );
+        assert_eq!(
+            log.admit(ip(1), start + REFUSAL_LOG_INTERVAL),
+            Some(1),
+            "a minute on, with the one it held back"
+        );
+
+        // Full of clients still inside their minute: a new one shares the
+        // overflow's pace.
+        for n in 3..(REJECTION_LOG_CLIENTS as u32 + 1) {
+            log.admit(ip(n), start);
+        }
+        assert_eq!(log.0.lock().len(), REJECTION_LOG_CLIENTS);
+        assert_eq!(
+            log.admit(ip(100_000), start),
+            Some(0),
+            "the overflow's first"
+        );
+        assert_eq!(log.admit(ip(100_001), start), None, "shares the overflow");
+        assert!(log.0.lock().len() <= REJECTION_LOG_CLIENTS + 1);
+        // Once their minute is up, the quiet ones make room again.
+        let later = start + 2 * REFUSAL_LOG_INTERVAL;
+        assert_eq!(log.admit(ip(100_002), later), Some(0));
+        assert!(log.0.lock().contains_key(&ip(100_002)), "held on its own");
+    }
+
+    #[test]
+    fn the_rejection_log_makes_room_once_a_held_back_burst_is_a_minute_old() {
+        let log = RejectionLog::default();
+        let start = Instant::now();
+        let ip = |n: u32| Some(IpAddr::from(std::net::Ipv4Addr::from(n)));
+        // One burst fills the map, and every client in it has a refusal held
+        // back.
+        for n in 0..REJECTION_LOG_CLIENTS as u32 {
+            assert_eq!(log.admit(ip(n), start), Some(0));
+            assert_eq!(log.admit(ip(n), start), None);
+        }
+        assert_eq!(log.0.lock().len(), REJECTION_LOG_CLIENTS);
+        // A minute on, a new client is paced on its own, not as the overflow.
+        let later = start + REFUSAL_LOG_INTERVAL;
+        assert_eq!(log.admit(ip(200_000), later), Some(0));
+        assert_eq!(log.admit(ip(200_001), later), Some(0), "and so is another");
+        let clients = log.0.lock();
+        assert!(clients.contains_key(&ip(200_000)), "held on its own");
+        assert!(!clients.contains_key(&None), "nothing went to the overflow");
     }
 }

@@ -127,6 +127,9 @@ hold.
 | `torrentd_auth_login_failures_total` | counter | `reason`: `bad_password`, `throttled`, `verification_budget` | daemon | from boot, at 0 | Refused logins: a wrong password, a client locked out by the throttle, or the daemon-wide verification budget spent. |
 | `torrentd_auth_token_scope_denials_total` | counter | — | daemon | from boot, at 0 | Requests carrying a valid token without the scope the route needs. |
 | `torrentd_auth_cross_site_refusals_total` | counter | `reason`: `host`, `sec_fetch_site`, `origin`, `content_type` | daemon | from boot, at 0 | Requests a daemon without [auth] refused as sent by a browser from another site, by the header that refused them: a Host neither loopback nor in allowed_hosts, a cross-site Sec-Fetch-Site, a foreign Origin, or a body type an HTML form can send. |
+| `torrentd_auth_rejections_total` | counter | `reason`: `malformed`, `unknown`, `expired` | daemon | from boot, at 0 | Requests refused 401 for the bearer credential they carried: malformed when it is not a well-formed bearer token, unknown when no static or live session token matches it (a revoked session included), expired when it names a session past its lifetime. |
+| `torrentd_http_requests_total` | counter | `route`; `method`; `status_class`: `1xx`, `2xx`, `3xx`, `4xx`, `5xx` | daemon | from boot: each route, before the API serves | Responses the HTTP API sent, by route (the OpenAPI path template, or unmatched where no operation matched the request), method and status class. |
+| `torrentd_http_request_duration_seconds` | histogram | `route`; `method` | daemon | from boot: each route, before the API serves | Seconds from a request arriving to its response head being ready, by route and method; a streamed body's delivery is not included. |
 | `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings` | daemon | from boot, at 0 | Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed. |
 | `torrentd_kill_switch_active` | gauge | — | daemon | from boot: always | 1 while the daemon holds the nftables kill switch installed. |
 | `torrentd_kill_switch_table_present` | gauge | — | daemon | from boot: kill switch on | 1 if the kill switch's nftables table was present and matched the rendered ruleset at the last check; 0 if it was missing or had drifted. |
@@ -149,3 +152,36 @@ hold.
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |
 | `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, or an emission whose labels differ from the series' first use. |
 | `torrentd_build_fault_injection` | gauge | — | daemon | from boot: always | 1 if this binary was built with the fault-injection feature, which mounts POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a deployment. |
+
+## The HTTP API
+
+`torrentd_http_requests_total` and `torrentd_http_request_duration_seconds`
+name a request by the operation it matched: `route` is that operation's path
+template in [`docs/api/openapi.json`](../docs/api/openapi.json)
+(`/v1/torrents/{infohash}`, never the path the request named), and `method`
+its method (`GET` for a `HEAD` a `GET` answers). A request no operation
+matched — an unknown path, a method the path does not take — is
+`route="unmatched", method="unmatched"`, so a scan of random paths adds no
+series. Every route in the document, and `unmatched`, is written before the
+API serves: the counter at 0 for every status class, the histogram empty.
+
+Every 5xx is also logged at `ERROR` (`server error response`, target
+`torrentd::http`) with the `request_id` the client received in `X-Request-Id`;
+a 4xx stays at `INFO`. Every refusal `torrentd_auth_rejections_total` counts is
+logged at `WARN` (target `torrentd::auth`) with its `reason`, the kind of token
+(`token_kind`: `static` or `session` by its prefix, `other` for a token with
+neither, and `none` where no token was read, which is every `malformed`
+refusal; never the token itself) and `client_ip`, at most once a minute per
+client, each line saying how many of that client's refusals went unlogged
+since its last (`refused_unlogged_since_last`). The log tracks at most 1024
+clients; when it is full, a client whose last line is a minute old is
+dropped from it, and its next line counts from 0. That count is a hint, not a
+total: `torrentd_auth_rejections_total` counts every refusal.
+
+Alerts on them:
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdHttp5xx` | warning | More than 5% of the API's responses over 10 minutes, and at least 3, were 5xx, held for 5 minutes. `/healthz` (its 503 is `TorrentdUnready`'s) and `/metrics` are left out. |
+| `TorrentdHttpSlow` | warning | A route's 99th-percentile time to the response head over 15 minutes stayed above 5s for 15 minutes. |
+| `TorrentdAuthRejections` | warning | Bearer tokens of one `reason` were refused in every 5-minute window for 15 minutes: a client — usually a scraper whose token was rotated — keeps presenting one that does not work. |

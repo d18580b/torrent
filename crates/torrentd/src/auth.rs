@@ -236,6 +236,17 @@ impl SessionStore {
             .map(|(_, wall)| *wall)
     }
 
+    /// Whether `token` is a session token this store minted that has
+    /// expired and not yet been swept. A swept or revoked one is unknown.
+    pub fn is_expired(&self, token: &str) -> bool {
+        if !token.starts_with(SESSION_TOKEN_PREFIX) {
+            return false;
+        }
+        let g = self.inner.lock();
+        g.get(&digest(token))
+            .is_some_and(|(exp, _)| *exp <= Instant::now())
+    }
+
     #[cfg(test)]
     pub fn is_valid(&self, token: &str) -> bool {
         self.expiry(token).is_some()
