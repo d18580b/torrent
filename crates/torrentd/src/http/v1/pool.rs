@@ -37,10 +37,10 @@ use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::server::count;
 use crate::http::v1::Pool;
-use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
+use crate::http::validate::ValidationFailed;
 use crate::pool_service::Adopted;
 use crate::pool_service::PoolService;
 use crate::registry::Claim;
@@ -516,20 +516,14 @@ pub enum TreeError {
     #[problem(status = 404, title = "Root not found")]
     RootNotFound,
     /// A query parameter breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(TreeError);
 
 impl From<InvalidCursor> for TreeError {
     fn from(_: InvalidCursor) -> Self {
@@ -783,20 +777,14 @@ pub enum ListError {
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
     /// A query parameter breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(ListError);
 
 impl From<InvalidCursor> for ListError {
     fn from(_: InvalidCursor) -> Self {
@@ -962,7 +950,7 @@ pub struct AdoptRequest {
 }
 
 impl Validate for AdoptRequest {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         if let AdoptSelector::Infohashes { infohashes } = &self.selector {
             check_infohashes(&mut invalid, "/selector/infohashes", infohashes);
@@ -1016,20 +1004,14 @@ pub enum AdoptError {
         profile_status: crate::http::v1::common::ProfileUnavailableReason,
     },
     /// The body breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(AdoptError);
 from_profile_problem!(AdoptError);
 
 /// Adopt existing payload.
@@ -1369,7 +1351,7 @@ pub struct VerifyRequest {
 }
 
 impl Validate for VerifyRequest {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         check_infohashes(&mut invalid, "/infohashes", &self.infohashes);
         invalid.finish()
@@ -1398,16 +1380,10 @@ pub enum VerifyError {
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
     /// The body breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
 }
-from_invalid!(VerifyError);
 
 /// Re-hash loaded torrents.
 ///
@@ -2073,20 +2049,14 @@ pub enum ListPlanStepsError {
     #[problem(status = 404, title = "Plan not found")]
     PlanNotFound,
     /// A query parameter breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(ListPlanStepsError);
 
 impl From<InvalidCursor> for ListPlanStepsError {
     fn from(_: InvalidCursor) -> Self {

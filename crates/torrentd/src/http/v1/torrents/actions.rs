@@ -21,11 +21,10 @@ use crate::http::v1::common::internal;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::Torrents;
-use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
-use crate::http::validate::Violation;
+use crate::http::validate::ValidationFailed;
 
 /// Why a torrent's upload limit was not set.
 #[derive(Debug, thiserror::Error, ApiError)]
@@ -36,20 +35,15 @@ pub enum SetUploadLimitError {
     #[problem(status = 404, title = "Torrent not found")]
     TorrentNotFound,
     /// A constraint the schema declares is broken.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        #[problem(extension)]
-        errors: Vec<Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The session refused the request.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
 from_lookup!(SetUploadLimitError);
-from_invalid!(SetUploadLimitError);
 
 /// Why a torrent was not paused.
 #[derive(Debug, thiserror::Error, ApiError)]
@@ -277,7 +271,7 @@ pub struct UploadLimit {
 }
 
 impl Validate for UploadLimit {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         if let Some(rate) = self.bytes_per_sec {
             // libtorrent reads 0 as "unlimited", which `null` already says;

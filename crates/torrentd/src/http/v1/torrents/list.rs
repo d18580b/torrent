@@ -23,8 +23,8 @@ use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::v1::common::blocking;
 use crate::http::v1::Torrents;
-use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
+use crate::http::validate::ValidationFailed;
 
 /// The listing name torrent cursors are bound to.
 const TORRENTS_LISTING: &str = "torrents";
@@ -57,15 +57,10 @@ pub enum ListTorrentsError {
     #[problem(status = 404, title = "Profile not found")]
     ProfileNotFound,
     /// A query parameter is out of range.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
 }
-from_invalid!(ListTorrentsError);
 
 /// List torrents.
 ///

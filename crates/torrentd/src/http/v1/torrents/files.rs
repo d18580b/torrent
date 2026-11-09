@@ -23,10 +23,10 @@ use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::internal;
 use crate::http::v1::Torrents;
-use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
+use crate::http::validate::ValidationFailed;
 
 /// The listing name file cursors are bound to.
 const FILES_LISTING: &str = "files";
@@ -100,20 +100,15 @@ pub enum ListFilesError {
     #[problem(status = 409, title = "Metadata pending")]
     MetadataPending,
     /// A query parameter is out of range.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The session could not be asked.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
 from_lookup!(ListFilesError);
-from_invalid!(ListFilesError);
 
 /// List a torrent's files.
 ///
@@ -187,7 +182,7 @@ pub struct FilePriority {
 }
 
 impl Validate for FilePriority {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         // Checked before it crosses the FFI boundary: libtorrent would read an
         // arbitrary byte however it happens to.
@@ -215,20 +210,15 @@ pub enum SetFilePriorityError {
     #[problem(status = 409, title = "Metadata pending")]
     MetadataPending,
     /// A constraint the schema declares is broken.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The session refused the request.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
 from_lookup!(SetFilePriorityError);
-from_invalid!(SetFilePriorityError);
 
 /// Set a file's download priority.
 ///

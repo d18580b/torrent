@@ -34,10 +34,10 @@ use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::Torrents;
-use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
+use crate::http::validate::ValidationFailed;
 use crate::registry::Claim;
 use crate::registry::RegistryError;
 
@@ -118,7 +118,7 @@ impl kynos::schema::Schema for Base64Metainfo {
 }
 
 impl Validate for AddTorrentRequest {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         match &self.source {
             TorrentSource::Magnet { uri } => {
@@ -142,13 +142,9 @@ impl Validate for AddTorrentRequest {
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum AddTorrentError {
     /// A member of the request breaks a constraint the schema declares.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// No profile with this `profile_id` is configured.
     #[error("unknown profile_id")]
     #[problem(status = 404, title = "Profile not found")]
@@ -190,7 +186,6 @@ pub enum AddTorrentError {
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(AddTorrentError);
 from_profile_problem!(AddTorrentError);
 
 /// The add source once read: what the infohash is computed from, and what
@@ -242,9 +237,7 @@ pub async fn add_torrent(
     let source = match source {
         TorrentSource::Metainfo { data } => {
             let bytes = STANDARD.decode(data.0.as_bytes()).map_err(|_| {
-                let mut invalid = Invalid::new();
-                invalid.push("/source/data", "must be base64 (standard alphabet, padded)");
-                AddTorrentError::from(invalid)
+                ValidationFailed::at("/source/data", "must be base64 (standard alphabet, padded)")
             })?;
             Ok(bytes)
         }
