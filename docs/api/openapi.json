@@ -11,13 +11,121 @@
     "version": "0.2.0"
   },
   "paths": {
-    "/healthz": {
+    "/livez": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "summary": "Liveness.",
+        "description": "503 only for what a restart fixes: the alert loop's heartbeat older than\nfifteen seconds, a batch writer thread dead, or the runtime's tick - a\ntask stamping the time twice a second - older than two seconds. Never for\na fenced, offline, failed or missing profile: those are `/readyz`'s, and\na fence in particular holds until an operator lifts it, which a restart\nwould undo. A runtime wedged hard enough not to run this handler at all\ngives no answer, which a probe's own timeout counts as a failure.\nUnauthenticated, as every probe is.",
+        "operationId": "get_live",
+        "responses": {
+          "200": {
+            "description": "The process is live.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LivenessReport"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The process is wedged; `failed` names the check. Restart it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LivenessReport"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
       "get": {
         "tags": [
           "operations"
         ],
         "summary": "Readiness.",
-        "description": "`profiles` is the **live** count — sessions that came up — and\n`profiles_failed` is how many configured profiles never got one. They are\nreported separately because a payload that only ever showed the live count\ngave no hint an account was missing.\n\nA daemon running **no** live session answers 503 whatever the reason — it\nis the state a total bring-up failure produces. Some-but-not-all failed\nstays 200: the profiles that did come up are serving, and taking the\ndaemon out of rotation would stop them too. `profiles_failed` and\n`torrentd_profile_vpn_tunnel_up` are what to alert on for that. The route is\nunauthenticated: a probe that needs a credential is a probe that breaks\nduring the incident it exists to detect.",
+        "description": "503 `starting` until the boot has finished: the API is up and every\ntorrent the boot loaded has reached the state map, or ten minutes have\npassed since the API state was built. A startup probe reads that.\n\n`profiles` is the **live** count — sessions that came up — and\n`profiles_failed` is how many configured profiles never got one. They are\nreported separately because a payload that only ever showed the live count\ngave no hint an account was missing.\n\nA daemon running **no** live session answers 503 whatever the reason — it\nis the state a total bring-up failure produces. Some-but-not-all failed\nstays 200: the profiles that did come up are serving, and taking the\ndaemon out of rotation would stop them too. `profiles_failed` and\n`torrentd_profile_vpn_tunnel_up` are what to alert on for that. The route is\nunauthenticated: a probe that needs a credential is a probe that breaks\nduring the incident it exists to detect.",
+        "operationId": "get_ready",
+        "responses": {
+          "200": {
+            "description": "The daemon is ready.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthReport"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The daemon is unready; `reason` says why. Take it out of rotation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthReport"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "summary": "Readiness, under its original name.",
+        "description": "The same answer as `GET /readyz`, kept so the scripts, the container\n`HEALTHCHECK` and the probes already pointed at it keep working.",
         "operationId": "get_health",
         "responses": {
           "200": {
@@ -11042,9 +11150,59 @@
   },
   "components": {
     "schemas": {
+      "LivenessCheck": {
+        "type": "string",
+        "enum": [
+          "alert_loop_stalled",
+          "batch_writer_dead",
+          "runtime_stalled"
+        ],
+        "description": "The check `/livez` failed."
+      },
+      "LivenessReport": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "description": "Whether the process is live. `true` exactly when the status is 200."
+          },
+          "failed": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LivenessCheck"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The check that failed; `null` when live."
+          },
+          "heartbeat_age_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Seconds since the alert loop last stamped its heartbeat; `null` when\nthere is no live session to run one."
+          },
+          "batch_writer_deaths": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Batch writer threads - the ones that write resume data - that have\ndied by a panic in this process."
+          }
+        },
+        "type": "object",
+        "required": [
+          "ok",
+          "batch_writer_deaths"
+        ],
+        "description": "Whether the process is wedged, and the readings behind it."
+      },
       "HealthReason": {
         "type": "string",
         "enum": [
+          "starting",
           "no_sessions",
           "alert_loop_stalled",
           "all_profiles_fenced"

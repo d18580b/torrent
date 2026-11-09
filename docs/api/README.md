@@ -17,10 +17,12 @@ operation follows, and what may change within `v1`.
 
 ## Versioning and evolution
 
-Every API operation lives under `/v1`. Two operational endpoints stay at the
+Every API operation lives under `/v1`. The operational endpoints stay at the
 root, where probes and scrapes conventionally look, and are unversioned:
 
-- `GET /healthz`, the readiness probe;
+- `GET /livez`, the liveness probe;
+- `GET /readyz`, the readiness probe, and `GET /healthz`, the same probe
+  under its older name;
 - `GET /metrics`, the Prometheus scrape.
 
 Within `v1`, changes are **additive only**:
@@ -48,7 +50,8 @@ compatibility line is the `/v1` prefix above, not that number.
 
 ## Authentication
 
-Every operation except `GET /healthz`, `GET /v1/openapi.json` and
+Every operation except the probes (`GET /livez`, `GET /readyz` and
+`GET /healthz`), `GET /v1/openapi.json` and
 `POST /v1/sessions` needs a bearer token: `Authorization: Bearer <token>`.
 There are two kinds.
 
