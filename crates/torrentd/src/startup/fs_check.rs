@@ -455,6 +455,41 @@ mod tests {
         assert_eq!(gauge(&sink, &root, "rename_noreplace"), "0");
     }
 
+    /// A plan touching a disabled root is refused where it is created and
+    /// where it is applied, naming the root, and nothing moves.
+    #[test]
+    fn a_plan_touching_a_disabled_root_is_refused_at_creation_and_at_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, orphan, _other) =
+            crate::apply::test_support::one_orphan_delete_plan(dir.path());
+        let root = dir.path().join("pool");
+        crate::apply::FAIL_RENAME_NOREPLACE.set(true);
+        probe_pool_roots(
+            &pool,
+            &torrentd_engine::NoopSink,
+            crate::apply::probe_mutations,
+        );
+        crate::apply::FAIL_RENAME_NOREPLACE.set(false);
+
+        let (source, state) = crate::apply::test_support::engine_and_state();
+        let e = crate::apply::apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(e.contains("mutations are disabled for pool root"), "{e}");
+        assert!(e.contains(&root.display().to_string()), "{e}");
+        assert!(orphan.exists(), "a step ran on a disabled root");
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, torrentd_pool::model::plan_status::DRAFT);
+
+        let spec = torrentd_pool::PlanSpec::DeleteOrphans {
+            root_id: pool.roots()[0].0,
+            prefix: String::new(),
+        };
+        let refused = pool.create_plan(&spec).unwrap().unwrap_err();
+        assert!(
+            refused.0.contains("mutations are disabled for pool root"),
+            "{refused}"
+        );
+    }
+
     /// Read-only use of a root is allowed on any filesystem: with mutations
     /// off nothing is probed, refused or exported.
     #[test]
