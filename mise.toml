@@ -175,10 +175,11 @@ fi
 # deploy/Containerfile's stages. The build context needs the vendor submodules,
 # so run this from a recursive checkout. `--format docker` keeps the
 # Containerfile's HEALTHCHECK: podman's default OCI format has no field for it,
-# and podman drops it with a warning.
+# and podman drops it with a warning. TORRENTD_REVISION stamps the checkout's
+# commit into torrentd_build_info's `revision`.
 [tasks.container]
 description = "Build the container image from deploy/Containerfile (needs podman and the vendor submodules)"
-run = "podman build --format docker -f deploy/Containerfile -t torrentd:dev ."
+run = "podman build --format docker --build-arg TORRENTD_REVISION=\"$(git rev-parse HEAD)\" -f deploy/Containerfile -t torrentd:dev ."
 
 [tasks.test]
 description = "Workspace tests (default features; parity with CI)"
@@ -515,12 +516,14 @@ run = "cargo deny check"
 # set unified), so that check runs first; `dist-musl` is a static torrentctl
 # and needs musl-gcc (Debian/Ubuntu `musl-tools`, Fedora `musl-gcc`) for
 # ring's C. scripts/dist checks each binary's version, against RELEASE_TAG
-# too when that is set, and packages it into target/dist/.
+# too when that is set, and packages it into target/dist/. Both builds set
+# TORRENTD_REVISION to the commit being built, which torrentd_build_info
+# reports as its `revision`.
 [tasks.dist]
 description = "Build and package the x86_64 glibc release tarball (torrentd + torrentctl) into target/dist/"
 run = [
   "mise run release-features",
-  "cargo build --release --locked --workspace --bin torrentd --bin torrentctl",
+  "TORRENTD_REVISION=\"$(git rev-parse HEAD)\" cargo build --release --locked --workspace --bin torrentd --bin torrentctl",
   "scripts/dist gnu",
 ]
 
@@ -528,7 +531,7 @@ run = [
 description = "Build and package the static x86_64 musl torrentctl tarball into target/dist/ (needs musl-gcc)"
 run = [
   "rustup target add x86_64-unknown-linux-musl",
-  "cargo build --release --locked -p torrentctl --target x86_64-unknown-linux-musl",
+  "TORRENTD_REVISION=\"$(git rev-parse HEAD)\" cargo build --release --locked -p torrentctl --target x86_64-unknown-linux-musl",
   "scripts/dist musl",
 ]
 
