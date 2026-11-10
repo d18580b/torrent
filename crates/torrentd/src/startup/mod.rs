@@ -59,6 +59,7 @@ use crate::signals::{self};
 use crate::vpn;
 
 mod cleanup;
+mod fs_check;
 mod http_stage;
 mod limits;
 mod listen_check;
@@ -110,6 +111,7 @@ use shutdown_report::take_shutdown_report;
 use shutdown_report::write_shutdown_report;
 use shutdown_report::ShutdownReport;
 use tasks::spawn_supervised;
+pub(crate) use tasks::spawn_transient;
 use teardown::stop_fencing;
 use teardown::teardown_network;
 use teardown::wait_for_pool_work;
@@ -255,6 +257,17 @@ pub async fn boot(
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
 
+    // The filesystems the state lives on, asked before the instance lock,
+    // which over NFS is a lease rather than a lock: overlayfs, NFS, CIFS and
+    // FUSE refuse the boot (exit 78) unless allow_unsupported_state_fs.
+    let unsupported_state_fs = {
+        let dirs = fs_check::state_dirs(&cfg);
+        let allow = cfg.allow_unsupported_state_fs;
+        tokio::task::spawn_blocking(move || fs_check::check_state_fs(&dirs, allow, &fs_check::Host))
+            .await
+            .context("state directory filesystem check")??
+    };
+
     // One daemon per state directory, decided before anything with an effect
     // outside this process. Declared before `cleanup`, so a failed boot's
     // teardown runs while the lock is still held.
@@ -285,7 +298,12 @@ pub async fn boot(
     let shutdown_tx = channels.shutdown_tx.clone();
     // Before the listener that can send to them: see `boot_shutdown_receivers`.
     let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
-    signals::run(channels.clone()).await;
+    // Metrics sink — created here, before the signal listener it supervises,
+    // the stores, whose batched writers count their failures in it, and the
+    // startup scans, which record registry rejections
+    // (profile_assignment_registry_errors_total).
+    let metrics = Arc::new(PromSink::new());
+    spawn_supervised("signals", metrics.clone(), signals::run(channels.clone()));
 
     // Tunnel bring-up (up to 30 s a profile) and the resume and torrent-dir
     // scans (minutes at 100K torrents) can outrun any fixed
@@ -298,6 +316,36 @@ pub async fn boot(
         sd_notify::TimeoutExtender::start_while_progressing(BOOT_STALL_BOUND, &boot_progress);
 
     warn_if_descriptors_are_short(&cfg);
+
+    // What the host must provide for the configured tunnels and kill switch,
+    // asked before any of them is attempted, each named. `main` has already
+    // refused a missing CAP_NET_ADMIN (exit 78). A profile whose tunnel the
+    // host cannot carry is failed with its reason, and the others go on; a
+    // kill switch `nft` cannot install fails the boot here rather than after
+    // every tunnel is up.
+    let preflight = {
+        let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
+        tokio::task::spawn_blocking(move || vpn::preflight::run(&needs, &vpn::preflight::Host))
+            .await
+            .context("host preflight")?
+    };
+    for o in &preflight {
+        match o.finding {
+            vpn::preflight::Finding::Met => {
+                info!(requirement = o.requirement.name(), "{}", o.detail);
+            }
+            vpn::preflight::Finding::Missing => {
+                error!(requirement = o.requirement.name(), "{}", o.detail);
+            }
+            vpn::preflight::Finding::NeedsCapability | vpn::preflight::Finding::Unknown => {
+                warn!(requirement = o.requirement.name(), "{}", o.detail);
+            }
+        }
+    }
+    if let Some(nft) = vpn::preflight::missing(&preflight, vpn::preflight::Requirement::Nft) {
+        anyhow::bail!("{nft}");
+    }
+
     {
         let profiles = cfg.profile.clone();
         tokio::task::spawn_blocking(move || vpn::warn_if_exits_are_shared(&profiles))
@@ -387,10 +435,15 @@ pub async fn boot(
 
     let mut cleanup = BootCleanup::new(run_dir.clone());
 
-    // Metrics sink — created before the stores, whose batched writers count
-    // their failures in it, and the startup scans, which record registry
-    // rejections (profile_assignment_registry_errors_total).
-    let metrics = Arc::new(PromSink::new());
+    metrics.set_gauge(
+        "state_fs_unsupported",
+        if unsupported_state_fs.is_empty() {
+            0.0
+        } else {
+            1.0
+        },
+        &[],
+    );
 
     // Empty until the alert loop sees each torrent added. Created before the
     // stores, because a resume write that fails on the batch writer has to
@@ -552,6 +605,7 @@ pub async fn boot(
         &*metrics,
         &mut boot_shutdown,
         &desired_states.current(),
+        |p| vpn::preflight::refusal_for(&preflight, p),
         boot_engine,
     )
     .await?;
@@ -606,24 +660,26 @@ pub async fn boot(
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
     // session if the forwarded port changes, and reannounces. Started as soon
     // as the profiles are built, so a 60 s lease is not left unrenewed through
-    // the scans, and supervised only where a profile negotiates a port. It
-    // confirms a rebind against the listen outcomes the alert loop publishes
-    // into `listen_events`.
+    // the scans, and started only where a profile negotiates a port: without
+    // one it has nothing to renew and returns at once, so there is no task to
+    // run, unsupervised or otherwise. It confirms a rebind against the listen
+    // outcomes the alert loop publishes into `listen_events`.
     let listen_events = Arc::new(torrentd_engine::port_forward::ListenEvents::new());
-    let pf = crate::port_forward_monitor::run(
-        profile_registry.clone(),
-        state.clone(),
-        metrics.clone(),
-        listen_events.clone(),
-        shutdown_tx.subscribe(),
-    );
     if profile_registry
         .iter()
         .any(|e| e.config.port_forward() == PortForwardMode::Natpmp)
     {
-        spawn_supervised("port_forward_monitor", metrics.clone(), pf);
-    } else {
-        tokio::spawn(pf);
+        spawn_supervised(
+            "port_forward_monitor",
+            metrics.clone(),
+            crate::port_forward_monitor::run(
+                profile_registry.clone(),
+                state.clone(),
+                metrics.clone(),
+                listen_events.clone(),
+                shutdown_tx.subscribe(),
+            ),
+        );
     }
     // VPN health monitor, started here for the same reason: the scans below
     // run for minutes on a large pool, and a tunnel that drops during them
@@ -671,6 +727,10 @@ pub async fn boot(
     // backstop the metric was simply absent, and an alert for exactly that
     // condition could never fire.
     metrics.set_gauge("kill_switch_active", 0.0, &[]);
+    // Seeded for the same reason: `kill_switch_dns_exempt == 1` is the
+    // series that says tracker lookups leave outside the tunnels.
+    metrics.set_gauge("kill_switch_dns_exempt", 0.0, &[]);
+    let carveouts = cfg.kill_switch_carveouts();
     if cfg.network_kill_switch {
         let tunnels: Vec<String> = profile_registry
             .iter()
@@ -687,7 +747,8 @@ pub async fn boot(
                  above, or unset network_kill_switch.",
             );
         }
-        let installed = vpn::killswitch::enable(&tunnels).map_err(kill_switch_enable_failure)?;
+        let installed =
+            vpn::killswitch::enable(&carveouts, &tunnels).map_err(kill_switch_enable_failure)?;
         cleanup.note_kill_switch();
         // Read back as the watch will read it. A table this host's nft lists
         // in a shape the check does not read as the one rendered would read
@@ -708,6 +769,10 @@ pub async fn boot(
         }
         metrics.set_gauge("kill_switch_active", 1.0, &[]);
         info!(uid = installed.uid, tunnels = ?tunnels, "network kill switch active");
+        warn_kill_switch_carveouts(&carveouts);
+        if carveouts.dns_exempt() {
+            metrics.set_gauge("kill_switch_dns_exempt", 1.0, &[]);
+        }
         // The watch, started here for the reason the monitors above are: the
         // scans below run for minutes on a large pool, and a firewall reload
         // that flushes the ruleset during them has to fence every vpn profile
@@ -765,6 +830,14 @@ pub async fn boot(
         if let Some(fence) = kill_switch.as_ref() {
             pool.set_kill_switch(Arc::clone(fence));
         }
+        // Before the boot re-drive and the API, either of which can apply a
+        // plan: a root whose filesystem cannot take one has it refused.
+        let (pool, metrics) = (Arc::clone(pool), metrics.clone());
+        tokio::task::spawn_blocking(move || {
+            fs_check::probe_pool_roots(&pool, metrics.as_ref(), crate::apply::probe_mutations)
+        })
+        .await
+        .context("pool root mutation probe")?;
     }
     // The daemon's one bound on hash checks, and the record of the
     // `.torrent`s it held paused for a slot when the daemon stopped: the
@@ -1089,6 +1162,22 @@ impl DaemonHandle {
         // teardown below waits for it before stopping the alert loop.
         let work: Arc<crate::app_state::WorkGate> = Arc::default();
 
+        // What the boot handed to sessions: the re-drive below waits for
+        // every one to reach the state map before acting on what is loaded,
+        // and `/readyz` answers `starting` until they have. A requeued
+        // adoption is not one: the queue adds it when its turn comes, which
+        // can be hours away.
+        let loaded: Vec<_> = registry
+            .entries()
+            .into_iter()
+            .map(|(ih, _)| ih)
+            .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
+            .collect();
+        let boot = Arc::new(crate::app_state::BootProgress::new(
+            loaded.clone(),
+            crate::app_state::BOOT_SETTLE_DEADLINE,
+        ));
+
         // Re-drive any plan a crash or a kill left mid-apply. A half-applied
         // reorganisation is exactly the state an operator cannot reason about.
         // Started before the server, but not awaited: it first waits for every
@@ -1096,16 +1185,6 @@ impl DaemonHandle {
         // the API rather than ahead of it. Held in the work gate like an API
         // apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
-            // What the boot handed to sessions: the re-drive waits for every
-            // one to reach the state map before acting on what is loaded. A
-            // requeued adoption is not one: the queue adds it when its turn
-            // comes, which can be hours away.
-            let loaded: Vec<_> = registry
-                .entries()
-                .into_iter()
-                .map(|(ih, _)| ih)
-                .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
-                .collect();
             // Read here, before the server below serves: a plan an API apply
             // claims during the wait is that apply's, not the re-drive's.
             let plans = crate::apply::unfinished_at_boot(&pool);
@@ -1138,6 +1217,20 @@ impl DaemonHandle {
             ),
         );
 
+        // Runtime tick: the stamp `/livez` reads to tell a starved scheduler
+        // or timer, which the probe's own handler running does not show.
+        let runtime_tick = Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        ));
+        spawn_supervised(
+            "runtime_tick",
+            metrics.clone(),
+            crate::http::healthz::run_runtime_tick(Arc::clone(&runtime_tick)),
+        );
+
         let trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
             .expect("validated at startup");
         let app_state = AppState {
@@ -1152,6 +1245,8 @@ impl DaemonHandle {
             pool,
             checks,
             alert_heartbeat: alert_loop.heartbeat(),
+            runtime_tick,
+            boot: Arc::clone(&boot),
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
             reload_tx: Some(reload_tx.clone()),
@@ -1165,6 +1260,8 @@ impl DaemonHandle {
             events: Arc::default(),
             tunnel_probe: crate::vpn_monitor::host_prober(),
             kill_switch: kill_switch.clone(),
+            kill_switch_dns_exempt: kill_switch.is_some()
+                && cfg.kill_switch_carveouts().dns_exempt(),
         };
 
         // The trust set the process runs with, once: effective blocks, and
@@ -1225,12 +1322,12 @@ impl DaemonHandle {
         // the background tasks to stop.
         let listener = bind_api_listener(&cfg).await;
         let posture = unauthenticated_posture(&cfg);
-        let (tx, alert, gate) = (&shutdown_tx, &alert_loop, &work);
+        let (tx, alert, gate, sink, boot) = (&shutdown_tx, &alert_loop, &work, &metrics, &boot);
         let mut exit_code = run_http_stage(
             listener,
             app,
             |listener, app| async move {
-                announce_ready(&http_listen, posture, tx, alert);
+                announce_ready(&http_listen, posture, tx, alert, sink, boot);
                 match listener {
                     ApiListener::Tcp(listener) => {
                         serve_until_shutdown(listener, app, shutdown_rx, gate).await
@@ -1390,6 +1487,32 @@ impl DaemonHandle {
 
         info!("torrentd: clean exit");
         exit_code
+    }
+}
+
+/// Say what the kill switch's carve-outs let out, once it is installed: the
+/// API's replies at INFO, since only its listener's port leaves and only by
+/// the named interfaces; the DNS carve-out at WARN, naming the resolvers,
+/// because every tracker hostname the daemon looks up is then visible to
+/// them and to whatever they forward to, which is a privacy cost the operator
+/// chose and should be reminded of on every boot.
+fn warn_kill_switch_carveouts(carveouts: &vpn::killswitch::Carveouts) {
+    if let Some((port, ifaces)) = carveouts.api() {
+        let ifaces: Vec<&str> = ifaces.collect();
+        info!(
+            api_port = port,
+            interfaces = ?ifaces,
+            "the kill switch lets the API's replies out by kill_switch_api_interfaces",
+        );
+    }
+    if carveouts.dns_exempt() {
+        let servers: Vec<String> = carveouts.dns_servers().map(|s| s.to_string()).collect();
+        warn!(
+            resolvers = %servers.join(", "),
+            "the kill switch lets DNS out to kill_switch_dns_servers outside the tunnels: every \
+             tracker hostname this daemon looks up is visible to these resolvers and to whatever \
+             they forward to",
+        );
     }
 }
 

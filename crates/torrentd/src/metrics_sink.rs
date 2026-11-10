@@ -11,7 +11,8 @@
 //! for `increase()` to compare with, so the event that created it never fires
 //! the alert written for it. [`PromSink::seed`] therefore writes every
 //! catalogued series marked [`Seed::Zero`] at boot, for every configured
-//! profile and every value of its label, before the alert loop starts.
+//! profile and every combination of its labels' values, before the alert
+//! loop starts.
 //!
 //! A zero nobody scraped is no sample, though. The first scrape comes only
 //! once `/metrics` is served, after the boot scans and the first stretch of
@@ -23,6 +24,9 @@
 
 use std::collections::HashMap;
 use std::sync::Once;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use parking_lot::Mutex;
 use prometheus::core::Collector;
@@ -81,45 +85,80 @@ pub struct Series {
     pub name: &'static str,
     pub kind: MetricType,
     pub scope: Scope,
-    /// Labels besides `profile_id` and [`label`](Series::label) whose values
-    /// the series' owner writes, from a set it holds rather than this table:
-    /// the HTTP API's routes and methods. Listed before `label`.
+    /// Labels besides `profile_id` and [`labels`](Series::labels) whose
+    /// values the series' owner writes, from a set it holds rather than this
+    /// table: the HTTP API's routes and methods. Listed before `labels`.
     pub keys: &'static [&'static str],
-    /// The label besides `profile_id`, if any, and every value it takes.
-    /// An empty value list means the values are not a fixed set.
-    pub label: Option<(&'static str, &'static [&'static str])>,
+    /// The labels besides `profile_id` and `keys`, each with every value it
+    /// takes; a seeded series is written for every combination of them. An
+    /// empty value list means the values are not a fixed set.
+    pub labels: &'static [Label],
     pub seed: Seed,
     pub help: &'static str,
 }
 
+/// A label's name and every value it takes.
+pub type Label = (&'static str, &'static [&'static str]);
+
+impl Series {
+    /// The series' label besides `profile_id`, where it has exactly one.
+    pub fn label(&self) -> Option<Label> {
+        match self.labels {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+}
+
+/// Every combination of one value of each of `labels`, as label pairs: one
+/// empty combination where there are no labels, none where a label has no
+/// values.
+fn label_sets(labels: &[Label]) -> Vec<Vec<(&'static str, &'static str)>> {
+    labels
+        .iter()
+        .fold(vec![Vec::new()], |sets, (name, values)| {
+            sets.iter()
+                .flat_map(|set| {
+                    values.iter().map(move |value| {
+                        let mut set = set.clone();
+                        set.push((*name, *value));
+                        set
+                    })
+                })
+                .collect()
+        })
+}
+
 /// Builds [`CATALOGUE`], one row per series:
-/// `name Type Scope [[keys]] [(label: values)] seed => help;`.
+/// `name Type Scope [[keys]] [(label: values)]... seed => help;`.
 macro_rules! catalogue {
     ($($name:literal $kind:ident $scope:ident $([$($key:literal),*])?
-       $(($label:literal: $values:expr))?
+       $(($label:literal: $values:expr))*
        $seed:ident $(($when:literal))? => $help:expr;)*) => {
         &[$(Series {
             name: $name,
             kind: MetricType::$kind,
             scope: Scope::$scope,
             keys: &[$($($key),*)?],
-            label: catalogue!(@label $(($label, $values))?),
+            labels: &[$(($label, $values)),*],
             seed: Seed::$seed $(($when))?,
             help: $help,
         },)*]
     };
-    (@label) => { None };
-    (@label $label:tt) => { Some($label) };
 }
 
 /// The `task` values of `task_up`: every long-running task the daemon
-/// supervises.
+/// supervises. A test in `startup::tasks` holds this equal to the tasks the
+/// daemon's source spawns under the supervisor.
 pub const TASKS: &[&str] = &[
+    "signals",
     "vpn_monitor",
     "port_forward_monitor",
     "reload",
     "verify_queue",
     "kill_switch_watch",
+    "watchdog",
+    "runtime_tick",
 ];
 
 /// The `reason` values of `auth_rejections_total`.
@@ -303,6 +342,13 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_metrics_dropped_samples" Gauge Daemon ("reason": &["registration", "labels"]) Owner("always") =>
         "metrics_dropped_samples_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
+    "boot_log_events" Gauge Daemon ("level": BOOT_LOG_EVENT_LEVELS)
+        ("target": crate::tracing_init::LOG_EVENT_TARGETS) Owner("always") =>
+        "log_events_total for these levels as of the first scrape, which already holds what \
+         the boot counted; fixed for the life of the process.";
+    "boot_panics" Gauge Daemon ("thread": crate::panic_hook::PANIC_THREADS) Owner("always") =>
+        "panics_total as of the first scrape, which already holds what the boot counted; fixed \
+         for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -374,6 +420,15 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "task_up" Gauge Daemon ("task": TASKS) Owner("always") =>
         "1 while a supervised background task runs; 0 once it has exited or panicked. \
          Only the tasks this configuration starts are present.";
+    "panics_total" Counter Daemon ("thread": crate::panic_hook::PANIC_THREADS) Zero =>
+        "Panics on any thread, by the thread's name (other for a thread with any other name, \
+         or none), caught or not: a kynos handler's and a supervised task's included. Each is \
+         also logged at ERROR, target torrentd::panic_hook, with its location, message and \
+         backtrace.";
+    "batch_writer_deaths_total" Counter Daemon Zero =>
+        "Batch writer threads (the resume and .torrent stores') that died by a panic. A dead \
+         writer's queued writes reach the disk only at the shutdown drain, so resume saves \
+         stop until the daemon restarts.";
     // control plane
     "auth_login_failures_total" Counter Daemon ("reason": &["bad_password", "throttled", "verification_budget"]) Zero =>
         "Refused logins: a wrong password, a client locked out by the throttle, or the \
@@ -402,6 +457,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
     // kill switch
     "kill_switch_active" Gauge Daemon Owner("always") => "1 while the daemon holds the nftables kill switch installed.";
+    "kill_switch_dns_exempt" Gauge Daemon Owner("always") =>
+        "1 while the kill switch lets the daemon's DNS out to kill_switch_dns_servers outside \
+         the tunnels, so every tracker hostname it looks up is visible to those resolvers.";
     "kill_switch_table_present" Gauge Daemon Owner("kill switch on") =>
         "1 if the kill switch's nftables table was present and matched the rendered ruleset at \
          the last check; 0 if it was missing or had drifted.";
@@ -462,7 +520,16 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
         "Torrents whose pool-index profile still disagrees with the assignment registry once \
          the boot has rewritten it to the registry's: nonzero only where that write failed.";
+    "pool_root_mutations_disabled" Gauge Daemon ["root"]
+        ("reason": crate::apply::ProbeFailure::ALL) Owner("[pool] allow_mutations, each root") =>
+        "1 while mutations are disabled for a pool root because its filesystem failed the \
+         boot's probe, by what failed: the scratch directory could not be made or removed, \
+         renameat2(RENAME_NOREPLACE) failed, or a directory fsync failed. Plans touching that \
+         root are refused; the other roots keep taking them.";
     // persistence and the exporter itself
+    "state_fs_unsupported" Gauge Daemon Owner("always") =>
+        "1 while allow_unsupported_state_fs let the daemon start with a state directory on \
+         overlayfs, NFS, CIFS/SMB or FUSE, which the boot otherwise refuses.";
     "dir_fsync_errors_total" Counter Daemon Zero =>
         "Directory fsyncs after a rename that failed, every one rather than only the logged \
          first; the renamed file is on disk, but a power loss may revert its name.";
@@ -472,12 +539,58 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "metrics_dropped_samples_total" Counter Daemon ("reason": &["registration", "labels"]) Zero =>
         "Samples the exporter dropped: a series that could not be registered, or an emission \
          whose labels differ from the series' first use.";
+    // the log
+    "log_events_total" Counter Daemon ("level": crate::tracing_init::LOG_EVENT_LEVELS)
+        ("target": crate::tracing_init::LOG_EVENT_TARGETS) Zero =>
+        "Lines logged at WARN or ERROR, by level and by the crate and top-level module that \
+         logged them (the target's first two path segments; other for any target not listed \
+         here). Counted whatever log_level or RUST_LOG lets through to the log.";
     // the build
     "build_fault_injection" Gauge Daemon Owner("always") =>
         "1 if this binary was built with the fault-injection feature, which mounts \
          POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a \
          deployment.";
+    "build_info" Gauge Daemon ("version": &[]) ("revision": &[]) ("arch": &[])
+        ("features": &[]) Owner("always") =>
+        "Always 1, labelled with this binary's version, the commit it was built from \
+         (TORRENTD_REVISION at build time, unknown where it was unset), its CPU architecture, \
+         and the cargo features beyond the default it was built with: fault-injection for the \
+         alert drill's build, empty on every deployment.";
+    // the process
+    "process_start_time_seconds" Gauge Daemon Owner("always") =>
+        "When this process started, in seconds since the Unix epoch: time() minus it is the \
+         uptime, and a change in it is a restart.";
 };
+
+/// The commit this binary was built from, as `build_info`'s `revision`:
+/// `TORRENTD_REVISION` in the build's environment, `unknown` where that was
+/// unset or empty.
+pub const BUILD_REVISION: &str = match option_env!("TORRENTD_REVISION") {
+    Some(revision) if !revision.is_empty() => revision,
+    _ => "unknown",
+};
+
+/// The cargo features beyond the default this binary was built with, as
+/// `build_info`'s `features`: comma-separated, and empty for every build but
+/// the alert drill's.
+pub const BUILD_FEATURES: &str = if cfg!(feature = "fault-injection") {
+    "fault-injection"
+} else {
+    ""
+};
+
+static PROCESS_START: OnceLock<f64> = OnceLock::new();
+
+/// When the process started, in seconds since the Unix epoch, as
+/// `process_start_time_seconds`: the time of the first call, which `main`
+/// makes before anything else but the panic hook.
+pub fn process_start_time() -> f64 {
+    *PROCESS_START.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |since| since.as_secs_f64())
+    })
+}
 
 /// The `kind` values of `session_alerts_total` that `TorrentdSessionErrors`
 /// reads, and so the ones `boot_session_alerts` carries.
@@ -495,6 +608,14 @@ pub const BOOT_TRACKER_KINDS: &[&str] = &["warning", "scrape_failed"];
 /// read, and so the ones `boot_port_forward_failures` carries. `port_taken`
 /// is left out: no alert reads it.
 pub const BOOT_PORT_FORWARD_STAGES: &[&str] = &["renew", "rebind"];
+
+/// The `level` values of `log_events_total` that `TorrentdErrorsLogged`
+/// reads, and so the ones `boot_log_events` carries. `warn` is left out:
+/// `TorrentdWarningsElevated` reads it only as a rate against the past day's,
+/// which a fixed boot count would not move.
+pub const BOOT_LOG_EVENT_LEVELS: &[&str] = &["error"];
+
+const LOG_EVENTS: &str = "log_events_total";
 
 /// A counter an alert reads that a boot moves before anything can scrape it,
 /// and the gauge [`PromSink::render`] exports its first-scrape count as.
@@ -526,7 +647,9 @@ pub struct BootCount {
 /// HTTP server starts, so a cleanup that fails there is always counted before
 /// the first scrape. The verify queue starts before the HTTP server too, and
 /// a re-queued adoption whose disk is not there can fail before it. An
-/// exporter's dropped sample can come from any emission, the boot's included.
+/// exporter's dropped sample can come from any emission, the boot's included,
+/// and so can a line logged at ERROR: `log_events_total` is mirrored only for
+/// the levels in [`BOOT_LOG_EVENT_LEVELS`].
 ///
 /// Two watchers start before the boot scans, and the scans can run for
 /// minutes. The kill-switch watch checks its table every 30 s, and counts a
@@ -669,6 +792,16 @@ pub const BOOT_COUNTS: &[BootCount] = &[
         gauge: "boot_kill_switch_probe_errors",
         only: None,
     },
+    BootCount {
+        counter: LOG_EVENTS,
+        gauge: "boot_log_events",
+        only: Some(("level", BOOT_LOG_EVENT_LEVELS)),
+    },
+    BootCount {
+        counter: PANICS,
+        gauge: "boot_panics",
+        only: None,
+    },
     // Last, so its gauge also holds any sample the rows above dropped as
     // they wrote theirs, which the first render's sample of the counter holds.
     BootCount {
@@ -710,13 +843,28 @@ pub struct PromSink {
     /// The engine's process-wide directory-fsync failure count as of the
     /// last time it was exported. See [`PromSink::export_dir_fsync_errors`].
     dir_fsync_exported: Mutex<u64>,
+    /// The process-wide WARN and ERROR counts as of the last time they were
+    /// exported, in `LogEventCounts::snapshot`'s order. See
+    /// [`PromSink::export_log_events`].
+    log_events_exported: Mutex<Vec<u64>>,
+    /// The process-wide panic counts as of the last time they were
+    /// exported, in `PanicCounts::snapshot`'s order. See
+    /// [`PromSink::export_panics`].
+    panics_exported: Mutex<Vec<u64>>,
+    /// The engine's process-wide batch-writer death count as of the last
+    /// time it was exported.
+    writer_deaths_exported: Mutex<u64>,
     /// Run by the first render. See [`PromSink::export_boot_counts`].
     boot_counts: Once,
 }
 
 const DROPPED: &str = "metrics_dropped_samples_total";
 const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
+const PANICS: &str = "panics_total";
+const WRITER_DEATHS: &str = "batch_writer_deaths_total";
 const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
+const BUILD_INFO: &str = "build_info";
+const PROCESS_START_TIME: &str = "process_start_time_seconds";
 
 impl PromSink {
     pub fn new() -> Self {
@@ -727,7 +875,7 @@ impl PromSink {
             register_counter_vec_with_registry!(row.name, row.help, &["reason"], registry,)
                 .expect("register metrics_dropped_samples_total on a fresh registry");
         // Present at zero from the start, like every other seeded series.
-        if let Some((_, reasons)) = row.label {
+        if let Some((_, reasons)) = row.label() {
             for reason in reasons {
                 dropped.with_label_values(&[reason]);
             }
@@ -739,6 +887,9 @@ impl PromSink {
             histos: Mutex::new(HashMap::new()),
             dropped,
             dir_fsync_exported: Mutex::new(0),
+            log_events_exported: Mutex::new(Vec::new()),
+            panics_exported: Mutex::new(Vec::new()),
+            writer_deaths_exported: Mutex::new(0),
             boot_counts: Once::new(),
         };
         // A property of the binary, so it is known before anything else is.
@@ -751,12 +902,24 @@ impl PromSink {
             },
             &[],
         );
+        sink.set_gauge(
+            BUILD_INFO,
+            1.0,
+            &[
+                ("version", env!("CARGO_PKG_VERSION")),
+                ("revision", BUILD_REVISION),
+                ("arch", std::env::consts::ARCH),
+                ("features", BUILD_FEATURES),
+            ],
+        );
+        // A property of the process, which every sink in it shares.
+        sink.set_gauge(PROCESS_START_TIME, process_start_time(), &[]);
         sink
     }
 
     /// Write every [`Seed::Zero`] series at zero, for each profile in
-    /// `profiles` where the series is per-profile and for every value of its
-    /// label. Called once at boot, before the alert loop starts, so no real
+    /// `profiles` where the series is per-profile and for every combination
+    /// of its labels' values. Called once at boot, before the alert loop starts, so no real
     /// sample can be overwritten. See the module docs for why.
     pub fn seed(&self, profiles: &[&str]) {
         // A series with keys takes values only its owner knows, so it is
@@ -766,10 +929,6 @@ impl PromSink {
             .iter()
             .filter(|s| s.seed == Seed::Zero && s.keys.is_empty())
         {
-            let values: &[&str] = match s.label {
-                Some((_, values)) => values,
-                None => &[""],
-            };
             let instances: Vec<Option<&str>> = match s.scope {
                 Scope::Daemon => vec![None],
                 // Seeded series are engine- and daemon-wide; the VPN and
@@ -778,15 +937,14 @@ impl PromSink {
                     profiles.iter().copied().map(Some).collect()
                 }
             };
+            let sets = label_sets(s.labels);
             for profile in &instances {
-                for value in values {
-                    let mut labels: Vec<(&str, &str)> = Vec::with_capacity(2);
+                for set in &sets {
+                    let mut labels: Vec<(&str, &str)> = Vec::with_capacity(set.len() + 1);
                     if let Some(p) = profile {
                         labels.push(("profile_id", p));
                     }
-                    if let Some((name, _)) = s.label {
-                        labels.push((name, value));
-                    }
+                    labels.extend(set.iter().copied());
                     match s.kind {
                         MetricType::Counter => self.add_counter(s.name, 0, &labels),
                         MetricType::Gauge => self.set_gauge(s.name, 0.0, &labels),
@@ -807,8 +965,11 @@ impl PromSink {
 
     pub fn render(&self) -> Vec<u8> {
         self.export_dir_fsync_errors(torrentd_engine::batch_writer::dir_fsync_errors());
-        // After the fsync count is brought up to date, so its boot gauge
-        // holds what this very render exports.
+        self.export_log_events(&crate::tracing_init::log_events().snapshot());
+        self.export_panics(&crate::panic_hook::panics().snapshot());
+        self.export_writer_deaths(torrentd_engine::batch_writer::writer_deaths());
+        // After the fsync, log and panic counts are brought up to date, so
+        // their boot gauges hold what this very render exports.
         self.boot_counts.call_once(|| self.export_boot_counts());
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();
@@ -829,6 +990,56 @@ impl PromSink {
         let mut exported = self.dir_fsync_exported.lock();
         if total > *exported {
             self.add_counter(DIR_FSYNC_ERRORS, total - *exported, &[]);
+            *exported = total;
+        }
+    }
+
+    /// Bring `log_events_total` up to `counts`, the process-wide WARN and
+    /// ERROR counts as `LogEventCounts::snapshot` returns them, by the events
+    /// since the last export.
+    ///
+    /// Read at scrape time for the reason the fsync count is: the layer that
+    /// counts them is installed before this sink exists, and holds none.
+    fn export_log_events(&self, counts: &[(&'static str, &'static str, u64)]) {
+        let mut exported = self.log_events_exported.lock();
+        exported.resize(counts.len(), 0);
+        for ((level, target, total), done) in counts.iter().zip(exported.iter_mut()) {
+            if *total > *done {
+                self.add_counter(
+                    LOG_EVENTS,
+                    *total - *done,
+                    &[("level", level), ("target", target)],
+                );
+                *done = *total;
+            }
+        }
+    }
+
+    /// Bring `panics_total` up to `counts`, the process-wide panic counts as
+    /// `PanicCounts::snapshot` returns them, by the panics since the last
+    /// export.
+    ///
+    /// Read at scrape time for the reason the log counts are: the hook that
+    /// counts them is installed first in `main`, long before this sink
+    /// exists, and holds none.
+    fn export_panics(&self, counts: &[(&'static str, u64)]) {
+        let mut exported = self.panics_exported.lock();
+        exported.resize(counts.len(), 0);
+        for ((thread, total), done) in counts.iter().zip(exported.iter_mut()) {
+            if *total > *done {
+                self.add_counter(PANICS, *total - *done, &[("thread", thread)]);
+                *done = *total;
+            }
+        }
+    }
+
+    /// Bring `batch_writer_deaths_total` up to `total`, the engine's
+    /// process-wide count of batch writer threads that died, read at scrape
+    /// time because the writers hold no sink.
+    fn export_writer_deaths(&self, total: u64) {
+        let mut exported = self.writer_deaths_exported.lock();
+        if total > *exported {
+            self.add_counter(WRITER_DEATHS, total - *exported, &[]);
             *exported = total;
         }
     }
@@ -995,7 +1206,7 @@ impl MetricsSink for PromSink {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -1015,7 +1226,7 @@ mod tests {
             labels.push("`profile_id`".to_string());
         }
         labels.extend(s.keys.iter().map(|key| format!("`{key}`")));
-        if let Some((name, values)) = s.label {
+        for (name, values) in s.labels {
             if values.is_empty() {
                 labels.push(format!("`{name}`"));
             } else {
@@ -1255,18 +1466,17 @@ mod tests {
             } else {
                 &["a", "b"]
             };
-            let values: &[&str] = s.label.map(|(_, v)| v).unwrap_or(&[""]);
             for p in profiles {
-                for v in values {
+                for set in label_sets(s.labels) {
                     let sample = text.lines().any(|l| {
                         l.starts_with(&format!("torrentd_{}", s.name))
                             && (p.is_empty() || l.contains(&format!("profile_id=\"{p}\"")))
-                            && (v.is_empty() || l.contains(&format!("=\"{v}\"")))
+                            && set.iter().all(|(k, v)| l.contains(&format!("{k}=\"{v}\"")))
                             && l.ends_with(" 0")
                     });
                     assert!(
                         sample,
-                        "{} has no zero sample for {p:?}/{v:?}:\n{text}",
+                        "{} has no zero sample for {p:?}/{set:?}:\n{text}",
                         s.name
                     );
                 }
@@ -1308,17 +1518,25 @@ mod tests {
             };
             assert_eq!(gauge.seed, present, "{}", b.gauge);
             assert_eq!(gauge.scope, counter.scope, "{}", b.gauge);
-            // The gauge carries the counter's label, with the values `only`
-            // keeps where it keeps some.
-            let expected = match (counter.label, b.only) {
-                (Some((name, _)), Some((only, values))) => {
-                    assert_eq!(name, only, "{}", b.gauge);
-                    Some((name, values))
-                }
-                (label, None) => label,
-                (None, Some(_)) => panic!("{} filters a label {} lacks", b.gauge, b.counter),
-            };
-            assert_eq!(gauge.label, expected, "{}", b.gauge);
+            // The gauge carries the counter's labels, with the values `only`
+            // keeps of the one it filters.
+            if let Some((only, _)) = b.only {
+                assert!(
+                    counter.labels.iter().any(|(name, _)| *name == only),
+                    "{} filters a label {} lacks",
+                    b.gauge,
+                    b.counter
+                );
+            }
+            let expected: Vec<Label> = counter
+                .labels
+                .iter()
+                .map(|&(name, values)| match b.only {
+                    Some((only, kept)) if only == name => (name, kept),
+                    _ => (name, values),
+                })
+                .collect();
+            assert_eq!(gauge.labels, expected.as_slice(), "{}", b.gauge);
         }
     }
 
@@ -1626,6 +1844,46 @@ mod tests {
     }
 
     #[test]
+    fn the_sink_exports_which_build_this_is() {
+        // Run in both builds: only the drill's names a feature.
+        let text = String::from_utf8(PromSink::new().render()).unwrap();
+        let features = if cfg!(feature = "fault-injection") {
+            "fault-injection"
+        } else {
+            ""
+        };
+        let labels = format!(
+            "{{arch=\"{}\",features=\"{features}\",revision=\"{BUILD_REVISION}\",version=\"{}\"}}",
+            std::env::consts::ARCH,
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert_eq!(
+            sample(&text, "build_info", &labels).as_deref(),
+            Some("1"),
+            "{text}"
+        );
+        assert!(!BUILD_REVISION.is_empty());
+    }
+
+    #[test]
+    fn every_sink_exports_the_one_process_start_time() {
+        let start = process_start_time();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(start > 0.0 && start <= now, "{start} vs {now}");
+        for _ in 0..2 {
+            let text = String::from_utf8(PromSink::new().render()).unwrap();
+            let exported: f64 = sample(&text, "process_start_time_seconds", "")
+                .expect("exported")
+                .parse()
+                .unwrap();
+            assert_eq!(exported, start, "{text}");
+        }
+    }
+
+    #[test]
     fn a_catalogued_series_is_exported_with_its_help() {
         let sink = PromSink::new();
         sink.inc_counter("config_reload_failures_total", &[("stage", "load")]);
@@ -1716,5 +1974,325 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("profile_id=\"t\""), "{text}");
+    }
+
+    #[test]
+    fn label_sets_are_every_combination_of_the_labels_values() {
+        assert_eq!(label_sets(&[]), vec![Vec::<(&str, &str)>::new()]);
+        assert!(label_sets(&[("op", &[])]).is_empty());
+        assert_eq!(
+            label_sets(&[("level", &["warn", "error"]), ("target", &["a", "b"])]),
+            vec![
+                vec![("level", "warn"), ("target", "a")],
+                vec![("level", "warn"), ("target", "b")],
+                vec![("level", "error"), ("target", "a")],
+                vec![("level", "error"), ("target", "b")],
+            ]
+        );
+    }
+
+    #[test]
+    fn log_events_are_exported_by_the_events_since_the_last_scrape() {
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        // Above anything this process has really counted, as in the fsync
+        // test above, so the scrape's own read of the counts does not move
+        // them.
+        let base = crate::tracing_init::log_events().snapshot();
+        let with = |level: &str, target: &str, extra: u64| {
+            base.iter()
+                .map(|&(l, t, n)| {
+                    let add = if l == level && t == target { extra } else { 0 };
+                    (l, t, n + 100 + add)
+                })
+                .collect::<Vec<_>>()
+        };
+        let labels = "{level=\"error\",target=\"torrentd::vpn\"}";
+        let was = |level: &str| {
+            base.iter()
+                .find(|(l, t, _)| *l == level && *t == "torrentd::vpn")
+                .map(|(_, _, n)| *n)
+                .expect("torrentd::vpn is a target")
+        };
+        sink.export_log_events(&with("error", "torrentd::vpn", 2));
+        let first = String::from_utf8(sink.render()).unwrap();
+        let expected = (was("error") + 102).to_string();
+        assert_eq!(
+            sample(&first, LOG_EVENTS, labels).as_deref(),
+            Some(expected.as_str()),
+            "{first}"
+        );
+        // The first render's count is the boot's, for ERROR only.
+        assert_eq!(
+            sample(&first, "boot_log_events", labels).as_deref(),
+            Some(expected.as_str()),
+            "{first}"
+        );
+        assert_eq!(
+            sample(
+                &first,
+                "boot_log_events",
+                "{level=\"warn\",target=\"torrentd::vpn\"}"
+            ),
+            None,
+            "{first}"
+        );
+        sink.export_log_events(&with("error", "torrentd::vpn", 2));
+        sink.export_log_events(&with("error", "torrentd::vpn", 5));
+        let later = String::from_utf8(sink.render()).unwrap();
+        let expected_later = (was("error") + 105).to_string();
+        assert_eq!(
+            sample(&later, LOG_EVENTS, labels).as_deref(),
+            Some(expected_later.as_str()),
+            "counted once: {later}"
+        );
+        assert_eq!(
+            sample(&later, "boot_log_events", labels).as_deref(),
+            Some(expected.as_str()),
+            "{later}"
+        );
+    }
+
+    /// The crates whose log lines the daemon writes: source directory and
+    /// crate name.
+    const DAEMON_CRATES: &[(&str, &str)] = &[
+        ("torrentd", "torrentd"),
+        ("torrentd-engine", "torrentd_engine"),
+        ("torrentd-pool", "torrentd_pool"),
+        ("libtorrent-safe", "libtorrent_safe"),
+    ];
+
+    /// Every non-test source file of [`DAEMON_CRATES`]: its file, the
+    /// module path its untargeted events log under cut to the crate and
+    /// top-level module, and its code up to an inline `#[cfg(test)] mod`,
+    /// comment lines left out.
+    pub(crate) fn daemon_sources() -> Vec<(String, String, String)> {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?}: {e}"));
+            for entry in entries {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let is_test = |stem: &str| {
+            stem == "tests"
+                || stem == "testing"
+                || stem == "test_support"
+                || stem.ends_with("_tests")
+        };
+        let mut out = Vec::new();
+        for (dir, krate) in DAEMON_CRATES {
+            let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(dir)
+                .join("src");
+            let mut files = Vec::new();
+            walk(&src, &mut files);
+            for file in files {
+                let rel = file.strip_prefix(&src).expect("under src");
+                let parts: Vec<String> = rel
+                    .iter()
+                    .map(|p| {
+                        Path::new(p)
+                            .file_stem()
+                            .expect("a name")
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                if parts.iter().any(|p| is_test(p)) {
+                    continue;
+                }
+                let module = match parts.first().map(String::as_str) {
+                    None | Some("main" | "lib") => (*krate).to_string(),
+                    Some(top) => format!("{krate}::{top}"),
+                };
+                let text = std::fs::read_to_string(&file).expect("readable");
+                let lines: Vec<&str> = text.lines().collect();
+                let cut = (0..lines.len())
+                    .find(|&i| {
+                        lines[i].trim() == "#[cfg(test)]"
+                            && lines.get(i + 1).is_some_and(|next| {
+                                let next = next.trim();
+                                (next.starts_with("mod ") || next.starts_with("pub(crate) mod "))
+                                    && next.ends_with('{')
+                            })
+                    })
+                    .unwrap_or(lines.len());
+                // Comment lines quote macro calls the code does not make.
+                let code: Vec<&str> = lines[..cut]
+                    .iter()
+                    .copied()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect();
+                out.push((rel.display().to_string(), module, code.join("\n")));
+            }
+        }
+        out
+    }
+
+    /// Each WARN or ERROR macro call in `text`: its level and what follows
+    /// its opening parenthesis.
+    fn warn_and_error_calls(text: &str) -> Vec<(&'static str, &str)> {
+        let mut calls = Vec::new();
+        for (level, mac) in [("warn", "warn!("), ("error", "error!(")] {
+            for (at, _) in text.match_indices(mac) {
+                let ident = text[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if !ident {
+                    calls.push((level, text[at + mac.len()..].trim_start()));
+                }
+            }
+        }
+        calls
+    }
+
+    /// The string literal `rest` opens with.
+    pub(crate) fn literal(rest: &str) -> Option<&str> {
+        let rest = rest.trim_start().strip_prefix('"')?;
+        rest.find('"').map(|end| &rest[..end])
+    }
+
+    #[test]
+    fn the_log_event_targets_are_what_the_daemon_logs_under() {
+        let mut wanted = BTreeSet::new();
+        for (_, module, text) in daemon_sources() {
+            for (_, args) in warn_and_error_calls(&text) {
+                match args.strip_prefix("target:") {
+                    Some(rest) => {
+                        let target = literal(rest).expect("a target is a string literal");
+                        wanted.insert(crate::tracing_init::log_event_module(target).to_string());
+                    }
+                    None => {
+                        wanted.insert(module.clone());
+                    }
+                }
+            }
+        }
+        wanted.insert("other".to_string());
+        let listed: BTreeSet<String> = crate::tracing_init::LOG_EVENT_TARGETS
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        assert!(
+            listed == wanted,
+            "LOG_EVENT_TARGETS has drifted from what the daemon logs under. It should be:\n{}",
+            wanted
+                .iter()
+                .map(|t| format!("    {t:?},"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    /// What reports the events of one `error.kind`.
+    enum Coverage {
+        /// A catalogued series present from boot that counts each one.
+        Series(&'static str),
+        /// Only `log_events_total`: every site logs it at WARN or ERROR.
+        LogEvents,
+    }
+
+    /// Every `error.kind` the daemon logs, and what counts it.
+    const ERROR_KINDS: &[(&str, Coverage)] = &[
+        ("alert_loop_panic", Coverage::LogEvents),
+        ("enforce_no_download", Coverage::LogEvents),
+        // disk_errors_total appears with its first event, so it is no
+        // seeded series.
+        ("file_error", Coverage::LogEvents),
+        (
+            "listen_accept_emfile",
+            Coverage::Series("listen_accept_errors_total"),
+        ),
+        ("listen_close_failed", Coverage::LogEvents),
+        ("listen_failed", Coverage::Series("listen_failures_total")),
+        ("listen_wrong_device", Coverage::LogEvents),
+        ("metadata_no_handle", Coverage::LogEvents),
+        ("metadata_private_unreadable", Coverage::LogEvents),
+        (
+            "resume_write",
+            Coverage::Series("resume_write_errors_total"),
+        ),
+        ("session_pause_failed", Coverage::LogEvents),
+        (
+            "storage_moved_failed",
+            Coverage::Series("storage_move_failures_total"),
+        ),
+        ("torrent_error", Coverage::Series("torrent_errors_total")),
+        (
+            "torrent_write",
+            Coverage::Series("torrent_file_persist_errors_total"),
+        ),
+        ("unset_flags", Coverage::LogEvents),
+    ];
+
+    #[test]
+    fn every_error_kind_is_counted_by_a_seeded_series_or_log_events() {
+        // Each `error.kind = "..."` in the daemon's code, with the level of
+        // the macro call it is in: the nearest WARN or ERROR call before it,
+        // unless an INFO, DEBUG or TRACE call is nearer.
+        let mut found: Vec<(String, &'static str, String)> = Vec::new();
+        for (file, _, text) in daemon_sources() {
+            for (at, _) in text.match_indices("error.kind = \"") {
+                let kind = literal(&text[at + "error.kind = ".len()..])
+                    .expect("a literal")
+                    .to_string();
+                let before = &text[..at];
+                let level = [
+                    ("warn", "warn!("),
+                    ("error", "error!("),
+                    ("info", "info!("),
+                    ("debug", "debug!("),
+                    ("trace", "trace!("),
+                ]
+                .iter()
+                .filter_map(|(level, mac)| before.rfind(mac).map(|i| (i, *level)))
+                .max()
+                .map(|(_, level)| level)
+                .unwrap_or_else(|| panic!("{file}: error.kind {kind:?} outside a macro call"));
+                found.push((kind, level, file.clone()));
+            }
+        }
+        assert!(!found.is_empty());
+        for (kind, level, file) in &found {
+            let coverage = ERROR_KINDS
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map(|(_, c)| c)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{file} logs error.kind {kind:?}, which ERROR_KINDS does not list: \
+                         name the seeded series that counts it, or log it at WARN or ERROR \
+                         and list it as covered by log_events_total"
+                    )
+                });
+            match coverage {
+                Coverage::Series(name) => {
+                    let s = catalogued(name).unwrap_or_else(|| panic!("{name} not catalogued"));
+                    assert_ne!(
+                        s.seed,
+                        Seed::OnFirstEvent,
+                        "{kind}: {name} is not present from boot"
+                    );
+                }
+                Coverage::LogEvents => assert!(
+                    ["warn", "error"].contains(level),
+                    "{file} logs error.kind {kind:?} at {level}, which log_events_total \
+                     does not count"
+                ),
+            }
+        }
+        for (kind, _) in ERROR_KINDS {
+            assert!(
+                found.iter().any(|(k, _, _)| k == kind),
+                "ERROR_KINDS lists {kind:?}, which the daemon no longer logs"
+            );
+        }
     }
 }

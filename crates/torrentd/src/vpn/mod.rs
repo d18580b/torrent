@@ -6,13 +6,17 @@
 //! a netlink-based implementation later without changing any caller.
 //!
 //! Every host tool this subsystem runs goes through [`exec::run`]: one
-//! timeout, one locale, one rule for interface names.
+//! timeout, one locale, one rule for interface names, and the one place
+//! `CAP_NET_ADMIN` is handed to a child ([`caps`]). What the host must provide
+//! is checked before any profile comes up ([`preflight`]).
 
+pub mod caps;
 pub(crate) mod exec;
 mod ip_lookup;
 pub mod killswitch;
 mod natpmp;
 mod openvpn;
+pub mod preflight;
 pub mod route;
 mod shared_exit;
 mod wireguard;
@@ -35,6 +39,7 @@ pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::release_recorded as release_recorded_wireguard;
 pub use wireguard::sweep_raised_records;
 pub use wireguard::transfer as wireguard_transfer;
+pub use wireguard::tunnel_holding as wireguard_tunnel_holding;
 pub use wireguard::ProbeUnavailable as HandshakeProbeUnavailable;
 pub use wireguard::Released as ReleasedWireguard;
 pub use wireguard::Transfer as WireguardTransfer;

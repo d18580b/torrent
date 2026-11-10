@@ -108,7 +108,10 @@ ReadWritePaths=/srv/media/movies /srv/media/tv /var/lib/torrentd-import
 ```
 
 Check the file as the daemon's user, then restart: `[pool]` takes a restart,
-and a `SIGHUP` or `POST /v1/config/reload` only warns that it was ignored.
+and a `SIGHUP` or `POST /v1/config/reload` only warns that it was ignored. A
+config with a `vpn` profile or `network_kill_switch = true` needs the
+`systemd-run` form of [running.md §8](running.md#8-start-it) instead, since
+`sudo -u` lacks the unit's `CAP_NET_ADMIN` and that check exits 78 without it.
 
 ```bash
 sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config

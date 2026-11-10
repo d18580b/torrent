@@ -249,6 +249,8 @@ struct Packet<'a> {
     oif: &'a str,
     /// `(sport, daddr, dport)` for a UDP packet.
     udp: Option<(u16, std::net::IpAddr, u16)>,
+    /// `(sport, daddr, dport)` for a TCP packet.
+    tcp: Option<(u16, std::net::IpAddr, u16)>,
 }
 
 fn pkt(uid: u32, saddr: impl Into<IpAddr>, oif: &str) -> Packet<'_> {
@@ -257,6 +259,7 @@ fn pkt(uid: u32, saddr: impl Into<IpAddr>, oif: &str) -> Packet<'_> {
         saddr: saddr.into(),
         oif,
         udp: None,
+        tcp: None,
     }
 }
 
@@ -264,6 +267,11 @@ impl<'a> Packet<'a> {
     fn udp(mut self, sport: u16, to: &str) -> Self {
         let to: SocketAddr = to.parse().unwrap();
         self.udp = Some((sport, to.ip(), to.port()));
+        self
+    }
+    fn tcp(mut self, sport: u16, to: &str) -> Self {
+        let to: SocketAddr = to.parse().unwrap();
+        self.tcp = Some((sport, to.ip(), to.port()));
         self
     }
     fn kernel(mut self) -> Self {
@@ -278,12 +286,13 @@ impl<'a> Packet<'a> {
 ///
 /// Reads only the shapes this module renders — `meta skuid`,
 /// `ip saddr`/`ip6 saddr`, `ip daddr`/`ip6 daddr`, `oifname` (one name or
-/// a set, `!=` a set), `udp sport`/`udp dport` (a set or one value) — and
+/// a set, `!=` a set), `udp sport`/`udp dport` and `tcp sport`/`tcp dport`
+/// (a set or one value; each holds only for a packet of its protocol) — and
 /// panics on anything else, so a new kind of match cannot be silently
 /// ignored here. An `ip` match holds only for an IPv4 packet and an
 /// `ip6` one only for an IPv6 packet, as in an `inet` table.
 fn verdict(ruleset: &str, p: Packet<'_>) -> &'static str {
-    const MATCHES: [&str; 8] = [
+    const MATCHES: [&str; 10] = [
         "meta skuid ",
         "ip saddr ",
         "ip6 saddr ",
@@ -292,7 +301,10 @@ fn verdict(ruleset: &str, p: Packet<'_>) -> &'static str {
         "oifname ",
         "udp sport ",
         "udp dport ",
+        "tcp sport ",
+        "tcp dport ",
     ];
+    let l4 = p.udp.or(p.tcp);
     for line in ruleset.lines().map(str::trim) {
         if !(line.starts_with("meta skuid ")
             || line.starts_with("ip saddr ")
@@ -336,12 +348,12 @@ fn verdict(ruleset: &str, p: Packet<'_>) -> &'static str {
                 "oifname " => Some(p.oif.to_string()),
                 "udp sport " => p.udp.map(|(s, ..)| s.to_string()),
                 "udp dport " => p.udp.map(|(.., d)| d.to_string()),
-                "ip daddr " => p
-                    .udp
+                "tcp sport " => p.tcp.map(|(s, ..)| s.to_string()),
+                "tcp dport " => p.tcp.map(|(.., d)| d.to_string()),
+                "ip daddr " => l4
                     .filter(|(_, a, _)| a.is_ipv4())
                     .map(|(_, a, _)| a.to_string()),
-                _ => p
-                    .udp
+                _ => l4
                     .filter(|(_, a, _)| a.is_ipv6())
                     .map(|(_, a, _)| a.to_string()),
             };
@@ -360,6 +372,7 @@ fn enable_refuses_to_install_a_ruleset_as_root() {
     let called = std::cell::Cell::new(false);
     let e = enable_for_uid(
         0,
+        &Carveouts::default(),
         &["wg-a".to_string()],
         addr_of,
         no_v6,
@@ -399,6 +412,7 @@ fn enable_replaces_the_stale_table_and_installs_the_new_one_in_one_transaction()
     let calls = std::cell::RefCell::new(Vec::<String>::new());
     let uid = enable_for_uid(
         998,
+        &Carveouts::default(),
         &["wg-b".to_string(), "wg-a".to_string()],
         addr_of,
         no_v6,
@@ -452,6 +466,7 @@ fn a_transport_port_that_will_not_read_stops_the_install_before_nft() {
     let applied = std::cell::Cell::new(false);
     let e = enable_for_uid(
         998,
+        &Carveouts::default(),
         &["wg-a".to_string()],
         addr_of,
         no_v6,
@@ -475,6 +490,7 @@ fn a_tunnel_address_that_will_not_read_stops_the_install_before_nft() {
     let applied = std::cell::Cell::new(false);
     let e = enable_for_uid(
         998,
+        &Carveouts::default(),
         &["wg-a".to_string(), "wg-b".to_string()],
         |iface| {
             if iface == "wg-b" {
@@ -510,6 +526,7 @@ fn a_tunnel_address_that_will_not_read_stops_the_install_before_nft() {
 fn a_profiles_address_on_another_profiles_tunnel_falls_through_to_the_drop() {
     let rs = render_ruleset_with_transport(
         998,
+        &Carveouts::default(),
         &[tunnel("wg-a"), tunnel("wg-b")],
         &[transport_on(51820)],
     )
@@ -554,7 +571,13 @@ fn a_profiles_address_on_another_profiles_tunnel_falls_through_to_the_drop() {
 /// endpoint, only the tunnel's own transport passes.
 #[test]
 fn the_transport_exemption_reaches_the_provider_endpoint_and_nowhere_else() {
-    let rs = render_ruleset_with_transport(998, &[tunnel("wg-a")], &[transport_on(51820)]).unwrap();
+    let rs = render_ruleset_with_transport(
+        998,
+        &Carveouts::default(),
+        &[tunnel("wg-a")],
+        &[transport_on(51820)],
+    )
+    .unwrap();
     let phys = Ipv4Addr::new(192, 0, 2, 1);
 
     assert_eq!(
@@ -603,6 +626,7 @@ fn the_transport_exemption_reaches_the_provider_endpoint_and_nowhere_else() {
 fn a_tunnel_address_leaves_by_its_own_tunnel_or_loopback_whoever_sent_it() {
     let rs = render_ruleset_with_transport(
         998,
+        &Carveouts::default(),
         &[tunnel("wg-a"), tunnel("wg-b")],
         &[transport_on(51820)],
     )
@@ -714,6 +738,7 @@ fn a_failed_ipv6_read_pairs_no_address_and_says_why() {
 fn enable_pairs_each_link_s_ipv6_addresses() {
     let installed = enable_for_uid(
         998,
+        &Carveouts::default(),
         &["wg-a".to_string(), "wg-b".to_string()],
         addr_of,
         |iface| {
@@ -792,6 +817,7 @@ fn ruleset_exempts_each_tunnels_transport_ahead_of_the_drop() {
     );
     let rs = render_ruleset_with_transport(
         998,
+        &Carveouts::default(),
         &[tunnel("wg-a"), tunnel("wg-b")],
         &[transport_on(51820), two_peers, transport_on(51820)],
     )
@@ -822,6 +848,7 @@ table inet torrentd_ks_998 {
 fn a_refused_transaction_is_reported() {
     let e = enable_for_uid(
         998,
+        &Carveouts::default(),
         &[],
         |_| unreachable!("no tunnels, no addresses"),
         |_| unreachable!("no tunnels, no IPv6 addresses"),
@@ -1088,10 +1115,11 @@ fn disable_reports_a_failed_listing_without_deleting() {
 #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
 fn disable_against_real_nft() {
     remove_table_for(998).expect("no table yet: success, in any locale");
-    let first = Installed::render(998, vec![tunnel("wg0")], vec![]).unwrap();
+    let first = Installed::render(998, Carveouts::default(), vec![tunnel("wg0")], vec![]).unwrap();
     apply(&first.script()).expect("install onto no table");
     let second = Installed::render(
         998,
+        Carveouts::default(),
         vec![tunnel("wg1")],
         vec![("wg1".to_string(), transport_on(51820))],
     )
@@ -1110,7 +1138,8 @@ fn disable_against_real_nft() {
         "and none of the one it replaced"
     );
     // #168: a second daemon's, under another uid, beside it.
-    apply(&install_script(1000, &[tunnel("wg2")], &[]).unwrap()).expect("install uid 1000's");
+    apply(&install_script(1000, &Carveouts::default(), &[tunnel("wg2")], &[]).unwrap())
+        .expect("install uid 1000's");
     assert!(table_listed(&list_tables().expect("list"), TABLE));
     assert!(
         remove_table_for(998).expect("an installed table is deleted"),
@@ -1202,7 +1231,7 @@ fn each_uid_owns_its_own_table() {
     assert_ne!(table_name(998), table_name(1000));
     let rs = render_ruleset(1000, &[tunnel("wg-a")]).unwrap();
     assert!(rs.starts_with("table inet torrentd_ks_1000 {\n"), "{rs}");
-    let script = install_script(1000, &[tunnel("wg-a")], &[]).unwrap();
+    let script = install_script(1000, &Carveouts::default(), &[tunnel("wg-a")], &[]).unwrap();
     assert!(
         script.starts_with("add table inet torrentd_ks_1000\ndelete table inet torrentd_ks_1000\n"),
         "the replace touches only this uid's table: {script}"
@@ -1283,6 +1312,7 @@ fn enable_refuses_an_unquotable_name_before_nft() {
     let applied = std::cell::Cell::new(false);
     enable_for_uid(
         998,
+        &Carveouts::default(),
         &["wg\"x".to_string()],
         addr_of,
         no_v6,
@@ -1326,6 +1356,7 @@ fn two_peer_transport() -> Transport {
 fn installed() -> Installed {
     Installed::render(
         998,
+        Carveouts::default(),
         vec![tunnel("wg-a")],
         vec![("wg-a".to_string(), two_peer_transport())],
     )
@@ -1371,6 +1402,7 @@ fn a_table_pairing_an_ipv6_address_verifies_intact() {
     const WG_A_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 8, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "2001:db8::2"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg-a"}}, {"accept": null}]}}"#;
     let installed = Installed::render(
         998,
+        Carveouts::default(),
         vec![tunnel("wg-a").with_v6([ADDR_A6])],
         vec![("wg-a".to_string(), two_peer_transport())],
     )
@@ -1633,6 +1665,7 @@ fn a_changed_or_removed_address_is_installed_again_with_the_live_ones() {
     let moved = Ipv4Addr::new(10, 2, 0, 9);
     let mut installed = Installed::render(
         998,
+        Carveouts::default(),
         vec![tunnel("wg-a").with_v6([ADDR_A6])],
         vec![("wg-a".to_string(), two_peer_transport())],
     )
@@ -1663,6 +1696,7 @@ fn a_changed_or_removed_address_is_installed_again_with_the_live_ones() {
 fn addresses_that_will_not_read_keep_the_last_ones() {
     let mut installed = Installed::render(
         998,
+        Carveouts::default(),
         vec![tunnel("wg-a").with_v6([ADDR_A6])],
         vec![("wg-a".to_string(), two_peer_transport())],
     )
@@ -2301,6 +2335,7 @@ fn verify_against_real_nft() {
 fn an_ipv6_fence_against_real_nft() {
     let installed = Installed::render(
         998,
+        Carveouts::default(),
         vec![tunnel("wg-a").with_v6([ADDR_A6])],
         vec![("wg-a".to_string(), two_peer_transport())],
     )
@@ -2321,6 +2356,8 @@ fn an_ipv6_fence_against_real_nft() {
     assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));
     remove_table_for(998).expect("remove");
 }
+
+mod carveouts;
 
 mod props {
     use std::fmt::Debug;
@@ -2531,8 +2568,15 @@ mod props {
             uid in any::<u32>(),
         ) {
             prop_assert_eq!(
-                render_ruleset_with_transport(uid, &tunnels, &transports).unwrap(),
-                render_ruleset_with_transport(uid, &tunnels2, &transports2).unwrap(),
+                render_ruleset_with_transport(uid, &Carveouts::default(), &tunnels, &transports)
+                    .unwrap(),
+                render_ruleset_with_transport(
+                    uid,
+                    &Carveouts::default(),
+                    &tunnels2,
+                    &transports2
+                )
+                .unwrap(),
             );
         }
 

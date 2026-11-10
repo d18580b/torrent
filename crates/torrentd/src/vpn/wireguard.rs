@@ -544,6 +544,29 @@ pub fn endpoint_hosts(text: &str) -> Vec<String> {
     hosts
 }
 
+/// Where a WireGuard config puts `addr` inside its tunnel, as the line that
+/// does, `Address = <prefix>` or `DNS = <server>`: an `Address` prefix holds
+/// it, which is the network the link puts on itself and the kernel routes by
+/// the link while it is up; or the `[Interface]`'s `DNS` names it, the
+/// provider's resolver, reached through the tunnel. `None` where neither
+/// does, or where the config does not parse ([`native::parse`]), which the
+/// link's bring-up refuses anyway.
+pub fn tunnel_holding(text: &str, addr: std::net::IpAddr) -> Option<String> {
+    let parsed = native::parse(text).ok()?;
+    if let Some(prefix) = parsed.addresses.iter().find(|a| native::covers(a, addr)) {
+        return Some(format!("Address = {prefix}"));
+    }
+    parsed
+        .dns
+        .iter()
+        .find(|value| {
+            value
+                .split(',')
+                .any(|v| v.trim().parse::<std::net::IpAddr>() == Ok(addr))
+        })
+        .map(|value| format!("DNS = {value}"))
+}
+
 #[derive(Debug)]
 pub struct WireguardManager {
     /// Where this boot's raised-interface records live — `Config::state_dir()`,
@@ -1073,7 +1096,7 @@ mod native {
     /// Whether the prefix `prefix` (`a.b.c.d[/len]` or `x:y::z[/len]`) holds
     /// `addr`. A prefix that does not parse, or is of the other address
     /// family, holds nothing.
-    fn covers(prefix: &str, addr: IpAddr) -> bool {
+    pub(super) fn covers(prefix: &str, addr: IpAddr) -> bool {
         let (net, len) = match prefix.split_once('/') {
             Some((net, len)) => (net, len.parse::<u32>().ok()),
             None => (prefix, None),
@@ -1135,6 +1158,9 @@ mod native {
         pub(super) mtu: Option<u32>,
         /// `false` for `Table = off`.
         pub(super) route: bool,
+        /// Each `[Interface]` `DNS` line's value, as written. The link never
+        /// applies it ([`Parsed::ignored`]); [`super::tunnel_holding`] reads it.
+        pub(super) dns: Vec<String>,
         /// `wg-quick`-only keys this path cannot honour and ignores.
         pub(super) ignored: Vec<String>,
         /// The config with every `wg-quick`-only line removed, for `wg setconf`.
@@ -1310,6 +1336,9 @@ mod native {
                         continue;
                     }
                     "dns" | "saveconfig" => {
+                        if lower == "dns" {
+                            p.dns.push(value.to_string());
+                        }
                         p.ignored.push(key.to_string());
                         continue;
                     }

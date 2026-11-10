@@ -180,31 +180,39 @@ impl Report {
     }
 }
 
-/// `CAP_NET_ADMIN`'s bit in a capability mask (`linux/capability.h`).
-const CAP_NET_ADMIN_BIT: u32 = 12;
-
-/// Whether `CapEff` in a `/proc/<pid>/status` body carries `bit`.
-///
-/// `None` when the file carried no `CapEff` line or an unparseable one, which
-/// the caller reads as "do not classify anything from this".
-fn cap_eff_has(status: &str, bit: u32) -> Option<bool> {
-    let rest = status
-        .lines()
-        .find_map(|l| l.strip_prefix("CapEff:"))?
-        .trim();
-    let mask = u64::from_str_radix(rest, 16).ok()?;
-    Some(mask & (1u64 << bit) != 0)
-}
-
 /// Whether this process holds `CAP_NET_ADMIN`, which `nft --check` and
-/// `wg show … latest-handshakes` both need, read from `/proc/self/status`.
+/// `wg show … latest-handshakes` both need ([`vpn::caps::holds_net_admin`]).
 /// `true` when the mask cannot be read, so a genuine rejection stays a
 /// failure.
 fn has_cap_net_admin() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| cap_eff_has(&s, CAP_NET_ADMIN_BIT))
-        .unwrap_or(true)
+    vpn::caps::holds_net_admin().unwrap_or(true)
+}
+
+/// The boot's preflight verdict ([`vpn::preflight`]) as a check.
+///
+/// A missing `CAP_NET_ADMIN` is a refusal at boot, which exits 78; here it is
+/// an `Unknown` nothing this invocation could settle, like every other
+/// verdict that rests on the invoker's capability: the documented invocation
+/// runs as the daemon's user from a shell, which does not hold what the unit
+/// grants the daemon. Its detail is the boot's refusal, word for word.
+fn preflight_check(o: vpn::preflight::Outcome) -> Check {
+    use vpn::preflight::Finding;
+    use vpn::preflight::Requirement;
+    let name = o.requirement.name();
+    match o.finding {
+        Finding::Met => Check::pass(name, o.detail),
+        Finding::Missing if o.requirement == Requirement::NetAdmin => Check::unknown_unsettleable(
+            name,
+            format!(
+                "{}. The daemon exits 78 for this at boot; this check judges the invoking \
+                     process",
+                o.detail
+            ),
+        ),
+        Finding::Missing => Check::fail(name, o.detail),
+        Finding::NeedsCapability => Check::unknown_unsettleable(name, o.detail),
+        Finding::Unknown => Check::unknown(name, o.detail),
+    }
 }
 
 /// The host-touching operations a profile's checks perform, behind a trait so the
@@ -264,6 +272,9 @@ pub trait CheckHost {
 
     /// Whether this process holds `CAP_NET_ADMIN`.
     fn has_cap_net_admin(&self) -> bool;
+
+    /// The boot's preflight ([`vpn::preflight::run`]) for `needs`.
+    fn preflight(&self, needs: &vpn::preflight::Needs) -> Vec<vpn::preflight::Outcome>;
 
     /// Dry-run a ruleset through `nft --check --file -`.
     ///
@@ -354,6 +365,10 @@ impl CheckHost for RealHost {
 
     fn has_cap_net_admin(&self) -> bool {
         has_cap_net_admin()
+    }
+
+    fn preflight(&self, needs: &vpn::preflight::Needs) -> Vec<vpn::preflight::Outcome> {
+        vpn::preflight::run(needs, &vpn::preflight::Host)
     }
 
     fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
@@ -729,6 +744,16 @@ fn host_checks(
         )
     });
 
+    // What the daemon's boot checks before any profile comes up, for the
+    // profiles this run is scoped to.
+    let needs = vpn::preflight::Needs::of(
+        cfg.profile
+            .iter()
+            .filter(|p| only.is_none_or(|id| p.id.as_str() == id)),
+        cfg.network_kill_switch,
+    );
+    out.extend(host.preflight(&needs).into_iter().map(preflight_check));
+
     if cfg.network_kill_switch {
         out.push(if host.tool_available("nft", "--version") {
             Check::pass("nftables", "`nft` is available")
@@ -773,7 +798,8 @@ fn host_checks(
                 // Boot reads each one off the live link and refuses to
                 // install without it; a link that is not up yet has neither
                 // to read, so what is missing is named rather than guessed at.
-                let (ruleset, unread) = boot_install_script(uid, &tunnels, host);
+                let (ruleset, unread) =
+                    boot_install_script(uid, &cfg.kill_switch_carveouts(), &tunnels, host);
                 // A name the renderer refuses is the same boot abort as a
                 // ruleset `nft` rejects, reported before any `nft` runs.
                 let verdict = match ruleset {
@@ -788,6 +814,7 @@ fn host_checks(
                 note_unread(verdict, &unread)
             }
         });
+        out.extend(carveout_checks(&cfg.kill_switch_carveouts()));
     } else {
         out.push(Check::skip("kill_switch", "network_kill_switch = false"));
     }
@@ -822,6 +849,7 @@ struct Unread {
 /// boot whether or not its link is up.
 fn boot_install_script(
     uid: u32,
+    carveouts: &vpn::killswitch::Carveouts,
     tunnels: &[String],
     host: &dyn CheckHost,
 ) -> (std::io::Result<String>, Unread) {
@@ -844,9 +872,41 @@ fn boot_install_script(
         }
     }
     (
-        vpn::killswitch::install_script(uid, &paired, &transports),
+        vpn::killswitch::install_script(uid, carveouts, &paired, &transports),
         unread,
     )
+}
+
+/// What the kill switch's carve-outs let out, a line each where one is
+/// configured. Both are rendered into the ruleset the check above dry-runs;
+/// these say so in words, and the DNS one names the privacy cost, as the
+/// boot's WARN does.
+fn carveout_checks(carveouts: &vpn::killswitch::Carveouts) -> Vec<Check> {
+    let mut out = Vec::new();
+    if let Some((port, ifaces)) = carveouts.api() {
+        let ifaces: Vec<&str> = ifaces.collect();
+        out.push(Check::pass(
+            "kill_switch_api_carveout",
+            format!(
+                "the API's replies from tcp port {port} may leave by {} \
+                 (kill_switch_api_interfaces); this carve-out lets nothing else out by them",
+                ifaces.join(", "),
+            ),
+        ));
+    }
+    if carveouts.dns_exempt() {
+        let servers: Vec<String> = carveouts.dns_servers().map(|s| s.to_string()).collect();
+        out.push(Check::pass(
+            "kill_switch_dns_exempt",
+            format!(
+                "kill_switch_dns_exempt = 1: DNS (udp and tcp port 53) may reach {} outside the \
+                 tunnels (kill_switch_dns_servers), so every tracker hostname the daemon looks up \
+                 is visible to these resolvers and to whatever they forward to",
+                servers.join(", "),
+            ),
+        ));
+    }
+    out
 }
 
 /// Say which tunnel addresses and transport exemptions the dry-run could not

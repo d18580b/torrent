@@ -34,7 +34,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | `ip` | `iproute2` / `iproute` | Any deployment with a `vpn` profile. Raises and routes each tunnel, and is polled every 30s per profile for the tunnel IP and the route from it. |
 | `wg` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age and transfer counters. The daemon raises every link with `ip` and `wg` itself, as root or not, and never runs `wg-quick` (§11.6). |
 | `openvpn`, `kill` | `openvpn`, `util-linux` (`util-linux-core` on Fedora) | OpenVPN profiles. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. `kill` is spawned as a binary and not as a shell builtin, so `/usr/bin/kill` has to be on the host: that is `util-linux`, not `procps-ng`, which ships `pgrep` and `pkill` and no `kill`. |
-| `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one, along with refusing uid 0 for the kill switch. |
+| `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one (`nft list tables` must run), along with refusing uid 0 for the kill switch. |
 
 A deployment whose profiles are all `network = "host"` needs none of them.
 
@@ -42,12 +42,15 @@ The daemon runs each of them by bare name, looked up on its own `PATH`, and
 treats that environment as trusted: whoever can set it can also change
 `ExecStart=`. The packaged unit sets no `PATH`, so systemd's default for
 system services applies. Do not put a directory writable by anyone but root
-on it. Of the host, `--check-config` probes two things, both only with
-`network_kill_switch = true`: that `nft` runs, and that it is not running as
-uid 0. That uid is the
-invoking process's, not the unit's `User=`, so run it as the daemon's user:
-`sudo -u torrentd torrentd --config <path> --check-config`; under plain `sudo`
-it judges root and refuses a kill-switch config the daemon would boot.
+on it. Of the host, `--check-config` refuses, with `network_kill_switch =
+true`, an `nft` whose `nft list tables` does not run and a process running as
+uid 0; with a `vpn` profile or the kill switch, a process without
+`CAP_NET_ADMIN`. It also prints the boot's VPN preflight (§8, "In a
+container", lists each requirement). The uid and the capability are the invoking
+process's, not the unit's: under plain `sudo` it judges root, and under
+`sudo -u torrentd` it lacks the unit's `AmbientCapabilities=`, so either
+refuses a config the daemon would boot. Run it as the unit runs the daemon,
+with the `systemd-run` invocation of §8.
 `torrentd --config <path> vpn check` (§9) checks the rest.
 
 **The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
@@ -261,12 +264,14 @@ authentication posture, and at least one `[[profile]]`:
 | `http_socket_group` | The daemon's own group. The group, by name or number, a `unix:` `http_listen` socket is given, so its members reach the API through the group bits. Refused beside a TCP `http_listen`. Read once, at startup. |
 | `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `allowed_hosts` | `[]`, so a daemon without `[auth]` answers only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`). List the names a reverse proxy passes through as `Host`, as bare names or addresses with no scheme, port or path. Refused beside `[auth]` — §6. Read once, at startup. |
+| `allow_unsupported_state_fs` | `false`, so a state directory (that of `resume_dir`, `registry_path` or `[pool] db_path`) on overlayfs, NFS, CIFS/SMB or FUSE refuses the start with exit 78. `true` starts anyway, with a WARN and `torrentd_state_fs_unsupported` at 1 — [operations.md, Storage the daemon runs on](operations.md#storage-the-daemon-runs-on). Read once, at startup. |
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
 | `vpn_handshake_max_age_secs` | `180` — how long a WireGuard profile with torrents that can send may go with no handshake answering them before it is fenced. An aged handshake fences only once the link has sent bytes that nothing answered for this long, so neither an idle profile nor a quiet seeding one is fenced on its handshake (§11, drill 5). |
 | `shutdown_drain_secs` | `60` — how long a stop waits for outstanding resume saves (`1`–`3600`). `deploy/torrentd.service`'s `TimeoutStopSec=120` is sized to the default. A larger value is covered by the `EXTEND_TIMEOUT_USEC` the daemon sends while it stops, so `TimeoutStopSec` needs raising only for a stop that must fit without those extensions. |
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
+| `kill_switch_api_interfaces`, `kill_switch_dns_servers` | empty — the kill switch's carve-outs for a cluster: the API's replies on the named interfaces, and DNS to the named resolvers. Restart-only, and refused without `network_kill_switch`; see §11, "In a cluster" |
 | `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
 | `unchoke_slots_limit` | unset: libtorrent's rate-based choker, which unchokes as many peers as the achieved upload rate supports. Set, it unchokes exactly that many per session (fixed-slots choker). Read once, at startup. |
 | `peer_fingerprint`, `user_agent` | libtorrent's own; a profile may override. Only the prefix and the strings change; the wire behaviour stays libtorrent's, so name a libtorrent-based client — see the `vpn` profile row below. |
@@ -709,12 +714,22 @@ refused; the top-level key has the same bound. It is not reloadable: a change
 to it is reported on SIGHUP and ignored until a restart, and a SIGHUP that
 changes the *top-level* limit is withheld from any profile that sets its own.
 
-Validate without starting anything, as the daemon's own user (the kill
-switch's uid refusal judges the invoking process, so a root `--check-config`
-refuses a kill-switch config the `torrentd` user would boot):
+Validate without starting anything, as the daemon's own user:
 
 ```bash
 sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config
+```
+
+With a `vpn` profile or `network_kill_switch = true` that form is refused:
+`--check-config` then judges `CAP_NET_ADMIN` for the invoking process, and
+`sudo -u` does not carry the unit's `AmbientCapabilities=` (nor does plain
+`sudo` pass, whose uid 0 the kill switch refuses). Validate such a config as
+the unit runs the daemon, with the `systemd-run` invocation of §8:
+
+```bash
+sudo systemd-run --pipe --wait -p User=torrentd \
+  -p AmbientCapabilities=CAP_NET_ADMIN -p CapabilityBoundingSet=CAP_NET_ADMIN \
+  /usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config
 ```
 
 ## 6. Authentication — required, one way or the other
@@ -959,8 +974,8 @@ overridden by a `proto=https` the client may have sent.
 
 **All are read only from a peer listed in `trusted_proxies`.** That key is
 empty by default, and with it empty no forwarding header is read at all — the
-socket's peer address is the client. Set it to the address your proxy connects
-from and nothing else: anything in that list can claim to be any client.
+socket's peer address is the client. Set it to the addresses your proxies
+connect from and nothing else: anything in that list can claim to be any client.
 
 Getting it wrong fails safe rather than open. An unset `trusted_proxies` means
 no header is read and the socket's peer address is the client. Behind a proxy
@@ -1039,14 +1054,53 @@ standardised `Forwarded` work at all, and that proxy is fully supported. The
 price is that the fallback is live in every deployment that sets only some of
 the three, and stripping the ones you do not set is what pays it.
 
-**One hop, not a chain walk.** torrentd reads the entry the peer it is
-talking to contributed and stops there. It does not walk back along the chain
-past hops that are themselves listed in `trusted_proxies`, so listing a range
-does not mean "believe the chain as far as my own edge" — `10.0.0.0/8` is a
-valid value and it does not buy that. Put two proxies in series and the
-address torrentd resolves is the **inner** one's, which gives every client
-behind that edge one shared throttle bucket and one `client_ip`. List the one
-address your proxy connects from, which is what this section asks for anyway.
+**A chain of proxies is walked back to the client.** Every hop appends the
+address it received the request from, so the forwarding header reads, left to
+right, from the furthest hop to the nearest. When the socket peer is in
+`trusted_proxies`, torrentd reads the address chain (`X-Forwarded-For`, or
+`Forwarded`'s `for=` where `X-Forwarded-For` is absent) **right to left**:
+
+1. Each element that is itself in `trusted_proxies` is a proxy, and is skipped.
+2. The first element that is not is the client.
+3. If every element is trusted, the client is the leftmost one.
+4. An element that carries no readable address — empty, unparseable, an
+   obfuscated `for=_hidden` or `for=unknown`, a `Forwarded` element with no
+   `for=`, or a field line that is not UTF-8 — stops the walk, and the client
+   is the trusted hop that wrote it (the socket peer, if that element was the
+   last). Nothing to its left was vouched for by anyone you trust.
+5. The walk skips at most 16 trusted hops. In a longer header, the element
+   beyond them is the client whatever its address, and nothing further left
+   is read.
+
+An unspecified address (`0.0.0.0`, `::`) is never a trusted hop, whatever the
+list holds, exactly as it is never a trusted socket peer.
+
+So with a CDN in front of an ingress controller, list both — the CDN's
+published edge ranges and the controller's addresses — and `X-Forwarded-For:
+198.51.100.7, 104.16.0.5` from the controller resolves to `198.51.100.7`. A
+client cannot get past this by writing its own entries: they sit to the left
+of the address your outermost proxy appended for it, which is untrusted and
+stops the walk first. List only the controller and the same request resolves
+to the CDN edge, so every client behind that CDN shares one throttle bucket
+and one `client_ip`.
+
+The cost of listing a range is that every host in it is believed. A host
+inside a trusted range that reaches the daemon directly can name any client,
+and one that is the *client* of a proxy is walked past like a proxy. Keep the
+range to what your proxies actually run on, and keep everything else in it
+from reaching the API.
+
+**Kubernetes.** The ingress controller's pod address is not fixed, so trust
+the cluster's pod CIDR (and, behind a CDN, the CDN's ranges), for example
+`trusted_proxies = ["10.42.0.0/16"]`. Every pod in that CIDR can then name any
+client, so a NetworkPolicy must admit traffic to torrentd's API port **only
+from the ingress controller's pods** — otherwise any workload in the cluster
+picks its own throttle bucket and writes what it likes into `client_ip`. Set
+`externalTrafficPolicy: Local` on the ingress controller's `LoadBalancer` or
+`NodePort` Service: with the default `Cluster`, a node forwarding the
+connection to a controller pod on another node rewrites its source address,
+so the controller sees a node address instead of the client's and every
+client shares whatever bucket that node's address keys.
 
 A v4-mapped address is folded to its v4 form, so `::ffff:198.51.100.9` and
 `198.51.100.9` are one client: one throttle bucket, one spelling in the log.
@@ -1061,9 +1115,10 @@ same host named through your proxy are one throttle bucket rather than two.
 The default is still `127.0.0.1:8080`, and a non-loopback bind of either
 family still requires `[auth]` (§6).
 
-Each of these headers is a chain every hop appends to, so torrentd reads the
-*last* entry — the one the trusted proxy added — rather than the first, which
-is whatever the original client chose to send. Whether your proxy appends by
+Each of these headers is a chain every hop appends to, so torrentd starts from
+the *last* entry — the one the trusted proxy added — and walks left only past
+hops it trusts, rather than reading the first, which is whatever the original
+client chose to send. Whether your proxy appends by
 extending the existing field line (nginx, Caddy) or by adding a second one
 (HAProxy's `option forwardfor`) makes no difference: repeated field lines are
 joined in order first, exactly as RFC 9110 §5.2-5.3 defines them. A proxy that
@@ -1071,7 +1126,8 @@ forwards client-supplied values intact is a proxy that cannot be trusted about
 anything.
 
 **The scheme is the exception, and it reads the whole chain.** "Which client
-is this" is answered by the nearest hop and by no other; "was the original
+is this" is answered by walking back from the nearest hop past trusted ones
+only; "was the original
 request over TLS" is answered by **any** hop that says `https`, because TLS is
 terminated at the edge and every hop behind it honestly reports plain HTTP. So
 `X-Forwarded-Proto: https, http` — a TLS edge in front of a plain-HTTP inner
@@ -1210,8 +1266,9 @@ or torrent directory read, every 256 entries a scan gets through — and stops
 being extended 15 minutes after its last such step, so a 100K-torrent scan on
 slow storage is not cut off however long it takes. A stop is extended up to
 the sum of its stages' own bounds. The watchdog ping is withheld if
-the alert loop stops advancing, so a wedged daemon gets restarted rather than
-reported healthy.
+the alert loop stops advancing or a batch writer thread dies - the checks
+`/livez` makes (§9) - so a wedged daemon gets restarted rather than reported
+healthy.
 
 A configuration the daemon or `--check-config` refuses exits `78`
 (`EX_CONFIG`); an operator subcommand such as `vpn check` keeps its own exit
@@ -1236,7 +1293,16 @@ Uncomment `AmbientCapabilities=CAP_NET_ADMIN` and
 `CapabilityBoundingSet=CAP_NET_ADMIN` for a deployment **with** a `vpn`
 profile; they are only needed to manage tunnels. A deployment without one
 takes the unit as shipped, which grants no capability and bounds the set to
-empty.
+empty. A `vpn` profile or `network_kill_switch = true` under a unit that
+grants no `CAP_NET_ADMIN` exits 78 at boot, naming the two directives.
+`sudo -u torrentd torrentd --check-config` judges its own capabilities, which
+`sudo` does not give the unit's; pre-flight such a config as the unit runs it:
+
+```bash
+sudo systemd-run --pipe --wait -p User=torrentd \
+  -p AmbientCapabilities=CAP_NET_ADMIN -p CapabilityBoundingSet=CAP_NET_ADMIN \
+  /usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config
+```
 
 **Signals:** `SIGHUP` reloads the six keys the
 [README lists as reloadable](../README.md#http-api); every other key takes a
@@ -1331,11 +1397,67 @@ the same arguments as `podman compose`.
    curl -s https://<your host>/healthz
    ```
 
-A `vpn` profile in this container needs the `user`, `cap_add` and `devices`
-lines and the `/etc/wireguard` volume that `compose.yaml` carries commented,
-and runs **without** the kill
-switch: the comment above them says why the two cannot be combined here. A
-deployment that needs both runs from `deploy/torrentd.service` instead.
+A `vpn` profile in this container needs the `cap_add` line, the `devices`
+line for an OpenVPN profile, and the `/etc/wireguard` volume that
+`compose.yaml` carries commented. It runs as the image's uid 1000, so the
+kill switch can run beside it; the next section says how.
+
+### In a container
+
+The image's `/usr/local/bin/torrentd` carries the file capability
+`cap_net_admin+p` (`deploy/Containerfile`). That is how a `vpn` profile and
+`network_kill_switch = true` run together in a container: the daemon stays
+the unprivileged uid the kill switch matches on, and still holds the
+`CAP_NET_ADMIN` its tunnels and its nftables table need. At boot it raises
+the capability to effective, and hands it as an ambient capability to each
+`ip`, `wg`, `nft`, `openvpn` and `kill` it runs, and to no other process. A
+Kubernetes pod running the image needs this `securityContext` on the
+container:
+
+```yaml
+securityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop: [ALL]
+    add: [NET_ADMIN]
+  allowPrivilegeEscalation: true
+```
+
+- **`runAsUser: 1000`.** The kill switch confines the daemon's own uid to
+  loopback and its tunnels, and refuses uid 0, whose rule would drop every
+  root-owned socket in the pod's network namespace. 1000 is the uid the image
+  owns its state directories as.
+- **`capabilities: {drop: [ALL], add: [NET_ADMIN]}`.** `add` puts
+  `CAP_NET_ADMIN` in the container's bounding set, which is the most a file
+  capability can grant: without it the daemon holds nothing. For a non-root
+  uid, `add` alone grants nothing effective, which is why the file
+  capability is there. `drop: [ALL]` leaves `CAP_NET_ADMIN` as the only one.
+- **`allowPrivilegeEscalation: true`.** `false` sets `no_new_privs`, under
+  which the kernel ignores file capabilities, and the daemon holds nothing.
+  Kubernetes defaults it to `true`, except where a `restricted` Pod Security
+  Standard or a policy engine sets it `false`; set it explicitly so neither
+  does. compose's `security_opt: [no-new-privileges:true]` is the same
+  setting and has the same effect.
+
+An OpenVPN profile also needs the host's `/dev/net/tun` in the container,
+and a WireGuard profile needs the host kernel's `wireguard` module, which a
+container cannot load itself (`modprobe wireguard` on the host).
+
+The capability is checked before any profile comes up. Where a `vpn` profile
+or the kill switch is configured and `CAP_NET_ADMIN` is not permitted, the
+daemon exits 78 and names the two ways to grant it: this `securityContext`,
+and the unit's `AmbientCapabilities=` (§8). The same boot preflight then
+checks that the kernel has WireGuard (its `wireguard` generic-netlink family
+is registered, asked without raising a link), that `nft list tables` runs
+when the kill switch is on, and that `/dev/net/tun` exists for an OpenVPN
+profile. A kill switch whose `nft` does not run fails the boot before any
+tunnel is raised. A profile whose tunnel the host cannot carry is failed
+with a reason that starts `preflight wireguard_kernel:` or
+`preflight tun_device:`: that is the profile's `failure_reason` in
+`GET /v1/profiles/{id}` and the `reason` on the boot's log line, and
+`torrentd_profile_boot_failed` is `1` for it. `torrentd --check-config` and
+`torrentd vpn check` report the same verdicts, run in the same container.
 
 ## 9. First-run checks
 
@@ -1343,7 +1465,7 @@ These address the daemon directly, so they are written for a deployment that
 publishes the API — the systemd path of §8, and any run bound to loopback.
 
 ```bash
-curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"ok":true,"profiles":1,"profiles_failed":0,"profiles_fenced":0}
+curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"kill_switch_dns_exempt":false,"ok":true,"profiles":1,"profiles_failed":0,"profiles_fenced":0}
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/v1/status | jq   # counts by phase, rates, peers
 curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics | head   # torrentd_* series
 ```
@@ -1360,19 +1482,42 @@ docker compose exec torrentd curl -s localhost:8080/healthz
 curl -s https://your.host/healthz         # through `proxy`, once TLS is up
 ```
 
+The daemon answers three probes, none of which needs a credential or checks
+the `Host` header:
+
+- `/livez` asks whether the process is wedged, which a restart fixes. It
+  answers 503 only when the alert loop's heartbeat is older than 15 seconds
+  (`alert_loop_stalled`), a batch writer thread - the one that writes resume
+  data - has died (`batch_writer_dead`), or the async runtime's tick - a task
+  that stamps the time twice a second - is older than 2 seconds, so its
+  scheduler or timer is starved (`runtime_stalled`), and its body's `failed`
+  names which. It never fails for a fenced, offline or failed profile, or for
+  no session at all: those are not fixed by a restart, and a fence holds until
+  an operator lifts it (operations.md, "Recovering a fenced profile").
+- `/readyz` asks whether the daemon should take traffic; the rest of this
+  section is its report.
+- `/healthz` is `/readyz` under its older name, kept so scripts, the
+  container `HEALTHCHECK` and existing probes keep working.
+
 `profiles` is the number of **live** sessions, and `profiles_fenced` is how
 many of those the VPN monitor has fenced. `profiles_failed` is how many
 configured profiles never got a session at all — a tunnel that did not come up
 at boot — and is reported in every response, so an account that is dark from
 the start is visible in the payload rather than only in the startup log.
 
-`/healthz` returns 503 with one of three reasons:
+`/readyz` (and `/healthz`) returns 503 with one of four reasons:
 
 | `reason` | Meaning |
 | --- | --- |
-| `no_sessions` | No session is up — before startup completes, or because every configured profile failed to come up. |
+| `starting` | The boot has not finished: a torrent it loaded has not reached the state map yet. It stops after ten minutes even if one never does. |
+| `no_sessions` | No session is up, because every configured profile failed to come up. |
 | `alert_loop_stalled` | The alert loop stopped advancing for 15 seconds. |
 | `all_profiles_fenced` | Every live profile is fenced: its tunnel is down and its torrents are paused. With any failed profiles, that is every configured profile out of service. Some-but-not-all stays **200** — the remaining profiles are still serving — with the count in `profiles_fenced`. |
+
+`kill_switch_dns_exempt` is true while the kill switch lets the daemon's DNS
+out to the resolvers kill_switch_dns_servers names, outside the tunnels (§11,
+"In a cluster"), so tracker hostnames are visible to them. It never makes the
+daemon unready.
 
 Confirm settings actually applied rather than trusting the config parsed:
 
@@ -1432,6 +1577,45 @@ refused to start it. A restart drops the queued rechecks that had not
 started. For a torrent that is paused or has no metadata yet, libtorrent is
 asked at once; a paused torrent's check starts when it is resumed.
 `torrentd_checks_started_total` counts every check started, by `source`.
+
+### Probes: Kubernetes and the systemd watchdog
+
+In Kubernetes, give each probe the route that asks its question:
+
+```yaml
+startupProbe:          # covers the boot: scans, then `starting`
+  httpGet: { path: /readyz, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 180      # 30 minutes; raise it for a very large library
+livenessProbe:         # restarts only a wedged process
+  httpGet: { path: /livez, port: 8080 }
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:        # takes it out of rotation, fenced or starting
+  httpGet: { path: /readyz, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 1
+```
+
+The API does not listen until the boot's scans are done, so for a large
+library the startup probe sees refused connections for a while and then
+`starting` while the loaded torrents reach their sessions; `starting` ends at
+the latest ten minutes after the API comes up. Size `failureThreshold` for the
+whole of that, since the kubelet kills a container whose startup probe never
+passes. Never point `livenessProbe` at `/readyz` or `/healthz`: every profile
+fenced makes them answer 503, and the restart that follows undoes the fence.
+`timeoutSeconds` matters for `/livez`: a runtime wedged too hard to run its
+handler gives no answer at all, which the kubelet counts as a failure. With
+`network_kill_switch` on, the kubelet's probes need the API carve-out (§11,
+"In a cluster").
+
+Under systemd there is no probe: the unit's `WatchdogSec=60s` is the liveness
+check. The daemon pings the watchdog while `/livez`'s heartbeat and batch
+writer checks pass, and withholds the ping once either fails, so systemd
+restarts a wedged process; it never withholds it for a fenced profile.
+Outside systemd, with no `NOTIFY_SOCKET`, nothing pings and nothing restarts
+a wedged daemon except a probe of `/livez`.
 
 ### Monitoring: Prometheus alerts and a Grafana dashboard
 
@@ -1659,11 +1843,15 @@ profile.
    shared host.
 4. **Reverse-path filtering.** Write and load the `sysctl.d` file of §7, so
    `net.ipv4.conf.all.rp_filter` is `2` now and after a reboot.
-5. **Validate the file as the daemon's user.** As root it would judge uid 0
-   and refuse the kill switch:
+5. **Validate the file as the unit runs the daemon.** As root it would judge
+   uid 0 and refuse the kill switch, and under `sudo -u torrentd` it would
+   lack the unit's `CAP_NET_ADMIN` and exit 78; this gives the daemon's user
+   the unit's grant (§8):
 
    ```bash
-   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config   # config OK
+   sudo systemd-run --pipe --wait -p User=torrentd \
+     -p AmbientCapabilities=CAP_NET_ADMIN -p CapabilityBoundingSet=CAP_NET_ADMIN \
+     /usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config   # config OK
    ```
 
 6. **Raise the tunnel once, by hand.** `--bring-up` raises it exactly as the
@@ -2225,6 +2413,32 @@ On a scratch pool, not your real one.
    the response leaves from a socket the daemon's uid owns. Over loopback, or
    through a tunnel, it works. With the kill switch on, reach the API through
    a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
+
+   **In a cluster** neither is to hand: kubelet probes `/livez` and `/readyz`, Prometheus
+   scrapes `/metrics` and Ingress reaches the API on the pod's `eth0`, and the
+   pod's `/etc/resolv.conf` names the cluster resolver, also on `eth0`. Two
+   restart-only keys carve exactly those out, and nothing else:
+
+   ```toml
+   network_kill_switch = true
+   http_listen = "0.0.0.0:8080"
+   kill_switch_api_interfaces = ["eth0"]   # meta skuid <uid> oifname "eth0" tcp sport 8080 accept
+   kill_switch_dns_servers = ["10.43.0.10"]  # ip daddr 10.43.0.10 udp/tcp dport 53 accept
+   ```
+
+   The API carve-out lets out the daemon's TCP from the `http_listen` port
+   by the named interfaces only; it is refused for a profile's
+   `vpn_interface` and beside a `unix:` `http_listen`. The DNS carve-out lets
+   the daemon's queries reach the named resolvers only; it is refused for an
+   address inside a WireGuard profile's `Address` prefixes or named by its
+   `DNS` line, which a tunnel reaches. Every peer and tracker connection,
+   the API port by any other interface, and port 53 to any other address
+   still meet the drop. **The cost of the DNS carve-out**: every tracker
+   hostname the daemon looks up is visible to these resolvers and to
+   whatever they forward to. The boot logs a WARN naming them,
+   `torrentd_kill_switch_dns_exempt` is `1`, and `vpn check` and the
+   `/healthz` body (`kill_switch_dns_exempt`) report it. `vpn check
+   --as-uid` dry-runs both carve-outs in the ruleset it hands to `nft`.
 8. **The kill switch's edges, and a fence during a renewal.** Four scripted
    drills, each in a private user, network and mount namespace that it
    creates and that disappears when it exits. None needs root, and none
@@ -2393,7 +2607,8 @@ run it by hand instead, start the service again afterwards:
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | Container reports no health status at all | The image was built in podman's default OCI format, which drops the `HEALTHCHECK`; rebuild it with `mise run container` or `BUILDAH_FORMAT=docker` (§8, "On the compose stack"). |
-| `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
+| `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. `/livez` fails for it too, so a kubelet restarts the pod. |
+| `/livez` 503 `batch_writer_dead` | A batch writer thread died by a panic, so resume data stops reaching the disk until a restart; `torrentd_batch_writer_deaths_total` counts it. systemd's watchdog and a kubelet's `livenessProbe` both restart the daemon; the panic's ERROR line says why it died. |
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, then recover each fenced profile as [Recovering a fenced profile](operations.md#recovering-a-fenced-profile) describes; fenced profiles do not resume themselves by design. A profile counted by `profiles_failed` (`status: "failed"`) never came up and has no session for `PATCH` to lift: bring its tunnel back, then restart. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |

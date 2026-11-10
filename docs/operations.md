@@ -398,6 +398,54 @@ off. To remove it now: `sudo nft delete table inet torrentd_ks_$(id -u torrentd)
   means a reader is holding a snapshot open, such as a long `sqlite3` session
   against the live file.
 
+## Storage the daemon runs on
+
+The boot checks the filesystems under the state and the pool before it takes
+the single-instance lock or opens anything.
+
+**The state directories.** The directories of `resume_dir`, `registry_path`
+and `[pool] db_path` (the state directory and wherever those keys move the
+databases) must be on a local filesystem: ext4, xfs, btrfs, zfs, or tmpfs for
+a scratch daemon. The boot `statfs`es each, or its nearest existing ancestor
+where it is still to be made, and refuses with exit `78` for:
+
+| Filesystem | Why |
+| --- | --- |
+| overlayfs | A container's writable layer: no volume is mounted there, so the registry, the pool index and the resume data are lost when the container is. |
+| NFS, CIFS/SMB, FUSE | SQLite runs both databases in WAL mode, which is unsafe over a network filesystem, and the instance `flock` becomes a lease that may not keep a second daemon out. |
+
+The refusal names each directory and its filesystem. Mount a volume with a
+local filesystem at the state directory (on Kubernetes, a `PersistentVolumeClaim`
+backed by block storage, not an NFS or SMB share), or point those keys at one.
+For a setup known to be safe anyway (a FUSE filesystem that honours POSIX
+locking and `fsync`, a single-writer NFS export you accept the risk of),
+`allow_unsupported_state_fs = true` starts the daemon. It then logs a WARN for
+each such directory, and `torrentd_state_fs_unsupported` is 1. The key is read
+at startup only.
+
+**The pool roots.** With `[pool] allow_mutations = true`, each root is probed
+at boot in a scratch directory, `.torrentd-mutation-probe`, which is removed
+again: a `renameat2(RENAME_NOREPLACE)`, one that must refuse to replace an
+existing name, and an `fsync` of the directory. Every relocate and delete
+step is built on those calls. A root that fails has its mutations disabled,
+alone:
+
+- a plan with a step inside it is refused when it is created
+  (`409 plan-refused`) and when it is applied, naming the root and the
+  failed call; a plan a crash left `applying` there stays `applying` and is
+  re-driven by the first boot after the root is fixed;
+- the boot logs a WARN naming the root and the reason;
+- `torrentd_pool_root_mutations_disabled{root,reason}` is 1, which
+  `TorrentdPoolRootMutationsDisabled` alerts on. Its `reason` is
+  `scratch_dir` (the probe directory could not be made, written in or
+  removed: a read-only mount, or one the daemon's user cannot write),
+  `rename_noreplace` (NFS, CIFS and many FUSE filesystems) or `dir_fsync`.
+
+The other roots keep taking plans. Move the root to a local filesystem, or
+set it back to read-only use, and restart. Read-only use of a root is allowed
+on any filesystem: with `allow_mutations = false` nothing is probed, and a
+root on NFS is scanned, matched and seeded from as before.
+
 ## Restart, recover, migrate
 
 ### Planned restart
@@ -682,6 +730,14 @@ every torrent in it, the monitor no longer probes it, `resume-all` refuses
 it, and adds into it answer `409 profile-unavailable`. Setting the profile
 online lifts the fence without a restart, and the other profiles stay on the
 network throughout.
+
+Nothing restarts the daemon for a fence on its own. With every profile
+fenced, `/readyz` (and `/healthz`) answers 503 `all_profiles_fenced`, which
+takes the daemon out of rotation, while `/livez` and the systemd watchdog
+stay healthy, so neither a kubelet's `livenessProbe` nor systemd restarts it
+(running.md §9, "Probes: Kubernetes and the systemd watchdog"). A liveness
+probe pointed at `/readyz` would restart it, with the costs the last
+paragraph of this section describes.
 
 1. Find out why its tunnel failed. The reason is on
    `torrentd_profile_vpn_fenced_total` and in the `VPN tunnel unhealthy` log

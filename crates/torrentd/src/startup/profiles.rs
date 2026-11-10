@@ -88,7 +88,13 @@ pub(super) fn boot_engine(
 /// A profile `desired` holds offline has its session paused as soon as it is
 /// built, before anything can give it a torrent.
 ///
+/// A profile `preflight` names a reason for is failed with that reason and
+/// never brought up: the host lacks something its tunnel needs
+/// (`vpn::preflight::refusal_for`), and a bring-up would fail on it with a
+/// message that does not say so.
+///
 /// `Err` only for a shutdown asked for between two profiles' bring-ups.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_profiles<F, E>(
     cfg: &Config,
     cleanup: &mut BootCleanup,
@@ -96,6 +102,7 @@ pub(super) async fn build_profiles<F, E>(
     metrics: &dyn MetricsSink,
     boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
     desired: &crate::profile_state::Record,
+    preflight: impl Fn(&ProfileConfig) -> Option<String>,
     mut make_engine: F,
 ) -> anyhow::Result<(Vec<ProfileEntry>, Vec<FailedProfile>)>
 where
@@ -121,6 +128,20 @@ where
         // A lagged receiver missed signals, so it counts as one too.
         if shutdown_requested(boot_shutdown) {
             anyhow::bail!("shutdown requested during profile bring-up");
+        }
+
+        if let Some(reason) = preflight(p) {
+            error!(
+                profile_id = %p.id,
+                reason = %reason,
+                "the host lacks what this profile's tunnel needs; profile disabled without a \
+                 bring-up",
+            );
+            failed_profiles.push(FailedProfile {
+                config: p.clone(),
+                reason,
+            });
+            continue;
         }
 
         // Keep the leases already negotiated alive across this bring-up. A
@@ -619,6 +640,17 @@ mod profile_construction_tests {
         forwarder: &MockForwarder,
         fail_engine_call: Option<usize>,
     ) -> Outcome {
+        build_after_preflight(cfg, vpn, forwarder, fail_engine_call, |_| None).await
+    }
+
+    /// [`build`], with the boot's preflight refusing what `preflight` names.
+    async fn build_after_preflight(
+        cfg: &Config,
+        vpn: &MockVpn,
+        forwarder: &MockForwarder,
+        fail_engine_call: Option<usize>,
+        preflight: impl Fn(&ProfileConfig) -> Option<String>,
+    ) -> Outcome {
         let vpn_for = vpn.clone();
         let mut cleanup = BootCleanup::with_vpn_factory(
             cfg.state_dir(),
@@ -637,6 +669,7 @@ mod profile_construction_tests {
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             &crate::profile_state::Record::default(),
+            preflight,
             move |settings: &Settings, state: Option<Vec<u8>>| {
                 let n = calls;
                 calls += 1;
@@ -698,6 +731,30 @@ mod profile_construction_tests {
             vec!["wg-a".to_string()],
             "the half-up tunnel is lowered",
         );
+    }
+
+    /// A profile the boot's preflight refuses is failed with the preflight's
+    /// reason and never brought up; the others carry on as before.
+    #[tokio::test]
+    async fn a_profile_the_preflight_refuses_is_failed_with_its_reason_and_never_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(
+            dir.path(),
+            &[vpn("acct_a", "wg-a", 1), host("public", false)],
+        );
+        let vpn = MockVpn::new();
+        let out = build_after_preflight(&cfg, &vpn, &MockForwarder::new(), None, |p| {
+            (p.id.as_str() == "acct_a")
+                .then(|| "preflight wireguard_kernel: the kernel has no WireGuard".to_string())
+        })
+        .await;
+        assert_eq!(out.up_ids(), vec!["public"]);
+        assert_eq!(
+            out.failed("acct_a").reason,
+            "preflight wireguard_kernel: the kernel has no WireGuard"
+        );
+        assert!(vpn.bring_up_calls().is_empty(), "no bring-up was attempted");
+        assert_eq!(out.built.len(), 1, "no session for the refused profile");
     }
 
     #[tokio::test]
@@ -1111,6 +1168,7 @@ mod profile_construction_tests {
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             &crate::profile_state::Record::default(),
+            |_: &ProfileConfig| None,
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 panic!("no session is built after a shutdown was asked for")
             },
@@ -1150,6 +1208,7 @@ mod profile_construction_tests {
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             &crate::profile_state::Record::default(),
+            |_: &ProfileConfig| None,
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 panic!("no session is built after a shutdown was missed")
             },
@@ -1195,6 +1254,7 @@ mod profile_construction_tests {
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             &states.current(),
+            |_: &ProfileConfig| None,
             move |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 let engine = Arc::new(MockEngine::new());
                 made.lock().unwrap().push(Arc::clone(&engine));
@@ -1244,6 +1304,7 @@ mod profile_construction_tests {
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             &record,
+            |_: &ProfileConfig| None,
             move |settings: &Settings,
                   state: Option<Vec<u8>>|
                   -> Result<Arc<dyn TorrentEngine>, String> {
@@ -1280,6 +1341,7 @@ mod profile_construction_tests {
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             &record,
+            |_: &ProfileConfig| None,
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 let engine = MockEngine::new();
                 engine.inject_error("pause_session", torrentd_engine::EngineError::Shutdown);

@@ -244,6 +244,7 @@ impl Config {
         }
 
         self.check_boot_rules()?;
+        self.validate_kill_switch_carveouts()?;
 
         // Shape before policy: every check above names something the operator
         // must change, and is reported before the posture, which operator
@@ -305,6 +306,109 @@ impl Config {
                      tunnel never comes up. The kill switch supports WireGuard profiles only.",
                     p.id.as_str(),
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a kill-switch carve-out that would be inert or would open a
+    /// path the ruleset exists to close:
+    ///
+    /// - either key without `network_kill_switch`, where nothing reads it;
+    /// - an API interface that is no interface name, or that is a profile's
+    ///   `vpn_interface`: a tunnel is already accepted from its own address,
+    ///   and an accept by name alone would let any of the daemon's sources
+    ///   out through it;
+    /// - an API interface beside a `unix:` `http_listen`, which has no port
+    ///   to let out;
+    /// - a DNS server inside a WireGuard profile's `Address` prefixes, or
+    ///   named by its `DNS` key: that resolver is reached through the
+    ///   tunnel, and a carve-out naming it
+    ///   would let the query out by the physical link once the tunnel is
+    ///   down. A config that cannot be read or parsed here is left to the
+    ///   profile's bring-up, which refuses it.
+    pub(super) fn validate_kill_switch_carveouts(&self) -> anyhow::Result<()> {
+        if !self.network_kill_switch {
+            for (key, set) in [
+                (
+                    "kill_switch_api_interfaces",
+                    !self.kill_switch_api_interfaces.is_empty(),
+                ),
+                (
+                    "kill_switch_dns_servers",
+                    !self.kill_switch_dns_servers.is_empty(),
+                ),
+            ] {
+                if set {
+                    anyhow::bail!(
+                        "{key} is set, but network_kill_switch is not, and {key} only \
+                         widens the kill switch's ruleset. Delete {key}, or set \
+                         network_kill_switch = true."
+                    );
+                }
+            }
+            return Ok(());
+        }
+        for iface in &self.kill_switch_api_interfaces {
+            if !ProfileConfig::is_valid_interface_name(iface) {
+                anyhow::bail!(
+                    "kill_switch_api_interfaces names {iface:?}, which is not an interface \
+                     name: it must be 1-15 characters of [A-Za-z0-9_=+.-], and not \".\", \
+                     \"..\", \"all\" or \"interfaces\""
+                );
+            }
+            if let Some(p) = self
+                .profile
+                .iter()
+                .find(|p| p.vpn_interface() == Some(iface.as_str()))
+            {
+                anyhow::bail!(
+                    "kill_switch_api_interfaces names {iface:?}, which is [[profile]] id = \
+                     \"{}\"'s vpn_interface. The kill switch already lets that tunnel carry \
+                     the API's replies from the tunnel's own address; a carve-out by name \
+                     would let the API port out through it from any address. Name the \
+                     interface the probes and scrapes arrive on (a pod's eth0), not a tunnel.",
+                    p.id.as_str(),
+                );
+            }
+        }
+        if !self.kill_switch_api_interfaces.is_empty() {
+            if let HttpListen::Unix(_) = self.http_listen {
+                anyhow::bail!(
+                    "kill_switch_api_interfaces is set, but http_listen = {} is a unix socket, \
+                     which no packet carries: there is no API port for the kill switch to let \
+                     out. Delete kill_switch_api_interfaces, or move http_listen to a TCP \
+                     address.",
+                    self.http_listen,
+                );
+            }
+        }
+        for server in &self.kill_switch_dns_servers {
+            for p in &self.profile {
+                let Some(tunnel) = p.vpn_tunnel() else {
+                    continue;
+                };
+                // Unreachable for OpenVPN: `check_boot_rules`, run first,
+                // refuses the kill switch beside any OpenVPN profile, and
+                // these keys are refused without the kill switch.
+                if tunnel.r#type != torrentd_engine::VpnType::Wireguard {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&tunnel.config_path) else {
+                    continue;
+                };
+                if let Some(line) = crate::vpn::wireguard_tunnel_holding(&text, *server) {
+                    anyhow::bail!(
+                        "kill_switch_dns_servers names {server}, which is inside [[profile]] \
+                         id = \"{}\"'s tunnel ({line} in {}). That resolver is \
+                         reached through the tunnel, and a carve-out naming it would let the \
+                         daemon's queries to it out by the physical link whenever the tunnel \
+                         is down. Name only resolvers outside every tunnel, such as the \
+                         cluster's DNS service.",
+                        p.id.as_str(),
+                        tunnel.config_path.display(),
+                    );
+                }
             }
         }
         Ok(())
@@ -513,5 +617,166 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+
+    use super::Config;
+    use super::HttpListen;
+
+    const KEY: &str = "SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=";
+
+    /// A config with the kill switch on over one WireGuard profile on `wg0`,
+    /// whose config file holds `Address = 10.2.0.2/24` and `DNS = 10.9.9.9`.
+    fn kill_switch(dir: &std::path::Path) -> Config {
+        kill_switch_with(dir, "")
+    }
+
+    /// [`kill_switch`], with `extra` among its top-level keys.
+    fn kill_switch_with(dir: &std::path::Path, extra: &str) -> Config {
+        let conf = dir.join("wg0.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[Interface]\nPrivateKey = {KEY}\nAddress = 10.2.0.2/24\nDNS = 10.9.9.9\n\n\
+                 [Peer]\nPublicKey = 9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=\n\
+                 AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.7:51820\n"
+            ),
+        )
+        .unwrap();
+        let toml = format!(
+            "default_save_path = \"/data\"\nresume_dir = \"/var/lib/torrentd/resume\"\n\
+             torrent_dir = \"/var/lib/torrentd/torrents\"\nallow_unauthenticated = true\n\
+             network_kill_switch = true\n{extra}\n\n[[profile]]\nid = \"acct_a\"\n\
+             network = \"vpn\"\nvpn_type = \"wireguard\"\nvpn_config = \"{}\"\n\
+             vpn_interface = \"wg0\"\nlisten_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
+             user_agent = \"ua-a\"\n",
+            conf.display(),
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate_kill_switch_carveouts().unwrap();
+        cfg
+    }
+
+    fn refusal(cfg: &Config) -> String {
+        format!("{:#}", cfg.validate_kill_switch_carveouts().unwrap_err())
+    }
+
+    #[test]
+    fn both_carve_outs_parse_from_toml_and_pass_beside_a_tcp_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let carved = kill_switch_with(
+            dir.path(),
+            "kill_switch_api_interfaces = [\"eth0\"]\n\
+             kill_switch_dns_servers = [\"10.43.0.10\", \"fd00:43::a\"]",
+        );
+        assert_eq!(carved.kill_switch_api_interfaces, ["eth0"]);
+        assert_eq!(
+            carved.kill_switch_dns_servers,
+            [
+                "10.43.0.10".parse::<IpAddr>().unwrap(),
+                "fd00:43::a".parse().unwrap()
+            ]
+        );
+        // Outside the tunnel's /24, and not its DNS: passes.
+        let mut cfg = carved;
+        cfg.kill_switch_dns_servers = vec!["10.2.1.1".parse().unwrap()];
+        cfg.validate_kill_switch_carveouts().unwrap();
+    }
+
+    #[test]
+    fn a_carve_out_without_the_kill_switch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for api in [true, false] {
+            let mut cfg = kill_switch(dir.path());
+            cfg.network_kill_switch = false;
+            let key = if api {
+                cfg.kill_switch_api_interfaces = vec!["eth0".into()];
+                "kill_switch_api_interfaces"
+            } else {
+                cfg.kill_switch_dns_servers = vec!["10.43.0.10".parse().unwrap()];
+                "kill_switch_dns_servers"
+            };
+            let msg = refusal(&cfg);
+            assert!(
+                msg.contains(key) && msg.contains("network_kill_switch"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_api_interface_that_is_a_tunnel_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = kill_switch(dir.path());
+        cfg.kill_switch_api_interfaces = vec!["eth0".into(), "wg0".into()];
+        let msg = refusal(&cfg);
+        assert!(msg.contains("\"wg0\"") && msg.contains("acct_a"), "{msg}");
+    }
+
+    #[test]
+    fn an_api_interface_that_is_no_interface_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = kill_switch(dir.path());
+        cfg.kill_switch_api_interfaces = vec!["eth0\" accept".into()];
+        assert!(refusal(&cfg).contains("not an interface name"));
+    }
+
+    #[test]
+    fn an_api_interface_beside_a_unix_listener_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = kill_switch(dir.path());
+        cfg.kill_switch_api_interfaces = vec!["eth0".into()];
+        cfg.http_listen = HttpListen::Unix("/run/torrentd/api.sock".into());
+        let msg = refusal(&cfg);
+        assert!(msg.contains("unix socket"), "{msg}");
+    }
+
+    #[test]
+    fn a_dns_server_inside_a_tunnel_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (server, line) in [
+            ("10.2.0.1", "Address = 10.2.0.2/24"),
+            ("10.9.9.9", "DNS = 10.9.9.9"),
+        ] {
+            let mut cfg = kill_switch(dir.path());
+            cfg.kill_switch_dns_servers =
+                vec!["10.43.0.10".parse().unwrap(), server.parse().unwrap()];
+            let msg = refusal(&cfg);
+            assert!(
+                msg.contains(server) && msg.contains(line) && msg.contains("acct_a"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// A provider's config, as ProtonVPN ships it: a comment line and a blank
+    /// line inside `[Interface]` ahead of its `DNS` line. Both are skipped as
+    /// the link's own parser skips them, so the `DNS` line is still in
+    /// `[Interface]` and its resolver is still refused.
+    #[test]
+    fn a_dns_server_after_a_comment_or_blank_line_in_interface_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = kill_switch(dir.path());
+        let conf = dir.path().join("wg0.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[Interface]\n# Key for acct_a\n# Bouncing = 1\nPrivateKey = {KEY}\n\
+                 Address = 10.2.0.2/32\n\n  # NetShield = 0\nDNS = 10.2.0.1\n\n\
+                 [Peer]\n# NL#1\nPublicKey = 9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=\n\
+                 AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.7:51820\n"
+            ),
+        )
+        .unwrap();
+        cfg.kill_switch_dns_servers = vec!["10.2.0.1".parse().unwrap()];
+        let msg = refusal(&cfg);
+        assert!(
+            msg.contains("10.2.0.1") && msg.contains("DNS = 10.2.0.1") && msg.contains("acct_a"),
+            "{msg}"
+        );
     }
 }

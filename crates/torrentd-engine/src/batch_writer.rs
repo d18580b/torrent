@@ -161,6 +161,8 @@ struct Shared {
     /// [`BatchWriter::flush`] do not run at once.
     io: Mutex<()>,
     stop: AtomicBool,
+    /// Set by the writer thread as it dies by a panic. See [`DeathWatch`].
+    dead: AtomicBool,
     on_error: Option<WriteErrorHook>,
 }
 
@@ -187,13 +189,17 @@ impl BatchWriter {
             wake: Condvar::new(),
             io: Mutex::new(()),
             stop: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
             on_error,
         });
         let thread = thread::Builder::new()
             .name(name.into())
             .spawn({
                 let shared = Arc::clone(&shared);
-                move || run(&shared)
+                move || {
+                    let _watch = DeathWatch(&shared);
+                    run(&shared)
+                }
             })
             .expect("spawn batch writer thread");
         Self {
@@ -264,6 +270,13 @@ impl BatchWriter {
         self.shared.pending.lock().by_path.len()
     }
 
+    /// Whether the writer thread is still running: false once it has died
+    /// by a panic. A dead writer takes no more batches, so what is queued
+    /// reaches the disk only through [`BatchWriter::flush`].
+    pub fn is_alive(&self) -> bool {
+        !self.shared.dead.load(Ordering::SeqCst)
+    }
+
     /// Run `f` with no batch in progress and none starting until it returns.
     pub(crate) fn between_batches<R>(&self, f: impl FnOnce() -> R) -> R {
         let _io = self.shared.io.lock();
@@ -330,8 +343,59 @@ impl Drop for BatchWriter {
             self.shared.wake.notify_all();
         }
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let name = t.thread().name().unwrap_or("batch writer").to_owned();
+            if t.join().is_err() {
+                // `DeathWatch` reported the death when it happened; this says
+                // what it cost, now that the writer is being let go of.
+                tracing::error!(
+                    target: "torrentd_engine::batch_writer",
+                    thread = %name,
+                    pending = self.shared.pending.lock().by_path.len(),
+                    "the batch writer thread had died by a panic; writes queued since then \
+                     reached the disk only where a flush wrote them",
+                );
+            }
         }
+    }
+}
+
+/// Every batch writer thread that has died by a panic in this process.
+static WRITER_DEATHS: AtomicU64 = AtomicU64::new(0);
+
+/// How many batch writer threads have died by a panic in this process. A
+/// writer never comes back from one, so any nonzero count means some store's
+/// queued writes have stopped reaching the disk: the liveness a probe reads.
+/// Process-wide for the reason [`dir_fsync_errors`] is; the exporter reads
+/// it at scrape time as `batch_writer_deaths_total`.
+pub fn writer_deaths() -> u64 {
+    WRITER_DEATHS.load(Ordering::Relaxed)
+}
+
+/// Held by the writer thread for its whole life. Dropped while the thread
+/// unwinds from a panic, it marks the writer dead, counts it in
+/// [`writer_deaths`] and logs it at ERROR, at the moment it happens: the
+/// thread is joined only when the writer is dropped, at shutdown, and until
+/// then nothing else would notice that resume saves had stopped.
+struct DeathWatch<'a>(&'a Shared);
+
+impl Drop for DeathWatch<'_> {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        self.0.dead.store(true, Ordering::SeqCst);
+        WRITER_DEATHS.fetch_add(1, Ordering::Relaxed);
+        // `try_lock`: the queue's lock is released by the time this runs,
+        // since its guard lived in a frame the unwind has already left, but
+        // a count is not worth a deadlock if it were not.
+        let pending = self.0.pending.try_lock().map(|p| p.by_path.len());
+        tracing::error!(
+            target: "torrentd_engine::batch_writer",
+            thread = thread::current().name().unwrap_or("batch writer"),
+            pending = ?pending,
+            "the batch writer thread died by a panic; queued writes no longer reach the disk \
+             until the shutdown drain flushes them, so restart the daemon",
+        );
     }
 }
 
@@ -982,5 +1046,44 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A writer thread that panics (here, in the error hook it calls for a
+    /// write whose directory is a file) is reported dead as it dies, counted
+    /// in `writer_deaths`, and dropping it later checks the join rather than
+    /// panicking on it. What it had queued still lands through `flush`.
+    #[test]
+    fn a_writer_that_panics_is_reported_dead_and_counted() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, b"").unwrap();
+        let hook: WriteErrorHook = Arc::new(|_, _, e| panic!("hook refused: {e}"));
+        let before = writer_deaths();
+        let w = BatchWriter::spawn("test-writer", Some(hook));
+        assert!(w.is_alive());
+        w.enqueue(
+            file.join("a.resume"),
+            &ProfileId::new("p"),
+            &ih(1),
+            b"never",
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while w.is_alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer thread did not die within 60s"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(writer_deaths() > before, "the death is counted");
+
+        let path = dir.path().join("b.resume");
+        w.enqueue(path.clone(), &ProfileId::new("p"), &ih(2), b"flushed");
+        // Dropped from the queue, so the flush does not run the hook on it
+        // again; its unlink fails, the path's parent being a file.
+        let _ = w.delete_now(&file.join("a.resume"));
+        w.flush();
+        assert_eq!(fs::read(&path).unwrap(), b"flushed");
+        drop(w);
     }
 }

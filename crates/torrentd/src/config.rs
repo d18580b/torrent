@@ -7,6 +7,7 @@
 //! restart.
 
 use std::fs;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
@@ -170,7 +171,7 @@ pub struct Config {
     pub http_socket_group: Option<String>,
 
     /// Peers whose forwarding headers are believed, as IPs or CIDR blocks:
-    /// the address the reverse proxy connects from, and only that, since
+    /// the addresses the reverse proxies connect from, and only those, since
     /// anything listed can claim to be any client. Empty by default, so no
     /// forwarding header is read and the socket peer is the client. See
     /// `http::forwarded` and `LoginThrottle`.
@@ -190,6 +191,15 @@ pub struct Config {
     /// Refused beside `[auth]`, where nothing reads it.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+
+    /// Start even though a state directory (that of `resume_dir`,
+    /// `registry_path` or `[pool] db_path`) is on overlayfs, NFS, CIFS/SMB or
+    /// FUSE, which the boot otherwise refuses with exit 78: overlayfs loses
+    /// the state with the container, and SQLite's WAL and the instance lock
+    /// are unsafe over the others. Set, the boot logs a WARN and
+    /// `state_fs_unsupported` is 1. For a setup known to be safe anyway.
+    #[serde(default)]
+    pub allow_unsupported_state_fs: bool,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
 
@@ -246,6 +256,29 @@ pub struct Config {
     /// OpenVPN profile. See `vpn::killswitch` for what that leaves runnable.
     #[serde(default)]
     pub network_kill_switch: bool,
+
+    /// Interfaces the kill switch lets the control API's replies leave by:
+    /// `meta skuid <uid> oifname "<if>" tcp sport <http_listen port> accept`
+    /// for each. For a pod, where kubelet's probes, a Prometheus scrape and
+    /// Ingress reach the API on `eth0` and the ruleset would otherwise drop
+    /// every reply. Only the API listener's source port is let out, and only
+    /// by these interfaces. Restart-only. Refused without
+    /// `network_kill_switch`, beside a `unix:` `http_listen`, and naming any
+    /// profile's `vpn_interface`.
+    #[serde(default)]
+    pub kill_switch_api_interfaces: Vec<String>,
+
+    /// Resolvers the kill switch lets the daemon's DNS reach outside the
+    /// tunnels: `meta skuid <uid> ip daddr <server> udp dport 53 accept`, and
+    /// the TCP equivalent, for each. For a pod, whose `/etc/resolv.conf`
+    /// names the cluster resolver on `eth0`. Every tracker hostname the
+    /// daemon looks up is then visible to these resolvers and to whatever
+    /// they forward to; the boot says so in a WARN, and
+    /// `kill_switch_dns_exempt` is 1. Restart-only. Refused without
+    /// `network_kill_switch`, and for an address inside a WireGuard
+    /// profile's `Address` prefixes or named by its `DNS` key.
+    #[serde(default)]
+    pub kill_switch_dns_servers: Vec<IpAddr>,
 
     /// `[[profile]]` array. Empty is refused: `ProfileConfigError::NoProfiles`.
     /// There is no implicit profile, because the only thing an implicit one
@@ -334,6 +367,20 @@ const TOP_LEVEL_FINGERPRINT: &str = "top-level peer_fingerprint";
 impl Config {
     fn default_http_listen() -> HttpListen {
         HttpListen::Tcp(SocketAddr::from(([127, 0, 0, 1], 8080)))
+    }
+
+    /// The kill switch's named exceptions: the API's replies from the
+    /// `http_listen` port by `kill_switch_api_interfaces`, and DNS to
+    /// `kill_switch_dns_servers`. Empty with the kill switch off.
+    pub fn kill_switch_carveouts(&self) -> crate::vpn::killswitch::Carveouts {
+        if !self.network_kill_switch {
+            return crate::vpn::killswitch::Carveouts::default();
+        }
+        crate::vpn::killswitch::Carveouts::new(
+            self.http_listen.tcp().map(|a| a.port()),
+            &self.kill_switch_api_interfaces,
+            &self.kill_switch_dns_servers,
+        )
     }
 
     /// The mode a `unix:` `http_listen` socket is created with.
@@ -527,6 +574,7 @@ impl Config {
             http_socket_group: None,
             allow_unauthenticated: true,
             allowed_hosts: vec![],
+            allow_unsupported_state_fs: false,
             log_level: Self::default_log_level(),
             registry_path: None,
             connections_limit: None,
@@ -541,6 +589,8 @@ impl Config {
             vpn_handshake_max_age_secs: Self::default_handshake_max_age(),
             shutdown_drain_secs: Self::default_shutdown_drain_secs(),
             network_kill_switch: false,
+            kill_switch_api_interfaces: vec![],
+            kill_switch_dns_servers: vec![],
             profile: vec![],
             auth: None,
             pool: Some(PoolConfig {

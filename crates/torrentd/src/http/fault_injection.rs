@@ -512,7 +512,7 @@ fn engine(state: &AppState, profile_id: &str) -> Result<Arc<FaultEngine>, FaultE
 /// sample is one the real code could have written.
 fn catalogued_value(series: &str, pointer: &str, value: &str) -> Result<&'static str, FaultError> {
     let values = crate::metrics_sink::catalogued(series)
-        .and_then(|s| s.label)
+        .and_then(|s| s.label())
         .map(|(_, values)| values)
         .unwrap_or_default();
     values

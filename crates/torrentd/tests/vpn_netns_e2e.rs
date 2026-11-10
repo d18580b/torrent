@@ -27,7 +27,8 @@
 //! namespace, per family: those counts are the leaks, and they must stay 0.
 //!
 //! Needs `ip`, `wg`, `nft`, `unshare` (util-linux 2.38 or later, for
-//! `--map-user`) and `nsenter`, an `/etc/wireguard` directory to mount a
+//! `--map-user`), `nsenter` and `setpriv`, `setcap` (libcap) for the
+//! file-capability case, an `/etc/wireguard` directory to mount a
 //! tmpfs over (`wireguard-tools` ships one), and a kernel that lets this user
 //! create user namespaces and WireGuard links; so they are ignored by
 //! default.
@@ -129,6 +130,81 @@ fn in_own_namespace(test: &str) -> bool {
         String::from_utf8_lossy(&out.stderr),
     );
     false
+}
+
+/// Where the re-run [`in_file_capability_namespace`] makes finds the copy of
+/// the daemon that carries the file capability.
+const CAP_BIN: &str = "TORRENTD_TEST_CAP_BIN";
+
+/// [`in_own_namespace`], one user namespace deeper, with a copy of the
+/// daemon carrying the file capability `cap_net_admin+p`, as
+/// `deploy/Containerfile` sets it. Returns that copy's path in the re-run.
+///
+/// The outer namespace maps this user to root, and there mounts a tmpfs,
+/// copies the daemon onto it and runs `setcap`; the test then runs as uid
+/// [`UID`] in a namespace that outer root created. Both levels are needed: a
+/// file capability is honoured only in a namespace whose root, or an
+/// ancestor's, owns it, and the one [`in_own_namespace`] makes maps no root.
+/// The test keeps its own capabilities as before, to build the topology, but
+/// an `execve` of a binary with a file capability clears the ambient set, so
+/// the daemon holds `CAP_NET_ADMIN` from the file and from nothing else.
+fn in_file_capability_namespace(test: &str) -> Option<std::path::PathBuf> {
+    if std::env::var_os(IN_NAMESPACE).is_some() {
+        let bin = std::env::var_os(CAP_BIN).expect("set by the launcher");
+        return Some(bin.into());
+    }
+    let capdir = tempfile::tempdir().unwrap();
+    let setup = "set -eu\n\
+                 mount -t tmpfs -o mode=0755 torrentd-cap \"$1\"\n\
+                 cp \"$2\" \"$1/torrentd\"\n\
+                 setcap cap_net_admin+p \"$1/torrentd\"\n\
+                 shift 2\n\
+                 exec \"$@\"\n";
+    let out = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "--"])
+        .args(["sh", "-c", setup, "sh"])
+        .arg(capdir.path())
+        .arg(env!("CARGO_BIN_EXE_torrentd"))
+        .args([
+            "unshare",
+            "--user",
+            &format!("--map-user={UID}"),
+            &format!("--map-group={UID}"),
+            "--net",
+            "--mount",
+            "--keep-caps",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(IN_NAMESPACE, "1")
+        .env(CAP_BIN, capdir.path().join("torrentd"))
+        .output()
+        .expect("run unshare");
+    assert!(
+        out.status.success(),
+        "the run inside the namespace failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    None
+}
+
+/// One capability set of process `pid`, from its `/proc/<pid>/status`.
+fn cap_set(pid: u32, line: &str) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix(line))
+        .unwrap_or_else(|| panic!("no {line} in {status}"))
+        .trim();
+    u64::from_str_radix(hex, 16).unwrap()
 }
 
 /// Run `cmd` through `sh -c`, asserting it succeeds; its trimmed stdout.
@@ -377,12 +453,25 @@ EOF",
 /// Minimal blocking HTTP/1.1 client: `(status, body)`, or the error that
 /// kept an answer from arriving.
 fn try_http(method: &str, path: &str, body: Option<&str>) -> std::io::Result<(u16, String)> {
-    let mut stream = TcpStream::connect(HTTP)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    try_http_at(HTTP, method, path, body, "", Duration::from_secs(10))
+}
+
+/// [`try_http`] to `addr`, with `headers` (each line ending `\r\n`) added and
+/// `wait` as the read timeout.
+fn try_http_at(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    headers: &str,
+    wait: Duration,
+) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(wait))?;
     let body = body.unwrap_or("");
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )?;
@@ -447,50 +536,20 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Write `dir/cfg.toml` — the kill switch on, and one vpn profile on
-    /// [`WG`] carrying `profile_extra` — spawn the daemon on it, and wait for
-    /// the profile to come up on its tunnel.
+    /// Write `dir/cfg.toml` ([`write_config`]), spawn the daemon on it, and
+    /// wait for the profile to come up on its tunnel.
     fn start(dir: &std::path::Path, profile_extra: &str) -> Self {
-        for sub in ["data", "resume", "torrents"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
-        let cfg = dir.join("cfg.toml");
-        std::fs::write(
-            &cfg,
-            format!(
-                "default_save_path = \"{d}/data\"\n\
-                 resume_dir = \"{d}/resume\"\n\
-                 torrent_dir = \"{d}/torrents\"\n\
-                 http_listen = \"{HTTP}\"\n\
-                 log_level = \"info\"\n\
-                 allow_unauthenticated = true\n\
-                 network_kill_switch = true\n\
-                 \n\
-                 [[profile]]\n\
-                 id = \"{PROFILE}\"\n\
-                 network = \"vpn\"\n\
-                 vpn_type = \"wireguard\"\n\
-                 vpn_config = \"{wg}\"\n\
-                 vpn_interface = \"{WG}\"\n\
-                 peer_fingerprint = \"-qB5030-\"\n\
-                 user_agent = \"qBittorrent/5.0.3\"\n\
-                 allowed_tracker_domains = [\"{PEER_TUNNEL}\", \"{PEER_TUNNEL_V6}\"]\n\
-                 {profile_extra}\n",
-                d = dir.display(),
-                wg = wg_config(),
-            ),
+        Self::start_from(
+            std::path::Path::new(env!("CARGO_BIN_EXE_torrentd")),
+            dir,
+            profile_extra,
         )
-        .unwrap();
-        let log = dir.join("daemon.log");
-        let out = std::fs::File::create(&log).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
-            .arg("--config")
-            .arg(&cfg)
-            .stdout(out.try_clone().unwrap())
-            .stderr(out)
-            .spawn()
-            .expect("spawn the daemon");
-        let mut daemon = Self { child, log };
+    }
+
+    /// [`Daemon::start`], running the daemon from `bin`.
+    fn start_from(bin: &std::path::Path, dir: &std::path::Path, profile_extra: &str) -> Self {
+        let cfg = write_config(dir, profile_extra);
+        let mut daemon = Self::spawn(bin, dir, &cfg);
         poll(
             "the profile to come up on its tunnel",
             Duration::from_secs(60),
@@ -507,6 +566,69 @@ impl Daemon {
         daemon
     }
 
+    /// Spawn the daemon from `bin` on `cfg`, its output in `dir/daemon.log`,
+    /// and wait for nothing.
+    fn spawn(bin: &std::path::Path, dir: &std::path::Path, cfg: &std::path::Path) -> Self {
+        let log = dir.join("daemon.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let child = Command::new(bin)
+            .arg("--config")
+            .arg(cfg)
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .spawn()
+            .expect("spawn the daemon");
+        Self { child, log }
+    }
+}
+
+/// Write `dir/cfg.toml` — the kill switch on, and one vpn profile on [`WG`]
+/// carrying `profile_extra` — with the directories it names, and return its
+/// path.
+fn write_config(dir: &std::path::Path, profile_extra: &str) -> std::path::PathBuf {
+    write_config_top(
+        dir,
+        &format!("http_listen = \"{HTTP}\"\nallow_unauthenticated = true"),
+        profile_extra,
+    )
+}
+
+/// [`write_config`], with `top` in place of its `http_listen` and
+/// authentication lines.
+fn write_config_top(dir: &std::path::Path, top: &str, profile_extra: &str) -> std::path::PathBuf {
+    for sub in ["data", "resume", "torrents"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let cfg = dir.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "default_save_path = \"{d}/data\"\n\
+                 resume_dir = \"{d}/resume\"\n\
+                 torrent_dir = \"{d}/torrents\"\n\
+                 log_level = \"info\"\n\
+                 network_kill_switch = true\n\
+                 {top}\n\
+                 \n\
+                 [[profile]]\n\
+                 id = \"{PROFILE}\"\n\
+                 network = \"vpn\"\n\
+                 vpn_type = \"wireguard\"\n\
+                 vpn_config = \"{wg}\"\n\
+                 vpn_interface = \"{WG}\"\n\
+                 peer_fingerprint = \"-qB5030-\"\n\
+                 user_agent = \"qBittorrent/5.0.3\"\n\
+                 allowed_tracker_domains = [\"{PEER_TUNNEL}\", \"{PEER_TUNNEL_V6}\"]\n\
+                 {profile_extra}\n",
+            d = dir.display(),
+            wg = wg_config(),
+        ),
+    )
+    .unwrap();
+    cfg
+}
+
+impl Daemon {
     /// SIGTERM, and wait for the exit.
     fn stop(&mut self) {
         sh(&format!("kill -TERM {}", self.child.id()));
@@ -1227,4 +1349,367 @@ fn vpn_netns_e2e_no_leak_across_a_crash_and_restart() {
     assert!(!tunnel_standing(), "the tunnel is removed on stop");
     assert_torn_down_in_order(&daemon.log);
     peer.assert_no_leak(base, "across the clean stop after the restart");
+}
+
+/// The container's privilege model: the daemon runs as a non-root uid with
+/// `CAP_NET_ADMIN` from its binary's file capability alone, no ambient grant
+/// from outside, and still raises its WireGuard link and installs its kill
+/// switch, because it hands the capability to the `ip`, `wg` and `nft` it
+/// runs. Without that hand-off each of them runs with nothing, and the
+/// profile never comes up.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare, nsenter and setcap, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_file_capability_alone_raises_the_tunnel_and_the_kill_switch() {
+    let Some(bin) = in_file_capability_namespace(
+        "vpn_netns_e2e_file_capability_alone_raises_the_tunnel_and_the_kill_switch",
+    ) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let _peer = topology(p);
+
+    let mut daemon = Daemon::start_from(&bin, p, &format!("listen_port = {LISTEN_PORT}"));
+    let pid = daemon.child.id();
+    let net_admin = 1u64 << 12;
+    assert_eq!(
+        cap_set(pid, "CapPrm:"),
+        net_admin,
+        "the daemon holds CAP_NET_ADMIN and nothing else, from the file"
+    );
+    assert_eq!(
+        cap_set(pid, "CapAmb:"),
+        0,
+        "no ambient grant: the tools get it only through the daemon's own raise"
+    );
+    assert_eq!(metric("torrentd_kill_switch_active"), Some(1.0));
+    assert!(table_listed(), "the kill switch table is installed");
+    assert!(tunnel_standing(), "the daemon raised its WireGuard link");
+    let log = std::fs::read_to_string(&daemon.log).unwrap();
+    assert!(
+        log.contains("came from the binary's file capability"),
+        "the boot says how it holds the capability: {log}"
+    );
+
+    daemon.stop();
+    assert!(!table_listed(), "the kill switch table is removed on stop");
+    assert!(!tunnel_standing(), "the tunnel is removed on stop");
+}
+
+/// Without `CAP_NET_ADMIN` a vpn profile with the kill switch exits 78, the
+/// status `RestartPreventExitStatus=78` and a container's restart policy read
+/// as the configuration's, naming both ways to grant it, before anything is
+/// raised.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_without_the_capability_exits_78_naming_both_fixes() {
+    if !in_own_namespace("vpn_netns_e2e_without_the_capability_exits_78_naming_both_fixes") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_config(dir.path(), &format!("listen_port = {LISTEN_PORT}"));
+    // The test holds every capability as ambient; the daemon is run with
+    // none, as a pod without `add: [NET_ADMIN]` runs it.
+    let out = Command::new("setpriv")
+        .args(["--inh-caps=-all", "--ambient-caps=-all", "--"])
+        .arg(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .expect("run setpriv");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(78), "{text}");
+    for needle in [
+        "CAP_NET_ADMIN",
+        "AmbientCapabilities=CAP_NET_ADMIN",
+        "securityContext",
+        "allowPrivilegeEscalation: true",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    assert!(!tunnel_standing(), "nothing was raised");
+    assert!(!table_listed(), "nothing was installed");
+}
+
+/// An `nft` that is installed but whose `nft list tables` fails, as one
+/// without the kernel's nf_tables does: `--check-config` refuses it with 78,
+/// and the boot fails with 70 at the preflight, naming `nft_runs`, before it
+/// raises the tunnel the topology is ready for. Without the preflight the
+/// boot raised every tunnel and only then failed to install the kill switch.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_a_kill_switch_whose_nft_does_not_run_is_refused_before_any_tunnel() {
+    if !in_own_namespace(
+        "vpn_netns_e2e_a_kill_switch_whose_nft_does_not_run_is_refused_before_any_tunnel",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let _peer = topology(p);
+    let cfg = write_config(p, &format!("listen_port = {LISTEN_PORT}"));
+
+    // First on the daemon's `PATH`: answers `--version`, so `nft` counts as
+    // installed, and fails everything else.
+    let fake = p.join("fake-nft");
+    std::fs::create_dir_all(&fake).unwrap();
+    let nft = fake.join("nft");
+    std::fs::write(
+        &nft,
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && { echo 'nftables v1.0.9'; exit 0; }\n\
+         echo 'netlink: Error: cache initialization failed: Operation not supported' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&nft, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    for (check, code) in [(true, 78), (false, 70)] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_torrentd"));
+        cmd.arg("--config").arg(&cfg).env("PATH", &path);
+        if check {
+            cmd.arg("--check-config");
+        }
+        let out = cmd.output().expect("run the daemon");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "--check-config: {check}; {text}"
+        );
+        for needle in ["preflight nft_runs", "Operation not supported"] {
+            assert!(
+                text.contains(needle),
+                "--check-config: {check}; {needle}: {text}"
+            );
+        }
+        assert!(
+            !tunnel_standing(),
+            "--check-config: {check}; no tunnel was raised"
+        );
+        assert!(
+            !table_listed(),
+            "--check-config: {check}; nothing was installed"
+        );
+    }
+}
+
+/// The scrape credential the cluster test's `[auth]` holds, shaped as
+/// `new-token` prints one.
+const METRICS_TOKEN: &str = "tdp_e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0";
+/// A second physical link, which no carve-out names.
+const OTHER_HOST_V4: &str = "10.10.0.1";
+const OTHER_PEER_V4: &str = "10.10.0.2";
+/// An address on the peer's side of the physical link that is no resolver
+/// the config names, though it answers on port 53.
+const UNNAMED_RESOLVER: &str = "10.9.0.3";
+
+/// `f`'s result, run on a thread of its own inside the peer namespace.
+fn in_peer<T: Send + 'static>(peer: &Peer, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    peer.spawn(move || tx.send(f()).unwrap());
+    rx.recv().unwrap()
+}
+
+/// Answer every UDP datagram to port `port` on any address of the peer
+/// namespace with its own bytes, and every TCP connection to it with `ok`.
+fn resolver(peer: &Peer, port: u16) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    peer.spawn(move || {
+        let sock = UdpSocket::bind(("0.0.0.0", port));
+        tx.send(sock.as_ref().map(|_| ()).map_err(|e| e.to_string()))
+            .unwrap();
+        let Ok(sock) = sock else { return };
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let _ = sock.send_to(&buf[..n], from);
+        }
+    });
+    rx.recv()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("bind udp {port} in the peer namespace: {e}"));
+    peer.serve_tcp(SocketAddr::from(([0, 0, 0, 0], port)), |mut conn| {
+        let _ = conn.write_all(b"ok");
+    });
+}
+
+/// Whether this uid's datagram to `to` is answered within two seconds.
+fn udp_answered(to: &str) -> bool {
+    let sock = UdpSocket::bind((HOST_V4, 0)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let _ = sock.send_to(b"q", to);
+    let mut buf = [0u8; 8];
+    sock.recv_from(&mut buf).is_ok()
+}
+
+/// Whether this uid's TCP connection to `to` is answered with `ok` within
+/// two seconds. The kernel answers a SYN with no socket of the uid's
+/// attached, so only the bytes after it say whether the uid's own packets
+/// leave.
+fn tcp_answered(to: &str) -> bool {
+    let Ok(mut conn) = TcpStream::connect_timeout(&to.parse().unwrap(), Duration::from_secs(2))
+    else {
+        return false;
+    };
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 2];
+    conn.read_exact(&mut buf).is_ok() && &buf == b"ok"
+}
+
+/// The kill switch's carve-outs for a cluster, in a real kernel: with
+/// `kill_switch_api_interfaces = ["veth-ks"]` and `kill_switch_dns_servers`
+/// naming the peer's address,
+///
+/// (a) a probe of `/healthz` and a scrape of `/metrics` from outside the
+///     daemon's namespace, on `veth-ks`, are answered, and both report the
+///     DNS carve-out;
+/// (b) this uid's DNS to the named resolver is answered, over UDP and TCP;
+/// (c) every other egress of the uid outside the tunnel is still dropped:
+///     the API's replies on an interface no carve-out names, port 53 to an
+///     address the config does not name, another port to the named
+///     resolver, and any other datagram, none of which reach the physical
+///     link.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_cluster_carve_outs_let_out_the_api_and_dns_and_nothing_else() {
+    if !in_own_namespace(
+        "vpn_netns_e2e_cluster_carve_outs_let_out_the_api_and_dns_and_nothing_else",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let peer = topology(p);
+    sh(&format!(
+        "ip link add veth-ks2 type veth peer name veth-peer2 netns {} && \
+         ip addr add {OTHER_HOST_V4}/24 dev veth-ks2 && ip link set veth-ks2 up",
+        peer.pid
+    ));
+    peer.sh(&format!(
+        "ip addr add {OTHER_PEER_V4}/24 dev veth-peer2; ip link set veth-peer2 up; \
+         ip addr add {UNNAMED_RESOLVER}/24 dev veth-peer"
+    ));
+    resolver(&peer, 53);
+    resolver(&peer, 5353);
+
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        METRICS_TOKEN.as_bytes(),
+    ));
+    // A routable bind takes `[auth]`; no test logs in, so any password does.
+    let password_hash = argon2::PasswordHasher::hash_password(
+        &argon2::Argon2::default(),
+        b"unused",
+        &argon2::password_hash::SaltString::from_b64("dnBuLW5ldG5zLWUyZQ").unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    let top = format!(
+        "http_listen = \"0.0.0.0:8080\"\n\
+         kill_switch_api_interfaces = [\"veth-ks\"]\n\
+         kill_switch_dns_servers = [\"{PEER_V4}\"]\n\
+         [auth]\n\
+         password_hash = \"{password_hash}\"\n\
+         [[auth.token]]\n\
+         name = \"scrape\"\n\
+         sha256 = \"{sha}\"\n\
+         scopes = [\"metrics\"]"
+    );
+    let cfg = write_config_top(p, &top, &format!("listen_port = {LISTEN_PORT}"));
+    let mut daemon = Daemon::spawn(
+        std::path::Path::new(env!("CARGO_BIN_EXE_torrentd")),
+        p,
+        &cfg,
+    );
+    poll(
+        "the daemon to report ready",
+        Duration::from_secs(60),
+        || {
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                panic!("the daemon exited {status} before it was ready");
+            }
+            let (code, _) = try_http("GET", "/healthz", None).ok()?;
+            (code == 200).then_some(())
+        },
+    );
+    assert!(table_listed(), "the kill switch table is installed");
+    let log = std::fs::read_to_string(&daemon.log).unwrap();
+    assert!(
+        log.contains("tracker hostname") && log.contains(PEER_V4),
+        "the boot warns, naming the resolver: {log}"
+    );
+
+    // (a) From the peer, over veth-ks: the probe and the scrape.
+    let api = format!("{HOST_V4}:8080");
+    let auth = format!("Authorization: Bearer {METRICS_TOKEN}\r\n");
+    let (health, metrics) = in_peer(&peer, move || {
+        let wait = Duration::from_secs(10);
+        (
+            try_http_at(&api, "GET", "/healthz", None, "", wait),
+            try_http_at(&api, "GET", "/metrics", None, &auth, wait),
+        )
+    });
+    let (code, body) = health.expect("the probe is answered over veth-ks");
+    assert_eq!(code, 200, "{body}");
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["kill_switch_dns_exempt"], true, "{body}");
+    let (code, text) = metrics.expect("the scrape is answered over veth-ks");
+    assert_eq!(code, 200, "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.trim() == "torrentd_kill_switch_dns_exempt 1"),
+        "{text}"
+    );
+
+    // (c) The API's reply on veth-ks2, which no carve-out names: the
+    // connection opens, as the kernel answers the SYN, and the reply from
+    // the daemon's socket never leaves.
+    let other = format!("{OTHER_HOST_V4}:8080");
+    let unnamed = in_peer(&peer, move || {
+        try_http_at(&other, "GET", "/healthz", None, "", Duration::from_secs(3))
+    });
+    assert!(
+        unnamed.as_ref().map_or(true, |(code, _)| *code == 0),
+        "the API answered on an interface no carve-out names: {unnamed:?}"
+    );
+
+    // (b) This uid's DNS to the named resolver, both protocols.
+    assert!(
+        udp_answered(&format!("{PEER_V4}:53")),
+        "DNS over UDP to the named resolver"
+    );
+    assert!(
+        tcp_answered(&format!("{PEER_V4}:53")),
+        "DNS over TCP to the named resolver"
+    );
+
+    // (c) Everything else the uid sends outside the tunnel: dropped before
+    // the physical link, so the peer counts none of it.
+    let base = peer.leaks();
+    for to in [
+        format!("{UNNAMED_RESOLVER}:53"),
+        format!("{PEER_V4}:5353"),
+        format!("{PEER_V4}:9"),
+    ] {
+        assert!(!udp_answered(&to), "udp to {to} left by the physical link");
+    }
+    for to in [format!("{UNNAMED_RESOLVER}:53"), format!("{PEER_V4}:5353")] {
+        assert!(!tcp_answered(&to), "tcp to {to} left by the physical link");
+    }
+    peer.assert_no_leak(base, "the uid's other egress under the carve-outs");
+
+    daemon.stop();
+    assert!(!table_listed(), "the kill switch table is removed on stop");
 }

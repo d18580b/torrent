@@ -1632,7 +1632,7 @@ fn every_reason_has_a_distinct_label() {
 #[test]
 fn the_catalogue_lists_every_fence_reason() {
     let (_, listed) = crate::metrics_sink::catalogued("profile_vpn_fenced_total")
-        .and_then(|s| s.label)
+        .and_then(|s| s.label())
         .expect("a reason label");
     let written: Vec<&str> = DownReason::ALL
         .map(DownReason::as_str)

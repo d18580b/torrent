@@ -17,9 +17,9 @@ use crate::sd_notify;
 /// How stale the alert loop's heartbeat may be before the watchdog ping is
 /// withheld.
 ///
-/// Matches `/healthz`'s bound: both are asking the same question, and a
-/// daemon that reports 503 to a load balancer while telling systemd it is
-/// healthy is the worst of both answers.
+/// Matches `/livez`'s bound: both are asking the same question, and a
+/// daemon that reports itself wedged to a kubelet while telling systemd it
+/// is healthy is the worst of both answers.
 const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The most HTTP connections the API holds open at once; the next waits in
@@ -182,19 +182,24 @@ pub(super) async fn bind_api_listener(cfg: &Config) -> Option<ApiListener> {
     }
 }
 
-/// Log the listener and the authentication posture, tell systemd the daemon
-/// is ready, and start the watchdog pings. Runs once the listener is bound.
+/// Log the listener and the authentication posture, mark the HTTP stage up
+/// in `boot` for `/readyz`, tell systemd the daemon is ready, and start the
+/// watchdog pings, as the supervised task `watchdog`. Runs once the listener
+/// is bound.
 pub(super) fn announce_ready(
     http_listen: &crate::config::HttpListen,
     posture: Option<String>,
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
     alert_loop: &torrentd_engine::AlertLoopHandle,
+    metrics: &Arc<crate::metrics_sink::PromSink>,
+    boot: &crate::app_state::BootProgress,
 ) {
     info!(addr = %http_listen, "HTTP server listening");
     if let Some(posture) = posture {
         warn!(target: "torrentd::auth", addr = %http_listen, "{posture}");
     }
 
+    boot.mark_serving();
     // The unit is `Type=notify`: systemd holds it in `activating` until
     // READY=1, so this must come after the listener is actually bound.
     sd_notify::ready();
@@ -206,7 +211,7 @@ pub(super) fn announce_ready(
         );
         let mut wd_shutdown = shutdown_tx.subscribe();
         let wd_heartbeat = alert_loop.heartbeat();
-        tokio::spawn(async move {
+        super::tasks::spawn_supervised("watchdog", Arc::clone(metrics), async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
@@ -216,13 +221,22 @@ pub(super) fn announce_ready(
                         // the daemon is healthy for as long as the process
                         // is alive — including when the loop has died and
                         // seeding, resume saves and status updates have all
-                        // stopped. `/healthz` reports that correctly, and
-                        // nothing reads `/healthz`.
+                        // stopped. `/livez` reports that, and systemd does
+                        // not read `/livez`. A dead batch writer is withheld
+                        // for too, as `/livez` fails for it: its store's
+                        // writes have stopped reaching the disk.
                         let age = torrentd_engine::heartbeat_age(&wd_heartbeat);
+                        let writer_deaths = torrentd_engine::batch_writer::writer_deaths();
                         if age > WATCHDOG_MAX_HEARTBEAT_AGE {
                             error!(
                                 heartbeat_age_secs = age.as_secs(),
                                 "alert loop is not making progress; withholding the \
+                                 systemd watchdog ping so the unit is restarted",
+                            );
+                        } else if writer_deaths > 0 {
+                            error!(
+                                batch_writer_deaths = writer_deaths,
+                                "a batch writer thread has died; withholding the \
                                  systemd watchdog ping so the unit is restarted",
                             );
                         } else {

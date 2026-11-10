@@ -50,7 +50,10 @@
 //! own socket send the query, and then the query is dropped unless it would
 //! leave by a tunnel from that tunnel's address. Which tracker hostnames the
 //! daemon looks up is therefore visible to the host's upstream resolver unless the resolver itself is
-//! pointed through a tunnel; see `docs/running.md`, "Kill switch".
+//! pointed through a tunnel; see `docs/running.md`, "Kill switch". In a pod,
+//! whose `/etc/resolv.conf` names the cluster resolver on `eth0`,
+//! `kill_switch_dns_servers` lets those queries out to the named resolvers
+//! alone ([`Carveouts`]), at the cost of their seeing every tracker hostname.
 //!
 //! Opt-in (`network_kill_switch = true`); needs `CAP_NET_ADMIN`, which the
 //! packaged systemd unit does not grant as shipped: uncomment its
@@ -131,7 +134,10 @@
 //! connection on the bare interface talk over it, which makes the guarantee
 //! rest on how each socket is bound — the application-layer property this
 //! module exists not to depend on. Reach the API through a reverse proxy on the
-//! same host (loopback), or scrape from inside the tunnel.
+//! same host (loopback), or scrape from inside the tunnel. Where neither can
+//! be had — a pod, probed and scraped on `eth0` — `kill_switch_api_interfaces`
+//! names the interfaces the API listener's port may answer by, statelessly
+//! and by that source port alone ([`Carveouts`]).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -373,6 +379,92 @@ impl Transport {
     }
 }
 
+/// The named exceptions a cluster needs, each a stateless accept for the
+/// daemon's uid ahead of the drop, and nothing broader:
+///
+/// - **API replies on named interfaces** (`kill_switch_api_interfaces`):
+///   `meta skuid <uid> oifname "<if>" tcp sport <api port> accept`. A pod's
+///   kubelet probes, Prometheus scrapes and Ingress reach the API on `eth0`,
+///   and their replies are sent from a socket the daemon's uid owns, so the
+///   drop took every one. Only the API listener's source port is let out, and
+///   only by these interfaces; the listener holds that port, so no other
+///   socket of the daemon's sends from it.
+/// - **DNS to named resolvers** (`kill_switch_dns_servers`):
+///   `meta skuid <uid> ip daddr <server> udp dport 53 accept`, and the TCP
+///   equivalent. A pod's `/etc/resolv.conf` names the cluster resolver,
+///   reached over `eth0`, and libc's lookups from the daemon's own socket were
+///   dropped. The cost is that every tracker hostname the daemon looks up is
+///   visible to these resolvers and to whatever they forward to, which the
+///   boot logs and `kill_switch_dns_exempt` reports.
+///
+/// Every other packet of the daemon's outside the tunnels still meets the
+/// drop: a peer or tracker connection from any other port, the API port by an
+/// unnamed interface, and port 53 to an unnamed address. The tunnel-address
+/// fences come first, so neither carve-out lets a tunnel's address out by
+/// another interface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Carveouts {
+    /// The API listener's TCP port, with the interfaces its replies may
+    /// leave by. `None` carves out nothing.
+    api: Option<(u16, BTreeSet<String>)>,
+    dns: BTreeSet<IpAddr>,
+}
+
+impl Carveouts {
+    /// The carve-outs for `api_ifaces` (replies from `api_port`; none without
+    /// a port, as a `unix:` listener has none) and `dns_servers`.
+    pub fn new(api_port: Option<u16>, api_ifaces: &[String], dns_servers: &[IpAddr]) -> Self {
+        let api = api_port
+            .filter(|_| !api_ifaces.is_empty())
+            .map(|port| (port, api_ifaces.iter().cloned().collect()));
+        Self {
+            api,
+            dns: dns_servers.iter().copied().collect(),
+        }
+    }
+
+    /// Whether the daemon's DNS is let out to a resolver outside the
+    /// tunnels: what `kill_switch_dns_exempt` reports.
+    pub fn dns_exempt(&self) -> bool {
+        !self.dns.is_empty()
+    }
+
+    /// The resolvers the daemon's DNS is let out to, sorted.
+    pub fn dns_servers(&self) -> impl Iterator<Item = &IpAddr> {
+        self.dns.iter()
+    }
+
+    /// The interfaces the API's replies are let out by, sorted, and the port
+    /// they leave from; `None` where nothing is carved out for the API.
+    pub fn api(&self) -> Option<(u16, impl Iterator<Item = &str>)> {
+        self.api
+            .as_ref()
+            .map(|(port, ifaces)| (*port, ifaces.iter().map(String::as_str)))
+    }
+
+    /// The rules, one per line, as [`render_ruleset_with_transport`] writes
+    /// them ahead of the drop.
+    fn rules(&self, uid: u32) -> String {
+        let mut out = String::new();
+        if let Some((port, ifaces)) = &self.api {
+            for iface in ifaces {
+                out.push_str(&format!(
+                    "\t\tmeta skuid {uid} oifname \"{iface}\" tcp sport {port} accept\n"
+                ));
+            }
+        }
+        for server in &self.dns {
+            for proto in ["udp", "tcp"] {
+                out.push_str(&format!(
+                    "\t\tmeta skuid {uid} {} daddr {server} {proto} dport 53 accept\n",
+                    family(server),
+                ));
+            }
+        }
+        out
+    }
+}
+
 /// Refuse, with `InvalidInput` naming it, the first interface name
 /// [`ProfileConfig::is_valid_interface_name`] rejects.
 ///
@@ -420,7 +512,7 @@ pub(crate) fn check_interface_names<'a>(
 /// control the live tests install, not a ruleset anything ships.
 #[cfg(test)]
 pub fn render_ruleset(uid: u32, tunnels: &[Tunnel]) -> io::Result<String> {
-    render_ruleset_with_transport(uid, tunnels, &[])
+    render_ruleset_with_transport(uid, &Carveouts::default(), tunnels, &[])
 }
 
 /// Render the fail-closed nftables ruleset confining uid `uid`'s egress to
@@ -441,14 +533,30 @@ pub fn render_ruleset(uid: u32, tunnels: &[Tunnel]) -> io::Result<String> {
 /// Every tunnel address is fenced to its own interfaces (and loopback) first,
 /// for every uid: see the module documentation.
 ///
+/// Then `carveouts`' accepts, the last ahead of the drop: see [`Carveouts`].
+///
 /// Tunnels, addresses and exemptions are de-duplicated and sorted, so the
 /// output is deterministic regardless of profile ordering.
 pub fn render_ruleset_with_transport(
     uid: u32,
+    carveouts: &Carveouts,
     tunnels: &[Tunnel],
     transports: &[Transport],
 ) -> io::Result<String> {
     check_interface_names(tunnels.iter().map(|t| t.iface.as_str()))?;
+    if let Some(bad) = carveouts
+        .api()
+        .and_then(|(_, mut ifaces)| ifaces.find(|i| !ProfileConfig::is_valid_interface_name(i)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "kill_switch_api_interfaces names {bad:?}, which cannot be written into the \
+                 kill-switch ruleset: an interface name must be 1-15 characters of \
+                 [A-Za-z0-9_=+.-], and not \".\", \"..\", \"all\" or \"interfaces\"",
+            ),
+        ));
+    }
     let mut pairs: Vec<&Tunnel> = tunnels.iter().collect();
     pairs.sort_unstable();
     pairs.dedup();
@@ -495,6 +603,7 @@ pub fn render_ruleset_with_transport(
             endpoint.port(),
         ));
     }
+    chain.push_str(&carveouts.rules(uid));
     chain.push_str(&format!("\t\tmeta skuid {uid} counter drop\n"));
 
     Ok(format!(
@@ -526,10 +635,11 @@ fn name_set<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
 /// interfaces would still be accepted.
 pub fn install_script(
     uid: u32,
+    carveouts: &Carveouts,
     tunnels: &[Tunnel],
     transports: &[Transport],
 ) -> io::Result<String> {
-    let table = render_ruleset_with_transport(uid, tunnels, transports)?;
+    let table = render_ruleset_with_transport(uid, carveouts, tunnels, transports)?;
     Ok(replace_script(uid, &table))
 }
 
@@ -548,6 +658,8 @@ fn replace_script(uid: u32, table: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub uid: u32,
+    /// The named exceptions it was rendered with, fixed for the run.
+    carveouts: Carveouts,
     tunnels: Vec<Tunnel>,
     /// Each tunnel interface's transport, as last read.
     transports: Vec<(String, Transport)>,
@@ -555,14 +667,17 @@ pub struct Installed {
 }
 
 impl Installed {
-    /// Render the table for `uid` over `tunnels` and `transports`.
+    /// Render the table for `uid` with `carveouts` over `tunnels` and
+    /// `transports`.
     fn render(
         uid: u32,
+        carveouts: Carveouts,
         tunnels: Vec<Tunnel>,
         transports: Vec<(String, Transport)>,
     ) -> io::Result<Self> {
         let table = render_ruleset_with_transport(
             uid,
+            &carveouts,
             &tunnels,
             &transports
                 .iter()
@@ -571,6 +686,7 @@ impl Installed {
         )?;
         Ok(Self {
             uid,
+            carveouts,
             tunnels,
             transports,
             table,
@@ -680,9 +796,12 @@ pub(crate) fn is_uid_refusal(e: &io::Error) -> bool {
 /// confines this uid and no other ([`remove_legacy_with`]): it would otherwise
 /// keep dropping whatever the old run's tunnels no longer cover. A failure
 /// there is logged and does not fail the install.
-pub fn enable(tunnels: &[String]) -> io::Result<Installed> {
+///
+/// `carveouts` are rendered in, and kept for every reinstall of the run.
+pub fn enable(carveouts: &Carveouts, tunnels: &[String]) -> io::Result<Installed> {
     let installed = enable_for_uid(
         current_uid()?,
+        carveouts,
         tunnels,
         super::ip_lookup::first_ipv4,
         tunnel_ipv6,
@@ -827,6 +946,7 @@ fn parse_listen_port(iface: &str, text: &str) -> io::Result<u16> {
 /// link with none, or whose addresses could not be read, pairs none.
 pub(crate) fn enable_for_uid(
     uid: u32,
+    carveouts: &Carveouts,
     tunnels: &[String],
     tunnel_addr: impl Fn(&str) -> io::Result<Ipv4Addr>,
     tunnel_v6: impl Fn(&str) -> Vec<Ipv6Addr>,
@@ -862,13 +982,14 @@ pub(crate) fn enable_for_uid(
         .collect::<io::Result<Vec<(String, Transport)>>>()?;
     // A name the ruleset cannot carry fails here, before nft, so a previous
     // run's kill switch stays armed.
-    let installed = Installed::render(uid, paired, transports)?;
+    let installed = Installed::render(uid, carveouts.clone(), paired, transports)?;
     apply(&installed.script())?;
     info!(
         target: "torrentd::vpn::killswitch",
         uid,
         tunnels = ?installed.tunnels,
         transports = ?installed.transports,
+        carveouts = ?installed.carveouts,
         "network kill switch installed (nftables, fail-closed)",
     );
     Ok(installed)
@@ -1176,6 +1297,8 @@ fn rule_line(exprs: &serde_json::Value) -> Result<String, String> {
                 (None, Some("ip6"), Some("daddr")) => "ip6 daddr",
                 (None, Some("udp"), Some("sport")) => "udp sport",
                 (None, Some("udp"), Some("dport")) => "udp dport",
+                (None, Some("tcp"), Some("sport")) => "tcp sport",
+                (None, Some("tcp"), Some("dport")) => "tcp dport",
                 _ => return Err(unread(e)),
             };
             // `!=` only where the renderer writes it: an interface-name set.
@@ -1519,7 +1642,7 @@ fn refresh(
     if tunnels == installed.tunnels && live == installed.transports {
         return false;
     }
-    let next = match Installed::render(installed.uid, tunnels, live) {
+    let next = match Installed::render(installed.uid, installed.carveouts.clone(), tunnels, live) {
         Ok(next) => next,
         // Not reached: the same names rendered at install.
         Err(e) => {
