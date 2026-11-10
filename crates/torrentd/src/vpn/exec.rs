@@ -29,6 +29,17 @@
 //!   the daemon's own uid and needs no capability. This is the only place
 //!   that hook is installed: no child the daemon spawns any other way gets it.
 //!
+//! * **Observed.** Every run is an INFO span named `external_command`
+//!   carrying the program, the command line redacted, its duration and its
+//!   exit status, and lands in `external_command_duration_seconds{program}`.
+//!   A run that failed — it could not start, it timed out, or [`run_ok`]'s
+//!   tool exited non-zero — is logged at WARN with its stderr (redacted and
+//!   truncated, and withheld where stdin was fed, since a tool may echo it)
+//!   and counted in `external_command_failures_total{program}`. A non-zero
+//!   exit from [`run`] is the caller's to judge, so it is recorded on the
+//!   span and not counted: `ip link show` saying "does not exist" is an
+//!   answer, not a failure.
+//!
 //! Every tool is still resolved through the daemon's `PATH`; see
 //! `vpn::ip_lookup` for why that is deliberate.
 
@@ -56,6 +67,39 @@ const POLL: Duration = Duration::from_millis(10);
 
 /// How long a child's output is waited for once the child has exited.
 const OUTPUT_GRACE: Duration = Duration::from_millis(500);
+
+/// The `program` values of the `external_command_*` series: every tool this
+/// module runs, and `other` for any other, so the label's cardinality is
+/// fixed whatever a caller passes.
+pub(crate) const PROGRAMS: &[&str] = &["ip", "wg", "nft", "openvpn", "kill", "other"];
+
+/// How much of a failed tool's stderr its WARN line keeps.
+const STDERR_LOGGED: usize = 512;
+
+/// What counts as a failure of a run, for the WARN line and
+/// `external_command_failures_total`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Judge {
+    /// [`run`]: the tool could not start or did not finish. Its exit status
+    /// is the caller's to judge.
+    Ran,
+    /// [`run_ok`]: as [`Judge::Ran`], or the tool exited non-zero.
+    Zero,
+    /// [`available`]: nothing; a tool that is missing or refuses is the
+    /// answer the probe asked for.
+    Probe,
+}
+
+/// `program`'s value of the `program` label: its basename where that is one
+/// of [`PROGRAMS`], `other` otherwise.
+pub(crate) fn program_label(program: &str) -> &'static str {
+    let base = program.rsplit('/').next().unwrap_or(program);
+    PROGRAMS
+        .iter()
+        .copied()
+        .find(|p| *p == base && *p != "other")
+        .unwrap_or("other")
+}
 
 /// `name`, if it is safe to hand to a tool as an interface argument.
 ///
@@ -88,6 +132,110 @@ pub(crate) fn iface(name: &str) -> io::Result<&str> {
 /// or did not finish in time (`ErrorKind::TimedOut`; the child has been killed
 /// and reaped by then).
 pub(crate) fn run(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+) -> io::Result<Output> {
+    observed(program, args, stdin, timeout, Judge::Ran)
+}
+
+/// [`spawn_and_wait`] inside an `external_command` span, with its duration
+/// recorded and a failure, as `judge` reads it, logged and counted. See the
+/// module docs.
+fn observed(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    judge: Judge,
+) -> io::Result<Output> {
+    let label = program_label(program);
+    let command = crate::redact::redact_urls(&shown(program, args)).into_owned();
+    let span = tracing::info_span!(
+        "external_command",
+        program = label,
+        command = %command,
+        timeout_s = timeout.as_secs(),
+        duration_ms = tracing::field::Empty,
+        exit_status = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let started = Instant::now();
+    let result = spawn_and_wait(program, args, stdin, timeout);
+    let elapsed = started.elapsed();
+    let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    span.record("duration_ms", duration_ms);
+    let failed = fails(judge, &result);
+    match &result {
+        Ok(out) => {
+            span.record("exit_status", tracing::field::display(out.status));
+            if failed {
+                span.record("error", "non-zero exit");
+                tracing::warn!(
+                    target: "torrentd::vpn::exec",
+                    program = label,
+                    command = %command,
+                    exit_status = %out.status,
+                    duration_ms,
+                    stderr = %logged_stderr(&out.stderr, stdin.is_some()),
+                    "external command exited non-zero",
+                );
+            }
+        }
+        Err(e) => {
+            span.record("error", tracing::field::display(e));
+            if failed {
+                tracing::warn!(
+                    target: "torrentd::vpn::exec",
+                    program = label,
+                    command = %command,
+                    duration_ms,
+                    error.kind = ?e.kind(),
+                    error.cause = %e,
+                    "external command failed",
+                );
+            }
+        }
+    }
+    crate::metrics_sink::note_external_command(label, elapsed.as_secs_f64(), failed);
+    result
+}
+
+/// Whether `result` is a failure as `judge` reads it. See [`Judge`].
+fn fails(judge: Judge, result: &io::Result<Output>) -> bool {
+    match (judge, result) {
+        (Judge::Probe, _) => false,
+        (_, Err(_)) => true,
+        (Judge::Zero, Ok(out)) => !out.status.success(),
+        (Judge::Ran, Ok(_)) => false,
+    }
+}
+
+/// What a failed tool's WARN line says of its stderr: redacted, cut at
+/// [`STDERR_LOGGED`] bytes, and withheld where the tool was fed stdin, which
+/// it may echo (`wg setconf` quotes the line it cannot read, private key
+/// included).
+fn logged_stderr(stderr: &[u8], fed_stdin: bool) -> String {
+    if fed_stdin {
+        return "(withheld: the command was fed stdin, which it may echo)".to_string();
+    }
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    let mut cut = text.len().min(STDERR_LOGGED);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut kept = crate::redact::redact_urls(&text[..cut]).into_owned();
+    if cut < text.len() {
+        kept.push_str(" …");
+    }
+    kept
+}
+
+/// Run the tool: [`run`]'s contract, without the observation.
+fn spawn_and_wait(
     program: &str,
     args: &[&str],
     stdin: Option<&[u8]>,
@@ -207,7 +355,7 @@ pub(crate) fn run_ok(
     stdin: Option<&[u8]>,
     timeout: Duration,
 ) -> io::Result<Output> {
-    let out = run(program, args, stdin, timeout)?;
+    let out = observed(program, args, stdin, timeout, Judge::Zero)?;
     if out.status.success() {
         Ok(out)
     } else {
@@ -222,7 +370,7 @@ pub(crate) fn run_ok(
 
 /// Whether `program probe_arg` runs and exits zero.
 pub(crate) fn available(program: &str, probe_arg: &str) -> bool {
-    run(program, &[probe_arg], None, QUICK).is_ok_and(|o| o.status.success())
+    observed(program, &[probe_arg], None, QUICK, Judge::Probe).is_ok_and(|o| o.status.success())
 }
 
 fn shown(program: &str, args: &[&str]) -> String {
@@ -327,6 +475,72 @@ mod tests {
         }
         // Unarmed in an ordinary process: nothing called `prepare_children`.
         assert!(!super::super::caps::ambient_raise_armed());
+    }
+
+    #[test]
+    fn the_program_label_is_a_known_tool_or_other() {
+        assert_eq!(program_label("ip"), "ip");
+        assert_eq!(program_label("/usr/sbin/nft"), "nft");
+        assert_eq!(program_label("sh"), "other");
+        assert_eq!(program_label("other"), "other");
+        assert_eq!(program_label(""), "other");
+    }
+
+    /// A non-zero exit is a failure only where the caller required a zero
+    /// exit; a tool that cannot run is one except to a probe, whose answer
+    /// that is. Count `run`'s non-zero exits and `ip link show` reporting a
+    /// missing link fires the alert on every boot.
+    #[test]
+    fn what_counts_as_a_failure_depends_on_who_asked() {
+        let exited = |code: i32| -> io::Result<Output> {
+            run("sh", &["-c", &format!("exit {code}")], None, QUICK)
+        };
+        let missing = || run("torrentd-no-such-tool", &[], None, QUICK);
+        assert!(!fails(Judge::Ran, &exited(0)));
+        assert!(!fails(Judge::Ran, &exited(1)));
+        assert!(fails(Judge::Ran, &missing()));
+        assert!(!fails(Judge::Zero, &exited(0)));
+        assert!(fails(Judge::Zero, &exited(1)));
+        assert!(fails(Judge::Zero, &missing()));
+        assert!(!fails(Judge::Probe, &exited(1)));
+        assert!(!fails(Judge::Probe, &missing()));
+    }
+
+    /// stdin carries a private key in one caller, and `wg setconf` quotes the
+    /// line it cannot read; a long stderr is cut on a character boundary.
+    #[test]
+    fn a_failed_tools_stderr_is_withheld_after_stdin_and_cut_otherwise() {
+        let secret = b"PrivateKey = abc";
+        assert!(!logged_stderr(secret, true).contains("abc"));
+        assert_eq!(logged_stderr(b"  oops \n", false), "oops");
+        let long = "é".repeat(STDERR_LOGGED);
+        let kept = logged_stderr(long.as_bytes(), false);
+        assert!(kept.ends_with(" …"), "{kept}");
+        assert!(kept.len() <= STDERR_LOGGED + " …".len(), "{}", kept.len());
+    }
+
+    /// Every run is timed; only the one the judge calls failed is counted.
+    /// The series are per test thread, so these are exact.
+    #[test]
+    fn a_run_lands_in_the_duration_histogram_and_a_failure_in_the_counter() {
+        let (failures, duration) = crate::metrics_sink::tests::external_command_series();
+        let runs = || duration.with_label_values(&["other"]).get_sample_count();
+        let failed = || failures.with_label_values(&["other"]).get();
+        assert_eq!((runs(), failed()), (0, 0.0));
+        run("sh", &["-c", "exit 1"], None, QUICK).unwrap();
+        assert_eq!(
+            (runs(), failed()),
+            (1, 0.0),
+            "run's non-zero exit is not a failure"
+        );
+        run_ok("sh", &["-c", "exit 1"], None, QUICK).unwrap_err();
+        assert_eq!((runs(), failed()), (2, 1.0), "run_ok's is");
+        assert!(!available("torrentd-no-such-tool", "--version"));
+        assert_eq!(
+            (runs(), failed()),
+            (3, 1.0),
+            "a probe's missing tool is an answer"
+        );
     }
 
     #[test]

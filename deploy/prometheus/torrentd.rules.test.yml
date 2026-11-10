@@ -183,6 +183,48 @@ tests:
 
   - interval: 1m
     input_series:
+      - series: 'torrentd_external_command_failures_total{program="nft"}'
+        values: '0 0 1 1x40'
+      - series: 'torrentd_external_command_failures_total{program="ip"}'
+        values: '0x40'
+      - series: 'torrentd_boot_external_command_failures{program="nft"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              program: nft
+            exp_annotations:
+              summary: "nft failed; read the WARN line naming the command and its stderr"
+      - eval_time: 30m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts: []
+
+  # One that failed during the boot, before the first scrape: the boot
+  # gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_external_command_failures_total{program="wg"}'
+        values: '1x40'
+      - series: 'torrentd_boot_external_command_failures{program="wg"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              program: wg
+            exp_annotations:
+              summary: "wg failed; read the WARN line naming the command and its stderr"
+
+  - interval: 1m
+    input_series:
       - series: 'torrentd_metrics_dropped_samples_total{reason="labels"}'
         values: '0 0 1 1'
       - series: 'torrentd_metrics_dropped_samples_total{reason="registration"}'
