@@ -292,10 +292,21 @@ fn parse_protocol(v: &str) -> anyhow::Result<OtlpProtocol> {
     }
 }
 
+/// Refuse an endpoint the exporter could not use: one that is not http:// or
+/// https://, or that does not parse as the URI both exporters parse it into,
+/// so `http://bad host` is a refused config rather than an exporter that
+/// fails to build. Neither error echoes the URL unredacted; the parser's
+/// reason is a fixed phrase that never quotes it.
 fn check_url(url: &str) -> anyhow::Result<()> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!(
             "{:?} is not an http:// or https:// URL",
+            redact_for_target("torrentd::telemetry", url)
+        );
+    }
+    if let Err(e) = url.parse::<hyper::Uri>() {
+        anyhow::bail!(
+            "{:?} is not a valid URL: {e}",
             redact_for_target("torrentd::telemetry", url)
         );
     }
