@@ -15,8 +15,10 @@
 # Test code is exempt:
 #   - files under a `tests/` directory, and files named `tests.rs`;
 #   - any item a `#[cfg(test)]` attribute gates: an inline `mod tests { ... }`,
-#     a `fn`, an `impl`, through the brace that closes it, or a statement
-#     through its `;`.
+#     a `fn`, an `impl`, through the brace that closes it; a statement through
+#     its `;`; a struct field, enum variant, match arm or struct-literal field
+#     through its trailing `,`, or through the `}` that closes the enclosing
+#     block where it is the last one and has no `,`.
 #
 # A module file that a `#[cfg(test)] mod name;` line pulls in is not exempt
 # by that line: the check reads one file at a time. `let _ =` inside a comment
@@ -89,15 +91,32 @@ function count(s, ch,    n, i) {
   for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == ch) n++
   return n
 }
-FNR == 1 { pending = 0; gated = 0; depth = 0; opened = 0; annotated_above = 0; str = -1; raw = 0; blk = 0 }
+# Track one line of the gated item: its brace and bracket depth, and whether
+# a body brace or a `where` clause has been seen.
+function track(code) {
+  depth += count(code, "{") - count(code, "}")
+  paren += count(code, "(") + count(code, "[") - count(code, ")") - count(code, "]")
+  if (count(code, "{") > 0) opened = 1
+  if (code ~ /(^|[^[:alnum:]_])where([^[:alnum:]_]|$)/) inwhere = 1
+}
+# Whether the gated item ends on this line. With a body, at the brace that
+# closes it. Without one, at its trailing `;`, at its trailing `,` outside
+# brackets and a `where` clause (a field, variant, match arm or struct-literal
+# field), or at an unmatched `}` (the enclosing block closing after a last
+# field or arm that has no trailing `,`).
+function gate_ends(code) {
+  if (opened) return depth <= 0
+  if (depth < 0 || code ~ /;[[:space:]]*$/) return 1
+  return paren <= 0 && !inwhere && code ~ /,[[:space:]]*$/
+}
+FNR == 1 { pending = 0; gated = 0; depth = 0; paren = 0; opened = 0; inwhere = 0; annotated_above = 0; str = -1; raw = 0; blk = 0 }
 {
   line = $0
   code = code_of(line)
 
   if (gated) {
-    depth += count(code, "{") - count(code, "}")
-    if (count(code, "{") > 0) opened = 1
-    if ((opened && depth <= 0) || (!opened && code ~ /;[[:space:]]*$/)) gated = 0
+    track(code)
+    if (gate_ends(code)) gated = 0
     annotated_above = 0
     next
   }
@@ -110,8 +129,9 @@ FNR == 1 { pending = 0; gated = 0; depth = 0; opened = 0; annotated_above = 0; s
   if (pending) {
     if (code ~ /^[[:space:]]*(#\[.*|)$/) next
     pending = 0
-    gated = 1; depth = count(code, "{") - count(code, "}"); opened = (count(code, "{") > 0)
-    if ((opened && depth <= 0) || (!opened && code ~ /;[[:space:]]*$/)) gated = 0
+    gated = 1; depth = 0; paren = 0; opened = 0; inwhere = 0
+    track(code)
+    if (gate_ends(code)) gated = 0
     annotated_above = 0
     next
   }
