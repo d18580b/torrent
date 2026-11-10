@@ -309,6 +309,8 @@ impl RaisedInterfaces {
 
     /// Drop the claim — the interface is down, or was never there.
     fn forget(&self, iface: &str) {
+        // ignore-result: a claim left behind no longer matches any live
+        // interface's key, so it claims nothing.
         let _ = std::fs::remove_file(self.path(iface));
     }
 
@@ -1597,6 +1599,8 @@ mod native {
         table: Option<u32>,
         mut run: impl FnMut(&[&str]) -> Result<(), String>,
     ) {
+        // ignore-result: teardown is best effort; a link already gone
+        // answers an error, and the rules go either way.
         let _ = run(&["ip", "link", "delete", "dev", iface]);
         if let Some(table) = table {
             route::remove_with(table, run);

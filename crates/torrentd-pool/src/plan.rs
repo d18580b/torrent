@@ -28,6 +28,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
+use tracing::warn;
 
 use crate::model::ops;
 use crate::model::AdoptionState;
@@ -316,6 +317,7 @@ fn build_relocate(
     // state cannot diverge from what is on disk; doing it behind libtorrent's
     // back is how a seeding torrent starts serving from a path that no longer
     // exists.
+    // ignore-result: a row, not a result; this plan needs only its presence.
     let _ = torrent;
     let listed = listed_under(store, infohash, src_root_id, &src_base)?;
     Ok(Ok(Prepared {
@@ -508,9 +510,28 @@ fn is_claimed_twin(
 ) -> Result<bool, PoolError> {
     use std::os::unix::fs::MetadataExt;
 
-    let live = match root.join(rel).symlink_metadata() {
+    let gone = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    };
+    let orphan = root.join(rel);
+    let live = match orphan.symlink_metadata() {
         Ok(md) => (md.dev(), md.ino()),
-        Err(_) => return Ok(claimed.contains(&indexed)),
+        Err(e) => {
+            let twin = claimed.contains(&indexed);
+            if !gone(&e) {
+                warn!(
+                    path = %orphan.display(),
+                    error.cause = %e,
+                    kept_as_claimed = twin,
+                    "cannot stat an orphan the delete plan considers; deciding whether it \
+                     is a claimed file's twin from its indexed identity alone",
+                );
+            }
+            return Ok(twin);
+        }
     };
     let mut candidates = vec![live];
     if indexed != live {
@@ -519,15 +540,21 @@ fn is_claimed_twin(
     candidates.retain(|id| claimed.contains(id));
     for (dev, ino) in candidates {
         for (claimed_root, claimed_rel) in index.claimed_files_with_identity(dev, ino)? {
-            match claimed_root.join(&claimed_rel).symlink_metadata() {
+            let candidate = claimed_root.join(&claimed_rel);
+            match candidate.symlink_metadata() {
                 Ok(md) if (md.dev(), md.ino()) == live => return Ok(true),
                 Ok(_) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) => {}
-                Err(_) => return Ok(true),
+                Err(e) if gone(&e) => {}
+                Err(e) => {
+                    warn!(
+                        path = %candidate.display(),
+                        orphan = %orphan.display(),
+                        error.cause = %e,
+                        "cannot stat a claimed file sharing an orphan's identity; keeping the \
+                         orphan out of the delete plan, since the two cannot be told apart",
+                    );
+                    return Ok(true);
+                }
             }
         }
     }

@@ -198,6 +198,7 @@ impl PoolService {
     /// into a profile it fenced. The daemon sets this once after opening,
     /// where the kill switch is on; a second call is ignored.
     pub(crate) fn set_kill_switch(&self, fence: Arc<crate::fence::KillSwitchFence>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.kill_switch.set(fence);
     }
 
@@ -210,6 +211,7 @@ impl PoolService {
     /// owns and not only the ones a session loaded. The daemon sets this
     /// once after opening; a second call is ignored.
     pub fn set_registry(&self, registry: Arc<AssignmentRegistry>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.registry.set(registry);
     }
 
@@ -439,7 +441,20 @@ impl PoolService {
         }
         let stale = self.with_store(|st| {
             let mut out: Vec<(String, String, String)> = Vec::new();
-            for t in st.torrents().unwrap_or_default() {
+            let torrents = st.torrents().unwrap_or_else(|e| {
+                // Logged at WARN, which `log_events_total` counts under
+                // this target; there is no read-error series to add to.
+                warn!(
+                    target: "torrentd::startup",
+                    op = "reconcile_owners_at_boot",
+                    error.cause = %e,
+                    "could not read the pool index to check its owners against the \
+                     assignment registry; pool_index_profile_disagreements reads 0 \
+                     unchecked until the next start",
+                );
+                Vec::new()
+            });
+            for t in torrents {
                 let Some(indexed) = t.profile.as_deref() else {
                     continue;
                 };
@@ -476,6 +491,7 @@ impl PoolService {
     /// torrent's `.torrent` into. The daemon sets this once after opening; a
     /// second call is ignored.
     pub fn set_torrent_store(&self, torrents: Arc<dyn TorrentStore>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.torrents.set(torrents);
     }
 
@@ -654,6 +670,7 @@ impl PoolService {
     /// The sessions' state map, so a scan knows what is loaded. The daemon
     /// sets this once after opening; a second call is ignored.
     pub fn set_state(&self, state: Arc<StateMap>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.loaded.set(state);
     }
 
@@ -661,6 +678,7 @@ impl PoolService {
     /// holds it. The daemon sets this once after opening; a second call is
     /// ignored.
     pub fn set_source(&self, source: Arc<dyn AlertSource>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.source.set(source);
     }
 
@@ -710,6 +728,7 @@ impl PoolService {
     /// Where the pool's failures are counted. The daemon sets this once after
     /// opening; a second call is ignored.
     pub fn set_metrics(&self, metrics: Arc<dyn MetricsSink>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.metrics.set(metrics);
     }
 

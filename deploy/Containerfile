@@ -84,6 +84,13 @@ ENV LIBTORRENT_SYS_CACHE_DIR=/root/.cache/torrentd/native
 # startup unless TORRENTD_FAULT_INJECTION=1, which only the drill sets.
 ARG CARGO_FEATURES=""
 
+# The commit being built, which torrentd_build_info reports as its `revision`
+# (crates/torrentd/src/metrics_sink.rs). The build context need not carry
+# .git, so the builder cannot read it: `mise run container` and the release
+# image job pass it. An ARG is in every later RUN's environment, so cargo sees
+# it; left empty, the binary reports `unknown`.
+ARG TORRENTD_REVISION=""
+
 # `cargo build --release` will re-read rust-toolchain.toml and download
 # the matching channel automatically.
 RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \
@@ -108,6 +115,7 @@ FROM registry.fedoraproject.org/fedora-minimal:43@sha256:faf83ebf1612b5c8da396dc
 #
 # The rest:
 #   curl        HEALTHCHECK below.
+#   tini        PID 1, in ENTRYPOINT below.
 #   coreutils   `stty`, which `torrentd hash-password` needs to hide the
 #               password; already in the base, declared rather than inherited.
 #   libcap      `setcap` and `getcap`, for torrentd's file capability below.
@@ -119,10 +127,13 @@ FROM registry.fedoraproject.org/fedora-minimal:43@sha256:faf83ebf1612b5c8da396dc
 #               repository: check `ip`, `wg` and `nft` before removing it.
 RUN microdnf install -y \
         openssl ca-certificates curl iproute wireguard-tools nftables procps-ng \
-        coreutils libcap \
+        coreutils libcap tini \
     && microdnf clean all
 
-COPY --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
+# 0755 whatever mode the build left: a builder whose umask or default ACL
+# drops "other" (a checkout on a setgid, ACL'd filesystem does) would
+# otherwise leave a binary that uid 1000 cannot execute.
+COPY --chmod=0755 --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
 
 # CAP_NET_ADMIN for a `network = "vpn"` profile and the kill switch, as a file
 # capability, so the daemon runs as the unprivileged uid below and the kill
@@ -154,19 +165,58 @@ COPY deploy/torrentd.sample.toml /etc/torrentd/torrentd.toml.sample
 RUN mkdir -p /var/lib/torrentd/resume /var/lib/torrentd/torrents /data/torrents \
     && chown -R 1000:1000 /var/lib/torrentd /data/torrents
 
+# A read-only root filesystem (`podman run --read-only`, a pod's
+# `readOnlyRootFilesystem: true`) is supported. Everything the daemon writes
+# is under one of these, and nothing else is written:
+#
+#   /var/lib/torrentd   the state directory, resume_dir's parent: resume and
+#                       .torrent stores, registry.db, pool.db, each profile's
+#                       session state, last_shutdown.json, the instance lock,
+#                       and the WireGuard and OpenVPN link records. A volume.
+#   /data/torrents      default_save_path and any [pool] root: payload, and
+#                       <root>/.torrentd-trash. A volume.
+#   /tmp                SQLite's temporary files (sorts, statement journals),
+#                       which it puts in the first writable of /var/tmp,
+#                       /usr/tmp and /tmp. A tmpfs.
+#
+# plus the directory of a `unix:` http_listen, when one is configured. Logs go
+# to stdout. tini, `ip`, `wg` and `nft` write nothing. deploy/check-image.sh
+# boots the image read-only with exactly these mounts.
+
+# OCI annotations. The release workflow passes VERSION and REVISION; a local
+# build says what it is not.
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="torrentd" \
+      org.opencontainers.image.source="https://github.com/d18580b/torrent" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 EXPOSE 6881/tcp 6881/udp 8080/tcp
 
 # Drop privileges. A `network = "vpn"` profile gets CAP_NET_ADMIN from the
 # file capability above, not from root: keep this uid and add NET_ADMIN to the
-# container's capabilities.
+# container's capabilities. Numeric, so a pod's `runAsNonRoot: true` can
+# verify it without reading /etc/passwd.
 USER 1000:1000
 
-# The image's only health check. It survives in a Docker-format image alone:
-# podman and buildah drop it from their default OCI format, so `mise run
-# container` builds with `--format docker`, and a podman build of compose.yaml
-# needs BUILDAH_FORMAT=docker (docs/running.md §8). docker and buildx, which
-# the release workflow uses, keep it.
+# The image's only health check, on the readiness route: it fails while every
+# profile is fenced, and while the boot is still `starting`. It survives in a
+# Docker-format image alone: podman and buildah drop it from their default OCI
+# format, so `mise run container` builds with `--format docker`, and a podman
+# build of compose.yaml needs BUILDAH_FORMAT=docker (docs/running.md §8).
+# docker and buildx, which the release workflow uses, keep it. Kubernetes
+# ignores it and runs the probes docs/running.md §9 gives.
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -fsS http://localhost:8080/healthz || exit 1
+    CMD curl -fsS http://localhost:8080/readyz || exit 1
 
-ENTRYPOINT ["/usr/local/bin/torrentd", "--config", "/etc/torrentd/torrentd.toml"]
+# tini is PID 1, not torrentd. Kubernetes has no `init: true`, so without it
+# the daemon would be PID 1: the kernel delivers PID 1 no signal it installed
+# no handler for, and nothing reaps an orphan reparented to it, such as
+# `openvpn --daemon`'s double-forked child. tini forwards SIGTERM and SIGINT
+# to torrentd, reaps every orphan, and exits with torrentd's status, so its
+# exit 78 still reaches the runtime. `-s` registers it as a subreaper as well,
+# for an engine that puts its own init at PID 1 (`podman run --init`, a pod's
+# shareProcessNamespace) and makes it a child.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/torrentd", "--config", "/etc/torrentd/torrentd.toml"]

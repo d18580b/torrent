@@ -1381,7 +1381,7 @@ the same arguments as `podman compose`.
 
    `BUILDAH_FORMAT=docker` keeps the image's health check. It is the
    `HEALTHCHECK` in `deploy/Containerfile`, which curls
-   `localhost:8080/healthz` every 30 s, and it lives only in a Docker-format
+   `localhost:8080/readyz` every 30 s, and it lives only in a Docker-format
    image: podman builds the OCI format by default, which has no field for it,
    and drops it with the warning `HEALTHCHECK is not supported for OCI image
    format`. `mise run container` builds Docker format for the same reason;
@@ -1422,6 +1422,7 @@ securityContext:
     drop: [ALL]
     add: [NET_ADMIN]
   allowPrivilegeEscalation: true
+  readOnlyRootFilesystem: true
 ```
 
 - **`runAsUser: 1000`.** The kill switch confines the daemon's own uid to
@@ -1439,6 +1440,45 @@ securityContext:
   Standard or a policy engine sets it `false`; set it explicitly so neither
   does. compose's `security_opt: [no-new-privileges:true]` is the same
   setting and has the same effect.
+- **`readOnlyRootFilesystem: true`.** The image runs on a read-only root
+  when it is given the writable paths below, and nothing else.
+
+#### Writable paths
+
+The daemon writes to these and nowhere else; `deploy/Containerfile` keeps
+the same list beside the directories it creates:
+
+| Path | Holds | Mount |
+| --- | --- | --- |
+| `/var/lib/torrentd` | The state directory, `resume_dir`'s parent: the resume and `.torrent` stores, `registry.db`, `pool.db`, each profile's session state, `last_shutdown.json`, the single-instance lock, and the WireGuard and OpenVPN link records | A persistent volume |
+| `/data/torrents` | `default_save_path` and any `[pool]` root: the payload, and `<root>/.torrentd-trash` | A persistent volume |
+| `/tmp` | SQLite's temporary files (large sorts, statement journals), which it puts in the first writable of `/var/tmp`, `/usr/tmp` and `/tmp` | `tmpfs`: an `emptyDir` with `medium: Memory`, or compose's `tmpfs:` |
+
+A `unix:` `http_listen` also needs its directory writable. Logs go to
+standard output, and `tini`, `ip`, `wg` and `nft` write nothing. The config
+and `/etc/wireguard` are only read, so a ConfigMap and a Secret serve them.
+[`deploy/compose.yaml`](../deploy/compose.yaml) runs the image this way
+(`read_only: true`), and `mise run image-check` boots it with exactly these
+mounts.
+
+#### PID 1
+
+The image's `ENTRYPOINT` runs `tini -s -- torrentd`, so tini is PID 1 and
+compose's `init: true` and podman's `--init` are not needed. tini forwards
+`SIGTERM` and `SIGINT` to the daemon, exits with the daemon's status (a
+refused config still exits `78`), and reaps every orphaned process, such as
+the child `openvpn --daemon` forks away from. A daemon that was PID 1 itself
+would leave each such orphan a zombie, and a zombie OpenVPN reads as gone
+to the daemon's own teardown. `-s` makes tini a subreaper too, for an engine
+that puts its own init at PID 1 instead.
+
+#### Image labels
+
+The image carries the OCI labels `org.opencontainers.image.source`,
+`.version`, `.revision` and `.licenses`. A release image's version and
+revision are its release's tag and commit; a local build reads `dev` and
+`unknown` unless `--build-arg VERSION=… --build-arg REVISION=…` says
+otherwise.
 
 An OpenVPN profile also needs the host's `/dev/net/tun` in the container,
 and a WireGuard profile needs the host kernel's `wireguard` module, which a
@@ -1497,7 +1537,8 @@ the `Host` header:
 - `/readyz` asks whether the daemon should take traffic; the rest of this
   section is its report.
 - `/healthz` is `/readyz` under its older name, kept so scripts, the
-  container `HEALTHCHECK` and existing probes keep working.
+  `HEALTHCHECK` of images built before it moved to `/readyz`, and existing
+  probes keep working.
 
 `profiles` is the number of **live** sessions, and `profiles_fenced` is how
 many of those the VPN monitor has fenced. `profiles_failed` is how many

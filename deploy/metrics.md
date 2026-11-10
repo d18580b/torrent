@@ -90,9 +90,10 @@ hold.
 | `torrentd_boot_port_forward_failures` | gauge | `profile_id`; `stage`: `renew`, `rebind` | each natpmp profile | from boot: live natpmp profiles | profile_port_forward_failures_total for these stages as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_kill_switch_lost` | gauge | `outcome`: `reinstalled`, `lost` | daemon | from boot: always | kill_switch_lost_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_kill_switch_probe_errors` | gauge | — | daemon | from boot: always | kill_switch_probe_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
-| `torrentd_boot_metrics_dropped_samples` | gauge | `reason`: `registration`, `labels` | daemon | from boot: always | metrics_dropped_samples_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
-| `torrentd_boot_log_events` | gauge | `level`: `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot: always | log_events_total for these levels as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_metrics_dropped_samples` | gauge | `reason`: `registration`, `labels`, `encode` | daemon | from boot: always | metrics_dropped_samples_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_log_events` | gauge | `level`: `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::plan`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot: always | log_events_total for these levels as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_panics` | gauge | `thread`: `main`, `torrentd-tokio`, `torrentd-alert-loop`, `torrentd-resume-writer`, `torrentd-torrent-writer`, `pool-release`, `other` | daemon | from boot: always | panics_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_ffi_errors` | gauge | `call`: `post_torrent_updates`, `post_session_stats`, `session_destroy` | daemon | from boot: always | ffi_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |
@@ -128,6 +129,7 @@ hold.
 | `torrentd_task_up` | gauge | `task`: `signals`, `vpn_monitor`, `port_forward_monitor`, `reload`, `verify_queue`, `kill_switch_watch`, `watchdog`, `runtime_tick` | daemon | from boot: always | 1 while a supervised background task runs; 0 once it has exited or panicked. Only the tasks this configuration starts are present. |
 | `torrentd_panics_total` | counter | `thread`: `main`, `torrentd-tokio`, `torrentd-alert-loop`, `torrentd-resume-writer`, `torrentd-torrent-writer`, `pool-release`, `other` | daemon | from boot, at 0 | Panics on any thread, by the thread's name (other for a thread with any other name, or none), caught or not: a kynos handler's and a supervised task's included. Each is also logged at ERROR, target torrentd::panic_hook, with its location, message and backtrace. |
 | `torrentd_batch_writer_deaths_total` | counter | — | daemon | from boot, at 0 | Batch writer threads (the resume and .torrent stores') that died by a panic. A dead writer's queued writes reach the disk only at the shutdown drain, so resume saves stop until the daemon restarts. |
+| `torrentd_ffi_errors_total` | counter | `call`: `post_torrent_updates`, `post_session_stats`, `session_destroy` | daemon | from boot, at 0 | C++ exceptions the libtorrent shim caught in an entry point that returns nothing, so could not report them: posting torrent updates or session stats, or destroying a session. Each rise is logged at WARN, target torrentd::metrics, with the last exception's message, by the scrape that exports it. |
 | `torrentd_auth_login_failures_total` | counter | `reason`: `bad_password`, `throttled`, `verification_budget` | daemon | from boot, at 0 | Refused logins: a wrong password, a client locked out by the throttle, or the daemon-wide verification budget spent. |
 | `torrentd_auth_token_scope_denials_total` | counter | — | daemon | from boot, at 0 | Requests carrying a valid token without the scope the route needs. |
 | `torrentd_auth_cross_site_refusals_total` | counter | `reason`: `host`, `sec_fetch_site`, `origin`, `content_type` | daemon | from boot, at 0 | Requests a daemon without [auth] refused as sent by a browser from another site, by the header that refused them: a Host neither loopback nor in allowed_hosts, a cross-site Sec-Fetch-Site, a foreign Origin, or a body type an HTML form can send. |
@@ -157,8 +159,8 @@ hold.
 | `torrentd_state_fs_unsupported` | gauge | — | daemon | from boot: always | 1 while allow_unsupported_state_fs let the daemon start with a state directory on overlayfs, NFS, CIFS/SMB or FUSE, which the boot otherwise refuses. |
 | `torrentd_dir_fsync_errors_total` | counter | — | daemon | from boot, at 0 | Directory fsyncs after a rename that failed, every one rather than only the logged first; the renamed file is on disk, but a power loss may revert its name. |
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |
-| `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, or an emission whose labels differ from the series' first use. |
-| `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
+| `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels`, `encode` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, an emission whose labels differ from the series' first use, or a whole scrape whose encoding failed (encode), which was answered 500. |
+| `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::plan`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
 | `torrentd_build_fault_injection` | gauge | — | daemon | from boot: always | 1 if this binary was built with the fault-injection feature, which mounts POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a deployment. |
 | `torrentd_build_info` | gauge | `version`; `revision`; `arch`; `features` | daemon | from boot: always | Always 1, labelled with this binary's version, the commit it was built from (TORRENTD_REVISION at build time, unknown where it was unset), its CPU architecture, and the cargo features beyond the default it was built with: fault-injection for the alert drill's build, empty on every deployment. |
 | `torrentd_process_start_time_seconds` | gauge | — | daemon | from boot: always | When this process started, in seconds since the Unix epoch: time() minus it is the uptime, and a change in it is a restart. |
@@ -192,7 +194,7 @@ Alerts on them:
 
 | Alert | Severity | Fires when |
 | --- | --- | --- |
-| `TorrentdHttp5xx` | warning | More than 5% of the API's responses over 10 minutes, and at least 3, were 5xx, held for 5 minutes. `/healthz` (its 503 is `TorrentdUnready`'s) and `/metrics` are left out. |
+| `TorrentdHttp5xx` | warning | More than 5% of the API's responses over 10 minutes, and at least 3, were 5xx, held for 5 minutes. The probes `/readyz` and its alias `/healthz` (their 503 is `TorrentdUnready`'s) and `/livez` (its 503 is the probe's restart to act on), and `/metrics`, are left out. |
 | `TorrentdHttpSlow` | warning | A route's 99th-percentile time to the response head over 15 minutes stayed above 5s for 15 minutes. |
 | `TorrentdAuthRejections` | warning | Bearer tokens of one `reason` were refused in every 5-minute window for 15 minutes: a client — usually a scraper whose token was rotated — keeps presenting one that does not work. |
 
@@ -241,6 +243,21 @@ Alerts on them:
 | --- | --- | --- |
 | `TorrentdPanicked` | critical | A thread panicked in the last 15 minutes, or during the boot (`torrentd_boot_panics`), by `thread`. |
 | `TorrentdTaskDown` | critical | A supervised task (`task`) has exited or panicked. |
+
+## Exceptions the libtorrent shim swallowed
+
+Three calls into libtorrent return nothing, so a C++ exception thrown inside
+one cannot come back as an error: posting torrent updates, posting session
+stats, and destroying a session. The shim catches it, and counts it in
+`torrentd_ffi_errors_total` by `call`. The scrape that exports a rise logs it
+once at `WARN` (target `torrentd::metrics`) with the number since the last
+scrape and the last exception's message, so a call that throws on every tick
+logs once per scrape rather than once per tick. A session destroyed as the
+daemon exits is counted after the last scrape, so that one is never seen.
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdFfiErrors` | warning | The shim swallowed an exception in the last 15 minutes, or during the boot (`torrentd_boot_ffi_errors`), by `call`. |
 
 ## The build and the process
 
