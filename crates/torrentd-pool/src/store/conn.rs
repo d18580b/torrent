@@ -56,6 +56,8 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolE
             if let Ok(meta) = file.metadata() {
                 let mode = meta.permissions().mode();
                 if mode & 0o044 != 0o044 {
+                    // ignore-result: best effort, as above; only the owner
+                    // may chmod.
                     let _ = file
                         .set_permissions(std::fs::Permissions::from_mode((mode | 0o044) & 0o7777));
                 }

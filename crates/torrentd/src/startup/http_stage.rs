@@ -108,7 +108,8 @@ where
         None => 70,
     };
     if exit_code != 0 {
-        // No receiver is not an error: nothing is left to stop.
+        // ignore-result: no receiver is not an error: nothing is left to
+        // stop.
         let _ = shutdown_tx.send(ShutdownReason::ListenFailed);
     }
     exit_code
@@ -262,6 +263,8 @@ async fn serve_once(
     http_server(app)
         .listener(listener)
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
+            // ignore-result: a reason, a lag and a closed sender all mean
+            // shut down.
             let _ = shutdown_rx.recv().await;
             // Latched first, so an apply still running stops at its next step
             // and a `/v1/events` stream opened from here on ends at once.

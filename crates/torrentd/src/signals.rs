@@ -110,11 +110,13 @@ async fn dispatch<T, I, H>(
             Some(()) = term.next() => {
                 info!("received SIGTERM");
                 shutting_down = true;
+                // ignore-result: no receiver means nothing is left to stop.
                 let _ = shutdown_tx.send(ShutdownReason::Sigterm);
             }
             Some(()) = int_.next() => {
                 info!("received SIGINT");
                 shutting_down = true;
+                // ignore-result: no receiver means nothing is left to stop.
                 let _ = shutdown_tx.send(ShutdownReason::Sigint);
             }
             Some(()) = hup.next() => {

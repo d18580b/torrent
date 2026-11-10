@@ -138,6 +138,8 @@ impl<C: Provides<Arc<AppState>> + Sync> FromRequestParts<C> for ClientAddr {
 
 impl Describe for ClientAddr {
     fn describe(operation: &mut OperationCx<'_>) {
+        // ignore-result: not a result; the client address adds nothing to
+        // the operation's description.
         let _ = operation;
     }
 }

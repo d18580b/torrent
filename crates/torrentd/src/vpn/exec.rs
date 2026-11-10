@@ -127,8 +127,11 @@ pub(crate) fn run(
         thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
+                // ignore-result: what was read is kept; the exit status, not
+                // the pipe, says how the tool went.
                 let _ = p.read_to_end(&mut buf);
             }
+            // ignore-result: a caller that stopped waiting wants no output.
             let _ = tx.send(buf);
         });
         rx
@@ -152,7 +155,10 @@ pub(crate) fn run(
             // its exit status says what went wrong, not the EPIPE.
             if let Err(e) = pipe.write_all(input) {
                 if e.kind() != io::ErrorKind::BrokenPipe {
+                    // ignore-result: the stdin error below is the report; a
+                    // child already exited refuses the kill.
                     let _ = child.kill();
+                    // ignore-result: only reaps the child.
                     let _ = child.wait();
                     return Err(io::Error::new(e.kind(), format!("`{shown}`: stdin: {e}")));
                 }
@@ -166,7 +172,10 @@ pub(crate) fn run(
             break status;
         }
         if Instant::now() >= deadline {
+            // ignore-result: the timeout below is the report; a child that
+            // exited meanwhile refuses the kill.
             let _ = child.kill();
+            // ignore-result: only reaps the child.
             let _ = child.wait();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,

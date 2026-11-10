@@ -155,7 +155,8 @@ fn early_line(thread: &str, location: &str, message: &str, backtrace: &str) -> S
     use tracing_subscriber::fmt::time::FormatTime as _;
 
     let mut timestamp = String::new();
-    // `ChronoUtc` only fails where its writer does, and a `String` does not.
+    // ignore-result: `ChronoUtc` only fails where its writer does, and a
+    // `String` does not.
     let _ = ChronoUtc::rfc_3339().format_time(&mut Writer::new(&mut timestamp));
     let json = |s: &str| serde_json::Value::from(s).to_string();
     // By hand, in the subscriber's key order: `message` first, then the
@@ -185,7 +186,9 @@ fn write_early(line: &str) {
         use std::io::Write as _;
 
         let mut out = std::io::stdout().lock();
+        // ignore-result: the hook has nowhere left to report it (see above).
         let _ = writeln!(out, "{line}");
+        // ignore-result: as above.
         let _ = out.flush();
     }
 }
