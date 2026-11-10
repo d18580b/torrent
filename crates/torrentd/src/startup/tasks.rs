@@ -226,6 +226,36 @@ mod tests {
         );
     }
 
+    /// Issue #728: a task and a blocking job log inside the span they were
+    /// spawned from, to the subscriber it was spawned under, though both
+    /// run elsewhere: the blocking job on another thread entirely.
+    #[tokio::test]
+    async fn spawned_work_logs_inside_the_span_it_was_spawned_from() {
+        let log = crate::tracing_init::Buf::default();
+        let (_handle, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+        let span = tracing::info_span!("request", request_id = "r-728");
+        let (task, job) = span.in_scope(|| {
+            (
+                spawn(async { info!("from the task") }),
+                spawn_blocking(|| info!("from the blocking job")),
+            )
+        });
+        task.await.unwrap();
+        job.await.unwrap();
+        let text = log.text();
+        for message in ["from the task", "from the blocking job"] {
+            let line: serde_json::Value = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .find(|l: &serde_json::Value| l["message"] == message)
+                .unwrap_or_else(|| panic!("{message:?} reached the subscriber: {text}"));
+            assert_eq!(line["span"]["request_id"], "r-728", "{line}");
+            assert!(line["trace_id"].is_string(), "{line}");
+        }
+    }
+
     /// A transient task that panics carries the panic to whoever awaits it,
     /// having logged what it left undone.
     #[tokio::test]
