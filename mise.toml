@@ -13,6 +13,7 @@
 #   mise run dist|dist-musl
 #   mise run unit-check [unit]
 #   mise run helm-sync|helm-lint|helm-test
+#   mise run test-k8s [image] [archive]
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
 #   mise run drill-alerts|drill-udp-transport|drill-listener-replies
@@ -53,6 +54,11 @@ hk = "1.48.0"
 # into a helm home outside the checkout.
 "aqua:helm/helm" = "4.3.1"
 "github:helm-unittest/helm-unittest" = { version = "1.2.1", bin = "untt" }
+# The chart installed for real (`test-k8s`): k3d runs a k3s cluster in a
+# container on the host's docker, and kubectl drives it. kubectl's minor
+# matches the k3s release deploy/k8s-test/k3d.yaml pins.
+"aqua:k3d-io/k3d" = "5.9.0"
+"aqua:kubernetes/kubectl" = "1.37.2"
 # pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
 # Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
 
@@ -348,6 +354,20 @@ done
 [tasks.helm-test]
 description = "Run the chart's helm-unittest suites"
 run = "untt --strict deploy/helm/torrentd"
+
+# The chart installed on k3s in a k3d cluster of its own, with the image
+# `container` builds: a host and a vpn release, driven end to end. Needs
+# docker (or podman's docker-compatible socket) for k3d, python3, and the
+# host's wireguard and nf_tables modules loaded. deploy/k8s-test/run.sh lists
+# every check. CI's k8s job passes the container job's saved image as the
+# archive; without one the image is taken from podman's or docker's store.
+[tasks.test-k8s]
+description = "Install the Helm chart on k3s (k3d) and check probes, metrics, seeding, DNS, egress, restart and reload"
+usage = '''
+arg "[image]" default="localhost/torrentd:dev" help="The image to install"
+arg "[archive]" default="" help="A docker-archive tarball holding the image, loaded instead of the local store's"
+'''
+run = 'deploy/k8s-test/run.sh "$usage_image" "$usage_archive"'
 
 [tasks.test-all]
 description = "Every automated test, including the ignored integration layers"
