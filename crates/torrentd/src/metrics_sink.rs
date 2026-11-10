@@ -466,8 +466,16 @@ pub const CATALOGUE: &[Series] = catalogue! {
         Owner("each route, before the API serves") =>
         "Seconds from a request arriving to its response head being ready, by route and \
          method; a streamed body's delivery is not included.";
-    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings"]) Zero =>
-        "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
+    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings", "watch"]) Zero =>
+        "Reloads (SIGHUP, POST /v1/config/reload, or a change config_watch saw) that failed, by \
+         the step that failed; watch counts config_watch failing to watch the config file's \
+         directory, at boot or later, after which only SIGHUP and the API reload.";
+    "config_restart_pending" Gauge Daemon ("key": crate::config::RESTART_PENDING_KEYS) Zero =>
+        "1 for each config key whose value in the file, at the last reload that read it, \
+         differs from the one the daemon runs and only a restart applies: a non-reloadable \
+         key, profile for any [[profile]] change, or a reloadable settings key the file \
+         deleted. Back to 0 when a reload finds the file matching again; a restart boots \
+         with the file and starts every key at 0.";
     // kill switch
     "kill_switch_active" Gauge Daemon Owner("always") => "1 while the daemon holds the nftables kill switch installed.";
     "kill_switch_dns_exempt" Gauge Daemon Owner("always") =>

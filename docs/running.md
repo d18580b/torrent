@@ -270,6 +270,7 @@ authentication posture, and at least one `[[profile]]`:
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
 | `vpn_handshake_max_age_secs` | `180` — how long a WireGuard profile with torrents that can send may go with no handshake answering them before it is fenced. An aged handshake fences only once the link has sent bytes that nothing answered for this long, so neither an idle profile nor a quiet seeding one is fenced on its handshake (§11, drill 5). |
 | `shutdown_drain_secs` | `60` — how long a stop waits for outstanding resume saves (`1`–`3600`). `deploy/torrentd.service`'s `TimeoutStopSec=120` is sized to the default. A larger value is covered by the `EXTEND_TIMEOUT_USEC` the daemon sends while it stops, so `TimeoutStopSec` needs raising only for a stop that must fit without those extensions. |
+| `config_watch` | `false`. `true` reloads when the config file changes, as a `SIGHUP` would, by watching its directory with inotify: an in-place write, an editor's rename over the file, and kubelet's `..data` symlink swap when a mounted ConfigMap or Secret is updated — §8. Read once, at startup. |
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
 | `kill_switch_api_interfaces`, `kill_switch_dns_servers` | empty — the kill switch's carve-outs for a cluster: the API's replies on the named interfaces, and DNS to the named resolvers. Restart-only, and refused without `network_kill_switch`; see §11, "In a cluster" |
 | `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
@@ -1360,6 +1361,28 @@ its files. They are still not reloadable — the stores are opened once at
 startup — but pointing a profile at its files is routine configuration, and
 the privacy warning is the line an alert rule watches for an account's identity
 changing under a live session.
+
+**Reloading on a changed file:** with `config_watch = true` the daemon needs
+neither `SIGHUP` nor the API. It watches the config file's directory with
+inotify, and once the directory has been quiet for half a second (five at most,
+however busy it is) and the file's bytes differ from the ones it last read, it
+runs the same reload `SIGHUP` does, with the same validation, warnings and
+`torrentd_config_reload_failures_total`. That is what a Kubernetes ConfigMap
+or Secret mount needs: kubelet updates one by swapping a `..data` symlink, and
+sends no signal. The key itself is read once, at startup. The watch starts
+once the profiles are up; an edit made while the daemon was starting is
+reloaded then, as one. The watch does not see a file that is a symlink to
+somewhere outside its directory changing, nor a file bind-mounted on its own
+(as `deploy/compose.yaml` mounts it) edited from outside the container; reload
+those as above. A watch that cannot be set up, or stops, is logged at `WARN`
+and counted at `stage="watch"`, and the daemon carries on reloading on
+`SIGHUP` and the API.
+
+Whatever starts it, a reload that finds a restart-only key changed sets
+`torrentd_config_restart_pending{key}` to 1, and `TorrentdConfigRestartPending`
+fires once it has stayed so for 30 minutes: the file says one thing and the
+daemon runs another until a restart, or until the file is edited back and
+reloaded ([metrics.md](../deploy/metrics.md#config-reloads)).
 
 ### On the compose stack
 

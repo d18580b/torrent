@@ -43,6 +43,92 @@ fn a_configured_allowed_host_is_answered_and_another_is_refused() {
     assert_exits_zero(&mut child, Duration::from_secs(30));
 }
 
+/// Point a kubelet-style config directory at a new version of the file, the
+/// way kubelet updates a mounted ConfigMap: write `..<to>/torrentd.toml`,
+/// point `..data_tmp` at it, rename that over `..data`, remove `..<from>`.
+fn kubelet_swap(dir: &std::path::Path, from: &str, to: &str, body: &str) {
+    std::fs::create_dir(dir.join(to)).unwrap();
+    std::fs::write(dir.join(to).join("torrentd.toml"), body).unwrap();
+    std::os::unix::fs::symlink(to, dir.join("..data_tmp")).unwrap();
+    std::fs::rename(dir.join("..data_tmp"), dir.join("..data")).unwrap();
+    std::fs::remove_dir_all(dir.join(from)).unwrap();
+}
+
+/// `config_watch` on a directory laid out as kubelet mounts a ConfigMap:
+/// each `..data` swap reloads with no signal and no API call, through the
+/// reload `SIGHUP` runs. A file that does not parse is counted as that
+/// reload's failure; a restart-only key changed raises
+/// `config_restart_pending` for that key; and the file swapped back clears
+/// it.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn config_watch_reloads_on_a_kubelet_symlink_swap_and_reports_a_pending_restart() {
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let base = std::fs::read_to_string(write_config(p, free_port(), addr)).unwrap();
+    let body = format!("config_watch = true\n{base}");
+    let conf = p.join("conf");
+    std::fs::create_dir_all(conf.join("..v1")).unwrap();
+    std::fs::write(conf.join("..v1/torrentd.toml"), &body).unwrap();
+    std::os::unix::fs::symlink("..v1", conf.join("..data")).unwrap();
+    std::os::unix::fs::symlink("..data/torrentd.toml", conf.join("torrentd.toml")).unwrap();
+    let daemon = Running(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(conf.join("torrentd.toml"))
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    let pending = "torrentd_config_restart_pending{key=\"shutdown_drain_secs\"}";
+    let load_failures = "torrentd_config_reload_failures_total{stage=\"load\"}";
+    let (_, metrics) = http(addr, "GET", "/metrics", None);
+    assert!(
+        metrics.lines().any(|l| l == format!("{pending} 0")),
+        "seeded at boot:\n{metrics}"
+    );
+
+    // A file that does not parse: the reload runs, fails, and is counted.
+    kubelet_swap(&conf, "..v1", "..v2", "this is = = not toml");
+    poll(
+        "the watched reload to fail at load",
+        Duration::from_secs(15),
+        || (metric(addr, load_failures) == 1.0).then_some(()),
+    );
+
+    // A restart-only key changed: reported as pending, by name.
+    kubelet_swap(
+        &conf,
+        "..v2",
+        "..v3",
+        &format!("shutdown_drain_secs = 61\n{body}"),
+    );
+    poll(
+        "shutdown_drain_secs pending a restart",
+        Duration::from_secs(15),
+        || (metric(addr, pending) == 1.0).then_some(()),
+    );
+    assert_eq!(
+        metric(addr, "torrentd_config_restart_pending{key=\"auth\"}"),
+        0.0,
+        "only the key that changed is pending"
+    );
+
+    // The file swapped back to what the daemon runs clears it.
+    kubelet_swap(&conf, "..v3", "..v4", &body);
+    poll(
+        "the pending restart to clear",
+        Duration::from_secs(15),
+        || (metric(addr, pending) == 0.0).then_some(()),
+    );
+    assert_eq!(metric(addr, load_failures), 1.0, "no further failure");
+
+    daemon.stop();
+}
+
 /// The rows of `deploy/metrics.md` a host-profile daemon with no pool and no
 /// kill switch must export from its first scrape: `(name, labels column)`.
 fn series_present_from_boot() -> Vec<(String, String)> {

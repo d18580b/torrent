@@ -134,6 +134,13 @@ enable_lsd = false
 # raising only for a stop that must fit without those extensions.
 # shutdown_drain_secs = 60
 
+# Reload when this file changes, as SIGHUP does, by watching its directory
+# with inotify. Sees kubelet's `..data` symlink swap when a mounted ConfigMap
+# or Secret is updated, and an editor's save. Off by default; read once, at
+# startup. A change to a key only a restart applies is reported as
+# torrentd_config_restart_pending{key} = 1 either way.
+# config_watch = true
+
 # Defence-in-depth kill switch. When true, torrentd installs a fail-closed
 # nftables table (`torrentd_ks_<uid>`) confining the daemon's own egress to loopback
 # and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel

@@ -39,6 +39,7 @@ mod bulk_adopt;
 mod check_queue;
 mod cli;
 mod config;
+mod config_watch;
 mod fence;
 mod http;
 mod instance_lock;

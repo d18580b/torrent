@@ -136,7 +136,8 @@ hold.
 | `torrentd_auth_rejections_total` | counter | `reason`: `malformed`, `unknown`, `expired` | daemon | from boot, at 0 | Requests refused 401 for the bearer credential they carried: malformed when it is not a well-formed bearer token, unknown when no static or live session token matches it (a revoked session included), expired when it names a session past its lifetime. |
 | `torrentd_http_requests_total` | counter | `route`; `method`; `status_class`: `1xx`, `2xx`, `3xx`, `4xx`, `5xx` | daemon | from boot: each route, before the API serves | Responses the HTTP API sent, by route (the OpenAPI path template, or unmatched where no operation matched the request), method and status class. |
 | `torrentd_http_request_duration_seconds` | histogram | `route`; `method` | daemon | from boot: each route, before the API serves | Seconds from a request arriving to its response head being ready, by route and method; a streamed body's delivery is not included. |
-| `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings` | daemon | from boot, at 0 | Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed. |
+| `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings`, `watch` | daemon | from boot, at 0 | Reloads (SIGHUP, POST /v1/config/reload, or a change config_watch saw) that failed, by the step that failed; watch counts config_watch failing to watch the config file's directory, at boot or later, after which only SIGHUP and the API reload. |
+| `torrentd_config_restart_pending` | gauge | `key`: `default_save_path`, `resume_dir`, `torrent_dir`, `http_listen`, `http_socket_mode`, `http_socket_group`, `trusted_proxies`, `allow_unauthenticated`, `allowed_hosts`, `allow_unsupported_state_fs`, `registry_path`, `connections_limit`, `file_pool_size`, `enable_lsd`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit`, `unchoke_slots_limit`, `peer_fingerprint`, `user_agent`, `vpn_handshake_max_age_secs`, `shutdown_drain_secs`, `network_kill_switch`, `kill_switch_api_interfaces`, `kill_switch_dns_servers`, `config_watch`, `profile`, `auth`, `pool`, `telemetry` | daemon | from boot, at 0 | 1 for each config key whose value in the file, at the last reload that read it, differs from the one the daemon runs and only a restart applies: a non-reloadable key, profile for any [[profile]] change, or a reloadable settings key the file deleted. Back to 0 when a reload finds the file matching again; a restart boots with the file and starts every key at 0. |
 | `torrentd_kill_switch_active` | gauge | — | daemon | from boot: always | 1 while the daemon holds the nftables kill switch installed. |
 | `torrentd_kill_switch_dns_exempt` | gauge | — | daemon | from boot: always | 1 while the kill switch lets the daemon's DNS out to kill_switch_dns_servers outside the tunnels, so every tracker hostname it looks up is visible to those resolvers. |
 | `torrentd_kill_switch_table_present` | gauge | — | daemon | from boot: kill switch on | 1 if the kill switch's nftables table was present and matched the rendered ruleset at the last check; 0 if it was missing or had drifted. |
@@ -259,6 +260,29 @@ daemon exits is counted after the last scrape, so that one is never seen.
 | Alert | Severity | Fires when |
 | --- | --- | --- |
 | `TorrentdFfiErrors` | warning | The shim swallowed an exception in the last 15 minutes, or during the boot (`torrentd_boot_ffi_errors`), by `call`. |
+
+## Config reloads
+
+A reload reads the config file again and applies what it can without a
+restart. `SIGHUP` and `POST /v1/config/reload` start one, and so, with
+`config_watch = true`, does the file changing: its directory is watched with
+inotify, which sees kubelet's `..data` symlink swap when a mounted ConfigMap
+or Secret is updated. A reload that fails keeps the running settings and is
+counted in `torrentd_config_reload_failures_total` by `stage`; `watch` counts
+the watch itself failing, at boot or later, after which only `SIGHUP` and the
+API reload.
+
+Every reload that reads the file sets `torrentd_config_restart_pending` to 1
+for each `key` the file holds at a value the daemon is not running and only a
+restart applies, and back to 0 for each it finds matching again. A restart
+boots with the file and starts every key at 0. Without `config_watch` the
+gauge moves only when something triggers a reload, so a file edited and never
+reloaded is not seen here.
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdReloadFailed` | warning | A reload failed in the last 15 minutes, by `stage`; the daemon runs the settings it had. |
+| `TorrentdConfigRestartPending` | warning | A key (`key`) has been pending a restart for 30 minutes: the file and the running daemon disagree, and will until it restarts or the file is edited back. |
 
 ## The build and the process
 
