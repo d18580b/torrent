@@ -824,6 +824,32 @@ fn the_log_is_json_lines_when_asked() {
     );
 }
 
+/// An unknown `TORRENTCTL_LOG_FORMAT` writes text, and the log says which
+/// value it did not know. Needs no daemon, so it is not ignored.
+#[test]
+fn an_unknown_log_format_is_warned_about_and_text_is_written() {
+    let run = run_under_pty_with(&[
+        (runtime::STALL_BLOCKING, "1"),
+        ("TORRENTCTL_LOG_FORMAT", "yaml"),
+    ]);
+    assert!(
+        run.status.success(),
+        "a quit exits cleanly: {:?}",
+        run.output
+    );
+    let log = &run.log;
+    let warning = log
+        .lines()
+        .find(|l| l.contains("TORRENTCTL_LOG_FORMAT is neither text nor json"))
+        .unwrap_or_else(|| panic!("no warning in the log: {log:?}"));
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(warning.contains("value=\"yaml\""), "{warning}");
+    assert!(
+        log.lines().all(|l| !l.starts_with('{')),
+        "text, not JSON: {log:?}"
+    );
+}
+
 /// A log that cannot be opened leaves torrentctl running without one, and
 /// it says why on the restored terminal as it exits, rather than going
 /// silently unlogged. Needs no daemon, so it is not ignored.
