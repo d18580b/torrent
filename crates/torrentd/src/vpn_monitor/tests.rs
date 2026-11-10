@@ -1109,6 +1109,65 @@ async fn the_poll_loop_fences_on_the_route_probe_and_reports_whether_it_ran() {
 /// the cause is logged at warn. An address `ip` answered is gone still
 /// fences.
 #[tokio::test(start_paused = true)]
+async fn each_poll_is_a_trace_of_its_own_linked_to_the_monitor() {
+    use opentelemetry::trace::SpanId;
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+    static ERRORS: crate::telemetry::ExportErrors = crate::telemetry::ExportErrors::new();
+    let exporter = InMemorySpanExporter::default();
+    let telemetry = crate::telemetry::Telemetry::for_tests(exporter.clone(), &ERRORS);
+    let (_reload, subscriber) = crate::tracing_init::for_tests_traced(
+        crate::config::LogLevel::Info,
+        crate::tracing_init::Buf::default(),
+        &telemetry,
+    );
+    let guard = torrentd_engine::testing::set_subscriber(subscriber);
+    let fresh = Ok(Some(Duration::from_secs(5)));
+    let (status, _) = poll_acct_a(StateMap::new(), MAX, scripted(None, fresh), 2).await;
+    drop(guard);
+    assert_eq!(status, ProfileStatus::Active);
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let monitor = spans
+        .iter()
+        .find(|s| s.name == "vpn_monitor")
+        .expect("the monitor's span, closed when it stops");
+    let checks: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "vpn_monitor.check")
+        .collect();
+    assert_eq!(checks.len(), 2, "one per poll: {spans:?}");
+    for check in &checks {
+        assert_eq!(check.parent_span_id, SpanId::INVALID, "a root: {check:?}");
+        assert_ne!(
+            check.span_context.trace_id(),
+            monitor.span_context.trace_id(),
+            "not in the monitor's never-ending trace",
+        );
+        assert!(
+            check
+                .links
+                .iter()
+                .any(|l| l.span_context == monitor.span_context),
+            "linked to the monitor: {check:?}",
+        );
+        let attr = |k: &str| {
+            check
+                .attributes
+                .iter()
+                .find(|a| a.key.as_str() == k)
+                .map(|a| a.value.to_string())
+        };
+        assert_eq!(attr("profile_id").as_deref(), Some("acct_a"));
+        assert_eq!(attr("verdict").as_deref(), Some("up"));
+    }
+    assert_ne!(
+        checks[0].span_context.trace_id(),
+        checks[1].span_context.trace_id()
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_poll_loop_does_not_fence_on_an_address_probe_that_could_not_run() {
     let fresh = Ok(Some(Duration::from_secs(5)));
     let log = crate::tracing_init::Buf::default();

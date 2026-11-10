@@ -290,10 +290,13 @@ pub async fn run(
     let mut catch_up = watch.is_some();
     let mut current = initial;
     loop {
+        // What started this reload, for its span.
+        let trigger;
         if std::mem::take(&mut catch_up) {
             if !differs_from_file(&config_path, &current) {
                 continue;
             }
+            trigger = "boot_catch_up";
             info!(
                 path = %config_path.display(),
                 "config_watch: the config file changed while the daemon started; reloading",
@@ -304,6 +307,7 @@ pub async fn run(
                     if request.is_none() {
                         break;
                     }
+                    trigger = "request";
                 }
                 changed = watched_change(&mut watch) => {
                     if let Err(e) = changed {
@@ -317,10 +321,16 @@ pub async fn run(
                         watch = None;
                         continue;
                     }
+                    trigger = "watch";
                     info!(path = %config_path.display(), "config_watch: the config file changed; reloading");
                 }
             }
         }
+        // One trace per reload, whatever span the task runs in. Nothing below
+        // awaits, so the guard is never held across a suspension.
+        let reload =
+            tracing::info_span!(parent: None, "reload", trigger, path = %config_path.display());
+        let _reload = reload.enter();
         let next = match Config::load(&config_path) {
             Ok(c) => c,
             Err(e) => {

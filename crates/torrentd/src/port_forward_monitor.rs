@@ -54,6 +54,7 @@ use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
 use tracing::info;
 use tracing::warn;
+use tracing::Instrument as _;
 
 use crate::metrics_sink::PromSink;
 use crate::pacing::reannounce_batch;
@@ -311,6 +312,10 @@ async fn renew_profile(
 ) {
     let mut delay = Duration::ZERO;
     let mut reannouncing: Option<tokio::task::JoinHandle<()>> = None;
+    // The profile's renewal loop's own span, as long-lived as it is. Each
+    // renewal is a root span linked to it rather than a child of it: a child
+    // would make the daemon's whole uptime one trace that never ends.
+    let monitor = tracing::info_span!(parent: None, "port_forward_monitor", profile_id = %id);
     loop {
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
@@ -319,9 +324,21 @@ async fn renew_profile(
         let Some(e) = profiles.resolve(&id).active() else {
             break;
         };
+        let renewal = tracing::info_span!(
+            parent: None,
+            "port_forward_monitor.renew",
+            profile_id = %id,
+            rebound = tracing::field::Empty,
+            next_in_s = tracing::field::Empty,
+        );
+        renewal.follows_from(&monitor);
         let taken = held_by_others_now(profiles.clone(), id.clone());
         let fenced = fenced_now(profiles.clone(), id.clone());
-        let next = renew_once(e, &*metrics, &forwarder, &listen, taken, fenced).await;
+        let next = renew_once(e, &*metrics, &forwarder, &listen, taken, fenced)
+            .instrument(renewal.clone())
+            .await;
+        renewal.record("rebound", next.rebound_at.is_some());
+        renewal.record("next_in_s", next.delay.as_secs());
         delay = next.delay;
         if let Some(detected) = next.rebound_at {
             // The old port's reannounce has nothing left worth saying.
@@ -329,16 +346,21 @@ async fn renew_profile(
                 old.abort();
             }
             let handles = state.handles_for_profile(&id);
-            reannouncing = Some(crate::startup::tasks::spawn(reannounce_paced(
-                e.engine.clone(),
-                handles,
-                metrics.clone(),
-                id.clone(),
-                detected,
-                pace,
-                stop.clone(),
-                fenced_now(profiles.clone(), id.clone()),
-            )));
+            // In the renewal's trace, which the port change it announces
+            // came from.
+            reannouncing = Some(crate::startup::tasks::spawn_in(
+                renewal,
+                reannounce_paced(
+                    e.engine.clone(),
+                    handles,
+                    metrics.clone(),
+                    id.clone(),
+                    detected,
+                    pace,
+                    stop.clone(),
+                    fenced_now(profiles.clone(), id.clone()),
+                ),
+            ));
         }
     }
     if let Some(r) = reannouncing {

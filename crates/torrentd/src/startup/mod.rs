@@ -43,6 +43,7 @@ use torrentd_engine::TorrentStore;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+use tracing::Instrument as _;
 
 use crate::app_state::AppState;
 use crate::config::Config;
@@ -252,6 +253,11 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting torrentd");
+    // The boot's own trace: each stage below is a `startup.<stage>` span
+    // under it, and it closes when `boot` returns, so it does not stay open
+    // for the daemon's whole life. Binding the API comes after, in
+    // `DaemonHandle::run_until_signal`, as `startup.http_bind`.
+    let startup = tracing::info_span!(parent: None, "startup");
     // `cfg` came from `Config::load`, whose validation ran
     // `Config::check_boot_rules` before any tunnel could be raised.
     // Where a VPN manager keeps state a *later* process has to find — see
@@ -264,7 +270,8 @@ pub async fn boot(
     let unsupported_state_fs = {
         let dirs = fs_check::state_dirs(&cfg);
         let allow = cfg.allow_unsupported_state_fs;
-        crate::startup::tasks::spawn_blocking(move || {
+        let stage = tracing::info_span!(parent: &startup, "startup.fs_check");
+        crate::startup::tasks::spawn_blocking_in(stage, move || {
             fs_check::check_state_fs(&dirs, allow, &fs_check::Host)
         })
         .await
@@ -276,7 +283,8 @@ pub async fn boot(
     // teardown runs while the lock is still held.
     let instance_lock = {
         let path = cfg.instance_lock_path();
-        crate::startup::tasks::spawn_blocking(move || InstanceLock::acquire(&path))
+        let stage = tracing::info_span!(parent: &startup, "startup.instance_lock");
+        crate::startup::tasks::spawn_blocking_in(stage, move || InstanceLock::acquire(&path))
             .await
             .context("single-instance lock")??
     };
@@ -285,9 +293,12 @@ pub async fn boot(
     // with the switch on and removing it as stale with the switch off. Taken
     // after the state directory's lock, so a second start on the same state
     // directory is told that first.
-    let table_lock = crate::startup::tasks::spawn_blocking(acquire_table_lock)
-        .await
-        .context("kill-switch table lock")??;
+    let table_lock = crate::startup::tasks::spawn_blocking_in(
+        tracing::info_span!(parent: &startup, "startup.table_lock"),
+        acquire_table_lock,
+    )
+    .await
+    .context("kill-switch table lock")??;
 
     // Signals, installed before anything that can block or fail, so a
     // SIGTERM during a tunnel bring-up is handled rather than fatal.
@@ -328,7 +339,8 @@ pub async fn boot(
     // every tunnel is up.
     let preflight = {
         let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
-        crate::startup::tasks::spawn_blocking(move || {
+        let stage = tracing::info_span!(parent: &startup, "startup.preflight");
+        crate::startup::tasks::spawn_blocking_in(stage, move || {
             vpn::preflight::run(&needs, &vpn::preflight::Host)
         })
         .await
@@ -384,7 +396,8 @@ pub async fn boot(
     {
         let state_dir = run_dir.clone();
         let configured = Arc::clone(&configured);
-        let released = crate::startup::tasks::spawn_blocking(move || {
+        let stage = tracing::info_span!(parent: &startup, "startup.release_wireguard");
+        let released = crate::startup::tasks::spawn_blocking_in(stage, move || {
             crate::vpn::release_recorded_wireguard(&state_dir, |iface| configured.contains(iface))
         })
         .await
@@ -407,7 +420,8 @@ pub async fn boot(
     {
         let state_dir = run_dir.clone();
         let configured = Arc::clone(&configured);
-        let released = crate::startup::tasks::spawn_blocking(move || {
+        let stage = tracing::info_span!(parent: &startup, "startup.release_openvpn");
+        let released = crate::startup::tasks::spawn_blocking_in(stage, move || {
             vpn::OpenvpnManager::new(state_dir).release_recorded(|iface| configured.contains(iface))
         })
         .await
@@ -427,7 +441,8 @@ pub async fn boot(
     // in the same transaction as its install. With it off nothing else would
     // remove it, so it goes here, before any session opens a socket.
     if !cfg.network_kill_switch {
-        crate::startup::tasks::spawn_blocking(|| {
+        let stage = tracing::info_span!(parent: &startup, "startup.stale_kill_switch");
+        crate::startup::tasks::spawn_blocking_in(stage, || {
             remove_stale_kill_switch(
                 crate::vpn::killswitch::nft_available(),
                 &crate::vpn::killswitch::own_table_name(),
@@ -616,6 +631,7 @@ pub async fn boot(
         |path| std::fs::read_to_string(path).ok(),
         boot_engine,
     )
+    .instrument(tracing::info_span!(parent: &startup, "startup.profiles"))
     .await?;
     boot_progress.advance();
     // Every alert-referenced series exists from here, before the alert loop
@@ -839,7 +855,9 @@ pub async fn boot(
     // startup rather than surfacing as a 500 on the first API call, and
     // before the resume scan, which falls back to its library for a
     // torrent's `.torrent`.
-    let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
+    let pool = tracing::info_span!(parent: &startup, "startup.pool_open")
+        .in_scope(|| crate::pool_service::PoolService::open(&cfg))
+        .context("open pool index")?;
     if let Some(pool) = pool.as_ref() {
         pool.set_metrics(metrics.clone());
         pool.set_state(Arc::clone(&state));
@@ -898,6 +916,7 @@ pub async fn boot(
         LISTEN_CHECK_BOUND,
         &mut boot_shutdown,
     )
+    .instrument(tracing::info_span!(parent: &startup, "startup.listen_check"))
     .await?;
     boot_progress.advance();
 
@@ -920,8 +939,12 @@ pub async fn boot(
             checked_hold: &checked_hold,
             boot_progress: &boot_progress,
         };
-        resume_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown).await?;
-        torrent_dir_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown).await?;
+        resume_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown)
+            .instrument(tracing::info_span!(parent: &startup, "startup.resume_scan"))
+            .await?;
+        torrent_dir_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown)
+            .instrument(tracing::info_span!(parent: &startup, "startup.torrent_dir_scan"))
+            .await?;
     }
     let ScanTally {
         loaded_by_profile,
@@ -1342,7 +1365,9 @@ impl DaemonHandle {
         // the server and falls through to the same drain and teardown a
         // signalled shutdown runs, exiting 70, after `run_http_stage` has told
         // the background tasks to stop.
-        let listener = bind_api_listener(&cfg).await;
+        let listener = bind_api_listener(&cfg)
+            .instrument(tracing::info_span!("startup.http_bind"))
+            .await;
         let posture = unauthenticated_posture(&cfg);
         let (tx, alert, gate, sink, boot) = (&shutdown_tx, &alert_loop, &work, &metrics, &boot);
         let mut exit_code = run_http_stage(

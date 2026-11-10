@@ -1039,6 +1039,9 @@ async fn an_adoption_runs_in_the_callers_trace_down_to_the_engine() {
     let dir = tempfile::tempdir().unwrap();
     let (pool, _) = fixture(dir.path(), false);
     let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    // The fixture's scan is a trace of its own (`pool.scan_root`), before
+    // the request; only what the request logs is read below.
+    let before = log.text().len();
     let resp = h
         .send_with(
             "POST",
@@ -1066,8 +1069,7 @@ async fn an_adoption_runs_in_the_callers_trace_down_to_the_engine() {
     assert_eq!(parts[1], TRACE_ID, "the caller's trace: {returned}");
     assert_ne!(parts[2], CALLER_SPAN, "the request's own span: {returned}");
 
-    let lines: Vec<Value> = log
-        .text()
+    let lines: Vec<Value> = log.text()[before..]
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();

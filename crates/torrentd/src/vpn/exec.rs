@@ -543,6 +543,56 @@ mod tests {
         );
     }
 
+    /// A run is an `external_command` span carrying the program, the command
+    /// line, the duration and the exit status; a failure is a WARN line in
+    /// it, with the tool's stderr.
+    #[test]
+    fn a_run_is_a_span_and_a_failure_a_warn_line_with_stderr() {
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        static ERRORS: crate::telemetry::ExportErrors = crate::telemetry::ExportErrors::new();
+        let exporter = InMemorySpanExporter::default();
+        let telemetry = crate::telemetry::Telemetry::for_tests(exporter.clone(), &ERRORS);
+        let log = crate::tracing_init::Buf::default();
+        let (_reload, subscriber) = crate::tracing_init::for_tests_traced(
+            crate::config::LogLevel::Info,
+            log.clone(),
+            &telemetry,
+        );
+        torrentd_engine::testing::with_subscriber(subscriber, || {
+            run_ok("sh", &["-c", "echo nope >&2; exit 4"], None, QUICK).unwrap_err();
+        });
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "external_command")
+            .expect("the run's span");
+        let attr = |k: &str| {
+            span.attributes
+                .iter()
+                .find(|a| a.key.as_str() == k)
+                .map(|a| a.value.to_string())
+        };
+        assert_eq!(attr("program").as_deref(), Some("other"));
+        assert_eq!(
+            attr("command").as_deref(),
+            Some("sh -c echo nope >&2; exit 4")
+        );
+        assert!(attr("duration_ms").is_some(), "{span:?}");
+        assert!(
+            attr("exit_status").is_some_and(|s| s.contains('4')),
+            "{span:?}"
+        );
+        let text = log.text();
+        let warn = text
+            .lines()
+            .find(|l| l.contains("external command exited non-zero"))
+            .unwrap_or_else(|| panic!("a WARN line: {text}"));
+        assert!(warn.contains("\"level\":\"WARN\""), "{warn}");
+        assert!(warn.contains("nope"), "the stderr: {warn}");
+        assert!(warn.contains("external_command"), "inside the span: {warn}");
+    }
+
     #[test]
     fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
         let out = run("sh", &["-c", "head -c 200000 /dev/zero"], None, QUICK).unwrap();
