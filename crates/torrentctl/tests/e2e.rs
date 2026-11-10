@@ -601,6 +601,8 @@ struct PtyRun {
     output: String,
     /// The pty's local modes once it had exited.
     lflag: libc::tcflag_t,
+    /// Its log file, or empty where it wrote none.
+    log: String,
 }
 
 impl PtyRun {
@@ -772,6 +774,82 @@ fn a_panic_on_a_background_task_exits_with_the_terminal_handed_back() {
         run.output[report..].contains(stopped),
         "no exit message after the report: {:?}",
         run.output
+    );
+}
+
+/// A panic is in the log, with its backtrace, though `RUST_BACKTRACE` is
+/// off: the report on the terminal is gone with it, and the log is what a
+/// bug report attaches. Needs no daemon, so it is not ignored.
+#[test]
+fn a_panic_is_written_to_the_log_with_its_backtrace() {
+    let run = run_under_pty(runtime::PANIC_AFTER_DRAW);
+    run.assert_terminal_handed_back("TORRENTCTL_TEST_PANIC is set");
+    let log = &run.log;
+    let line = log
+        .lines()
+        .position(|l| l.contains("ERROR") && l.contains("panicked"))
+        .unwrap_or_else(|| panic!("no panic in the log: {log:?}"));
+    let report: String = log.lines().skip(line).collect::<Vec<_>>().join("\n");
+    assert!(report.contains("TORRENTCTL_TEST_PANIC is set"), "{report}");
+    assert!(report.contains("backtrace="), "{report}");
+    assert!(
+        report.contains("torrentctl::runtime"),
+        "the backtrace names the frames: {report}"
+    );
+}
+
+/// `TORRENTCTL_LOG_FORMAT=json` writes the log as JSON lines. Needs no
+/// daemon, so it is not ignored.
+#[test]
+fn the_log_is_json_lines_when_asked() {
+    let run = run_under_pty_with(&[
+        (runtime::STALL_BLOCKING, "1"),
+        ("TORRENTCTL_LOG_FORMAT", "json"),
+    ]);
+    assert!(
+        run.status.success(),
+        "a quit exits cleanly: {:?}",
+        run.output
+    );
+    let log = &run.log;
+    assert!(log.lines().count() > 0, "something was logged: {log:?}");
+    for line in log.lines() {
+        let parsed: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("not a JSON line ({e}): {line:?}"));
+        assert!(parsed["level"].is_string(), "{line}");
+    }
+    assert!(
+        log.lines().any(|l| l.contains("\"message\":\"exiting\"")),
+        "{log:?}"
+    );
+}
+
+/// A log that cannot be opened leaves torrentctl running without one, and
+/// it says why on the restored terminal as it exits, rather than going
+/// silently unlogged. Needs no daemon, so it is not ignored.
+#[test]
+fn a_log_that_cannot_be_opened_is_reported_once_the_terminal_is_handed_back() {
+    // A state directory under a file: it cannot be created.
+    let run = run_under_pty_with(&[
+        (runtime::STALL_BLOCKING, "1"),
+        ("XDG_STATE_HOME", "/dev/null/state"),
+    ]);
+    let output = &run.output;
+    assert!(run.status.success(), "a quit exits cleanly: {output:?}");
+    let left = output
+        .find("\x1b[?1049l")
+        .unwrap_or_else(|| panic!("never left the alternate screen: {output:?}"));
+    let said = output
+        .find("torrentctl: logging is off: cannot create /dev/null/state/torrentctl")
+        .unwrap_or_else(|| panic!("the failure was not reported: {output:?}"));
+    assert!(
+        left < said,
+        "reported after the terminal is handed back: {output:?}"
+    );
+    assert_eq!(
+        output.matches("logging is off").count(),
+        1,
+        "reported once: {output:?}"
     );
 }
 
@@ -1185,6 +1263,11 @@ fn a_hangup_exits_as_sighup_without_aborting_and_flushes_the_log() {
 /// Run `torrentctl` against a closed port under a pty, with `env` (one of
 /// the test switches in `runtime`) set, until it exits or [`STEP`] passes.
 fn run_under_pty(env: &str) -> PtyRun {
+    run_under_pty_with(&[(env, "1")])
+}
+
+/// [`run_under_pty`] with `envs` set.
+fn run_under_pty_with(envs: &[(&str, &str)]) -> PtyRun {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
 
@@ -1192,9 +1275,9 @@ fn run_under_pty(env: &str) -> PtyRun {
     let Pty {
         mut child,
         master,
-        home: _home,
+        home,
         _one_at_a_time,
-    } = spawn_under_pty(&[(env, "1")]);
+    } = spawn_under_pty(envs);
 
     // Read on a thread until the child closes its end (Linux reports that as
     // EIO), so a binary that neither panics nor exits fails the test at a
@@ -1238,10 +1321,13 @@ fn run_under_pty(env: &str) -> PtyRun {
         );
         termios.c_lflag
     };
+    let log = std::fs::read_to_string(home.path().join("state/torrentctl/torrentctl.log"))
+        .unwrap_or_default();
     PtyRun {
         status,
         output,
         lflag,
+        log,
     }
 }
 
