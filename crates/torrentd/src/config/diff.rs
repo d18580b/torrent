@@ -44,6 +44,7 @@ impl Config {
             auth: new_auth,
             pool: new_pool,
             trusted_proxies: new_trusted_proxies,
+            telemetry: new_telemetry,
         } = new;
 
         let mut d = ConfigDiff::default();
@@ -152,6 +153,11 @@ impl Config {
         }
         if old.pool != *new_pool {
             d.non_reloadable_changes.push("pool");
+        }
+        // The tracer provider and its exporter are built once, with the
+        // subscriber, before the runtime runs anything.
+        if old.telemetry != *new_telemetry {
+            d.non_reloadable_changes.push("telemetry");
         }
         d.profile_changes = diff_profiles(&old.profile, new_profile);
         d

@@ -556,6 +556,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Lines logged at WARN or ERROR, by level and by the crate and top-level module that \
          logged them (the target's first two path segments; other for any target not listed \
          here). Counted whatever log_level or RUST_LOG lets through to the log.";
+    // traces
+    "telemetry_export_errors_total" Counter Daemon Zero =>
+        "OTLP span exports that failed, each dropping its batch: a collector that refused or \
+         did not answer within the timeout. Logged at WARN, target torrentd::telemetry, at \
+         most once a minute. Always 0 without [telemetry].";
     // the build
     "build_fault_injection" Gauge Daemon Owner("always") =>
         "1 if this binary was built with the fault-injection feature, which mounts \
@@ -870,6 +875,9 @@ pub struct PromSink {
     /// The engine's process-wide batch-writer death count as of the last
     /// time it was exported.
     writer_deaths_exported: Mutex<u64>,
+    /// The process-wide failed span export count as of the last time it was
+    /// exported. See [`PromSink::export_telemetry_errors`].
+    telemetry_errors_exported: Mutex<u64>,
     /// The pool index's process-wide failed-rollback count as of the last
     /// time it was exported. See [`PromSink::export_pool_rollback_errors`].
     pool_rollbacks_exported: Mutex<u64>,
@@ -905,6 +913,7 @@ pub fn note_dir_fsync_error() {
     DAEMON_DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);
 }
 const WRITER_DEATHS: &str = "batch_writer_deaths_total";
+const TELEMETRY_EXPORT_ERRORS: &str = "telemetry_export_errors_total";
 const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
 const BUILD_INFO: &str = "build_info";
 const PROCESS_START_TIME: &str = "process_start_time_seconds";
@@ -933,6 +942,7 @@ impl PromSink {
             log_events_exported: Mutex::new(Vec::new()),
             panics_exported: Mutex::new(Vec::new()),
             writer_deaths_exported: Mutex::new(0),
+            telemetry_errors_exported: Mutex::new(0),
             pool_rollbacks_exported: Mutex::new(0),
             ffi_errors_exported: Mutex::new(Vec::new()),
             boot_counts: Once::new(),
@@ -1024,6 +1034,7 @@ impl PromSink {
         self.export_log_events(&crate::tracing_init::log_events().snapshot());
         self.export_panics(&crate::panic_hook::panics().snapshot());
         self.export_writer_deaths(torrentd_engine::batch_writer::writer_deaths());
+        self.export_telemetry_errors(crate::telemetry::export_errors().total());
         self.export_pool_rollback_errors(torrentd_pool::PoolStore::rollback_errors());
         self.export_ffi_errors(&libtorrent_safe::ffi_errors::swallowed());
         // After the process-wide counts are brought up to date, so their
@@ -1170,6 +1181,17 @@ impl PromSink {
         let mut exported = self.writer_deaths_exported.lock();
         if total > *exported {
             self.add_counter(WRITER_DEATHS, total - *exported, &[]);
+            *exported = total;
+        }
+    }
+
+    /// Bring `telemetry_export_errors_total` up to `total`, the span
+    /// exporter's process-wide count of failed exports, read at scrape time
+    /// because the exporter, built with the subscriber, holds no sink.
+    fn export_telemetry_errors(&self, total: u64) {
+        let mut exported = self.telemetry_errors_exported.lock();
+        if total > *exported {
+            self.add_counter(TELEMETRY_EXPORT_ERRORS, total - *exported, &[]);
             *exported = total;
         }
     }
@@ -2456,6 +2478,11 @@ pub(crate) mod tests {
             Coverage::Series("resume_write_errors_total"),
         ),
         ("session_pause_failed", Coverage::LogEvents),
+        (
+            "span_export_failed",
+            Coverage::Series("telemetry_export_errors_total"),
+        ),
+        ("span_flush_failed", Coverage::LogEvents),
         (
             "storage_moved_failed",
             Coverage::Series("storage_move_failures_total"),
