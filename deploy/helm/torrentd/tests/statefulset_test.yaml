@@ -1,0 +1,278 @@
+suite: statefulset
+templates:
+  - templates/statefulset.yaml
+tests:
+  - it: runs one replica, never more
+    values: [values/host-only.yaml]
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: state
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.accessModes
+          value: [ReadWriteOnce]
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: state
+            mountPath: /var/lib/torrentd
+
+  - it: probes /livez for liveness and /readyz for startup and readiness
+    values: [values/host-only.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /livez
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.path
+          value: /readyz
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 180
+
+  - it: sizes the stop grace from shutdown_drain_secs plus the margin
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 360
+
+  - it: uses the default drain when the config does not set one
+    values: [values/host-only.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 120
+
+  - it: takes an explicit stop grace as given
+    values: [values/host-only.yaml]
+    set:
+      terminationGracePeriodSeconds: 900
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 900
+
+  - it: drops every capability and forbids escalation for host profiles only
+    values: [values/host-only.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      - notExists:
+          path: spec.template.spec.securityContext.sysctls
+
+  - it: adds NET_ADMIN and allows escalation for a vpn profile
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities
+          value:
+            drop: [ALL]
+            add: [NET_ADMIN]
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+
+  - it: adds NET_ADMIN for the kill switch
+    values: [values/kill-switch.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          value: [NET_ADMIN]
+
+  - it: adds NET_ADMIN from vpn.enabled when the config is an existing Secret
+    set:
+      config.existingSecret: my-config
+      vpn.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          value: [NET_ADMIN]
+
+  - it: sets rp_filter loose only when asked
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.sysctls
+          value:
+            - name: net.ipv4.conf.all.rp_filter
+              value: "2"
+
+  - it: never chowns a payload volume recursively
+    values: [values/host-only.yaml]
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.fsGroupChangePolicy
+          value: OnRootMismatch
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+
+  - it: mounts each payload volume, by claim or host path
+    values: [values/host-only.yaml]
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: payload-torrents
+            persistentVolumeClaim:
+              claimName: torrents
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: payload-library
+            hostPath:
+              path: /srv/library
+              type: Directory
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: payload-library
+            mountPath: /data/library
+
+  - it: mounts the config as a directory, never with subPath
+    values: [values/host-only.yaml]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: config
+            mountPath: /etc/torrentd
+            readOnly: true
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts[0].subPath
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: config
+            secret:
+              secretName: RELEASE-NAME-torrentd-config
+              defaultMode: 288
+              items:
+                - key: torrentd.toml
+                  path: torrentd.toml
+
+  - it: reads an existing Secret's key as torrentd.toml
+    set:
+      config.existingSecret: my-config
+      config.existingSecretKey: config.toml
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: config
+            secret:
+              secretName: my-config
+              defaultMode: 288
+              items:
+                - key: config.toml
+                  path: torrentd.toml
+
+  - it: mounts the WireGuard configs at /etc/wireguard, mode 0440
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: wireguard
+            secret:
+              secretName: torrentd-wireguard
+              defaultMode: 288
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: wireguard
+            mountPath: /etc/wireguard
+            readOnly: true
+
+  - it: keeps /tmp on a memory-backed emptyDir
+    values: [values/host-only.yaml]
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir:
+              medium: Memory
+              sizeLimit: 256Mi
+
+  - it: publishes a host profile's peer port on the node with hostPort
+    values: [values/host-only.yaml]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: public-tcp
+            containerPort: 6881
+            protocol: TCP
+            hostPort: 6881
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: public-udp
+            containerPort: 6881
+            protocol: UDP
+            hostPort: 6881
+
+  - it: leaves hostPort off when a LoadBalancer exposes the peers
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: public-tcp
+            containerPort: 6881
+            protocol: TCP
+
+  - it: rolls the pod on a config change only when asked
+    values: [values/host-only.yaml]
+    set:
+      config.rollOnChange: true
+    asserts:
+      - exists:
+          path: spec.template.metadata.annotations["checksum/config"]
+
+  - it: carries no config checksum by default
+    values: [values/host-only.yaml]
+    asserts:
+      - notExists:
+          path: spec.template.metadata.annotations
+
+  - it: pins the image by digest when one is given
+    values: [values/host-only.yaml]
+    set:
+      image.digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/d18580b/torrent:0.2.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+  - it: refuses a payload volume that is neither a claim nor a host path
+    values: [values/host-only.yaml]
+    set:
+      payloadVolumes:
+        - name: bad
+          mountPath: /data/bad
+    asserts:
+      - failedTemplate: {}

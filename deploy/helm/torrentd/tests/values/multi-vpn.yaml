@@ -1,0 +1,40 @@
+# deploy/torrentd.multi-account.sample.toml's profiles: a host profile and two
+# WireGuard accounts, one with a static port and one forwarded over NAT-PMP.
+config:
+  settings:
+    vpn_handshake_max_age_secs: 180
+    shutdown_drain_secs: 300
+    auth:
+      password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo"
+    profile:
+      - id: public
+        network: host
+        listen_interfaces: "eth0:6881"
+        dht: true
+      - id: acct_a
+        network: vpn
+        vpn_type: wireguard
+        vpn_config: /etc/wireguard/wg-acct-a.conf
+        vpn_interface: wg-acct-a
+        listen_port: 6891
+        peer_fingerprint: "-qB5030-"
+        user_agent: qBittorrent/5.0.3
+        allowed_tracker_domains: [tracker-a.example.com]
+      - id: acct_b
+        network: vpn
+        vpn_type: wireguard
+        vpn_config: /etc/wireguard/proton-b.conf
+        vpn_interface: proton-b
+        port_forward: natpmp
+        port_forward_gateway: 10.2.0.1
+        peer_fingerprint: "-DE211s-"
+        user_agent: Deluge/2.1.1 libtorrent/2.0.14.0
+        allowed_tracker_domains: [tracker-b.example.com]
+vpn:
+  wireguardSecret: torrentd-wireguard
+rpFilterLoose: true
+peers:
+  ports:
+    - name: public
+      port: 6881
+  expose: loadBalancer

@@ -418,6 +418,22 @@ jobs:
           toolchain: ''
       - run: mise run test-alerts
 
+  helm-chart:
+    name: helm chart (lint + unittest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # mise provides helm and helm-unittest. helm-lint also fails while the
+      # chart's copy of the alert rules or the dashboard is stale.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - run: mise run helm-lint
+      - run: mise run helm-test
+
   commit-lint:
     name: conventional commits
     runs-on: ubuntu-24.04
