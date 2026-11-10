@@ -183,6 +183,8 @@ fn commit_all(store: &mut PoolStore, jobs: Vec<Job>) {
     match committed {
         Ok(()) => {
             for (value, done) in ran {
+                // ignore-result: a caller that stopped waiting wants no
+                // answer; the work is committed either way.
                 let _ = done.send(Ok(value));
             }
         }
@@ -190,6 +192,8 @@ fn commit_all(store: &mut PoolStore, jobs: Vec<Job>) {
             // What ran was rolled back with the rest; what did not run, the
             // transaction never began for or was gone before.
             for done in ran.into_iter().map(|(_, d)| d).chain(jobs.map(|j| j.done)) {
+                // ignore-result: a caller that stopped waiting wants no
+                // answer.
                 let _ = done.send(Err(why.clone()));
             }
         }
