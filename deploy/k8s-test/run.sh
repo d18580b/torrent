@@ -328,8 +328,16 @@ printf '{"profile_id":"public","source":{"kind":"magnet","uri":"magnet:?xt=urn:b
 resp=$(api "$write_token" leech-torrentd-0 POST /v1/torrents --data-binary @- <"$tmp/add-leech.json")
 [ "${resp##*$'\n'}" = 201 ] || die "leech refused the magnet: $resp"
 poll 180 "leech to download the fixture from seed" is_seeding leech-torrentd-0
-uploaded=$(get seed-torrentd-0 "/v1/torrents/$infohash" | json total_payload_uploaded)
-[ "${uploaded:-0}" -ge "$size" ] || die "seed uploaded $uploaded payload bytes, under the fixture's $size"
+# The daemon serves torrent status from a cache refreshed every 2 s, so
+# seed's counter can trail leech's completion: poll it rather than read it once.
+has_uploaded() {
+  local t
+  t=$(get seed-torrentd-0 "/v1/torrents/$infohash") || return 1
+  uploaded=$(json total_payload_uploaded <<<"$t")
+  last_seen="total_payload_uploaded=${uploaded:-none}, want >= $size"
+  [ "${uploaded:-0}" -ge "$size" ]
+}
+poll 30 "seed to report uploading the fixture's $size bytes" has_uploaded
 echo "seeded: $infohash, $uploaded bytes from seed to leech"
 
 # ---- the metrics scrape ---------------------------------------------------
