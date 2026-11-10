@@ -92,8 +92,15 @@ function count(s, ch,    n, i) {
   return n
 }
 # Track one line of the gated item: its brace and bracket depth, and whether
-# a body brace or a `where` clause has been seen.
-function track(code) {
+# a body brace or a `where` clause has been seen. In an item header (`fn`,
+# `impl`, `struct`, ...) before its body, also the depth of `<...>` generic
+# lists, `->` and `=>` aside; elsewhere `<` may be a comparison.
+function track(code,    gen) {
+  if (header && !opened) {
+    gen = code
+    gsub(/->|=>/, "", gen)
+    angle += count(gen, "<") - count(gen, ">")
+  }
   depth += count(code, "{") - count(code, "}")
   paren += count(code, "(") + count(code, "[") - count(code, ")") - count(code, "]")
   if (count(code, "{") > 0) opened = 1
@@ -101,15 +108,15 @@ function track(code) {
 }
 # Whether the gated item ends on this line. With a body, at the brace that
 # closes it. Without one, at its trailing `;`, at its trailing `,` outside
-# brackets and a `where` clause (a field, variant, match arm or struct-literal
-# field), or at an unmatched `}` (the enclosing block closing after a last
-# field or arm that has no trailing `,`).
+# brackets, a generic list and a `where` clause (a field, variant, match arm
+# or struct-literal field), or at an unmatched `}` (the enclosing block
+# closing after a last field or arm that has no trailing `,`).
 function gate_ends(code) {
   if (opened) return depth <= 0
   if (depth < 0 || code ~ /;[[:space:]]*$/) return 1
-  return paren <= 0 && !inwhere && code ~ /,[[:space:]]*$/
+  return paren <= 0 && angle <= 0 && !inwhere && code ~ /,[[:space:]]*$/
 }
-FNR == 1 { pending = 0; gated = 0; depth = 0; paren = 0; opened = 0; inwhere = 0; annotated_above = 0; str = -1; raw = 0; blk = 0 }
+FNR == 1 { pending = 0; gated = 0; depth = 0; paren = 0; angle = 0; header = 0; opened = 0; inwhere = 0; annotated_above = 0; str = -1; raw = 0; blk = 0 }
 {
   line = $0
   code = code_of(line)
@@ -129,7 +136,8 @@ FNR == 1 { pending = 0; gated = 0; depth = 0; paren = 0; opened = 0; inwhere = 0
   if (pending) {
     if (code ~ /^[[:space:]]*(#\[.*|)$/) next
     pending = 0
-    gated = 1; depth = 0; paren = 0; opened = 0; inwhere = 0
+    gated = 1; depth = 0; paren = 0; angle = 0; opened = 0; inwhere = 0
+    header = code ~ /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?((const|async|unsafe|default|extern([[:space:]]+"")?)[[:space:]]+)*(fn|impl|struct|enum|union|trait|type)([^[:alnum:]_]|$)/
     track(code)
     if (gate_ends(code)) gated = 0
     annotated_above = 0
