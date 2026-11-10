@@ -582,9 +582,13 @@ run = "cargo deny check"
 # ring's C. scripts/dist checks each binary's version, against RELEASE_TAG
 # too when that is set, and packages it into target/dist/. Both builds set
 # TORRENTD_REVISION to the commit being built, which torrentd_build_info
-# reports as its `revision`.
+# reports as its `revision`. Both build for the machine's own architecture
+# (`uname -m`, x86_64 or aarch64): the release builds each on a native runner.
+# The musl build names musl-gcc as its target's C compiler, since cc picks it
+# on its own for x86_64 only and looks for an `aarch64-linux-musl-gcc` that
+# musl-tools does not ship.
 [tasks.dist]
-description = "Build and package the x86_64 glibc release tarball (torrentd + torrentctl) into target/dist/"
+description = "Build and package this machine's glibc release tarball (torrentd + torrentctl) into target/dist/"
 run = [
   "mise run release-features",
   "TORRENTD_REVISION=\"$(git rev-parse HEAD)\" cargo build --release --locked --workspace --bin torrentd --bin torrentctl",
@@ -592,10 +596,10 @@ run = [
 ]
 
 [tasks.dist-musl]
-description = "Build and package the static x86_64 musl torrentctl tarball into target/dist/ (needs musl-gcc)"
+description = "Build and package this machine's static musl torrentctl tarball into target/dist/ (needs musl-gcc)"
 run = [
-  "rustup target add x86_64-unknown-linux-musl",
-  "TORRENTD_REVISION=\"$(git rev-parse HEAD)\" cargo build --release --locked -p torrentctl --target x86_64-unknown-linux-musl",
+  "rustup target add \"$(uname -m)-unknown-linux-musl\"",
+  "TORRENTD_REVISION=\"$(git rev-parse HEAD)\" env \"CC_$(uname -m)_unknown_linux_musl=musl-gcc\" cargo build --release --locked -p torrentctl --target \"$(uname -m)-unknown-linux-musl\"",
   "scripts/dist musl",
 ]
 
