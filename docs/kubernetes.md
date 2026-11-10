@@ -374,8 +374,10 @@ metrics:
 #### Values: multi-account VPN behind the kill switch
 
 Two WireGuard accounts and no `host` profile: with the kill switch on, the
-daemon's uid reaches the network only through the tunnels, so a `host`
-profile would be dropped. The chart adds the kill switch's API and DNS
+daemon's uid reaches the network only through the tunnels, so the daemon
+refuses at boot a config that sets `network_kill_switch = true` beside any
+`host` profile. Run host profiles in a separate release without the kill
+switch. The chart adds the kill switch's API and DNS
 carve-outs, `NET_ADMIN`, and `allowPrivilegeEscalation: true` by itself. It
 needs a `privileged` namespace, the kubelet's unsafe-sysctl flag, and the
 `wireguard` module on the node.
