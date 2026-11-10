@@ -246,9 +246,12 @@ pub const CATALOGUE: &[Series] = catalogue! {
          it, as one being added landed after the fence, or as the disk-error retry resumed one \
          after the fence.";
     // boot
-    "profile_boot_failed" Gauge Profile Owner("always") =>
+    "profile_boot_failed" Gauge Profile ("reason": crate::profile_registry::BootFailure::LABELS)
+        Owner("always") =>
         "1 if the profile got no session at boot (tunnel, port forward, or session \
-         construction failed).";
+         construction failed). One series per profile: reason is none at 0, and at 1 names \
+         the failure's class, rp_filter_strict where strict reverse-path filtering on the \
+         tunnel's interface would drop replies to its sockets, other for the rest.";
     "profile_offline" Gauge Profile Owner("always") =>
         "1 while the operator holds the profile offline, by its own state or by offline-all.";
     "boot_torrent_load_failures" Gauge Profile

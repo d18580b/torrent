@@ -49,6 +49,7 @@ use crate::config::Config;
 use crate::http;
 use crate::instance_lock::InstanceLock;
 use crate::metrics_sink::PromSink;
+use crate::profile_registry::BootFailure;
 use crate::profile_registry::ProfileRegistry;
 use crate::profile_registry::ProfileStatus;
 use crate::registry::AssignmentRegistry;
@@ -606,22 +607,34 @@ pub async fn boot(
         &mut boot_shutdown,
         &desired_states.current(),
         |p| vpn::preflight::refusal_for(&preflight, p),
+        |path| std::fs::read_to_string(path).ok(),
         boot_engine,
     )
     .await?;
     boot_progress.advance();
     // Every alert-referenced series exists from here, before the alert loop
     // or any request can move one. A profile that failed is seeded too: its
-    // engine counters stay at zero, and `profile_boot_failed` says why.
+    // engine counters stay at zero, and `profile_boot_failed` says why: one
+    // series per profile, its `reason` the failure's class or `none`, so a
+    // count of the series is still a count of the profiles.
     {
         let configured: Vec<&str> = cfg.profile.iter().map(|p| p.id.as_str()).collect();
         metrics.seed(&configured);
         for p in &cfg.profile {
-            let failed = failed_profiles.iter().any(|f| f.config.id == p.id);
+            let cause = failed_profiles
+                .iter()
+                .find(|f| f.config.id == p.id)
+                .map(|f| f.cause);
             metrics.set_gauge(
                 "profile_boot_failed",
-                if failed { 1.0 } else { 0.0 },
-                &[("profile_id", p.id.as_str())],
+                if cause.is_some() { 1.0 } else { 0.0 },
+                &[
+                    ("profile_id", p.id.as_str()),
+                    (
+                        "reason",
+                        cause.map_or(BootFailure::NONE, BootFailure::label),
+                    ),
+                ],
             );
         }
         export_shutdown_report(&metrics, &take_shutdown_report(&run_dir));

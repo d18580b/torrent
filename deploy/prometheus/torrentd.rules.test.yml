@@ -319,11 +319,13 @@ tests:
         exp_alerts: []
 
   # acct_a never came up; acct_b's tunnel drops at 2m, leaving nothing serving.
+  # Each profile's one series carries its own `reason`, which the counts and
+  # the profile_id join must not trip over.
   - interval: 1m
     input_series:
-      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_a", reason="rp_filter_strict"}'
         values: '1x6'
-      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_b"}'
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_b", reason="none"}'
         values: '0x6'
       - series: 'torrentd_profile_vpn_tunnel_up{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
         values: '0x6'
@@ -360,9 +362,9 @@ tests:
   # ---- profiles and tunnels ---------------------------------------------
   - interval: 1m
     input_series:
-      - series: 'torrentd_profile_boot_failed{profile_id="acct_b"}'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_b", reason="rp_filter_strict"}'
         values: '1 1 1'
-      - series: 'torrentd_profile_boot_failed{profile_id="acct_a"}'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_a", reason="none"}'
         values: '0 0 0'
     alert_rule_test:
       - eval_time: 1m
@@ -371,6 +373,7 @@ tests:
           - exp_labels:
               severity: critical
               profile_id: acct_b
+              reason: rp_filter_strict
             exp_annotations:
               summary: "Profile acct_b got no session at boot and is not seeding"
 
