@@ -936,7 +936,10 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // ignore-result: a drop cannot report; a daemon already exited
+        // refuses the kill.
         let _ = self.child.kill();
+        // ignore-result: only reaps the child; its status is not wanted.
         let _ = self.child.wait();
     }
 }

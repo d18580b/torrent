@@ -317,6 +317,7 @@ fn build_relocate(
     // state cannot diverge from what is on disk; doing it behind libtorrent's
     // back is how a seeding torrent starts serving from a path that no longer
     // exists.
+    // ignore-result: a row, not a result; this plan needs only its presence.
     let _ = torrent;
     let listed = listed_under(store, infohash, src_root_id, &src_base)?;
     Ok(Ok(Prepared {
