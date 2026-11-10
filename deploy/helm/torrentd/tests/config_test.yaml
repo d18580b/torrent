@@ -70,6 +70,15 @@ tests:
           path: stringData["torrentd.toml"]
           pattern: (?m)^\[telemetry\]$
 
+  - it: writes a [telemetry] table holding only telemetry.otlpEndpoint
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: http://alloy.monitoring:4318
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]\n[ \t]*otlp_endpoint = "http://alloy\.monitoring:4318"$
+
   - it: writes telemetry.otlpEndpoint into [telemetry]
     values: [values/host-only.yaml]
     set:
