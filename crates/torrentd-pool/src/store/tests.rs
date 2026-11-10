@@ -148,7 +148,7 @@ fn step_outcomes_written_together_are_one_commit() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = PoolStore::open(&dir.path().join("pool.db")).unwrap();
     let id = plan_of(&mut store, 5);
-    let commits = store.count_commits();
+    let commits = store.count_commits().unwrap();
     store
         .set_steps_status(
             id,
