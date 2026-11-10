@@ -1,0 +1,56 @@
+{{- if .Values.networkPolicy.enabled }}
+# The API port only from the ingress controller and Prometheus: trusted_proxies
+# trusts the whole pod CIDR, so any other pod reaching the API could name any
+# client (docs/running.md §6a). The peer ports stay open to everyone.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "torrentd.fullname" . }}
+  labels:
+    {{- include "torrentd.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "torrentd.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+      from:
+        {{- with .Values.networkPolicy.ingressControllerNamespaces }}
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  {{- toYaml . | nindent 18 }}
+          {{- with $.Values.networkPolicy.ingressControllerPodSelector }}
+          podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.networkPolicy.prometheusNamespaces }}
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  {{- toYaml . | nindent 18 }}
+          {{- with $.Values.networkPolicy.prometheusPodSelector }}
+          podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+        {{- end }}
+    {{- if .Values.peers.ports }}
+    - ports:
+        {{- range .Values.peers.ports }}
+        - port: {{ .port }}
+          protocol: TCP
+        - port: {{ .port }}
+          protocol: UDP
+        {{- end }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,291 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "torrentd chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "positiveInt": { "type": "integer", "minimum": 1 },
+    "namespaces": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "properties": {
+    "global": { "type": "object" },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": { "type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string" } }
+      }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["podCIDR", "dnsIP"],
+      "properties": {
+        "podCIDR": { "type": "string", "minLength": 1 },
+        "dnsIP": { "type": "string", "minLength": 1 }
+      }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": { "port": { "$ref": "#/definitions/port" } }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "existingSecretKey": { "type": "string", "minLength": 1 },
+        "rollOnChange": { "type": "boolean" },
+        "settings": {
+          "description": "torrentd.toml's keys; the daemon validates them at boot (docs/running.md §5).",
+          "type": "object",
+          "properties": {
+            "profile": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "network"],
+                "properties": {
+                  "id": { "type": "string", "minLength": 1 },
+                  "network": { "enum": ["host", "vpn"] }
+                }
+              }
+            },
+            "network_kill_switch": { "type": "boolean" },
+            "shutdown_drain_secs": { "type": "integer", "minimum": 0, "maximum": 3600 },
+            "trusted_proxies": { "type": "array", "items": { "type": "string" } },
+            "kill_switch_api_interfaces": { "type": "array", "items": { "type": "string" } },
+            "kill_switch_dns_servers": { "type": "array", "items": { "type": "string" } },
+            "auth": { "type": "object" },
+            "allow_unauthenticated": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "vpn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "wireguardSecret": { "type": "string" }
+      }
+    },
+    "rpFilterLoose": { "type": "boolean" },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size", "accessModes"],
+      "properties": {
+        "size": { "type": "string", "minLength": 1 },
+        "storageClass": { "type": "string" },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["ReadWriteOnce", "ReadWriteOncePod", "ReadWriteMany"] }
+        },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "payloadVolumes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "mountPath"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 55 },
+          "mountPath": { "type": "string", "pattern": "^/" },
+          "existingClaim": { "type": "string", "minLength": 1 },
+          "hostPath": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+              "path": { "type": "string", "pattern": "^/" },
+              "type": { "type": "string" }
+            }
+          }
+        },
+        "oneOf": [
+          { "required": ["existingClaim"], "not": { "required": ["hostPath"] } },
+          { "required": ["hostPath"], "not": { "required": ["existingClaim"] } }
+        ]
+      }
+    },
+    "tmp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "sizeLimit": { "type": "string", "minLength": 1 } }
+    },
+    "podSecurityContext": { "type": "object" },
+    "terminationGracePeriodSeconds": { "type": ["integer", "null"], "minimum": 0 },
+    "shutdownGraceMarginSeconds": { "type": "integer", "minimum": 0 },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": { "$ref": "#/definitions/positiveInt" },
+            "failureThreshold": { "$ref": "#/definitions/positiveInt" }
+          }
+        },
+        "liveness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": { "$ref": "#/definitions/positiveInt" },
+            "timeoutSeconds": { "$ref": "#/definitions/positiveInt" },
+            "failureThreshold": { "$ref": "#/definitions/positiveInt" }
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": { "$ref": "#/definitions/positiveInt" },
+            "failureThreshold": { "$ref": "#/definitions/positiveInt" }
+          }
+        }
+      }
+    },
+    "resources": { "type": "object" },
+    "podAnnotations": { "$ref": "#/definitions/stringMap" },
+    "podLabels": { "$ref": "#/definitions/stringMap" },
+    "nodeSelector": { "$ref": "#/definitions/stringMap" },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" },
+    "priorityClassName": { "type": "string" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "peers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "port"],
+            "properties": {
+              "name": {
+                "description": "Suffixed -tcp and -udp into a container port name, which is at most 15 characters.",
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                "maxLength": 11
+              },
+              "port": { "$ref": "#/definitions/port" }
+            }
+          }
+        },
+        "expose": { "enum": ["none", "hostPort", "loadBalancer"] },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "annotations": { "$ref": "#/definitions/stringMap" },
+            "loadBalancerClass": { "type": "string" },
+            "loadBalancerIP": { "type": "string" }
+          }
+        }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "hosts": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "tls": { "type": "array", "items": { "type": "object" } },
+        "maxBodyBytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingressControllerNamespaces": { "$ref": "#/definitions/namespaces" },
+        "ingressControllerPodSelector": { "$ref": "#/definitions/stringMap" },
+        "prometheusNamespaces": { "$ref": "#/definitions/namespaces" },
+        "prometheusPodSelector": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "tokenSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" },
+            "labels": { "$ref": "#/definitions/stringMap" }
+          }
+        },
+        "prometheusRule": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "labels": { "$ref": "#/definitions/stringMap" }
+          }
+        },
+        "dashboard": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "labels": { "$ref": "#/definitions/stringMap" },
+            "annotations": { "$ref": "#/definitions/stringMap" }
+          }
+        }
+      }
+    }
+  }
+}

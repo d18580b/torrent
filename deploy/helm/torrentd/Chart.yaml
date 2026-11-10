@@ -1,0 +1,23 @@
+apiVersion: v2
+name: torrentd
+description: >-
+  torrentd, a multi-profile BitTorrent seeding daemon, as one StatefulSet pod
+  with its API Service, NetworkPolicy and Prometheus monitoring.
+type: application
+# The chart's own version. Bump it with any change under this directory.
+version: 0.1.0
+# The image tag the chart defaults to: torrentd's release version.
+appVersion: "0.2.0"
+# fsGroupChangePolicy and a LoadBalancer Service mixing TCP and UDP ports are
+# both GA from 1.26; 1.29 is the oldest release still receiving patches when
+# the chart was written.
+kubeVersion: ">=1.29.0-0"
+home: https://github.com/d18580b/torrent
+sources:
+  - https://github.com/d18580b/torrent
+annotations:
+  artifacthub.io/license: Apache-2.0
+keywords:
+  - bittorrent
+  - seedbox
+  - wireguard
