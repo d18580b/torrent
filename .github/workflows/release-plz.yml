@@ -602,6 +602,15 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
+          # Not applied: the push below is by digest. The action derives its
+          # version label from its first tag, and with no tags input it falls
+          # back to the branch name, `master`, which would override the
+          # Containerfile's VERSION label. X.Y.Z from the release's tag keeps
+          # the label the release's version; a dry run enables no tag, so its
+          # version label is empty, as the check below expects.
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
+          flavor: latest=false
           # The action titles the image after the repository, `torrent`;
           # the Containerfile titles it after the binary. Keep the
           # Containerfile's, so a released image and a local build agree.
