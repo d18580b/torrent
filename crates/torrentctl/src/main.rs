@@ -51,7 +51,9 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
         token_file: cli.token_file,
         config: cli.config,
     })?;
-    let _log = init_logging();
+    // Why there is no log, if there is none: printed once the terminal is
+    // the user's again, since on the alternate screen it would vanish.
+    let log = torrentctl::log::init();
 
     // Without a token, present a placeholder. The generated client sends no
     // request whose document-declared credential is missing, but a daemon
@@ -71,6 +73,9 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     // and installs a panic hook that restores it first. A panic on a
     // background task ends `run` with `Model::fatal` set.
     let mut terminal = ratatui::init();
+    // In front of that hook, so a panic and its backtrace are in the log
+    // before the terminal is handed back.
+    torrentctl::log::log_panics();
     // However the loop ends, a session token minted from the password is
     // revoked before `run` returns (or resumes a panic in the loop),
     // including after a background task's panic.
@@ -94,6 +99,14 @@ fn main() -> color_eyre::Result<std::process::ExitCode> {
     // wait, and left SIGHUP ignored, so a hangup's repeat does not cut off
     // the notice and the log flush below.
     runtime.shutdown_timeout(EXIT_TIMEOUT);
+    // The terminal is the user's again, after a panic as well.
+    let _log = match log {
+        Ok(guard) => Some(guard),
+        Err(why) => {
+            runtime::notify(&why);
+            None
+        }
+    };
     let ended = looped.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     // Printed only now: on the alternate screen it would vanish with it.
     if let Some(notice) = &ended.model.exit_notice {
@@ -158,28 +171,6 @@ fn exit_code(
         (None, Some(what)) => color_eyre::eyre::bail!("torrentctl stopped: {what}"),
         (None, None) => Ok(std::process::ExitCode::SUCCESS),
     }
-}
-
-/// Log to a file in the XDG state directory, never to the terminal the UI
-/// owns. Returns the guard that flushes it.
-fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    use etcetera::BaseStrategy as _;
-    let dir = etcetera::choose_base_strategy()
-        .ok()?
-        .state_dir()?
-        .join("torrentctl");
-    std::fs::create_dir_all(&dir).ok()?;
-    let (writer, guard) =
-        tracing_appender::non_blocking(tracing_appender::rolling::never(dir, "torrentctl.log"));
-    tracing_subscriber::fmt()
-        .with_writer(writer)
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("TORRENTCTL_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-    Some(guard)
 }
 
 #[cfg(test)]

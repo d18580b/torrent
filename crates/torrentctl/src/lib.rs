@@ -19,6 +19,7 @@ pub mod api;
 pub mod app;
 pub mod config;
 mod fmt;
+pub mod log;
 pub mod runtime;
 mod screens;
 #[cfg(test)]

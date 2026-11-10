@@ -343,7 +343,13 @@ token_file = "/home/me/.config/torrentctl/token"
 
 **Logs.** `$XDG_STATE_HOME/torrentctl/torrentctl.log`, never the terminal, at
 `info`. `TORRENTCTL_LOG` takes a `tracing` filter
-(`TORRENTCTL_LOG=debug`, or `torrentctl=debug`) for more.
+(`TORRENTCTL_LOG=debug`, or `torrentctl=debug`) for more, and
+`TORRENTCTL_LOG_FORMAT=json` writes one JSON object per line. Past 10 MiB the
+file rotates to `torrentctl.log.1`, keeping four rotated files. Every request
+carries a fresh W3C `traceparent`, and its log line records that and the
+daemon's `x-request-id`, which find it in the daemon's log and traces. A
+panic is logged with its backtrace. Where the log cannot be opened, torrentctl
+runs without one and says why on stderr as it exits.
 
 **Keys.** `?` lists the keys on every screen, `1` to `n` (or `Tab`) switch
 screens (Dashboard, Torrents, Profiles, then Pool, which appears only when the
