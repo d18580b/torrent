@@ -88,14 +88,20 @@ impl SizeRotating {
     }
 
     /// Shift every file one number up, dropping the oldest, and start a new
-    /// live file.
+    /// live file. A file that is missing, the live one included (deleted
+    /// while open), is skipped rather than failing the rotation: a failure
+    /// would leave the shifted files shifted and retry on the next line,
+    /// shifting them again until all but one is gone.
     fn rotate(&mut self) -> io::Result<()> {
         if self.keep == 0 {
-            std::fs::remove_file(&self.path)?;
+            match std::fs::remove_file(&self.path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                other => other?,
+            }
         } else {
             for n in (0..self.keep).rev() {
                 match std::fs::rename(self.numbered(n), self.numbered(n + 1)) {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound && n > 0 => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     other => other?,
                 }
             }
@@ -286,6 +292,21 @@ mod tests {
         std::fs::write(dir.path().join("t.log.1/x"), "").unwrap();
         log.write_all(b"second\n").unwrap();
         assert_eq!(read(&dir.path().join("t.log")), "first\nsecond\n");
+    }
+
+    #[test]
+    fn a_live_log_deleted_while_open_is_replaced_without_losing_rotated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SizeRotating::open(dir.path(), "t.log", 10, 2).unwrap();
+        log.write_all(b"aaaaaaaa\n").unwrap();
+        log.write_all(b"bbbbbbbb\n").unwrap();
+        std::fs::remove_file(dir.path().join("t.log")).unwrap();
+        for line in ["cccccccc\n", "dddddddd\n", "eeeeeeee\n"] {
+            log.write_all(line.as_bytes()).unwrap();
+        }
+        assert_eq!(read(&dir.path().join("t.log")), "eeeeeeee\n");
+        assert_eq!(read(&dir.path().join("t.log.1")), "dddddddd\n");
+        assert_eq!(read(&dir.path().join("t.log.2")), "cccccccc\n");
     }
 
     #[test]
