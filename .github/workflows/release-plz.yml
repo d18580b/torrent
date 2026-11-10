@@ -18,6 +18,7 @@ name: Release
 #    docs/api/openapi.json (its `info.version` is the crate version) in its
 #    checkout, records the result as one verified commit on the pushed
 #    commit through the GraphQL API, and moves `release-plz-next` onto it.
+#    The Helm chart's version and appVersion move with it.
 #    It opens or updates the release pull request; where GitHub refuses this
 #    workflow's token a pull request (an organisation or repository
 #    setting), the run stays green and its summary links the comparison to
@@ -30,8 +31,9 @@ name: Release
 #    everything the release ships, from the tagged commit, with no cache,
 #    for x86_64 and aarch64 each on a native runner of that architecture;
 #    `image-manifest` joins the two images into the one manifest list the
-#    tags name, and `publish` signs and attests the files, uploads them to
-#    the draft and publishes it. GitHub's immutable releases freeze a release's assets and
+#    tags name, `chart` pushes the Helm chart at the release's version, and
+#    `publish` signs and attests the files, uploads them to the draft and
+#    publishes it. GitHub's immutable releases freeze a release's assets and
 #    tag once it is published, which is why it is created as a draft.
 #
 # A token-created tag or release triggers no further workflow, so the build
@@ -304,6 +306,21 @@ jobs:
           mise run native-fetch
           mise run openapi
           git add --update -- docs/api/openapi.json
+      # The Helm chart is released with torrentd at the same version, and
+      # `chart` refuses one whose version or appVersion is not the
+      # release's; release-plz knows nothing of the chart, so both move here.
+      - if: steps.update.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/torrentd/Chart.yaml
+          sed -i -E "s/^version:.*/version: $VERSION/; s/^appVersion:.*/appVersion: \"$VERSION\"/" "$chart"
+          if ! grep -qxF "version: $VERSION" "$chart" || ! grep -qxF "appVersion: \"$VERSION\"" "$chart"; then
+            echo "::error::$chart has no top-level version and appVersion line to move to $VERSION"
+            exit 1
+          fi
+          git add -- "$chart"
       # The staged change becomes one commit on the pushed commit, made
       # through the GraphQL API so GitHub signs and verifies it, and the
       # release branch is moved onto it.
@@ -868,13 +885,134 @@ jobs:
           fi
           echo "pulled $ref anonymously (${platforms[*]:-its one platform}), $DIGEST"
 
+  # deploy/helm/torrentd, packaged and pushed as the OCI artifact
+  # oci://ghcr.io/OWNER/charts/torrentd:X.Y.Z, signed and attested like the
+  # image, and pulled back anonymously. Its version and appVersion are the
+  # release's (`release-pr` moves both), and a chart naming another is
+  # refused. After `image-manifest`, so the image the chart's appVersion
+  # names is pushed and pullable before the chart is. A dry run packages and
+  # checks the chart against the checkout's version, and pushes nothing.
+  chart:
+    name: helm chart (ghcr.io)
+    needs: [release, image-manifest]
+    if: >-
+      !cancelled() && (github.event_name != 'push'
+      || (needs.release.outputs.tag != '' && needs.image-manifest.result == 'success'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # the checkout
+      packages: write # push the chart, its signature and its attestation
+      id-token: write # keyless Sigstore signing and the attestation's certificate
+      attestations: write # record the attestation with GitHub
+    env:
+      CHART: ghcr.io/${{ github.repository_owner }}/charts/torrentd
+      VERSION: ${{ needs.release.outputs.version }}
+      PUBLISH: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # mise provides helm at the version mise.toml pins, as in ci.yml.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - id: package
+        name: The chart's version and appVersion are the release's
+        run: |
+          set -euo pipefail
+          # On a dry run there is no release; the checkout's version is
+          # what the chart would be released as.
+          expected=${VERSION:-$(python3 -c 'import tomllib; print(tomllib.load(open("crates/torrentd/Cargo.toml", "rb"))["package"]["version"])')}
+          meta=$(helm show chart deploy/helm/torrentd)
+          field() { sed -n -E "s/^$1:[[:space:]]*\"?([^\"[:space:]]*)\"?[[:space:]]*\$/\\1/p" <<<"$meta"; }
+          version=$(field version)
+          app_version=$(field appVersion)
+          if [ "$version" != "$expected" ] || [ "$app_version" != "$expected" ]; then
+            echo "::error::deploy/helm/torrentd/Chart.yaml has version '$version' and appVersion '$app_version', expected both '$expected'"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/chart"
+          helm package deploy/helm/torrentd --destination "$RUNNER_TEMP/chart"
+          pkg=$RUNNER_TEMP/chart/torrentd-$expected.tgz
+          [ -f "$pkg" ] || { echo "::error::helm package did not write $pkg"; exit 1; }
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+      # cosign and the attestation read the Docker login; helm reads its own.
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: push
+        if: env.PUBLISH == 'true'
+        env:
+          PACKAGE: ${{ steps.package.outputs.package }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          helm registry login ghcr.io --username "$ACTOR" --password-stdin <<<"$TOKEN"
+          out=$(helm push "$PACKAGE" "oci://${CHART%/*}" 2>&1)
+          echo "$out"
+          digest=$(sed -n -E 's/^Digest: (sha256:[0-9a-f]{64})$/\1/p' <<<"$out")
+          if [ -z "$digest" ]; then
+            echo "::error::helm push printed no digest for $CHART:$VERSION"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - if: env.PUBLISH == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$CHART@$DIGEST"
+      - if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.CHART }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      # The README tells anyone to pull the chart, so pull it as anyone, as
+      # `image-manifest` pulls the image: an empty helm registry config and
+      # Docker config, which hold none of the logins above, and no token in
+      # the environment. A private package, or a version that does not name
+      # what this job pushed, fails the job, and `publish` then leaves the
+      # release a draft (README.md, Releasing).
+      - name: Anyone can pull the release's chart, with no login
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN GH_TOKEN
+          DOCKER_CONFIG=$(mktemp -d)
+          HELM_REGISTRY_CONFIG=$DOCKER_CONFIG/helm-registry.json
+          echo '{}' > "$HELM_REGISTRY_CONFIG"
+          export DOCKER_CONFIG HELM_REGISTRY_CONFIG
+          dest=$(mktemp -d)
+          if ! out=$(helm pull "oci://$CHART" --version "$VERSION" --destination "$dest" 2>&1); then
+            echo "$out"
+            echo "::error::an anonymous client cannot pull oci://$CHART:$VERSION; is the ghcr.io package public?"
+            exit 1
+          fi
+          echo "$out"
+          got=$(sed -n -E 's/^Digest: (sha256:[0-9a-f]{64})$/\1/p' <<<"$out")
+          if [ "$got" != "$DIGEST" ]; then
+            echo "::error::oci://$CHART:$VERSION resolves to '$got', not the pushed $DIGEST"
+            exit 1
+          fi
+          echo "pulled oci://$CHART:$VERSION anonymously, $DIGEST"
+
   publish:
     name: sign, attest and publish the release
-    needs: [release, dist, dist-musl, image, image-manifest]
+    needs: [release, dist, dist-musl, image, image-manifest, chart]
     if: >-
       !cancelled() && github.event_name == 'push' && needs.release.outputs.tag != ''
       && needs.dist.result == 'success' && needs.dist-musl.result == 'success'
       && needs.image.result == 'success' && needs.image-manifest.result == 'success'
+      && needs.chart.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
