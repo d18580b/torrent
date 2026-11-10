@@ -1970,6 +1970,25 @@ tests:
         alertname: TorrentdHttp5xx
         exp_alerts: []
 
+  # /readyz, the probe /healthz is an alias of, answering 503 to every probe
+  # while the daemon is unready, and /livez answering 503 while it is wedged,
+  # are no more the API's 5xx than /healthz's are.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_http_requests_total{route="/readyz", method="GET", status_class="5xx"}'
+        values: '0+6x30'
+      - series: 'torrentd_http_requests_total{route="/livez", method="GET", status_class="5xx"}'
+        values: '0+6x30'
+      - series: 'torrentd_http_requests_total{route="/v1/torrents", method="GET", status_class="2xx"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: TorrentdHttp5xx
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: TorrentdHttp5xx
+        exp_alerts: []
+
   # Every GET /v1/status response took between 5s and 10s; GET /v1/server's
   # all took under 100ms.
   - interval: 1m
