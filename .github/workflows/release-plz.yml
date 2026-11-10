@@ -574,6 +574,11 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
             type=raw,value=latest,enable=${{ env.PUBLISH }}
           flavor: latest=false
+          # The action titles the image after the repository, `torrent`;
+          # the Containerfile titles it after the binary. Keep the
+          # Containerfile's, so a released image and a local build agree.
+          labels: |
+            org.opencontainers.image.title=torrentd
       # Built once and loaded, so the binary inside is checked before
       # anything is pushed. No build cache: like the tarballs, the image is
       # built from the tagged sources alone. buildx's own provenance and SBOM
@@ -590,11 +595,19 @@ jobs:
           push: false
           tags: torrentd:release-check
           labels: ${{ steps.meta.outputs.labels }}
+          # The Containerfile's own OCI labels. The metadata action's labels
+          # above take precedence; they agree on every label both set (its
+          # title is overridden to match), and add description, url and
+          # created.
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            REVISION=${{ github.sha }}
           provenance: false
           sbom: false
       - name: The image's torrentd is this release's
         env:
           EXPECTED: ${{ needs.release.outputs.version }}
+          REVISION: ${{ github.sha }}
         run: |
           set -euo pipefail
           # On a dry run there is no release; the checkout's version is
@@ -606,6 +619,22 @@ jobs:
             exit 1
           fi
           echo "$got"
+          # The OCI labels a registry and a scanner read. A dry run tags
+          # nothing, so its version label is empty; a release's is its own.
+          label() {
+            docker image inspect --format "{{index .Config.Labels \"org.opencontainers.image.$1\"}}" torrentd:release-check
+          }
+          [ "$(label revision)" = "$REVISION" ] \
+            || { echo "::error::the image's revision label is '$(label revision)', expected '$REVISION'"; exit 1; }
+          [ "$(label licenses)" = Apache-2.0 ] \
+            || { echo "::error::the image's licenses label is '$(label licenses)', expected 'Apache-2.0'"; exit 1; }
+          [ -n "$(label source)" ] || { echo "::error::the image has no source label"; exit 1; }
+          [ "$(label title)" = torrentd ] \
+            || { echo "::error::the image's title label is '$(label title)', expected 'torrentd'"; exit 1; }
+          if [ "$PUBLISH" = true ] && [ "$(label version)" != "$expected" ]; then
+            echo "::error::the image's version label is '$(label version)', expected '$expected'"
+            exit 1
+          fi
       - if: env.PUBLISH == 'true'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -623,6 +652,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The Containerfile's own OCI labels, under the metadata action's,
+          # as in the build above.
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            REVISION=${{ github.sha }}
           provenance: false
           sbom: false
       - if: env.PUBLISH == 'true'

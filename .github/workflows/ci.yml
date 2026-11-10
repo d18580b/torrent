@@ -390,6 +390,18 @@ jobs:
       # Nothing built deploy/Containerfile once, which is how it sat broken
       # for a while; building it here keeps the image's builder stage honest.
       - run: mise run container
+      # The image as a pod runs it: read-only root, NET_ADMIN only, uid 1000,
+      # a WireGuard profile behind the kill switch in the container's own
+      # network namespace, an orphan reaped by tini, and a clean stop. The
+      # container cannot load the modules its tunnel and ruleset need, and
+      # rootless podman needs unprivileged user namespaces.
+      - name: Allow unprivileged user namespaces, and load wireguard
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo modprobe -a wireguard nf_tables
+      - run: mise run image-check
 
   alert-rules:
     name: alert rules (promtool)
