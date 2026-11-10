@@ -35,7 +35,9 @@ pub struct Swallowed {
 }
 
 /// Every call in [`CALLS`], in that order, with what it has swallowed.
+#[tracing::instrument(name = "ffi.ffi_errors", level = "debug", skip_all, fields(duration_us = tracing::field::Empty))]
 pub fn swallowed() -> Vec<Swallowed> {
+    let _timed = crate::ffi_util::Timed::start();
     CALLS
         .iter()
         .enumerate()

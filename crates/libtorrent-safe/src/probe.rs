@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::ffi_util::c_string;
 use crate::ffi_util::ErrBuf;
+use crate::ffi_util::Timed;
 use crate::handle::InfoHash;
 use crate::metadata::InfoHashes;
 use crate::session::AddParams;
@@ -22,7 +23,9 @@ use crate::session::TrackerOverride;
 
 /// The info-hashes of a `.torrent` buffer, without adding it to a session —
 /// used to enforce registry uniqueness before any session sees the torrent.
+#[tracing::instrument(name = "ffi.torrent_info_hashes", level = "debug", skip_all, fields(bytes = bytes.len(), duration_us = tracing::field::Empty), err(level = "debug"))]
 pub fn info_hashes_from_torrent(bytes: &[u8]) -> Result<InfoHashes> {
+    let _timed = Timed::start();
     if bytes.is_empty() {
         return Err(Error::InvalidInput("empty .torrent buffer"));
     }
@@ -45,7 +48,9 @@ pub fn info_hashes_from_torrent(bytes: &[u8]) -> Result<InfoHashes> {
 }
 
 /// The info-hashes a magnet URI names (`btih`, `btmh`), without adding it.
+#[tracing::instrument(name = "ffi.magnet_info_hashes", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
 pub fn info_hashes_from_magnet(uri: &str) -> Result<InfoHashes> {
+    let _timed = Timed::start();
     let uri_c = c_string(uri, "magnet uri")?;
     let mut out: ffi::lt_info_hashes = unsafe { std::mem::zeroed() };
     let mut err = ErrBuf::new();
@@ -112,7 +117,9 @@ impl AddInfoHashes {
 /// session keys the torrent by. An `Err` is a source the add would refuse on
 /// its own: one the shim cannot parse, or a `.torrent` that names another
 /// torrent than the resume data it is attached to.
+#[tracing::instrument(name = "ffi.add_info_hashes", level = "debug", skip_all, fields(kind = params.kind(), duration_us = tracing::field::Empty), err(level = "debug"))]
 pub fn add_info_hashes(params: &AddParams) -> Result<AddInfoHashes> {
+    let _timed = Timed::start();
     let buf = |b: Option<&Vec<u8>>| match b {
         Some(b) if !b.is_empty() => (b.as_ptr(), b.len()),
         _ => (std::ptr::null(), 0),
@@ -181,11 +188,13 @@ pub fn add_info_hashes(params: &AddParams) -> Result<AddInfoHashes> {
 /// tracker is under none of `url_prefixes`;
 /// [`TrackerVerdict::NoTrackers`] when there is no tracker at all. An `Err` is
 /// a source the shim cannot parse, which the add would refuse too.
+#[tracing::instrument(name = "ffi.add_trackers_allowed", level = "debug", skip_all, fields(kind = params.kind(), duration_us = tracing::field::Empty), err(level = "debug"))]
 pub fn add_trackers_allowed(
     params: &AddParams,
     domains: &[String],
     url_prefixes: &[String],
 ) -> Result<TrackerVerdict> {
+    let _timed = Timed::start();
     if domains.is_empty() {
         return Ok(TrackerVerdict::NotAllowed);
     }
@@ -268,7 +277,9 @@ pub fn add_trackers_allowed(
 /// or `&`, or the URL ends there or goes on with one of `/?&#;` — so
 /// `?passkey=a` does not admit `?passkey=ab`. A prefix of any other shape, or
 /// either argument holding a NUL, matches nothing.
+#[tracing::instrument(name = "ffi.announce_url_has_prefix", level = "debug", skip_all, fields(duration_us = tracing::field::Empty))]
 pub fn announce_url_has_prefix(url: &str, prefix: &str) -> bool {
+    let _timed = Timed::start();
     let (Ok(url), Ok(prefix)) = (CString::new(url), CString::new(prefix)) else {
         return false;
     };
@@ -294,7 +305,9 @@ pub enum TrackerVerdict {
 /// to its index in the `session_stats_alert` counter array, or `None` if the
 /// name is unknown to this libtorrent build. The mapping is a build-time
 /// constant — resolve once and cache.
+#[tracing::instrument(name = "ffi.session_stats_metric_index", level = "debug", skip_all, fields(name, duration_us = tracing::field::Empty))]
 pub fn session_stats_metric_index(name: &str) -> Option<usize> {
+    let _timed = Timed::start();
     let c = CString::new(name).ok()?;
     let idx = unsafe { ffi::lt_session_stats_metric_index(c.as_ptr()) };
     if idx < 0 {
