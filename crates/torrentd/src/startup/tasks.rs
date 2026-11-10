@@ -35,8 +35,13 @@ pub(crate) struct Carried {
 impl Carried {
     /// What is current here.
     pub(crate) fn current() -> Self {
+        Self::in_span(tracing::Span::current())
+    }
+
+    /// `span`, and the subscriber current here.
+    fn in_span(span: tracing::Span) -> Self {
         Self {
-            span: tracing::Span::current(),
+            span,
             dispatch: tracing::dispatcher::get_default(tracing::Dispatch::clone),
         }
     }
@@ -54,11 +59,23 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    spawn_in(tracing::Span::current(), fut)
+}
+
+/// [`spawn`], with the task inside `span` instead of the span current here:
+/// for work started from a span it is not part of, such as a task one
+/// request starts that goes on to serve others. A disabled `span` leaves the
+/// task in no span, never in the one current here.
+pub(crate) fn spawn_in<F>(span: tracing::Span, fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     #[expect(
         clippy::disallowed_methods,
-        reason = "the one place a task is spawned, with the current span and subscriber"
+        reason = "the one place a task is spawned, with its span and the current subscriber"
     )]
-    tokio::spawn(fut.in_current_span().with_current_subscriber())
+    tokio::spawn(fut.instrument(span).with_current_subscriber())
 }
 
 /// `tokio::task::spawn_blocking`, with `f` run inside the span current here
@@ -68,10 +85,20 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let carried = Carried::current();
+    spawn_blocking_in(tracing::Span::current(), f)
+}
+
+/// [`spawn_blocking`], with `f` run inside `span` instead of the span current
+/// here, as [`spawn_in`] is.
+pub(crate) fn spawn_blocking_in<F, R>(span: tracing::Span, f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let carried = Carried::in_span(span);
     #[expect(
         clippy::disallowed_methods,
-        reason = "the one place blocking work is spawned, with the current span and subscriber"
+        reason = "the one place blocking work is spawned, with its span and the current subscriber"
     )]
     tokio::task::spawn_blocking(move || carried.run(f))
 }
@@ -154,15 +181,15 @@ mod tests {
     use crate::metrics_sink::tests::literal;
 
     /// Every task spawned in the daemon's source outside the supervisor
-    /// (`tasks::spawn`, or the `tokio::spawn` it wraps), by file, with why it
-    /// is not a long-lived task: each ends on its own, or is awaited or
-    /// aborted by what started it. A long-lived task goes through
-    /// `spawn_supervised` instead, and is in `TASKS`.
+    /// (`tasks::spawn` or `tasks::spawn_in`, or the `tokio::spawn` they
+    /// wrap), by file, with why it is not a long-lived task: each ends on its
+    /// own, or is awaited or aborted by what started it. A long-lived task
+    /// goes through `spawn_supervised` instead, and is in `TASKS`.
     const UNSUPERVISED: &[(&str, usize, &str)] = &[
         (
             "startup/tasks.rs",
             1,
-            "`spawn` itself, which the supervisor and every other task goes through",
+            "`spawn_in` itself, which `spawn`, the supervisor and every other task go through",
         ),
         (
             "sd_notify.rs",
@@ -197,6 +224,7 @@ mod tests {
         for (file, _, text) in daemon_sources() {
             let n = text.matches("tokio::spawn(").count()
                 + text.matches("tasks::spawn(").count()
+                + text.matches("tasks::spawn_in(").count()
                 + text.matches("Handle::current().spawn(").count();
             if n > 0 {
                 spawns.insert(file.clone(), n);
