@@ -95,7 +95,7 @@ fn a_large_delete_plan_journals_a_batch_of_steps_per_commit() {
     let plan_id = delete_plan(&pool);
     assert_eq!(statuses(&pool, plan_id).len(), FILES);
 
-    let commits = pool.with_store(|st| st.count_commits());
+    let commits = pool.with_store_mut(|st| st.count_commits()).unwrap();
     let (source, state) = engine_and_state();
     let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
     assert_eq!(
