@@ -71,6 +71,11 @@ sha1 = { workspace = true }
 # The assignment registry's database
 rusqlite = { workspace = true }
 
+# `config_watch`: the config file's directory, watched for a changed file.
+# The inotify crate directly, ISC, rather than `notify`, whose CC0-1.0
+# licence deny.toml does not allow; the daemon runs only on Linux.
+inotify = "0.11"
+
 [features]
 # The alert drill's build (deploy/drill): layers a MockEngine over every
 # session and mounts `POST /v1/faults` to queue alerts, stall the alert loop,

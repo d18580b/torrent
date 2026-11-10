@@ -625,6 +625,18 @@ groups:
         annotations:
           summary: "A config reload failed at {{ $labels.stage }}; the daemon is running the previous settings"
 
+      - alert: TorrentdConfigRestartPending
+        # A restart-only key edited in the file, which a reload found and
+        # could not apply. The grace period lets a change rolled out ahead of
+        # a planned restart pass; past it, the file and the daemon disagree
+        # until someone restarts it or edits the file back.
+        expr: torrentd_config_restart_pending > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Config key {{ $labels.key }} has changed in the file and needs a daemon restart to take effect"
+
       # ---- pool --------------------------------------------------------
       - alert: TorrentdPoolPlanFailed
         # The boot re-drive of interrupted plans can fail before the first

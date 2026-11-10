@@ -27,6 +27,7 @@ mod validate;
 pub use diff::ConfigDiff;
 pub use diff::ProfileChange;
 pub use diff::ProfileChangeKind;
+pub use diff::RESTART_PENDING_KEYS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -279,6 +280,17 @@ pub struct Config {
     /// profile's `Address` prefixes or named by its `DNS` key.
     #[serde(default)]
     pub kill_switch_dns_servers: Vec<IpAddr>,
+
+    /// Reload when the config file changes, without a `SIGHUP`. The file's
+    /// directory is watched with inotify, which sees an in-place write, an
+    /// editor's rename over the file, and the `..data` symlink swap kubelet
+    /// makes when a mounted ConfigMap or Secret is updated. Once the
+    /// directory has been quiet for a moment and the file's bytes differ from
+    /// the last ones read, the reload runs exactly as a `SIGHUP` does. Off by
+    /// default. Restart-only. A file that is itself a symlink out of its
+    /// directory is not followed: its target changing is not seen.
+    #[serde(default)]
+    pub config_watch: bool,
 
     /// `[[profile]]` array. Empty is refused: `ProfileConfigError::NoProfiles`.
     /// There is no implicit profile, because the only thing an implicit one
@@ -654,6 +666,7 @@ impl Config {
             network_kill_switch: false,
             kill_switch_api_interfaces: vec![],
             kill_switch_dns_servers: vec![],
+            config_watch: false,
             profile: vec![],
             auth: None,
             pool: Some(PoolConfig {

@@ -2042,6 +2042,31 @@ tests:
             exp_annotations:
               summary: "A config reload failed at load; the daemon is running the previous settings"
 
+  # shutdown_drain_secs edited in the file at 5m, found by a reload and left
+  # for a restart; the restart at 46m boots with it and seeds 0. Quiet through
+  # the grace period, firing past it for that key alone, quiet once restarted.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_config_restart_pending{key="shutdown_drain_secs"}'
+        values: '0x4 1x40 0x10'
+      - series: 'torrentd_config_restart_pending{key="auth"}'
+        values: '0x55'
+    alert_rule_test:
+      - eval_time: 34m
+        alertname: TorrentdConfigRestartPending
+        exp_alerts: []
+      - eval_time: 36m
+        alertname: TorrentdConfigRestartPending
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              key: shutdown_drain_secs
+            exp_annotations:
+              summary: "Config key shutdown_drain_secs has changed in the file and needs a daemon restart to take effect"
+      - eval_time: 50m
+        alertname: TorrentdConfigRestartPending
+        exp_alerts: []
+
   # ---- pool -------------------------------------------------------------
   - interval: 1m
     input_series:

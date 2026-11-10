@@ -6,6 +6,48 @@ use torrentd_engine::ProfileConfig;
 use super::Config;
 use super::LogLevel;
 
+/// The `key` values of `config_restart_pending`: every key a reload can find
+/// changed and leave for a restart to take, in `Config`'s order.
+///
+/// That is each key [`Config::diff`] reports as non-reloadable, `profile` for
+/// any `[[profile]]` change, and the five reloadable settings keys, which a
+/// reload applies but cannot delete: a deleted one falls back to its preset
+/// default only at the next boot. `log_level` is the one key absent, since
+/// every change to it, deletion included, is applied. A test below changes
+/// every field at once and holds this list equal to what the diff reports.
+pub const RESTART_PENDING_KEYS: &[&str] = &[
+    "default_save_path",
+    "resume_dir",
+    "torrent_dir",
+    "http_listen",
+    "http_socket_mode",
+    "http_socket_group",
+    "trusted_proxies",
+    "allow_unauthenticated",
+    "allowed_hosts",
+    "allow_unsupported_state_fs",
+    "registry_path",
+    "connections_limit",
+    "file_pool_size",
+    "enable_lsd",
+    "aio_threads",
+    "max_concurrent_http_announces",
+    "upload_rate_limit",
+    "unchoke_slots_limit",
+    "peer_fingerprint",
+    "user_agent",
+    "vpn_handshake_max_age_secs",
+    "shutdown_drain_secs",
+    "network_kill_switch",
+    "kill_switch_api_interfaces",
+    "kill_switch_dns_servers",
+    "config_watch",
+    "profile",
+    "auth",
+    "pool",
+    "telemetry",
+];
+
 impl Config {
     /// Compute a diff against an old config. Used by SIGHUP reload to
     /// apply only the fields that may change without restart.
@@ -40,6 +82,7 @@ impl Config {
             network_kill_switch: new_network_kill_switch,
             kill_switch_api_interfaces: new_kill_switch_api_interfaces,
             kill_switch_dns_servers: new_kill_switch_dns_servers,
+            config_watch: new_config_watch,
             profile: new_profile,
             auth: new_auth,
             pool: new_pool,
@@ -150,6 +193,10 @@ impl Config {
         }
         if old.kill_switch_dns_servers != *new_kill_switch_dns_servers {
             d.non_reloadable_changes.push("kill_switch_dns_servers");
+        }
+        // The watch is started, or not, with the reload pump.
+        if old.config_watch != *new_config_watch {
+            d.non_reloadable_changes.push("config_watch");
         }
         if old.pool != *new_pool {
             d.non_reloadable_changes.push("pool");
@@ -382,6 +429,22 @@ impl ConfigDiff {
             && self.profile_changes.is_empty()
     }
 
+    /// The [`RESTART_PENDING_KEYS`] this diff leaves for a restart: its
+    /// non-reloadable keys, `profile` where any `[[profile]]` changed, and
+    /// the reloadable keys the file deleted.
+    ///
+    /// Taken against the running config, which a reload advances only by
+    /// what it applied, this is every key whose file value the daemon is not
+    /// running, and an empty list once the file matches it again.
+    pub fn restart_pending(&self) -> Vec<&'static str> {
+        let mut keys = self.non_reloadable_changes.clone();
+        keys.extend(self.reloadable_deletions.iter().copied());
+        if !self.profile_changes.is_empty() {
+            keys.push("profile");
+        }
+        keys
+    }
+
     /// Record that a reloadable settings key differed; `has_value` is false
     /// when the new file deletes it.
     fn record_reloadable(&mut self, key: &'static str, has_value: bool) {
@@ -401,4 +464,107 @@ pub struct SettingsPatch {
     pub settings: libtorrent_safe::Settings,
     /// The `Settings` field names this patch sets, in the order it set them.
     pub fields: Vec<&'static str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::config::HttpListen;
+    use crate::config::TelemetryConfig;
+
+    /// Every field changed at once, the reloadable settings keys by deletion,
+    /// reports exactly [`RESTART_PENDING_KEYS`] as pending a restart.
+    ///
+    /// `new` is written out field by field with no `..`, so a field added to
+    /// `Config` does not compile here until it is changed too, and a key the
+    /// diff reports under a name the list lacks fails the comparison.
+    #[test]
+    fn changing_every_key_leaves_exactly_the_listed_keys_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = Config::minimal_for_tests(dir.path(), false);
+        old.connections_limit = Some(100);
+        old.enable_lsd = Some(false);
+        old.aio_threads = Some(4);
+        old.max_concurrent_http_announces = Some(10);
+        old.upload_rate_limit = Some(1000);
+        let elsewhere = dir.path().join("elsewhere");
+        let new = Config {
+            default_save_path: elsewhere.join("data"),
+            resume_dir: elsewhere.join("resume"),
+            torrent_dir: elsewhere.join("torrents"),
+            http_listen: HttpListen::Tcp(([127, 0, 0, 1], 9090).into()),
+            http_socket_mode: Some(0o600),
+            http_socket_group: Some("torrentd".into()),
+            trusted_proxies: vec!["10.0.0.1".into()],
+            allow_unauthenticated: !old.allow_unauthenticated,
+            allowed_hosts: vec!["torrentd.example".into()],
+            allow_unsupported_state_fs: !old.allow_unsupported_state_fs,
+            log_level: LogLevel::Debug,
+            registry_path: Some(elsewhere.join("registry.db")),
+            connections_limit: None,
+            file_pool_size: Some(10),
+            enable_lsd: None,
+            aio_threads: None,
+            max_concurrent_http_announces: None,
+            upload_rate_limit: None,
+            unchoke_slots_limit: Some(8),
+            peer_fingerprint: Some("-AA1000-".into()),
+            user_agent: Some("agent/1.0".into()),
+            vpn_handshake_max_age_secs: old.vpn_handshake_max_age_secs + 1,
+            shutdown_drain_secs: old.shutdown_drain_secs + 1,
+            network_kill_switch: !old.network_kill_switch,
+            kill_switch_api_interfaces: vec!["eth0".into()],
+            kill_switch_dns_servers: vec![[10, 43, 0, 10].into()],
+            config_watch: !old.config_watch,
+            profile: vec![ProfileConfig {
+                id: torrentd_engine::ProfileId::new("added"),
+                network: torrentd_engine::ProfileNetwork::Host {
+                    listen_interfaces: "127.0.0.1:6881".into(),
+                    dht: false,
+                },
+                peer_fingerprint: None,
+                user_agent: None,
+                resume_dir: None,
+                torrent_dir: None,
+                allowed_tracker_domains: vec![],
+                allowed_tracker_urls: vec![],
+                upload_rate_limit: None,
+            }],
+            auth: Some(crate::auth::AuthConfig {
+                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+                session_ttl_secs: 3600,
+                token: vec![],
+            }),
+            pool: None,
+            telemetry: Some(TelemetryConfig {
+                otlp_endpoint: None,
+                protocol: None,
+                sample_ratio: None,
+                resource_attributes: Default::default(),
+                headers_file: None,
+            }),
+        };
+
+        let diff = Config::diff(&old, &new);
+        let pending: BTreeSet<&str> = diff.restart_pending().into_iter().collect();
+        let listed: BTreeSet<&str> = RESTART_PENDING_KEYS.iter().copied().collect();
+        assert_eq!(
+            listed.len(),
+            RESTART_PENDING_KEYS.len(),
+            "a key is listed twice"
+        );
+        assert_eq!(pending, listed);
+        assert!(!listed.contains("log_level"), "log_level is always applied");
+    }
+
+    /// The config the daemon runs, diffed against itself, leaves nothing
+    /// pending.
+    #[test]
+    fn an_unchanged_config_leaves_nothing_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::minimal_for_tests(dir.path(), false);
+        assert!(Config::diff(&cfg, &cfg).restart_pending().is_empty());
+    }
 }
