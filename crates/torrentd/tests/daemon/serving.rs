@@ -113,6 +113,16 @@ fn the_first_scrape_holds_every_series_present_from_boot() {
         if name == "torrentd_task_up" {
             continue;
         }
+        // `profile_boot_failed` is one series per profile, its `reason` the
+        // failure's class or `none`; a profile that came up holds only
+        // `none`, at 0.
+        if name == "torrentd_profile_boot_failed" {
+            let series = format!("{name}{{profile_id=\"test\",reason=\"none\"}} 0");
+            if !metrics.lines().any(|l| l == series) {
+                missing.push(series);
+            }
+            continue;
+        }
         for value in listed_values(labels) {
             let found = metrics.lines().any(|l| {
                 l.starts_with(&format!("{name}{{"))
