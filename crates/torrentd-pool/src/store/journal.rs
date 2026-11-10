@@ -247,7 +247,7 @@ impl PoolStore {
              GROUP BY status ORDER BY status",
         )?;
         let rows = st.query_map(params![plan_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }

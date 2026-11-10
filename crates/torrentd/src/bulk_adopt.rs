@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn jobs_queued_behind_the_writer_commit_together() {
         let (_dir, store) = store();
-        let commits = store.lock().count_commits();
+        let commits = store.lock().count_commits().unwrap();
         let group = Arc::new(GroupCommit::default());
         let held = store.lock();
         let callers = 5;
@@ -325,7 +325,7 @@ mod tests {
                 std::fs::write(&fr, bytes).unwrap();
                 pool.scan().unwrap();
             }
-            let commits = pool.with_store(PoolStore::count_commits);
+            let commits = pool.with_store_mut(PoolStore::count_commits).unwrap();
             let adopted = pool
                 .adopt(&source, &profiles, &ih, ProfileId::new("p"), false)
                 .unwrap_or_else(|e| panic!("{}", e.reason));
