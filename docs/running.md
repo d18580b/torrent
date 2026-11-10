@@ -1239,13 +1239,32 @@ The daemon sets none of these itself.
   bare metal. The kernel uses `max(conf/all, conf/<iface>)` per interface, so
   `all = 2` is sufficient on its own — but `all = 0` is *not* safe, because a
   tunnel interface created later inherits `conf/default` and may come up
-  strict. `vpn check` reports both values and the effective mode. On the
-  host, write it to a `sysctl.d` file so it outlasts a reboot, and load it:
+  strict. `vpn check` reports both values and the effective mode, judging
+  an interface it has not raised on `conf/default`, the value it will take.
+  The daemon judges each `vpn` profile's interface the same way once its
+  tunnel is up: an effective strict mode fails that profile, takes its
+  tunnel down, logs the sysctl and the value to set, and sets
+  `torrentd_profile_boot_failed{reason="rp_filter_strict"}` to `1`, which
+  `TorrentdProfileBootFailed` pages on. A value it cannot read is logged as
+  a warning and fails nothing. On the host, write it to a `sysctl.d` file so
+  it outlasts a reboot, and load it:
 
   ```bash
   echo 'net.ipv4.conf.all.rp_filter = 2' | sudo tee /etc/sysctl.d/90-torrentd.conf
   sudo sysctl --system
   sysctl net.ipv4.conf.all.rp_filter          # net.ipv4.conf.all.rp_filter = 2
+  ```
+
+  In a Kubernetes pod, `net.ipv4.conf.*` is an unsafe sysctl, and a pod
+  without it runs on the node's value, which is often strict. Allow it on
+  the node (on k3s, `--kubelet-arg=allowed-unsafe-sysctls=net.ipv4.conf.*`)
+  and set it in the pod's `securityContext`:
+
+  ```yaml
+  securityContext:
+    sysctls:
+      - name: net.ipv4.conf.all.rp_filter
+        value: "2"
   ```
 
 ## 8. Start it
@@ -1496,7 +1515,10 @@ tunnel is raised. A profile whose tunnel the host cannot carry is failed
 with a reason that starts `preflight wireguard_kernel:` or
 `preflight tun_device:`: that is the profile's `failure_reason` in
 `GET /v1/profiles/{id}` and the `reason` on the boot's log line, and
-`torrentd_profile_boot_failed` is `1` for it. `torrentd --check-config` and
+`torrentd_profile_boot_failed` is `1` for it, with `reason="other"`.
+`reason="rp_filter_strict"` is the one failure labelled on its own: the
+tunnel came up on an interface whose reverse-path filter is strict (§7).
+`torrentd --check-config` and
 `torrentd vpn check` report the same verdicts, run in the same container.
 
 ## 9. First-run checks
