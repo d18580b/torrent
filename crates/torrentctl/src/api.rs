@@ -713,13 +713,36 @@ mod tests {
         }
     }
 
+    /// This thread's default subscriber, writing to a [`Captured`], and a
+    /// second live dispatcher, both held until it is dropped.
+    struct Installed {
+        // Fields drop in declaration order: the default is restored before
+        // the pinned dispatcher goes.
+        _default: tracing::subscriber::DefaultGuard,
+        _pin: tracing::Dispatch,
+    }
+
     impl Captured {
-        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + use<> {
+        /// Make this the thread's log until the returned guard drops.
+        ///
+        /// A second live dispatcher is pinned first (see torrentd-engine's
+        /// `testing::with_subscriber`): with only one registered process-wide,
+        /// a parallel test with no subscriber that reaches a `record`
+        /// callsite first caches its interest as never, and this thread's
+        /// subscriber then sees nothing from it. Pinning makes a callsite's
+        /// registration ask every live dispatcher, and installing rebuilds
+        /// the interest of callsites already cached as never.
+        fn install(&self) -> Installed {
+            let pin = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
             let log = self.clone();
-            tracing_subscriber::fmt()
+            let subscriber = tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_writer(move || log.clone())
-                .finish()
+                .finish();
+            Installed {
+                _default: tracing::subscriber::set_default(subscriber),
+                _pin: pin,
+            }
         }
 
         fn text(&self) -> String {
@@ -771,7 +794,7 @@ mod tests {
     #[tokio::test]
     async fn each_request_carries_a_fresh_traceparent_logged_with_the_daemons_request_id() {
         let log = Captured::default();
-        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let _log = log.install();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -806,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn a_hand_built_post_is_traced_and_logged_too() {
         let log = Captured::default();
-        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let _log = log.install();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -835,7 +858,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_that_found_no_daemon_is_logged_with_its_cause() {
         let log = Captured::default();
-        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let _log = log.install();
         let api = Api::new(&closed_port(), Some("tdp_valid")).unwrap();
         call(api.client.get_status()).await.unwrap_err();
         let text = log.text();
