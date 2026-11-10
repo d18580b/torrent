@@ -276,7 +276,7 @@ async fn run_with(
     // The releases are blocking UDP exchanges — up to two retransmits per
     // protocol per profile — and this runs on a runtime worker, during the
     // shutdown drain that every other task is also trying to finish.
-    let released = tokio::task::spawn_blocking({
+    let released = crate::startup::tasks::spawn_blocking({
         let profiles = profiles.clone();
         move || release_mappings(&profiles, &forwarder)
     })
@@ -329,7 +329,7 @@ async fn renew_profile(
                 old.abort();
             }
             let handles = state.handles_for_profile(&id);
-            reannouncing = Some(tokio::spawn(reannounce_paced(
+            reannouncing = Some(crate::startup::tasks::spawn(reannounce_paced(
                 e.engine.clone(),
                 handles,
                 metrics.clone(),
@@ -509,7 +509,7 @@ async fn renew_once(
         let engine = e.engine.clone();
         let listen = listen.clone();
         let id = profile_id.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::startup::tasks::spawn_blocking(move || {
             renew_and_rebind(
                 &*forwarder,
                 &*engine,

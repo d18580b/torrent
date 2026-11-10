@@ -83,6 +83,9 @@ macro_rules! daemon_router {
             // included — carries them, and one id source serves every
             // request.
             .intercept(request_id)
+            // After `RequestId`, whose id it reads from the request; before
+            // everything else, so all of it runs in the span.
+            .intercept(crate::http::headers::RequestSpan)
             .intercept(crate::http::headers::ApiHeaders)
             .observe(trace)
             .not_found(FallbackPolicy::Problem)

@@ -152,6 +152,75 @@ async fn server_and_operations_behave_as_documented() {
     scenarios(&Coverage::new()).await;
 }
 
+/// Issue #728: every response, a 404 for an unknown path included, carries
+/// a `traceparent`. A request with none, or with one that is not valid W3C
+/// trace context, starts a trace of its own rather than joining it; a
+/// request that sends one joins its trace.
+#[tokio::test]
+async fn every_response_carries_a_traceparent_and_only_a_valid_one_is_joined() {
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let (_reload, subscriber) = crate::tracing_init::for_tests(
+        crate::config::LogLevel::Info,
+        crate::tracing_init::Buf::default(),
+    );
+    let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+    let h = Harness::authed(&Coverage::new(), |_| {});
+    let read = h.tokens.read.clone();
+    let trace_of = |resp: &kynos::test::TestResponse| -> String {
+        let parent = resp.header("traceparent").expect("a traceparent");
+        let parts: Vec<&str> = parent.split('-').collect();
+        assert_eq!(parts.len(), 4, "{parent}");
+        assert_eq!(parts[0], "00", "{parent}");
+        assert_eq!(parts[1].len(), 32, "{parent}");
+        assert_eq!(parts[2].len(), 16, "{parent}");
+        parts[1].to_owned()
+    };
+
+    let mut own = std::collections::BTreeSet::new();
+    for headers in [
+        &[][..],
+        &[("traceparent", "not-a-traceparent")][..],
+        // An all-zero trace id is invalid W3C trace context.
+        &[(
+            "traceparent",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        )][..],
+    ] {
+        let resp = h
+            .send_with("GET", "/v1/server", Some(&read), None, headers)
+            .await;
+        let trace = trace_of(&resp);
+        assert_ne!(trace, TRACE_ID);
+        assert_ne!(trace, "0".repeat(32), "{headers:?}");
+        own.insert(trace);
+    }
+    assert_eq!(own.len(), 3, "each request its own trace: {own:?}");
+
+    let joined = format!("00-{TRACE_ID}-00f067aa0ba902b7-01");
+    let resp = h
+        .send_with(
+            "GET",
+            "/v1/server",
+            Some(&read),
+            None,
+            &[("traceparent", &joined)],
+        )
+        .await;
+    assert_eq!(trace_of(&resp), TRACE_ID);
+
+    let unknown = h
+        .send_with(
+            "GET",
+            "/v1/nowhere",
+            None,
+            None,
+            &[("traceparent", &joined)],
+        )
+        .await;
+    assert_eq!(unknown.status().as_u16(), 404);
+    assert_eq!(trace_of(&unknown), TRACE_ID);
+}
+
 #[tokio::test]
 async fn events_stream_ticks_carrying_a_typed_event() {
     events(&Coverage::new()).await;

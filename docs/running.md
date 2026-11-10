@@ -1704,6 +1704,14 @@ and every JSON log line inside one ends with them:
 They are there with nothing exported, so a log query can already group one
 operation's lines by `trace_id`. A line outside any span has neither key.
 
+Every API request runs in a span named `request`, carrying its
+`request_id` (the response's `X-Request-Id`), `method`, `route` template,
+`status`, and caller (`principal`: `session`, `token` or `anonymous`, and a
+static token's `token_name`, never the token). Work the request hands to
+another task or thread stays inside it, so an engine line an adoption causes
+has the request's `trace_id`. A request carrying a W3C `traceparent` joins
+the caller's trace, and every response returns its own `traceparent`.
+
 A `[telemetry]` section exports the spans themselves over OTLP. It is off by
 default and restart-only; `deploy/torrentd.sample.toml` lists its keys and the
 `OTEL_EXPORTER_OTLP_*` variable each falls back to. Pointing it at Grafana

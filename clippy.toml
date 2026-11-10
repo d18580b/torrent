@@ -1,2 +1,13 @@
 # Keep clippy suggestions MSRV-safe and identical across contributors.
 msrv = "1.90"
+
+# A task or blocking job spawned bare starts with no span: its log lines
+# cannot be tied back to the request, pool job or check-queue job that
+# started it. torrentd spawns through `startup::tasks::spawn` and
+# `spawn_blocking`, which carry the current span and subscriber. Test code is
+# exempt (`cfg_attr(test, allow(...))` at each crate root); torrentctl, a
+# client with no request spans to carry, allows them at its crate root.
+disallowed-methods = [
+  { path = "tokio::task::spawn", reason = "spawn through torrentd's startup::tasks::spawn, which carries the current span" },
+  { path = "tokio::task::spawn_blocking", reason = "spawn through torrentd's startup::tasks::spawn_blocking, which carries the current span" },
+]

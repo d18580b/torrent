@@ -68,7 +68,7 @@ mod refusal;
 mod scan;
 mod scan_fence;
 mod shutdown_report;
-mod tasks;
+pub(crate) mod tasks;
 mod teardown;
 #[cfg(test)]
 mod test_support;
@@ -263,9 +263,11 @@ pub async fn boot(
     let unsupported_state_fs = {
         let dirs = fs_check::state_dirs(&cfg);
         let allow = cfg.allow_unsupported_state_fs;
-        tokio::task::spawn_blocking(move || fs_check::check_state_fs(&dirs, allow, &fs_check::Host))
-            .await
-            .context("state directory filesystem check")??
+        crate::startup::tasks::spawn_blocking(move || {
+            fs_check::check_state_fs(&dirs, allow, &fs_check::Host)
+        })
+        .await
+        .context("state directory filesystem check")??
     };
 
     // One daemon per state directory, decided before anything with an effect
@@ -273,7 +275,7 @@ pub async fn boot(
     // teardown runs while the lock is still held.
     let instance_lock = {
         let path = cfg.instance_lock_path();
-        tokio::task::spawn_blocking(move || InstanceLock::acquire(&path))
+        crate::startup::tasks::spawn_blocking(move || InstanceLock::acquire(&path))
             .await
             .context("single-instance lock")??
     };
@@ -282,7 +284,7 @@ pub async fn boot(
     // with the switch on and removing it as stale with the switch off. Taken
     // after the state directory's lock, so a second start on the same state
     // directory is told that first.
-    let table_lock = tokio::task::spawn_blocking(acquire_table_lock)
+    let table_lock = crate::startup::tasks::spawn_blocking(acquire_table_lock)
         .await
         .context("kill-switch table lock")??;
 
@@ -325,9 +327,11 @@ pub async fn boot(
     // every tunnel is up.
     let preflight = {
         let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
-        tokio::task::spawn_blocking(move || vpn::preflight::run(&needs, &vpn::preflight::Host))
-            .await
-            .context("host preflight")?
+        crate::startup::tasks::spawn_blocking(move || {
+            vpn::preflight::run(&needs, &vpn::preflight::Host)
+        })
+        .await
+        .context("host preflight")?
     };
     for o in &preflight {
         match o.finding {
@@ -348,7 +352,7 @@ pub async fn boot(
 
     {
         let profiles = cfg.profile.clone();
-        tokio::task::spawn_blocking(move || vpn::warn_if_exits_are_shared(&profiles))
+        crate::startup::tasks::spawn_blocking(move || vpn::warn_if_exits_are_shared(&profiles))
             .await
             .context("shared WireGuard endpoint check")?;
     }
@@ -357,7 +361,7 @@ pub async fn boot(
     // hand, say) before any bring-up can consult one.
     {
         let sweep_dir = run_dir.clone();
-        tokio::task::spawn_blocking(move || crate::vpn::sweep_raised_records(&sweep_dir))
+        crate::startup::tasks::spawn_blocking(move || crate::vpn::sweep_raised_records(&sweep_dir))
             .await
             .context("raised-interface record sweep")?;
     }
@@ -379,7 +383,7 @@ pub async fn boot(
     {
         let state_dir = run_dir.clone();
         let configured = Arc::clone(&configured);
-        let released = tokio::task::spawn_blocking(move || {
+        let released = crate::startup::tasks::spawn_blocking(move || {
             crate::vpn::release_recorded_wireguard(&state_dir, |iface| configured.contains(iface))
         })
         .await
@@ -402,7 +406,7 @@ pub async fn boot(
     {
         let state_dir = run_dir.clone();
         let configured = Arc::clone(&configured);
-        let released = tokio::task::spawn_blocking(move || {
+        let released = crate::startup::tasks::spawn_blocking(move || {
             vpn::OpenvpnManager::new(state_dir).release_recorded(|iface| configured.contains(iface))
         })
         .await
@@ -422,7 +426,7 @@ pub async fn boot(
     // in the same transaction as its install. With it off nothing else would
     // remove it, so it goes here, before any session opens a socket.
     if !cfg.network_kill_switch {
-        tokio::task::spawn_blocking(|| {
+        crate::startup::tasks::spawn_blocking(|| {
             remove_stale_kill_switch(
                 crate::vpn::killswitch::nft_available(),
                 &crate::vpn::killswitch::own_table_name(),
@@ -557,10 +561,11 @@ pub async fn boot(
     // the scans below give it a torrent.
     let desired_states = {
         let path = cfg.profile_state_path();
-        let (states, loaded) =
-            tokio::task::spawn_blocking(move || crate::profile_state::DesiredStates::load(path))
-                .await
-                .context("read the profiles' online/offline states")?;
+        let (states, loaded) = crate::startup::tasks::spawn_blocking(move || {
+            crate::profile_state::DesiredStates::load(path)
+        })
+        .await
+        .context("read the profiles' online/offline states")?;
         if let crate::profile_state::Loaded::Unreadable(why) = &loaded {
             error!(
                 path = %cfg.profile_state_path().display(),
@@ -579,10 +584,11 @@ pub async fn boot(
             .profile_state_path()
             .with_file_name(crate::profile_state::PACED_HOLDS_FILE);
         let shown = path.display().to_string();
-        let (holds, unreadable) =
-            tokio::task::spawn_blocking(move || crate::profile_state::PacedHolds::load(path))
-                .await
-                .context("read the record of what paced set-onlines hold")?;
+        let (holds, unreadable) = crate::startup::tasks::spawn_blocking(move || {
+            crate::profile_state::PacedHolds::load(path)
+        })
+        .await
+        .context("read the record of what paced set-onlines hold")?;
         if let Some(why) = unreadable {
             error!(
                 path = %shown,
@@ -833,7 +839,7 @@ pub async fn boot(
         // Before the boot re-drive and the API, either of which can apply a
         // plan: a root whose filesystem cannot take one has it refused.
         let (pool, metrics) = (Arc::clone(pool), metrics.clone());
-        tokio::task::spawn_blocking(move || {
+        crate::startup::tasks::spawn_blocking(move || {
             fs_check::probe_pool_roots(&pool, metrics.as_ref(), crate::apply::probe_mutations)
         })
         .await
@@ -849,10 +855,11 @@ pub async fn boot(
             .profile_state_path()
             .with_file_name(crate::check_queue::CHECK_HOLDS_FILE);
         let shown = path.display().to_string();
-        let (holds, unreadable) =
-            tokio::task::spawn_blocking(move || crate::profile_state::PacedHolds::load(path))
-                .await
-                .context("read the record of the .torrent adds held for a check slot")?;
+        let (holds, unreadable) = crate::startup::tasks::spawn_blocking(move || {
+            crate::profile_state::PacedHolds::load(path)
+        })
+        .await
+        .context("read the record of the .torrent adds held for a check slot")?;
         if let Some(why) = unreadable {
             error!(
                 path = %shown,
@@ -1402,7 +1409,7 @@ impl DaemonHandle {
         let unsaved_at_shutdown = alert_loop.unsaved_at_shutdown();
         // Joined off the runtime's workers: the drain can take its whole
         // deadline, and the timeout extender above has to keep running.
-        match tokio::task::spawn_blocking(move || alert_loop.join()).await {
+        match crate::startup::tasks::spawn_blocking(move || alert_loop.join()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!(error.cause = ?e, "alert loop join panicked"),
             Err(e) => warn!(error.cause = %e, "alert loop join task failed"),

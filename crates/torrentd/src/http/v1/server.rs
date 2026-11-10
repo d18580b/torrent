@@ -297,10 +297,19 @@ impl EventFeed {
     /// The state is read with the lock released: it makes an engine call per
     /// profile and reads the pool index, and a stream joining a running feed
     /// must not wait on either.
+    ///
+    /// The read and the feed task run in an `event_feed` span of their own, a
+    /// root, never in the span current here, which is the request span of
+    /// whichever stream happens to start the feed: the feed serves every
+    /// stream that joins it and outlives that request, so its lines carrying
+    /// that one request's `trace_id` would misattribute them, and holding the
+    /// span would keep the request's span open, and unexported, for as long
+    /// as any stream listens.
     async fn subscribe(s: &Arc<AppState>) -> tokio::sync::watch::Receiver<u64> {
         if let Some(rx) = s.events.join() {
             return rx;
         }
+        let span = tracing::info_span!(parent: None, "event_feed");
         let last = {
             let mut read = s.events.read.lock().await;
             // Another stream started a feed while this one waited for the
@@ -312,7 +321,7 @@ impl EventFeed {
             // tick, so the first tick a stream sends carries the daemon's
             // state rather than a placeholder. A read an earlier feed left
             // running is collected, not started again.
-            read.start(s);
+            read.start(s, span.clone());
             read.collect(TICK).await;
             read.last
         };
@@ -325,7 +334,7 @@ impl EventFeed {
         let (tx, rx) = tokio::sync::watch::channel(with_heartbeat(last, s));
         let tx = Arc::new(tx);
         *feed = Some(Arc::clone(&tx));
-        tokio::spawn(Self::run(Arc::clone(s), tx));
+        crate::startup::tasks::spawn_in(span, Self::run(Arc::clone(s), tx));
         rx
     }
 
@@ -359,7 +368,7 @@ impl EventFeed {
             }
             let last = {
                 let mut read = s.events.read.lock().await;
-                read.start(&s);
+                read.start(&s, tracing::Span::current());
                 read.collect(TICK / 2).await;
                 read.last
             };
@@ -552,12 +561,12 @@ struct StateRead {
 }
 
 impl StateRead {
-    /// Start a read, unless one is still running.
-    fn start(&mut self, s: &Arc<AppState>) {
+    /// Start a read in `span`, unless one is still running.
+    fn start(&mut self, s: &Arc<AppState>, span: tracing::Span) {
         if self.pending.is_none() {
             let s = Arc::clone(s);
             self.pending = Some((
-                tokio::task::spawn_blocking(move || state_fingerprint(&s)),
+                crate::startup::tasks::spawn_blocking_in(span, move || state_fingerprint(&s)),
                 std::time::Instant::now(),
             ));
         }
@@ -993,6 +1002,47 @@ mod tests {
             "the restarted feed started a read beside the one still running"
         );
         release.send(()).unwrap();
+    }
+
+    /// The feed serves every stream that joins it, so it does not run in the
+    /// span of the request whose stream started it: that span closes when
+    /// its request is done, with the feed still running.
+    #[tokio::test]
+    async fn the_feed_does_not_hold_the_span_of_the_request_that_started_it() {
+        use tracing::Instrument as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// The names of the spans closed so far.
+        #[derive(Clone, Default)]
+        struct Closed(Arc<parking_lot::Mutex<Vec<&'static str>>>);
+        impl<S> tracing_subscriber::Layer<S> for Closed
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_close(
+                &self,
+                id: tracing::span::Id,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if let Some(span) = ctx.span(&id) {
+                    self.0.lock().push(span.name());
+                }
+            }
+        }
+
+        let closed = Closed::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let s = Arc::new(steady());
+        let rx = EventFeed::subscribe(&s)
+            .instrument(tracing::info_span!("request"))
+            .await;
+        assert!(s.events.is_running());
+        assert!(
+            closed.0.lock().contains(&"request"),
+            "the feed holds the request span of the stream that started it"
+        );
+        drop(rx);
     }
 
     #[test]
