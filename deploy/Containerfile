@@ -7,7 +7,9 @@
 # Each release publishes this image as ghcr.io/d18580b/torrent:X.Y.Z, built
 # by .github/workflows/release-plz.yml from the tagged commit with no build
 # cache, checked to carry that release's torrentd, then signed and attested
-# (README.md § Install says how to verify it).
+# (README.md § Install says how to verify it). It is built once per
+# platform, linux/amd64 and linux/arm64, each on a native runner, and the tag
+# names the manifest list of both; nothing here may assume one architecture.
 #
 # Both base images are pinned by the digest of their multi-arch index, not by
 # tag alone: `fedora:43` is re-pushed with every update, so a tag names a

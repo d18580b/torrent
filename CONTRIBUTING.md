@@ -10,10 +10,10 @@ non-goals are spelled out in [`README.md`](./README.md) and
 
 ### Supported host
 
-Linux x86_64 only. Verified on:
+Linux on x86_64 and arm64 (aarch64). Verified on:
 
-- Fedora 43 (kernel 6.18+), GCC 14
-- Ubuntu 24.04, GCC 13
+- Fedora 43 (kernel 6.18+), GCC 14, x86_64
+- Ubuntu 24.04, GCC 13, x86_64 and arm64 (CI's `arm64` job runs the tests and the daemon's lifecycle there)
 
 The binary is not supported on Windows or macOS.
 
