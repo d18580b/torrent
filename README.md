@@ -62,6 +62,7 @@ Each [release](https://github.com/d18580b/torrent/releases) carries:
 | `SHA256SUMS` | the SHA-256 of each file above |
 | `*.sigstore.json` | a Sigstore bundle signing each file above, `SHA256SUMS` included |
 | `ghcr.io/d18580b/torrent:X.Y.Z` | the container image of [`deploy/Containerfile`](deploy/Containerfile) for `linux/amd64` and `linux/arm64`, also tagged `X.Y` and `latest` |
+| `oci://ghcr.io/d18580b/charts/torrentd`, version `X.Y.Z` | the Helm chart of [`deploy/helm/torrentd`](deploy/helm/torrentd), whose version and `appVersion` are the release's, so it defaults to that release's image |
 
 Each architecture is built on a machine of that architecture, never
 emulated, and its `torrentd --version` is checked there before anything is
@@ -120,6 +121,21 @@ gh attestation verify oci://ghcr.io/d18580b/torrent:X.Y.Z --repo d18580b/torrent
 cosign verify ghcr.io/d18580b/torrent:X.Y.Z \
   --certificate-identity https://github.com/d18580b/torrent/.github/workflows/release-plz.yml@refs/heads/master \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The chart is public the same way, signed and attested by the same workflow,
+and pulled anonymously by it on every release before the release is
+published. Verify it by the same two routes, then install it, or point
+Flux's `OCIRepository` at the same URL with `verify.provider: cosign` and
+that identity:
+
+```bash
+gh attestation verify oci://ghcr.io/d18580b/charts/torrentd:X.Y.Z --repo d18580b/torrent \
+  --signer-workflow d18580b/torrent/.github/workflows/release-plz.yml
+cosign verify ghcr.io/d18580b/charts/torrentd:X.Y.Z \
+  --certificate-identity https://github.com/d18580b/torrent/.github/workflows/release-plz.yml@refs/heads/master \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+helm install torrentd oci://ghcr.io/d18580b/charts/torrentd --version X.Y.Z -f values.yaml
 ```
 
 `torrentd --version` and `torrentctl --version` print the release's version,
@@ -656,11 +672,21 @@ it is:
 
 A published release is immutable. Neither path changes one.
 
-When the `image (ghcr.io)` job fails at `Anyone can pull the release's
+When the `image manifest list (ghcr.io)` job fails at `Anyone can pull the release's
 image, with no login`, the image is pushed, but anonymous clients cannot
 pull it, and the release stays a draft. The usual cause is a private
 package: set the `torrent` package's visibility to public (the package's
 settings on GitHub, Danger Zone), then re-run the failed jobs.
+
+The `helm chart (ghcr.io)` job fails the same way at `Anyone can pull the
+release's chart, with no login`, and the release stays a draft. The first
+release that pushes the chart creates its package, `charts/torrentd`, and
+GitHub makes a new package private, so that release always stops here: set
+the `charts/torrentd` package's visibility to public the same way, then
+re-run the failed jobs. The job also refuses a chart whose `version` or
+`appVersion` in `deploy/helm/torrentd/Chart.yaml` is not the release's;
+the release pull request moves both, so that means the file was edited on
+`release-plz-next` or after it was refreshed.
 
 ## Contributing & license
 
