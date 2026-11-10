@@ -109,12 +109,18 @@ run = [
 # Log field names. CONTRIBUTING.md fixes the `infohash` and `profile_id`
 # spellings; the other spelling of either silently splits every log query in
 # two. Scoped to *.rs so the C++ shim's include of libtorrent's real header
-# (<libtorrent/info_hash.hpp>) is not flagged. The `::error::` and
+# (<libtorrent/info_hash.hpp>) is not flagged. It also fails a `let _ =` in
+# non-test code that does not say why the value may be dropped (CONTRIBUTING.md,
+# Style). The `::error::` and
 # `::warning::` prefixes are GitHub annotations in CI, and plain text locally.
 [tasks.lint-tracing]
-description = "Reject info_hash and slot_id log field names in crates/"
+description = "Reject info_hash and slot_id log field names, and an unannotated let _ =, in crates/"
 run = '''
 set -eu
+# A `let _ =` in non-test code needs `// ignore-result: <reason>` on its line
+# or in the comment lines directly above. scripts/lint-let-underscore holds
+# the rules and what counts as test code.
+scripts/lint-let-underscore
 if grep -RnE --include='*.rs' '\binfo_hash\b' crates/; then
   echo "::error::Field name must be 'infohash' (no underscore)."
   exit 1

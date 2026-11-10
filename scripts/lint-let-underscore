@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Ignored-value gate: a `let _ =` in non-test Rust under crates/ must say why
+# discarding the value is right.
+#
+# `let _ = expr;` drops whatever `expr` returns, and when that is a `Result`
+# the error goes with it, silently. A grep cannot tell a `Result` from any
+# other value, so every `let _ =` needs the annotation
+#
+#     // ignore-result: <reason>
+#
+# either at the end of the `let _ =` line itself, or in the run of `//`
+# comment lines directly above it (no blank line between). The reason is
+# required: `// ignore-result:` with nothing after it does not count.
+#
+# Test code is exempt:
+#   - files under a `tests/` directory, and files named `tests.rs`;
+#   - any item a `#[cfg(test)]` attribute gates: an inline `mod tests { ... }`,
+#     a `fn`, an `impl`, through the brace that closes it, or a statement
+#     through its `;`.
+#
+# A module file that a `#[cfg(test)] mod name;` line pulls in is not exempt
+# by that line: the check reads one file at a time. `let _ =` inside a comment
+# or a string is not code and is not checked. Braces are counted outside
+# comments, strings (raw and multi-line included) and char literals.
+#
+# Only files git tracks are read, so a new file is checked once it is staged.
+#
+# Run as `mise run lint-tracing`; CI calls that task.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+files=()
+while IFS= read -r -d '' path; do
+  case "/$path" in
+    */tests/* | */tests.rs) continue ;;
+  esac
+  [ -f "$path" ] || continue
+  files+=("$path")
+done < <(git ls-files -z -- ':(glob)crates/**/*.rs')
+
+[ "${#files[@]}" -gt 0 ] || exit 0
+
+# POSIX awk only: CI's ubuntu runner has mawk, not gawk.
+read -r -d '' program <<'AWK' || true
+# The line with comments and the contents of string and char literals
+# removed. `str` (-1 outside a string, else the raw string's `#` count, 0 for
+# a plain string) and `blk` (block comment nesting) carry across lines.
+function code_of(s,    out, i, n, c, j, h, endq) {
+  out = ""; n = length(s); i = 1
+  while (i <= n) {
+    c = substr(s, i, 1)
+    if (blk > 0) {
+      if (substr(s, i, 2) == "*/") { blk--; i += 2 }
+      else if (substr(s, i, 2) == "/*") { blk++; i += 2 }
+      else i++
+      continue
+    }
+    if (str >= 0) {
+      if (str == 0 && !raw && c == "\\") { i += 2; continue }
+      endq = "\""
+      for (h = 0; h < str; h++) endq = endq "#"
+      if (substr(s, i, length(endq)) == endq) { str = -1; raw = 0; out = out "\"\""; i += length(endq) }
+      else i++
+      continue
+    }
+    if (substr(s, i, 2) == "//") break
+    if (substr(s, i, 2) == "/*") { blk = 1; i += 2; continue }
+    if (c == "\"") { str = 0; raw = 0; i++; continue }
+    if (c == "r" && (i == 1 || substr(s, i - 1, 1) !~ /[[:alnum:]_]/ || substr(s, i - 1, 1) == "b")) {
+      j = i + 1
+      while (substr(s, j, 1) == "#") j++
+      if (substr(s, j, 1) == "\"") { str = j - i - 1; raw = 1; i = j + 1; continue }
+    }
+    # A char literal; a lifetime (`'a`) has no closing quote two along.
+    if (c == "'") {
+      if (substr(s, i + 1, 1) == "\\") {
+        j = index(substr(s, i + 2), "'")
+        if (j > 0) { i = i + 2 + j; continue }
+      } else if (substr(s, i + 2, 1) == "'") { i += 3; continue }
+    }
+    out = out c; i++
+  }
+  return out
+}
+function count(s, ch,    n, i) {
+  n = 0
+  for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == ch) n++
+  return n
+}
+FNR == 1 { pending = 0; gated = 0; depth = 0; opened = 0; annotated_above = 0; str = -1; raw = 0; blk = 0 }
+{
+  line = $0
+  code = code_of(line)
+
+  if (gated) {
+    depth += count(code, "{") - count(code, "}")
+    if (count(code, "{") > 0) opened = 1
+    if ((opened && depth <= 0) || (!opened && code ~ /;[[:space:]]*$/)) gated = 0
+    annotated_above = 0
+    next
+  }
+
+  if (line ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+    pending = 1
+    sub(/^[[:space:]]*#\[cfg\(test\)\]/, "", code)
+    if (code ~ /^[[:space:]]*$/) next
+  }
+  if (pending) {
+    if (code ~ /^[[:space:]]*(#\[.*|)$/) next
+    pending = 0
+    gated = 1; depth = count(code, "{") - count(code, "}"); opened = (count(code, "{") > 0)
+    if ((opened && depth <= 0) || (!opened && code ~ /;[[:space:]]*$/)) gated = 0
+    annotated_above = 0
+    next
+  }
+
+  if (code ~ /(^|[^[:alnum:]_])let _ =/) {
+    if (!annotated_above && line !~ /\/\/ ignore-result: [^[:space:]]/) {
+      printf "%s:%d: %s\n", FILENAME, FNR, line
+      bad++
+    }
+  }
+
+  if (line ~ /^[[:space:]]*\/\//) {
+    if (line ~ /^[[:space:]]*\/\/ ignore-result: [^[:space:]]/) annotated_above = 1
+  } else {
+    annotated_above = 0
+  }
+}
+END { exit bad > 0 ? 1 : 0 }
+AWK
+
+status=0
+awk "$program" "${files[@]}" || status=$?
+if [ "$status" -eq 1 ]; then
+  echo "::error::let _ = discards a value without saying why; add '// ignore-result: <reason>' on the line or the comment line above it, or handle the value."
+fi
+exit "$status"
