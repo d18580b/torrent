@@ -91,6 +91,7 @@ impl ScanStats {
 /// the same way and keeps that subtree's previous rows, and a file the walk
 /// listed but could not stat counts a `stat` error and keeps its previous
 /// row; the rest of the root is re-indexed as usual.
+#[tracing::instrument(name = "pool.scan_root", level = "info", skip_all, fields(root = %root_path.display()), err(level = "info"))]
 pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, PoolError> {
     let root_id = store.upsert_root(root_path)?;
     let mut stats = ScanStats::default();
@@ -256,6 +257,7 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
 /// library was read in full: a single walk, read or parse error (a sidecar's
 /// excepted) keeps every torrent missing from this scan, because the
 /// torrent behind the error cannot be told apart from one that is gone.
+#[tracing::instrument(name = "pool.scan_library", level = "info", skip_all, fields(library_dir = %library_dir.display()), err(level = "info"))]
 pub fn scan_library(
     store: &mut PoolStore,
     library_dir: &Path,

@@ -305,7 +305,7 @@ pub enum TrackerVerdict {
 /// to its index in the `session_stats_alert` counter array, or `None` if the
 /// name is unknown to this libtorrent build. The mapping is a build-time
 /// constant — resolve once and cache.
-#[tracing::instrument(name = "ffi.session_stats_metric_index", level = "debug", skip_all, fields(name, duration_us = tracing::field::Empty))]
+#[tracing::instrument(name = "ffi.session_stats_metric_index", level = "debug", skip_all, fields(name = name, duration_us = tracing::field::Empty))]
 pub fn session_stats_metric_index(name: &str) -> Option<usize> {
     let _timed = Timed::start();
     let c = CString::new(name).ok()?;

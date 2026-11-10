@@ -385,7 +385,7 @@ impl Session {
         })
     }
 
-    #[tracing::instrument(name = "ffi.remove_torrent", level = "debug", skip_all, fields(infohash = %h.infohash, delete_files, duration_us = tracing::field::Empty), err(level = "debug"))]
+    #[tracing::instrument(name = "ffi.remove_torrent", level = "debug", skip_all, fields(infohash = %h.infohash, delete_files = delete_files, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<()> {
         let _timed = Timed::start();
         let rc = unsafe {
@@ -420,7 +420,7 @@ impl Session {
         }
     }
 
-    #[tracing::instrument(name = "ffi.torrent_set_upload_limit", level = "debug", skip_all, fields(infohash = %h.infohash, bytes_per_sec, duration_us = tracing::field::Empty), err(level = "debug"))]
+    #[tracing::instrument(name = "ffi.torrent_set_upload_limit", level = "debug", skip_all, fields(infohash = %h.infohash, bytes_per_sec = bytes_per_sec, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<()> {
         let _timed = Timed::start();
         let rc = unsafe {
@@ -433,7 +433,7 @@ impl Session {
         }
     }
 
-    #[tracing::instrument(name = "ffi.torrent_set_file_priority", level = "debug", skip_all, fields(infohash = %h.infohash, file_idx, priority, duration_us = tracing::field::Empty), err(level = "debug"))]
+    #[tracing::instrument(name = "ffi.torrent_set_file_priority", level = "debug", skip_all, fields(infohash = %h.infohash, file_idx = file_idx, priority = priority, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<()> {
         let _timed = Timed::start();
         let rc = unsafe {
@@ -518,7 +518,7 @@ impl Session {
     /// Relocate the torrent's payload, letting libtorrent perform the move so
     /// its storage state stays consistent. Asynchronous — completion arrives
     /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.
-    #[tracing::instrument(name = "ffi.torrent_move_storage", level = "debug", skip_all, fields(infohash = %h.infohash, new_path, duration_us = tracing::field::Empty), err(level = "debug"))]
+    #[tracing::instrument(name = "ffi.torrent_move_storage", level = "debug", skip_all, fields(infohash = %h.infohash, new_path = new_path, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn move_storage(&self, h: TorrentHandle, new_path: &str, flags: MoveFlags) -> Result<()> {
         let _timed = Timed::start();
         let path = c_string(new_path, "new_path")?;
@@ -606,7 +606,7 @@ impl Session {
     /// the session. A caller that serialises session access behind a lock
     /// takes this under the lock and calls [`RawFileList::into_page`] or
     /// [`RawFileList::into_files`] after releasing it.
-    #[tracing::instrument(name = "ffi.torrent_files", level = "debug", skip_all, fields(infohash = %h.infohash, start, limit, duration_us = tracing::field::Empty), err(level = "debug"))]
+    #[tracing::instrument(name = "ffi.torrent_files", level = "debug", skip_all, fields(infohash = %h.infohash, start = start, limit = limit, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn torrent_files_raw(
         &self,
         h: TorrentHandle,
@@ -787,7 +787,7 @@ impl Session {
     /// One `ffi.pop_alerts` span for the batch rather than one per
     /// [`Session::pop_alert`]: the alert loop pops thousands a second under
     /// load, and a span per alert would be a span per torrent event.
-    #[tracing::instrument(name = "ffi.pop_alerts", level = "debug", skip_all, fields(max, popped = tracing::field::Empty, duration_us = tracing::field::Empty))]
+    #[tracing::instrument(name = "ffi.pop_alerts", level = "debug", skip_all, fields(max = max, popped = tracing::field::Empty, duration_us = tracing::field::Empty))]
     pub fn drain_alerts_up_to(&self, max: usize) -> Vec<Alert> {
         let _timed = Timed::start();
         let mut out = Vec::new();
