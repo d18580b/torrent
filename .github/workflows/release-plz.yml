@@ -590,16 +590,17 @@ jobs:
         with:
           context: .
           file: deploy/Containerfile
-          build-args: TORRENTD_REVISION=${{ github.sha }}
           load: true
           push: false
           tags: torrentd:release-check
           labels: ${{ steps.meta.outputs.labels }}
-          # The Containerfile's own OCI labels. The metadata action's labels
-          # above take precedence; they agree on every label both set (its
-          # title is overridden to match), and add description, url and
-          # created.
+          # TORRENTD_REVISION is what torrentd_build_info reports. VERSION
+          # and REVISION are the Containerfile's own OCI labels; the metadata
+          # action's labels above take precedence, they agree on every label
+          # both set (its title is overridden to match), and add description,
+          # url and created.
           build-args: |
+            TORRENTD_REVISION=${{ github.sha }}
             VERSION=${{ env.VERSION }}
             REVISION=${{ github.sha }}
           provenance: false
@@ -648,13 +649,12 @@ jobs:
         with:
           context: .
           file: deploy/Containerfile
-          build-args: TORRENTD_REVISION=${{ github.sha }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # The Containerfile's own OCI labels, under the metadata action's,
-          # as in the build above.
+          # The same build-args as the build above, so it reuses its layers.
           build-args: |
+            TORRENTD_REVISION=${{ github.sha }}
             VERSION=${{ env.VERSION }}
             REVISION=${{ github.sha }}
           provenance: false
