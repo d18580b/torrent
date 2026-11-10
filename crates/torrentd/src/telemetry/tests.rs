@@ -75,6 +75,36 @@ fn a_line_inside_a_span_carries_its_trace_and_span_id_with_nothing_exported() {
     assert_eq!(l[1]["message"], "in outer");
 }
 
+#[test]
+fn a_warn_line_carries_the_ids_of_spans_its_log_level_hides() {
+    let buf = Buf::default();
+    let (handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Warn, buf.clone());
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        // `log_level` = warn keeps these INFO spans out of the JSON layer;
+        // their ids must still reach the lines inside them.
+        let outer = tracing::info_span!(target: "torrentd", "outer");
+        let _outer = outer.enter();
+        tracing::warn!(target: "torrentd", "warn in outer");
+        let inner = tracing::info_span!(target: "torrentd", "inner");
+        let _inner = inner.enter();
+        tracing::error!(target: "torrentd", "error in inner");
+        // As after a SIGHUP raising it from info.
+        handle.set_level(LogLevel::Error).expect("reload");
+        tracing::warn!(target: "torrentd", "held back");
+        tracing::error!(target: "torrentd", "error after reload");
+    });
+    let l = lines(&buf);
+    assert_eq!(l.len(), 3, "{}", buf.text());
+    for line in &l {
+        assert!(is_hex(&line["trace_id"], 32), "{line}");
+        assert!(is_hex(&line["span_id"], 16), "{line}");
+        assert_eq!(line["trace_id"], l[0]["trace_id"], "one trace");
+    }
+    assert_ne!(l[0]["span_id"], l[1]["span_id"]);
+    assert_eq!(l[1]["span_id"], l[2]["span_id"]);
+    assert_eq!(l[2]["message"], "error after reload");
+}
+
 /// Every credential shape `crate::redact`'s tests hold the log to: the
 /// shapes it recognises anywhere, and those it cuts only under a
 /// `HOST_ONLY_TARGETS` target.

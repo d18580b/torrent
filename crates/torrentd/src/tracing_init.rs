@@ -141,12 +141,10 @@ where
     ) -> fmt::Result {
         let mut line = String::new();
         self.0.format_event(ctx, Writer::new(&mut line), event)?;
-        let ids = ctx.event_scope().and_then(|scope| {
-            scope
-                .into_iter()
-                .find_map(|span| span.extensions().get::<TraceIds>().copied())
-        });
-        if let Some(ids) = ids {
+        // Not `ctx.event_scope()`: that scope is behind this layer's own
+        // `log_level` filter, which hides the INFO spans of a WARN line once
+        // `log_level` is warn or error. `EventTraceIds` reads the whole scope.
+        if let Some(ids) = EVENT_TRACE_IDS.take() {
             ids.splice_into(&mut line);
         }
         writer.write_str(&redact_for_target(event.metadata().target(), &line))
@@ -204,6 +202,8 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_register_dispatch(&self, subscriber: &Dispatch) {
+        // ignore-result: a layer registered with a second dispatcher keeps
+        // the first, which is the one `subscriber` installs.
         let _ = self.dispatch.set(subscriber.downgrade());
     }
 
@@ -226,6 +226,34 @@ where
                 span_id: span_context.span_id(),
             });
         }
+    }
+}
+
+thread_local! {
+    /// The ids [`EventTraceIds`] found for the event this thread is
+    /// dispatching, for [`Redacting`] to take when it formats that event.
+    static EVENT_TRACE_IDS: std::cell::Cell<Option<TraceIds>> = const { std::cell::Cell::new(None) };
+}
+
+/// Finds each event's ids, those of the innermost span in its scope that has
+/// [`TraceIds`], and leaves them in [`EVENT_TRACE_IDS`] for the JSON layer.
+/// It has no filter of its own, so its scope holds every span, including the
+/// INFO spans the JSON layer's `log_level` filter hides at warn or error. It
+/// runs before the JSON layer only because [`subscriber`] composes the two
+/// with `and_then`, which calls it first.
+struct EventTraceIds;
+
+impl<S> Layer<S> for EventTraceIds
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let ids = ctx.event_scope(event).and_then(|scope| {
+            scope
+                .into_iter()
+                .find_map(|span| span.extensions().get::<TraceIds>().copied())
+        });
+        EVENT_TRACE_IDS.set(ids);
     }
 }
 
@@ -283,9 +311,10 @@ where
     let (filter, handle) = reload::Layer::new(filter);
     // `RecordTraceIds` above the OpenTelemetry layer, whose `on_new_span`
     // runs first and gives the span the context it reads. The JSON layer
-    // reads what it recorded only when an event is formatted.
+    // reads what it recorded only when an event is formatted, through
+    // `EventTraceIds`, which `and_then` runs before it on every event.
     let subscriber = tracing_subscriber::registry()
-        .with(fmt_layer(writer).with_filter(filter))
+        .with(EventTraceIds.and_then(fmt_layer(writer).with_filter(filter)))
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
