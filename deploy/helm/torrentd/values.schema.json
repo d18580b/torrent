@@ -139,7 +139,7 @@
     "tmp": {
       "type": "object",
       "additionalProperties": false,
-      "properties": { "sizeLimit": { "type": "string", "minLength": 1 } }
+      "properties": { "sizeLimit": { "type": ["string", "null"], "minLength": 1 } }
     },
     "podSecurityContext": { "type": "object" },
     "terminationGracePeriodSeconds": { "type": ["integer", "null"], "minimum": 0 },

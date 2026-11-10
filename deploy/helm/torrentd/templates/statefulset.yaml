@@ -146,7 +146,9 @@ spec:
         - name: tmp
           emptyDir:
             medium: Memory
-            sizeLimit: {{ .Values.tmp.sizeLimit }}
+            {{- with .Values.tmp.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
         {{- with .Values.vpn.wireguardSecret }}
         - name: wireguard
           secret:

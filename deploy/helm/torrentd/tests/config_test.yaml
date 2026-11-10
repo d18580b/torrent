@@ -114,6 +114,32 @@ tests:
       - failedTemplate:
           errorPattern: needs `auth`
 
+  - it: refuses a default_save_path on no payload volume
+    values: [values/host-only.yaml]
+    set:
+      payloadVolumes:
+        - name: library
+          mountPath: /data/library
+          existingClaim: library
+    asserts:
+      - failedTemplate:
+          errorPattern: default_save_path /data/torrents is under no payloadVolumes mountPath
+
+  - it: does not take a sibling path with the same prefix as a mount
+    values: [values/host-only.yaml]
+    set:
+      config.settings.default_save_path: /data/torrents-new
+    asserts:
+      - failedTemplate:
+          errorPattern: default_save_path /data/torrents-new is under no payloadVolumes mountPath
+
+  - it: accepts a default_save_path below a payload volume's mountPath
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^default_save_path = "/data/torrents"$
+
   - it: refuses an http_listen of its own
     values: [values/host-only.yaml]
     set:

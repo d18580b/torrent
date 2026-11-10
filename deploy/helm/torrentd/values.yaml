@@ -124,11 +124,19 @@ persistence:
 # The pod's fsGroup is applied with fsGroupChangePolicy OnRootMismatch, so a
 # large library is never chowned file by file; a host path is never relabelled
 # at all. Each directory must already be writable by uid or gid 1000.
+#
+# A rendered config's default_save_path (default /data/torrents) must lie at
+# or under one entry's mountPath, or the render fails: the image root is
+# read-only. The chart cannot check a config from config.existingSecret.
 payloadVolumes: []
 
 # /tmp, where SQLite keeps its temporary files: a memory-backed emptyDir.
+# Unsized by default, as compose.yaml's tmpfs is: its pages count against the
+# container's memory, so resources.limits.memory bounds it, and a large
+# SQLite sort is never evicted for crossing a separate cap. Set sizeLimit
+# (e.g. 256Mi) to cap it below the memory limit.
 tmp:
-  sizeLimit: 256Mi
+  sizeLimit: null
 
 podSecurityContext:
   runAsUser: 1000

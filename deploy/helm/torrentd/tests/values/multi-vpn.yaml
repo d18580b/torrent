@@ -38,3 +38,7 @@ peers:
     - name: public
       port: 6881
   expose: loadBalancer
+payloadVolumes:
+  - name: torrents
+    mountPath: /data
+    existingClaim: torrents

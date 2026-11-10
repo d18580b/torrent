@@ -30,3 +30,7 @@ metrics:
     enabled: true
   dashboard:
     enabled: true
+payloadVolumes:
+  - name: torrents
+    mountPath: /data/torrents
+    existingClaim: torrents

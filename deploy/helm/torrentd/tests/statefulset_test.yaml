@@ -206,8 +206,20 @@ tests:
             mountPath: /etc/wireguard
             readOnly: true
 
-  - it: keeps /tmp on a memory-backed emptyDir
+  - it: keeps /tmp on an unsized memory-backed emptyDir by default
     values: [values/host-only.yaml]
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir:
+              medium: Memory
+
+  - it: caps /tmp when tmp.sizeLimit is set
+    values: [values/host-only.yaml]
+    set:
+      tmp.sizeLimit: 256Mi
     asserts:
       - contains:
           path: spec.template.spec.volumes

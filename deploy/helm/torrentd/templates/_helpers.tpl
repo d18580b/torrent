@@ -95,6 +95,16 @@ a reason the chart can see.
 {{- if and (not $s.auth) (not $s.allow_unauthenticated) -}}
 {{- fail "config.settings needs `auth` (or `allow_unauthenticated: true`): the API listens on the pod's address, and a non-loopback http_listen requires [auth]" -}}
 {{- end -}}
+{{- /* The root is read-only, so default_save_path must sit on a payload volume. */ -}}
+{{- $save := clean (toString $s.default_save_path) -}}
+{{- $mounted := false -}}
+{{- range $v := (.Values.payloadVolumes | default list) -}}
+{{- $m := clean (toString $v.mountPath) -}}
+{{- if or (eq $save $m) (hasPrefix (printf "%s/" (trimSuffix "/" $m)) $save) -}}{{- $mounted = true -}}{{- end -}}
+{{- end -}}
+{{- if not $mounted -}}
+{{- fail (printf "config.settings.default_save_path %s is under no payloadVolumes mountPath: the image root is read-only, so torrentd could not write payload there" $save) -}}
+{{- end -}}
 {{- toYaml $s -}}
 {{- end -}}
 
