@@ -343,13 +343,15 @@ impl PoolStore {
     ///
     /// Each commit of the writer is a WAL fsync under `synchronous=FULL`, so
     /// this is how a test holds a loop to the number of fsyncs it makes.
-    pub fn count_commits(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    pub fn count_commits(
+        &mut self,
+    ) -> Result<std::sync::Arc<std::sync::atomic::AtomicU64>, PoolError> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let seen = std::sync::Arc::clone(&counter);
         self.conn.commit_hook(Some(move || {
             seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             false
-        }));
-        counter
+        }))?;
+        Ok(counter)
     }
 }
