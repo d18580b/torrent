@@ -568,6 +568,12 @@ Run torrentd as its own user. Setup is
 [`docs/running.md`](docs/running.md), whose §8 also brings up the compose
 stack, and §9 has the day-one runbook for WireGuard behind the kill switch.
 
+On Kubernetes, [`docs/kubernetes.md`](docs/kubernetes.md) lists what the
+cluster must provide (kernel, Pod Security level, storage, network and
+resources), then deploys the Helm chart of
+[`deploy/helm/torrentd`](deploy/helm/torrentd) through FluxCD, with example
+values for a host-only and a multi-account VPN deployment.
+
 ### The daemon's command line
 
 `--config <PATH>` comes first and is required by everything but `openapi`.
