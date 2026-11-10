@@ -1691,6 +1691,75 @@ where that is intended, as it must be for an OpenVPN profile (§11, drill 6).
 `mise run test-alerts` checks the rules with `promtool` and runs a fixture per
 alert; it needs podman or docker.
 
+### Traces: OpenTelemetry over OTLP
+
+Every span the daemon opens at INFO or above (an HTTP request's, an engine
+call's under `op`, a pool step's) has an OpenTelemetry trace id and span id,
+and every JSON log line inside one ends with them:
+
+```json
+{"timestamp":"…","level":"INFO","message":"…","target":"torrentd_engine::real","span":{"op":"add_torrent","name":"add_torrent"},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}
+```
+
+They are there with nothing exported, so a log query can already group one
+operation's lines by `trace_id`. A line outside any span has neither key.
+
+A `[telemetry]` section exports the spans themselves over OTLP. It is off by
+default and restart-only; `deploy/torrentd.sample.toml` lists its keys and the
+`OTEL_EXPORTER_OTLP_*` variable each falls back to. Pointing it at Grafana
+Alloy, which forwards to Tempo:
+
+```toml
+[telemetry]
+otlp_endpoint = "http://127.0.0.1:4318"   # http/protobuf; /v1/traces is appended
+```
+
+```alloy
+otelcol.receiver.otlp "default" {
+  http { endpoint = "127.0.0.1:4318" }
+  grpc { endpoint = "127.0.0.1:4317" }
+  output { traces = [otelcol.exporter.otlp.tempo.input] }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client { endpoint = "tempo:4317" }
+}
+```
+
+Straight to Tempo, which has an OTLP receiver of its own, is
+`otlp_endpoint = "http://tempo:4317"` with `protocol = "grpc"`. For a
+collector that wants credentials (Grafana Cloud's OTLP gateway), put them in
+a `headers_file` of `name=value` lines readable by the daemon's user alone,
+not in the TOML. To join logs to traces in Grafana, give the Loki data
+source a derived field on `"trace_id":"(\w+)"` linking to the Tempo data
+source, and Tempo's trace-to-logs setting a `{job="torrentd"} |= "${__span.traceId}"`
+query.
+
+What is exported, and what is not:
+
+- Spans and the events logged inside them, at INFO and above, each held to
+  the redaction every log line gets: a tracker credential reaches the
+  collector no more than it reaches the journal. `service.name` is
+  `torrentd`, `service.version` the build's; `resource_attributes` and
+  `OTEL_RESOURCE_ATTRIBUTES` add the rest.
+- `sample_ratio` keeps that share of new traces (default all of them); a span
+  under a sampled parent is kept with it. Unsampled spans still have ids in
+  the log.
+- Nothing waits on the collector. Spans queue in a bounded buffer that drops
+  when full, and each export is bounded (10 s for http/protobuf,
+  `OTEL_EXPORTER_OTLP_TIMEOUT` for grpc). A failed export drops its batch,
+  counts in `torrentd_telemetry_export_errors_total`, and logs a WARN under
+  `torrentd::telemetry` at most once a minute, with `held_back` counting the
+  failures it did not log. On a stop, the spans still queued are exported
+  after the resume drain, for at most 5 s more; `TimeoutStopSec=120s` covers
+  it.
+- With `network_kill_switch`, the daemon's egress is loopback and its tunnels
+  only, so the collector has to be on loopback: Alloy on the host, or a
+  sidecar in the same pod. An exporter pointed anywhere else fails every
+  export, and the counter says so.
+- Operator subcommands (`pool …`, `vpn check`, …) export nothing; their log
+  lines carry ids all the same.
+
 ### Checking the VPN on its own
 
 `vpn check` runs the VPN pre-flight without constructing a session, so "does
