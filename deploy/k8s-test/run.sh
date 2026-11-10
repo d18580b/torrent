@@ -213,8 +213,16 @@ step "create the k3d cluster $cluster"
 created=1
 k3d cluster create "$cluster" --config "$here/k3d.yaml"
 k3d kubeconfig get "$cluster" >"$KUBECONFIG"
-kubectl -n kube-system rollout status deployment/coredns --timeout=180s
-kubectl -n kube-system rollout status deployment/local-path-provisioner --timeout=180s
+# k3s's addon controller creates these Deployments from its manifests some
+# time after the API answers, and `rollout status` fails NotFound at once on
+# one that does not exist yet: wait for each to exist, then for its rollout.
+system_deployment() {
+  kubectl -n kube-system get "deployment/$1" >/dev/null 2>&1
+}
+for addon in coredns local-path-provisioner; do
+  poll 120 "k3s to create deployment/$addon" system_deployment "$addon"
+  kubectl -n kube-system rollout status "deployment/$addon" --timeout=180s
+done
 
 step "load $image"
 if [ -n "$archive" ]; then
