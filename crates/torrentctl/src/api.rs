@@ -205,10 +205,112 @@ pub fn from_problem(
     }
 }
 
+/// A fresh W3C `traceparent` (version 00, sampled): a new trace for every
+/// request, so the daemon's spans for it share one trace id this log
+/// records. Neither id is ever all zeros, which the format forbids.
+pub fn traceparent() -> String {
+    let trace = rand::random::<u128>().max(1);
+    let span = rand::random::<u64>().max(1);
+    format!("00-{trace:032x}-{span:016x}-01")
+}
+
+/// Give `headers` a fresh [`traceparent`], replacing any there, and return it.
+fn stamp(headers: &mut reqwest::header::HeaderMap) -> String {
+    let traceparent = traceparent();
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(&traceparent) {
+        headers.insert("traceparent", value);
+    }
+    traceparent
+}
+
+/// The one log line for a request: its `traceparent`, and the daemon's
+/// `X-Request-Id` when it answered with one, the two ids a report needs to
+/// find the request in the daemon's log and its traces.
+fn record(
+    method: &reqwest::Method,
+    path: &str,
+    traceparent: &str,
+    started: std::time::Instant,
+    outcome: Result<(u16, Option<String>), String>,
+) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match outcome {
+        Ok((status, request_id)) => tracing::info!(
+            target: "torrentctl::http",
+            %method,
+            path,
+            status,
+            request_id = request_id.as_deref().unwrap_or("none"),
+            traceparent,
+            elapsed_ms,
+            "request"
+        ),
+        Err(error) => tracing::info!(
+            target: "torrentctl::http",
+            %method,
+            path,
+            traceparent,
+            elapsed_ms,
+            error,
+            "request failed"
+        ),
+    }
+}
+
+/// The middleware every request the generated client sends goes through:
+/// it carries a fresh [`traceparent`], and is logged once the response's
+/// head arrives (or the transport fails).
+#[derive(Debug)]
+struct Traced;
+
+impl generated::Middleware for Traced {
+    fn handle<'a>(
+        &'a self,
+        mut request: http::Request<generated::HttpBody>,
+        next: generated::Next<'a>,
+    ) -> generated::ExecuteFuture<'a> {
+        let traceparent = stamp(request.headers_mut());
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let outcome = next.run(request).await;
+            let logged = match &outcome {
+                Ok(response) => Ok((response.status().as_u16(), request_id(response.headers()))),
+                Err(e) => Err(root_cause(e)),
+            };
+            record(&method, &path, &traceparent, started, logged);
+            outcome
+        })
+    }
+}
+
+/// Send a request [`Api::post`] built, as the generated client sends its
+/// own: with a fresh [`traceparent`], and logged.
+pub async fn send(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    let (client, request) = request.build_split();
+    let mut request = request?;
+    let traceparent = stamp(request.headers_mut());
+    let method = request.method().clone();
+    let path = request.url().path().to_owned();
+    let started = std::time::Instant::now();
+    let outcome = client.execute(request).await;
+    let logged = match &outcome {
+        Ok(response) => Ok((response.status().as_u16(), request_id(response.headers()))),
+        Err(e) => Err(root_cause(e)),
+    };
+    record(&method, &path, &traceparent, started, logged);
+    outcome
+}
+
 /// Where the daemon is and how to authenticate to it.
 #[derive(Clone)]
 pub struct Api {
     pub client: Client,
+    /// The HTTP client the generated one executes on, for the requests
+    /// [`Api::post`] builds by hand: the generated client builds its own
+    /// requests on a default one.
+    http: reqwest::Client,
     /// The URL the client talks to, for the header.
     pub base_url: String,
     /// Bumped whenever the credential changes, so what holds a copy — the
@@ -256,7 +358,11 @@ impl Api {
         let http = builder
             .build()
             .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
-        let mut client = Client::with_client(http, origin)
+        let backend = generated::MiddlewareBackend::new(std::sync::Arc::new(
+            generated::ReqwestBackend::new(http.clone()),
+        ))
+        .layer(std::sync::Arc::new(Traced));
+        let mut client = Client::with_backend(std::sync::Arc::new(backend), origin)
             .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?;
         if let Some(token) = token {
             client = client.with_credential(
@@ -266,6 +372,7 @@ impl Api {
         }
         Ok(Self {
             client,
+            http,
             base_url: base_url.to_owned(),
             epoch: 0,
         })
@@ -281,7 +388,8 @@ impl Api {
     /// A `POST` to the path `segments` names under the daemon's URL, built
     /// by hand through the generated client's own HTTP client, base URL and
     /// credential, for a request the generated client cannot send. Fails
-    /// only when the URL cannot take a path.
+    /// only when the URL cannot take a path. Send it with [`send`], so it
+    /// carries a `traceparent` and is logged.
     #[allow(
         clippy::result_large_err,
         reason = "a Failure is built once per failed request and moved straight to the UI"
@@ -298,7 +406,7 @@ impl Api {
             })?
             .pop_if_empty()
             .extend(segments);
-        let mut request = core.http().post(url);
+        let mut request = self.http.post(url);
         if let Some(generated::Credential::Bearer(token)) = core.credential("bearer") {
             request = request.bearer_auth(token.expose_secret());
         }
@@ -561,6 +669,181 @@ mod tests {
         assert!(
             request.contains("\r\nauthorization: bearer tdp_sock\r\n"),
             "{request}"
+        );
+        assert!(
+            request.contains(concat!(
+                "\r\nuser-agent: torrentctl/",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{request}"
+        );
+        assert!(request.contains("\r\ntraceparent: 00-"), "{request}");
+    }
+
+    #[test]
+    fn a_traceparent_is_w3c_version_00_sampled_and_fresh_each_time() {
+        let first = traceparent();
+        let parts: Vec<&str> = first.split('-').collect();
+        assert_eq!(parts.len(), 4, "{first}");
+        assert_eq!(parts[0], "00");
+        assert_eq!(parts[1].len(), 32);
+        assert_eq!(parts[2].len(), 16);
+        assert_eq!(parts[3], "01");
+        assert!(
+            parts[1..3].iter().all(|id| id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                && id.bytes().any(|b| b != b'0')),
+            "{first}"
+        );
+        assert_ne!(first, traceparent());
+    }
+
+    /// A log that a test reads back.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + use<> {
+            let log = self.clone();
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || log.clone())
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Answer `count` requests on a unix socket, each with `X-Request-Id:
+    /// req-<n>` and `status`, returning each request's head.
+    fn serve(
+        listener: tokio::net::UnixListener,
+        count: usize,
+        status: &'static str,
+        body: String,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        tokio::spawn(async move {
+            let mut heads = Vec::new();
+            for n in 0..count {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                let mut buf = [0_u8; 4096];
+                while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = socket.read(&mut buf).await.unwrap();
+                    assert!(read > 0, "the request head ended early");
+                    received.extend_from_slice(&buf[..read]);
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nx-request-id: \
+                     req-{n}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                heads.push(String::from_utf8_lossy(&received).to_ascii_lowercase());
+            }
+            heads
+        })
+    }
+
+    fn header<'a>(head: &'a str, name: &str) -> &'a str {
+        head.split("\r\n")
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+            .unwrap_or_else(|| panic!("no {name} in {head}"))
+    }
+
+    /// Every request carries its own `traceparent`, and its log line
+    /// records that and the daemon's `X-Request-Id`.
+    #[tokio::test]
+    async fn each_request_carries_a_fresh_traceparent_logged_with_the_daemons_request_id() {
+        let log = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let body = serde_json::to_string(&crate::testing::server(false, false)).unwrap();
+        let server = serve(listener, 2, "200 OK", body);
+
+        let api = Api::new(&format!("unix:{}", path.display()), Some("tdp_sock")).unwrap();
+        call(api.client.get_server()).await.expect("the first");
+        call(api.client.get_server()).await.expect("the second");
+        let heads = server.await.unwrap();
+
+        let sent: Vec<&str> = heads.iter().map(|h| header(h, "traceparent")).collect();
+        assert_ne!(sent[0], sent[1], "a fresh traceparent per request");
+        let text = log.text();
+        for (n, traceparent) in sent.iter().enumerate() {
+            let line = text
+                .lines()
+                .find(|l| l.contains(traceparent))
+                .unwrap_or_else(|| panic!("no log line for {traceparent}: {text}"));
+            assert!(line.contains(&format!("request_id=\"req-{n}\"")), "{line}");
+            assert!(line.contains("path=\"/v1/server\""), "{line}");
+            assert!(line.contains("status=200"), "{line}");
+            assert!(
+                !line.contains("tdp_sock"),
+                "the token is never logged: {line}"
+            );
+        }
+    }
+
+    /// A request [`Api::post`] builds is sent the same way: traced, logged,
+    /// and on the same socket and credential.
+    #[tokio::test]
+    async fn a_hand_built_post_is_traced_and_logged_too() {
+        let log = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = serve(listener, 1, "400 Bad Request", "{}".to_owned());
+
+        let api = Api::new(&format!("unix:{}", path.display()), Some("tdp_sock")).unwrap();
+        let response = send(api.post(&["v1", "torrents"]).unwrap().json(&json!({})))
+            .await
+            .expect("answered");
+        assert_eq!(response.status().as_u16(), 400);
+        let heads = server.await.unwrap();
+        let head = &heads[0];
+        assert!(head.starts_with("post /v1/torrents http/1.1\r\n"), "{head}");
+        assert_eq!(header(head, "authorization"), "bearer tdp_sock");
+        let traceparent = header(head, "traceparent");
+        let text = log.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains(traceparent))
+            .unwrap_or_else(|| panic!("no log line for {traceparent}: {text}"));
+        assert!(line.contains("request_id=\"req-0\""), "{line}");
+        assert!(line.contains("status=400"), "{line}");
+    }
+
+    /// A request that never reached the daemon is logged with its cause.
+    #[tokio::test]
+    async fn a_request_that_found_no_daemon_is_logged_with_its_cause() {
+        let log = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(log.subscriber());
+        let api = Api::new(&closed_port(), Some("tdp_valid")).unwrap();
+        call(api.client.get_status()).await.unwrap_err();
+        let text = log.text();
+        assert!(
+            text.lines().any(|l| l.contains("request failed")
+                && l.contains("traceparent=\"00-")
+                && l.contains("refused")),
+            "{text}"
         );
     }
 }
