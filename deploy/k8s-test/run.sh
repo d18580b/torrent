@@ -67,6 +67,9 @@ done
 for m in wireguard nf_tables; do
   [ -d "/sys/module/$m" ] || die "the host kernel has no $m module loaded; run: sudo modprobe -a wireguard nf_tables"
 done
+if ! reach=$(k3d cluster list 2>&1); then
+  die "k3d cannot reach a docker daemon (or podman's docker-compatible socket, through DOCKER_HOST): $reach"
+fi
 if k3d cluster get "$cluster" >/dev/null 2>&1; then
   die "a k3d cluster named $cluster already exists; delete it with: k3d cluster delete $cluster"
 fi
@@ -110,7 +113,7 @@ collect() {
 }
 cleanup() {
   local status=$?
-  if [ "$status" != 0 ] && [ -n "$created" ]; then
+  if [ "$status" != 0 ] && [ -s "$KUBECONFIG" ]; then
     collect
   fi
   if [ -n "$created" ] && [ "${K8S_TEST_KEEP:-}" != 1 ]; then
