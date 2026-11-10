@@ -12,6 +12,13 @@
 //! subcommands in [`cli`] are operator tools that run to completion instead.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// Tests spawn bare: what they spawn is the test's own scaffolding, not work a
+// request hands off. Outside tests, `clippy.toml` sends every spawn through
+// `startup::tasks`.
+#![cfg_attr(
+    test,
+    allow(clippy::disallowed_methods, reason = "test scaffolding spawns bare")
+)]
 
 // Linux-only, stated as a compile error rather than left to chance. The crate
 // already fails to build elsewhere, because `sd_notify` uses
@@ -732,7 +739,7 @@ fn main() -> anyhow::Result<()> {
     let flush_spans = move || {
         let telemetry = telemetry.clone();
         async move {
-            let flushed = tokio::task::spawn_blocking(move || {
+            let flushed = crate::startup::tasks::spawn_blocking(move || {
                 telemetry.shutdown(crate::telemetry::SHUTDOWN_FLUSH);
             })
             .await;

@@ -697,7 +697,7 @@ async fn run_with(
                 let is_wg = e.config.vpn_type() == Some(VpnType::Wireguard);
                 // The probes shell out: blocking work, off the runtime's
                 // worker threads.
-                let task = tokio::task::spawn_blocking({
+                let task = crate::startup::tasks::spawn_blocking({
                     let iface = iface.clone();
                     let probe = probe.clone();
                     let counters = counters.clone();

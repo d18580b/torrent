@@ -101,7 +101,7 @@ pub(super) async fn teardown_network<K>(
 {
     let closing: Vec<_> = engines
         .into_iter()
-        .map(|e| tokio::task::spawn_blocking(move || e.close()))
+        .map(|e| crate::startup::tasks::spawn_blocking(move || e.close()))
         .collect();
     for c in closing {
         if let Err(e) = c.await {
@@ -132,7 +132,7 @@ where
 {
     let handles: Vec<_> = jobs
         .into_iter()
-        .map(|(id, iface, job)| (id, iface, tokio::task::spawn_blocking(job)))
+        .map(|(id, iface, job)| (id, iface, crate::startup::tasks::spawn_blocking(job)))
         .collect();
     for (id, iface, handle) in handles {
         if let Err(e) = handle.await {

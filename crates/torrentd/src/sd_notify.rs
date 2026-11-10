@@ -141,7 +141,7 @@ impl TimeoutExtender {
         if std::env::var_os("NOTIFY_SOCKET").is_none() {
             return Self(None);
         }
-        Self(Some(tokio::spawn(async move {
+        Self(Some(crate::startup::tasks::spawn(async move {
             let mut seen = progress.as_ref().map(Progress::get);
             let mut until = tokio::time::Instant::now() + window;
             loop {

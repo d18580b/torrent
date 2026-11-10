@@ -1,12 +1,80 @@
-//! The daemon's long-running background tasks, supervised under `task_up`.
+//! How the daemon starts work off the current task: long-running background
+//! tasks supervised under `task_up`, transient ones, and the [`spawn`] and
+//! [`spawn_blocking`] every other hand-off goes through.
+//!
+//! Each hand-off here carries the span current where it is made, and the
+//! subscriber that span belongs to, into the work it starts: a log line from
+//! a task a request spawned is inside that request's span, with its
+//! `trace_id`, rather than starting with no context. `clippy.toml` forbids a
+//! bare `tokio::spawn` or `tokio::task::spawn_blocking`, so a new hand-off
+//! cannot skip it.
 
 use std::sync::Arc;
 
 use torrentd_engine::MetricsSink;
 use tracing::error;
 use tracing::info;
+use tracing::instrument::WithSubscriber as _;
+use tracing::Instrument as _;
 
 use crate::metrics_sink::PromSink;
+
+/// The span current where it was captured, and the subscriber current
+/// there: what a hand-off carries to the thread that runs the work.
+///
+/// The subscriber is carried as well as the span because entering a span on
+/// another thread does not make its subscriber that thread's default: an
+/// event there would go to that thread's own (the global one in the daemon,
+/// where they are the same, but not under a test's scoped subscriber).
+#[derive(Clone, Debug)]
+pub(crate) struct Carried {
+    span: tracing::Span,
+    dispatch: tracing::Dispatch,
+}
+
+impl Carried {
+    /// What is current here.
+    pub(crate) fn current() -> Self {
+        Self {
+            span: tracing::Span::current(),
+            dispatch: tracing::dispatcher::get_default(tracing::Dispatch::clone),
+        }
+    }
+
+    /// Run `f` inside the captured span, under the captured subscriber.
+    pub(crate) fn run<R>(&self, f: impl FnOnce() -> R) -> R {
+        tracing::dispatcher::with_default(&self.dispatch, || self.span.in_scope(f))
+    }
+}
+
+/// `tokio::spawn`, with the task inside the span current here and under the
+/// subscriber current here.
+pub(crate) fn spawn<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one place a task is spawned, with the current span and subscriber"
+    )]
+    tokio::spawn(fut.in_current_span().with_current_subscriber())
+}
+
+/// `tokio::task::spawn_blocking`, with `f` run inside the span current here
+/// and under the subscriber current here.
+pub(crate) fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let carried = Carried::current();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one place blocking work is spawned, with the current span and subscriber"
+    )]
+    tokio::task::spawn_blocking(move || carried.run(f))
+}
 
 /// Spawn a long-running task under `task_up{task}`: 1 from now, 0 once the
 /// task returns or panics.
@@ -28,9 +96,9 @@ where
 {
     let labels = [("task", task)];
     metrics.set_gauge("task_up", 1.0, &labels);
-    let handle = tokio::spawn(fut);
+    let handle = spawn(fut);
     let abort = handle.abort_handle();
-    tokio::spawn(async move {
+    spawn(async move {
         match handle.await {
             Ok(()) => info!(task, "background task exited"),
             Err(e) if e.is_cancelled() => info!(task, "background task stopped"),
@@ -65,7 +133,7 @@ where
 {
     use futures_util::FutureExt as _;
 
-    tokio::spawn(async move {
+    spawn(async move {
         match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
             Ok(out) => out,
             Err(panic) => {
@@ -85,15 +153,16 @@ mod tests {
     use crate::metrics_sink::tests::daemon_sources;
     use crate::metrics_sink::tests::literal;
 
-    /// Every `tokio::spawn` in the daemon's source outside the supervisor,
-    /// by file, with why it is not a long-lived task: each ends on its own,
-    /// or is awaited or aborted by what started it. A long-lived task goes
-    /// through `spawn_supervised` instead, and is in `TASKS`.
+    /// Every task spawned in the daemon's source outside the supervisor
+    /// (`tasks::spawn`, or the `tokio::spawn` it wraps), by file, with why it
+    /// is not a long-lived task: each ends on its own, or is awaited or
+    /// aborted by what started it. A long-lived task goes through
+    /// `spawn_supervised` instead, and is in `TASKS`.
     const UNSUPERVISED: &[(&str, usize, &str)] = &[
         (
             "startup/tasks.rs",
-            3,
-            "the supervisor: a supervised task and its watcher, and a transient task",
+            1,
+            "`spawn` itself, which the supervisor and every other task goes through",
         ),
         (
             "sd_notify.rs",
@@ -120,13 +189,14 @@ mod tests {
     /// Every task the daemon spawns is either supervised, under a name in
     /// `TASKS`, or listed in `UNSUPERVISED` with why it ends on its own; and
     /// every `TASKS` entry is a task the source still supervises. A new
-    /// `tokio::spawn` fails this until it is one or the other.
+    /// `tasks::spawn` fails this until it is one or the other.
     #[test]
     fn every_long_lived_task_is_supervised() {
         let mut spawns: BTreeMap<String, usize> = BTreeMap::new();
         let mut supervised = BTreeSet::new();
         for (file, _, text) in daemon_sources() {
             let n = text.matches("tokio::spawn(").count()
+                + text.matches("tasks::spawn(").count()
                 + text.matches("Handle::current().spawn(").count();
             if n > 0 {
                 spawns.insert(file.clone(), n);

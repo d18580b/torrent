@@ -374,27 +374,30 @@ where
             // does not come up on it.
             let vpn = cleanup.manager_for(vpn_type);
             let read_iface = iface.to_string();
-            let v6 = match tokio::task::spawn_blocking(move || vpn.global_ipv6(&read_iface)).await {
-                Ok(Ok(v6)) => v6,
-                Ok(Err(e)) => {
-                    error!(
-                        profile_id = %p.id,
-                        vpn_iface = %iface,
-                        error.cause = %e,
-                        "could not read the tunnel's IPv6 addresses, so could not check that \
-                         no other profile's tunnel has one; profile disabled",
-                    );
-                    tear_down_or_warn!(iface);
-                    fail_profile!(format!(
-                        "could not read tunnel {iface}'s IPv6 addresses to check none is \
+            let v6 =
+                match crate::startup::tasks::spawn_blocking(move || vpn.global_ipv6(&read_iface))
+                    .await
+                {
+                    Ok(Ok(v6)) => v6,
+                    Ok(Err(e)) => {
+                        error!(
+                            profile_id = %p.id,
+                            vpn_iface = %iface,
+                            error.cause = %e,
+                            "could not read the tunnel's IPv6 addresses, so could not check that \
+                             no other profile's tunnel has one; profile disabled",
+                        );
+                        tear_down_or_warn!(iface);
+                        fail_profile!(format!(
+                            "could not read tunnel {iface}'s IPv6 addresses to check none is \
                          another profile's: {e}"
-                    ));
-                }
-                Err(e) => {
-                    tear_down_or_warn!(iface);
-                    profile_task_failed!("VPN IPv6 address read", e)
-                }
-            };
+                        ));
+                    }
+                    Err(e) => {
+                        tear_down_or_warn!(iface);
+                        profile_task_failed!("VPN IPv6 address read", e)
+                    }
+                };
             if let Some((addr, owner)) = v6
                 .iter()
                 .find_map(|a| held.tunnels.get(&IpAddr::V6(*a)).map(|o| (a, o)))

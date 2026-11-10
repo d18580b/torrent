@@ -325,7 +325,7 @@ impl EventFeed {
         let (tx, rx) = tokio::sync::watch::channel(with_heartbeat(last, s));
         let tx = Arc::new(tx);
         *feed = Some(Arc::clone(&tx));
-        tokio::spawn(Self::run(Arc::clone(s), tx));
+        crate::startup::tasks::spawn(Self::run(Arc::clone(s), tx));
         rx
     }
 
@@ -557,7 +557,7 @@ impl StateRead {
         if self.pending.is_none() {
             let s = Arc::clone(s);
             self.pending = Some((
-                tokio::task::spawn_blocking(move || state_fingerprint(&s)),
+                crate::startup::tasks::spawn_blocking(move || state_fingerprint(&s)),
                 std::time::Instant::now(),
             ));
         }

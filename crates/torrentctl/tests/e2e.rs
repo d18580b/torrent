@@ -12,6 +12,11 @@
 //! rendered screen. Every test daemon gets its own HTTP and peer ports,
 //! since the tests run in parallel.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: no request span to carry"
+)]
+
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
