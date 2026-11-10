@@ -47,6 +47,60 @@ tests:
           path: stringData["torrentd.toml"]
           pattern: (?m)^default_save_path = "/data/torrents"$
 
+  - it: turns config_watch on by default
+    values: [values/host-only.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^config_watch = true$
+
+  - it: keeps config_watch as given
+    values: [values/host-only.yaml]
+    set:
+      config.settings.config_watch: false
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^config_watch = false$
+
+  - it: writes no [telemetry] without an endpoint
+    values: [values/host-only.yaml]
+    asserts:
+      - notMatchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]$
+
+  - it: writes telemetry.otlpEndpoint into [telemetry]
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: http://alloy.monitoring:4318
+      config.settings.telemetry:
+        protocol: http/protobuf
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]\n(?:[ \t]+[a-z_]+ = .*\n)*[ \t]+otlp_endpoint = "http://alloy\.monitoring:4318"$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]\n(?:[ \t]+[a-z_]+ = .*\n)*[ \t]+protocol = "http/protobuf"$
+
+  - it: refuses an OTLP endpoint set in both places
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: http://alloy.monitoring:4318
+      config.settings.telemetry:
+        otlp_endpoint: http://tempo.monitoring:4317
+    asserts:
+      - failedTemplate:
+          errorPattern: both set; set one
+
+  - it: refuses an OTLP endpoint that is not an http(s) URL
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: alloy.monitoring:4317
+    asserts:
+      - failedTemplate: {}
+
   - it: keeps trusted_proxies as given, even empty
     values: [values/host-only.yaml]
     set:

@@ -85,6 +85,16 @@ a reason the chart can see.
 {{- if not (hasKey $s "resume_dir") -}}{{- $_ := set $s "resume_dir" "/var/lib/torrentd/resume" -}}{{- end -}}
 {{- if not (hasKey $s "torrent_dir") -}}{{- $_ := set $s "torrent_dir" "/var/lib/torrentd/torrents" -}}{{- end -}}
 {{- if not (hasKey $s "trusted_proxies") -}}{{- $_ := set $s "trusted_proxies" (list .Values.cluster.podCIDR) -}}{{- end -}}
+{{- /* The Secret is mounted as a directory, so kubelet's ..data swap reaches the watch. */ -}}
+{{- if not (hasKey $s "config_watch") -}}{{- $_ := set $s "config_watch" true -}}{{- end -}}
+{{- with .Values.telemetry.otlpEndpoint -}}
+{{- $t := $s.telemetry | default dict -}}
+{{- if hasKey $t "otlp_endpoint" -}}
+{{- fail "config.settings.telemetry.otlp_endpoint and telemetry.otlpEndpoint are both set; set one" -}}
+{{- end -}}
+{{- $_ := set $t "otlp_endpoint" . -}}
+{{- $_ := set $s "telemetry" $t -}}
+{{- end -}}
 {{- if $s.network_kill_switch -}}
 {{- if not (hasKey $s "kill_switch_api_interfaces") -}}{{- $_ := set $s "kill_switch_api_interfaces" (list "eth0") -}}{{- end -}}
 {{- if not (hasKey $s "kill_switch_dns_servers") -}}{{- $_ := set $s "kill_switch_dns_servers" (list .Values.cluster.dnsIP) -}}{{- end -}}

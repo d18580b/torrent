@@ -53,6 +53,17 @@
       "required": ["port"],
       "properties": { "port": { "$ref": "#/definitions/port" } }
     },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "otlpEndpoint": {
+          "description": "Written as [telemetry] otlp_endpoint; empty writes none.",
+          "type": "string",
+          "pattern": "^$|^https?://"
+        }
+      }
+    },
     "config": {
       "type": "object",
       "additionalProperties": false,
@@ -81,7 +92,9 @@
             "kill_switch_api_interfaces": { "type": "array", "items": { "type": "string" } },
             "kill_switch_dns_servers": { "type": "array", "items": { "type": "string" } },
             "auth": { "type": "object" },
-            "allow_unauthenticated": { "type": "boolean" }
+            "allow_unauthenticated": { "type": "boolean" },
+            "config_watch": { "type": "boolean" },
+            "telemetry": { "type": "object" }
           }
         }
       }
