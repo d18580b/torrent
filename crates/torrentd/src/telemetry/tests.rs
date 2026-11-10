@@ -409,6 +409,44 @@ fn what_cannot_be_exported_with_is_refused() {
 }
 
 #[test]
+fn an_endpoint_that_does_not_parse_is_refused_and_redacted() {
+    let refusal = |cfg: &TelemetryConfig, vars: &[(&str, &str)]| {
+        format!(
+            "{:#}",
+            Export::resolve(cfg, env(vars)).expect_err("refused")
+        )
+    };
+    for bad in ["http://bad host", "http://", "https://[::1:4318/"] {
+        let in_config = TelemetryConfig {
+            otlp_endpoint: Some(bad.to_owned()),
+            ..cfg()
+        };
+        let err = refusal(&in_config, &[]);
+        assert!(
+            err.contains("otlp_endpoint") && err.contains("not a valid URL"),
+            "{err}"
+        );
+        let err = refusal(&cfg(), &[(ENV_ENDPOINT, bad)]);
+        assert!(
+            err.contains(ENV_ENDPOINT) && err.contains("not a valid URL"),
+            "{err}"
+        );
+        let err = refusal(&cfg(), &[(ENV_TRACES_ENDPOINT, bad)]);
+        assert!(
+            err.contains(ENV_TRACES_ENDPOINT) && err.contains("not a valid URL"),
+            "{err}"
+        );
+    }
+    let leaky = TelemetryConfig {
+        otlp_endpoint: Some(format!("https://user:{PASSKEY}@bad host/")),
+        ..cfg()
+    };
+    let err = refusal(&leaky, &[]);
+    assert!(err.contains("not a valid URL"), "{err}");
+    assert!(!err.contains(PASSKEY), "{err}");
+}
+
+#[test]
 fn a_headers_file_is_read_and_never_echoed() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("otlp-headers");
