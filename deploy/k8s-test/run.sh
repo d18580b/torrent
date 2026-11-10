@@ -20,14 +20,17 @@
 # ~/.kube/config. On a failure every pod's description, logs and events are
 # written to $K8S_TEST_ARTIFACTS (default target/k8s-test) and printed.
 #
-# Three releases in the torrentd-e2e namespace: `seed` and `leech`, each a
-# `host` profile (values/host.yaml), and `vpn`, a WireGuard profile behind
-# the kill switch (values/vpn.yaml) whose peer is the wg-peer pod. Fails when:
+# Two releases in the torrentd-e2e namespace: `seed`, a `host` profile
+# (values/host.yaml), and `vpn`, a WireGuard profile behind the kill switch
+# (values/vpn.yaml) whose peer is the wg-peer pod. The test peer `seed` seeds
+# to is leech.py, run here and reaching seed's peer port through `kubectl
+# port-forward`: torrentd never downloads, so it cannot be one. Fails when:
 #   - a torrentd pod's startup probe never passes, it is not Ready, it has
 #     restarted, or its liveness or readiness probe has failed;
 #   - a scrape of /metrics from the monitoring namespace with the metrics
 #     token fails, or one without it is not refused 401;
-#   - the fixture torrent, seeded by `seed`, does not download to `leech`;
+#   - the fixture torrent, seeded by `seed`, does not download to leech.py
+#     with every piece's hash intact, or seed does not count the upload;
 #   - the vpn profile's announce to a tracker only the cluster resolver can
 #     name does not resolve through the DNS carve-out and reach the peer
 #     through the tunnel;
@@ -87,6 +90,7 @@ fi
 
 tmp=$(mktemp -d)
 created=""
+forwarder=""
 export KUBECONFIG=$tmp/kubeconfig
 rm -rf "$artifacts"
 mkdir -p "$artifacts"
@@ -113,6 +117,9 @@ collect() {
 }
 cleanup() {
   local status=$?
+  if [ -n "$forwarder" ]; then
+    kill "$forwarder" 2>/dev/null || true
+  fi
   if [ "$status" != 0 ] && [ -s "$KUBECONFIG" ]; then
     collect
   fi
@@ -295,14 +302,13 @@ install() {
     --set image.repository="$repository" --set image.tag="$tag" --set image.pullPolicy=Never \
     --set-json "payloadVolumes=[{\"name\":\"torrents\",\"mountPath\":\"/data/torrents\",\"existingClaim\":\"torrents-$release\"}]"
 }
-step "install the seed, leech and vpn releases"
+step "install the seed and vpn releases"
 install seed host
-install leech host
 install vpn vpn
-for release in seed leech vpn; do
+for release in seed vpn; do
   k rollout status "statefulset/$release-torrentd" --timeout=300s
 done
-for release in seed leech vpn; do
+for release in seed vpn; do
   check_probes "$release-torrentd-0"
 done
 
@@ -311,7 +317,7 @@ ready=$(k exec vpn-torrentd-0 -c torrentd -- curl -sS --max-time 10 http://127.0
 [ "$(json kill_switch_dns_exempt <<<"$ready")" = true ] || die "the DNS carve-out is not in force: $ready"
 
 # ---- seeding --------------------------------------------------------------
-step "seed the fixture from seed to leech"
+step "seed the fixture from seed to leech.py"
 read -r infohash size < <(python3 -I "$here/fixture.py" "$tmp/fixture")
 k exec -i seed-torrentd-0 -c torrentd -- sh -c 'cat > /data/torrents/k8s-e2e.bin' <"$tmp/fixture/k8s-e2e.bin"
 python3 -I -c '
@@ -330,14 +336,25 @@ is_seeding() {
 }
 poll 120 "seed to check the fixture and seed it" is_seeding seed-torrentd-0
 
-seed_ip=$(k get pod seed-torrentd-0 -o jsonpath='{.status.podIP}')
-printf '{"profile_id":"public","source":{"kind":"magnet","uri":"magnet:?xt=urn:btih:%s&x.pe=%s:6881"}}' \
-  "$infohash" "$seed_ip" >"$tmp/add-leech.json"
-resp=$(api "$write_token" leech-torrentd-0 POST /v1/torrents --data-binary @- <"$tmp/add-leech.json")
-[ "${resp##*$'\n'}" = 201 ] || die "leech refused the magnet: $resp"
-poll 180 "leech to download the fixture from seed" is_seeding leech-torrentd-0
+# seed's peer port on a local port the API server picks; the forward reaches
+# it on the pod's loopback, where the profile's 0.0.0.0 listen also answers.
+kubectl -n "$ns" port-forward pod/seed-torrentd-0 :6881 >"$tmp/port-forward.log" 2>&1 &
+forwarder=$!
+forwarded() {
+  last_seen=$(cat "$tmp/port-forward.log")
+  peer_port=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 6881$/\1/p' <<<"$last_seen")
+  [ -n "$peer_port" ]
+}
+poll 30 "kubectl port-forward to seed's peer port" forwarded
+leeched=$(python3 -I "$here/leech.py" 127.0.0.1 "$peer_port" "$tmp/fixture/k8s-e2e.torrent" "$tmp/leeched.bin" 2>&1) ||
+  die "leech.py did not download the fixture from seed: $leeched"
+echo "$leeched"
+cmp -s "$tmp/leeched.bin" "$tmp/fixture/k8s-e2e.bin" || die "leech.py's download differs from the fixture"
+kill "$forwarder" 2>/dev/null || true
+wait "$forwarder" 2>/dev/null || true
+forwarder=""
 # The daemon serves torrent status from a cache refreshed every 2 s, so
-# seed's counter can trail leech's completion: poll it rather than read it once.
+# seed's counter can trail the download: poll it rather than read it once.
 has_uploaded() {
   local t
   t=$(get seed-torrentd-0 "/v1/torrents/$infohash") || return 1
@@ -346,7 +363,7 @@ has_uploaded() {
   [ "${uploaded:-0}" -ge "$size" ]
 }
 poll 30 "seed to report uploading the fixture's $size bytes" has_uploaded
-echo "seeded: $infohash, $uploaded bytes from seed to leech"
+echo "seeded: $infohash, $uploaded bytes from seed to leech.py"
 
 # ---- the metrics scrape ---------------------------------------------------
 scrape() {
@@ -495,7 +512,7 @@ restart vpn
 ready=$(k exec vpn-torrentd-0 -c torrentd -- curl -sS --max-time 10 http://127.0.0.1:8080/readyz)
 [ "$(json profiles_failed <<<"$ready")" = 0 ] || die "the vpn profile failed after the restart: $ready"
 
-for release in seed leech vpn; do
+for release in seed vpn; do
   check_probes "$release-torrentd-0"
 done
 echo "test-k8s: the chart installs on k3s and the daemon passes every check"

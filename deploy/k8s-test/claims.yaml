@@ -15,16 +15,6 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: torrents-leech
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 256Mi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
   name: torrents-vpn
 spec:
   accessModes: [ReadWriteOnce]
