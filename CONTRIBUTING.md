@@ -184,12 +184,14 @@ Every test command is a mise task, and CI runs the same tasks:
 | `mise run test-torrentctl` | Layer 3, torrentctl's generated client against a spawned daemon (builds `torrentd` first) |
 | `mise run test-netns` | the VPN in a real kernel: the kill switch's nft rules, WireGuard's live links, the listen device, and the daemon end to end over a real tunnel, each in a private network namespace. Needs unprivileged user namespaces, `nft`, `wg`, `ip`, `unshare` and `nsenter` (util-linux 2.38 or later, for `unshare --map-user`), an `/etc/wireguard` directory (`wireguard-tools` ships one), and the `wireguard`, `nf_tables` and `veth` modules loaded. |
 | `mise run test-alerts` | `promtool` checks `deploy/prometheus`'s alert rules and runs their fixtures. Needs podman or docker. |
-| `mise run test-all` | every row above except `deny` and `release-features`, in order, so it needs what `test-shim`, `test-netns` and `test-alerts` need |
+| `mise run test-k8s [image] [archive]` | the Helm chart installed on k3s, in a k3d cluster of its own that it deletes on exit: a `host` release seeding a fixture torrent to a second one, and a `vpn` release behind the kill switch whose WireGuard peer is another pod. Checks the probes, a metrics scrape with the metrics token, the seeding, tracker DNS through the carve-out, that nothing leaves the vpn pod outside the tunnel but the carve-outs, a clean `kubectl delete pod` restart, and a config Secret reloaded without one; [`deploy/k8s-test/run.sh`](./deploy/k8s-test/run.sh) lists each failure. Installs the image `mise run container` builds (`localhost/torrentd:dev`). Needs docker (or podman's docker-compatible socket, through `DOCKER_HOST`) for k3d, `python3`, and the `wireguard` and `nf_tables` modules loaded. A failure writes every pod's logs, description and events to `target/k8s-test`; `K8S_TEST_KEEP=1` leaves the cluster up. |
+| `mise run test-all` | every row above except `deny`, `release-features` and `test-k8s`, in order, so it needs what `test-shim`, `test-netns` and `test-alerts` need |
 | `mise run bench -- <subcommand>` | Layer 4: alert throughput, memory per torrent, startup time, and the pool's scan, match and adopt preview over a synthetic pool. Each subcommand exits non-zero on a breach of [`crates/torrentd-bench/budgets.toml`](./crates/torrentd-bench/budgets.toml), or where the work it timed failed. CI's `bench` job runs the pool at `--size ci`; the default, `--size full` (a million files, 5,000 torrents), takes minutes and is where the README's figures come from. A budget may only tighten: raising one needs the measured run that shows why. |
 
 Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast.
 Layer 2 runs as its own CI job; the three Layer 3 suites share one, and
-`test-netns` (the `vpn-netns` job) and `test-alerts` each have their own.
+`test-netns` (the `vpn-netns` job), `test-alerts` and `test-k8s` (the `k8s`
+job, on the image the `container` job built) each have their own.
 
 ### Mutation testing
 
