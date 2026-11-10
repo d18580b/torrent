@@ -1,0 +1,33 @@
+# The payload volume of each release run.sh installs: the image's root is
+# read-only, so default_save_path (/data/torrents) has to be on a claim. k3s's
+# local-path provisioner creates each directory world-writable, which the
+# daemon's uid 1000 needs, and binds it once the pod is scheduled.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: torrents-seed
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: torrents-leech
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: torrents-vpn
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 256Mi

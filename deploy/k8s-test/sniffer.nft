@@ -1,0 +1,42 @@
+# The egress sniffer run.sh installs in the vpn pod's network namespace, from
+# an ephemeral container: counters on every packet that leaves by eth0, the
+# pod's one link to the cluster, after the kill switch's output hook has had
+# its say. run.sh passes the two addresses with `nft -D`:
+#
+#   peer  the WireGuard peer pod's address, the tunnel's endpoint
+#   dns   the cluster DNS Service's address, kill_switch_dns_servers
+#
+# What the kill switch lets out by eth0, each counted by name:
+#
+#   wg_transport  the tunnel's own UDP to its endpoint
+#   api_reply     the API's replies (kill_switch_api_interfaces), which carry
+#                 the kubelet's probes and the metrics scrape
+#   dns_query     lookups to the cluster resolver (kill_switch_dns_servers)
+#
+# Anything else the daemon's uid (1000) sends by eth0 is a leak: it counts in
+# daemon_leak, and its destination lands in leak4 or leak6 for the report.
+# Everything else leaving by eth0 that no socket of that uid sent counts in
+# `other`, which run.sh prints and does not judge: the kernel's own replies
+# and neighbour discovery name only the pod.
+table inet k8s_e2e_sniff {
+  counter wg_transport {}
+  counter api_reply {}
+  counter dns_query {}
+  counter daemon_leak {}
+  counter other {}
+  set leak4 { type ipv4_addr; flags dynamic; }
+  set leak6 { type ipv6_addr; flags dynamic; }
+  chain egress {
+    # After every other postrouting hook, so it sees what actually leaves.
+    type filter hook postrouting priority 500; policy accept;
+    oifname != "eth0" accept
+    ip daddr $peer udp dport 51820 counter name wg_transport accept
+    tcp sport 8080 counter name api_reply accept
+    ip daddr $dns meta l4proto { tcp, udp } th dport 53 counter name dns_query accept
+    meta skuid 1000 meta nfproto ipv4 add @leak4 { ip daddr }
+    meta skuid 1000 meta nfproto ipv6 add @leak6 { ip6 daddr }
+    meta skuid 1000 counter name daemon_leak accept
+    meta nfproto ipv6 meta l4proto ipv6-icmp accept
+    counter name other accept
+  }
+}

@@ -1,0 +1,37 @@
+# The cluster deploy/k8s-test/run.sh installs the chart into: one k3s server
+# in a container on the host's docker (or podman's docker-compatible socket).
+#
+# The k3s image is pinned by the digest of its multi-arch index, so every run
+# boots the same Kubernetes. Move it with
+#   skopeo inspect --raw docker://docker.io/rancher/k3s:TAG | sha256sum
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: torrentd-e2e
+servers: 1
+agents: 0
+image: docker.io/rancher/k3s:v1.37.2-k3s1@sha256:21ea6e0fac4e3930c2ce8aa40ddd41a8b18cb3e9a0222c030dc005e7e88c4332
+options:
+  k3d:
+    wait: true
+    timeout: 300s
+    # Nothing is reached from outside the cluster: every check runs in a pod
+    # or through `kubectl exec`.
+    disableLoadbalancer: true
+  k3s:
+    extraArgs:
+      # Neither an ingress controller nor a LoadBalancer is under test, and
+      # the run reads no resource metrics. local-path stays: the chart's
+      # state volume and the payload claims are its.
+      - arg: --disable=traefik,servicelb,metrics-server
+        nodeFilters: [server:*]
+      # The chart's rpFilterLoose sets net.ipv4.conf.all.rp_filter = 2 on the
+      # vpn pod, which Kubernetes counts an unsafe sysctl: without this the
+      # kubelet refuses the pod (deploy/helm/torrentd/values.yaml).
+      - arg: --kubelet-arg=allowed-unsafe-sysctls=net.ipv4.conf.all.rp_filter
+        nodeFilters: [server:*]
+  # run.sh writes the cluster's kubeconfig to a file of its own; the user's
+  # ~/.kube/config is never touched.
+  kubeconfig:
+    updateDefaultKubeconfig: false
+    switchCurrentContext: false

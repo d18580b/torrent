@@ -1,0 +1,40 @@
+# What the chart's ServiceMonitor asks Prometheus to do, done once by a pod in
+# the `monitoring` namespace (networkPolicy.prometheusNamespaces' default):
+# GET /metrics on the release's API Service, port `http`, with the metrics
+# token from a Secret. The cluster has no Prometheus Operator, so this is the
+# scrape without the operator. run.sh applies it with @RELEASE@, @NAMESPACE@
+# and @IMAGE@ replaced; the image under test carries the curl this runs.
+#
+# It prints the status an unauthenticated scrape gets, then the authenticated
+# scrape's body, and fails where the authenticated scrape fails.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scrape-@RELEASE@
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  containers:
+    - name: scrape
+      image: "@IMAGE@"
+      imagePullPolicy: Never
+      command: [/bin/bash, -c]
+      args:
+        - |
+          set -euo pipefail
+          url=http://@RELEASE@-torrentd.@NAMESPACE@.svc:8080/metrics
+          printf 'unauthenticated %s\n' "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url")"
+          curl -fsS --max-time 10 -H "Authorization: Bearer $TOKEN" "$url"
+      env:
+        - name: TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: torrentd-metrics-token
+              key: token
+      securityContext:
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
