@@ -70,6 +70,21 @@ groups:
         annotations:
           summary: "A torrentd thread ({{ $labels.thread }}) panicked; read the panic line in its log"
 
+      - alert: TorrentdFfiErrors
+        # The libtorrent shim caught a C++ exception in a call that returns
+        # nothing (posting torrent updates or session stats, destroying a
+        # session), so the call did not do what it was asked and nothing
+        # else reports it. The WARN line (target torrentd::metrics) carries
+        # the exception's message. One caught during the boot is in the
+        # first sample, so the boot gauge carries it.
+        expr: >
+          increase(torrentd_ffi_errors_total[15m]) > 0
+          or torrentd_boot_ffi_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "libtorrent threw in {{ $labels.call }} and the shim swallowed it; read the WARN line naming the exception"
+
       - alert: TorrentdMetricsDropped
         expr: >
           increase(torrentd_metrics_dropped_samples_total[15m]) > 0

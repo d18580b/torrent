@@ -213,9 +213,25 @@ inline int buffer_len(std::size_t len) {
         return (fail_ret);                                                 \
     }
 
+namespace lt_shim {
+
+// Count an exception the void entry point `call` (an LT_FFI_CALL_* value)
+// caught, and keep its what() for lt_ffi_last_error. Never throws: it runs
+// inside a catch block. Defined in shim_alerts.cpp.
+void record_swallowed(int call, const char* what) noexcept;
+
+}  // namespace lt_shim
+
+// A void entry point has no err_out and no failure return, so what it catches
+// cannot reach its caller: it is counted per call instead (lt_ffi_errors),
+// which the daemon exports as ffi_errors_total{call} and logs.
 #define LT_SHIM_TRY_VOID  try {
-#define LT_SHIM_CATCH_VOID                                                  \
-    } catch (...) { /* void return: swallow */ }
+#define LT_SHIM_CATCH_VOID(call)                                            \
+    } catch (const std::exception& __e) {                                  \
+        lt_shim::record_swallowed((call), __e.what());                     \
+    } catch (...) {                                                        \
+        lt_shim::record_swallowed((call), "unknown C++ exception");        \
+    }
 
 namespace lt_shim {
 

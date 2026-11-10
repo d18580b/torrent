@@ -439,7 +439,20 @@ impl PoolService {
         }
         let stale = self.with_store(|st| {
             let mut out: Vec<(String, String, String)> = Vec::new();
-            for t in st.torrents().unwrap_or_default() {
+            let torrents = st.torrents().unwrap_or_else(|e| {
+                // Logged at WARN, which `log_events_total` counts under
+                // this target; there is no read-error series to add to.
+                warn!(
+                    target: "torrentd::startup",
+                    op = "reconcile_owners_at_boot",
+                    error.cause = %e,
+                    "could not read the pool index to check its owners against the \
+                     assignment registry; pool_index_profile_disagreements reads 0 \
+                     unchecked until the next start",
+                );
+                Vec::new()
+            });
+            for t in torrents {
                 let Some(indexed) = t.profile.as_deref() else {
                     continue;
                 };
