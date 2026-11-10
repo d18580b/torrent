@@ -106,6 +106,7 @@ fn record(step: impl FnOnce() -> Step) {
     #[cfg(test)]
     STEPS.lock().unwrap().push(step());
     #[cfg(not(test))]
+    // ignore-result: a closure, not a result; outside tests it goes unused.
     let _ = step;
 }
 
@@ -499,6 +500,9 @@ fn run_batch(shared: &Shared) {
         match r {
             Ok(()) => written.push((path, q)),
             Err(e) => {
+                // ignore-result: the write's own error is reported below; a
+                // temp file left behind is never read, and the path's next
+                // write truncates it.
                 let _ = fs::remove_file(tmp_for(path));
                 report(q, path, &e);
             }
@@ -550,6 +554,8 @@ fn run_batch(shared: &Shared) {
                 .get(path)
                 .is_some_and(|now| now.generation == q.generation);
             if !current {
+                // ignore-result: a temp file left behind is never read, and
+                // the path's next write truncates it.
                 let _ = fs::remove_file(tmp_for(path));
                 continue;
             }
@@ -560,6 +566,9 @@ fn run_batch(shared: &Shared) {
             }
         };
         if let Err(e) = r {
+            // ignore-result: the rename's own error is reported below; a
+            // temp file left behind is never read, and the path's next write
+            // truncates it.
             let _ = fs::remove_file(tmp_for(path));
             report(q, path, &e);
         }

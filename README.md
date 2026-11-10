@@ -560,8 +560,8 @@ With no subcommand, `torrentd` runs the daemon.
 Every command below lives in [`mise.toml`](mise.toml), and
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs each check as
 that task rather than a second copy of the command; besides each job's setup,
-it spells out nothing for itself. So do the field-name grep
-(`mise run lint-tracing`), the source file-length gate
+it spells out nothing for itself. So do the field-name grep and the
+unannotated-`let _ =` check (`mise run lint-tracing`), the source file-length gate
 (`mise run size-check`), the container image build (`mise run container`),
 the release-build feature check that `fault-injection` and `test-support`
 resolve off (`mise run release-features`), the check that systemd accepts

@@ -435,7 +435,9 @@ impl EarlyErrorKind {
 pub fn early_error(kind: EarlyErrorKind, message: &str) {
     let line = early_line(kind, message);
     let mut out = std::io::stdout().lock();
+    // ignore-result: there is nowhere left to report it (see above).
     let _ = writeln!(out, "{line}");
+    // ignore-result: as above.
     let _ = out.flush();
 }
 
@@ -444,7 +446,8 @@ fn early_line(kind: EarlyErrorKind, message: &str) -> String {
     use tracing_subscriber::fmt::time::FormatTime as _;
 
     let mut timestamp = String::new();
-    // `ChronoUtc` only fails where its writer does, and a `String` does not.
+    // ignore-result: `ChronoUtc` only fails where its writer does, and a
+    // `String` does not.
     let _ = ChronoUtc::rfc_3339().format_time(&mut Writer::new(&mut timestamp));
     let json = |s: &str| serde_json::Value::from(s).to_string();
     // Built by hand rather than from a `serde_json::Map`, which sorts its keys

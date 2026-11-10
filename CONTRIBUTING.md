@@ -228,6 +228,15 @@ trust it — is in [`docs/running.md`](docs/running.md).
 The pre-commit hook applies both automatically to staged changes. Do not commit code with
 `unwrap()` outside tests — return a `Result` or expect-with-context.
 
+- `mise run lint-tracing` — log field names, and discarded values
+
+A `let _ =` outside test code drops whatever it binds, and a dropped `Result` drops its error
+without a trace. Handle the value, or say why discarding it is right with
+`// ignore-result: <reason>` at the end of that line or in the comment lines directly above
+it; the task fails on a `let _ =` with neither. Test code is exempt: files under `tests/`,
+files named `tests.rs`, and items gated by `#[cfg(test)]`.
+[`scripts/lint-let-underscore`](./scripts/lint-let-underscore) holds the rules.
+
 - `mise run size-check` — file length
 
 No tracked source file (`.rs`, `.c`, `.cc`, `.cpp`, `.h`, `.hpp`, `.py`, `.sh`) may exceed

@@ -1043,6 +1043,8 @@ pub async fn boot(
     .on_fatal({
         let tx = shutdown_tx.clone();
         Arc::new(move |reason| {
+            // ignore-result: no receiver means the daemon is already
+            // stopping.
             let _ = tx.send(reason);
         }) as torrentd_engine::FatalCallback
     })

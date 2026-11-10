@@ -108,6 +108,8 @@ impl NoEcho {
 impl Drop for NoEcho {
     fn drop(&mut self) {
         if std::mem::take(&mut self.active) {
+            // ignore-result: a drop cannot report, and a terminal that
+            // refuses `stty echo` is gone or no longer ours.
             let _ = std::process::Command::new("stty")
                 .arg("echo")
                 .stdin(std::process::Stdio::inherit())

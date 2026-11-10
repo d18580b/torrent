@@ -1017,6 +1017,8 @@ impl PromSink {
     /// Export `name`'s histogram for `labels` with no observation in it, so
     /// the series exists, at a count of 0, before its first event.
     pub fn seed_histogram(&self, name: &str, labels: &[(&str, &str)]) {
+        // ignore-result: registering is the point; a failure is already
+        // warned and counted inside.
         let _ = self.histogram(name, labels);
     }
 

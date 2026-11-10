@@ -308,6 +308,8 @@ impl PortForwarder for NatpmpForwarder {
                         tcp_port,
                         "NAT-PMP gateway assigned divergent UDP/TCP ports; releasing the UDP mapping and binding TCP",
                     );
+                    // ignore-result: tidying only; a mapping the delete
+                    // misses lapses when its lease ends.
                     let _ = self.delete_one(&sock, OP_MAP_UDP, req.gateway);
                 } else {
                     warn!(

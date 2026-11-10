@@ -195,7 +195,7 @@ Alerts on them:
 
 | Alert | Severity | Fires when |
 | --- | --- | --- |
-| `TorrentdHttp5xx` | warning | More than 5% of the API's responses over 10 minutes, and at least 3, were 5xx, held for 5 minutes. `/healthz` (its 503 is `TorrentdUnready`'s) and `/metrics` are left out. |
+| `TorrentdHttp5xx` | warning | More than 5% of the API's responses over 10 minutes, and at least 3, were 5xx, held for 5 minutes. The probes `/readyz` and its alias `/healthz` (their 503 is `TorrentdUnready`'s) and `/livez` (its 503 is the probe's restart to act on), and `/metrics`, are left out. |
 | `TorrentdHttpSlow` | warning | A route's 99th-percentile time to the response head over 15 minutes stayed above 5s for 15 minutes. |
 | `TorrentdAuthRejections` | warning | Bearer tokens of one `reason` were refused in every 5-minute window for 15 minutes: a client — usually a scraper whose token was rotated — keeps presenting one that does not work. |
 

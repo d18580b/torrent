@@ -259,7 +259,9 @@ async fn run_with(
         ));
     }
 
+    // ignore-result: a reason, a lag and a closed sender all mean shut down.
     let _ = shutdown.recv().await;
+    // ignore-result: no receiver left means no task left to stop.
     let _ = stop_tx.send(true);
     while let Some(joined) = tasks.join_next().await {
         if let Err(err) = joined {
