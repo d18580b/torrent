@@ -46,7 +46,7 @@ which torrents point at data that moved or vanished.
 - [ ] **Sequential streaming, RSS, torrent creation, auto-discovery,
       multi-instance coordination.** Not planned. You tell it what to load.
 
-Linux x86-64 only.
+Linux on x86-64 and arm64 (aarch64).
 
 ## Install
 
@@ -55,19 +55,24 @@ Each [release](https://github.com/d18580b/torrent/releases) carries:
 | Asset | What it is |
 | --- | --- |
 | `torrent-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `torrentd` and `torrentctl`, the sample configs, the systemd unit, `LICENSE`, this README and `CHANGELOG.md` |
+| `torrent-X.Y.Z-aarch64-unknown-linux-gnu.tar.gz` | the same, for arm64 |
 | `torrentctl-X.Y.Z-x86_64-unknown-linux-musl.tar.gz` | a static `torrentctl`, for any x86_64 Linux, e.g. an operator's laptop |
+| `torrentctl-X.Y.Z-aarch64-unknown-linux-musl.tar.gz` | a static `torrentctl`, for any arm64 Linux |
 | `torrent-X.Y.Z.spdx.json` | the SPDX SBOM of the crates both binaries are built from |
 | `SHA256SUMS` | the SHA-256 of each file above |
 | `*.sigstore.json` | a Sigstore bundle signing each file above, `SHA256SUMS` included |
-| `ghcr.io/d18580b/torrent:X.Y.Z` | the container image of [`deploy/Containerfile`](deploy/Containerfile), also tagged `X.Y` and `latest` |
+| `ghcr.io/d18580b/torrent:X.Y.Z` | the container image of [`deploy/Containerfile`](deploy/Containerfile) for `linux/amd64` and `linux/arm64`, also tagged `X.Y` and `latest` |
 
-The glibc tarball is built on Ubuntu 24.04, against its glibc 2.39; a host
+Each architecture is built on a machine of that architecture, never
+emulated, and its `torrentd --version` is checked there before anything is
+published. The image tag names a manifest list, so a pull fetches the
+platform the host runs. The glibc tarballs are built on Ubuntu 24.04, against its glibc 2.39; a host
 with an older glibc may refuse to load it. `torrentd` links OpenSSL 3
 (`libssl.so.3`, `libcrypto.so.3`), the GCC C++ runtime (`libstdc++.so.6`)
 and zlib dynamically, and shells out to the tools
 [`docs/running.md` § *1. Packages*](docs/running.md#1-packages) lists;
-`torrentctl` needs nothing past glibc. aarch64 and other architectures are not built:
-open an issue if you need one. Install the binary where the systemd unit
+`torrentctl` needs nothing past glibc. Architectures other than x86_64 and
+aarch64 are not built: open an issue if you need one. Install the binary where the systemd unit
 expects it, as [`docs/running.md` § *4*](docs/running.md#4-service-user-binary-directories)
 shows, and follow that runbook from there.
 
@@ -82,7 +87,7 @@ three below; the first needs only `gh`, the second only `cosign`:
 
 ```bash
 v=X.Y.Z
-f=torrent-$v-x86_64-unknown-linux-gnu.tar.gz
+f=torrent-$v-$(uname -m)-unknown-linux-gnu.tar.gz
 gh release download "v$v" --repo d18580b/torrent
 
 # The release workflow of this repository built it, from that tag's commit.
