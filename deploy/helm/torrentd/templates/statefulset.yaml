@@ -137,7 +137,9 @@ spec:
         - name: config
           secret:
             secretName: {{ include "torrentd.configSecretName" . }}
-            defaultMode: 0440
+            # 0440, in decimal: a leading-zero octal reads as 440 to a YAML
+            # 1.2 parser. Group-owned by fsGroup, which the daemon runs as.
+            defaultMode: 288
             items:
               - key: {{ ternary .Values.config.existingSecretKey "torrentd.toml" (ne .Values.config.existingSecret "") }}
                 path: torrentd.toml
@@ -149,7 +151,8 @@ spec:
         - name: wireguard
           secret:
             secretName: {{ . }}
-            defaultMode: 0440
+            # 0440, as above: readable by the daemon's group, nobody else.
+            defaultMode: 288
         {{- end }}
         {{- range .Values.payloadVolumes }}
         - name: {{ printf "payload-%s" .name }}

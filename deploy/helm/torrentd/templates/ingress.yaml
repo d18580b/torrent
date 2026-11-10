@@ -1,4 +1,7 @@
 {{- if .Values.ingress.enabled }}
+{{- if not .Values.ingress.hosts }}
+{{- fail "ingress.hosts is empty: an Ingress with no rule routes nothing to the API" }}
+{{- end }}
 {{- $fullname := include "torrentd.fullname" . }}
 {{- $traefik := and (eq .Values.ingress.className "traefik") .Values.ingress.maxBodyBytes }}
 {{- if $traefik }}
