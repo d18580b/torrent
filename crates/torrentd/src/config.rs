@@ -294,6 +294,69 @@ pub struct Config {
     /// and the daemon behaves exactly as before.
     #[serde(default)]
     pub pool: Option<PoolConfig>,
+
+    /// OpenTelemetry trace export over OTLP. Absent → nothing is exported;
+    /// log lines carry `trace_id` and `span_id` either way. Restart-only.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// `[telemetry]`: where and how spans are exported. Present, the daemon
+/// exports; each key left out falls back to the standard
+/// `OTEL_EXPORTER_OTLP_*` environment variable, then to the OpenTelemetry
+/// default. See `crate::telemetry`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// The collector's base URL, as `OTEL_EXPORTER_OTLP_ENDPOINT` is
+    /// written: `http://alloy:4317` for gRPC, `http://alloy:4318` for
+    /// http/protobuf, which has `/v1/traces` appended.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+
+    /// `grpc` or `http/protobuf`.
+    #[serde(default)]
+    pub protocol: Option<OtlpProtocol>,
+
+    /// The share of new traces exported, 0.0 to 1.0. Default 1.0. A span
+    /// whose parent was sampled is always exported with it.
+    #[serde(default)]
+    pub sample_ratio: Option<f64>,
+
+    /// Resource attributes added to every exported span, such as
+    /// `deployment.environment`. `service.name` (torrentd) and
+    /// `service.version` (the build's) are fixed and refused here.
+    #[serde(default)]
+    pub resource_attributes: std::collections::BTreeMap<String, String>,
+
+    /// A file of `name=value` lines, the headers sent with every export
+    /// (an `authorization` header, typically), so no credential sits in the
+    /// TOML. Blank lines and lines starting `#` are skipped.
+    #[serde(default)]
+    pub headers_file: Option<PathBuf>,
+}
+
+// `validate` refuses a NaN `sample_ratio`, the one value that would make
+// equality irreflexive.
+impl Eq for TelemetryConfig {}
+
+/// The OTLP transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OtlpProtocol {
+    #[serde(rename = "grpc")]
+    Grpc,
+    #[serde(rename = "http/protobuf")]
+    HttpProtobuf,
+}
+
+impl OtlpProtocol {
+    /// The value as the config and `OTEL_EXPORTER_OTLP_PROTOCOL` write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grpc => "grpc",
+            Self::HttpProtobuf => "http/protobuf",
+        }
+    }
 }
 
 /// The directories torrentd indexes, and where it keeps the index.
@@ -602,6 +665,7 @@ impl Config {
                 allow_mutations,
             }),
             trusted_proxies: vec![],
+            telemetry: None,
         }
     }
 }

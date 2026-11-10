@@ -52,6 +52,7 @@ mod reload;
 mod sd_notify;
 mod signals;
 mod startup;
+mod telemetry;
 mod torrent_keys;
 mod tracing_init;
 mod vpn;
@@ -655,7 +656,8 @@ fn main() -> anyhow::Result<()> {
     // on this thread and never construct a session.
     if let Some(command) = cli.command {
         // A subcommand's failure to install it is its own human error, exit 1.
-        tracing_init::init(cfg.log_level)?;
+        // Operator tools export no spans; their lines still carry ids.
+        tracing_init::init(cfg.log_level, &telemetry::Telemetry::ids_only())?;
         log_prepared(prepared.as_ref());
         return match command {
             Command::Pool { cmd } => match cmd {
@@ -696,28 +698,59 @@ fn main() -> anyhow::Result<()> {
         refuse_config(&e);
     }
 
-    // A daemon whose subscriber did not install would run with every log
-    // line lost, so it stops here, 70 (EX_SOFTWARE) as for any other startup
-    // failure, saying why in the shape the lost lines would have had.
-    let log_handle = match tracing_init::init(cfg.log_level) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing_init::early_error(EarlyErrorKind::TracingInitFailed, &format!("{e:#}"));
-            std::process::exit(70);
-        }
-    };
-    log_prepared(prepared.as_ref());
-
+    // Before the subscriber: a gRPC span exporter spawns its channel's task
+    // on the runtime it is built in.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("torrentd-tokio")
         .build()
         .context("build tokio runtime")?;
 
+    // A daemon whose subscriber did not install would run with every log
+    // line lost, so it stops here, 70 (EX_SOFTWARE) as for any other startup
+    // failure, saying why in the shape the lost lines would have had.
+    let installed = {
+        let _entered = runtime.enter();
+        telemetry::Telemetry::new(cfg.telemetry.as_ref())
+            .and_then(|t| Ok((tracing_init::init(cfg.log_level, &t)?, t)))
+    };
+    let (log_handle, telemetry) = match installed {
+        Ok(installed) => installed,
+        Err(e) => {
+            tracing_init::early_error(EarlyErrorKind::TracingInitFailed, &format!("{e:#}"));
+            std::process::exit(70);
+        }
+    };
+    log_prepared(prepared.as_ref());
+    if telemetry.is_exporting() {
+        info!(target: "torrentd::telemetry", "exporting spans over OTLP");
+    }
+    // The last step of the shutdown drain, and of a failed boot: export the
+    // spans still queued, bounded, from a blocking thread, since the gRPC
+    // exporter sends on this runtime's workers.
+    let telemetry = std::sync::Arc::new(telemetry);
+    let flush_spans = move || {
+        let telemetry = telemetry.clone();
+        async move {
+            let flushed = tokio::task::spawn_blocking(move || {
+                telemetry.shutdown(crate::telemetry::SHUTDOWN_FLUSH);
+            })
+            .await;
+            if let Err(e) = flushed {
+                warn!(
+                    error.kind = "span_flush_failed",
+                    error.cause = %e,
+                    "spans still queued at shutdown were not all exported",
+                );
+            }
+        }
+    };
+
     runtime.block_on(async move {
         match startup::boot(cfg, config_path, log_handle).await {
             Ok(handle) => {
                 let exit_code = handle.run_until_signal().await;
+                flush_spans().await;
                 std::process::exit(exit_code);
             }
             Err(e) => {
@@ -729,6 +762,7 @@ fn main() -> anyhow::Result<()> {
                 // log line is the only thing they get. Every `.context(...)`
                 // on the way up is written to be read; this is what prints it.
                 error!(error.cause = %format_args!("{e:#}"), "startup failed");
+                flush_spans().await;
                 if startup::is_config_refusal(&e) {
                     std::process::exit(EX_CONFIG);
                 }
