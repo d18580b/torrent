@@ -84,6 +84,13 @@ ENV LIBTORRENT_SYS_CACHE_DIR=/root/.cache/torrentd/native
 # startup unless TORRENTD_FAULT_INJECTION=1, which only the drill sets.
 ARG CARGO_FEATURES=""
 
+# The commit being built, which torrentd_build_info reports as its `revision`
+# (crates/torrentd/src/metrics_sink.rs). The build context need not carry
+# .git, so the builder cannot read it: `mise run container` and the release
+# image job pass it. An ARG is in every later RUN's environment, so cargo sees
+# it; left empty, the binary reports `unknown`.
+ARG TORRENTD_REVISION=""
+
 # `cargo build --release` will re-read rust-toolchain.toml and download
 # the matching channel automatically.
 RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \

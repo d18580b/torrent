@@ -578,10 +578,14 @@ jobs:
       # anything is pushed. No build cache: like the tarballs, the image is
       # built from the tagged sources alone. buildx's own provenance and SBOM
       # are off; the Sigstore attestations below are the image's.
+      # TORRENTD_REVISION is the checked-out commit, which torrentd_build_info
+      # reports as its `revision`; the push below passes the same, so it
+      # reuses this build's layers.
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/Containerfile
+          build-args: TORRENTD_REVISION=${{ github.sha }}
           load: true
           push: false
           tags: torrentd:release-check
@@ -615,6 +619,7 @@ jobs:
         with:
           context: .
           file: deploy/Containerfile
+          build-args: TORRENTD_REVISION=${{ github.sha }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
