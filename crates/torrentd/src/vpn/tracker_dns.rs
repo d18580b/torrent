@@ -291,7 +291,7 @@ impl TrackerProxy {
         let password = random_token();
         let auth = Arc::new((username.clone(), password.clone()));
         let resolver = Arc::new(resolver);
-        let task = tokio::spawn(async move {
+        let task = crate::startup::tasks::spawn(async move {
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(c) => c,
@@ -310,7 +310,7 @@ impl TrackerProxy {
                 }
                 let resolver = resolver.clone();
                 let auth = auth.clone();
-                tokio::spawn(async move {
+                crate::startup::tasks::spawn(async move {
                     if let Err(e) = serve(stream, &resolver, &auth).await {
                         debug!(error.cause = %e, "tracker proxy connection ended");
                     }
@@ -628,6 +628,8 @@ async fn associate(mut control: TcpStream, resolver: &TunnelResolver) -> io::Res
                 let mut wrapped = vec![0, 0, 0];
                 put_addr(&mut wrapped, from);
                 wrapped.extend_from_slice(&from_out[..n]);
+                // ignore-result: UDP is lossy; a reply the client cannot
+                // take is one its UDP tracker retry already covers.
                 let _ = relay.send_to(&wrapped, client).await;
             }
         }
