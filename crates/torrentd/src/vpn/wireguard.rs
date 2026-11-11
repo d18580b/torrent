@@ -1583,13 +1583,21 @@ mod native {
         // The table is named from the link's ifindex, so it is read while the
         // link still exists.
         let table = route::table_for(iface).ok();
-        // The rule deletions end on `ip`'s non-zero "no rule left", which is
-        // an answer and not a failure, so they run uncounted.
-        down_with(iface, table, |args| match args.split_first() {
+        down_with(iface, table, teardown_command);
+    }
+
+    /// Run one of [`down_with`]'s command lines (program first) for real.
+    ///
+    /// The rule deletions (`ip -4|-6 rule …`) end on `ip`'s non-zero "no rule
+    /// left", which is an answer and not a failure, so they go through
+    /// [`route::del_rule`] and run uncounted. Every other command goes
+    /// through `run_ok`, where a non-zero exit is a failure.
+    pub(super) fn teardown_command(args: &[&str]) -> Result<(), String> {
+        match args.split_first() {
             Some(_) if args.get(2) == Some(&"rule") => route::del_rule(args),
             Some((program, rest)) => run(program, rest, None),
             None => Ok(()),
-        });
+        }
     }
 
     /// [`down`] over a command runner, so the order can be tested.
