@@ -671,6 +671,39 @@ impl OnlinePacing for NoTorrents {
 pub struct FailedProfile {
     pub config: ProfileConfig,
     pub reason: String,
+    /// What class of failure `reason` describes, as `profile_boot_failed`
+    /// labels it.
+    pub cause: BootFailure,
+}
+
+/// The class of a profile's boot failure: the `reason` label of
+/// `profile_boot_failed`, where `reason` itself is the prose an operator reads.
+///
+/// Only a cause an alert or runbook acts on differently gets its own value;
+/// everything else is [`BootFailure::Other`], and its log line says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootFailure {
+    /// The tunnel came up, but strict reverse-path filtering on its interface
+    /// would drop every reply to a socket bound to it.
+    RpFilterStrict,
+    /// Any other failure: preflight, bring-up, address or port collision,
+    /// port forwarding, session construction.
+    Other,
+}
+
+impl BootFailure {
+    /// The `reason` a profile that did not fail carries.
+    pub const NONE: &'static str = "none";
+
+    /// Every value of `profile_boot_failed`'s `reason` label.
+    pub const LABELS: &'static [&'static str] = &[Self::NONE, "rp_filter_strict", "other"];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RpFilterStrict => "rp_filter_strict",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// What [`ProfileRegistry::resolve`] found: the three answers a profile id can
@@ -762,6 +795,7 @@ pub(crate) fn test_failed_profile(id: &str, reason: &str) -> FailedProfile {
     FailedProfile {
         config: test_vpn_entry(id, ProfileStatus::Active).config,
         reason: reason.to_string(),
+        cause: BootFailure::Other,
     }
 }
 

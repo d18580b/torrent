@@ -23,6 +23,7 @@ use crate::error::Result;
 use crate::ffi_util::c_string;
 use crate::ffi_util::ErrBuf;
 use crate::ffi_util::StatusListGuard;
+use crate::ffi_util::Timed;
 use crate::handle::InfoHash;
 use crate::handle::TorrentHandle;
 use crate::settings::MoveFlags;
@@ -74,6 +75,16 @@ pub enum AddParams {
 }
 
 impl AddParams {
+    /// `file`, `magnet` or `resume`: the `kind` field of the `ffi.add_torrent`
+    /// span.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
+            Self::Magnet { .. } => "magnet",
+            Self::Resume { .. } => "resume",
+        }
+    }
+
     /// Re-add from resume data with no relocation and no `.torrent` — the
     /// plain restart path. Asserts `UPLOAD_MODE` and clears every flag that
     /// could lift it, as the shim does on every add anyway: a constructor that
@@ -153,7 +164,9 @@ unsafe impl Send for Session {}
 impl Session {
     /// Construct a new session with the given settings layered on top of
     /// libtorrent's `high_performance_seed()` preset.
+    #[tracing::instrument(name = "ffi.session_create", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn new(settings: &Settings) -> Result<Self> {
+        let _timed = Timed::start();
         let json = settings.to_shim_json()?;
         let json_c = c_string(json, "settings_json")?;
         let mut err = ErrBuf::new();
@@ -171,7 +184,9 @@ impl Session {
     /// Like [`Session::new`], but restores the DHT routing table + session
     /// state from a blob previously produced by [`Session::save_state`]. Used
     /// at startup for single-session (DHT-enabled) mode.
+    #[tracing::instrument(name = "ffi.session_create_with_state", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn with_state(settings: &Settings, state: &[u8]) -> Result<Self> {
+        let _timed = Timed::start();
         let json = settings.to_shim_json()?;
         let json_c = c_string(json, "settings_json")?;
         let mut err = ErrBuf::new();
@@ -196,7 +211,9 @@ impl Session {
 
     /// Apply settings on a running session. Used by SIGHUP reload and per-profile
     /// startup overrides.
+    #[tracing::instrument(name = "ffi.session_apply_settings", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn apply_settings(&self, settings: &Settings) -> Result<()> {
+        let _timed = Timed::start();
         let json = settings.to_shim_json()?;
         let json_c = c_string(json, "settings_json")?;
         let mut err = ErrBuf::new();
@@ -212,7 +229,9 @@ impl Session {
 
     /// Save serialized session state (DHT routing table, settings) for
     /// restoration.
+    #[tracing::instrument(name = "ffi.session_save_state", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn save_state(&self) -> Result<Vec<u8>> {
+        let _timed = Timed::start();
         let mut buf: *mut u8 = std::ptr::null_mut();
         let mut len: usize = 0;
         let mut err = ErrBuf::new();
@@ -235,7 +254,9 @@ impl Session {
     /// paused. Each torrent's own paused flag is untouched, so
     /// [`Session::resume`] puts back exactly what was running. Queued in
     /// order with every other call, so a pause before an add covers it.
+    #[tracing::instrument(name = "ffi.session_pause", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn pause(&self) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe { ffi::lt_session_pause(self.ptr) };
         if rc == ffi::LT_OK as i32 {
             Ok(())
@@ -245,7 +266,9 @@ impl Session {
     }
 
     /// Undo [`Session::pause`].
+    #[tracing::instrument(name = "ffi.session_resume", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn resume(&self) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe { ffi::lt_session_resume(self.ptr) };
         if rc == ffi::LT_OK as i32 {
             Ok(())
@@ -256,7 +279,9 @@ impl Session {
 
     /// Whether the session is paused, as of every pause or resume issued
     /// before this call.
+    #[tracing::instrument(name = "ffi.session_is_paused", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn is_paused(&self) -> Result<bool> {
+        let _timed = Timed::start();
         match unsafe { ffi::lt_session_is_paused(self.ptr) } {
             0 => Ok(false),
             1 => Ok(true),
@@ -265,7 +290,9 @@ impl Session {
     }
 
     /// Add a torrent. Returns the stable `TorrentHandle` (or an error).
+    #[tracing::instrument(name = "ffi.add_torrent", level = "debug", skip_all, fields(kind = params.kind(), duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle> {
+        let _timed = Timed::start();
         let mut err = ErrBuf::new();
         let mut infohash = [0u8; 20];
 
@@ -358,7 +385,9 @@ impl Session {
         })
     }
 
+    #[tracing::instrument(name = "ffi.remove_torrent", level = "debug", skip_all, fields(infohash = %h.infohash, delete_files = delete_files, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe {
             ffi::lt_remove_torrent(self.ptr, h.id as ffi::lt_handle, delete_files as i32)
         };
@@ -369,7 +398,9 @@ impl Session {
         }
     }
 
+    #[tracing::instrument(name = "ffi.torrent_pause", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn pause_torrent(&self, h: TorrentHandle) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe { ffi::lt_torrent_pause(self.ptr, h.id as ffi::lt_handle) };
         if rc == ffi::LT_OK as i32 {
             Ok(())
@@ -378,7 +409,9 @@ impl Session {
         }
     }
 
+    #[tracing::instrument(name = "ffi.torrent_resume", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn resume_torrent(&self, h: TorrentHandle) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe { ffi::lt_torrent_resume(self.ptr, h.id as ffi::lt_handle) };
         if rc == ffi::LT_OK as i32 {
             Ok(())
@@ -387,7 +420,9 @@ impl Session {
         }
     }
 
+    #[tracing::instrument(name = "ffi.torrent_set_upload_limit", level = "debug", skip_all, fields(infohash = %h.infohash, bytes_per_sec = bytes_per_sec, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe {
             ffi::lt_torrent_set_upload_limit(self.ptr, h.id as ffi::lt_handle, bytes_per_sec)
         };
@@ -398,7 +433,9 @@ impl Session {
         }
     }
 
+    #[tracing::instrument(name = "ffi.torrent_set_file_priority", level = "debug", skip_all, fields(infohash = %h.infohash, file_idx = file_idx, priority = priority, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe {
             ffi::lt_torrent_set_file_priority(self.ptr, h.id as ffi::lt_handle, file_idx, priority)
         };
@@ -412,7 +449,9 @@ impl Session {
     /// Re-hash the payload against the torrent's piece hashes (v1 SHA-1 / v2
     /// SHA-256 merkle). Asynchronous — completion arrives as
     /// `Alert::TorrentChecked`.
+    #[tracing::instrument(name = "ffi.torrent_force_recheck", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn force_recheck(&self, h: TorrentHandle) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe { ffi::lt_torrent_force_recheck(self.ptr, h.id as ffi::lt_handle) };
         if rc == ffi::LT_OK as i32 {
             Ok(())
@@ -423,7 +462,9 @@ impl Session {
 
     /// Announce to every tracker now instead of at the next scheduled
     /// interval. Fire-and-forget — the outcome arrives as tracker alerts.
+    #[tracing::instrument(name = "ffi.torrent_force_reannounce", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn force_reannounce(&self, h: TorrentHandle) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe { ffi::lt_torrent_force_reannounce(self.ptr, h.id as ffi::lt_handle) };
         if rc == ffi::LT_OK as i32 {
             Ok(())
@@ -440,7 +481,9 @@ impl Session {
     /// torrent, so this can never lift upload mode. libtorrent writes the
     /// three bits into resume data, so the change survives a restart only
     /// once a resume save follows it.
+    #[tracing::instrument(name = "ffi.torrent_unset_flags", level = "debug", skip_all, fields(infohash = %h.infohash, flags = flags.bits(), duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn unset_flags(&self, h: TorrentHandle, flags: TorrentFlags) -> Result<()> {
+        let _timed = Timed::start();
         let clearable =
             TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD;
         if !clearable.contains(flags) {
@@ -461,7 +504,9 @@ impl Session {
     /// applies: clear [`FORBIDDEN_TORRENT_FLAGS`], then set
     /// [`TorrentFlags::UPLOAD_MODE`]. It takes no flags, so it can never lift
     /// upload mode or set anything else.
+    #[tracing::instrument(name = "ffi.torrent_enforce_no_download", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn enforce_no_download(&self, h: TorrentHandle) -> Result<()> {
+        let _timed = Timed::start();
         let rc = unsafe { ffi::lt_torrent_enforce_no_download(self.ptr, h.id as ffi::lt_handle) };
         if rc == ffi::LT_OK as i32 {
             Ok(())
@@ -473,7 +518,9 @@ impl Session {
     /// Relocate the torrent's payload, letting libtorrent perform the move so
     /// its storage state stays consistent. Asynchronous — completion arrives
     /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.
+    #[tracing::instrument(name = "ffi.torrent_move_storage", level = "debug", skip_all, fields(infohash = %h.infohash, new_path = new_path, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn move_storage(&self, h: TorrentHandle, new_path: &str, flags: MoveFlags) -> Result<()> {
+        let _timed = Timed::start();
         let path = c_string(new_path, "new_path")?;
         let rc = unsafe {
             ffi::lt_torrent_move_storage(
@@ -490,7 +537,9 @@ impl Session {
         }
     }
 
+    #[tracing::instrument(name = "ffi.save_resume_data", level = "debug", skip_all, fields(infohash = %h.infohash, flags = flags.bits(), duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<()> {
+        let _timed = Timed::start();
         let rc =
             unsafe { ffi::lt_save_resume_data(self.ptr, h.id as ffi::lt_handle, flags.bits()) };
         if rc == ffi::LT_OK as i32 {
@@ -502,7 +551,9 @@ impl Session {
 
     /// Name, size, save path, upload limit and added time of one torrent.
     /// Synchronous: libtorrent answers from its network thread.
+    #[tracing::instrument(name = "ffi.torrent_details", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails> {
+        let _timed = Timed::start();
         let mut raw = DetailsGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
@@ -555,12 +606,14 @@ impl Session {
     /// the session. A caller that serialises session access behind a lock
     /// takes this under the lock and calls [`RawFileList::into_page`] or
     /// [`RawFileList::into_files`] after releasing it.
+    #[tracing::instrument(name = "ffi.torrent_files", level = "debug", skip_all, fields(infohash = %h.infohash, start = start, limit = limit, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn torrent_files_raw(
         &self,
         h: TorrentHandle,
         start: usize,
         limit: usize,
     ) -> Result<RawFileList> {
+        let _timed = Timed::start();
         let mut list = FileListGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
@@ -581,7 +634,9 @@ impl Session {
     }
 
     /// The torrent's trackers, tier by tier, with their announce state.
+    #[tracing::instrument(name = "ffi.torrent_trackers", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>> {
+        let _timed = Timed::start();
         let mut list = TrackerListGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
@@ -603,7 +658,9 @@ impl Session {
     /// whose status changed since the last one; a torrent whose status did
     /// not change is left out (see [`Session::torrent_statuses`]).
     /// Asynchronous: the alert arrives through [`Session::pop_alert`].
+    #[tracing::instrument(name = "ffi.post_torrent_updates", level = "debug", skip_all, fields(duration_us = tracing::field::Empty))]
     pub fn post_torrent_updates(&self) {
+        let _timed = Timed::start();
         unsafe { ffi::lt_post_torrent_updates(self.ptr) }
     }
 
@@ -612,7 +669,9 @@ impl Session {
     /// [`Session::post_torrent_updates`]. libtorrent posts a torrent again
     /// only once its status changes again, so this is the only way to learn
     /// the status of a paused or idle torrent whose update was dropped.
+    #[tracing::instrument(name = "ffi.torrent_statuses", level = "debug", skip_all, fields(duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn torrent_statuses(&self) -> Result<Vec<TorrentStatusView>> {
+        let _timed = Timed::start();
         let mut list = StatusListGuard::new();
         let mut err = ErrBuf::new();
         let rc =
@@ -628,7 +687,9 @@ impl Session {
     }
 
     /// Triggers a `session_stats_alert` with the current counters.
+    #[tracing::instrument(name = "ffi.post_session_stats", level = "debug", skip_all, fields(duration_us = tracing::field::Empty))]
     pub fn post_session_stats(&self) {
+        let _timed = Timed::start();
         unsafe { ffi::lt_post_session_stats(self.ptr) }
     }
 
@@ -659,7 +720,9 @@ impl Session {
     /// daemon never saw, and each is dropped on its own while the rest of the
     /// queue is still delivered, so a nonzero count is alerts lost one at a
     /// time, not a stalled queue. Monotonic for the session's lifetime.
+    #[tracing::instrument(name = "ffi.alert_translate_errors", level = "debug", skip_all, fields(duration_us = tracing::field::Empty))]
     pub fn alert_translate_errors(&self) -> u64 {
+        let _timed = Timed::start();
         let shim = unsafe { ffi::lt_alert_translate_errors(self.ptr) };
         shim.saturating_add(self.unknown_alerts.get())
     }
@@ -671,7 +734,9 @@ impl Session {
     /// The daemon never dials a peer by address. This exists so a test can put
     /// a seeder next to a torrent and show the torrent takes nothing from it.
     #[cfg(feature = "test-api")]
+    #[tracing::instrument(name = "ffi.test_connect_peer", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn connect_peer(&self, h: TorrentHandle, peer: std::net::SocketAddr) -> Result<()> {
+        let _timed = Timed::start();
         let ip = c_string(peer.ip().to_string(), "peer ip")?;
         let rc = unsafe {
             ffi::lt_test_connect_peer(self.ptr, h.id as ffi::lt_handle, ip.as_ptr(), peer.port())
@@ -689,7 +754,9 @@ impl Session {
     /// Not in [`TorrentStatusView`]: no torrent the daemon adds downloads, and
     /// this is how a test shows that.
     #[cfg(feature = "test-api")]
+    #[tracing::instrument(name = "ffi.test_total_payload_download", level = "debug", skip_all, fields(infohash = %h.infohash, duration_us = tracing::field::Empty), err(level = "debug"))]
     pub fn total_payload_download(&self, h: TorrentHandle) -> Result<u64> {
+        let _timed = Timed::start();
         let mut out = 0u64;
         let rc = unsafe {
             ffi::lt_test_total_payload_download(self.ptr, h.id as ffi::lt_handle, &mut out)
@@ -716,7 +783,13 @@ impl Session {
     /// Whatever is left stays queued for the next call, so a caller holding
     /// a lock across this bounds how long it holds it. `max` 0 pops nothing,
     /// libtorrent's queue included.
+    ///
+    /// One `ffi.pop_alerts` span for the batch rather than one per
+    /// [`Session::pop_alert`]: the alert loop pops thousands a second under
+    /// load, and a span per alert would be a span per torrent event.
+    #[tracing::instrument(name = "ffi.pop_alerts", level = "debug", skip_all, fields(max = max, popped = tracing::field::Empty, duration_us = tracing::field::Empty))]
     pub fn drain_alerts_up_to(&self, max: usize) -> Vec<Alert> {
+        let _timed = Timed::start();
         let mut out = Vec::new();
         while out.len() < max {
             match self.pop_alert() {
@@ -724,6 +797,7 @@ impl Session {
                 None => break,
             }
         }
+        tracing::Span::current().record("popped", out.len());
         out
     }
 }
@@ -841,6 +915,10 @@ impl TrackerOverride {
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            let span =
+                tracing::debug_span!("ffi.session_destroy", duration_us = tracing::field::Empty);
+            let _entered = span.enter();
+            let _timed = Timed::start();
             unsafe { ffi::lt_session_destroy(self.ptr) };
             self.ptr = std::ptr::null_mut();
         }

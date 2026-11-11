@@ -28,6 +28,18 @@ groups:
         annotations:
           summary: "torrentd on {{ $labels.instance }} is not answering scrapes"
 
+      - alert: TorrentdRestarted
+        # A crash loop: the process started more than twice in an hour. One
+        # restart is a deploy or an upgrade, and two an operator retrying
+        # one; a third is not. A process that dies before its first scrape
+        # leaves no start time to change, so a loop that fast is
+        # TorrentdDown's. The panic and ERROR-line alerts name the cause.
+        expr: changes(torrentd_process_start_time_seconds[1h]) > 2
+        labels:
+          severity: warning
+        annotations:
+          summary: "torrentd on {{ $labels.instance }} restarted {{ $value }} times in the last hour; it is crash-looping"
+
       - alert: TorrentdAlertLoopStalled
         expr: torrentd_alert_loop_heartbeat_age_seconds > 15
         for: 1m
@@ -43,6 +55,50 @@ groups:
           severity: critical
         annotations:
           summary: "Background task {{ $labels.task }} has exited or panicked; what it watched is no longer watched"
+
+      - alert: TorrentdPanicked
+        # Any panic, on any thread, caught or not. Whatever it stopped may
+        # have no series of its own (a batch writer, a fence lift), so the
+        # panic is the alert; its ERROR line (target torrentd::panic_hook)
+        # names the location. A panic during the boot is in the first
+        # sample, so the boot gauge carries it.
+        expr: >
+          increase(torrentd_panics_total[15m]) > 0
+          or torrentd_boot_panics > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A torrentd thread ({{ $labels.thread }}) panicked; read the panic line in its log"
+
+      - alert: TorrentdFfiErrors
+        # The libtorrent shim caught a C++ exception in a call that returns
+        # nothing (posting torrent updates or session stats, destroying a
+        # session), so the call did not do what it was asked and nothing
+        # else reports it. The WARN line (target torrentd::metrics) carries
+        # the exception's message. One caught during the boot is in the
+        # first sample, so the boot gauge carries it.
+        expr: >
+          increase(torrentd_ffi_errors_total[15m]) > 0
+          or torrentd_boot_ffi_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "libtorrent threw in {{ $labels.call }} and the shim swallowed it; read the WARN line naming the exception"
+
+      - alert: TorrentdExternalCommandFailures
+        # A host tool (ip, wg, nft, openvpn, kill) could not start, did not
+        # finish within its bound, or exited non-zero where the caller
+        # required a zero exit. The WARN line (target torrentd::vpn::exec)
+        # carries the command and its stderr. The kill switch and the tunnels
+        # are set up by the boot, so one failing then is in the first
+        # sample, and the boot gauge carries it.
+        expr: >
+          increase(torrentd_external_command_failures_total[15m]) > 0
+          or torrentd_boot_external_command_failures > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.program }} failed; read the WARN line naming the command and its stderr"
 
       - alert: TorrentdMetricsDropped
         expr: >
@@ -543,18 +599,20 @@ groups:
       - alert: TorrentdHttp5xx
         # Over 5% of the API's responses in 10 minutes were 5xx, and at least
         # three of them, so one failure among a handful of requests does not
-        # page. /healthz answers 503 by design while the daemon is unready,
-        # which TorrentdUnready reports, and /metrics is the scrape's own
-        # traffic, so neither is in the ratio. Each 5xx is logged at ERROR
-        # with the request id the client received.
+        # page. The probes answer 503 by design: /readyz and its alias
+        # /healthz while the daemon is unready, which TorrentdUnready
+        # reports, and /livez while it is wedged, which the probe's own
+        # restart acts on. /metrics is the scrape's own traffic. None of the
+        # four is in the ratio. Each 5xx is logged at ERROR with the request
+        # id the client received.
         expr: |
           (
-            sum by (instance, job) (rate(torrentd_http_requests_total{status_class="5xx", route!~"/healthz|/metrics"}[10m]))
+            sum by (instance, job) (rate(torrentd_http_requests_total{status_class="5xx", route!~"/livez|/readyz|/healthz|/metrics"}[10m]))
               /
-            sum by (instance, job) (rate(torrentd_http_requests_total{route!~"/healthz|/metrics"}[10m]))
+            sum by (instance, job) (rate(torrentd_http_requests_total{route!~"/livez|/readyz|/healthz|/metrics"}[10m]))
           ) > 0.05
             and on (instance, job)
-          sum by (instance, job) (increase(torrentd_http_requests_total{status_class="5xx", route!~"/healthz|/metrics"}[10m])) >= 3
+          sum by (instance, job) (increase(torrentd_http_requests_total{status_class="5xx", route!~"/livez|/readyz|/healthz|/metrics"}[10m])) >= 3
         for: 5m
         labels:
           severity: warning
@@ -581,6 +639,18 @@ groups:
           severity: warning
         annotations:
           summary: "A config reload failed at {{ $labels.stage }}; the daemon is running the previous settings"
+
+      - alert: TorrentdConfigRestartPending
+        # A restart-only key edited in the file, which a reload found and
+        # could not apply. The grace period lets a change rolled out ahead of
+        # a planned restart pass; past it, the file and the daemon disagree
+        # until someone restarts it or edits the file back.
+        expr: torrentd_config_restart_pending > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Config key {{ $labels.key }} has changed in the file and needs a daemon restart to take effect"
 
       # ---- pool --------------------------------------------------------
       - alert: TorrentdPoolPlanFailed
@@ -647,3 +717,14 @@ groups:
           severity: info
         annotations:
           summary: "The pool index and the assignment registry still disagree about {{ $value }} torrents because the boot could not rewrite the index; read the pool index write warning in the boot log, then restart"
+
+      - alert: TorrentdPoolRootMutationsDisabled
+        # The boot's probe found the root's filesystem without
+        # renameat2(RENAME_NOREPLACE) or directory fsync (NFS, CIFS, many
+        # FUSE filesystems): every plan touching it is refused until the root
+        # is moved and the daemon restarted. Read-only use goes on.
+        expr: torrentd_pool_root_mutations_disabled == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pool mutations are disabled for root {{ $labels.root }} ({{ $labels.reason }}): its filesystem failed the boot's probe, and plans touching it are refused; see docs/operations.md, Storage the daemon runs on"

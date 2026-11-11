@@ -2,8 +2,11 @@
 # Package an already-built release binary set as a release tarball, after
 # checking that what is packaged is what a release may ship.
 #
-#   scripts/dist gnu    # torrentd + torrentctl, x86_64-unknown-linux-gnu
-#   scripts/dist musl   # static torrentctl, x86_64-unknown-linux-musl
+#   scripts/dist gnu    # torrentd + torrentctl, <arch>-unknown-linux-gnu
+#   scripts/dist musl   # static torrentctl, <arch>-unknown-linux-musl
+#
+# <arch> is the building machine's own (`uname -m`: x86_64 or aarch64); a
+# release builds each architecture natively, on a runner of that architecture.
 #
 # Run as `mise run dist` or `mise run dist-musl`, which build the binaries
 # first; .github/workflows/release-plz.yml calls the same tasks. The tarball
@@ -32,6 +35,15 @@ usage() {
 [ $# -eq 1 ] || usage
 flavour=$1
 
+arch=$(uname -m)
+case "$arch" in
+  x86_64 | aarch64) ;;
+  *)
+    echo "::error::no release is built for $arch; only x86_64 and aarch64"
+    exit 1
+    ;;
+esac
+
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
@@ -55,7 +67,7 @@ check_version() {
 
 case "$flavour" in
   gnu)
-    triple=x86_64-unknown-linux-gnu
+    triple=$arch-unknown-linux-gnu
     bindir=target/release
     name=torrent-$version-$triple
     check_version "$bindir/torrentd" torrentd
@@ -78,7 +90,7 @@ case "$flavour" in
     )
     ;;
   musl)
-    triple=x86_64-unknown-linux-musl
+    triple=$arch-unknown-linux-musl
     bindir=target/$triple/release
     name=torrentctl-$version-$triple
     check_version "$bindir/torrentctl" torrentctl

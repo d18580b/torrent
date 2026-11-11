@@ -1,0 +1,34 @@
+{{- with .Values.metrics.serviceMonitor }}
+{{- if .enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "torrentd.fullname" $ }}
+  labels:
+    {{- include "torrentd.labels" $ | nindent 4 }}
+    {{- with .labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "torrentd.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .interval }}
+      scrapeTimeout: {{ .scrapeTimeout }}
+      # /metrics answers only a metrics-scope token (docs/running.md §6).
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ required "metrics.serviceMonitor.tokenSecret.name names the Secret holding a metrics-scope token" .tokenSecret.name }}
+          key: {{ .tokenSecret.key }}
+      # deploy/prometheus/torrentd.rules.yml's TorrentdDown matches
+      # job="torrentd", whatever the release is called.
+      relabelings:
+        - targetLabel: job
+          replacement: torrentd
+{{- end }}
+{{- end }}

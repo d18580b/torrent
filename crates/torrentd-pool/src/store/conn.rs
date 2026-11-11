@@ -3,6 +3,8 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use rusqlite::Connection;
 use tracing::warn;
@@ -54,6 +56,8 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolE
             if let Ok(meta) = file.metadata() {
                 let mode = meta.permissions().mode();
                 if mode & 0o044 != 0o044 {
+                    // ignore-result: best effort, as above; only the owner
+                    // may chmod.
                     let _ = file
                         .set_permissions(std::fs::Permissions::from_mode((mode | 0o044) & 0o7777));
                 }
@@ -95,7 +99,49 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolE
     }
 }
 
+/// Every `ROLLBACK` (or `ROLLBACK TO` a savepoint) that failed in this
+/// process. See [`PoolStore::rollback_errors`].
+static ROLLBACK_ERRORS: AtomicU64 = AtomicU64::new(0);
+
 impl PoolStore {
+    /// How many rollbacks have failed in this process, on any connection.
+    ///
+    /// Process-wide, because a store holds no metrics sink; the daemon's
+    /// exporter reads it at scrape time into
+    /// `store_write_errors_total{store="pool_index"}`. A failed rollback can
+    /// leave the connection inside the transaction its caller believes
+    /// ended, so the writes after it may land in that transaction or be lost
+    /// with it.
+    pub fn rollback_errors() -> u64 {
+        ROLLBACK_ERRORS.load(Ordering::Relaxed)
+    }
+
+    /// Run `statement`, a rollback, and log and count it where it fails.
+    ///
+    /// Nothing to do where the connection is already out of every
+    /// transaction: SQLite rolls the whole one back by itself after a
+    /// statement fails with `SQLITE_FULL`, `SQLITE_IOERR` or `SQLITE_NOMEM`,
+    /// and a `ROLLBACK` after that fails only because nothing is left to roll
+    /// back. The failure that caused it is the caller's to report.
+    ///
+    /// The caller carries on either way: it is already reporting the failure
+    /// or the panic that made it roll back, and that stays what it reports.
+    fn roll_back(&self, statement: &str) {
+        if self.conn.is_autocommit() {
+            return;
+        }
+        if let Err(e) = self.conn.execute_batch(statement) {
+            ROLLBACK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target: "torrentd_pool::store",
+                statement,
+                error.cause = %e,
+                "pool index rollback failed; the connection may still be inside the \
+                 transaction it was ending",
+            );
+        }
+    }
+
     /// Open (creating if needed) the pool database at `path` as one of any
     /// number of concurrent writers: the daemon, or a short CLI command such
     /// as `pool check`.
@@ -103,6 +149,7 @@ impl PoolStore {
     /// Holds a shared lock on `pool.db.lock` for the life of the store, which
     /// is what makes [`PoolStore::open_exclusive`] refuse while the daemon
     /// runs. [`PoolError::Busy`] while an exclusive holder has it.
+    #[tracing::instrument(name = "pool_store.open", level = "debug", skip_all, fields(path = %path.display()), err(level = "debug"))]
     pub fn open(path: &Path) -> Result<Self, PoolError> {
         Self::open_held(path, false)
     }
@@ -116,6 +163,7 @@ impl PoolStore {
     /// journal, a verification's verdict, a released owner. So it refuses to
     /// start, with [`PoolError::Busy`], while any other [`PoolStore::open`]
     /// holds the index, and while it runs no other one can open it.
+    #[tracing::instrument(name = "pool_store.open_exclusive", level = "debug", skip_all, fields(path = %path.display()), err(level = "debug"))]
     pub fn open_exclusive(path: &Path) -> Result<Self, PoolError> {
         Self::open_held(path, true)
     }
@@ -180,6 +228,7 @@ impl PoolStore {
     /// this connection and none of them waits for the scan. It never
     /// migrates and cannot write: `query_only` refuses any statement that
     /// would.
+    #[tracing::instrument(name = "pool_store.open_read_only", level = "debug", skip_all, fields(path = %path.display()), err(level = "debug"))]
     pub fn open_read_only(path: &Path) -> Result<Self, PoolError> {
         use rusqlite::OpenFlags;
         let conn = Connection::open_with_flags(
@@ -216,6 +265,7 @@ impl PoolStore {
     /// `BEGIN DEFERRED` takes no lock and reads nothing, so it fails only on
     /// a connection that is already unusable; `f` then runs without the
     /// snapshot and its own statements report the failure.
+    #[tracing::instrument(name = "pool_store.read_snapshot", level = "debug", skip_all)]
     pub fn read_snapshot<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
         if self.tx_depth > 0
             || !self.conn.is_autocommit()
@@ -227,7 +277,7 @@ impl PoolStore {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         // A read transaction has nothing to keep; ending it releases the
         // snapshot so the WAL can be checkpointed past it.
-        let _ = self.conn.execute_batch("ROLLBACK");
+        self.roll_back("ROLLBACK");
         match out {
             Ok(v) => v,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -257,6 +307,7 @@ impl PoolStore {
     ///
     /// Re-entrant: a nested call becomes a savepoint, so callers can compose
     /// without knowing whether they are already inside one.
+    #[tracing::instrument(name = "pool_store.transaction", level = "debug", skip_all, fields(depth = self.tx_depth))]
     pub fn in_transaction<T, E>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, E>,
@@ -303,7 +354,7 @@ impl PoolStore {
         let out = match out {
             Ok(v) => v,
             Err(panic) => {
-                let _ = self.conn.execute_batch(&rollback);
+                self.roll_back(&rollback);
                 self.tx_depth = depth;
                 std::panic::resume_unwind(panic);
             }
@@ -323,7 +374,7 @@ impl PoolStore {
                     // `BEGIN IMMEDIATE` fails with "cannot start a
                     // transaction within a transaction" for the life of the
                     // process. Roll back explicitly, then restore.
-                    let _ = self.conn.execute_batch(&rollback);
+                    self.roll_back(&rollback);
                     self.tx_depth = depth;
                     Err(E::from(PoolError::Sqlite(e)))
                 }
@@ -331,7 +382,7 @@ impl PoolStore {
             Err(e) => {
                 // Report the original failure; a rollback that itself fails
                 // means the connection is already unusable either way.
-                let _ = self.conn.execute_batch(&rollback);
+                self.roll_back(&rollback);
                 self.tx_depth = depth;
                 Err(e)
             }
@@ -343,13 +394,67 @@ impl PoolStore {
     ///
     /// Each commit of the writer is a WAL fsync under `synchronous=FULL`, so
     /// this is how a test holds a loop to the number of fsyncs it makes.
-    pub fn count_commits(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    pub fn count_commits(
+        &mut self,
+    ) -> Result<std::sync::Arc<std::sync::atomic::AtomicU64>, PoolError> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let seen = std::sync::Arc::clone(&counter);
         self.conn.commit_hook(Some(move || {
             seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             false
-        }));
-        counter
+        }))?;
+        Ok(counter)
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn a_rollback_that_fails_is_counted_and_the_callers_error_is_kept() {
+        let mut store = PoolStore::open_in_memory().unwrap();
+        let before = PoolStore::rollback_errors();
+        // Releasing the savepoint under a nested `in_transaction` makes its
+        // own `ROLLBACK TO` fail, inside the outer transaction: there is no
+        // such savepoint left.
+        let out: Result<(), PoolError> = store.in_transaction(|s| {
+            let inner: Result<(), PoolError> = s.in_transaction(|s| {
+                s.conn.execute_batch("RELEASE pool_tx_1").unwrap();
+                Err(PoolError::Busy)
+            });
+            assert!(matches!(inner, Err(PoolError::Busy)), "{inner:?}");
+            // Another test in this process may fail one too, so at least one.
+            assert!(PoolStore::rollback_errors() > before);
+            Ok(())
+        });
+        out.unwrap();
+        // The depth was restored, so the next transaction is a real one.
+        store
+            .in_transaction(|s| {
+                assert!(s.in_open_transaction());
+                Ok::<_, PoolError>(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_transaction_sqlite_already_ended_is_not_a_failed_rollback() {
+        let mut store = PoolStore::open_in_memory().unwrap();
+        // What SQLite does by itself after SQLITE_FULL or SQLITE_IOERR.
+        let out: Result<(), PoolError> = store.in_transaction(|s| {
+            s.conn.execute_batch("ROLLBACK").unwrap();
+            Err(PoolError::Busy)
+        });
+        assert!(matches!(out, Err(PoolError::Busy)), "{out:?}");
+        // Nothing to assert about the process-wide count, which another test
+        // may move; the connection must simply be usable again.
+        assert!(!store.in_open_transaction());
+        store
+            .in_transaction(|s| {
+                assert!(s.in_open_transaction());
+                Ok::<_, PoolError>(())
+            })
+            .unwrap();
     }
 }

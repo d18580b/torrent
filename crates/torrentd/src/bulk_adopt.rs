@@ -58,14 +58,17 @@ pub(crate) fn in_parallel<I: Sync, T: Send>(
         groups.iter().for_each(|g| work(g));
     } else {
         let next = AtomicUsize::new(0);
-        let span = tracing::Span::current();
+        // The request's span and subscriber, so each worker's log lines are
+        // the request's.
+        let carried = crate::startup::tasks::Carried::current();
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
-                    let _entered = span.enter();
-                    while let Some(group) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        work(group);
-                    }
+                    carried.run(|| {
+                        while let Some(group) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            work(group);
+                        }
+                    });
                 });
             }
         });
@@ -183,6 +186,8 @@ fn commit_all(store: &mut PoolStore, jobs: Vec<Job>) {
     match committed {
         Ok(()) => {
             for (value, done) in ran {
+                // ignore-result: a caller that stopped waiting wants no
+                // answer; the work is committed either way.
                 let _ = done.send(Ok(value));
             }
         }
@@ -190,6 +195,8 @@ fn commit_all(store: &mut PoolStore, jobs: Vec<Job>) {
             // What ran was rolled back with the rest; what did not run, the
             // transaction never began for or was gone before.
             for done in ran.into_iter().map(|(_, d)| d).chain(jobs.map(|j| j.done)) {
+                // ignore-result: a caller that stopped waiting wants no
+                // answer.
                 let _ = done.send(Err(why.clone()));
             }
         }
@@ -250,7 +257,7 @@ mod tests {
     #[test]
     fn jobs_queued_behind_the_writer_commit_together() {
         let (_dir, store) = store();
-        let commits = store.lock().count_commits();
+        let commits = store.lock().count_commits().unwrap();
         let group = Arc::new(GroupCommit::default());
         let held = store.lock();
         let callers = 5;
@@ -325,7 +332,7 @@ mod tests {
                 std::fs::write(&fr, bytes).unwrap();
                 pool.scan().unwrap();
             }
-            let commits = pool.with_store(PoolStore::count_commits);
+            let commits = pool.with_store_mut(PoolStore::count_commits).unwrap();
             let adopted = pool
                 .adopt(&source, &profiles, &ih, ProfileId::new("p"), false)
                 .unwrap_or_else(|e| panic!("{}", e.reason));

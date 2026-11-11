@@ -1,0 +1,75 @@
+suite: monitoring
+templates:
+  - templates/servicemonitor.yaml
+  - templates/prometheusrule.yaml
+  - templates/dashboard.yaml
+tests:
+  - it: scrapes /metrics with the metrics token and labels the job torrentd
+    values: [values/kill-switch.yaml]
+    template: templates/servicemonitor.yaml
+    asserts:
+      - isKind:
+          of: ServiceMonitor
+      - equal:
+          path: spec.endpoints[0].authorization
+          value:
+            type: Bearer
+            credentials:
+              name: torrentd-metrics-token
+              key: token
+      - equal:
+          path: spec.endpoints[0].relabelings
+          value:
+            - targetLabel: job
+              replacement: torrentd
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: api
+
+  - it: refuses a ServiceMonitor with no token Secret
+    values: [values/host-only.yaml]
+    template: templates/servicemonitor.yaml
+    set:
+      metrics.serviceMonitor.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: metrics-scope token
+
+  - it: carries the alert rules of deploy/prometheus/torrentd.rules.yml
+    values: [values/kill-switch.yaml]
+    template: templates/prometheusrule.yaml
+    asserts:
+      - isKind:
+          of: PrometheusRule
+      - equal:
+          path: spec.groups[0].name
+          value: torrentd_runtime
+      - contains:
+          path: spec.groups[0].rules
+          content:
+            alert: TorrentdDown
+            expr: up{job="torrentd"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "torrentd on {{ $labels.instance }} is not answering scrapes"
+
+  - it: ships the dashboard with the Grafana sidecar label
+    values: [values/kill-switch.yaml]
+    template: templates/dashboard.yaml
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - equal:
+          path: metadata.labels.grafana_dashboard
+          value: "1"
+      - matchRegex:
+          path: data["torrentd.json"]
+          pattern: '"uid": "torrentd"'
+
+  - it: renders no monitoring objects by default
+    values: [values/host-only.yaml]
+    asserts:
+      - hasDocuments:
+          count: 0

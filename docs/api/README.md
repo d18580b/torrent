@@ -17,10 +17,12 @@ operation follows, and what may change within `v1`.
 
 ## Versioning and evolution
 
-Every API operation lives under `/v1`. Two operational endpoints stay at the
+Every API operation lives under `/v1`. The operational endpoints stay at the
 root, where probes and scrapes conventionally look, and are unversioned:
 
-- `GET /healthz`, the readiness probe;
+- `GET /livez`, the liveness probe;
+- `GET /readyz`, the readiness probe, and `GET /healthz`, the same probe
+  under its older name;
 - `GET /metrics`, the Prometheus scrape.
 
 Within `v1`, changes are **additive only**:
@@ -48,7 +50,8 @@ compatibility line is the `/v1` prefix above, not that number.
 
 ## Authentication
 
-Every operation except `GET /healthz`, `GET /v1/openapi.json` and
+Every operation except the probes (`GET /livez`, `GET /readyz` and
+`GET /healthz`), `GET /v1/openapi.json` and
 `POST /v1/sessions` needs a bearer token: `Authorization: Bearer <token>`.
 There are two kinds.
 
@@ -174,6 +177,14 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
     reporting a failure. (The line logged when the request arrives is
     written before the id is assigned, and carries an empty `request_id`:
     an id the client sent is neither adopted nor logged.)
+  - `traceparent`: the W3C trace context of the span the request ran in,
+    `00-<trace id>-<span id>-<flags>`. Every log line written while the
+    request is handled, on whichever thread, carries that trace id as
+    `trace_id` (the two trace lines above are written outside it). A request
+    that sends a valid `traceparent` (and `tracestate`) joins the caller's
+    trace: the response's trace id is the caller's, and its span id the
+    request's own. An invalid one is ignored, and the request starts a
+    trace of its own.
 - **Body limits.** A request body is capped at 64 KiB, except for
   `POST /v1/torrents`, which takes 96 MiB so it can carry a base64-encoded
   64 MiB `.torrent`. An operation that takes no body declares no `413`.

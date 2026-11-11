@@ -309,6 +309,8 @@ impl RaisedInterfaces {
 
     /// Drop the claim — the interface is down, or was never there.
     fn forget(&self, iface: &str) {
+        // ignore-result: a claim left behind no longer matches any live
+        // interface's key, so it claims nothing.
         let _ = std::fs::remove_file(self.path(iface));
     }
 
@@ -1605,10 +1607,21 @@ mod native {
         // The table is named from the link's ifindex, so it is read while the
         // link still exists.
         let table = route::table_for(iface).ok();
-        down_with(iface, table, |args| match args.split_first() {
+        down_with(iface, table, teardown_command);
+    }
+
+    /// Run one of [`down_with`]'s command lines (program first) for real.
+    ///
+    /// The rule deletions (`ip -4|-6 rule …`) end on `ip`'s non-zero "no rule
+    /// left", which is an answer and not a failure, so they go through
+    /// [`route::del_rule`] and run uncounted. Every other command goes
+    /// through `run_ok`, where a non-zero exit is a failure.
+    pub(super) fn teardown_command(args: &[&str]) -> Result<(), String> {
+        match args.split_first() {
+            Some(_) if args.get(2) == Some(&"rule") => route::del_rule(args),
             Some((program, rest)) => run(program, rest, None),
             None => Ok(()),
-        });
+        }
     }
 
     /// [`down`] over a command runner, so the order can be tested.
@@ -1621,6 +1634,8 @@ mod native {
         table: Option<u32>,
         mut run: impl FnMut(&[&str]) -> Result<(), String>,
     ) {
+        // ignore-result: teardown is best effort; a link already gone
+        // answers an error, and the rules go either way.
         let _ = run(&["ip", "link", "delete", "dev", iface]);
         if let Some(table) = table {
             route::remove_with(table, run);

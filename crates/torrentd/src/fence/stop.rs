@@ -50,9 +50,12 @@ impl FencingStop {
         self.stop.send_replace(true);
         let closed = self.gate.try_close() || {
             let gate = self.gate.clone();
-            tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(move || gate.close()))
-                .await
-                .is_ok_and(|joined| joined.is_ok())
+            tokio::time::timeout_at(
+                deadline,
+                crate::startup::tasks::spawn_blocking(move || gate.close()),
+            )
+            .await
+            .is_ok_and(|joined| joined.is_ok())
         };
         let returned = tokio::time::timeout_at(deadline, self.stop.closed())
             .await
@@ -109,7 +112,7 @@ impl FencingStopped {
     /// Resolves once the stop is asked for, or its [`FencingStop`] is
     /// dropped. Cancel safe: the stop is a level, read afresh each call.
     pub(crate) async fn stopped(&mut self) {
-        // `Err` is the sender gone, which is a stop as well.
+        // ignore-result: `Err` is the sender gone, which is a stop as well.
         let _ = self.stop.wait_for(|stop| *stop).await;
     }
 

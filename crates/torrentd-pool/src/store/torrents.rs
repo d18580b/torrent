@@ -17,6 +17,7 @@ use crate::model::PoolTorrent;
 use crate::model::TorrentFileRow;
 
 impl PoolStore {
+    #[tracing::instrument(name = "pool_store.upsert_torrent", level = "debug", skip_all, fields(infohash = %t.infohash), err(level = "debug"))]
     pub fn upsert_torrent(&self, t: &PoolTorrent, added_at: i64) -> Result<(), PoolError> {
         self.conn.execute(
             "INSERT INTO torrent(infohash, infohash_v1, infohash_v2, name, total_size,
@@ -61,6 +62,7 @@ impl PoolStore {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pool_store.replace_torrent_files", level = "debug", skip_all, fields(infohash = infohash, files = files.len()), err(level = "debug"))]
     pub fn replace_torrent_files(
         &mut self,
         infohash: &str,
@@ -98,6 +100,7 @@ impl PoolStore {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pool_store.torrent", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn torrent(&self, infohash: &str) -> Result<Option<PoolTorrent>, PoolError> {
         Ok(self
             .conn
@@ -111,6 +114,12 @@ impl PoolStore {
             .optional()?)
     }
 
+    #[tracing::instrument(
+        name = "pool_store.torrents",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn torrents(&self) -> Result<Vec<PoolTorrent>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT infohash, infohash_v1, infohash_v2, name, total_size, num_files,
@@ -121,6 +130,7 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    #[tracing::instrument(name = "pool_store.torrent_files", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn torrent_files(&self, infohash: &str) -> Result<Vec<TorrentFileRow>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT infohash, idx, rel_path, size, pieces_root, pad_file
@@ -139,6 +149,12 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    #[tracing::instrument(
+        name = "pool_store.torrent_count",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn torrent_count(&self) -> Result<u64, PoolError> {
         Ok(self
             .conn
@@ -148,6 +164,7 @@ impl PoolStore {
 
     // -- profile assignment (absorbs profile_assignments.json) --------------------
 
+    #[tracing::instrument(name = "pool_store.profile_of", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn profile_of(&self, infohash: &str) -> Result<Option<String>, PoolError> {
         Ok(self
             .conn
@@ -160,6 +177,7 @@ impl PoolStore {
             .flatten())
     }
 
+    #[tracing::instrument(name = "pool_store.set_profile", level = "debug", skip_all, fields(infohash = infohash, profile_id = profile), err(level = "debug"))]
     pub fn set_profile(&self, infohash: &str, profile: Option<&str>) -> Result<(), PoolError> {
         self.conn.execute(
             "UPDATE torrent SET profile = ?2 WHERE infohash = ?1",
@@ -174,6 +192,7 @@ impl PoolStore {
     /// For an owner the assignment registry, the authority, gives another
     /// profile than the record does. Conditional, so a record that changed
     /// since `from` was read is left as it now stands.
+    #[tracing::instrument(name = "pool_store.rewrite_owner", level = "debug", skip_all, fields(infohash = infohash, from = from, to = to), err(level = "debug"))]
     pub fn rewrite_owner(&self, infohash: &str, from: &str, to: &str) -> Result<bool, PoolError> {
         Ok(self.conn.execute(
             "UPDATE torrent SET profile = ?3 WHERE infohash = ?1 AND profile = ?2",
@@ -188,6 +207,7 @@ impl PoolStore {
     /// `adopted` outright, so left behind it would refuse every later
     /// adoption, into any profile. `payload_deleted` says its files were
     /// deleted with it. Returns whether the record named `profile`.
+    #[tracing::instrument(name = "pool_store.release_owner", level = "debug", skip_all, fields(infohash = infohash, profile_id = profile), err(level = "debug"))]
     pub fn release_owner(
         &mut self,
         infohash: &str,
@@ -206,6 +226,7 @@ impl PoolStore {
 
     /// Fold a legacy `profile_assignments.json` in. Existing assignments win, so
     /// re-running is safe and the JSON can stay on disk as a backup.
+    #[tracing::instrument(name = "pool_store.import_legacy_registry", level = "debug", skip_all, fields(assignments = assignments.len()), err(level = "debug"))]
     pub fn import_legacy_registry(
         &mut self,
         assignments: &HashMap<String, String>,

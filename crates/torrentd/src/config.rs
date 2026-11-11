@@ -27,6 +27,7 @@ mod validate;
 pub use diff::ConfigDiff;
 pub use diff::ProfileChange;
 pub use diff::ProfileChangeKind;
+pub use diff::RESTART_PENDING_KEYS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -191,8 +192,24 @@ pub struct Config {
     /// Refused beside `[auth]`, where nothing reads it.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+
+    /// Start even though a state directory (that of `resume_dir`,
+    /// `registry_path` or `[pool] db_path`) is on overlayfs, NFS, CIFS/SMB or
+    /// FUSE, which the boot otherwise refuses with exit 78: overlayfs loses
+    /// the state with the container, and SQLite's WAL and the instance lock
+    /// are unsafe over the others. Set, the boot logs a WARN and
+    /// `state_fs_unsupported` is 1. For a setup known to be safe anyway.
+    #[serde(default)]
+    pub allow_unsupported_state_fs: bool,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
+    /// `EnvFilter` directives laid over `log_level`, e.g.
+    /// `torrentd_pool::apply=debug,torrentd::vpn=trace`. Reloadable. Where
+    /// `RUST_LOG` is set, its directives win on any target both name. One
+    /// that does not parse refuses the boot, and fails a reload with the
+    /// filter in place kept (`crate::tracing_init`).
+    #[serde(default)]
+    pub log_filter: Option<String>,
 
     /// Where the assignment registry database lives. Defaults to
     /// `<resume_dir parent>/registry.db`. A path ending in `.json` is a
@@ -271,6 +288,17 @@ pub struct Config {
     #[serde(default)]
     pub kill_switch_dns_servers: Vec<IpAddr>,
 
+    /// Reload when the config file changes, without a `SIGHUP`. The file's
+    /// directory is watched with inotify, which sees an in-place write, an
+    /// editor's rename over the file, and the `..data` symlink swap kubelet
+    /// makes when a mounted ConfigMap or Secret is updated. Once the
+    /// directory has been quiet for a moment and the file's bytes differ from
+    /// the last ones read, the reload runs exactly as a `SIGHUP` does. Off by
+    /// default. Restart-only. A file that is itself a symlink out of its
+    /// directory is not followed: its target changing is not seen.
+    #[serde(default)]
+    pub config_watch: bool,
+
     /// `[[profile]]` array. Empty is refused: `ProfileConfigError::NoProfiles`.
     /// There is no implicit profile, because the only thing an implicit one
     /// could be is the least private posture the daemon has.
@@ -285,6 +313,69 @@ pub struct Config {
     /// and the daemon behaves exactly as before.
     #[serde(default)]
     pub pool: Option<PoolConfig>,
+
+    /// OpenTelemetry trace export over OTLP. Absent → nothing is exported;
+    /// log lines carry `trace_id` and `span_id` either way. Restart-only.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// `[telemetry]`: where and how spans are exported. Present, the daemon
+/// exports; each key left out falls back to the standard
+/// `OTEL_EXPORTER_OTLP_*` environment variable, then to the OpenTelemetry
+/// default. See `crate::telemetry`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// The collector's base URL, as `OTEL_EXPORTER_OTLP_ENDPOINT` is
+    /// written: `http://alloy:4317` for gRPC, `http://alloy:4318` for
+    /// http/protobuf, which has `/v1/traces` appended.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+
+    /// `grpc` or `http/protobuf`.
+    #[serde(default)]
+    pub protocol: Option<OtlpProtocol>,
+
+    /// The share of new traces exported, 0.0 to 1.0. Default 1.0. A span
+    /// whose parent was sampled is always exported with it.
+    #[serde(default)]
+    pub sample_ratio: Option<f64>,
+
+    /// Resource attributes added to every exported span, such as
+    /// `deployment.environment`. `service.name` (torrentd) and
+    /// `service.version` (the build's) are fixed and refused here.
+    #[serde(default)]
+    pub resource_attributes: std::collections::BTreeMap<String, String>,
+
+    /// A file of `name=value` lines, the headers sent with every export
+    /// (an `authorization` header, typically), so no credential sits in the
+    /// TOML. Blank lines and lines starting `#` are skipped.
+    #[serde(default)]
+    pub headers_file: Option<PathBuf>,
+}
+
+// `validate` refuses a NaN `sample_ratio`, the one value that would make
+// equality irreflexive.
+impl Eq for TelemetryConfig {}
+
+/// The OTLP transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OtlpProtocol {
+    #[serde(rename = "grpc")]
+    Grpc,
+    #[serde(rename = "http/protobuf")]
+    HttpProtobuf,
+}
+
+impl OtlpProtocol {
+    /// The value as the config and `OTEL_EXPORTER_OTLP_PROTOCOL` write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grpc => "grpc",
+            Self::HttpProtobuf => "http/protobuf",
+        }
+    }
 }
 
 /// The directories torrentd indexes, and where it keeps the index.
@@ -565,7 +656,9 @@ impl Config {
             http_socket_group: None,
             allow_unauthenticated: true,
             allowed_hosts: vec![],
+            allow_unsupported_state_fs: false,
             log_level: Self::default_log_level(),
+            log_filter: None,
             registry_path: None,
             connections_limit: None,
             file_pool_size: None,
@@ -581,6 +674,7 @@ impl Config {
             network_kill_switch: false,
             kill_switch_api_interfaces: vec![],
             kill_switch_dns_servers: vec![],
+            config_watch: false,
             profile: vec![],
             auth: None,
             pool: Some(PoolConfig {
@@ -592,6 +686,7 @@ impl Config {
                 allow_mutations,
             }),
             trusted_proxies: vec![],
+            telemetry: None,
         }
     }
 }

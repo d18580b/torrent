@@ -23,7 +23,12 @@
 //! beside the counter.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Once;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use parking_lot::Mutex;
 use prometheus::core::Collector;
@@ -145,13 +150,17 @@ macro_rules! catalogue {
 }
 
 /// The `task` values of `task_up`: every long-running task the daemon
-/// supervises.
+/// supervises. A test in `startup::tasks` holds this equal to the tasks the
+/// daemon's source spawns under the supervisor.
 pub const TASKS: &[&str] = &[
+    "signals",
     "vpn_monitor",
     "port_forward_monitor",
     "reload",
     "verify_queue",
     "kill_switch_watch",
+    "watchdog",
+    "runtime_tick",
 ];
 
 /// The `reason` values of `auth_rejections_total`.
@@ -237,9 +246,12 @@ pub const CATALOGUE: &[Series] = catalogue! {
          it, as one being added landed after the fence, or as the disk-error retry resumed one \
          after the fence.";
     // boot
-    "profile_boot_failed" Gauge Profile Owner("always") =>
+    "profile_boot_failed" Gauge Profile ("reason": crate::profile_registry::BootFailure::LABELS)
+        Owner("always") =>
         "1 if the profile got no session at boot (tunnel, port forward, or session \
-         construction failed).";
+         construction failed). One series per profile: reason is none at 0, and at 1 names \
+         the failure's class, rp_filter_strict where strict reverse-path filtering on the \
+         tunnel's interface would drop replies to its sockets, other for the rest.";
     "profile_offline" Gauge Profile Owner("always") =>
         "1 while the operator holds the profile offline, by its own state or by offline-all.";
     "boot_torrent_load_failures" Gauge Profile
@@ -332,13 +344,23 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_kill_switch_probe_errors" Gauge Daemon Owner("always") =>
         "kill_switch_probe_errors_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
-    "boot_metrics_dropped_samples" Gauge Daemon ("reason": &["registration", "labels"]) Owner("always") =>
+    "boot_metrics_dropped_samples" Gauge Daemon ("reason": DROP_REASONS) Owner("always") =>
         "metrics_dropped_samples_total as of the first scrape, which already holds what the \
          boot counted; fixed for the life of the process.";
     "boot_log_events" Gauge Daemon ("level": BOOT_LOG_EVENT_LEVELS)
         ("target": crate::tracing_init::LOG_EVENT_TARGETS) Owner("always") =>
         "log_events_total for these levels as of the first scrape, which already holds what \
          the boot counted; fixed for the life of the process.";
+    "boot_panics" Gauge Daemon ("thread": crate::panic_hook::PANIC_THREADS) Owner("always") =>
+        "panics_total as of the first scrape, which already holds what the boot counted; fixed \
+         for the life of the process.";
+    "boot_ffi_errors" Gauge Daemon ("call": libtorrent_safe::ffi_errors::CALLS) Owner("always") =>
+        "ffi_errors_total as of the first scrape, which already holds what the boot counted; \
+         fixed for the life of the process.";
+    "boot_external_command_failures" Gauge Daemon ("program": crate::vpn::exec::PROGRAMS)
+        Owner("always") =>
+        "external_command_failures_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -410,6 +432,20 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "task_up" Gauge Daemon ("task": TASKS) Owner("always") =>
         "1 while a supervised background task runs; 0 once it has exited or panicked. \
          Only the tasks this configuration starts are present.";
+    "panics_total" Counter Daemon ("thread": crate::panic_hook::PANIC_THREADS) Zero =>
+        "Panics on any thread, by the thread's name (other for a thread with any other name, \
+         or none), caught or not: a kynos handler's and a supervised task's included. Each is \
+         also logged at ERROR, target torrentd::panic_hook, with its location, message and \
+         backtrace.";
+    "batch_writer_deaths_total" Counter Daemon Zero =>
+        "Batch writer threads (the resume and .torrent stores') that died by a panic. A dead \
+         writer's queued writes reach the disk only at the shutdown drain, so resume saves \
+         stop until the daemon restarts.";
+    "ffi_errors_total" Counter Daemon ("call": libtorrent_safe::ffi_errors::CALLS) Zero =>
+        "C++ exceptions the libtorrent shim caught in an entry point that returns nothing, so \
+         could not report them: posting torrent updates or session stats, or destroying a \
+         session. Each rise is logged at WARN, target torrentd::metrics, with the last \
+         exception's message, by the scrape that exports it.";
     // control plane
     "auth_login_failures_total" Counter Daemon ("reason": &["bad_password", "throttled", "verification_budget"]) Zero =>
         "Refused logins: a wrong password, a client locked out by the throttle, or the \
@@ -434,8 +470,17 @@ pub const CATALOGUE: &[Series] = catalogue! {
         Owner("each route, before the API serves") =>
         "Seconds from a request arriving to its response head being ready, by route and \
          method; a streamed body's delivery is not included.";
-    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings"]) Zero =>
-        "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
+    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "log_filter", "apply_settings", "watch"]) Zero =>
+        "Reloads (SIGHUP, POST /v1/config/reload, or a change config_watch saw) that failed, by \
+         the step that failed; log_filter counts a log_filter that does not parse, which keeps \
+         the log filter in place; watch counts config_watch failing to watch the config file's \
+         directory, at boot or later, after which only SIGHUP and the API reload.";
+    "config_restart_pending" Gauge Daemon ("key": crate::config::RESTART_PENDING_KEYS) Zero =>
+        "1 for each config key whose value in the file, at the last reload that read it, \
+         differs from the one the daemon runs and only a restart applies: a non-reloadable \
+         key, profile for any [[profile]] change, or a reloadable settings key the file \
+         deleted. Back to 0 when a reload finds the file matching again; a restart boots \
+         with the file and starts every key at 0.";
     // kill switch
     "kill_switch_active" Gauge Daemon Owner("always") => "1 while the daemon holds the nftables kill switch installed.";
     "kill_switch_dns_exempt" Gauge Daemon Owner("always") =>
@@ -501,28 +546,93 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
         "Torrents whose pool-index profile still disagrees with the assignment registry once \
          the boot has rewritten it to the registry's: nonzero only where that write failed.";
+    "pool_root_mutations_disabled" Gauge Daemon ["root"]
+        ("reason": crate::apply::ProbeFailure::ALL) Owner("[pool] allow_mutations, each root") =>
+        "1 while mutations are disabled for a pool root because its filesystem failed the \
+         boot's probe, by what failed: the scratch directory could not be made or removed, \
+         renameat2(RENAME_NOREPLACE) failed, or a directory fsync failed. Plans touching that \
+         root are refused; the other roots keep taking them.";
     // persistence and the exporter itself
+    "state_fs_unsupported" Gauge Daemon Owner("always") =>
+        "1 while allow_unsupported_state_fs let the daemon start with a state directory on \
+         overlayfs, NFS, CIFS/SMB or FUSE, which the boot otherwise refuses.";
     "dir_fsync_errors_total" Counter Daemon Zero =>
         "Directory fsyncs after a rename that failed, every one rather than only the logged \
          first; the renamed file is on disk, but a power loss may revert its name.";
     "store_write_errors_total" Counter Daemon ("store": &["registry", "pool_index"]) Zero =>
         "Writes to the assignment registry or the pool index that failed where nothing \
          else reports them.";
-    "metrics_dropped_samples_total" Counter Daemon ("reason": &["registration", "labels"]) Zero =>
-        "Samples the exporter dropped: a series that could not be registered, or an emission \
-         whose labels differ from the series' first use.";
+    "metrics_dropped_samples_total" Counter Daemon ("reason": DROP_REASONS) Zero =>
+        "Samples the exporter dropped: a series that could not be registered, an emission \
+         whose labels differ from the series' first use, or a whole scrape whose encoding \
+         failed (encode), which was answered 500.";
     // the log
     "log_events_total" Counter Daemon ("level": crate::tracing_init::LOG_EVENT_LEVELS)
         ("target": crate::tracing_init::LOG_EVENT_TARGETS) Zero =>
         "Lines logged at WARN or ERROR, by level and by the crate and top-level module that \
          logged them (the target's first two path segments; other for any target not listed \
          here). Counted whatever log_level or RUST_LOG lets through to the log.";
+    // external commands
+    "external_command_failures_total" Counter Daemon ("program": crate::vpn::exec::PROGRAMS) Zero =>
+        "Host tools (ip, wg, nft, openvpn, kill; other for any other) that failed: could not \
+         start, did not finish within their bound, or exited non-zero where the caller required \
+         a zero exit. Each is logged at WARN, target torrentd::vpn::exec, with its redacted \
+         command line and stderr.";
+    "external_command_duration_seconds" Histogram Daemon ("program": crate::vpn::exec::PROGRAMS)
+        Owner("always") =>
+        "Seconds each host tool run took, from spawn to exit, timeout or refusal to start, by \
+         program.";
+    // traces
+    "telemetry_export_errors_total" Counter Daemon Zero =>
+        "OTLP span exports that failed, each dropping its batch: a collector that refused or \
+         did not answer within the timeout. Logged at WARN, target torrentd::telemetry, at \
+         most once a minute. Always 0 without [telemetry].";
     // the build
     "build_fault_injection" Gauge Daemon Owner("always") =>
         "1 if this binary was built with the fault-injection feature, which mounts \
          POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a \
          deployment.";
+    "build_info" Gauge Daemon ("version": &[]) ("revision": &[]) ("arch": &[])
+        ("features": &[]) Owner("always") =>
+        "Always 1, labelled with this binary's version, the commit it was built from \
+         (TORRENTD_REVISION at build time, unknown where it was unset), its CPU architecture, \
+         and the cargo features beyond the default it was built with: fault-injection for the \
+         alert drill's build, empty on every deployment.";
+    // the process
+    "process_start_time_seconds" Gauge Daemon Owner("always") =>
+        "When this process started, in seconds since the Unix epoch: time() minus it is the \
+         uptime, and a change in it is a restart.";
 };
+
+/// The commit this binary was built from, as `build_info`'s `revision`:
+/// `TORRENTD_REVISION` in the build's environment, `unknown` where that was
+/// unset or empty.
+pub const BUILD_REVISION: &str = match option_env!("TORRENTD_REVISION") {
+    Some(revision) if !revision.is_empty() => revision,
+    _ => "unknown",
+};
+
+/// The cargo features beyond the default this binary was built with, as
+/// `build_info`'s `features`: comma-separated, and empty for every build but
+/// the alert drill's.
+pub const BUILD_FEATURES: &str = if cfg!(feature = "fault-injection") {
+    "fault-injection"
+} else {
+    ""
+};
+
+static PROCESS_START: OnceLock<f64> = OnceLock::new();
+
+/// When the process started, in seconds since the Unix epoch, as
+/// `process_start_time_seconds`: the time of the first call, which `main`
+/// makes before anything else but the panic hook.
+pub fn process_start_time() -> f64 {
+    *PROCESS_START.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |since| since.as_secs_f64())
+    })
+}
 
 /// The `kind` values of `session_alerts_total` that `TorrentdSessionErrors`
 /// reads, and so the ones `boot_session_alerts` carries.
@@ -729,6 +839,21 @@ pub const BOOT_COUNTS: &[BootCount] = &[
         gauge: "boot_log_events",
         only: Some(("level", BOOT_LOG_EVENT_LEVELS)),
     },
+    BootCount {
+        counter: PANICS,
+        gauge: "boot_panics",
+        only: None,
+    },
+    BootCount {
+        counter: FFI_ERRORS,
+        gauge: "boot_ffi_errors",
+        only: None,
+    },
+    BootCount {
+        counter: EXTERNAL_COMMAND_FAILURES,
+        gauge: "boot_external_command_failures",
+        only: None,
+    },
     // Last, so its gauge also holds any sample the rows above dropped as
     // they wrote theirs, which the first render's sample of the counter holds.
     BootCount {
@@ -774,13 +899,63 @@ pub struct PromSink {
     /// exported, in `LogEventCounts::snapshot`'s order. See
     /// [`PromSink::export_log_events`].
     log_events_exported: Mutex<Vec<u64>>,
+    /// The process-wide panic counts as of the last time they were
+    /// exported, in `PanicCounts::snapshot`'s order. See
+    /// [`PromSink::export_panics`].
+    panics_exported: Mutex<Vec<u64>>,
+    /// The engine's process-wide batch-writer death count as of the last
+    /// time it was exported.
+    writer_deaths_exported: Mutex<u64>,
+    /// The process-wide failed span export count as of the last time it was
+    /// exported. See [`PromSink::export_telemetry_errors`].
+    telemetry_errors_exported: Mutex<u64>,
+    /// The pool index's process-wide failed-rollback count as of the last
+    /// time it was exported. See [`PromSink::export_pool_rollback_errors`].
+    pool_rollbacks_exported: Mutex<u64>,
+    /// The shim's process-wide swallowed-exception counts as of the last
+    /// time they were exported, in `ffi_errors::CALLS` order. See
+    /// [`PromSink::export_ffi_errors`].
+    ffi_errors_exported: Mutex<Vec<u64>>,
     /// Run by the first render. See [`PromSink::export_boot_counts`].
     boot_counts: Once,
+    /// See [`PromSink::fail_next_encode`].
+    #[cfg(test)]
+    fail_next_encode: std::sync::atomic::AtomicBool,
 }
+
+/// Why `metrics_dropped_samples_total` dropped a sample.
+const DROP_REASONS: &[&str] = &["registration", "labels", "encode"];
 
 const DROPPED: &str = "metrics_dropped_samples_total";
 const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
+const FFI_ERRORS: &str = "ffi_errors_total";
+const STORE_WRITE_ERRORS: &str = "store_write_errors_total";
+const PANICS: &str = "panics_total";
+
+/// Directory fsyncs the daemon itself ran, outside the engine's
+/// `sync_dir`, that failed. Added to the engine's count when
+/// `dir_fsync_errors_total` is exported. See [`note_dir_fsync_error`].
+static DAEMON_DIR_FSYNC_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a failed directory fsync the daemon ran itself, into
+/// `dir_fsync_errors_total`. Process-wide, read at scrape time, for the
+/// reason the engine's count is: the code that syncs holds no sink.
+pub fn note_dir_fsync_error() {
+    DAEMON_DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+mod external_commands;
+
+use external_commands::external_commands;
+pub use external_commands::note_external_command;
+use external_commands::EXTERNAL_COMMAND_DURATION;
+use external_commands::EXTERNAL_COMMAND_FAILURES;
+
+const WRITER_DEATHS: &str = "batch_writer_deaths_total";
+const TELEMETRY_EXPORT_ERRORS: &str = "telemetry_export_errors_total";
 const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
+const BUILD_INFO: &str = "build_info";
+const PROCESS_START_TIME: &str = "process_start_time_seconds";
 
 impl PromSink {
     pub fn new() -> Self {
@@ -804,7 +979,14 @@ impl PromSink {
             dropped,
             dir_fsync_exported: Mutex::new(0),
             log_events_exported: Mutex::new(Vec::new()),
+            panics_exported: Mutex::new(Vec::new()),
+            writer_deaths_exported: Mutex::new(0),
+            telemetry_errors_exported: Mutex::new(0),
+            pool_rollbacks_exported: Mutex::new(0),
+            ffi_errors_exported: Mutex::new(Vec::new()),
             boot_counts: Once::new(),
+            #[cfg(test)]
+            fail_next_encode: std::sync::atomic::AtomicBool::new(false),
         };
         // A property of the binary, so it is known before anything else is.
         sink.set_gauge(
@@ -816,7 +998,46 @@ impl PromSink {
             },
             &[],
         );
+        sink.set_gauge(
+            BUILD_INFO,
+            1.0,
+            &[
+                ("version", env!("CARGO_PKG_VERSION")),
+                ("revision", BUILD_REVISION),
+                ("arch", std::env::consts::ARCH),
+                ("features", BUILD_FEATURES),
+            ],
+        );
+        // A property of the process, which every sink in it shares.
+        sink.set_gauge(PROCESS_START_TIME, process_start_time(), &[]);
+        sink.register_external_commands();
         sink
+    }
+
+    /// Register the process-wide `external_command_*` vectors, with a
+    /// duration child for every program so the histogram exists from boot.
+    /// The failure counter is `Seed::Zero`, written by [`PromSink::seed`].
+    fn register_external_commands(&self) {
+        let (failures, duration) = external_commands();
+        match self.registry.register(Box::new(failures.clone())) {
+            Ok(()) => {
+                self.counters
+                    .lock()
+                    .insert(EXTERNAL_COMMAND_FAILURES.to_string(), failures.clone());
+            }
+            Err(e) => self.warn_registration("counter", EXTERNAL_COMMAND_FAILURES, &e),
+        }
+        match self.registry.register(Box::new(duration.clone())) {
+            Ok(()) => {
+                for program in crate::vpn::exec::PROGRAMS {
+                    duration.with_label_values(&[program]);
+                }
+                self.histos
+                    .lock()
+                    .insert(EXTERNAL_COMMAND_DURATION.to_string(), duration.clone());
+            }
+            Err(e) => self.warn_registration("histogram", EXTERNAL_COMMAND_DURATION, &e),
+        }
     }
 
     /// Write every [`Seed::Zero`] series at zero, for each profile in
@@ -862,25 +1083,113 @@ impl PromSink {
     /// Export `name`'s histogram for `labels` with no observation in it, so
     /// the series exists, at a count of 0, before its first event.
     pub fn seed_histogram(&self, name: &str, labels: &[(&str, &str)]) {
+        // ignore-result: registering is the point; a failure is already
+        // warned and counted inside.
         let _ = self.histogram(name, labels);
     }
 
-    pub fn render(&self) -> Vec<u8> {
-        self.export_dir_fsync_errors(torrentd_engine::batch_writer::dir_fsync_errors());
+    /// Every series, in the Prometheus text format.
+    ///
+    /// `Err` where encoding failed, which is counted in
+    /// `metrics_dropped_samples_total{reason="encode"}`: the text written up
+    /// to the failure is a partial scrape, which would read as every series
+    /// after it having vanished, so none of it is returned.
+    pub fn try_render(&self) -> prometheus::Result<Vec<u8>> {
+        self.export_dir_fsync_errors(
+            torrentd_engine::batch_writer::dir_fsync_errors()
+                + DAEMON_DIR_FSYNC_ERRORS.load(Ordering::Relaxed),
+        );
         self.export_log_events(&crate::tracing_init::log_events().snapshot());
-        // After the fsync and log counts are brought up to date, so their
+        self.export_panics(&crate::panic_hook::panics().snapshot());
+        self.export_writer_deaths(torrentd_engine::batch_writer::writer_deaths());
+        self.export_telemetry_errors(crate::telemetry::export_errors().total());
+        self.export_pool_rollback_errors(torrentd_pool::PoolStore::rollback_errors());
+        self.export_ffi_errors(&libtorrent_safe::ffi_errors::swallowed());
+        // After the process-wide counts are brought up to date, so their
         // boot gauges hold what this very render exports.
         self.boot_counts.call_once(|| self.export_boot_counts());
-        let metric_families = self.registry.gather();
-        let encoder = TextEncoder::new();
-        let mut buf = Vec::new();
-        let _ = encoder.encode(&metric_families, &mut buf);
-        buf
+        let families = self.registry.gather();
+        // The text encoder refuses a family with no name and no metric,
+        // which the registry itself never yields.
+        #[cfg(test)]
+        let families = if self.fail_next_encode.swap(false, Ordering::Relaxed) {
+            vec![prometheus::proto::MetricFamily::default()]
+        } else {
+            families
+        };
+        self.encode(&families)
     }
 
-    /// Bring `dir_fsync_errors_total` up to `total`, the engine's
-    /// process-wide count of failed directory fsyncs, by the failures since
-    /// the last export.
+    /// [`PromSink::try_render`], for a test that expects it to succeed.
+    #[cfg(test)]
+    pub fn render(&self) -> Vec<u8> {
+        self.try_render()
+            .expect("the registry's own families encode")
+    }
+
+    /// Make the next [`PromSink::try_render`] fail to encode, as a test of
+    /// what a scrape answers then.
+    #[cfg(test)]
+    pub fn fail_next_encode(&self) {
+        self.fail_next_encode.store(true, Ordering::Relaxed);
+    }
+
+    /// `families` in the text format, counting a failure.
+    fn encode(&self, families: &[prometheus::proto::MetricFamily]) -> prometheus::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(families, &mut buf)
+            .inspect_err(|_| self.dropped.with_label_values(&["encode"]).inc())?;
+        Ok(buf)
+    }
+
+    /// Bring `store_write_errors_total{store="pool_index"}` up to `total`,
+    /// the pool index's process-wide count of failed rollbacks, read at
+    /// scrape time because a store holds no sink.
+    fn export_pool_rollback_errors(&self, total: u64) {
+        let mut exported = self.pool_rollbacks_exported.lock();
+        if total > *exported {
+            self.add_counter(
+                STORE_WRITE_ERRORS,
+                total - *exported,
+                &[("store", "pool_index")],
+            );
+            *exported = total;
+        }
+    }
+
+    /// Bring `ffi_errors_total` up to `swallowed`, the shim's process-wide
+    /// counts of the exceptions its void entry points caught, and log each
+    /// call's rise with the last exception's message.
+    ///
+    /// Logged here rather than where the exception was caught, which is C++
+    /// with no logger: once per scrape that sees a rise, however many there
+    /// were, so a call that throws on every tick logs once per scrape
+    /// interval rather than once per tick.
+    fn export_ffi_errors(&self, swallowed: &[libtorrent_safe::ffi_errors::Swallowed]) {
+        let mut exported = self.ffi_errors_exported.lock();
+        exported.resize(swallowed.len(), 0);
+        for (s, done) in swallowed.iter().zip(exported.iter_mut()) {
+            if s.count > *done {
+                let new = s.count - *done;
+                self.add_counter(FFI_ERRORS, new, &[("call", s.call)]);
+                *done = s.count;
+                tracing::warn!(
+                    target: "torrentd::metrics",
+                    call = s.call,
+                    new,
+                    total = s.count,
+                    error.cause = %s.last_what,
+                    "the libtorrent shim caught an exception it could not return, and the \
+                     call stopped where it threw (error.cause is the last one's message)",
+                );
+            }
+        }
+    }
+
+    /// Bring `dir_fsync_errors_total` up to `total`, the process-wide count
+    /// of failed directory fsyncs (the engine's and
+    /// [`note_dir_fsync_error`]'s), by the failures since the last export.
     ///
     /// Read at scrape time rather than pushed: the writes that sync a
     /// directory (`write_atomic` and every `BatchWriter`) hold no sink. A
@@ -912,6 +1221,46 @@ impl PromSink {
                 );
                 *done = *total;
             }
+        }
+    }
+
+    /// Bring `panics_total` up to `counts`, the process-wide panic counts as
+    /// `PanicCounts::snapshot` returns them, by the panics since the last
+    /// export.
+    ///
+    /// Read at scrape time for the reason the log counts are: the hook that
+    /// counts them is installed first in `main`, long before this sink
+    /// exists, and holds none.
+    fn export_panics(&self, counts: &[(&'static str, u64)]) {
+        let mut exported = self.panics_exported.lock();
+        exported.resize(counts.len(), 0);
+        for ((thread, total), done) in counts.iter().zip(exported.iter_mut()) {
+            if *total > *done {
+                self.add_counter(PANICS, *total - *done, &[("thread", thread)]);
+                *done = *total;
+            }
+        }
+    }
+
+    /// Bring `batch_writer_deaths_total` up to `total`, the engine's
+    /// process-wide count of batch writer threads that died, read at scrape
+    /// time because the writers hold no sink.
+    fn export_writer_deaths(&self, total: u64) {
+        let mut exported = self.writer_deaths_exported.lock();
+        if total > *exported {
+            self.add_counter(WRITER_DEATHS, total - *exported, &[]);
+            *exported = total;
+        }
+    }
+
+    /// Bring `telemetry_export_errors_total` up to `total`, the span
+    /// exporter's process-wide count of failed exports, read at scrape time
+    /// because the exporter, built with the subscriber, holds no sink.
+    fn export_telemetry_errors(&self, total: u64) {
+        let mut exported = self.telemetry_errors_exported.lock();
+        if total > *exported {
+            self.add_counter(TELEMETRY_EXPORT_ERRORS, total - *exported, &[]);
+            *exported = total;
         }
     }
 
@@ -1077,11 +1426,46 @@ impl MetricsSink for PromSink {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
     use super::*;
+
+    /// This test thread's `external_command_*` vectors, for `vpn::exec`'s
+    /// test of what a run records.
+    pub(crate) fn external_command_series() -> &'static (CounterVec, HistogramVec) {
+        external_commands()
+    }
+
+    /// Every sink exports the process-wide vectors: the failure counter at
+    /// zero for every program from the seed, the histogram from creation.
+    #[test]
+    fn every_sink_exports_the_external_command_series_from_boot() {
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        let text = String::from_utf8(sink.render()).unwrap();
+        for program in crate::vpn::exec::PROGRAMS {
+            assert!(
+                text.contains(&format!(
+                    "torrentd_external_command_failures_total{{program=\"{program}\"}}"
+                )),
+                "{program}: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "torrentd_external_command_duration_seconds_count{{program=\"{program}\"}}"
+                )),
+                "{program}"
+            );
+        }
+        // A second sink in the same process registers the same vectors in
+        // its own registry rather than failing.
+        let again = PromSink::new();
+        assert!(String::from_utf8(again.render())
+            .unwrap()
+            .contains("torrentd_external_command_duration_seconds_count"));
+    }
 
     fn deploy(file: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1370,6 +1754,112 @@ mod tests {
         sink.export_dir_fsync_errors(total + 2);
         let text = String::from_utf8(sink.render()).unwrap();
         assert!(text.contains(&sample(total + 2)), "counted once: {text}");
+    }
+
+    #[test]
+    fn pool_rollback_failures_are_exported_as_pool_index_write_errors() {
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        let total = torrentd_pool::PoolStore::rollback_errors() + 2;
+        let sample =
+            |n: u64| format!("torrentd_store_write_errors_total{{store=\"pool_index\"}} {n}\n");
+        sink.export_pool_rollback_errors(total);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(text.contains(&sample(total)), "{text}");
+        sink.export_pool_rollback_errors(total);
+        sink.export_pool_rollback_errors(total + 1);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(text.contains(&sample(total + 1)), "counted once: {text}");
+    }
+
+    #[test]
+    fn swallowed_ffi_exceptions_are_exported_by_call_since_the_last_scrape() {
+        use libtorrent_safe::ffi_errors::Swallowed;
+        let log = crate::tracing_init::Buf::default();
+        let (_reload, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        // Above anything this process has really counted, as the fsync test
+        // does, so the scrape's own read of the shim does not move it.
+        let real = libtorrent_safe::ffi_errors::swallowed();
+        let at = |n: u64| -> Vec<Swallowed> {
+            real.iter()
+                .map(|s| {
+                    if s.call == "post_session_stats" {
+                        Swallowed {
+                            count: s.count + n,
+                            last_what: format!("injected throw {n}"),
+                            ..s.clone()
+                        }
+                    } else {
+                        s.clone()
+                    }
+                })
+                .collect()
+        };
+        // The WARN lines for `post_session_stats`; the other calls' counts
+        // never move here, so they log nothing.
+        let warned = || -> Vec<serde_json::Value> {
+            log.text()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|l| l["level"] == "WARN" && l["target"] == "torrentd::metrics")
+                .collect()
+        };
+        let sample =
+            |call: &str, n: u64| format!("torrentd_ffi_errors_total{{call=\"{call}\"}} {n}\n");
+        let base = real
+            .iter()
+            .find(|s| s.call == "post_session_stats")
+            .unwrap()
+            .count;
+        sink.export_ffi_errors(&at(100));
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(
+            text.contains(&sample("post_session_stats", base + 100)),
+            "{text}"
+        );
+        for s in &real {
+            if s.call != "post_session_stats" {
+                assert!(text.contains(&sample(s.call, s.count)), "{text}");
+            }
+        }
+        let lines = warned();
+        assert_eq!(lines.len(), 1, "one line for the rise: {lines:?}");
+        assert_eq!(lines[0]["call"], "post_session_stats", "{lines:?}");
+        assert_eq!(lines[0]["new"], 100, "{lines:?}");
+        assert_eq!(lines[0]["total"], base + 100, "{lines:?}");
+        assert_eq!(lines[0]["error.cause"], "injected throw 100", "{lines:?}");
+        sink.export_ffi_errors(&at(100));
+        assert_eq!(warned().len(), 1, "no rise, no line: {:?}", warned());
+        sink.export_ffi_errors(&at(101));
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(
+            text.contains(&sample("post_session_stats", base + 101)),
+            "counted once: {text}"
+        );
+        let lines = warned();
+        assert_eq!(lines.len(), 2, "one line per rise: {lines:?}");
+        assert_eq!(lines[1]["new"], 1, "{lines:?}");
+        assert_eq!(lines[1]["error.cause"], "injected throw 101", "{lines:?}");
+    }
+
+    #[test]
+    fn a_scrape_that_cannot_be_encoded_is_an_error_and_counted() {
+        let sink = PromSink::new();
+        let dropped = |sink: &PromSink| sink.dropped.with_label_values(&["encode"]).get();
+        assert_eq!(dropped(&sink), 0.0);
+        // A family with no name and no metric, which the encoder refuses.
+        let bad = prometheus::proto::MetricFamily::default();
+        assert!(sink.encode(&[bad]).is_err());
+        assert_eq!(dropped(&sink), 1.0);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(
+            text.contains("torrentd_metrics_dropped_samples_total{reason=\"encode\"} 1\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1715,6 +2205,46 @@ mod tests {
     }
 
     #[test]
+    fn the_sink_exports_which_build_this_is() {
+        // Run in both builds: only the drill's names a feature.
+        let text = String::from_utf8(PromSink::new().render()).unwrap();
+        let features = if cfg!(feature = "fault-injection") {
+            "fault-injection"
+        } else {
+            ""
+        };
+        let labels = format!(
+            "{{arch=\"{}\",features=\"{features}\",revision=\"{BUILD_REVISION}\",version=\"{}\"}}",
+            std::env::consts::ARCH,
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert_eq!(
+            sample(&text, "build_info", &labels).as_deref(),
+            Some("1"),
+            "{text}"
+        );
+        assert!(!BUILD_REVISION.is_empty());
+    }
+
+    #[test]
+    fn every_sink_exports_the_one_process_start_time() {
+        let start = process_start_time();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(start > 0.0 && start <= now, "{start} vs {now}");
+        for _ in 0..2 {
+            let text = String::from_utf8(PromSink::new().render()).unwrap();
+            let exported: f64 = sample(&text, "process_start_time_seconds", "")
+                .expect("exported")
+                .parse()
+                .unwrap();
+            assert_eq!(exported, start, "{text}");
+        }
+    }
+
+    #[test]
     fn a_catalogued_series_is_exported_with_its_help() {
         let sink = PromSink::new();
         sink.inc_counter("config_reload_failures_total", &[("stage", "load")]);
@@ -1897,7 +2427,7 @@ mod tests {
     /// module path its untargeted events log under cut to the crate and
     /// top-level module, and its code up to an inline `#[cfg(test)] mod`,
     /// comment lines left out.
-    fn daemon_sources() -> Vec<(String, String, String)> {
+    pub(crate) fn daemon_sources() -> Vec<(String, String, String)> {
         fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
             let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?}: {e}"));
             for entry in entries {
@@ -1949,7 +2479,8 @@ mod tests {
                         lines[i].trim() == "#[cfg(test)]"
                             && lines.get(i + 1).is_some_and(|next| {
                                 let next = next.trim();
-                                next.starts_with("mod ") && next.ends_with('{')
+                                (next.starts_with("mod ") || next.starts_with("pub(crate) mod "))
+                                    && next.ends_with('{')
                             })
                     })
                     .unwrap_or(lines.len());
@@ -1984,7 +2515,7 @@ mod tests {
     }
 
     /// The string literal `rest` opens with.
-    fn literal(rest: &str) -> Option<&str> {
+    pub(crate) fn literal(rest: &str) -> Option<&str> {
         let rest = rest.trim_start().strip_prefix('"')?;
         rest.find('"').map(|end| &rest[..end])
     }
@@ -2050,6 +2581,11 @@ mod tests {
             Coverage::Series("resume_write_errors_total"),
         ),
         ("session_pause_failed", Coverage::LogEvents),
+        (
+            "span_export_failed",
+            Coverage::Series("telemetry_export_errors_total"),
+        ),
+        ("span_flush_failed", Coverage::LogEvents),
         (
             "storage_moved_failed",
             Coverage::Series("storage_move_failures_total"),

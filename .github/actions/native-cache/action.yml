@@ -47,6 +47,9 @@ runs:
     # still restores the ~111 MB libtorrent prefix and rebuilds only the
     # ~4 MB shim. v2: v1 entries were saved by the advisory mutants job
     # without the prefix their key names; a new prefix leaves them unread.
+    # The runner's architecture is in it too: build.rs keys a prefix by its
+    # target, so an arm64 job restoring an x64 job's entry would rebuild
+    # Boost and libtorrent every run and, on an exact hit, never save them.
     - id: ids
       shell: bash
       env:
@@ -57,7 +60,7 @@ runs:
                         'crates/libtorrent-sys/shim/**') }}
       run: |
         set -euo pipefail
-        prefix="native-v2-${RUNNER_OS}-$(git rev-parse HEAD:vendor/libtorrent)-$(git rev-parse HEAD:vendor/boost)-"
+        prefix="native-v2-${RUNNER_OS}-${RUNNER_ARCH}-$(git rev-parse HEAD:vendor/libtorrent)-$(git rev-parse HEAD:vendor/boost)-"
         echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
         echo "key=${prefix}${FILES_HASH}" >> "$GITHUB_OUTPUT"
 

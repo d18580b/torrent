@@ -774,8 +774,18 @@ fn move_aside(file: &Path) -> Result<PathBuf, RegistryError> {
     }
     fs::rename(file, &to)?;
     if let Some(parent) = to.parent() {
-        if let Ok(d) = fs::File::open(parent) {
-            let _ = d.sync_all();
+        // Best effort, as the engine's `sync_dir` is: the import is already
+        // committed, and a rename a power loss reverts only means the next
+        // boot reads the file again and skips every entry the database holds.
+        if let Err(e) = fs::File::open(parent).and_then(|d| d.sync_all()) {
+            crate::metrics_sink::note_dir_fsync_error();
+            warn!(
+                target: "torrentd_engine::registry",
+                dir = %parent.display(),
+                error.cause = %e,
+                "directory fsync after moving the imported assignments file aside failed; \
+                 a power loss may revert the rename, and the next boot read the file again",
+            );
         }
     }
     Ok(to)

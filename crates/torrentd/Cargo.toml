@@ -39,6 +39,16 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 prometheus = { workspace = true }
 
+# Traces
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-http = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+# The http/protobuf exporter's client: the workspace's reqwest, blocking,
+# since the batch span processor exports from a thread of its own.
+reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"] }
+
 # Streams
 async-stream = { workspace = true }
 futures-util = { workspace = true }
@@ -61,6 +71,11 @@ sha1 = { workspace = true }
 # The assignment registry's database
 rusqlite = { workspace = true }
 
+# `config_watch`: the config file's directory, watched for a changed file.
+# The inotify crate directly, ISC, rather than `notify`, whose CC0-1.0
+# licence deny.toml does not allow; the daemon runs only on Linux.
+inotify = "0.11"
+
 [features]
 # The alert drill's build (deploy/drill): layers a MockEngine over every
 # session and mounts `POST /v1/faults` to queue alerts, stall the alert loop,
@@ -82,6 +97,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 kynos = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
+# The in-memory span exporter the redaction test exports to.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

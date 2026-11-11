@@ -43,12 +43,14 @@ use torrentd_engine::TorrentStore;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+use tracing::Instrument as _;
 
 use crate::app_state::AppState;
 use crate::config::Config;
 use crate::http;
 use crate::instance_lock::InstanceLock;
 use crate::metrics_sink::PromSink;
+use crate::profile_registry::BootFailure;
 use crate::profile_registry::ProfileRegistry;
 use crate::profile_registry::ProfileStatus;
 use crate::registry::AssignmentRegistry;
@@ -59,6 +61,7 @@ use crate::signals::{self};
 use crate::vpn;
 
 mod cleanup;
+mod fs_check;
 mod http_stage;
 mod limits;
 mod listen_check;
@@ -67,7 +70,7 @@ mod refusal;
 mod scan;
 mod scan_fence;
 mod shutdown_report;
-mod tasks;
+pub(crate) mod tasks;
 mod teardown;
 #[cfg(test)]
 mod test_support;
@@ -110,6 +113,7 @@ use shutdown_report::take_shutdown_report;
 use shutdown_report::write_shutdown_report;
 use shutdown_report::ShutdownReport;
 use tasks::spawn_supervised;
+pub(crate) use tasks::spawn_transient;
 use teardown::stop_fencing;
 use teardown::teardown_network;
 use teardown::wait_for_pool_work;
@@ -249,18 +253,38 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting torrentd");
+    // The boot's own trace: each stage below is a `startup.<stage>` span
+    // under it, and it closes when `boot` returns, so it does not stay open
+    // for the daemon's whole life. Binding the API comes after, in
+    // `DaemonHandle::run_until_signal`, as `startup.http_bind`.
+    let startup = tracing::info_span!(parent: None, "startup");
     // `cfg` came from `Config::load`, whose validation ran
     // `Config::check_boot_rules` before any tunnel could be raised.
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
 
+    // The filesystems the state lives on, asked before the instance lock,
+    // which over NFS is a lease rather than a lock: overlayfs, NFS, CIFS and
+    // FUSE refuse the boot (exit 78) unless allow_unsupported_state_fs.
+    let unsupported_state_fs = {
+        let dirs = fs_check::state_dirs(&cfg);
+        let allow = cfg.allow_unsupported_state_fs;
+        let stage = tracing::info_span!(parent: &startup, "startup.fs_check");
+        crate::startup::tasks::spawn_blocking_in(stage, move || {
+            fs_check::check_state_fs(&dirs, allow, &fs_check::Host)
+        })
+        .await
+        .context("state directory filesystem check")??
+    };
+
     // One daemon per state directory, decided before anything with an effect
     // outside this process. Declared before `cleanup`, so a failed boot's
     // teardown runs while the lock is still held.
     let instance_lock = {
         let path = cfg.instance_lock_path();
-        tokio::task::spawn_blocking(move || InstanceLock::acquire(&path))
+        let stage = tracing::info_span!(parent: &startup, "startup.instance_lock");
+        crate::startup::tasks::spawn_blocking_in(stage, move || InstanceLock::acquire(&path))
             .await
             .context("single-instance lock")??
     };
@@ -269,9 +293,12 @@ pub async fn boot(
     // with the switch on and removing it as stale with the switch off. Taken
     // after the state directory's lock, so a second start on the same state
     // directory is told that first.
-    let table_lock = tokio::task::spawn_blocking(acquire_table_lock)
-        .await
-        .context("kill-switch table lock")??;
+    let table_lock = crate::startup::tasks::spawn_blocking_in(
+        tracing::info_span!(parent: &startup, "startup.table_lock"),
+        acquire_table_lock,
+    )
+    .await
+    .context("kill-switch table lock")??;
 
     // Signals, installed before anything that can block or fail, so a
     // SIGTERM during a tunnel bring-up is handled rather than fatal.
@@ -285,7 +312,12 @@ pub async fn boot(
     let shutdown_tx = channels.shutdown_tx.clone();
     // Before the listener that can send to them: see `boot_shutdown_receivers`.
     let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
-    signals::run(channels.clone()).await;
+    // Metrics sink — created here, before the signal listener it supervises,
+    // the stores, whose batched writers count their failures in it, and the
+    // startup scans, which record registry rejections
+    // (profile_assignment_registry_errors_total).
+    let metrics = Arc::new(PromSink::new());
+    spawn_supervised("signals", metrics.clone(), signals::run(channels.clone()));
 
     // Tunnel bring-up (up to 30 s a profile) and the resume and torrent-dir
     // scans (minutes at 100K torrents) can outrun any fixed
@@ -307,9 +339,12 @@ pub async fn boot(
     // every tunnel is up.
     let preflight = {
         let needs = vpn::preflight::Needs::of(&cfg.profile, cfg.network_kill_switch);
-        tokio::task::spawn_blocking(move || vpn::preflight::run(&needs, &vpn::preflight::Host))
-            .await
-            .context("host preflight")?
+        let stage = tracing::info_span!(parent: &startup, "startup.preflight");
+        crate::startup::tasks::spawn_blocking_in(stage, move || {
+            vpn::preflight::run(&needs, &vpn::preflight::Host)
+        })
+        .await
+        .context("host preflight")?
     };
     for o in &preflight {
         match o.finding {
@@ -330,7 +365,7 @@ pub async fn boot(
 
     {
         let profiles = cfg.profile.clone();
-        tokio::task::spawn_blocking(move || vpn::warn_if_exits_are_shared(&profiles))
+        crate::startup::tasks::spawn_blocking(move || vpn::warn_if_exits_are_shared(&profiles))
             .await
             .context("shared WireGuard endpoint check")?;
     }
@@ -339,7 +374,7 @@ pub async fn boot(
     // hand, say) before any bring-up can consult one.
     {
         let sweep_dir = run_dir.clone();
-        tokio::task::spawn_blocking(move || crate::vpn::sweep_raised_records(&sweep_dir))
+        crate::startup::tasks::spawn_blocking(move || crate::vpn::sweep_raised_records(&sweep_dir))
             .await
             .context("raised-interface record sweep")?;
     }
@@ -361,7 +396,8 @@ pub async fn boot(
     {
         let state_dir = run_dir.clone();
         let configured = Arc::clone(&configured);
-        let released = tokio::task::spawn_blocking(move || {
+        let stage = tracing::info_span!(parent: &startup, "startup.release_wireguard");
+        let released = crate::startup::tasks::spawn_blocking_in(stage, move || {
             crate::vpn::release_recorded_wireguard(&state_dir, |iface| configured.contains(iface))
         })
         .await
@@ -384,7 +420,8 @@ pub async fn boot(
     {
         let state_dir = run_dir.clone();
         let configured = Arc::clone(&configured);
-        let released = tokio::task::spawn_blocking(move || {
+        let stage = tracing::info_span!(parent: &startup, "startup.release_openvpn");
+        let released = crate::startup::tasks::spawn_blocking_in(stage, move || {
             vpn::OpenvpnManager::new(state_dir).release_recorded(|iface| configured.contains(iface))
         })
         .await
@@ -404,7 +441,8 @@ pub async fn boot(
     // in the same transaction as its install. With it off nothing else would
     // remove it, so it goes here, before any session opens a socket.
     if !cfg.network_kill_switch {
-        tokio::task::spawn_blocking(|| {
+        let stage = tracing::info_span!(parent: &startup, "startup.stale_kill_switch");
+        crate::startup::tasks::spawn_blocking_in(stage, || {
             remove_stale_kill_switch(
                 crate::vpn::killswitch::nft_available(),
                 &crate::vpn::killswitch::own_table_name(),
@@ -417,10 +455,15 @@ pub async fn boot(
 
     let mut cleanup = BootCleanup::new(run_dir.clone());
 
-    // Metrics sink — created before the stores, whose batched writers count
-    // their failures in it, and the startup scans, which record registry
-    // rejections (profile_assignment_registry_errors_total).
-    let metrics = Arc::new(PromSink::new());
+    metrics.set_gauge(
+        "state_fs_unsupported",
+        if unsupported_state_fs.is_empty() {
+            0.0
+        } else {
+            1.0
+        },
+        &[],
+    );
 
     // Empty until the alert loop sees each torrent added. Created before the
     // stores, because a resume write that fails on the batch writer has to
@@ -534,10 +577,11 @@ pub async fn boot(
     // the scans below give it a torrent.
     let desired_states = {
         let path = cfg.profile_state_path();
-        let (states, loaded) =
-            tokio::task::spawn_blocking(move || crate::profile_state::DesiredStates::load(path))
-                .await
-                .context("read the profiles' online/offline states")?;
+        let (states, loaded) = crate::startup::tasks::spawn_blocking(move || {
+            crate::profile_state::DesiredStates::load(path)
+        })
+        .await
+        .context("read the profiles' online/offline states")?;
         if let crate::profile_state::Loaded::Unreadable(why) = &loaded {
             error!(
                 path = %cfg.profile_state_path().display(),
@@ -556,10 +600,11 @@ pub async fn boot(
             .profile_state_path()
             .with_file_name(crate::profile_state::PACED_HOLDS_FILE);
         let shown = path.display().to_string();
-        let (holds, unreadable) =
-            tokio::task::spawn_blocking(move || crate::profile_state::PacedHolds::load(path))
-                .await
-                .context("read the record of what paced set-onlines hold")?;
+        let (holds, unreadable) = crate::startup::tasks::spawn_blocking(move || {
+            crate::profile_state::PacedHolds::load(path)
+        })
+        .await
+        .context("read the record of what paced set-onlines hold")?;
         if let Some(why) = unreadable {
             error!(
                 path = %shown,
@@ -583,22 +628,35 @@ pub async fn boot(
         &mut boot_shutdown,
         &desired_states.current(),
         |p| vpn::preflight::refusal_for(&preflight, p),
+        |path| std::fs::read_to_string(path).ok(),
         boot_engine,
     )
+    .instrument(tracing::info_span!(parent: &startup, "startup.profiles"))
     .await?;
     boot_progress.advance();
     // Every alert-referenced series exists from here, before the alert loop
     // or any request can move one. A profile that failed is seeded too: its
-    // engine counters stay at zero, and `profile_boot_failed` says why.
+    // engine counters stay at zero, and `profile_boot_failed` says why: one
+    // series per profile, its `reason` the failure's class or `none`, so a
+    // count of the series is still a count of the profiles.
     {
         let configured: Vec<&str> = cfg.profile.iter().map(|p| p.id.as_str()).collect();
         metrics.seed(&configured);
         for p in &cfg.profile {
-            let failed = failed_profiles.iter().any(|f| f.config.id == p.id);
+            let cause = failed_profiles
+                .iter()
+                .find(|f| f.config.id == p.id)
+                .map(|f| f.cause);
             metrics.set_gauge(
                 "profile_boot_failed",
-                if failed { 1.0 } else { 0.0 },
-                &[("profile_id", p.id.as_str())],
+                if cause.is_some() { 1.0 } else { 0.0 },
+                &[
+                    ("profile_id", p.id.as_str()),
+                    (
+                        "reason",
+                        cause.map_or(BootFailure::NONE, BootFailure::label),
+                    ),
+                ],
             );
         }
         export_shutdown_report(&metrics, &take_shutdown_report(&run_dir));
@@ -637,24 +695,26 @@ pub async fn boot(
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
     // session if the forwarded port changes, and reannounces. Started as soon
     // as the profiles are built, so a 60 s lease is not left unrenewed through
-    // the scans, and supervised only where a profile negotiates a port. It
-    // confirms a rebind against the listen outcomes the alert loop publishes
-    // into `listen_events`.
+    // the scans, and started only where a profile negotiates a port: without
+    // one it has nothing to renew and returns at once, so there is no task to
+    // run, unsupervised or otherwise. It confirms a rebind against the listen
+    // outcomes the alert loop publishes into `listen_events`.
     let listen_events = Arc::new(torrentd_engine::port_forward::ListenEvents::new());
-    let pf = crate::port_forward_monitor::run(
-        profile_registry.clone(),
-        state.clone(),
-        metrics.clone(),
-        listen_events.clone(),
-        shutdown_tx.subscribe(),
-    );
     if profile_registry
         .iter()
         .any(|e| e.config.port_forward() == PortForwardMode::Natpmp)
     {
-        spawn_supervised("port_forward_monitor", metrics.clone(), pf);
-    } else {
-        tokio::spawn(pf);
+        spawn_supervised(
+            "port_forward_monitor",
+            metrics.clone(),
+            crate::port_forward_monitor::run(
+                profile_registry.clone(),
+                state.clone(),
+                metrics.clone(),
+                listen_events.clone(),
+                shutdown_tx.subscribe(),
+            ),
+        );
     }
     // VPN health monitor, started here for the same reason: the scans below
     // run for minutes on a large pool, and a tunnel that drops during them
@@ -795,7 +855,9 @@ pub async fn boot(
     // startup rather than surfacing as a 500 on the first API call, and
     // before the resume scan, which falls back to its library for a
     // torrent's `.torrent`.
-    let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
+    let pool = tracing::info_span!(parent: &startup, "startup.pool_open")
+        .in_scope(|| crate::pool_service::PoolService::open(&cfg))
+        .context("open pool index")?;
     if let Some(pool) = pool.as_ref() {
         pool.set_metrics(metrics.clone());
         pool.set_state(Arc::clone(&state));
@@ -805,6 +867,14 @@ pub async fn boot(
         if let Some(fence) = kill_switch.as_ref() {
             pool.set_kill_switch(Arc::clone(fence));
         }
+        // Before the boot re-drive and the API, either of which can apply a
+        // plan: a root whose filesystem cannot take one has it refused.
+        let (pool, metrics) = (Arc::clone(pool), metrics.clone());
+        crate::startup::tasks::spawn_blocking(move || {
+            fs_check::probe_pool_roots(&pool, metrics.as_ref(), crate::apply::probe_mutations)
+        })
+        .await
+        .context("pool root mutation probe")?;
     }
     // The daemon's one bound on hash checks, and the record of the
     // `.torrent`s it held paused for a slot when the daemon stopped: the
@@ -816,10 +886,11 @@ pub async fn boot(
             .profile_state_path()
             .with_file_name(crate::check_queue::CHECK_HOLDS_FILE);
         let shown = path.display().to_string();
-        let (holds, unreadable) =
-            tokio::task::spawn_blocking(move || crate::profile_state::PacedHolds::load(path))
-                .await
-                .context("read the record of the .torrent adds held for a check slot")?;
+        let (holds, unreadable) = crate::startup::tasks::spawn_blocking(move || {
+            crate::profile_state::PacedHolds::load(path)
+        })
+        .await
+        .context("read the record of the .torrent adds held for a check slot")?;
         if let Some(why) = unreadable {
             error!(
                 path = %shown,
@@ -845,6 +916,7 @@ pub async fn boot(
         LISTEN_CHECK_BOUND,
         &mut boot_shutdown,
     )
+    .instrument(tracing::info_span!(parent: &startup, "startup.listen_check"))
     .await?;
     boot_progress.advance();
 
@@ -867,8 +939,12 @@ pub async fn boot(
             checked_hold: &checked_hold,
             boot_progress: &boot_progress,
         };
-        resume_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown).await?;
-        torrent_dir_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown).await?;
+        resume_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown)
+            .instrument(tracing::info_span!(parent: &startup, "startup.resume_scan"))
+            .await?;
+        torrent_dir_scan(&inputs, &mut tally, &mut scan_fence, &mut boot_shutdown)
+            .instrument(tracing::info_span!(parent: &startup, "startup.torrent_dir_scan"))
+            .await?;
     }
     let ScanTally {
         loaded_by_profile,
@@ -1010,6 +1086,8 @@ pub async fn boot(
     .on_fatal({
         let tx = shutdown_tx.clone();
         Arc::new(move |reason| {
+            // ignore-result: no receiver means the daemon is already
+            // stopping.
             let _ = tx.send(reason);
         }) as torrentd_engine::FatalCallback
     })
@@ -1129,6 +1207,22 @@ impl DaemonHandle {
         // teardown below waits for it before stopping the alert loop.
         let work: Arc<crate::app_state::WorkGate> = Arc::default();
 
+        // What the boot handed to sessions: the re-drive below waits for
+        // every one to reach the state map before acting on what is loaded,
+        // and `/readyz` answers `starting` until they have. A requeued
+        // adoption is not one: the queue adds it when its turn comes, which
+        // can be hours away.
+        let loaded: Vec<_> = registry
+            .entries()
+            .into_iter()
+            .map(|(ih, _)| ih)
+            .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
+            .collect();
+        let boot = Arc::new(crate::app_state::BootProgress::new(
+            loaded.clone(),
+            crate::app_state::BOOT_SETTLE_DEADLINE,
+        ));
+
         // Re-drive any plan a crash or a kill left mid-apply. A half-applied
         // reorganisation is exactly the state an operator cannot reason about.
         // Started before the server, but not awaited: it first waits for every
@@ -1136,16 +1230,6 @@ impl DaemonHandle {
         // the API rather than ahead of it. Held in the work gate like an API
         // apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
-            // What the boot handed to sessions: the re-drive waits for every
-            // one to reach the state map before acting on what is loaded. A
-            // requeued adoption is not one: the queue adds it when its turn
-            // comes, which can be hours away.
-            let loaded: Vec<_> = registry
-                .entries()
-                .into_iter()
-                .map(|(ih, _)| ih)
-                .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
-                .collect();
             // Read here, before the server below serves: a plan an API apply
             // claims during the wait is that apply's, not the re-drive's.
             let plans = crate::apply::unfinished_at_boot(&pool);
@@ -1178,6 +1262,20 @@ impl DaemonHandle {
             ),
         );
 
+        // Runtime tick: the stamp `/livez` reads to tell a starved scheduler
+        // or timer, which the probe's own handler running does not show.
+        let runtime_tick = Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        ));
+        spawn_supervised(
+            "runtime_tick",
+            metrics.clone(),
+            crate::http::healthz::run_runtime_tick(Arc::clone(&runtime_tick)),
+        );
+
         let trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
             .expect("validated at startup");
         let app_state = AppState {
@@ -1192,6 +1290,8 @@ impl DaemonHandle {
             pool,
             checks,
             alert_heartbeat: alert_loop.heartbeat(),
+            runtime_tick,
+            boot: Arc::clone(&boot),
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
             reload_tx: Some(reload_tx.clone()),
@@ -1265,14 +1365,16 @@ impl DaemonHandle {
         // the server and falls through to the same drain and teardown a
         // signalled shutdown runs, exiting 70, after `run_http_stage` has told
         // the background tasks to stop.
-        let listener = bind_api_listener(&cfg).await;
+        let listener = bind_api_listener(&cfg)
+            .instrument(tracing::info_span!("startup.http_bind"))
+            .await;
         let posture = unauthenticated_posture(&cfg);
-        let (tx, alert, gate) = (&shutdown_tx, &alert_loop, &work);
+        let (tx, alert, gate, sink, boot) = (&shutdown_tx, &alert_loop, &work, &metrics, &boot);
         let mut exit_code = run_http_stage(
             listener,
             app,
             |listener, app| async move {
-                announce_ready(&http_listen, posture, tx, alert);
+                announce_ready(&http_listen, posture, tx, alert, sink, boot);
                 match listener {
                     ApiListener::Tcp(listener) => {
                         serve_until_shutdown(listener, app, shutdown_rx, gate).await
@@ -1345,7 +1447,7 @@ impl DaemonHandle {
         let unsaved_at_shutdown = alert_loop.unsaved_at_shutdown();
         // Joined off the runtime's workers: the drain can take its whole
         // deadline, and the timeout extender above has to keep running.
-        match tokio::task::spawn_blocking(move || alert_loop.join()).await {
+        match crate::startup::tasks::spawn_blocking(move || alert_loop.join()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!(error.cause = ?e, "alert loop join panicked"),
             Err(e) => warn!(error.cause = %e, "alert loop join task failed"),

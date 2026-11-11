@@ -9,9 +9,10 @@
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check|msrv|rustfmt-toolchain
 #   mise run test-shim|test-shim-asan|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|release-features|deny
-#   mise run lint-tracing|lint-workflows|size-check|container|commit-lint <file-or-range>
+#   mise run lint-tracing|lint-workflows|size-check|container|image-check|commit-lint <file-or-range>
 #   mise run dist|dist-musl
 #   mise run unit-check [unit]
+#   mise run helm-sync|helm-lint|helm-test
 #   mise run native|native-fetch|native-clean
 #   mise run vpn-check <config> [-- <flags>]
 #   mise run drill-alerts|drill-udp-transport|drill-listener-replies
@@ -46,6 +47,12 @@ hk = "1.48.0"
 "aqua:rhysd/actionlint" = "1.7.12"
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:zizmorcore/zizmor" = "1.31.1"
+# The Helm chart in deploy/helm/torrentd (`helm-lint`, `helm-test`): helm
+# lints and renders it, and helm-unittest's standalone `untt` binary runs the
+# chart's tests/ against the same rendering, with no helm plugin installed
+# into a helm home outside the checkout.
+"aqua:helm/helm" = "4.3.1"
+"github:helm-unittest/helm-unittest" = { version = "1.2.1", bin = "untt" }
 # pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
 # Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
 
@@ -109,12 +116,18 @@ run = [
 # Log field names. CONTRIBUTING.md fixes the `infohash` and `profile_id`
 # spellings; the other spelling of either silently splits every log query in
 # two. Scoped to *.rs so the C++ shim's include of libtorrent's real header
-# (<libtorrent/info_hash.hpp>) is not flagged. The `::error::` and
+# (<libtorrent/info_hash.hpp>) is not flagged. It also fails a `let _ =` in
+# non-test code that does not say why the value may be dropped (CONTRIBUTING.md,
+# Style). The `::error::` and
 # `::warning::` prefixes are GitHub annotations in CI, and plain text locally.
 [tasks.lint-tracing]
-description = "Reject info_hash and slot_id log field names in crates/"
+description = "Reject info_hash and slot_id log field names, and an unannotated let _ =, in crates/"
 run = '''
 set -eu
+# A `let _ =` in non-test code needs `// ignore-result: <reason>` on its line
+# or in the comment lines directly above. scripts/lint-let-underscore holds
+# the rules and what counts as test code.
+scripts/lint-let-underscore
 if grep -RnE --include='*.rs' '\binfo_hash\b' crates/; then
   echo "::error::Field name must be 'infohash' (no underscore)."
   exit 1
@@ -175,10 +188,22 @@ fi
 # deploy/Containerfile's stages. The build context needs the vendor submodules,
 # so run this from a recursive checkout. `--format docker` keeps the
 # Containerfile's HEALTHCHECK: podman's default OCI format has no field for it,
-# and podman drops it with a warning.
+# and podman drops it with a warning. TORRENTD_REVISION stamps the checkout's
+# commit into torrentd_build_info's `revision`.
 [tasks.container]
 description = "Build the container image from deploy/Containerfile (needs podman and the vendor submodules)"
-run = "podman build --format docker -f deploy/Containerfile -t torrentd:dev ."
+run = "podman build --format docker --build-arg TORRENTD_REVISION=\"$(git rev-parse HEAD)\" -f deploy/Containerfile -t torrentd:dev ."
+
+# The image `container` builds, run as a Kubernetes pod runs it: read-only
+# root, NET_ADMIN only, uid 1000, a vpn profile in its own network namespace.
+# Needs podman and the host's wireguard and nf_tables modules loaded.
+# deploy/check-image.sh lists every refusal.
+[tasks.image-check]
+description = "Boot the image read-only with a vpn profile, check tini reaps orphans and it stops cleanly"
+usage = '''
+arg "[image]" default="localhost/torrentd:dev" help="The image to check"
+'''
+run = 'deploy/check-image.sh "$usage_image"'
 
 [tasks.test]
 description = "Workspace tests (default features; parity with CI)"
@@ -283,6 +308,46 @@ promtool() {
 promtool check rules torrentd.rules.yml
 promtool test rules torrentd.rules.test.yml
 '''
+
+# The Helm chart in deploy/helm/torrentd. A chart cannot read a file outside
+# its own directory, so its PrometheusRule and dashboard ConfigMap are built
+# from copies in its files/: deploy/prometheus/torrentd.rules.yml and
+# deploy/dashboard.json stay the one source, `helm-sync` refreshes the copies,
+# and `helm-lint` fails while either differs from its source.
+[tasks.helm-sync]
+description = "Copy the alert rules and dashboard into deploy/helm/torrentd/files/"
+run = [
+  "cp deploy/prometheus/torrentd.rules.yml deploy/helm/torrentd/files/torrentd.rules.yml",
+  "cp deploy/dashboard.json deploy/helm/torrentd/files/dashboard.json",
+]
+
+# `helm lint --strict` over the defaults' required values and over each test
+# fixture under tests/values/, which values.schema.json validates too.
+[tasks.helm-lint]
+description = "Fail on a stale chart copy of the rules or dashboard, then helm lint the chart with each test fixture"
+run = '''
+set -eu
+chart=deploy/helm/torrentd
+stale=0
+for pair in "deploy/prometheus/torrentd.rules.yml:$chart/files/torrentd.rules.yml" \
+            "deploy/dashboard.json:$chart/files/dashboard.json"; do
+  if ! cmp -s "${pair%%:*}" "${pair#*:}"; then
+    echo "::error::${pair#*:} differs from ${pair%%:*}; run mise run helm-sync"
+    stale=1
+  fi
+done
+[ "$stale" -eq 0 ]
+for values in "$chart"/tests/values/*.yaml; do
+  echo "helm lint --strict with $values"
+  helm lint --strict "$chart" -f "$values"
+done
+'''
+
+# helm-unittest's suites in deploy/helm/torrentd/tests/, through its
+# standalone binary.
+[tasks.helm-test]
+description = "Run the chart's helm-unittest suites"
+run = "untt --strict deploy/helm/torrentd"
 
 [tasks.test-all]
 description = "Every automated test, including the ignored integration layers"
@@ -515,20 +580,26 @@ run = "cargo deny check"
 # set unified), so that check runs first; `dist-musl` is a static torrentctl
 # and needs musl-gcc (Debian/Ubuntu `musl-tools`, Fedora `musl-gcc`) for
 # ring's C. scripts/dist checks each binary's version, against RELEASE_TAG
-# too when that is set, and packages it into target/dist/.
+# too when that is set, and packages it into target/dist/. Both builds set
+# TORRENTD_REVISION to the commit being built, which torrentd_build_info
+# reports as its `revision`. Both build for the machine's own architecture
+# (`uname -m`, x86_64 or aarch64): the release builds each on a native runner.
+# The musl build names musl-gcc as its target's C compiler, since cc picks it
+# on its own for x86_64 only and looks for an `aarch64-linux-musl-gcc` that
+# musl-tools does not ship.
 [tasks.dist]
-description = "Build and package the x86_64 glibc release tarball (torrentd + torrentctl) into target/dist/"
+description = "Build and package this machine's glibc release tarball (torrentd + torrentctl) into target/dist/"
 run = [
   "mise run release-features",
-  "cargo build --release --locked --workspace --bin torrentd --bin torrentctl",
+  "TORRENTD_REVISION=\"$(git rev-parse HEAD)\" cargo build --release --locked --workspace --bin torrentd --bin torrentctl",
   "scripts/dist gnu",
 ]
 
 [tasks.dist-musl]
-description = "Build and package the static x86_64 musl torrentctl tarball into target/dist/ (needs musl-gcc)"
+description = "Build and package this machine's static musl torrentctl tarball into target/dist/ (needs musl-gcc)"
 run = [
-  "rustup target add x86_64-unknown-linux-musl",
-  "cargo build --release --locked -p torrentctl --target x86_64-unknown-linux-musl",
+  "rustup target add \"$(uname -m)-unknown-linux-musl\"",
+  "TORRENTD_REVISION=\"$(git rev-parse HEAD)\" env \"CC_$(uname -m)_unknown_linux_musl=musl-gcc\" cargo build --release --locked -p torrentctl --target \"$(uname -m)-unknown-linux-musl\"",
   "scripts/dist musl",
 ]
 

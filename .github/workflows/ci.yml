@@ -299,6 +299,31 @@ jobs:
       - run: mise run test-daemon
       - run: mise run test-torrentctl
 
+  arm64:
+    name: test + lifecycle on arm64
+    # A native arm64 runner, as the release's arm64 builds use: the release
+    # ships torrentd for aarch64, so its unit tests and the daemon's
+    # lifecycle run there too, against libtorrent built for that machine.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          system-deps: 'true'
+          cache-prefix: cargo-arm64
+
+      - uses: ./.github/actions/native-cache
+        with:
+          path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
+
+      - run: mise run test
+      - run: mise run test-lifecycle
+
   bench:
     name: bench at CI size (Layer 4)
     runs-on: ubuntu-24.04
@@ -390,6 +415,18 @@ jobs:
       # Nothing built deploy/Containerfile once, which is how it sat broken
       # for a while; building it here keeps the image's builder stage honest.
       - run: mise run container
+      # The image as a pod runs it: read-only root, NET_ADMIN only, uid 1000,
+      # a WireGuard profile behind the kill switch in the container's own
+      # network namespace, an orphan reaped by tini, and a clean stop. The
+      # container cannot load the modules its tunnel and ruleset need, and
+      # rootless podman needs unprivileged user namespaces.
+      - name: Allow unprivileged user namespaces, and load wireguard
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo modprobe -a wireguard nf_tables
+      - run: mise run image-check
 
   alert-rules:
     name: alert rules (promtool)
@@ -405,6 +442,22 @@ jobs:
         with:
           toolchain: ''
       - run: mise run test-alerts
+
+  helm-chart:
+    name: helm chart (lint + unittest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # mise provides helm and helm-unittest. helm-lint also fails while the
+      # chart's copy of the alert rules or the dashboard is stale.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - run: mise run helm-lint
+      - run: mise run helm-test
 
   commit-lint:
     name: conventional commits

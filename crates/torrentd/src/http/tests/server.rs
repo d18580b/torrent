@@ -89,22 +89,46 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     resp.assert_header("content-type", "text/plain; version=0.0.4");
     assert!(resp.text().contains("alert_loop_heartbeat_age_seconds"));
 
+    // A scrape that cannot be encoded is a 500, never a partial exposition,
+    // and the next one counts it.
+    h.state.metrics.fail_next_encode();
+    let resp = h
+        .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
+        .await;
+    assert_problem(&resp, 500, "internal");
+    let resp = h
+        .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
+        .await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    assert!(resp
+        .text()
+        .contains("torrentd_metrics_dropped_samples_total{reason=\"encode\"} 1\n"));
+
     // The document, unauthenticated and byte-identical to the committed one's
     // source.
     let resp = h.send("GET", "/v1/openapi.json", None, None).await;
     resp.assert_status(kynos::http::StatusCode::OK);
     assert_eq!(resp.text(), crate::http::document_json().unwrap());
 
-    // The probe: ready, then unready once the heartbeat is stale.
-    let resp = h.send("GET", "/healthz", None, None).await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    // The probes, unauthenticated: live and ready, then wedged and unready
+    // once the heartbeat is stale, `/healthz` answering as `/readyz` does.
+    for path in ["/livez", "/readyz", "/healthz"] {
+        let resp = h.send("GET", path, None, None).await;
+        resp.assert_status(kynos::http::StatusCode::OK);
+    }
     h.state
         .alert_heartbeat
         .store(0, std::sync::atomic::Ordering::Relaxed);
-    let resp = h.send("GET", "/healthz", None, None).await;
+    let resp = h.send("GET", "/livez", None, None).await;
     resp.assert_status(kynos::http::StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = resp.json();
-    assert_eq!(body["reason"], "alert_loop_stalled");
+    assert_eq!(body["failed"], "alert_loop_stalled");
+    for path in ["/readyz", "/healthz"] {
+        let resp = h.send("GET", path, None, None).await;
+        resp.assert_status(kynos::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["reason"], "alert_loop_stalled", "{path}");
+    }
 
     h.assert_conformance();
 
@@ -126,6 +150,75 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
 #[tokio::test]
 async fn server_and_operations_behave_as_documented() {
     scenarios(&Coverage::new()).await;
+}
+
+/// Issue #728: every response, a 404 for an unknown path included, carries
+/// a `traceparent`. A request with none, or with one that is not valid W3C
+/// trace context, starts a trace of its own rather than joining it; a
+/// request that sends one joins its trace.
+#[tokio::test]
+async fn every_response_carries_a_traceparent_and_only_a_valid_one_is_joined() {
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let (_reload, subscriber) = crate::tracing_init::for_tests(
+        crate::config::LogLevel::Info,
+        crate::tracing_init::Buf::default(),
+    );
+    let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+    let h = Harness::authed(&Coverage::new(), |_| {});
+    let read = h.tokens.read.clone();
+    let trace_of = |resp: &kynos::test::TestResponse| -> String {
+        let parent = resp.header("traceparent").expect("a traceparent");
+        let parts: Vec<&str> = parent.split('-').collect();
+        assert_eq!(parts.len(), 4, "{parent}");
+        assert_eq!(parts[0], "00", "{parent}");
+        assert_eq!(parts[1].len(), 32, "{parent}");
+        assert_eq!(parts[2].len(), 16, "{parent}");
+        parts[1].to_owned()
+    };
+
+    let mut own = std::collections::BTreeSet::new();
+    for headers in [
+        &[][..],
+        &[("traceparent", "not-a-traceparent")][..],
+        // An all-zero trace id is invalid W3C trace context.
+        &[(
+            "traceparent",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        )][..],
+    ] {
+        let resp = h
+            .send_with("GET", "/v1/server", Some(&read), None, headers)
+            .await;
+        let trace = trace_of(&resp);
+        assert_ne!(trace, TRACE_ID);
+        assert_ne!(trace, "0".repeat(32), "{headers:?}");
+        own.insert(trace);
+    }
+    assert_eq!(own.len(), 3, "each request its own trace: {own:?}");
+
+    let joined = format!("00-{TRACE_ID}-00f067aa0ba902b7-01");
+    let resp = h
+        .send_with(
+            "GET",
+            "/v1/server",
+            Some(&read),
+            None,
+            &[("traceparent", &joined)],
+        )
+        .await;
+    assert_eq!(trace_of(&resp), TRACE_ID);
+
+    let unknown = h
+        .send_with(
+            "GET",
+            "/v1/nowhere",
+            None,
+            None,
+            &[("traceparent", &joined)],
+        )
+        .await;
+    assert_eq!(unknown.status().as_u16(), 404);
+    assert_eq!(trace_of(&unknown), TRACE_ID);
 }
 
 #[tokio::test]
@@ -289,11 +382,41 @@ async fn an_events_stream_opened_after_the_shutdown_ends_at_once() {
     assert!(resp.events().is_empty(), "nothing is sent once shut down");
 }
 
+/// The probes need no credential and answer whatever `Host` a kubelet or a
+/// load balancer sends: a daemon without `[auth]` refuses a foreign `Host`
+/// on every `/v1` operation, never on a probe.
+#[tokio::test]
+async fn the_probes_answer_a_foreign_host_without_a_credential() {
+    let h = Harness::new(
+        &Coverage::new(),
+        crate::app_state::build_test_state(None),
+        Default::default(),
+    );
+    let refused = h
+        .send_with(
+            "GET",
+            "/v1/status",
+            None,
+            None,
+            &[("host", "10.0.0.7:8080")],
+        )
+        .await;
+    assert_eq!(refused.status().as_u16(), 403, "the check is on");
+    for path in ["/livez", "/readyz", "/healthz"] {
+        let resp = h
+            .send_with("GET", path, None, None, &[("host", "10.0.0.7:8080")])
+            .await;
+        resp.assert_status(kynos::http::StatusCode::OK);
+    }
+}
+
 #[tokio::test]
 async fn every_response_carries_the_shared_headers_and_its_own_request_id() {
     let h = Harness::authed(&Coverage::new(), |_| {});
     let mut ids = std::collections::BTreeSet::new();
     for (method, path, token) in [
+        ("GET", "/livez", None),
+        ("GET", "/readyz", None),
         ("GET", "/healthz", None),
         ("GET", "/v1/openapi.json", None),
         ("GET", "/metrics", Some(h.tokens.metrics.clone())),

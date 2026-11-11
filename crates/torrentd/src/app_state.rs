@@ -54,8 +54,16 @@ pub struct AppState {
     /// A `.torrent` add holds its first check here, and a recheck queues.
     pub checks: Arc<crate::check_queue::VerifyQueue>,
     /// Alert-loop liveness stamp (Unix millis at its last iteration). Read by
-    /// `/healthz` so a wedged loop makes the daemon report unready.
+    /// `/livez` and `/readyz` so a wedged loop makes the daemon report both
+    /// wedged and unready.
     pub alert_heartbeat: Arc<AtomicU64>,
+    /// The runtime's liveness stamp (Unix millis), which the supervised task
+    /// `runtime_tick` refreshes twice a second. Read by `/livez`: stale, the
+    /// runtime's scheduler or timer is starved.
+    pub runtime_tick: Arc<AtomicU64>,
+    /// How far the boot has got: `/readyz` answers `starting` until it says
+    /// the boot is done.
+    pub boot: Arc<BootProgress>,
     /// Save path used when `POST /v1/torrents` omits `save_path`.
     pub default_save_path: PathBuf,
     /// Root of the `.torrent` store on disk: every profile's directory without
@@ -112,6 +120,90 @@ pub struct AppState {
     /// `kill_switch_dns_servers` outside the tunnels, as the readiness
     /// report and `kill_switch_dns_exempt` say. Fixed at boot.
     pub kill_switch_dns_exempt: bool,
+}
+
+/// How long after the API state is built `/readyz` keeps answering
+/// `starting` for torrents the boot loaded that have not reached the state
+/// map. Matches the boot re-drive's wait for the same set: a torrent whose
+/// add never lands must not hold the daemon out of rotation for good.
+pub const BOOT_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether the boot has finished, as `/readyz` reads it.
+///
+/// The boot hands every resume file and `.torrent` it loads to a session,
+/// and each reaches the state map only when the session's add alert does.
+/// Until the HTTP stage is up and every one of them is there - or
+/// [`BOOT_SETTLE_DEADLINE`] passes - the daemon is starting: it answers, but
+/// what it reports is not yet the whole of what it seeds.
+///
+/// Read lazily, by the probe itself: no task watches the state map.
+#[derive(Debug)]
+pub struct BootProgress {
+    /// Set once the API listener is bound and about to serve.
+    serving: std::sync::atomic::AtomicBool,
+    /// Latched once the boot is done; never cleared.
+    settled: std::sync::atomic::AtomicBool,
+    /// Info-hashes the boot loaded and the state map did not hold when last
+    /// read.
+    pending: Mutex<Vec<InfoHash>>,
+    /// When the probe stops waiting for `pending`.
+    deadline: std::time::Instant,
+}
+
+impl BootProgress {
+    /// A boot that loaded `loaded`, whose torrents the probe waits for for
+    /// at most `within` from now.
+    pub fn new(loaded: Vec<InfoHash>, within: std::time::Duration) -> Self {
+        Self {
+            serving: std::sync::atomic::AtomicBool::new(false),
+            settled: std::sync::atomic::AtomicBool::new(false),
+            pending: Mutex::new(loaded),
+            deadline: std::time::Instant::now() + within,
+        }
+    }
+
+    /// A boot already done, for a state no boot built.
+    #[cfg(test)]
+    pub(crate) fn finished() -> Self {
+        let boot = Self::new(Vec::new(), std::time::Duration::ZERO);
+        boot.mark_serving();
+        boot
+    }
+
+    /// The HTTP stage is up.
+    pub fn mark_serving(&self) {
+        self.serving
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the daemon is still starting: the HTTP stage is not up yet,
+    /// or a torrent the boot loaded is not yet in `state` and the deadline
+    /// has not passed. Once false, false for good.
+    pub fn is_starting(&self, state: &StateMap) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.settled.load(Ordering::SeqCst) {
+            return false;
+        }
+        if !self.serving.load(Ordering::SeqCst) {
+            return true;
+        }
+        let mut pending = self.pending.lock();
+        pending.retain(|ih| !state.contains(ih));
+        if !pending.is_empty() && std::time::Instant::now() < self.deadline {
+            return true;
+        }
+        if !pending.is_empty() {
+            tracing::warn!(
+                target: "torrentd::startup",
+                missing = pending.len(),
+                "not every torrent the boot loaded reached the state map in time; \
+                 /readyz stops answering starting anyway",
+            );
+            pending.clear();
+        }
+        self.settled.store(true, Ordering::SeqCst);
+        false
+    }
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
@@ -326,6 +418,13 @@ pub(crate) fn build_test_state_with_sessions(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         )),
+        runtime_tick: Arc::new(AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )),
+        boot: Arc::new(BootProgress::finished()),
         default_save_path: std::env::temp_dir(),
         torrent_dir: std::env::temp_dir(),
         reload_tx: None,
@@ -458,6 +557,43 @@ mod tests {
             "a profile's own torrent_dir is the daemon's torrent store too"
         );
         assert!(!confined(&elsewhere.path().join("a.torrent")));
+    }
+
+    /// Starting until the HTTP stage is up and every torrent the boot loaded
+    /// is in the state map; done for good after that.
+    #[test]
+    fn the_boot_is_starting_until_serving_and_every_loaded_torrent_is_in_the_state_map() {
+        let ih = InfoHash([3; 20]);
+        let state = StateMap::new();
+        let boot = BootProgress::new(vec![ih], std::time::Duration::from_secs(600));
+        assert!(boot.is_starting(&state), "not serving yet");
+        boot.mark_serving();
+        assert!(boot.is_starting(&state), "the loaded torrent is not there");
+        let h = torrentd_engine::TorrentHandle {
+            id: 3,
+            infohash: ih,
+        };
+        state.insert(
+            ih,
+            torrentd_engine::TorrentState::newly_added(
+                h,
+                ProfileId::new("p"),
+                std::time::Instant::now(),
+            ),
+        );
+        assert!(!boot.is_starting(&state));
+        state.remove(&ih, &ProfileId::new("p"), None);
+        assert!(!boot.is_starting(&state), "latched");
+    }
+
+    /// A torrent whose add never lands stops holding the boot open at the
+    /// deadline.
+    #[test]
+    fn the_boot_stops_waiting_for_a_missing_torrent_at_its_deadline() {
+        let state = StateMap::new();
+        let boot = BootProgress::new(vec![InfoHash([4; 20])], std::time::Duration::ZERO);
+        boot.mark_serving();
+        assert!(!boot.is_starting(&state));
     }
 
     #[test]

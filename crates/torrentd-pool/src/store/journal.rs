@@ -12,6 +12,7 @@ use crate::model::PlanStepRow;
 use crate::model::PoolError;
 
 impl PoolStore {
+    #[tracing::instrument(name = "pool_store.create_plan", level = "debug", skip_all, fields(kind = kind), err(level = "debug"))]
     pub fn create_plan(&self, kind: &str, spec: &str, created_at: i64) -> Result<i64, PoolError> {
         self.conn.execute(
             "INSERT INTO plan(kind, created_at, status, spec) VALUES (?1,?2,'draft',?3)",
@@ -20,6 +21,7 @@ impl PoolStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    #[tracing::instrument(name = "pool_store.add_plan_steps", level = "debug", skip_all, fields(plan_id = plan_id, steps = steps.len()), err(level = "debug"))]
     pub fn add_plan_steps(&mut self, plan_id: i64, steps: &[PlanStep]) -> Result<(), PoolError> {
         let tx = self.conn.savepoint()?;
         {
@@ -35,6 +37,7 @@ impl PoolStore {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pool_store.plan", level = "debug", skip_all, fields(plan_id = id), err(level = "debug"))]
     pub fn plan(&self, id: i64) -> Result<Option<PlanRow>, PoolError> {
         Ok(self
             .conn
@@ -55,6 +58,12 @@ impl PoolStore {
             .optional()?)
     }
 
+    #[tracing::instrument(
+        name = "pool_store.plans",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn plans(&self) -> Result<Vec<PlanRow>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT id, kind, created_at, applied_at, status, spec FROM plan ORDER BY id DESC",
@@ -74,6 +83,12 @@ impl PoolStore {
 
     /// Plans left mid-apply by a crash or a kill, in id order so the oldest is
     /// resumed first.
+    #[tracing::instrument(
+        name = "pool_store.unfinished_plans",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn unfinished_plans(&self) -> Result<Vec<PlanRow>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT id, kind, created_at, applied_at, status, spec
@@ -92,6 +107,7 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    #[tracing::instrument(name = "pool_store.set_plan_status", level = "debug", skip_all, fields(plan_id = id, status = status), err(level = "debug"))]
     pub fn set_plan_status(
         &self,
         id: i64,
@@ -117,6 +133,7 @@ impl PoolStore {
     /// what a crash leaves behind. Only the startup re-drive passes it: for an
     /// API request `applying` means another caller is mid-apply right now, and
     /// admitting it would be the very race this exists to prevent.
+    #[tracing::instrument(name = "pool_store.claim_plan_for_apply", level = "debug", skip_all, fields(plan_id = id, resume = resume), err(level = "debug"))]
     pub fn claim_plan_for_apply(&self, id: i64, resume: bool) -> Result<bool, PoolError> {
         use crate::model::plan_status as ps;
         let changed = if resume {
@@ -144,6 +161,7 @@ impl PoolStore {
     /// third apply would then run the same steps alongside the first. Returns
     /// whether the plan was parked; `false` means it is no longer this
     /// caller's to touch.
+    #[tracing::instrument(name = "pool_store.fail_unclaimed_plan", level = "debug", skip_all, fields(plan_id = id, resume = resume), err(level = "debug"))]
     pub fn fail_unclaimed_plan(&self, id: i64, resume: bool) -> Result<bool, PoolError> {
         use crate::model::plan_status as ps;
         let changed = if resume {
@@ -168,6 +186,7 @@ impl PoolStore {
     /// apply went on moving files. One transaction for the plan and its
     /// steps, so a process dying between the two leaves no orphaned
     /// `plan_step` rows.
+    #[tracing::instrument(name = "pool_store.delete_plan", level = "debug", skip_all, fields(plan_id = id), err(level = "debug"))]
     pub fn delete_plan(&mut self, id: i64) -> Result<PlanDelete, PoolError> {
         use crate::model::plan_status as ps;
         let tx = self.conn.savepoint()?;
@@ -194,6 +213,7 @@ impl PoolStore {
         Ok(outcome)
     }
 
+    #[tracing::instrument(name = "pool_store.plan_steps", level = "debug", skip_all, fields(plan_id = plan_id), err(level = "debug"))]
     pub fn plan_steps(&self, plan_id: i64) -> Result<Vec<PlanStepRow>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT seq, op, src, dst, status, error FROM plan_step
@@ -215,6 +235,7 @@ impl PoolStore {
     /// Up to `limit` steps of `plan_id` after `after_seq` (from the first
     /// when `None`), in `seq` order: one page, read off the primary key
     /// whatever the plan's size.
+    #[tracing::instrument(name = "pool_store.plan_steps_page", level = "debug", skip_all, fields(plan_id = plan_id, limit = limit), err(level = "debug"))]
     pub fn plan_steps_page(
         &self,
         plan_id: i64,
@@ -241,17 +262,19 @@ impl PoolStore {
 
     /// How many of `plan_id`'s steps stand in each status, as `(status,
     /// count)` pairs in status order. A status no step holds is absent.
+    #[tracing::instrument(name = "pool_store.plan_step_counts", level = "debug", skip_all, fields(plan_id = plan_id), err(level = "debug"))]
     pub fn plan_step_counts(&self, plan_id: i64) -> Result<Vec<(String, u64)>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT status, count(*) FROM plan_step WHERE plan_id = ?1
              GROUP BY status ORDER BY status",
         )?;
         let rows = st.query_map(params![plan_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    #[tracing::instrument(name = "pool_store.set_step_status", level = "debug", skip_all, fields(plan_id = plan_id, step = seq, status = status), err(level = "debug"))]
     pub fn set_step_status(
         &self,
         plan_id: i64,
@@ -270,6 +293,7 @@ impl PoolStore {
     /// `(seq, status, error)`, in one transaction: one commit, so one WAL
     /// fsync, however many steps it records. Either every row is written or
     /// none is.
+    #[tracing::instrument(name = "pool_store.set_steps_status", level = "debug", skip_all, fields(plan_id = plan_id, steps = steps.len()), err(level = "debug"))]
     pub fn set_steps_status(
         &mut self,
         plan_id: i64,

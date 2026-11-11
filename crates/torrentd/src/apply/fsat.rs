@@ -143,6 +143,10 @@ pub fn stat_nofollow(dir: &File, name: &str) -> io::Result<std::fs::Metadata> {
 /// `renameat2(RENAME_NOREPLACE)`: refuses rather than overwrites.
 pub fn rename_noreplace(from: &File, a: &str, to: &File, b: &str) -> io::Result<()> {
     let (a, b) = (cname(a)?, cname(b)?);
+    #[cfg(test)]
+    if FAIL_RENAME_NOREPLACE.get() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
     // SAFETY: valid directory fds and NUL-terminated names.
     let rc = unsafe {
         libc::renameat2(
@@ -175,12 +179,89 @@ pub fn fsync(dir: &File) -> io::Result<()> {
     dir.sync_all()
 }
 
+/// The scratch directory [`probe_mutations`] makes, and removes, in a root.
+pub const PROBE_DIR: &str = ".torrentd-mutation-probe";
+
+/// Why [`probe_mutations`] found a root unable to take mutations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeFailure {
+    /// The scratch directory could not be made, written in, or removed.
+    ScratchDir,
+    /// `renameat2(RENAME_NOREPLACE)` failed, or replaced an existing name.
+    RenameNoreplace,
+    /// `fsync(2)` on a directory failed.
+    DirFsync,
+}
+
+impl ProbeFailure {
+    /// Every reason, as `pool_root_mutations_disabled` labels it.
+    pub const ALL: &'static [&'static str] = &["scratch_dir", "rename_noreplace", "dir_fsync"];
+
+    /// The `reason` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeFailure::ScratchDir => "scratch_dir",
+            ProbeFailure::RenameNoreplace => "rename_noreplace",
+            ProbeFailure::DirFsync => "dir_fsync",
+        }
+    }
+}
+
+/// Whether `root` can take what a plan's steps do to it: in a scratch
+/// directory [`PROBE_DIR`] beneath it, a `renameat2(RENAME_NOREPLACE)` that
+/// renames, one onto an existing name that is refused, and an `fsync` of the
+/// directory. The scratch directory is removed afterwards, whatever the
+/// outcome; one a previous probe left behind is removed first. The error
+/// beside the reason is what failed.
+pub fn probe_mutations(root: &Path) -> Result<(), (ProbeFailure, io::Error)> {
+    let scratch = root.join(PROBE_DIR);
+    let outcome = probe_in(root, &scratch);
+    let cleanup = match std::fs::remove_dir_all(&scratch) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err((ProbeFailure::ScratchDir, e)),
+        _ => Ok(()),
+    };
+    outcome.and(cleanup)
+}
+
+fn probe_in(root: &Path, scratch: &Path) -> Result<(), (ProbeFailure, io::Error)> {
+    let scratch_err = |e| (ProbeFailure::ScratchDir, e);
+    match std::fs::remove_dir_all(scratch) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(scratch_err(e)),
+        _ => {}
+    }
+    let start = File::open(root).map_err(scratch_err)?;
+    let dir = walk(&start, &[PROBE_DIR], true)
+        .map_err(scratch_err)?
+        .dir
+        .ok_or_else(|| scratch_err(io::Error::other("the scratch directory was not opened")))?;
+    for name in ["a", "c"] {
+        File::create(scratch.join(name)).map_err(scratch_err)?;
+    }
+    let rename_err = |e| (ProbeFailure::RenameNoreplace, e);
+    rename_noreplace(&dir, "a", &dir, "b").map_err(rename_err)?;
+    match rename_noreplace(&dir, "b", &dir, "c") {
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+        Err(e) => return Err(rename_err(e)),
+        Ok(()) => {
+            return Err(rename_err(io::Error::other(
+                "RENAME_NOREPLACE replaced an existing name",
+            )));
+        }
+    }
+    fsync(&dir).map_err(|e| (ProbeFailure::DirFsync, e))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Fails every [`fsync`] on this thread with `EIO`, for the tests of
     /// a rename or storage move that happened but could not be made
     /// durable.
     pub static FAIL_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Fails every [`rename_noreplace`] on this thread with `EINVAL`, as a
+    /// filesystem without `RENAME_NOREPLACE` (NFS, CIFS, many FUSE ones)
+    /// answers it.
+    pub static FAIL_RENAME_NOREPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// The `(device, inode)` of every directory or file [`fsync`] was
     /// called on, on this thread, in order, for the tests of what a step
