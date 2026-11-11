@@ -1583,7 +1583,10 @@ mod native {
         // The table is named from the link's ifindex, so it is read while the
         // link still exists.
         let table = route::table_for(iface).ok();
+        // The rule deletions end on `ip`'s non-zero "no rule left", which is
+        // an answer and not a failure, so they run uncounted.
         down_with(iface, table, |args| match args.split_first() {
+            Some(_) if args.get(2) == Some(&"rule") => route::del_rule(args),
             Some((program, rest)) => run(program, rest, None),
             None => Ok(()),
         });
