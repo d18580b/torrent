@@ -58,14 +58,17 @@ pub(crate) fn in_parallel<I: Sync, T: Send>(
         groups.iter().for_each(|g| work(g));
     } else {
         let next = AtomicUsize::new(0);
-        let span = tracing::Span::current();
+        // The request's span and subscriber, so each worker's log lines are
+        // the request's.
+        let carried = crate::startup::tasks::Carried::current();
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
-                    let _entered = span.enter();
-                    while let Some(group) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        work(group);
-                    }
+                    carried.run(|| {
+                        while let Some(group) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            work(group);
+                        }
+                    });
                 });
             }
         });

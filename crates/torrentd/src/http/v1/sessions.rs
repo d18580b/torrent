@@ -232,17 +232,18 @@ pub async fn create_session(
     // runtime is serving. A join failure (the KDF panicked) never
     // authenticates.
     let verifier = auth.clone();
-    let verified = tokio::task::spawn_blocking(move || verifier.verify_password(&body.password))
-        .await
-        .unwrap_or_else(|e| {
-            warn!(
-                target: "torrentd::auth",
-                client_ip,
-                error.cause = %e,
-                "password verification task failed",
-            );
-            false
-        });
+    let verified =
+        crate::startup::tasks::spawn_blocking(move || verifier.verify_password(&body.password))
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "torrentd::auth",
+                    client_ip,
+                    error.cause = %e,
+                    "password verification task failed",
+                );
+                false
+            });
     if !verified {
         auth.throttle.note_failure(client.ip);
         // No detail about which part was wrong, and no username to enumerate.

@@ -868,7 +868,7 @@ fn no_egress_flag_means_no_egress_line() {
 fn rp_filter_is_judged_on_the_pair_the_kernel_actually_uses() {
     // The kernel takes max(conf/all, conf/<iface>): all = 0 with the
     // interface at 1 is strict.
-    let c = judge_rp_filter("wg-acct-a", Some("0"), Some("1"));
+    let c = judge_rp_filter("wg-acct-a", Some("0"), Some("1"), None);
     assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
     assert!(c.detail.contains("effective 1"), "detail: {}", c.detail);
     assert!(
@@ -879,20 +879,93 @@ fn rp_filter_is_judged_on_the_pair_the_kernel_actually_uses() {
 
     // The converse: all = 1 with the interface at 2 is loose and healthy,
     // and used to FAIL and take the exit code with it.
-    let c = judge_rp_filter("wg-acct-a", Some("1"), Some("2"));
+    let c = judge_rp_filter("wg-acct-a", Some("1"), Some("2"), None);
     assert_eq!(c.verdict, Verdict::Pass, "detail: {}", c.detail);
     assert!(c.detail.contains("effective 2"), "detail: {}", c.detail);
 
     // Both loose, the documented configuration.
     assert_eq!(
-        judge_rp_filter("wg-acct-a", Some("2"), Some("2")).verdict,
+        judge_rp_filter("wg-acct-a", Some("2"), Some("2"), None).verdict,
         Verdict::Pass,
     );
     // Both strict.
     assert_eq!(
-        judge_rp_filter("wg-acct-a", Some("1"), Some("1")).verdict,
+        judge_rp_filter("wg-acct-a", Some("1"), Some("1"), None).verdict,
         Verdict::Fail,
     );
+    // A link that exists is judged on its own value: `default` at 1 does not
+    // make a loose interface strict.
+    assert_eq!(
+        judge_rp_filter("wg-acct-a", Some("0"), Some("2"), Some("1")).verdict,
+        Verdict::Pass,
+    );
+}
+
+#[test]
+fn a_link_not_yet_created_is_judged_on_the_default_it_will_take() {
+    // Strict: `all` reads clean, but the interface is created at 1.
+    let c = judge_rp_filter("wg-acct-a", Some("0"), None, Some("1"));
+    assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+    assert!(
+        c.detail.contains("net.ipv4.conf.default.rp_filter"),
+        "the sysctl the value came from is named: {}",
+        c.detail,
+    );
+    // Loose: `all` at 2 outweighs a strict default.
+    assert_eq!(
+        judge_rp_filter("wg-acct-a", Some("2"), None, Some("1")).verdict,
+        Verdict::Pass,
+    );
+    // Off on both: no filtering at all.
+    assert_eq!(
+        judge_rp_filter("wg-acct-a", Some("0"), None, Some("0")).verdict,
+        Verdict::Pass,
+    );
+}
+
+#[test]
+fn rp_filter_check_reads_the_default_only_for_a_link_that_is_not_there() {
+    let reads = Mutex::new(Vec::new());
+    let sysctls = |values: &'static [(&'static str, &'static str)]| {
+        let reads = &reads;
+        move |path: &str| {
+            reads.lock().unwrap().push(path.to_string());
+            values
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, v)| (*v).to_string())
+        }
+    };
+    const ALL: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
+    const IFACE: &str = "/proc/sys/net/ipv4/conf/wg-acct-a/rp_filter";
+    const DEFAULT: &str = "/proc/sys/net/ipv4/conf/default/rp_filter";
+
+    // Strict on the link itself.
+    let c = rp_filter_check(
+        "wg-acct-a",
+        sysctls(&[(ALL, "0"), (IFACE, "1"), (DEFAULT, "2")]),
+    );
+    assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+    assert!(
+        !reads.lock().unwrap().iter().any(|p| p == DEFAULT),
+        "an existing link's own value decides; default is not read",
+    );
+
+    // Loose on the link itself.
+    let c = rp_filter_check("wg-acct-a", sysctls(&[(ALL, "1"), (IFACE, "2")]));
+    assert_eq!(c.verdict, Verdict::Pass, "detail: {}", c.detail);
+
+    // Unset: no link yet, so the default decides, strict and loose.
+    reads.lock().unwrap().clear();
+    let c = rp_filter_check("wg-acct-a", sysctls(&[(ALL, "0"), (DEFAULT, "1")]));
+    assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+    assert!(reads.lock().unwrap().iter().any(|p| p == DEFAULT));
+    let c = rp_filter_check("wg-acct-a", sysctls(&[(ALL, "0"), (DEFAULT, "2")]));
+    assert_eq!(c.verdict, Verdict::Pass, "detail: {}", c.detail);
+
+    // Nothing readable at all is unestablished, never a pass.
+    let c = rp_filter_check("wg-acct-a", sysctls(&[]));
+    assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
 }
 
 #[test]
@@ -906,7 +979,7 @@ fn an_rp_filter_value_that_cannot_be_read_or_parsed_is_not_a_pass() {
         (Some("banana"), Some("2")),
         (Some("2"), Some("")),
     ] {
-        let c = judge_rp_filter("wg-acct-a", all, iface);
+        let c = judge_rp_filter("wg-acct-a", all, iface, None);
         assert_eq!(
             c.verdict,
             Verdict::Unknown,

@@ -197,7 +197,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    match crate::startup::tasks::spawn_blocking(f).await {
         Ok(v) => v,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         // Only a runtime shutting down cancels a blocking task, and then the

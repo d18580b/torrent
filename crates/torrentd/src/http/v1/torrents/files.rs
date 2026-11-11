@@ -272,7 +272,10 @@ async fn blocking_files(
     limit: u32,
 ) -> Result<Option<torrentd_engine::FilePage>, FilesFailure> {
     let engine = Arc::clone(engine);
-    match tokio::task::spawn_blocking(move || engine.torrent_files_page(handle, start, limit)).await
+    match crate::startup::tasks::spawn_blocking(move || {
+        engine.torrent_files_page(handle, start, limit)
+    })
+    .await
     {
         Ok(Ok(files)) => Ok(files),
         Ok(Err(e)) => Err(FilesFailure::Engine(e)),

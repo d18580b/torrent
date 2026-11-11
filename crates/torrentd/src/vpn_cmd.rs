@@ -442,7 +442,17 @@ fn link_type_is_wireguard(ip_detail: &str) -> Option<bool> {
 /// Each argument is the raw file contents, or `None` if the file could not be
 /// read. An unparseable value is `unknown`: the previous `Some(v) => pass` arm
 /// passed anything that was not the literal `"1"`, including nonsense.
-fn judge_rp_filter(iface: &str, all: Option<&str>, per_iface: Option<&str>) -> Check {
+///
+/// `default` stands in for `per_iface` only where that is unread: a link not
+/// yet created has no `conf/<iface>` of its own, and takes `conf/default`'s
+/// value when it is created. A link that exists is judged on its own value,
+/// whatever `default` says.
+fn judge_rp_filter(
+    iface: &str,
+    all: Option<&str>,
+    per_iface: Option<&str>,
+    default: Option<&str>,
+) -> Check {
     fn mode(v: u8) -> &'static str {
         match v {
             0 => "off",
@@ -460,7 +470,13 @@ fn judge_rp_filter(iface: &str, all: Option<&str>, per_iface: Option<&str>) -> C
         }
     };
     let all_path = "net.ipv4.conf.all.rp_filter";
-    let iface_path = format!("net.ipv4.conf.{iface}.rp_filter");
+    let (iface_path, per_iface) = match (per_iface, default) {
+        (None, Some(d)) => (
+            format!("net.ipv4.conf.default.rp_filter (which {iface} takes when it is created)"),
+            Some(d),
+        ),
+        _ => (format!("net.ipv4.conf.{iface}.rp_filter"), per_iface),
+    };
     let (a, i) = match (read(all_path, all), read(&iface_path, per_iface)) {
         (Ok(a), Ok(i)) => (a, i),
         (Err(e), _) | (_, Err(e)) => {
@@ -486,6 +502,22 @@ fn judge_rp_filter(iface: &str, all: Option<&str>, per_iface: Option<&str>) -> C
     } else {
         Check::pass("rp_filter", detail)
     }
+}
+
+/// [`judge_rp_filter`] for `iface`, its sysctls read through `read`, which
+/// takes a `/proc/sys` path and answers `None` where the file cannot be read.
+///
+/// `conf/default` is read only where `conf/<iface>` is not, since only a link
+/// not yet created is judged on it. `vpn check` and the daemon's boot both
+/// judge a profile's interface through this, so the two cannot disagree.
+pub(crate) fn rp_filter_check(iface: &str, read: impl Fn(&str) -> Option<String>) -> Check {
+    let all = read("/proc/sys/net/ipv4/conf/all/rp_filter");
+    let per = read(&format!("/proc/sys/net/ipv4/conf/{iface}/rp_filter"));
+    let default = match per {
+        Some(_) => None,
+        None => read("/proc/sys/net/ipv4/conf/default/rp_filter"),
+    };
+    judge_rp_filter(iface, all.as_deref(), per.as_deref(), default.as_deref())
 }
 
 /// The uid the kill-switch ruleset would confine.
@@ -1157,9 +1189,9 @@ fn profile_checks(
     //     `/proc/sys/net/ipv4/conf/<iface>/rp_filter` does not exist until the
     //     interface does. Reading it before `--bring-up` raised the tunnel
     //     reported `unknown` for the one interface the run was about.
-    let all = host.read_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter");
-    let per = host.read_sysctl(&format!("/proc/sys/net/ipv4/conf/{iface}/rp_filter"));
-    checks.push(judge_rp_filter(iface, all.as_deref(), per.as_deref()));
+    //     An interface that is not there (no `--bring-up`) is judged on
+    //     `conf/default`, the value it will take when it is created.
+    checks.push(rp_filter_check(iface, |path| host.read_sysctl(path)));
 
     // 4. The address the daemon would bind every socket in this profile to.
     let tunnel_ip = match host.first_ipv4(iface) {

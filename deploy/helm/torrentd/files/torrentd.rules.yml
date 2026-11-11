@@ -1,0 +1,730 @@
+# Alert rules for torrentd. Every series read here is in ../metrics.md, and
+# every alert has a fixture in torrentd.rules.test.yml:
+#
+#   promtool test rules deploy/prometheus/torrentd.rules.test.yml
+#   mise run test-alerts      # the same, in a container
+#
+# Severity:
+#   critical  seeding has stopped, or a safety guarantee no longer holds
+#   warning   something failed and an operator should look
+#   info      worth knowing; routine on some trackers
+#
+# `increase(x[15m]) > 0` fires on the first evaluation after an event and
+# resolves 15 minutes after the last one. Why a counter a boot moves is also
+# read through its boot gauge (`or boot_gauge > 0`, holding for
+# the life of the process), and a first-event series matched on its
+# appearance (`or (x unless x offset 15m)`), is the Present column of
+# ../metrics.md.
+
+groups:
+  - name: torrentd_runtime
+    rules:
+      # ---- the daemon itself -------------------------------------------
+      - alert: TorrentdDown
+        expr: up{job="torrentd"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "torrentd on {{ $labels.instance }} is not answering scrapes"
+
+      - alert: TorrentdRestarted
+        # A crash loop: the process started more than twice in an hour. One
+        # restart is a deploy or an upgrade, and two an operator retrying
+        # one; a third is not. A process that dies before its first scrape
+        # leaves no start time to change, so a loop that fast is
+        # TorrentdDown's. The panic and ERROR-line alerts name the cause.
+        expr: changes(torrentd_process_start_time_seconds[1h]) > 2
+        labels:
+          severity: warning
+        annotations:
+          summary: "torrentd on {{ $labels.instance }} restarted {{ $value }} times in the last hour; it is crash-looping"
+
+      - alert: TorrentdAlertLoopStalled
+        expr: torrentd_alert_loop_heartbeat_age_seconds > 15
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The alert loop has not advanced for {{ $value }}s; seeding, resume saves and status updates have stopped"
+
+      - alert: TorrentdTaskDown
+        expr: torrentd_task_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Background task {{ $labels.task }} has exited or panicked; what it watched is no longer watched"
+
+      - alert: TorrentdPanicked
+        # Any panic, on any thread, caught or not. Whatever it stopped may
+        # have no series of its own (a batch writer, a fence lift), so the
+        # panic is the alert; its ERROR line (target torrentd::panic_hook)
+        # names the location. A panic during the boot is in the first
+        # sample, so the boot gauge carries it.
+        expr: >
+          increase(torrentd_panics_total[15m]) > 0
+          or torrentd_boot_panics > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A torrentd thread ({{ $labels.thread }}) panicked; read the panic line in its log"
+
+      - alert: TorrentdFfiErrors
+        # The libtorrent shim caught a C++ exception in a call that returns
+        # nothing (posting torrent updates or session stats, destroying a
+        # session), so the call did not do what it was asked and nothing
+        # else reports it. The WARN line (target torrentd::metrics) carries
+        # the exception's message. One caught during the boot is in the
+        # first sample, so the boot gauge carries it.
+        expr: >
+          increase(torrentd_ffi_errors_total[15m]) > 0
+          or torrentd_boot_ffi_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "libtorrent threw in {{ $labels.call }} and the shim swallowed it; read the WARN line naming the exception"
+
+      - alert: TorrentdExternalCommandFailures
+        # A host tool (ip, wg, nft, openvpn, kill) could not start, did not
+        # finish within its bound, or exited non-zero where the caller
+        # required a zero exit. The WARN line (target torrentd::vpn::exec)
+        # carries the command and its stderr. The kill switch and the tunnels
+        # are set up by the boot, so one failing then is in the first
+        # sample, and the boot gauge carries it.
+        expr: >
+          increase(torrentd_external_command_failures_total[15m]) > 0
+          or torrentd_boot_external_command_failures > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.program }} failed; read the WARN line naming the command and its stderr"
+
+      - alert: TorrentdMetricsDropped
+        expr: >
+          increase(torrentd_metrics_dropped_samples_total[15m]) > 0
+          or torrentd_boot_metrics_dropped_samples > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The exporter dropped samples ({{ $labels.reason }}); some series are missing or stale"
+
+      - alert: TorrentdErrorsLogged
+        # Any line logged at ERROR, by the module that logged it: the
+        # catch-all for an error path no series of its own reports. Many
+        # ERROR lines also fire an alert of their own; this one names whose
+        # log to read. An ERROR the boot logged is in the first sample, so
+        # the boot gauge carries it.
+        expr: >
+          increase(torrentd_log_events_total{level="error"}[15m]) > 0
+          or torrentd_boot_log_events{level="error"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "torrentd logged ERROR lines under {{ $labels.target }}; read its log for them"
+
+      - alert: TorrentdWarningsElevated
+        # WARN lines over the last 15 minutes at more than three times the
+        # daemon's own rate over the day before them, and at least 10 of
+        # them, held for 15 minutes. Some WARN lines are routine (a tracker
+        # that stops answering), so the baseline is the daemon's own rather
+        # than a fixed number, and the floor keeps a quiet daemon's first
+        # few warnings from firing it. Without the day before (a daemon not
+        # scraped for 15 minutes yet) there is no baseline and no alert.
+        expr: |
+          sum by (instance, job) (rate(torrentd_log_events_total{level="warn"}[15m]))
+            >
+          3 * sum by (instance, job) (rate(torrentd_log_events_total{level="warn"}[1d] offset 15m))
+            and on (instance, job)
+          sum by (instance, job) (increase(torrentd_log_events_total{level="warn"}[15m])) >= 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "torrentd is logging WARN lines at over three times its rate of the day before; torrentd_log_events_total by target names the module"
+
+      - alert: TorrentdUnready
+        # The `no_sessions` and `all_profiles_fenced` cases of /healthz's 503,
+        # from the scrape rather than a probe: every configured profile either
+        # got no session at boot or is a vpn profile whose tunnel is down. A
+        # host profile is never fenced, so one live host profile keeps this
+        # quiet, as it keeps /healthz at 200. The third 503, a stalled alert
+        # loop, is TorrentdAlertLoopStalled.
+        expr: |
+          count by (instance, job) (torrentd_profile_boot_failed)
+            unless on (instance, job)
+          count by (instance, job) (
+            torrentd_profile_boot_failed == 0
+              unless on (instance, job, profile_id) (torrentd_profile_vpn_tunnel_up == 0)
+          )
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Every profile failed at boot or is fenced; the daemon is seeding nothing and /healthz answers 503"
+
+      # ---- profiles and tunnels ----------------------------------------
+      - alert: TorrentdProfileBootFailed
+        expr: torrentd_profile_boot_failed == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Profile {{ $labels.profile_id }} got no session at boot and is not seeding"
+
+      # The gauge goes to 0 whenever the profile is fenced: by the VPN monitor
+      # for its tunnel, by the kill-switch watch while the nftables table is
+      # missing or drifted, or at boot for a tunnel that never came up. A
+      # kill-switch fence whose lift found the tunnel failing the recovery
+      # check stays standing, and keeps this firing after
+      # TorrentdKillSwitchLost has resolved. It clears once the profile is
+      # set online on a healthy tunnel, or the kill-switch lift finds one.
+      - alert: TorrentdVpnTunnelDown
+        expr: torrentd_profile_vpn_tunnel_up == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s tunnel is down or it is fenced (by the VPN monitor, or a kill-switch fence its lift left standing); it seeds nothing until it is set online on a healthy tunnel, or restarted if it never came up"
+
+      - alert: TorrentdFencePauseFailed
+        expr: >
+          increase(torrentd_profile_fence_pause_errors_total[15m]) > 0
+          or torrentd_boot_fence_pause_errors > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fencing profile {{ $labels.profile_id }} failed to pause some torrents; they may still be seeding without the tunnel"
+
+      - alert: TorrentdHandshakeProbeUnavailable
+        expr: torrentd_profile_vpn_handshake_probe_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The WireGuard handshake probe cannot run for {{ $labels.profile_id }} (wg missing or unprivileged); while it has torrents to carry, 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
+
+      - alert: TorrentdTransferProbeUnavailable
+        # Once the transfer probe has failed three polls in a row, and for as
+        # long as it keeps failing, an aged handshake is judged on the time
+        # the profile has carried traffic rather than on the link's byte
+        # counters, so a dead peer is still fenced handshake_stale, and so
+        # may a quiet seed be.
+        expr: torrentd_profile_vpn_transfer_probe_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The WireGuard transfer probe cannot run for {{ $labels.profile_id }}; an aged handshake is judged on the profile's torrents alone, so a quiet seed may be fenced handshake_stale"
+
+      - alert: TorrentdRouteProbeUnavailable
+        # While the route probe cannot run (ip missing, denied, or timing out,
+        # or the address probe failing so it is never asked) route loss is not
+        # detected, but 3 such polls in a row fence the profile
+        # probe_unavailable, well inside this alert's `for`.
+        expr: torrentd_profile_vpn_route_probe_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The route probe cannot run for {{ $labels.profile_id }}; the tunnel's routing is not being checked, so 3 failed polls in a row (about 90s) fence it probe_unavailable; setting it online lifts the fence without waiting for the probe, so it is fenced again about 90s later unless the probe runs"
+
+      - alert: TorrentdHandshakeAgeRising
+        # The trend before the fence. WireGuard re-handshakes every two
+        # minutes while traffic flows, so a healthy tunnel's handshake age is
+        # a sawtooth averaging about a minute. An average past 90s over half
+        # an hour means handshakes are repeatedly late — a provider endpoint
+        # dropping initiations, or a path losing UDP — while each one still
+        # lands inside vpn_handshake_max_age_secs, so nothing has fenced yet.
+        # A stale handshake that does fence is TorrentdVpnTunnelDown.
+        # WireGuard handshakes only when it has a packet to send, so an idle
+        # profile's age rises without end while the tunnel stays healthy and
+        # unfenced. The resets() term asks that a handshake has landed in the
+        # last 10 minutes: a profile that stops carrying traffic drops out of
+        # the alert before its `for` elapses, rather than firing for as long
+        # as it stays idle.
+        expr: |
+          avg_over_time(torrentd_profile_vpn_handshake_age_seconds[30m]) > 90
+            and resets(torrentd_profile_vpn_handshake_age_seconds[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s WireGuard handshakes have averaged {{ $value | printf \"%.0f\" }}s old over 30 minutes; a healthy tunnel re-handshakes every 2 minutes"
+
+      - alert: TorrentdPortForwardDown
+        expr: torrentd_profile_port_forward_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }} holds no NAT-PMP lease; incoming connections are not forwarded"
+
+      - alert: TorrentdPortForwardRenewFailed
+        # Provider side: the gateway did not answer or refused the lease. The
+        # renewal is retried within seconds and one failure leaves the lease
+        # standing, so this is information; a lease actually lost is
+        # TorrentdPortForwardDown.
+        expr: >
+          increase(torrentd_profile_port_forward_failures_total{stage="renew"}[15m]) > 0
+          or torrentd_boot_port_forward_failures{stage="renew"} > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The NAT-PMP gateway did not renew profile {{ $labels.profile_id }}'s lease; a provider-side problem, retried in seconds"
+
+      - alert: TorrentdPortForwardRebindFailed
+        # Local side: the gateway named a new port and the session could not
+        # be rebound to it, so the session still listens on the old port.
+        expr: >
+          increase(torrentd_profile_port_forward_failures_total{stage="rebind"}[15m]) > 0
+          or torrentd_boot_port_forward_failures{stage="rebind"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s session could not be rebound to the port the gateway forwarded; it still listens on the old one"
+
+      - alert: TorrentdListenFailed
+        expr: torrentd_listen_failure_active == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s listen socket failed; it accepts no incoming connections"
+
+      - alert: TorrentdListenAcceptErrors
+        # Not a listen failure: libtorrent keeps listening and accepts again
+        # at once, dropping peers and lowering connections_limit meanwhile.
+        # The boot, when every profile's torrents start at once, is when a
+        # descriptor limit too low for the load is likeliest to show.
+        expr: >
+          increase(torrentd_listen_accept_errors_total[15m]) > 0
+          or torrentd_boot_listen_accept_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s listen socket ran out of file descriptors accepting peers ({{ $labels.errno }}); raise LimitNOFILE or lower connections_limit, see docs/running.md section 7"
+
+      # ---- kill switch -------------------------------------------------
+      - alert: TorrentdKillSwitchOff
+        # Every profile is vpn-backed, which is the only shape the daemon
+        # accepts the kill switch for, and it is not installed. Off is the
+        # default and a deliberate choice for an OpenVPN profile, which the
+        # kill switch refuses and these series cannot tell apart, so this is
+        # information rather than a page: silence it where off is intended.
+        expr: |
+          torrentd_kill_switch_active == 0
+            and on (instance, job)
+          (
+            count by (instance, job) (torrentd_profile_vpn_tunnel_up)
+              == on (instance, job)
+            count by (instance, job) (torrentd_profile_boot_failed)
+          )
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Every profile is vpn-backed but the nftables kill switch is off; the backstop confining egress to the tunnels is not installed"
+
+      - alert: TorrentdKillSwitchGone
+        expr: torrentd_kill_switch_active == 1 and torrentd_kill_switch_table_present == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "The nftables kill switch table is missing or no longer matches the rendered ruleset; the daemon's egress may no longer be confined to the tunnels"
+
+      # A loss the watch's reinstall repairs is over within one check, so
+      # TorrentdKillSwitchGone never sees it: the counter is its only trace.
+      # Each one left the daemon's egress unconfined for up to a check
+      # interval and fenced every vpn profile meanwhile. The watch starts
+      # before the boot scans, so a loss in them is in the boot gauge.
+      - alert: TorrentdKillSwitchLost
+        expr: >
+          increase(torrentd_kill_switch_lost_total[1h]) > 0
+          or torrentd_boot_kill_switch_lost > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A runtime check found the nftables kill switch table missing or drifted in the last hour or during the boot; the daemon's egress was unconfined until it was reinstalled (outcome reinstalled) or still is (outcome lost). Look for what flushes the ruleset"
+
+      - alert: TorrentdKillSwitchUnverifiable
+        expr: >
+          increase(torrentd_kill_switch_probe_errors_total[15m]) > 0
+          or torrentd_boot_kill_switch_probe_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed; 3 checks in a row that nft cannot answer fence every vpn profile probe_unavailable until a check finds the kill switch intact"
+
+      - alert: TorrentdKillSwitchLeftInstalled
+        expr: torrentd_last_shutdown_kill_switch_removal_failed == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "The previous run could not remove the kill switch on exit; check `nft list tables`"
+
+      # ---- resume data -------------------------------------------------
+      - alert: TorrentdResumeWriteErrors
+        expr: >
+          increase(torrentd_resume_write_errors_total[15m]) > 0
+          or torrentd_boot_resume_write_errors > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Resume data for profile {{ $labels.profile_id }} could not be written; a restart loses progress"
+
+      - alert: TorrentdResumeSaveFailures
+        expr: >
+          increase(torrentd_resume_save_failures_total[15m]) > 0
+          or increase(torrentd_resume_save_dispatch_errors_total[15m]) > 0
+          or torrentd_boot_resume_save_failures > 0
+          or torrentd_boot_resume_save_dispatch_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "save_resume_data is failing for profile {{ $labels.profile_id }}"
+
+      - alert: TorrentdShutdownLeftResumeUnsaved
+        expr: torrentd_last_shutdown_unsaved_resumes > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The previous shutdown left {{ $value }} resume saves unsaved; those torrents restarted from older state"
+
+      # ---- libtorrent --------------------------------------------------
+      # Not only a slow alert loop: a bulk operation that pauses every
+      # torrent of a large profile at once (a fence, pause-all, setting it
+      # offline or online) raises a tracker alert per torrent within a second
+      # or so, more than the queue holds. Bulk resumes are paced and do not.
+      - alert: TorrentdAlertQueueOverflow
+        expr: >
+          increase(torrentd_alert_queue_overflows_total[15m]) > 0
+          or torrentd_boot_alert_queue_overflows > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "libtorrent dropped alerts for profile {{ $labels.profile_id }}; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
+
+      # Any increase: each is one alert the daemon popped and could not
+      # translate, so no handler saw it. It may have been a torrent's removal
+      # or a resume save's answer, which leaves the state map wrong until a
+      # restart. Not a backlog, so nothing here recovers on its own.
+      - alert: TorrentdAlertTranslateErrors
+        expr: >
+          increase(torrentd_alert_translate_errors_total[15m]) > 0
+          or torrentd_boot_alert_translate_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The daemon dropped libtorrent alerts for profile {{ $labels.profile_id }} it could not translate; a torrent's removal or resume save may have gone unseen"
+
+      - alert: TorrentdTrackerErrors
+        # A fraction of announces, not any error: one dead tracker among many
+        # torrents fails on every retry forever, while the rest keep replying.
+        # This fires only when most announces fail, as in a tracker outage or
+        # a tunnel that blocks them. No announces at all divides 0 by 0 and
+        # stays silent. It reads no boot gauge: an outage keeps failing the
+        # announces that follow the first scrape, which the fraction sees, and
+        # a count fixed at boot would skew the fraction for the process's life.
+        # Per host, as every other per-profile rule here: hosts commonly share
+        # a profile_id, and summed across them one host's outage is diluted by
+        # the others' replies and fires, if at all, without naming the host.
+        expr: |
+          sum by (instance, job, profile_id) (increase(torrentd_tracker_alerts_total{kind="error"}[30m]))
+            / sum by (instance, job, profile_id) (increase(torrentd_tracker_alerts_total{kind=~"error|reply"}[30m]))
+            > 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Most tracker announces for profile {{ $labels.profile_id }} on {{ $labels.instance }} have been failing for 30 minutes"
+
+      - alert: TorrentdTrackerWarnings
+        expr: >
+          increase(torrentd_tracker_alerts_total{kind=~"warning|scrape_failed"}[1h]) > 0
+          or torrentd_boot_tracker_alerts > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Trackers returned {{ $labels.kind }} for profile {{ $labels.profile_id }}"
+
+      - alert: TorrentdSessionErrors
+        expr: >
+          increase(torrentd_session_alerts_total{kind=~"portmap_error|udp_error|fastresume_rejected"}[15m]) > 0
+          or torrentd_boot_session_alerts > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "libtorrent reported {{ $labels.kind }} for profile {{ $labels.profile_id }}"
+
+      - alert: TorrentdPerformanceWarning
+        expr: increase(torrentd_session_alerts_total{kind="performance_warning"}[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "libtorrent raised a performance warning for profile {{ $labels.profile_id }}; see the journal"
+
+      - alert: TorrentdTorrentErrors
+        expr: >
+          increase(torrentd_torrent_errors_total[15m]) > 0
+          or increase(torrentd_torrent_add_errors_total[15m]) > 0
+          or increase(torrentd_storage_move_failures_total[15m]) > 0
+          or increase(torrentd_disk_error_retry_errors_total[15m]) > 0
+          or torrentd_boot_torrent_errors > 0
+          or torrentd_boot_torrent_add_errors > 0
+          or torrentd_boot_disk_error_retry_errors > 0
+          or torrentd_boot_storage_move_failures > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Torrents in profile {{ $labels.profile_id }} are failing"
+
+      - alert: TorrentdDiskErrors
+        # The appearance clause misses a boot that restarts within 15 minutes
+        # of the last: the previous run's series, under the same labels, is
+        # still there at the offset. The boot gauge carries what the boot
+        # counted whatever ran before it.
+        expr: >
+          increase(torrentd_disk_errors_total[15m]) > 0
+          or (torrentd_disk_errors_total unless torrentd_disk_errors_total offset 15m)
+          or torrentd_boot_disk_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "File errors ({{ $labels.op }}) in profile {{ $labels.profile_id }}; the journal names the torrent and file"
+
+      # ---- boot and persistence ----------------------------------------
+      - alert: TorrentdBootLoadFailures
+        expr: torrentd_boot_torrent_load_failures > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} torrents in profile {{ $labels.profile_id }} failed to load at boot ({{ $labels.source }})"
+
+      - alert: TorrentdBootSavePathFallbacks
+        # Only the boot torrent-dir scan counts this, so like the load
+        # failures it holds for the life of the process.
+        expr: torrentd_boot_save_path_fallbacks_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} torrents in profile {{ $labels.profile_id }} were re-added at default_save_path at boot because no usable save path was recorded; they will not seed until moved to their data"
+
+      - alert: TorrentdUnloadedRegistryTorrents
+        expr: torrentd_profile_unloaded_registry_torrents > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The registry claims {{ $value }} torrents for profile {{ $labels.profile_id }} that no session loaded"
+
+      - alert: TorrentdRegistryErrors
+        expr: >
+          increase(torrentd_profile_assignment_registry_errors_total[15m]) > 0
+          or torrentd_boot_registry_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loads or adds for profile {{ $labels.profile_id }} were refused by the assignment registry"
+
+      - alert: TorrentdTorrentPersistFailed
+        expr: >
+          increase(torrentd_torrent_file_persist_errors_total[15m]) > 0
+          or torrentd_boot_torrent_file_persist_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A .torrent for profile {{ $labels.profile_id }} could not be written ({{ $labels.source }})"
+
+      - alert: TorrentdRemoveCleanupFailed
+        # The boot counts a cleanup it could not finish as it honours the
+        # tombstones, before the first scrape; the boot gauge carries it.
+        expr: >
+          increase(torrentd_torrent_remove_cleanup_errors_total[15m]) > 0
+          or torrentd_boot_torrent_remove_cleanup_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cleaning up a removed torrent in profile {{ $labels.profile_id }} failed ({{ $labels.store }}); see the log: a removed torrent whose files and tombstone both failed comes back at the next boot"
+
+      - alert: TorrentdStoreWriteFailed
+        expr: >
+          increase(torrentd_store_write_errors_total[15m]) > 0
+          or torrentd_boot_store_write_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A write to the {{ $labels.store }} failed; it no longer matches what the daemon did"
+
+      - alert: TorrentdDirFsyncFailed
+        expr: >
+          increase(torrentd_dir_fsync_errors_total[15m]) > 0
+          or torrentd_boot_dir_fsync_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A state directory could not be fsynced; renames into it may not survive a power loss (see the log)"
+
+      # ---- control plane -----------------------------------------------
+      - alert: TorrentdLoginThrottled
+        expr: increase(torrentd_auth_login_failures_total{reason=~"throttled|verification_budget"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Logins are being throttled ({{ $labels.reason }}); someone is guessing passwords"
+
+      - alert: TorrentdLoginFailures
+        expr: increase(torrentd_auth_login_failures_total{reason="bad_password"}[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than three failed logins in 15 minutes"
+
+      - alert: TorrentdTokenScopeDenied
+        expr: increase(torrentd_auth_token_scope_denials_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A valid API token was used for a route outside its scope"
+
+      - alert: TorrentdAuthRejections
+        # A client that keeps presenting a token that no longer works: most
+        # often a scraper whose token was rotated, or a session that expired
+        # under a script. One mistyped token refuses for a moment and never
+        # holds this for 15 minutes; the daemon's WARN line, once a minute per
+        # client, names the client_ip.
+        expr: increase(torrentd_auth_rejections_total[5m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bearer tokens have been refused ({{ $labels.reason }}) for 15 minutes; a client keeps presenting one that does not work"
+
+      - alert: TorrentdHttp5xx
+        # Over 5% of the API's responses in 10 minutes were 5xx, and at least
+        # three of them, so one failure among a handful of requests does not
+        # page. The probes answer 503 by design: /readyz and its alias
+        # /healthz while the daemon is unready, which TorrentdUnready
+        # reports, and /livez while it is wedged, which the probe's own
+        # restart acts on. /metrics is the scrape's own traffic. None of the
+        # four is in the ratio. Each 5xx is logged at ERROR with the request
+        # id the client received.
+        expr: |
+          (
+            sum by (instance, job) (rate(torrentd_http_requests_total{status_class="5xx", route!~"/livez|/readyz|/healthz|/metrics"}[10m]))
+              /
+            sum by (instance, job) (rate(torrentd_http_requests_total{route!~"/livez|/readyz|/healthz|/metrics"}[10m]))
+          ) > 0.05
+            and on (instance, job)
+          sum by (instance, job) (increase(torrentd_http_requests_total{status_class="5xx", route!~"/livez|/readyz|/healthz|/metrics"}[10m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of API responses in the last 10 minutes were 5xx; each is logged at ERROR with its request id"
+
+      - alert: TorrentdHttpSlow
+        # The p99 of one route's responses, over 15 minutes, held above 5s
+        # for 15 more. The time is to the response head, so an event stream
+        # or a large download is timed by how long it took to start.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (instance, job, route, method, le) (rate(torrentd_http_request_duration_seconds_bucket[15m]))
+          ) > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.method }} {{ $labels.route }} has answered in over 5s at the 99th percentile for 15 minutes"
+
+      - alert: TorrentdReloadFailed
+        expr: increase(torrentd_config_reload_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A config reload failed at {{ $labels.stage }}; the daemon is running the previous settings"
+
+      - alert: TorrentdConfigRestartPending
+        # A restart-only key edited in the file, which a reload found and
+        # could not apply. The grace period lets a change rolled out ahead of
+        # a planned restart pass; past it, the file and the daemon disagree
+        # until someone restarts it or edits the file back.
+        expr: torrentd_config_restart_pending > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Config key {{ $labels.key }} has changed in the file and needs a daemon restart to take effect"
+
+      # ---- pool --------------------------------------------------------
+      - alert: TorrentdPoolPlanFailed
+        # The boot re-drive of interrupted plans can fail before the first
+        # scrape, where increase() cannot see it; the boot gauge carries it.
+        expr: >
+          increase(torrentd_pool_plan_failures_total[15m]) > 0
+          or torrentd_boot_pool_plan_failures > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A pool plan stopped ({{ $labels.kind }}); inspect it before resuming"
+
+      - alert: TorrentdPoolScanErrors
+        expr: increase(torrentd_pool_scan_errors_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A pool scan skipped entries ({{ $labels.kind }}); the index may be incomplete"
+
+      - alert: TorrentdPoolVerifyFailed
+        # The verify queue starts before /metrics is served, so an adoption
+        # the boot re-queued can fail before the first scrape; the boot gauge
+        # carries it.
+        expr: >
+          increase(torrentd_pool_verify_failed_total[1h]) > 0
+          or torrentd_boot_pool_verify_failed > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Adopted torrents failed verification"
+
+      - alert: TorrentdPoolVerifyStuck
+        # Adoptions are waiting and not one has finished, verified or failed,
+        # in an hour: the verify queue has stopped draining. A single large
+        # torrent can take a while to hash, which is why the window is an
+        # hour and not minutes; nothing finishing at all for that long, with
+        # work queued behind it, is a wedged queue or a stalled disk.
+        #
+        # `increase(...[1h]) == 0` alone is also true of a counter younger
+        # than an hour, so a large first adoption on a fresh deployment would
+        # page after `for:` rather than after an hour. The `offset 1h` term
+        # requires the counter to have existed an hour ago, whatever the
+        # scrape interval, so the window really spans an hour of history.
+        expr: |
+          torrentd_pool_verify_queue_depth > 0
+            and on (instance, job)
+          (
+            increase(torrentd_pool_verify_completed_total[1h])
+              + on (instance, job)
+            increase(torrentd_pool_verify_failed_total[1h])
+          ) == 0
+            and on (instance, job)
+          torrentd_pool_verify_completed_total offset 1h
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} adoptions are queued for verification and none has finished in an hour; the verify queue is not draining"
+
+      - alert: TorrentdPoolIndexDisagrees
+        expr: torrentd_pool_index_profile_disagreements > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The pool index and the assignment registry still disagree about {{ $value }} torrents because the boot could not rewrite the index; read the pool index write warning in the boot log, then restart"
+
+      - alert: TorrentdPoolRootMutationsDisabled
+        # The boot's probe found the root's filesystem without
+        # renameat2(RENAME_NOREPLACE) or directory fsync (NFS, CIFS, many
+        # FUSE filesystems): every plan touching it is refused until the root
+        # is moved and the daemon restarted. Read-only use goes on.
+        expr: torrentd_pool_root_mutations_disabled == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pool mutations are disabled for root {{ $labels.root }} ({{ $labels.reason }}): its filesystem failed the boot's probe, and plans touching it are refused; see docs/operations.md, Storage the daemon runs on"

@@ -1,0 +1,198 @@
+{{- $vpn := include "torrentd.vpn" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "torrentd.fullname" . }}
+  labels:
+    {{- include "torrentd.labels" . | nindent 4 }}
+spec:
+  # Exactly one: the daemon holds a single-instance lock in its state
+  # directory, and a second pod could only fail on it.
+  replicas: 1
+  serviceName: {{ include "torrentd.fullname" . }}
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "torrentd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "torrentd.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or .Values.podAnnotations (and .Values.config.rollOnChange (not .Values.config.existingSecret)) }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if and .Values.config.rollOnChange (not .Values.config.existingSecret) }}
+        checksum/config: {{ include "torrentd.configToml" . | sha256sum }}
+        {{- end }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ include "torrentd.terminationGrace" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- if .Values.rpFilterLoose }}
+        sysctls:
+          - name: net.ipv4.conf.all.rp_filter
+            value: "2"
+        {{- end }}
+      containers:
+        - name: torrentd
+          image: {{ include "torrentd.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            {{- if $vpn }}
+            # The image's file capability (cap_net_admin+p) grants NET_ADMIN
+            # only where the bounding set holds it and no_new_privs is unset.
+            allowPrivilegeEscalation: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_ADMIN]
+            {{- else }}
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+            {{- range .Values.peers.ports }}
+            - name: {{ printf "%s-tcp" .name | trunc 15 }}
+              containerPort: {{ .port }}
+              protocol: TCP
+              {{- if eq $.Values.peers.expose "hostPort" }}
+              hostPort: {{ .port }}
+              {{- end }}
+            - name: {{ printf "%s-udp" .name | trunc 15 }}
+              containerPort: {{ .port }}
+              protocol: UDP
+              {{- if eq $.Values.peers.expose "hostPort" }}
+              hostPort: {{ .port }}
+              {{- end }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # A directory, never a subPath, so an updated Secret reaches the
+            # running pod.
+            - name: config
+              mountPath: /etc/torrentd
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/torrentd
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.vpn.wireguardSecret }}
+            - name: wireguard
+              mountPath: /etc/wireguard
+              readOnly: true
+            {{- end }}
+            {{- range .Values.payloadVolumes }}
+            - name: {{ printf "payload-%s" .name }}
+              mountPath: {{ .mountPath }}
+            {{- end }}
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "torrentd.configSecretName" . }}
+            # 0440, in decimal: a leading-zero octal reads as 440 to a YAML
+            # 1.2 parser. Group-owned by fsGroup, which the daemon runs as.
+            defaultMode: 288
+            items:
+              - key: {{ ternary .Values.config.existingSecretKey "torrentd.toml" (ne .Values.config.existingSecret "") }}
+                path: torrentd.toml
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            {{- with .Values.tmp.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        {{- with .Values.vpn.wireguardSecret }}
+        - name: wireguard
+          secret:
+            secretName: {{ . }}
+            # 0440, as above: readable by the daemon's group, nobody else.
+            defaultMode: 288
+        {{- end }}
+        {{- range .Values.payloadVolumes }}
+        - name: {{ printf "payload-%s" .name }}
+          {{- if .existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .existingClaim }}
+          {{- else if .hostPath }}
+          hostPath:
+            {{- toYaml .hostPath | nindent 12 }}
+          {{- else }}
+          {{- fail (printf "payloadVolumes[%s] needs existingClaim or hostPath" .name) }}
+          {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

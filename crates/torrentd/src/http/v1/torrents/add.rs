@@ -279,12 +279,13 @@ pub async fn add_torrent(
             // Filesystem I/O, up to 64 MiB of it: on the blocking pool, not
             // on the async worker serving every other request.
             let state = Arc::clone(&s);
-            let read =
-                tokio::task::spawn_blocking(move || read_local_torrent(&state, FsPath::new(&path)))
-                    .await
-                    .map_err(|e| AddTorrentError::Internal {
-                        detail: internal("reading the server_path .torrent", e),
-                    })?;
+            let read = crate::startup::tasks::spawn_blocking(move || {
+                read_local_torrent(&state, FsPath::new(&path))
+            })
+            .await
+            .map_err(|e| AddTorrentError::Internal {
+                detail: internal("reading the server_path .torrent", e),
+            })?;
             AddSource::File(read?)
         }
         Err(TorrentSource::Metainfo { .. }) => unreachable!("decoded above"),

@@ -1,0 +1,266 @@
+# Values for the torrentd chart. values.schema.json refuses a key that is not
+# listed here, so a typo fails the install instead of being ignored.
+#
+# docs/running.md is the reference for every daemon setting; the comments
+# here say only what the chart does with them.
+
+image:
+  repository: ghcr.io/d18580b/torrent
+  # Empty: the chart's appVersion.
+  tag: ""
+  # A sha256:... digest. Set, it pins the image and the tag is only a label.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Addresses the chart writes into a rendered config. The defaults are k3s's.
+cluster:
+  # trusted_proxies' default: the ingress controller's pod address is not
+  # fixed, so its whole pod CIDR is trusted, and the NetworkPolicy below is
+  # what keeps every other pod in that range off the API (docs/running.md §6a).
+  podCIDR: 10.42.0.0/16
+  # kill_switch_dns_servers' default with the kill switch on: the cluster DNS
+  # Service's address, the resolver the pod's /etc/resolv.conf names.
+  dnsIP: 10.43.0.10
+
+# The control API. The chart writes http_listen = "0.0.0.0:<port>" into a
+# rendered config, so the container port, the probes, the Service and the
+# NetworkPolicy all agree with it.
+api:
+  port: 8080
+
+# OpenTelemetry trace export (docs/running.md, "Traces: OpenTelemetry over
+# OTLP"). otlpEndpoint set, a rendered config writes it as [telemetry]'s
+# otlp_endpoint, e.g. http://alloy.monitoring:4318 (http/protobuf) or
+# http://tempo.monitoring:4317 with config.settings.telemetry.protocol: grpc.
+# The other [telemetry] keys go in config.settings.telemetry. Empty: no
+# endpoint is written, and with no [telemetry] nothing is exported. Ignored
+# with config.existingSecret.
+telemetry:
+  otlpEndpoint: ""
+
+config:
+  # A Secret holding the whole torrentd.toml under existingSecretKey. Set, the
+  # chart renders no config and `settings` is ignored; the chart's own defaults
+  # (http_listen, trusted_proxies, the kill-switch carve-outs) are then yours
+  # to write, and http_listen's port must equal api.port.
+  existingSecret: ""
+  existingSecretKey: torrentd.toml
+  # Roll the pod when the rendered config changes. Off: the Secret is mounted
+  # as a directory (never with subPath), so a changed file reaches the pod in
+  # place, and config_watch (on by default, below) reloads it, applying what a
+  # reload can without the restart that drains every torrent's resume data
+  # (docs/running.md §8). With config_watch false, `POST /v1/config/reload`
+  # does the same.
+  rollOnChange: false
+  # The config, as TOML keys: top-level keys here, `profile` for the
+  # [[profile]] tables, `auth` for [auth] and `telemetry` for [telemetry].
+  # Whole numbers are written as TOML integers. The chart fills in, where a
+  # key is absent:
+  #
+  #   default_save_path  /data/torrents
+  #   resume_dir         /var/lib/torrentd/resume
+  #   torrent_dir        /var/lib/torrentd/torrents
+  #   trusted_proxies    [cluster.podCIDR]
+  #   config_watch       true: a changed Secret reloads by itself, as
+  #                      `POST /v1/config/reload` would
+  #   kill_switch_api_interfaces  ["eth0"]           with network_kill_switch
+  #   kill_switch_dns_servers     [cluster.dnsIP]    with network_kill_switch
+  #
+  # and always writes http_listen from api.port, refusing one set here. A
+  # non-loopback http_listen needs [auth], so the render fails without either
+  # `auth` or `allow_unauthenticated: true`, and without a profile.
+  settings:
+    log_level: info
+    # auth:
+    #   password_hash: "$argon2id$..."    # torrentd hash-password
+    #   token:
+    #     - name: prometheus             # torrentd new-token --scopes metrics
+    #       sha256: "..."
+    #       scopes: [metrics]
+    profile: []
+    # - id: public
+    #   network: host
+    #   listen_interfaces: "0.0.0.0:6881"
+    # - id: acct_a
+    #   network: vpn
+    #   vpn_type: wireguard
+    #   vpn_config: /etc/wireguard/wg-acct-a.conf
+    #   vpn_interface: wg-acct-a
+    #   listen_port: 6891
+    #   peer_fingerprint: "-qB5030-"
+    #   user_agent: qBittorrent/5.0.3
+    #   allowed_tracker_domains: [tracker-a.example.com]
+
+vpn:
+  # Grant what a `network = "vpn"` profile and the kill switch need:
+  # capabilities.add NET_ADMIN with allowPrivilegeEscalation true, so the
+  # image's file capability applies (docs/running.md §8, "In a container").
+  # A rendered config turns this on by itself when a profile is a vpn one or
+  # network_kill_switch is set; with config.existingSecret, set it yourself.
+  enabled: false
+  # A Secret whose keys are the WireGuard configs, each named
+  # <vpn_interface>.conf, mounted read-only at /etc/wireguard with mode 0440
+  # and group-owned by podSecurityContext.fsGroup.
+  wireguardSecret: ""
+
+# Set net.ipv4.conf.all.rp_filter = 2, which a vpn profile's replies need
+# (docs/running.md §7). Kubernetes counts it an unsafe sysctl, so the kubelet
+# must allow it (--allowed-unsafe-sysctls=net.ipv4.conf.all.rp_filter) or the
+# pod is refused.
+rpFilterLoose: false
+
+# The state directory, /var/lib/torrentd: the resume and .torrent stores,
+# registry.db, pool.db and the instance lock. One ReadWriteOnce volume, from
+# the StatefulSet's claim template.
+persistence:
+  size: 10Gi
+  # Empty: the cluster's default StorageClass.
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  annotations: {}
+
+# The payload directories: default_save_path and any [pool] root. Each entry
+# is an existing claim or a host path, mounted read-write at mountPath:
+#
+#   - name: torrents
+#     mountPath: /data/torrents
+#     existingClaim: torrents
+#   - name: library
+#     mountPath: /data/library
+#     hostPath:
+#       path: /srv/library
+#       type: Directory
+#
+# The pod's fsGroup is applied with fsGroupChangePolicy OnRootMismatch, so a
+# large library is never chowned file by file; a host path is never relabelled
+# at all. Each directory must already be writable by uid or gid 1000.
+#
+# A rendered config's default_save_path (default /data/torrents) must lie at
+# or under one entry's mountPath, or the render fails: the image root is
+# read-only. The chart cannot check a config from config.existingSecret.
+payloadVolumes: []
+
+# /tmp, where SQLite keeps its temporary files: a memory-backed emptyDir.
+# Unsized by default, as compose.yaml's tmpfs is: its pages count against the
+# container's memory, so resources.limits.memory bounds it, and a large
+# SQLite sort is never evicted for crossing a separate cap. Set sizeLimit
+# (e.g. 256Mi) to cap it below the memory limit.
+tmp:
+  sizeLimit: null
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  runAsNonRoot: true
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# The grace a stop gets before SIGKILL. Empty: the config's
+# shutdown_drain_secs (default 60) plus shutdownGraceMarginSeconds, which
+# covers the HTTP drain, pool work and session teardown around the resume
+# drain (deploy/torrentd.service). A SIGKILL mid-drain leaves resume saves
+# unwritten.
+terminationGracePeriodSeconds: null
+shutdownGraceMarginSeconds: 60
+
+# The probes docs/running.md §9 gives. Raise startupProbe.failureThreshold for
+# a very large library: the kubelet kills a container whose startup probe
+# never passes.
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 180
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 1
+
+resources: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# The API Service.
+service:
+  type: ClusterIP
+  annotations: {}
+
+# The peer ports of the `host` profiles, each declared for TCP and UDP. A vpn
+# profile's port is on its tunnel and is not exposed here.
+peers:
+  ports: []
+  # - name: public
+  #   port: 6881
+  # none: container ports only. hostPort: each port on the node's address.
+  # loadBalancer: a LoadBalancer Service with externalTrafficPolicy Local, so
+  # a peer's address reaches the daemon unrewritten.
+  expose: none
+  service:
+    annotations: {}
+    loadBalancerClass: ""
+    loadBalancerIP: ""
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  # - torrentd.example.com
+  tls: []
+  # - secretName: torrentd-tls
+  #   hosts: [torrentd.example.com]
+  # The body cap deploy/Caddyfile sets (96 MiB, the daemon's own largest body
+  # limit), in bytes; 0 sets none. Written as the controller's own setting
+  # where className is `nginx` (an annotation) or `traefik` (a buffering
+  # Middleware). The header-read (10s) and idle (2m) timeouts deploy/Caddyfile
+  # sets are entrypoint-wide in both controllers, not per route: set them on
+  # the controller.
+  maxBodyBytes: 100663296
+
+networkPolicy:
+  enabled: true
+  # Namespaces whose pods may reach the API port. Every pod in podCIDR is a
+  # trusted proxy, so nothing else may.
+  ingressControllerNamespaces: [kube-system]
+  # Narrows the above to the controller's own pods, e.g.
+  # {app.kubernetes.io/name: traefik}.
+  ingressControllerPodSelector: {}
+  prometheusNamespaces: [monitoring]
+  prometheusPodSelector: {}
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    # The Secret, in the release's namespace, holding a metrics-scope token
+    # (torrentd new-token --scopes metrics).
+    tokenSecret:
+      name: ""
+      key: token
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+  # deploy/prometheus/torrentd.rules.yml as a PrometheusRule. The scrape's job
+  # label is set to `torrentd`, which TorrentdDown matches on.
+  prometheusRule:
+    enabled: false
+    labels: {}
+  # deploy/dashboard.json as a ConfigMap the Grafana sidecar loads.
+  dashboard:
+    enabled: false
+    labels:
+      grafana_dashboard: "1"
+    annotations: {}

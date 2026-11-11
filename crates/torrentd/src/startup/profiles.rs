@@ -22,8 +22,10 @@ use tracing::warn;
 use super::cleanup::BootCleanup;
 use super::shutdown_requested;
 use crate::config::Config;
+use crate::profile_registry::BootFailure;
 use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
+use crate::vpn_cmd::Verdict;
 
 /// The settings a profile's session is built with: the config's, plus whether
 /// libtorrent posts its log alerts at all.
@@ -93,6 +95,10 @@ pub(super) fn boot_engine(
 /// (`vpn::preflight::refusal_for`), and a bring-up would fail on it with a
 /// message that does not say so.
 ///
+/// `read_sysctl` reads a `/proc/sys` path, `None` where it cannot: a vpn
+/// profile whose interface comes up with strict reverse-path filtering is
+/// failed through it (`vpn_cmd::rp_filter_check`).
+///
 /// `Err` only for a shutdown asked for between two profiles' bring-ups.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_profiles<F, E>(
@@ -103,6 +109,7 @@ pub(super) async fn build_profiles<F, E>(
     boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
     desired: &crate::profile_state::Record,
     preflight: impl Fn(&ProfileConfig) -> Option<String>,
+    read_sysctl: impl Fn(&str) -> Option<String>,
     mut make_engine: F,
 ) -> anyhow::Result<(Vec<ProfileEntry>, Vec<FailedProfile>)>
 where
@@ -140,6 +147,7 @@ where
             failed_profiles.push(FailedProfile {
                 config: p.clone(),
                 reason,
+                cause: BootFailure::Other,
             });
             continue;
         }
@@ -162,6 +170,7 @@ where
                 ports: &ports_taken_at_boot(cfg, &profile_entries, &p.id),
             },
             desired.holds_offline(&p.id),
+            &read_sysctl,
             &mut make_engine,
         )
         .await
@@ -229,6 +238,7 @@ async fn build_profile<F, E>(
     forwarder: &dyn PortForwarder,
     held: Held<'_>,
     held_offline: bool,
+    read_sysctl: &dyn Fn(&str) -> Option<String>,
     make_engine: &mut F,
 ) -> Result<(ProfileEntry, Vec<std::net::Ipv6Addr>), Box<FailedProfile>>
 where
@@ -237,9 +247,13 @@ where
 {
     macro_rules! fail_profile {
         ($reason:expr) => {
+            fail_profile!($reason, BootFailure::Other)
+        };
+        ($reason:expr, $cause:expr) => {
             return Err(Box::new(FailedProfile {
                 config: p.clone(),
                 reason: $reason,
+                cause: $cause,
             }))
         };
     }
@@ -351,6 +365,52 @@ where
                     fail_profile!(format!("VPN bring-up failed: {e}"));
                 }
             };
+            // Strict reverse-path filtering drops every reply to a socket
+            // bound to the tunnel, so a profile up on it announces and peers
+            // into silence that reads as a tracker or VPN outage. Judged
+            // after the bring-up, as `vpn check --bring-up` judges it: only
+            // now does the interface have a `conf/<iface>` of its own. A
+            // value that cannot be read is not a failure; it is said once.
+            let rp = crate::vpn_cmd::rp_filter_check(iface, read_sysctl);
+            match rp.verdict {
+                Verdict::Fail => {
+                    error!(
+                        profile_id = %p.id,
+                        vpn_iface = %iface,
+                        reason = BootFailure::RpFilterStrict.label(),
+                        detail = %rp.detail,
+                        "strict reverse-path filtering on the tunnel's interface drops every \
+                         reply to a socket bound to it; profile disabled. Set \
+                         net.ipv4.conf.all.rp_filter = 2 (loose): the kernel applies \
+                         max(all, interface), so that alone loosens every interface. In a \
+                         Kubernetes pod the sysctl is unsafe and must be allowed first: on \
+                         k3s, start the node with \
+                         --kubelet-arg=allowed-unsafe-sysctls=net.ipv4.conf.* and list \
+                         net.ipv4.conf.all.rp_filter with value \"2\" in the pod's \
+                         securityContext.sysctls",
+                    );
+                    tear_down_or_warn!(iface);
+                    fail_profile!(
+                        format!(
+                            "strict rp_filter on {iface} drops replies to its sockets ({}); set \
+                             net.ipv4.conf.all.rp_filter = 2",
+                            rp.detail
+                        ),
+                        BootFailure::RpFilterStrict
+                    );
+                }
+                Verdict::Unknown => {
+                    warn!(
+                        profile_id = %p.id,
+                        vpn_iface = %iface,
+                        detail = %rp.detail,
+                        "could not establish the tunnel interface's reverse-path filter; if it \
+                         is strict, replies to its sockets are dropped. \
+                         net.ipv4.conf.all.rp_filter = 2 rules that out",
+                    );
+                }
+                Verdict::Pass | Verdict::Skip => {}
+            }
             if let Some(owner) = held.tunnels.get(&ip) {
                 error!(
                     profile_id = %p.id,
@@ -374,27 +434,30 @@ where
             // does not come up on it.
             let vpn = cleanup.manager_for(vpn_type);
             let read_iface = iface.to_string();
-            let v6 = match tokio::task::spawn_blocking(move || vpn.global_ipv6(&read_iface)).await {
-                Ok(Ok(v6)) => v6,
-                Ok(Err(e)) => {
-                    error!(
-                        profile_id = %p.id,
-                        vpn_iface = %iface,
-                        error.cause = %e,
-                        "could not read the tunnel's IPv6 addresses, so could not check that \
-                         no other profile's tunnel has one; profile disabled",
-                    );
-                    tear_down_or_warn!(iface);
-                    fail_profile!(format!(
-                        "could not read tunnel {iface}'s IPv6 addresses to check none is \
+            let v6 =
+                match crate::startup::tasks::spawn_blocking(move || vpn.global_ipv6(&read_iface))
+                    .await
+                {
+                    Ok(Ok(v6)) => v6,
+                    Ok(Err(e)) => {
+                        error!(
+                            profile_id = %p.id,
+                            vpn_iface = %iface,
+                            error.cause = %e,
+                            "could not read the tunnel's IPv6 addresses, so could not check that \
+                             no other profile's tunnel has one; profile disabled",
+                        );
+                        tear_down_or_warn!(iface);
+                        fail_profile!(format!(
+                            "could not read tunnel {iface}'s IPv6 addresses to check none is \
                          another profile's: {e}"
-                    ));
-                }
-                Err(e) => {
-                    tear_down_or_warn!(iface);
-                    profile_task_failed!("VPN IPv6 address read", e)
-                }
-            };
+                        ));
+                    }
+                    Err(e) => {
+                        tear_down_or_warn!(iface);
+                        profile_task_failed!("VPN IPv6 address read", e)
+                    }
+                };
             if let Some((addr, owner)) = v6
                 .iter()
                 .find_map(|a| held.tunnels.get(&IpAddr::V6(*a)).map(|o| (a, o)))
@@ -640,16 +703,24 @@ mod profile_construction_tests {
         forwarder: &MockForwarder,
         fail_engine_call: Option<usize>,
     ) -> Outcome {
-        build_after_preflight(cfg, vpn, forwarder, fail_engine_call, |_| None).await
+        build_after_preflight(cfg, vpn, forwarder, fail_engine_call, |_| None, no_sysctls).await
     }
 
-    /// [`build`], with the boot's preflight refusing what `preflight` names.
+    /// A host whose sysctls cannot be read: every `rp_filter` is unknown,
+    /// which warns and fails nothing.
+    fn no_sysctls(_: &str) -> Option<String> {
+        None
+    }
+
+    /// [`build`], with the boot's preflight refusing what `preflight` names
+    /// and each sysctl read through `read_sysctl`.
     async fn build_after_preflight(
         cfg: &Config,
         vpn: &MockVpn,
         forwarder: &MockForwarder,
         fail_engine_call: Option<usize>,
         preflight: impl Fn(&ProfileConfig) -> Option<String>,
+        read_sysctl: impl Fn(&str) -> Option<String>,
     ) -> Outcome {
         let vpn_for = vpn.clone();
         let mut cleanup = BootCleanup::with_vpn_factory(
@@ -670,6 +741,7 @@ mod profile_construction_tests {
             &mut boot_shutdown,
             &crate::profile_state::Record::default(),
             preflight,
+            read_sysctl,
             move |settings: &Settings, state: Option<Vec<u8>>| {
                 let n = calls;
                 calls += 1;
@@ -743,10 +815,17 @@ mod profile_construction_tests {
             &[vpn("acct_a", "wg-a", 1), host("public", false)],
         );
         let vpn = MockVpn::new();
-        let out = build_after_preflight(&cfg, &vpn, &MockForwarder::new(), None, |p| {
-            (p.id.as_str() == "acct_a")
-                .then(|| "preflight wireguard_kernel: the kernel has no WireGuard".to_string())
-        })
+        let out = build_after_preflight(
+            &cfg,
+            &vpn,
+            &MockForwarder::new(),
+            None,
+            |p| {
+                (p.id.as_str() == "acct_a")
+                    .then(|| "preflight wireguard_kernel: the kernel has no WireGuard".to_string())
+            },
+            no_sysctls,
+        )
         .await;
         assert_eq!(out.up_ids(), vec!["public"]);
         assert_eq!(
@@ -755,6 +834,96 @@ mod profile_construction_tests {
         );
         assert!(vpn.bring_up_calls().is_empty(), "no bring-up was attempted");
         assert_eq!(out.built.len(), 1, "no session for the refused profile");
+        assert_eq!(out.failed("acct_a").cause, BootFailure::Other);
+    }
+
+    /// Sysctls answering `all` and, per interface, `conf/<iface>`; anything
+    /// else reads as absent.
+    fn sysctls(
+        all: &'static str,
+        per_iface: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
+        move |path: &str| {
+            if path == "/proc/sys/net/ipv4/conf/all/rp_filter" {
+                return Some(all.to_string());
+            }
+            per_iface
+                .iter()
+                .find(|(iface, _)| path == format!("/proc/sys/net/ipv4/conf/{iface}/rp_filter"))
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_up_with_strict_rp_filter_fails_its_profile_and_is_lowered() {
+        // wg-a strict on its own value, wg-b loose, wg-c with nothing of its
+        // own to read: only wg-a's profile fails, and with its own cause.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(
+            dir.path(),
+            &[
+                vpn("acct_a", "wg-a", 1),
+                vpn("acct_b", "wg-b", 2),
+                vpn("acct_c", "wg-c", 3),
+            ],
+        );
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        vpn.set_ip("wg-b", OTHER_TUNNEL_IP);
+        vpn.set_ip("wg-c", IpAddr::V4(Ipv4Addr::new(10, 3, 0, 2)));
+        let out = build_after_preflight(
+            &cfg,
+            &vpn,
+            &MockForwarder::new(),
+            None,
+            |_| None,
+            sysctls("0", &[("wg-a", "1"), ("wg-b", "2")]),
+        )
+        .await;
+
+        assert_eq!(out.up_ids(), vec!["acct_b", "acct_c"]);
+        let failed = out.failed("acct_a");
+        assert_eq!(failed.cause, BootFailure::RpFilterStrict);
+        assert_eq!(failed.cause.label(), "rp_filter_strict");
+        assert!(
+            failed.reason.contains("net.ipv4.conf.all.rp_filter = 2")
+                && failed.reason.contains("wg-a"),
+            "the reason names the interface and the fix: {}",
+            failed.reason,
+        );
+        assert_eq!(
+            vpn.bring_down_calls(),
+            vec!["wg-a".to_string()],
+            "the tunnel raised for it is taken down with it",
+        );
+        assert_eq!(out.built.len(), 2, "no session for the strict profile");
+    }
+
+    #[tokio::test]
+    async fn a_loose_all_overrides_a_strict_interface_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[vpn("acct_a", "wg-a", 1)]);
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        let out = build_after_preflight(
+            &cfg,
+            &vpn,
+            &MockForwarder::new(),
+            None,
+            |_| None,
+            sysctls("2", &[("wg-a", "1")]),
+        )
+        .await;
+        assert_eq!(out.up_ids(), vec!["acct_a"], "failed: {:?}", out.failed);
+        assert!(vpn.bring_down_calls().is_empty());
+    }
+
+    #[test]
+    fn every_boot_failure_label_is_catalogued() {
+        for cause in [BootFailure::RpFilterStrict, BootFailure::Other] {
+            assert!(BootFailure::LABELS.contains(&cause.label()), "{cause:?}");
+        }
+        assert!(BootFailure::LABELS.contains(&BootFailure::NONE));
     }
 
     #[tokio::test]
@@ -1169,6 +1338,7 @@ mod profile_construction_tests {
             &mut boot_shutdown,
             &crate::profile_state::Record::default(),
             |_: &ProfileConfig| None,
+            no_sysctls,
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 panic!("no session is built after a shutdown was asked for")
             },
@@ -1209,6 +1379,7 @@ mod profile_construction_tests {
             &mut boot_shutdown,
             &crate::profile_state::Record::default(),
             |_: &ProfileConfig| None,
+            no_sysctls,
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 panic!("no session is built after a shutdown was missed")
             },
@@ -1255,6 +1426,7 @@ mod profile_construction_tests {
             &mut boot_shutdown,
             &states.current(),
             |_: &ProfileConfig| None,
+            no_sysctls,
             move |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 let engine = Arc::new(MockEngine::new());
                 made.lock().unwrap().push(Arc::clone(&engine));
@@ -1305,6 +1477,7 @@ mod profile_construction_tests {
             &mut boot_shutdown,
             &record,
             |_: &ProfileConfig| None,
+            no_sysctls,
             move |settings: &Settings,
                   state: Option<Vec<u8>>|
                   -> Result<Arc<dyn TorrentEngine>, String> {
@@ -1342,6 +1515,7 @@ mod profile_construction_tests {
             &mut boot_shutdown,
             &record,
             |_: &ProfileConfig| None,
+            no_sysctls,
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 let engine = MockEngine::new();
                 engine.inject_error("pause_session", torrentd_engine::EngineError::Shutdown);

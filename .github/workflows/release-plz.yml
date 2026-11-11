@@ -18,6 +18,7 @@ name: Release
 #    docs/api/openapi.json (its `info.version` is the crate version) in its
 #    checkout, records the result as one verified commit on the pushed
 #    commit through the GraphQL API, and moves `release-plz-next` onto it.
+#    The Helm chart's version and appVersion move with it.
 #    It opens or updates the release pull request; where GitHub refuses this
 #    workflow's token a pull request (an organisation or repository
 #    setting), the run stays green and its summary links the comparison to
@@ -27,7 +28,10 @@ name: Release
 #    release-pr` used to leave behind. With nothing to release it deletes
 #    `release-plz-next`, which closes a stale release pull request.
 # 3. When `release` created a release, `dist`, `dist-musl` and `image` build
-#    everything the release ships, from the tagged commit, with no cache, and
+#    everything the release ships, from the tagged commit, with no cache,
+#    for x86_64 and aarch64 each on a native runner of that architecture;
+#    `image-manifest` joins the two images into the one manifest list the
+#    tags name, `chart` pushes the Helm chart at the release's version, and
 #    `publish` signs and attests the files, uploads them to the draft and
 #    publishes it. GitHub's immutable releases freeze a release's assets and
 #    tag once it is published, which is why it is created as a draft.
@@ -302,6 +306,21 @@ jobs:
           mise run native-fetch
           mise run openapi
           git add --update -- docs/api/openapi.json
+      # The Helm chart is released with torrentd at the same version, and
+      # `chart` refuses one whose version or appVersion is not the
+      # release's; release-plz knows nothing of the chart, so both move here.
+      - if: steps.update.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/torrentd/Chart.yaml
+          sed -i -E "s/^version:.*/version: $VERSION/; s/^appVersion:.*/appVersion: \"$VERSION\"/" "$chart"
+          if ! grep -qxF "version: $VERSION" "$chart" || ! grep -qxF "appVersion: \"$VERSION\"" "$chart"; then
+            echo "::error::$chart has no top-level version and appVersion line to move to $VERSION"
+            exit 1
+          fi
+          git add -- "$chart"
       # The staged change becomes one commit on the pushed commit, made
       # through the GraphQL API so GitHub signs and verifies it, and the
       # release branch is moved onto it.
@@ -470,15 +489,26 @@ jobs:
             echo "deleted $branch"
           done <<< "$refs"
 
+  # Each architecture is built on a native runner of its own, never under
+  # QEMU: the Boost and libtorrent build takes far too long emulated. A
+  # matrix job's result is `success` only when every leg succeeded, which
+  # is what the jobs below that need it read.
   dist:
-    name: dist (x86_64 glibc)
+    name: dist (${{ matrix.arch }} glibc)
     needs: release
     # `!cancelled()` because `release` is skipped on a dry run (a pull
     # request, or a dispatch), and a skipped need otherwise skips this job too.
     if: >-
       !cancelled() && (github.event_name != 'push'
       || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -500,18 +530,25 @@ jobs:
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dist-gnu
+          name: dist-gnu-${{ matrix.arch }}
           path: target/dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
   dist-musl:
-    name: dist (static torrentctl, x86_64 musl)
+    name: dist (static torrentctl, ${{ matrix.arch }} musl)
     needs: release
     if: >-
       !cancelled() && (github.event_name != 'push'
       || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -532,19 +569,31 @@ jobs:
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dist-musl
+          name: dist-musl-${{ matrix.arch }}
           path: target/dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
+  # One image per platform, each built and checked on a native runner of its
+  # own and pushed by digest alone, untagged. `image-manifest` then joins
+  # the digests into the one manifest list the release's tags name.
   image:
-    name: image (ghcr.io)
+    name: image (${{ matrix.platform }})
     needs: [release, dist, dist-musl]
     # After the tarballs, so a release whose binaries fail their checks
     # pushes no image and moves no tag.
     if: >-
       !cancelled() && needs.dist.result == 'success' && needs.dist-musl.result == 'success'
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            slug: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            slug: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
       contents: read # the checkout
@@ -556,6 +605,7 @@ jobs:
       TAG: ${{ needs.release.outputs.tag }}
       VERSION: ${{ needs.release.outputs.version }}
       PUBLISH: ${{ github.event_name == 'push' }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -563,16 +613,20 @@ jobs:
           submodules: recursive
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The labels only: this job tags nothing, `image-manifest` tags the
+      # manifest list.
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
-          # X.Y.Z, X.Y and latest, from the release's tag. Nothing is tagged
-          # on a dry run, where nothing is pushed.
+          # Not applied: the push below is by digest. The action derives its
+          # version label from its first tag, and with no tags input it falls
+          # back to the branch name, `master`, which would override the
+          # Containerfile's VERSION label. X.Y.Z from the release's tag keeps
+          # the label the release's version; a dry run enables no tag, so its
+          # version label is empty, as the check below expects.
           tags: |
             type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }},enable=${{ env.PUBLISH }}
-            type=raw,value=latest,enable=${{ env.PUBLISH }}
           flavor: latest=false
           # The action titles the image after the repository, `torrent`;
           # the Containerfile titles it after the binary. Keep the
@@ -590,6 +644,8 @@ jobs:
         with:
           context: .
           file: deploy/Containerfile
+          # The runner's own platform, named so the image records it.
+          platforms: ${{ matrix.platform }}
           load: true
           push: false
           tags: torrentd:release-check
@@ -620,6 +676,13 @@ jobs:
             exit 1
           fi
           echo "$got"
+          # The image is the platform this leg builds, which the binary
+          # above just ran natively on.
+          arch=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' torrentd:release-check)
+          if [ "$arch" != "$PLATFORM" ]; then
+            echo "::error::the image is $arch, expected $PLATFORM"
+            exit 1
+          fi
           # The OCI labels a registry and a scanner read. A dry run tags
           # nothing, so its version label is empty; a release's is its own.
           label() {
@@ -642,15 +705,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # The same build again, from the builder's layers, now pushed.
+      # The same build again, from the builder's layers, now pushed by its
+      # digest alone: no tag names a single platform's image.
       - id: push
         if: env.PUBLISH == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/Containerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           # The same build-args as the build above, so it reuses its layers.
           build-args: |
@@ -686,6 +750,102 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           sbom-path: ${{ runner.temp }}/image.spdx.json
           push-to-registry: true
+      # The digest, for `image-manifest` to list. The file's name is the
+      # digest; it holds nothing.
+      - if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-digest-${{ matrix.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # The manifest list the release's tags name: one entry per platform
+  # `image` pushed, each already signed and attested with its own SBOM. The
+  # list itself is signed and carries a build-provenance attestation, so
+  # `cosign verify` and `gh attestation verify` pass on the tag as they did
+  # when it named a single image. Only a release pushes anything, so a dry
+  # run skips this job.
+  image-manifest:
+    name: image manifest list (ghcr.io)
+    needs: [release, image]
+    if: >-
+      !cancelled() && github.event_name == 'push' && needs.image.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: write # push the manifest list, its signature and its attestation
+      id-token: write # keyless Sigstore signing and the attestation's certificate
+      attestations: write # record the attestation with GitHub
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # X.Y.Z, X.Y and latest, from the release's tag, and the OCI
+      # annotations for the list itself.
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag }}
+            type=raw,value=latest
+          flavor: latest=false
+          # Titled after the binary, as each platform's image is labelled.
+          annotations: |
+            org.opencontainers.image.title=torrentd
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Every platform the matrix builds, or the job fails: a release never
+      # tags a list missing one.
+      - id: list
+        env:
+          META: ${{ steps.meta.outputs.json }}
+          DIGESTS: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          mapfile -t digests < <(find "$DIGESTS" -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [ "${#digests[@]}" -ne 2 ]; then
+            echo "::error::expected 2 platform digests (amd64, arm64), found ${#digests[@]}: ${digests[*]}"
+            exit 1
+          fi
+          args=()
+          while IFS= read -r tag; do args+=(--tag "$tag"); done < <(jq -r '.tags[]' <<<"$META")
+          while IFS= read -r a; do args+=(--annotation "$a"); done < <(jq -r '.annotations[]' <<<"$META")
+          for d in "${digests[@]}"; do args+=("$IMAGE@sha256:$d"); done
+          docker buildx imagetools create "${args[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "$IMAGE:$VERSION is $digest"
+          docker buildx imagetools inspect "$IMAGE@$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - env:
+          DIGEST: ${{ steps.list.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.list.outputs.digest }}
+          push-to-registry: true
       # The README tells anyone to pull the image, so pull it as anyone: the
       # release tag, through a fresh, empty Docker config that holds none of
       # the login above, with no token in the environment. Every platform
@@ -694,9 +854,8 @@ jobs:
       # that does not name what this job pushed, fails the job, and
       # `publish` then leaves the release a draft (README.md, Releasing).
       - name: Anyone can pull the release's image, with no login
-        if: env.PUBLISH == 'true'
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.list.outputs.digest }}
         run: |
           set -euo pipefail
           unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN GH_TOKEN
@@ -726,13 +885,134 @@ jobs:
           fi
           echo "pulled $ref anonymously (${platforms[*]:-its one platform}), $DIGEST"
 
+  # deploy/helm/torrentd, packaged and pushed as the OCI artifact
+  # oci://ghcr.io/OWNER/charts/torrentd:X.Y.Z, signed and attested like the
+  # image, and pulled back anonymously. Its version and appVersion are the
+  # release's (`release-pr` moves both), and a chart naming another is
+  # refused. After `image-manifest`, so the image the chart's appVersion
+  # names is pushed and pullable before the chart is. A dry run packages and
+  # checks the chart against the checkout's version, and pushes nothing.
+  chart:
+    name: helm chart (ghcr.io)
+    needs: [release, image-manifest]
+    if: >-
+      !cancelled() && (github.event_name != 'push'
+      || (needs.release.outputs.tag != '' && needs.image-manifest.result == 'success'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # the checkout
+      packages: write # push the chart, its signature and its attestation
+      id-token: write # keyless Sigstore signing and the attestation's certificate
+      attestations: write # record the attestation with GitHub
+    env:
+      CHART: ghcr.io/${{ github.repository_owner }}/charts/torrentd
+      VERSION: ${{ needs.release.outputs.version }}
+      PUBLISH: ${{ github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # mise provides helm at the version mise.toml pins, as in ci.yml.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - id: package
+        name: The chart's version and appVersion are the release's
+        run: |
+          set -euo pipefail
+          # On a dry run there is no release; the checkout's version is
+          # what the chart would be released as.
+          expected=${VERSION:-$(python3 -c 'import tomllib; print(tomllib.load(open("crates/torrentd/Cargo.toml", "rb"))["package"]["version"])')}
+          meta=$(helm show chart deploy/helm/torrentd)
+          field() { sed -n -E "s/^$1:[[:space:]]*\"?([^\"[:space:]]*)\"?[[:space:]]*\$/\\1/p" <<<"$meta"; }
+          version=$(field version)
+          app_version=$(field appVersion)
+          if [ "$version" != "$expected" ] || [ "$app_version" != "$expected" ]; then
+            echo "::error::deploy/helm/torrentd/Chart.yaml has version '$version' and appVersion '$app_version', expected both '$expected'"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/chart"
+          helm package deploy/helm/torrentd --destination "$RUNNER_TEMP/chart"
+          pkg=$RUNNER_TEMP/chart/torrentd-$expected.tgz
+          [ -f "$pkg" ] || { echo "::error::helm package did not write $pkg"; exit 1; }
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+      # cosign and the attestation read the Docker login; helm reads its own.
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: push
+        if: env.PUBLISH == 'true'
+        env:
+          PACKAGE: ${{ steps.package.outputs.package }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          helm registry login ghcr.io --username "$ACTOR" --password-stdin <<<"$TOKEN"
+          out=$(helm push "$PACKAGE" "oci://${CHART%/*}" 2>&1)
+          echo "$out"
+          digest=$(sed -n -E 's/^Digest: (sha256:[0-9a-f]{64})$/\1/p' <<<"$out")
+          if [ -z "$digest" ]; then
+            echo "::error::helm push printed no digest for $CHART:$VERSION"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - if: env.PUBLISH == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$CHART@$DIGEST"
+      - if: env.PUBLISH == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.CHART }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      # The README tells anyone to pull the chart, so pull it as anyone, as
+      # `image-manifest` pulls the image: an empty helm registry config and
+      # Docker config, which hold none of the logins above, and no token in
+      # the environment. A private package, or a version that does not name
+      # what this job pushed, fails the job, and `publish` then leaves the
+      # release a draft (README.md, Releasing).
+      - name: Anyone can pull the release's chart, with no login
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN GH_TOKEN
+          DOCKER_CONFIG=$(mktemp -d)
+          HELM_REGISTRY_CONFIG=$DOCKER_CONFIG/helm-registry.json
+          echo '{}' > "$HELM_REGISTRY_CONFIG"
+          export DOCKER_CONFIG HELM_REGISTRY_CONFIG
+          dest=$(mktemp -d)
+          if ! out=$(helm pull "oci://$CHART" --version "$VERSION" --destination "$dest" 2>&1); then
+            echo "$out"
+            echo "::error::an anonymous client cannot pull oci://$CHART:$VERSION; is the ghcr.io package public?"
+            exit 1
+          fi
+          echo "$out"
+          got=$(sed -n -E 's/^Digest: (sha256:[0-9a-f]{64})$/\1/p' <<<"$out")
+          if [ "$got" != "$DIGEST" ]; then
+            echo "::error::oci://$CHART:$VERSION resolves to '$got', not the pushed $DIGEST"
+            exit 1
+          fi
+          echo "pulled oci://$CHART:$VERSION anonymously, $DIGEST"
+
   publish:
     name: sign, attest and publish the release
-    needs: [release, dist, dist-musl, image]
+    needs: [release, dist, dist-musl, image, image-manifest, chart]
     if: >-
       !cancelled() && github.event_name == 'push' && needs.release.outputs.tag != ''
       && needs.dist.result == 'success' && needs.dist-musl.result == 'success'
-      && needs.image.result == 'success'
+      && needs.image.result == 'success' && needs.image-manifest.result == 'success'
+      && needs.chart.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

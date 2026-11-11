@@ -12,6 +12,13 @@
 //! subcommands in [`cli`] are operator tools that run to completion instead.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// Tests spawn bare: what they spawn is the test's own scaffolding, not work a
+// request hands off. Outside tests, `clippy.toml` sends every spawn through
+// `startup::tasks`.
+#![cfg_attr(
+    test,
+    allow(clippy::disallowed_methods, reason = "test scaffolding spawns bare")
+)]
 
 // Linux-only, stated as a compile error rather than left to chance. The crate
 // already fails to build elsewhere, because `sd_notify` uses
@@ -32,6 +39,7 @@ mod bulk_adopt;
 mod check_queue;
 mod cli;
 mod config;
+mod config_watch;
 mod fence;
 mod http;
 mod instance_lock;
@@ -52,6 +60,7 @@ mod reload;
 mod sd_notify;
 mod signals;
 mod startup;
+mod telemetry;
 mod torrent_keys;
 mod tracing_init;
 mod vpn;
@@ -470,6 +479,12 @@ fn check_config_as(
     nft_available: impl FnOnce() -> bool,
     cap_sets: impl FnOnce() -> Option<vpn::caps::CapSets>,
 ) -> anyhow::Result<()> {
+    // Not in `Config::validate`: a reload loads the file through it, and a
+    // `log_filter` that does not parse there is a failed `log_filter` stage
+    // that keeps the log filter in place, not a file that failed to load.
+    if let Some(f) = &cfg.log_filter {
+        tracing_init::check_log_filter(f)?;
+    }
     if cfg.network_kill_switch {
         let uid = uid().context("read this process's uid for the kill switch")?;
         if let Some(refusal) = startup::kill_switch_uid_refusal(uid) {
@@ -655,7 +670,15 @@ fn main() -> anyhow::Result<()> {
     // on this thread and never construct a session.
     if let Some(command) = cli.command {
         // A subcommand's failure to install it is its own human error, exit 1.
-        tracing_init::init(cfg.log_level)?;
+        // Operator tools export no spans; their lines still carry ids. A
+        // `log_filter` that does not parse is the daemon's refusal to make,
+        // not a reason to refuse `hash-password` or `net-cleanup`: a tool
+        // runs at `log_level` without it.
+        let log_filter = cfg
+            .log_filter
+            .as_deref()
+            .filter(|f| tracing_init::check_log_filter(f).is_ok());
+        tracing_init::init(cfg.log_level, log_filter, &telemetry::Telemetry::ids_only())?;
         log_prepared(prepared.as_ref());
         return match command {
             Command::Pool { cmd } => match cmd {
@@ -696,28 +719,63 @@ fn main() -> anyhow::Result<()> {
         refuse_config(&e);
     }
 
-    // A daemon whose subscriber did not install would run with every log
-    // line lost, so it stops here, 70 (EX_SOFTWARE) as for any other startup
-    // failure, saying why in the shape the lost lines would have had.
-    let log_handle = match tracing_init::init(cfg.log_level) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing_init::early_error(EarlyErrorKind::TracingInitFailed, &format!("{e:#}"));
-            std::process::exit(70);
-        }
-    };
-    log_prepared(prepared.as_ref());
-
+    // Before the subscriber: a gRPC span exporter spawns its channel's task
+    // on the runtime it is built in.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("torrentd-tokio")
         .build()
         .context("build tokio runtime")?;
 
+    // A daemon whose subscriber did not install would run with every log
+    // line lost, so it stops here, 70 (EX_SOFTWARE) as for any other startup
+    // failure, saying why in the shape the lost lines would have had.
+    let installed = {
+        let _entered = runtime.enter();
+        telemetry::Telemetry::new(cfg.telemetry.as_ref()).and_then(|t| {
+            Ok((
+                tracing_init::init(cfg.log_level, cfg.log_filter.as_deref(), &t)?,
+                t,
+            ))
+        })
+    };
+    let (log_handle, telemetry) = match installed {
+        Ok(installed) => installed,
+        Err(e) => {
+            tracing_init::early_error(EarlyErrorKind::TracingInitFailed, &format!("{e:#}"));
+            std::process::exit(70);
+        }
+    };
+    log_prepared(prepared.as_ref());
+    if telemetry.is_exporting() {
+        info!(target: "torrentd::telemetry", "exporting spans over OTLP");
+    }
+    // The last step of the shutdown drain, and of a failed boot: export the
+    // spans still queued, bounded, from a blocking thread, since the gRPC
+    // exporter sends on this runtime's workers.
+    let telemetry = std::sync::Arc::new(telemetry);
+    let flush_spans = move || {
+        let telemetry = telemetry.clone();
+        async move {
+            let flushed = crate::startup::tasks::spawn_blocking(move || {
+                telemetry.shutdown(crate::telemetry::SHUTDOWN_FLUSH);
+            })
+            .await;
+            if let Err(e) = flushed {
+                warn!(
+                    error.kind = "span_flush_failed",
+                    error.cause = %e,
+                    "spans still queued at shutdown were not all exported",
+                );
+            }
+        }
+    };
+
     runtime.block_on(async move {
         match startup::boot(cfg, config_path, log_handle).await {
             Ok(handle) => {
                 let exit_code = handle.run_until_signal().await;
+                flush_spans().await;
                 std::process::exit(exit_code);
             }
             Err(e) => {
@@ -729,6 +787,7 @@ fn main() -> anyhow::Result<()> {
                 // log line is the only thing they get. Every `.context(...)`
                 // on the way up is written to be read; this is what prints it.
                 error!(error.cause = %format_args!("{e:#}"), "startup failed");
+                flush_spans().await;
                 if startup::is_config_refusal(&e) {
                     std::process::exit(EX_CONFIG);
                 }
@@ -1271,5 +1330,26 @@ http_listen = "127.0.0.1:8080"
              listen_interfaces = \"0.0.0.0:6881\"\n"
         ));
         check_config(&cfg).unwrap();
+    }
+
+    /// A `log_filter` that does not parse loads, so a reload can count it as
+    /// its own stage, and the boot's pre-flight refuses it.
+    #[test]
+    fn check_config_refuses_a_log_filter_that_does_not_parse() {
+        let profile = "\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+                       listen_interfaces = \"0.0.0.0:6881\"\n";
+        let bad = cfg_from(&format!("{TOP}log_filter = \"torrentd=loud\"\n{profile}"));
+        let msg = format!("{:#}", check_config(&bad).expect_err("refused"));
+        assert!(
+            msg.contains("log_filter") && msg.contains("torrentd=loud"),
+            "{msg}"
+        );
+        let good = cfg_from(&format!(
+            "{TOP}log_filter = \"torrentd_pool::apply=debug,torrentd::vpn=trace\"\n{profile}"
+        ));
+        check_config(&good).unwrap();
+        // A whitespace-only `log_filter` is unset, as a reload applies it.
+        let blank = cfg_from(&format!("{TOP}log_filter = \"  \"\n{profile}"));
+        check_config(&blank).unwrap();
     }
 }

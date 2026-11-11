@@ -1021,6 +1021,102 @@ async fn an_untimed_operation_refuses_a_body_that_did_not_arrive_whole() {
     );
 }
 
+/// Issue #728: an adoption sent with a W3C `traceparent` runs in the
+/// caller's trace all the way down: every log line it causes — on the
+/// blocking pool, on the adopt workers, in the pool and the engine — carries
+/// the caller's `trace_id`, and the response's `traceparent` names the same
+/// trace and the request's own span.
+#[tokio::test]
+async fn an_adoption_runs_in_the_callers_trace_down_to_the_engine() {
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const CALLER_SPAN: &str = "00f067aa0ba902b7";
+
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Debug, log.clone());
+    let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    // The fixture's scan is a trace of its own (`pool.scan_root`), before
+    // the request; only what the request logs is read below.
+    let before = log.text().len();
+    let resp = h
+        .send_with(
+            "POST",
+            "/v1/pool/adoptions",
+            Some(&h.tokens.write.clone()),
+            adopt(
+                "p",
+                false,
+                // Several targets, so they are adopted on worker threads.
+                json!({"kind": "infohashes", "infohashes": [IH_C, IH_A, IH_B]}),
+            ),
+            &[("traceparent", &format!("00-{TRACE_ID}-{CALLER_SPAN}-01"))],
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let request_id = resp
+        .header("x-request-id")
+        .expect("a request id")
+        .to_owned();
+
+    let returned = resp.header("traceparent").expect("a traceparent");
+    let parts: Vec<&str> = returned.split('-').collect();
+    assert_eq!(parts.len(), 4, "{returned}");
+    assert_eq!(parts[0], "00", "{returned}");
+    assert_eq!(parts[1], TRACE_ID, "the caller's trace: {returned}");
+    assert_ne!(parts[2], CALLER_SPAN, "the request's own span: {returned}");
+
+    let lines: Vec<Value> = log.text()[before..]
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    // The lines inside the request: all of them but the observer's two,
+    // which kynos emits outside every interceptor.
+    let inside: Vec<&Value> = lines.iter().filter(|l| l["trace_id"].is_string()).collect();
+    for line in &inside {
+        assert_eq!(line["trace_id"], TRACE_ID, "{line}");
+    }
+    let targets: std::collections::BTreeSet<&str> =
+        inside.iter().filter_map(|l| l["target"].as_str()).collect();
+    // The handler's summary, written once the blocking pool hands back.
+    assert!(
+        inside
+            .iter()
+            .any(|l| l["message"] == "adopt" && l["target"] == "torrentd::http::pool"),
+        "{targets:?}"
+    );
+    // Lines written below the handler, on the adopt workers.
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.starts_with("torrentd_engine") || t.starts_with("torrentd_pool")),
+        "no engine or pool line in the trace: {targets:?}\n{}",
+        log.text()
+    );
+    // The request span itself: its id, route and principal.
+    let handler = inside
+        .iter()
+        .find(|l| l["message"] == "adopt")
+        .expect("the adopt line");
+    assert_eq!(handler["span"]["name"], "request", "{handler}");
+    assert_eq!(
+        handler["span"]["request_id"],
+        request_id.as_str(),
+        "{handler}"
+    );
+    assert_eq!(handler["span"]["route"], "/v1/pool/adoptions", "{handler}");
+    assert_eq!(handler["span"]["method"], "POST", "{handler}");
+    assert_eq!(handler["span"]["principal"], "token", "{handler}");
+    assert_eq!(handler["span"]["token_name"], "writer", "{handler}");
+    assert!(
+        !log.text().contains(&h.tokens.write),
+        "the token itself is never logged"
+    );
+}
+
 /// Issue #507: the targets of one request are adopted side by side, and the
 /// response still lists each where it went in the order named. An infohash
 /// named twice meets its first occurrence's claim exactly as one target at a

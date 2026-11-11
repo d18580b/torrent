@@ -998,6 +998,7 @@ impl PoolService {
     }
 
     /// Adopt `infohash` into `profile`: [`execute_adopt`] on this pool.
+    #[tracing::instrument(name = "pool.adopt", level = "info", skip_all, fields(infohash = infohash, profile_id = %profile, dry_run = dry_run, refused = tracing::field::Empty))]
     pub fn adopt(
         &self,
         source: &Arc<dyn AlertSource>,
@@ -1006,7 +1007,9 @@ impl PoolService {
         profile: ProfileId,
         dry_run: bool,
     ) -> Result<Adopted, AdoptRefusal> {
-        execute_adopt(self, source, profiles, infohash, profile, dry_run)
+        execute_adopt(self, source, profiles, infohash, profile, dry_run).inspect_err(|e| {
+            tracing::Span::current().record("refused", e.reason.as_str());
+        })
     }
 
     /// The profile the pool index names as `infohash`'s owner, read on the
@@ -1032,6 +1035,7 @@ impl PoolService {
     /// it is released, holding no lock: the index reads among them each
     /// take the reader for that read alone ([`ReaderIndex`]), so every other
     /// request that reads the index goes on meanwhile.
+    #[tracing::instrument(name = "pool.plan", level = "info", skip_all, fields(kind = spec.kind(), plan_id = tracing::field::Empty), err(level = "info"))]
     pub fn create_plan(
         &self,
         spec: &torrentd_pool::PlanSpec,
@@ -1055,6 +1059,7 @@ impl PoolService {
         }
         let spec_json = serde_json::to_string(spec)?;
         let id = self.with_store(|st| st.create_plan(spec.kind(), &spec_json, now_secs()))?;
+        tracing::Span::current().record("plan_id", id);
         self.with_store_mut(|st| st.add_plan_steps(id, &steps))?;
         Ok(Ok(id))
     }
@@ -1102,6 +1107,7 @@ impl PoolService {
     /// holds back only adoptions' admission and verdicts and goes on
     /// starting re-hashes and held adds. Reads through
     /// [`PoolService::with_reader`] never wait.
+    #[tracing::instrument(name = "pool.scan", level = "info", skip_all, err(level = "info"))]
     pub fn scan(&self) -> anyhow::Result<ScanSummary> {
         // Each skipped entry was a `warn` line and a number in the API
         // response. An unreadable root, or subdirectory, keeps its previous

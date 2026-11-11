@@ -50,9 +50,12 @@ impl FencingStop {
         self.stop.send_replace(true);
         let closed = self.gate.try_close() || {
             let gate = self.gate.clone();
-            tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(move || gate.close()))
-                .await
-                .is_ok_and(|joined| joined.is_ok())
+            tokio::time::timeout_at(
+                deadline,
+                crate::startup::tasks::spawn_blocking(move || gate.close()),
+            )
+            .await
+            .is_ok_and(|joined| joined.is_ok())
         };
         let returned = tokio::time::timeout_at(deadline, self.stop.closed())
             .await

@@ -183,6 +183,48 @@ tests:
 
   - interval: 1m
     input_series:
+      - series: 'torrentd_external_command_failures_total{program="nft"}'
+        values: '0 0 1 1x40'
+      - series: 'torrentd_external_command_failures_total{program="ip"}'
+        values: '0x40'
+      - series: 'torrentd_boot_external_command_failures{program="nft"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              program: nft
+            exp_annotations:
+              summary: "nft failed; read the WARN line naming the command and its stderr"
+      - eval_time: 30m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts: []
+
+  # One that failed during the boot, before the first scrape: the boot
+  # gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_external_command_failures_total{program="wg"}'
+        values: '1x40'
+      - series: 'torrentd_boot_external_command_failures{program="wg"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TorrentdExternalCommandFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              program: wg
+            exp_annotations:
+              summary: "wg failed; read the WARN line naming the command and its stderr"
+
+  - interval: 1m
+    input_series:
       - series: 'torrentd_metrics_dropped_samples_total{reason="labels"}'
         values: '0 0 1 1'
       - series: 'torrentd_metrics_dropped_samples_total{reason="registration"}'
@@ -319,11 +361,13 @@ tests:
         exp_alerts: []
 
   # acct_a never came up; acct_b's tunnel drops at 2m, leaving nothing serving.
+  # Each profile's one series carries its own `reason`, which the counts and
+  # the profile_id join must not trip over.
   - interval: 1m
     input_series:
-      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_a", reason="rp_filter_strict"}'
         values: '1x6'
-      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_b"}'
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_b", reason="none"}'
         values: '0x6'
       - series: 'torrentd_profile_vpn_tunnel_up{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
         values: '0x6'
@@ -360,9 +404,9 @@ tests:
   # ---- profiles and tunnels ---------------------------------------------
   - interval: 1m
     input_series:
-      - series: 'torrentd_profile_boot_failed{profile_id="acct_b"}'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_b", reason="rp_filter_strict"}'
         values: '1 1 1'
-      - series: 'torrentd_profile_boot_failed{profile_id="acct_a"}'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_a", reason="none"}'
         values: '0 0 0'
     alert_rule_test:
       - eval_time: 1m
@@ -371,6 +415,7 @@ tests:
           - exp_labels:
               severity: critical
               profile_id: acct_b
+              reason: rp_filter_strict
             exp_annotations:
               summary: "Profile acct_b got no session at boot and is not seeding"
 
@@ -2038,6 +2083,31 @@ tests:
               stage: load
             exp_annotations:
               summary: "A config reload failed at load; the daemon is running the previous settings"
+
+  # shutdown_drain_secs edited in the file at 5m, found by a reload and left
+  # for a restart; the restart at 46m boots with it and seeds 0. Quiet through
+  # the grace period, firing past it for that key alone, quiet once restarted.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_config_restart_pending{key="shutdown_drain_secs"}'
+        values: '0x4 1x40 0x10'
+      - series: 'torrentd_config_restart_pending{key="auth"}'
+        values: '0x55'
+    alert_rule_test:
+      - eval_time: 34m
+        alertname: TorrentdConfigRestartPending
+        exp_alerts: []
+      - eval_time: 36m
+        alertname: TorrentdConfigRestartPending
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              key: shutdown_drain_secs
+            exp_annotations:
+              summary: "Config key shutdown_drain_secs has changed in the file and needs a daemon restart to take effect"
+      - eval_time: 50m
+        alertname: TorrentdConfigRestartPending
+        exp_alerts: []
 
   # ---- pool -------------------------------------------------------------
   - interval: 1m

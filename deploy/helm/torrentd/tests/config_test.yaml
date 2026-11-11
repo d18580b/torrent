@@ -1,0 +1,212 @@
+suite: config
+templates:
+  - templates/secret.yaml
+tests:
+  - it: writes whole numbers as TOML integers, however large
+    values: [values/host-only.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^connections_limit = 10000$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^upload_rate_limit = 10485760$
+      - notMatchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: '(?m)\d\.0(,|\]|$)|\de\+'
+
+  - it: writes integers inside arrays of tables
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\s*listen_port = 6891$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^shutdown_drain_secs = 300$
+
+  - it: listens on the pod address at api.port
+    values: [values/host-only.yaml]
+    set:
+      api.port: 9090
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^http_listen = "0\.0\.0\.0:9090"$
+
+  - it: fills the state paths and trusts the pod CIDR by default
+    values: [values/host-only.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^trusted_proxies = \["10\.42\.0\.0/16"\]$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^resume_dir = "/var/lib/torrentd/resume"$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^default_save_path = "/data/torrents"$
+
+  - it: turns config_watch on by default
+    values: [values/host-only.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^config_watch = true$
+
+  - it: keeps config_watch as given
+    values: [values/host-only.yaml]
+    set:
+      config.settings.config_watch: false
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^config_watch = false$
+
+  - it: writes no [telemetry] without an endpoint
+    values: [values/host-only.yaml]
+    asserts:
+      - notMatchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]$
+
+  - it: writes a [telemetry] table holding only telemetry.otlpEndpoint
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: http://alloy.monitoring:4318
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]\n[ \t]*otlp_endpoint = "http://alloy\.monitoring:4318"$
+
+  - it: writes telemetry.otlpEndpoint into [telemetry]
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: http://alloy.monitoring:4318
+      config.settings.telemetry:
+        protocol: http/protobuf
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]\n(?:[ \t]+[a-z_]+ = .*\n)*[ \t]+otlp_endpoint = "http://alloy\.monitoring:4318"$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[telemetry\]\n(?:[ \t]+[a-z_]+ = .*\n)*[ \t]+protocol = "http/protobuf"$
+
+  - it: refuses an OTLP endpoint set in both places
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: http://alloy.monitoring:4318
+      config.settings.telemetry:
+        otlp_endpoint: http://tempo.monitoring:4317
+    asserts:
+      - failedTemplate:
+          errorPattern: both set; set one
+
+  - it: refuses an OTLP endpoint that is not an http(s) URL
+    values: [values/host-only.yaml]
+    set:
+      telemetry.otlpEndpoint: alloy.monitoring:4317
+    asserts:
+      - failedTemplate: {}
+
+  - it: keeps trusted_proxies as given, even empty
+    values: [values/host-only.yaml]
+    set:
+      config.settings.trusted_proxies: []
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^trusted_proxies = \[\]$
+
+  - it: renders [[profile]] and [auth] tables
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^\[auth\]$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?s)\[\[profile\]\].*id = "public".*\[\[profile\]\].*id = "acct_a".*\[\[profile\]\].*id = "acct_b"
+
+  - it: carves the API reply and cluster DNS out of the kill switch
+    values: [values/kill-switch.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^kill_switch_api_interfaces = \["eth0"\]$
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^kill_switch_dns_servers = \["10\.43\.0\.10"\]$
+
+  - it: takes the cluster DNS address from cluster.dnsIP
+    values: [values/kill-switch.yaml]
+    set:
+      cluster.dnsIP: 10.96.0.10
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^kill_switch_dns_servers = \["10\.96\.0\.10"\]$
+
+  - it: writes no carve-out without the kill switch
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - notMatchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: kill_switch_
+
+  - it: renders nothing for an existing Secret
+    set:
+      config.existingSecret: my-config
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: refuses a config with no profile
+    asserts:
+      - failedTemplate:
+          errorPattern: no \[\[profile\]\]
+
+  - it: refuses a config with neither auth nor allow_unauthenticated
+    set:
+      config.settings.profile:
+        - id: public
+          network: host
+          listen_interfaces: "0.0.0.0:6881"
+    asserts:
+      - failedTemplate:
+          errorPattern: needs `auth`
+
+  - it: refuses a default_save_path on no payload volume
+    values: [values/host-only.yaml]
+    set:
+      payloadVolumes:
+        - name: library
+          mountPath: /data/library
+          existingClaim: library
+    asserts:
+      - failedTemplate:
+          errorPattern: default_save_path /data/torrents is under no payloadVolumes mountPath
+
+  - it: does not take a sibling path with the same prefix as a mount
+    values: [values/host-only.yaml]
+    set:
+      config.settings.default_save_path: /data/torrents-new
+    asserts:
+      - failedTemplate:
+          errorPattern: default_save_path /data/torrents-new is under no payloadVolumes mountPath
+
+  - it: accepts a default_save_path below a payload volume's mountPath
+    values: [values/multi-vpn.yaml]
+    asserts:
+      - matchRegex:
+          path: stringData["torrentd.toml"]
+          pattern: (?m)^default_save_path = "/data/torrents"$
+
+  - it: refuses an http_listen of its own
+    values: [values/host-only.yaml]
+    set:
+      config.settings.http_listen: "127.0.0.1:8080"
+    asserts:
+      - failedTemplate:
+          errorPattern: set api.port instead

@@ -265,11 +265,13 @@ authentication posture, and at least one `[[profile]]`:
 | `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `allowed_hosts` | `[]`, so a daemon without `[auth]` answers only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`). List the names a reverse proxy passes through as `Host`, as bare names or addresses with no scheme, port or path. Refused beside `[auth]` — §6. Read once, at startup. |
 | `allow_unsupported_state_fs` | `false`, so a state directory (that of `resume_dir`, `registry_path` or `[pool] db_path`) on overlayfs, NFS, CIFS/SMB or FUSE refuses the start with exit 78. `true` starts anyway, with a WARN and `torrentd_state_fs_unsupported` at 1 — [operations.md, Storage the daemon runs on](operations.md#storage-the-daemon-runs-on). Read once, at startup. |
-| `log_level` | `info` |
+| `log_level` | `info`. Sets every crate of the workspace, `torrentd_pool` included; every other target logs at `info`. Reloadable. |
+| `log_filter` | unset. `EnvFilter` directives laid over `log_level`, e.g. `"torrentd_pool::apply=debug,torrentd::vpn=trace"`: a target named here wins over `log_level`. Reloadable. One that does not parse refuses the boot with exit 78, and fails a reload with the filter in place kept, counted in `torrentd_config_reload_failures_total{stage="log_filter"}` — §12. |
 | `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
 | `vpn_handshake_max_age_secs` | `180` — how long a WireGuard profile with torrents that can send may go with no handshake answering them before it is fenced. An aged handshake fences only once the link has sent bytes that nothing answered for this long, so neither an idle profile nor a quiet seeding one is fenced on its handshake (§11, drill 5). |
 | `shutdown_drain_secs` | `60` — how long a stop waits for outstanding resume saves (`1`–`3600`). `deploy/torrentd.service`'s `TimeoutStopSec=120` is sized to the default. A larger value is covered by the `EXTEND_TIMEOUT_USEC` the daemon sends while it stops, so `TimeoutStopSec` needs raising only for a stop that must fit without those extensions. |
+| `config_watch` | `false`. `true` reloads when the config file changes, as a `SIGHUP` would, by watching its directory with inotify: an in-place write, an editor's rename over the file, and kubelet's `..data` symlink swap when a mounted ConfigMap or Secret is updated — §8. Read once, at startup. |
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
 | `kill_switch_api_interfaces`, `kill_switch_dns_servers` | empty — the kill switch's carve-outs for a cluster: the API's replies on the named interfaces, and DNS to the named resolvers. Restart-only, and refused without `network_kill_switch`; see §11, "In a cluster" |
 | `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
@@ -1239,13 +1241,32 @@ The daemon sets none of these itself.
   bare metal. The kernel uses `max(conf/all, conf/<iface>)` per interface, so
   `all = 2` is sufficient on its own — but `all = 0` is *not* safe, because a
   tunnel interface created later inherits `conf/default` and may come up
-  strict. `vpn check` reports both values and the effective mode. On the
-  host, write it to a `sysctl.d` file so it outlasts a reboot, and load it:
+  strict. `vpn check` reports both values and the effective mode, judging
+  an interface it has not raised on `conf/default`, the value it will take.
+  The daemon judges each `vpn` profile's interface the same way once its
+  tunnel is up: an effective strict mode fails that profile, takes its
+  tunnel down, logs the sysctl and the value to set, and sets
+  `torrentd_profile_boot_failed{reason="rp_filter_strict"}` to `1`, which
+  `TorrentdProfileBootFailed` pages on. A value it cannot read is logged as
+  a warning and fails nothing. On the host, write it to a `sysctl.d` file so
+  it outlasts a reboot, and load it:
 
   ```bash
   echo 'net.ipv4.conf.all.rp_filter = 2' | sudo tee /etc/sysctl.d/90-torrentd.conf
   sudo sysctl --system
   sysctl net.ipv4.conf.all.rp_filter          # net.ipv4.conf.all.rp_filter = 2
+  ```
+
+  In a Kubernetes pod, `net.ipv4.conf.*` is an unsafe sysctl, and a pod
+  without it runs on the node's value, which is often strict. Allow it on
+  the node (on k3s, `--kubelet-arg=allowed-unsafe-sysctls=net.ipv4.conf.*`)
+  and set it in the pod's `securityContext`:
+
+  ```yaml
+  securityContext:
+    sysctls:
+      - name: net.ipv4.conf.all.rp_filter
+        value: "2"
   ```
 
 ## 8. Start it
@@ -1341,6 +1362,28 @@ its files. They are still not reloadable — the stores are opened once at
 startup — but pointing a profile at its files is routine configuration, and
 the privacy warning is the line an alert rule watches for an account's identity
 changing under a live session.
+
+**Reloading on a changed file:** with `config_watch = true` the daemon needs
+neither `SIGHUP` nor the API. It watches the config file's directory with
+inotify, and once the directory has been quiet for half a second (five at most,
+however busy it is) and the file's bytes differ from the ones it last read, it
+runs the same reload `SIGHUP` does, with the same validation, warnings and
+`torrentd_config_reload_failures_total`. That is what a Kubernetes ConfigMap
+or Secret mount needs: kubelet updates one by swapping a `..data` symlink, and
+sends no signal. The key itself is read once, at startup. The watch starts
+once the profiles are up; an edit made while the daemon was starting is
+reloaded then, as one. The watch does not see a file that is a symlink to
+somewhere outside its directory changing, nor a file bind-mounted on its own
+(as `deploy/compose.yaml` mounts it) edited from outside the container; reload
+those as above. A watch that cannot be set up, or stops, is logged at `WARN`
+and counted at `stage="watch"`, and the daemon carries on reloading on
+`SIGHUP` and the API.
+
+Whatever starts it, a reload that finds a restart-only key changed sets
+`torrentd_config_restart_pending{key}` to 1, and `TorrentdConfigRestartPending`
+fires once it has stayed so for 30 minutes: the file says one thing and the
+daemon runs another until a restart, or until the file is edited back and
+reloaded ([metrics.md](../deploy/metrics.md#config-reloads)).
 
 ### On the compose stack
 
@@ -1496,7 +1539,10 @@ tunnel is raised. A profile whose tunnel the host cannot carry is failed
 with a reason that starts `preflight wireguard_kernel:` or
 `preflight tun_device:`: that is the profile's `failure_reason` in
 `GET /v1/profiles/{id}` and the `reason` on the boot's log line, and
-`torrentd_profile_boot_failed` is `1` for it. `torrentd --check-config` and
+`torrentd_profile_boot_failed` is `1` for it, with `reason="other"`.
+`reason="rp_filter_strict"` is the one failure labelled on its own: the
+tunnel came up on an interface whose reverse-path filter is strict (§7).
+`torrentd --check-config` and
 `torrentd vpn check` report the same verdicts, run in the same container.
 
 ## 9. First-run checks
@@ -1690,6 +1736,115 @@ where that is intended, as it must be for an OpenVPN profile (§11, drill 6).
 
 `mise run test-alerts` checks the rules with `promtool` and runs a fixture per
 alert; it needs podman or docker.
+
+### Traces: OpenTelemetry over OTLP
+
+Every span the daemon opens at INFO or above (an HTTP request's, an engine
+call's under `op`, a pool step's) has an OpenTelemetry trace id and span id,
+and every JSON log line inside one ends with them:
+
+```json
+{"timestamp":"…","level":"INFO","message":"…","target":"torrentd_engine::real","span":{"op":"add_torrent","name":"add_torrent"},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}
+```
+
+They are there with nothing exported, so a log query can already group one
+operation's lines by `trace_id`. A line outside any span has neither key.
+
+Every API request runs in a span named `request`, carrying its
+`request_id` (the response's `X-Request-Id`), `method`, `route` template,
+`status`, and caller (`principal`: `session`, `token` or `anonymous`, and a
+static token's `token_name`, never the token). Work the request hands to
+another task or thread stays inside it, so an engine line an adoption causes
+has the request's `trace_id`. A request carrying a W3C `traceparent` joins
+the caller's trace, and every response returns its own `traceparent`.
+
+The spans each layer opens, by name, to search for in the log's
+`span.name` or in Tempo. INFO spans are logged and exported; DEBUG spans
+appear only with `log_level = "debug"` and are never exported. Nothing
+that runs once per torrent on a recurring path opens an INFO span, so a
+10K-torrent daemon's trace volume does not grow with its torrents.
+
+| Layer | Span | Level | Fields |
+| --- | --- | --- | --- |
+| HTTP API | `request` | INFO | `request_id`, `method`, `route`, `status`, `principal` |
+| Startup | `startup`, and under it `startup.fs_check`, `startup.instance_lock`, `startup.table_lock`, `startup.preflight`, `startup.release_wireguard`, `startup.release_openvpn`, `startup.stale_kill_switch`, `startup.profiles`, `startup.pool_open`, `startup.listen_check`, `startup.resume_scan`, `startup.torrent_dir_scan`; then `startup.http_bind` | INFO | |
+| Reload | `reload`, one trace per reload | INFO | `trigger` (`request`, `watch`, `boot_catch_up`), `path` |
+| VPN monitor | `vpn_monitor.check`, one trace per profile per poll, linked to the long-lived `vpn_monitor` | INFO | `profile_id`, `vpn_iface`, `verdict` (`up` or the fence reason) |
+| Port-forward monitor | `port_forward_monitor.renew`, one trace per renewal, linked to the profile's long-lived `port_forward_monitor` | INFO | `profile_id`, `rebound`, `next_in_s` |
+| Host tools | `external_command` | INFO | `program`, `command` (redacted), `timeout_s`, `duration_ms`, `exit_status`, `error` |
+| Pool | `pool.scan`, `pool.scan_root`, `pool.scan_library`, `pool.match`, `pool.drift`, `pool.plan`, `pool.plan_prepare`, `pool.plan_finish`, `pool.adopt`, `pool.apply` | INFO | `root`, `kind`, `plan_id`, `infohash`, `profile_id`, `refused` |
+| Pool apply steps | `pool.apply_step`: INFO for a relocate's move, DEBUG for each delete | INFO / DEBUG | `plan_id`, `step`, `op`, `src`, `outcome`, `error` |
+| Check queue | `check_queue.verify_outcome` | INFO | `infohash`, `outcome` |
+| Check queue | `check_queue.tick`, `check_queue.admit` (`kind`: `adoption`, `recheck`, `add`), `pool.adopt_plan` | DEBUG | `infohash`, `profile_id`, `depth`, `in_flight` |
+| Pool index (SQLite) | `pool_store.<operation>` (`pool_store.transaction`, `pool_store.torrent`, `pool_store.set_step_status`, …) | DEBUG | `infohash`, `plan_id`, `step`, `root_id` |
+| libtorrent FFI | `ffi.<call>` (`ffi.add_torrent`, `ffi.torrent_statuses`, `ffi.pop_alerts`, `ffi.save_resume_data`, …) | DEBUG | `infohash`, `duration_us` |
+| Engine | one span per engine call, named for it, with `op` | INFO | `op`, `infohash` |
+
+A failed operation records its error on its span: as `error`, `refused` or
+`outcome`, or as an event logged inside it. A host tool that failed (could
+not start, timed out, or exited non-zero where its caller needed a zero
+exit) is also logged at WARN, target `torrentd::vpn::exec`, with its stderr
+redacted and cut at 512 bytes (withheld where the tool was fed stdin, which
+may hold a private key), and counted in
+`torrentd_external_command_failures_total{program}`;
+`torrentd_external_command_duration_seconds{program}` times every run, and
+`TorrentdExternalCommandFailures` alerts on a failure.
+
+A `[telemetry]` section exports the spans themselves over OTLP. It is off by
+default and restart-only; `deploy/torrentd.sample.toml` lists its keys and the
+`OTEL_EXPORTER_OTLP_*` variable each falls back to. Pointing it at Grafana
+Alloy, which forwards to Tempo:
+
+```toml
+[telemetry]
+otlp_endpoint = "http://127.0.0.1:4318"   # http/protobuf; /v1/traces is appended
+```
+
+```alloy
+otelcol.receiver.otlp "default" {
+  http { endpoint = "127.0.0.1:4318" }
+  grpc { endpoint = "127.0.0.1:4317" }
+  output { traces = [otelcol.exporter.otlp.tempo.input] }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client { endpoint = "tempo:4317" }
+}
+```
+
+Straight to Tempo, which has an OTLP receiver of its own, is
+`otlp_endpoint = "http://tempo:4317"` with `protocol = "grpc"`. For a
+collector that wants credentials (Grafana Cloud's OTLP gateway), put them in
+a `headers_file` of `name=value` lines readable by the daemon's user alone,
+not in the TOML. To join logs to traces in Grafana, give the Loki data
+source a derived field on `"trace_id":"(\w+)"` linking to the Tempo data
+source, and Tempo's trace-to-logs setting a `{job="torrentd"} |= "${__span.traceId}"`
+query.
+
+What is exported, and what is not:
+
+- Spans and the events logged inside them, at INFO and above, each held to
+  the redaction every log line gets: a tracker credential reaches the
+  collector no more than it reaches the journal. `service.name` is
+  `torrentd`, `service.version` the build's; `resource_attributes` and
+  `OTEL_RESOURCE_ATTRIBUTES` add the rest.
+- `sample_ratio` keeps that share of new traces (default all of them); a span
+  under a sampled parent is kept with it. Unsampled spans still have ids in
+  the log.
+- Nothing waits on the collector. Spans queue in a bounded buffer that drops
+  when full, and each export is bounded (10 s for http/protobuf,
+  `OTEL_EXPORTER_OTLP_TIMEOUT` for grpc). A failed export drops its batch,
+  counts in `torrentd_telemetry_export_errors_total`, and logs a WARN under
+  `torrentd::telemetry` at most once a minute, with `held_back` counting the
+  failures it did not log. On a stop, the spans still queued are exported
+  after the resume drain, for at most 5 s more; `TimeoutStopSec=120s` covers
+  it.
+- With `network_kill_switch`, the daemon's egress is loopback and its tunnels
+  only, so the collector has to be on loopback: Alloy on the host, or a
+  sidecar in the same pod. An exporter pointed anywhere else fails every
+  export, and the counter says so.
+- Operator subcommands (`pool …`, `vpn check`, …) export nothing; their log
+  lines carry ids all the same.
 
 ### Checking the VPN on its own
 
@@ -2602,9 +2757,19 @@ A restart would throw away the state you are trying to capture.
    daemon reads at every start, so a level left at `debug` there survives the
    next restart too.
 
-The reload applies `log_level` only when it differs from the value the daemon
-last loaded, and the level it applies replaces any `RUST_LOG` the process was
-started with. Where there is no `systemctl` — the container in `deploy/` has no
+**One subsystem only.** `log_filter` takes `EnvFilter` directives laid over
+`log_level`, and is reloadable the same way: `log_filter =
+"torrentd_pool::apply=debug"` raises the pool's apply step to `debug` and
+leaves everything else where `log_level` puts it. Delete the key and reload to
+take it away again. A `log_filter` that does not parse fails the reload with
+`SIGHUP: failed to apply log level; keeping the current log filter`, naming the
+directive, and counts in `torrentd_config_reload_failures_total{stage="log_filter"}`;
+the filter in place stays, `log_level` included.
+
+The reload applies `log_level` and `log_filter` only when one differs from the
+value the daemon last loaded. `RUST_LOG`, read once at startup, keeps priority
+across every reload: where it is set it stands in for `log_level`, and its
+directives win over `log_filter`'s on any target both name. Where there is no `systemctl` — the container in `deploy/` has no
 unit, and its log is `docker compose logs torrentd` (or `podman logs`) rather
 than the journal — edit the mounted `torrentd.toml` and call `POST /v1/config/reload`
 (§8) instead: it does what `SIGHUP` does. §8's `curl localhost:8080/v1/config/reload`

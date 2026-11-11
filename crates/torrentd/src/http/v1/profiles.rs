@@ -836,7 +836,7 @@ async fn resume_each(
         Arc::clone(&s.metrics),
         profile_id.clone(),
     );
-    let task = tokio::spawn(async move {
+    let task = crate::startup::tasks::spawn(async move {
         let mut reached = Reached {
             ok: 0,
             failed_count: 0,

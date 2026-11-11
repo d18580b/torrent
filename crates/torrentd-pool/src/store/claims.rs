@@ -12,6 +12,7 @@ use crate::model::PoolError;
 
 impl PoolStore {
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "pool_store.set_adoption", level = "debug", skip_all, fields(infohash = infohash, state = ?state), err(level = "debug"))]
     pub fn set_adoption(
         &self,
         infohash: &str,
@@ -34,6 +35,7 @@ impl PoolStore {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pool_store.adoption_state", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn adoption_state(&self, infohash: &str) -> Result<Option<AdoptionState>, PoolError> {
         let s: Option<String> = self
             .conn
@@ -51,6 +53,7 @@ impl PoolStore {
     /// to it. `None` when the torrent has no adoption row, or its row records
     /// no root or no base (a torrent never matched, or one whose root has
     /// since left the index, which nulls `root_id`), whatever its state.
+    #[tracing::instrument(name = "pool_store.adoption_base", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn adoption_base(&self, infohash: &str) -> Result<Option<(i64, String)>, PoolError> {
         Ok(self
             .conn
@@ -63,6 +66,12 @@ impl PoolStore {
             .optional()?)
     }
 
+    #[tracing::instrument(
+        name = "pool_store.counts_by_state",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn counts_by_state(&self) -> Result<HashMap<AdoptionState, u64>, PoolError> {
         let mut st = self
             .conn
@@ -81,6 +90,7 @@ impl PoolStore {
     }
 
     /// Record exactly which files a torrent claims, replacing any prior set.
+    #[tracing::instrument(name = "pool_store.replace_claims", level = "debug", skip_all, fields(infohash = infohash, claims = claims.len()), err(level = "debug"))]
     pub fn replace_claims(
         &mut self,
         infohash: &str,
@@ -105,6 +115,12 @@ impl PoolStore {
     /// Only meaningful inside [`PoolStore::in_transaction`] — on its own it
     /// publishes an empty claim table, under which every indexed file reads as
     /// an orphan. Refuses rather than trusting the caller.
+    #[tracing::instrument(
+        name = "pool_store.clear_all_claims",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn clear_all_claims(&self) -> Result<(), PoolError> {
         if self.tx_depth == 0 {
             return Err(PoolError::ClaimsClearedOutsideTransaction);
@@ -118,6 +134,12 @@ impl PoolStore {
     /// This is the check that gates destructive operations: two torrents over
     /// the same bytes means moving or deleting for one silently breaks the
     /// other.
+    #[tracing::instrument(
+        name = "pool_store.overlapping_torrents",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn overlapping_torrents(&self) -> Result<Vec<String>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT DISTINCT c.infohash FROM claim c
@@ -133,6 +155,7 @@ impl PoolStore {
 
     /// Every file `infohash` claims, sorted, so two claim sets compare equal
     /// exactly when they name the same files.
+    #[tracing::instrument(name = "pool_store.claims_of", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn claims_of(&self, infohash: &str) -> Result<Vec<(i64, String)>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT root_id, rel_path FROM claim WHERE infohash = ?1 ORDER BY root_id, rel_path",
@@ -142,6 +165,7 @@ impl PoolStore {
     }
 
     /// The other torrents that claim at least one file `infohash` claims.
+    #[tracing::instrument(name = "pool_store.co_claimants", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn co_claimants(&self, infohash: &str) -> Result<Vec<String>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT DISTINCT o.infohash FROM claim c
@@ -159,6 +183,7 @@ impl PoolStore {
     ///
     /// Asked directly rather than read off the adoption state, because an
     /// adopted torrent keeps `adopted` across a rescan that finds it sharing.
+    #[tracing::instrument(name = "pool_store.shares_claims", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn shares_claims(&self, infohash: &str) -> Result<bool, PoolError> {
         Ok(self.conn.query_row(
             "SELECT EXISTS (
@@ -172,6 +197,7 @@ impl PoolStore {
 
     /// When drift was last recorded for `infohash` and not since cleared by a
     /// verification. Only a verify clears it.
+    #[tracing::instrument(name = "pool_store.drift_at", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn drift_at(&self, infohash: &str) -> Result<Option<i64>, PoolError> {
         Ok(self
             .conn

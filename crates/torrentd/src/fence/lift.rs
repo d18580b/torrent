@@ -164,7 +164,7 @@ pub(crate) fn spawn_run(
             // to whatever stopped it ([`ProfileEntry::end_resume`]).
             let release = {
                 let (profiles, id, run) = (profiles.clone(), id.clone(), run.clone());
-                tokio::task::spawn_blocking(move || {
+                crate::startup::tasks::spawn_blocking(move || {
                     if let Some(entry) = profiles.resolve(&id).active() {
                         entry.end_resume(&run, &reached);
                     }
@@ -278,7 +278,7 @@ pub(crate) async fn resume_paced(
             break;
         }
         let batch = handles[range].to_vec();
-        let ran = tokio::task::spawn_blocking({
+        let ran = crate::startup::tasks::spawn_blocking({
             let (profiles, id, metrics, gate, cancelled) = (
                 profiles.clone(),
                 id.clone(),
