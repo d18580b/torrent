@@ -209,9 +209,11 @@ fn the_first_scrape_holds_every_series_present_from_boot() {
             }
             continue;
         }
+        // A histogram's series are its `_bucket`, `_sum` and `_count`; its
+        // `_count` stands for the row.
         for value in listed_values(labels) {
             let found = metrics.lines().any(|l| {
-                l.starts_with(&format!("{name}{{"))
+                (l.starts_with(&format!("{name}{{")) || l.starts_with(&format!("{name}_count{{")))
                     && l.contains(&value)
                     && (!labels.contains("profile_id") || l.contains("profile_id=\"test\""))
             });
