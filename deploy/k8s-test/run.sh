@@ -496,8 +496,11 @@ restart() {
   printf '%s\n' "$boot" >"$artifacts/$release.boot.log"
   # Every error, and each line a boot logs only after an unclean stop: resume
   # saves left unsaved, a kill switch left standing, a tunnel or a lock left
-  # behind. None is expected after a clean one.
-  bad=$(grep -E '"level":"ERROR"|left resume data unsaved|could not remove the network kill switch|left by an earlier run|unclean shutdown|single-instance lock' <<<"$boot" || true)
+  # behind. None is expected after a clean one. A stale kill-switch table is
+  # matched by the warning that removes one, not by "left by an earlier run":
+  # a pod without CAP_NET_ADMIN logs that phrase at info on every boot, clean
+  # or not, because it cannot list nftables tables at all.
+  bad=$(grep -E '"level":"ERROR"|left resume data unsaved|could not remove the network kill switch|removed a stale network kill-switch table|unclean shutdown|single-instance lock' <<<"$boot" || true)
   [ -z "$bad" ] || die "$pod's next boot was not clean: $bad"
   metrics=$(api "$metrics_token" "$pod" GET /metrics </dev/null)
   grep -qx 'torrentd_last_shutdown_unsaved_resumes 0' <<<"$metrics" || die "$pod: the last shutdown left resume data unsaved"
