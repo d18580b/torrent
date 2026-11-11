@@ -1124,6 +1124,42 @@ fn a_reloadable_top_level_change_does_not_leak_into_profile_changes() {
     }
 }
 
+/// `log_filter` is unset by default, loads whatever directives it holds (a
+/// reload judges them, as its own stage), and a change to it — deletion
+/// included — is a reloadable difference and nothing else.
+#[test]
+fn log_filter_loads_and_every_change_to_it_is_reloadable() {
+    let dir = tempdir().unwrap();
+    let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+    assert_eq!(a.log_filter, None);
+    let b = Config::load(&write_cfg(
+        dir.path(),
+        &with_top_level("log_filter = \"torrentd_pool::apply=debug,torrentd::vpn=trace\""),
+    ))
+    .unwrap();
+    assert_eq!(
+        b.log_filter.as_deref(),
+        Some("torrentd_pool::apply=debug,torrentd::vpn=trace")
+    );
+    Config::load(&write_cfg(
+        dir.path(),
+        &with_top_level("log_filter = \"torrentd=loud\""),
+    ))
+    .expect("the load does not judge the directives");
+    for (old, new, want) in [
+        (&a, &b, Some(b.log_filter.clone())),
+        (&b, &a, Some(None)),
+        (&b, &b, None),
+    ] {
+        let d = Config::diff(old, new);
+        assert_eq!(d.log_filter, want);
+        assert!(d.non_reloadable_changes.is_empty(), "{d:?}");
+        assert!(d.reloadable_changes.is_empty(), "{d:?}");
+        assert!(d.restart_pending().is_empty(), "{d:?}");
+        assert_eq!(d.is_empty(), want.is_none());
+    }
+}
+
 /// A reload cannot apply any other top-level key, so a file differing in
 /// exactly one of them is reported as that key, and is not unchanged.
 #[test]

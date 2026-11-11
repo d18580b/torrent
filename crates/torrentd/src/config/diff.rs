@@ -12,9 +12,10 @@ use super::LogLevel;
 /// That is each key [`Config::diff`] reports as non-reloadable, `profile` for
 /// any `[[profile]]` change, and the five reloadable settings keys, which a
 /// reload applies but cannot delete: a deleted one falls back to its preset
-/// default only at the next boot. `log_level` is the one key absent, since
-/// every change to it, deletion included, is applied. A test below changes
-/// every field at once and holds this list equal to what the diff reports.
+/// default only at the next boot. `log_level` and `log_filter` are the keys
+/// absent, since every change to either, deletion included, is applied. A
+/// test below changes every field at once and holds this list equal to what
+/// the diff reports.
 pub const RESTART_PENDING_KEYS: &[&str] = &[
     "default_save_path",
     "resume_dir",
@@ -67,6 +68,7 @@ impl Config {
             allowed_hosts: new_allowed_hosts,
             allow_unsupported_state_fs: new_allow_unsupported_state_fs,
             log_level: new_log_level,
+            log_filter: new_log_filter,
             registry_path: new_registry_path,
             connections_limit: new_connections_limit,
             file_pool_size: new_file_pool_size,
@@ -119,6 +121,10 @@ impl Config {
         // Not an `Option`: deleting the key yields the default, a real value.
         if old.log_level != *new_log_level {
             d.log_level = Some(*new_log_level);
+        }
+        // Deleting it is a change to `None`, applied like any other.
+        if old.log_filter != *new_log_filter {
+            d.log_filter = Some(new_log_filter.clone());
         }
 
         // Every other field but `[[profile]]` (`diff_profiles`) cannot be
@@ -356,10 +362,13 @@ pub struct ConfigDiff {
     pub aio_threads: Option<u32>,
     pub enable_lsd: Option<bool>,
     pub log_level: Option<LogLevel>,
+    /// `Some` holding the new `log_filter` when it differs, `Some(None)`
+    /// where it was deleted.
+    pub log_filter: Option<Option<String>>,
     /// The five settings keys above that **differed**, named whatever they
     /// differ to: a deleted key assigns `None`, which alone reads as
-    /// unchanged. Not `log_level`, which is never `None` when it differs and
-    /// is not a `Settings` key.
+    /// unchanged. Not `log_level` or `log_filter`, which are never `None`
+    /// when they differ and are not `Settings` keys.
     pub reloadable_changes: Vec<&'static str>,
     /// The subset of `reloadable_changes` the operator deleted. A `Settings`
     /// patch cannot unset a key, so a deletion is reported, never applied.
@@ -425,6 +434,7 @@ impl ConfigDiff {
     pub fn is_empty(&self) -> bool {
         self.reloadable_changes.is_empty()
             && self.log_level.is_none()
+            && self.log_filter.is_none()
             && self.non_reloadable_changes.is_empty()
             && self.profile_changes.is_empty()
     }
@@ -502,6 +512,7 @@ mod tests {
             allowed_hosts: vec!["torrentd.example".into()],
             allow_unsupported_state_fs: !old.allow_unsupported_state_fs,
             log_level: LogLevel::Debug,
+            log_filter: Some("torrentd_pool=debug".into()),
             registry_path: Some(elsewhere.join("registry.db")),
             connections_limit: None,
             file_pool_size: Some(10),
@@ -557,6 +568,10 @@ mod tests {
         );
         assert_eq!(pending, listed);
         assert!(!listed.contains("log_level"), "log_level is always applied");
+        assert!(
+            !listed.contains("log_filter"),
+            "log_filter is always applied"
+        );
     }
 
     /// The config the daemon runs, diffed against itself, leaves nothing

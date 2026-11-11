@@ -479,6 +479,12 @@ fn check_config_as(
     nft_available: impl FnOnce() -> bool,
     cap_sets: impl FnOnce() -> Option<vpn::caps::CapSets>,
 ) -> anyhow::Result<()> {
+    // Not in `Config::validate`: a reload loads the file through it, and a
+    // `log_filter` that does not parse there is a failed `log_filter` stage
+    // that keeps the log filter in place, not a file that failed to load.
+    if let Some(f) = &cfg.log_filter {
+        tracing_init::check_log_filter(f)?;
+    }
     if cfg.network_kill_switch {
         let uid = uid().context("read this process's uid for the kill switch")?;
         if let Some(refusal) = startup::kill_switch_uid_refusal(uid) {
@@ -664,8 +670,15 @@ fn main() -> anyhow::Result<()> {
     // on this thread and never construct a session.
     if let Some(command) = cli.command {
         // A subcommand's failure to install it is its own human error, exit 1.
-        // Operator tools export no spans; their lines still carry ids.
-        tracing_init::init(cfg.log_level, &telemetry::Telemetry::ids_only())?;
+        // Operator tools export no spans; their lines still carry ids. A
+        // `log_filter` that does not parse is the daemon's refusal to make,
+        // not a reason to refuse `hash-password` or `net-cleanup`: a tool
+        // runs at `log_level` without it.
+        let log_filter = cfg
+            .log_filter
+            .as_deref()
+            .filter(|f| tracing_init::check_log_filter(f).is_ok());
+        tracing_init::init(cfg.log_level, log_filter, &telemetry::Telemetry::ids_only())?;
         log_prepared(prepared.as_ref());
         return match command {
             Command::Pool { cmd } => match cmd {
@@ -719,8 +732,12 @@ fn main() -> anyhow::Result<()> {
     // failure, saying why in the shape the lost lines would have had.
     let installed = {
         let _entered = runtime.enter();
-        telemetry::Telemetry::new(cfg.telemetry.as_ref())
-            .and_then(|t| Ok((tracing_init::init(cfg.log_level, &t)?, t)))
+        telemetry::Telemetry::new(cfg.telemetry.as_ref()).and_then(|t| {
+            Ok((
+                tracing_init::init(cfg.log_level, cfg.log_filter.as_deref(), &t)?,
+                t,
+            ))
+        })
     };
     let (log_handle, telemetry) = match installed {
         Ok(installed) => installed,
@@ -1313,5 +1330,23 @@ http_listen = "127.0.0.1:8080"
              listen_interfaces = \"0.0.0.0:6881\"\n"
         ));
         check_config(&cfg).unwrap();
+    }
+
+    /// A `log_filter` that does not parse loads, so a reload can count it as
+    /// its own stage, and the boot's pre-flight refuses it.
+    #[test]
+    fn check_config_refuses_a_log_filter_that_does_not_parse() {
+        let profile = "\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+                       listen_interfaces = \"0.0.0.0:6881\"\n";
+        let bad = cfg_from(&format!("{TOP}log_filter = \"torrentd=loud\"\n{profile}"));
+        let msg = format!("{:#}", check_config(&bad).expect_err("refused"));
+        assert!(
+            msg.contains("log_filter") && msg.contains("torrentd=loud"),
+            "{msg}"
+        );
+        let good = cfg_from(&format!(
+            "{TOP}log_filter = \"torrentd_pool::apply=debug,torrentd::vpn=trace\"\n{profile}"
+        ));
+        check_config(&good).unwrap();
     }
 }
