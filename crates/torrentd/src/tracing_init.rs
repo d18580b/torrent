@@ -356,8 +356,13 @@ fn level_directives(level: LogLevel) -> String {
     dirs
 }
 
-/// Check that `log_filter` holds only directives `EnvFilter` parses.
+/// Check that `log_filter` holds only directives `EnvFilter` parses. A
+/// blank or whitespace-only `log_filter` passes: it is unset, as
+/// [`build_filter`] treats it.
 pub fn check_log_filter(log_filter: &str) -> Result<(), LogFilterError> {
+    if log_filter.trim().is_empty() {
+        return Ok(());
+    }
     EnvFilter::builder()
         .parse(log_filter)
         .map(drop)
@@ -1025,6 +1030,7 @@ mod tests {
         assert_eq!(after, before, "neither the level nor the filter moved");
         assert!(check_log_filter("torrentd_pool::apply=debug,torrentd::vpn=trace").is_ok());
         assert!(check_log_filter("").is_ok());
+        assert!(check_log_filter(" \t ").is_ok(), "blank is unset");
         assert_eq!(check_log_filter("=").unwrap_err().stage(), "log_filter");
     }
 

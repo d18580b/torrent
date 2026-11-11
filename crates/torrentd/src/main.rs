@@ -1348,5 +1348,8 @@ http_listen = "127.0.0.1:8080"
             "{TOP}log_filter = \"torrentd_pool::apply=debug,torrentd::vpn=trace\"\n{profile}"
         ));
         check_config(&good).unwrap();
+        // A whitespace-only `log_filter` is unset, as a reload applies it.
+        let blank = cfg_from(&format!("{TOP}log_filter = \"  \"\n{profile}"));
+        check_config(&blank).unwrap();
     }
 }
