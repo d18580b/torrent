@@ -394,7 +394,7 @@ extern "C" void lt_session_destroy(lt_session* s) {
     std::lock_guard<std::mutex> lk(s->alert_mutex);
     for (auto& u : s->ready_alerts) lt_alert_payload_free(&u);
     s->ready_alerts.clear();
-    LT_SHIM_CATCH_VOID
+    LT_SHIM_CATCH_VOID(LT_FFI_CALL_SESSION_DESTROY)
     delete s;
 }
 

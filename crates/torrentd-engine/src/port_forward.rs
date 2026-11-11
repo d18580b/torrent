@@ -661,6 +661,8 @@ pub fn renew_and_rebind(
                     // read as fatal. A revert that fails is published for the
                     // previous endpoint, which no rebind holds, so with one
                     // live session it is still fatal.
+                    // ignore-result: the revert's outcome reaches the alert
+                    // loop on its own; this wait only bounds the rebind.
                     let _ = target.listen.wait_for(
                         target.profile,
                         cursor,

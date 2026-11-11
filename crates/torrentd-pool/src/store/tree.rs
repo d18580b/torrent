@@ -26,6 +26,7 @@ impl PoolStore {
     /// torrent claiming anything under `prefix`, never one per file. A
     /// `prefix` that names no directory — a file, or nothing — rolls up to
     /// zero, as a directory with nothing under it would.
+    #[tracing::instrument(name = "pool_store.rollup", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn rollup(&self, root_id: i64, prefix: &str) -> Result<DirRollup, PoolError> {
         let path = prefix.trim_matches('/');
         let Some((bytes_total, files_total, bytes_orphan, files_orphan)) = self
@@ -81,6 +82,7 @@ impl PoolStore {
     ///
     /// An empty file at a declared empty path of a torrent placed in the
     /// root is not counted as an orphan, as in [`PoolStore::orphan_files`].
+    #[tracing::instrument(name = "pool_store.rebuild_rollups", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn rebuild_rollups(&mut self, root_id: i64) -> Result<(), PoolError> {
         #[derive(Default)]
         struct Agg {
@@ -180,6 +182,12 @@ impl PoolStore {
     }
 
     /// [`PoolStore::rebuild_rollups`] for every root the index holds.
+    #[tracing::instrument(
+        name = "pool_store.rebuild_all_rollups",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn rebuild_all_rollups(&mut self) -> Result<(), PoolError> {
         let ids: Vec<i64> = {
             let mut st = self.conn.prepare("SELECT id FROM root ORDER BY id")?;
@@ -204,6 +212,7 @@ impl PoolStore {
     /// in this root is that torrent's, and is not listed: the matcher claims
     /// no file without bytes, so it has no claim row (see
     /// [`PoolStore::declared_empty_paths`]).
+    #[tracing::instrument(name = "pool_store.orphan_files", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn orphan_files(&self, root_id: i64, prefix: &str) -> Result<Vec<String>, PoolError> {
         Ok(self
             .orphan_files_sized(root_id, prefix)?
@@ -217,6 +226,7 @@ impl PoolStore {
     ///
     /// The identity lets the delete planner drop an orphan that is a claimed
     /// file reached by another path (see [`PoolStore::claimed_identities`]).
+    #[tracing::instrument(name = "pool_store.orphan_files_sized", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn orphan_files_sized(
         &self,
         root_id: i64,
@@ -262,6 +272,7 @@ impl PoolStore {
     /// The matcher claims no file without bytes, so an empty file at one of
     /// these paths has no claim row, yet it is that torrent's payload: a
     /// delete that took it would take a file the torrent declares.
+    #[tracing::instrument(name = "pool_store.declared_empty_paths", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn declared_empty_paths(&self, root_id: i64) -> Result<HashSet<String>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT a.base_rel, t.rel_path FROM torrent_file t
@@ -319,6 +330,7 @@ impl PoolStore {
     ///
     /// Returns at most `limit` paths; the caller only needs enough to name one
     /// in the refusal.
+    #[tracing::instrument(name = "pool_store.foreign_files_under", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn foreign_files_under(
         &self,
         root_id: i64,
@@ -364,6 +376,7 @@ impl PoolStore {
     ///
     /// Derived from live state rather than counted as torrents are added, so
     /// it is correct across a restart and cannot drift from reality.
+    #[tracing::instrument(name = "pool_store.loaded_without_claims", level = "debug", skip_all, fields(loaded = loaded.len()), err(level = "debug"))]
     pub fn loaded_without_claims(&self, loaded: &[String]) -> Result<Vec<String>, PoolError> {
         if loaded.is_empty() {
             return Ok(Vec::new());
@@ -387,6 +400,7 @@ impl PoolStore {
     /// re-check before an irreversible delete. Listing every orphan in the root
     /// and scanning it would be O(pool) per file. An empty file that is a
     /// placed torrent's declared empty file is not an orphan, as there.
+    #[tracing::instrument(name = "pool_store.is_orphan", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn is_orphan(&self, root_id: i64, rel_path: &str) -> Result<bool, PoolError> {
         let claimed: i64 = self.conn.query_row(
             "SELECT EXISTS(
@@ -423,6 +437,12 @@ impl PoolStore {
     /// delete planner and the delete step both use it to find the claimed
     /// files ([`PoolStore::claimed_files_with_identity`]) whose live identity
     /// they compare with the orphan's.
+    #[tracing::instrument(
+        name = "pool_store.claimed_identities",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn claimed_identities(&self) -> Result<HashSet<(u64, u64)>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT DISTINCT f.dev, f.ino FROM claim c
@@ -442,6 +462,12 @@ impl PoolStore {
     /// devices and inodes. A match against [`PoolStore::claimed_identities`]
     /// is therefore only a candidate, which the delete planner and the
     /// delete step confirm by stat'ing the paths this returns.
+    #[tracing::instrument(
+        name = "pool_store.claimed_files_with_identity",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn claimed_files_with_identity(
         &self,
         dev: u64,
@@ -468,6 +494,7 @@ impl PoolStore {
     ///
     /// Lets the tree view colour a directory in one query instead of one per
     /// row, which matters when a page has 500 entries.
+    #[tracing::instrument(name = "pool_store.states_under", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn states_under(
         &self,
         root_id: i64,
@@ -511,6 +538,7 @@ impl PoolStore {
     /// Every child at once; [`PoolStore::children_page`] is the paged form.
     /// Both read one directory's rows of the materialised tree, never the
     /// paths under its subdirectories.
+    #[tracing::instrument(name = "pool_store.children", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn children(&self, root_id: i64, prefix: &str) -> Result<Vec<(String, bool)>, PoolError> {
         self.children_page(root_id, prefix, None, usize::MAX, false)
     }
@@ -522,6 +550,7 @@ impl PoolStore {
     /// With `orphans_only`, only children holding bytes no torrent claims: a
     /// directory whose materialised orphan bytes are non-zero, or an
     /// unclaimed file that is not empty.
+    #[tracing::instrument(name = "pool_store.children_page", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn children_page(
         &self,
         root_id: i64,
@@ -583,6 +612,12 @@ impl PoolStore {
     /// Keyset pagination in SQL: a page costs `limit` index steps whatever
     /// the library's size, where loading every torrent and cutting a page
     /// from it cost the whole library on every request.
+    #[tracing::instrument(
+        name = "pool_store.torrents_page",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn torrents_page(
         &self,
         after: Option<&str>,

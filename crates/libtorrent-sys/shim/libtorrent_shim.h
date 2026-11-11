@@ -706,6 +706,25 @@ int         lt_save_resume_data(lt_session* s, lt_handle h, uint32_t flags);
  * delivered. Monotonic for the session's lifetime; 0 for a null session. */
 uint64_t    lt_alert_translate_errors(lt_session* s);
 
+/* The entry points that return nothing, and so cannot report an exception
+ * they catch to their caller: each catch is counted here instead, and the
+ * exception's what() kept, so the daemon can export and log it. */
+#define LT_FFI_CALL_POST_TORRENT_UPDATES 0
+#define LT_FFI_CALL_POST_SESSION_STATS   1
+#define LT_FFI_CALL_SESSION_DESTROY      2
+#define LT_FFI_CALL_COUNT                3
+
+/* How many exceptions `call` (an LT_FFI_CALL_* value) has caught and
+ * swallowed in this process, across every session. Monotonic; 0 for a call
+ * outside [0, LT_FFI_CALL_COUNT). */
+uint64_t    lt_ffi_errors(int call);
+
+/* Copy the what() of the last exception `call` swallowed into `out`, cut at
+ * a UTF-8 boundary to fit `cap` bytes with its NUL, and return the bytes
+ * copied before the NUL: 0 when it has swallowed none, for a call out of
+ * range, or for a null `out` or zero `cap`. */
+size_t      lt_ffi_last_error(int call, char* out, size_t cap);
+
 /* ------------------------------------------------------------------ */
 /* Test-only                                                           */
 /* ------------------------------------------------------------------ */
@@ -730,6 +749,11 @@ int         lt_test_connect_peer(lt_session* s, lt_handle h,
  * LT_ERR for a null argument or an unknown handle (*out untouched). */
 int         lt_test_total_payload_download(lt_session* s, lt_handle h,
                                            uint64_t* out);
+
+/* Record `what` as an exception the void entry point `call` swallowed, as
+ * its catch does, so a test can reach lt_ffi_errors and lt_ffi_last_error
+ * without making libtorrent throw. Ignores a call out of range. */
+void        lt_test_record_swallowed(int call, const char* what);
 
 #ifdef __cplusplus
 }

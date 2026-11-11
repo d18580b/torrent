@@ -167,6 +167,8 @@ impl Recorder {
                     .lock()
                     .expect("not poisoned")
                     .push(Request { line, bearer });
+                // ignore-result: a test fake; a client that hung up first is
+                // the test's to notice.
                 let _ = socket.write_all(response.as_bytes());
             }
         });

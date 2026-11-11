@@ -105,6 +105,7 @@ pub async fn run_verify_queue(
 /// held adds - never touches the index, and goes on while a scan runs:
 /// waiting on the writer here stalled every check the daemon starts until the
 /// scan committed.
+#[tracing::instrument(name = "check_queue.tick", level = "debug", skip_all, fields(depth = q.depth(), in_flight = q.in_flight()))]
 pub(super) fn verify_tick(
     q: &VerifyQueue,
     pool: Option<&PoolService>,
@@ -346,6 +347,10 @@ pub(super) fn admit_recheck(
     let Some(r) = q.pending_rechecks.lock().pop_front() else {
         return Admission::Stop;
     };
+    // DEBUG: a re-hash held for a fenced profile is popped and put back on
+    // every tick, so at INFO this would be a span per held torrent per tick.
+    let _job = tracing::debug_span!("check_queue.admit", kind = "recheck", infohash = %r.infohash)
+        .entered();
     let Some(st) = libtorrent_safe::InfoHash::from_hex(&r.infohash).and_then(|h| state.get(&h))
     else {
         info!(
@@ -490,6 +495,14 @@ pub(super) fn admit_held_add(
     let Some(add) = q.pending_adds.lock().pop_front() else {
         return Admission::Stop;
     };
+    // DEBUG for the reason `admit_recheck`'s is.
+    let _job = tracing::debug_span!(
+        "check_queue.admit",
+        kind = "add",
+        infohash = %add.infohash,
+        profile_id = %add.profile,
+    )
+    .entered();
     let put_back = |add: HeldAdd| q.pending_adds.lock().push_back(add);
     let Some(st) = state.get(&add.infohash) else {
         // Still claimed for its profile: its add alert has not been handled
@@ -592,6 +605,15 @@ pub(super) fn admit_adoption(
     let Some(item) = q.pending.lock().pop_front() else {
         return Admission::Stop;
     };
+    // DEBUG for the reason `admit_recheck`'s is: an adoption into a fenced
+    // profile is put back and popped again on every tick.
+    let _job = tracing::debug_span!(
+        "check_queue.admit",
+        kind = "adoption",
+        infohash = %item.infohash,
+        profile_id = %item.profile,
+    )
+    .entered();
     // `POST /v1/pool/adoptions` checks the profile's tunnel before queueing,
     // but the queue drains over minutes or hours and the tunnel can
     // drop in between. Admitting then would add torrents to a fenced
@@ -1056,6 +1078,7 @@ pub(super) fn release_dropped_claim(
 /// adoption keeps it until here, so a restart before the verdict is recorded
 /// waits for the boot's check rather than lose it.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(name = "check_queue.verify_outcome", level = "info", skip_all, fields(infohash = ih, outcome = ?outcome))]
 pub(super) fn record_verify_outcome(
     pool: &PoolService,
     writer: Writer<'_>,

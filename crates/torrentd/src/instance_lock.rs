@@ -49,7 +49,8 @@ impl InstanceLock {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 let mut holder = String::new();
-                // Best effort: the pid only sharpens the message.
+                // ignore-result: best effort; the pid only sharpens the
+                // message.
                 let _ = file.read_to_string(&mut holder);
                 let who = match holder.trim().parse::<u32>() {
                     Ok(pid) => format!("another torrentd (pid {pid})"),

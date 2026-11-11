@@ -1,7 +1,14 @@
 //! SIGHUP reload pump.
 //!
+//! Three things start a reload, and each runs the same one: `SIGHUP`,
+//! `POST /v1/config/reload`, and, with `config_watch` on, a change to the
+//! config file the watch in `config_watch` saw. Every reload that reads the
+//! file also writes `config_restart_pending{key}`: 1 for each key the file
+//! holds at a value the daemon is not running and only a restart applies.
+//!
 //! Reloadable: `connections_limit`, `upload_rate_limit`,
-//! `max_concurrent_http_announces`, `aio_threads`, `enable_lsd`, `log_level`.
+//! `max_concurrent_http_announces`, `aio_threads`, `enable_lsd`, `log_level`,
+//! `log_filter`.
 //! Every other key of `Config` triggers a `warn` and is ignored, and
 //! `[[profile]]` identity changes are warned about one field at a time. There
 //! is no third class that is silently dropped, and it takes two separate
@@ -195,6 +202,69 @@ fn refuse_short_descriptors(
     Some((limit, needed))
 }
 
+/// Write `config_restart_pending`: 1 for each key in `pending`, 0 for every
+/// other key it has.
+///
+/// `pending` is the diff against the running config, which a reload advances
+/// only by what it applied, so a key stays 1 on every reload until a restart
+/// boots with it, where the seed writes 0, or the file is edited back.
+fn set_restart_pending(metrics: &dyn torrentd_engine::MetricsSink, pending: &[&str]) {
+    for key in crate::config::RESTART_PENDING_KEYS {
+        let value = if pending.contains(key) { 1.0 } else { 0.0 };
+        metrics.set_gauge("config_restart_pending", value, &[("key", key)]);
+    }
+}
+
+/// The config file's watch, where `config_watch` is on and it could be
+/// started. Where it could not, the reload pump runs on `SIGHUP` and the API
+/// alone, and says so, counted as a failed reload at `watch`.
+///
+/// It runs inside the pump, as an arm of its `select!`, rather than as a task
+/// of its own: `ConfigWatch::changed` is cancel-safe, so a `SIGHUP` arriving
+/// mid-burst loses nothing.
+fn start_watch(
+    config_path: &std::path::Path,
+    cfg: &Config,
+    failed: &impl Fn(&str),
+) -> Option<crate::config_watch::ConfigWatch> {
+    if !cfg.config_watch {
+        return None;
+    }
+    match crate::config_watch::ConfigWatch::start(config_path) {
+        Ok(watch) => {
+            info!(path = %config_path.display(), "config_watch: reloading when the config file changes");
+            Some(watch)
+        }
+        Err(e) => {
+            warn!(
+                error.cause = %e,
+                path = %config_path.display(),
+                "config_watch: could not watch the config file's directory; a change needs \
+                 SIGHUP or POST /v1/config/reload",
+            );
+            failed("watch");
+            None
+        }
+    }
+}
+
+/// The next change `watch` reports, or never where there is no watch.
+async fn watched_change(
+    watch: &mut Option<crate::config_watch::ConfigWatch>,
+) -> std::io::Result<()> {
+    match watch {
+        Some(watch) => watch.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the file at `config_path` no longer holds `running`: it fails to
+/// load, so the reload that follows counts that, or it loads to a config that
+/// differs from it.
+fn differs_from_file(config_path: &std::path::Path, running: &Config) -> bool {
+    Config::load(config_path).map_or(true, |file| !Config::diff(running, &file).is_empty())
+}
+
 pub async fn run(
     config_path: PathBuf,
     initial: Config,
@@ -211,8 +281,57 @@ pub async fn run(
     let failed = |stage: &str| {
         metrics.inc_counter("config_reload_failures_total", &[("stage", stage)]);
     };
+    let mut watch = start_watch(&config_path, &initial, &failed);
+    // The watch takes its baseline from the file as it reads now, after boot
+    // brought the profiles up, not from the bytes boot parsed. An edit landing
+    // in between would be that baseline, never reported as a change, and
+    // neither applied nor raised in `config_restart_pending`. So the first
+    // pass compares the file with the config the daemon booted on, and
+    // reloads once where they differ.
+    let mut catch_up = watch.is_some();
     let mut current = initial;
-    while reload_rx.recv().await.is_some() {
+    loop {
+        // What started this reload, for its span.
+        let trigger;
+        if std::mem::take(&mut catch_up) {
+            if !differs_from_file(&config_path, &current) {
+                continue;
+            }
+            trigger = "boot_catch_up";
+            info!(
+                path = %config_path.display(),
+                "config_watch: the config file changed while the daemon started; reloading",
+            );
+        } else {
+            tokio::select! {
+                request = reload_rx.recv() => {
+                    if request.is_none() {
+                        break;
+                    }
+                    trigger = "request";
+                }
+                changed = watched_change(&mut watch) => {
+                    if let Err(e) = changed {
+                        warn!(
+                            error.cause = %e,
+                            path = %config_path.display(),
+                            "config_watch: watching the config file stopped; a change now needs \
+                             SIGHUP or POST /v1/config/reload",
+                        );
+                        failed("watch");
+                        watch = None;
+                        continue;
+                    }
+                    trigger = "watch";
+                    info!(path = %config_path.display(), "config_watch: the config file changed; reloading");
+                }
+            }
+        }
+        // One trace per reload, whatever span the task runs in. Nothing below
+        // awaits, so the guard is never held across a suspension.
+        let reload =
+            tracing::info_span!(parent: None, "reload", trigger, path = %config_path.display());
+        let _reload = reload.enter();
         let next = match Config::load(&config_path) {
             Ok(c) => c,
             Err(e) => {
@@ -230,6 +349,9 @@ pub async fn run(
             }
         };
         let mut diff = Config::diff(&current, &next);
+        // Before the early return below: a file edited back to what the
+        // daemon runs clears what an earlier reload left pending.
+        set_restart_pending(&*metrics, &diff.restart_pending());
         if diff.is_empty() {
             info!("SIGHUP: config unchanged");
             continue;
@@ -279,19 +401,29 @@ pub async fn run(
         for sc in &diff.profile_changes {
             warn!(changed_field = %sc.what, "{}", warning_for(sc));
         }
+        // `log_level` and `log_filter` make one filter, rebuilt whole when
+        // either changed and swapped in only when it built: a `log_filter`
+        // that does not parse keeps the filter in place, both keys included,
+        // and is counted as its own stage.
         let mut log_level_applied = false;
-        if let Some(level) = diff.log_level {
-            match log_handle.set_level(level) {
+        if diff.log_level.is_some() || diff.log_filter.is_some() {
+            match log_handle.set_filter(next.log_level, next.log_filter.as_deref()) {
                 Ok(()) => {
                     log_level_applied = true;
-                    info!(new_log_level = level.as_str(), "SIGHUP: log level applied");
+                    info!(
+                        new_log_level = next.log_level.as_str(),
+                        new_log_filter = next.log_filter.as_deref().unwrap_or(""),
+                        rust_log_set = log_handle.rust_log_is_set(),
+                        "SIGHUP: log level applied",
+                    );
                 }
                 Err(e) => {
                     warn!(
-                        error.cause = %format_args!("{e:#}"),
-                        "SIGHUP: failed to apply log level",
+                        error.cause = %e,
+                        stage = e.stage(),
+                        "SIGHUP: failed to apply log level; keeping the current log filter",
                     );
-                    failed("log_level");
+                    failed(e.stage());
                 }
             }
         }
@@ -362,7 +494,7 @@ pub async fn run(
 /// - the five settings keys, unless the operator deleted the key (a deletion
 ///   is reported and not applied; see the module docs) or an
 ///   `apply_settings` call failed, in which case the next reload retries them;
-/// - `log_level`, once `set_level` succeeded.
+/// - `log_level` and `log_filter`, together, once `set_filter` succeeded.
 ///
 /// A key withheld from some profile (`enable_lsd` on a vpn profile, a
 /// top-level `upload_rate_limit` under a per-profile one) advances like any
@@ -407,6 +539,7 @@ fn running_config(
     }
     if log_level_applied {
         running.log_level = next.log_level;
+        running.log_filter = next.log_filter.clone();
     }
     running
 }
@@ -1020,6 +1153,142 @@ listen_interfaces = "0.0.0.0:6881"
         assert_eq!(log.matches("SIGHUP: settings applied").count(), 1, "{log}");
     }
 
+    /// A `log_filter` that does not parse fails its own stage, keeps the
+    /// filter in place, and leaves the rest of the reload to apply; fixed, it
+    /// applies once and advances, so the next reload finds nothing changed.
+    #[tokio::test]
+    async fn an_invalid_log_filter_fails_its_own_stage_and_the_fixed_one_applies_once() {
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileSource;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::TorrentEngine;
+
+        const TOP_LEVEL: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
+"#;
+        const PROFILE: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.toml");
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}connections_limit = 100\n{PROFILE}"),
+        )
+        .unwrap();
+        let boot = Config::load(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{TOP_LEVEL}connections_limit = 200\nlog_filter = \"torrentd=loud\"\n{PROFILE}"
+            ),
+        )
+        .unwrap();
+        Config::load(&path).expect("log_filter's directives are not judged by the load");
+
+        let mock = Arc::new(MockEngine::new());
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let profile = boot.profile[0].clone();
+        let id = profile.id.clone();
+        let registry = Arc::new(crate::profile_registry::ProfileRegistry::new(vec![
+            crate::profile_registry::ProfileEntry::new(profile, engine.clone(), None, None, 0),
+        ]));
+        let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![(id, engine)]));
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+        let failures = |stage: &str| -> Option<String> {
+            let exported = String::from_utf8(metrics.render()).unwrap();
+            let series = format!("torrentd_config_reload_failures_total{{stage=\"{stage}\"}} ");
+            exported
+                .lines()
+                .find_map(|l| l.strip_prefix(series.as_str()).map(str::to_owned))
+        };
+        let applies = || -> Vec<Option<u32>> {
+            mock.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::ApplySettings(s) => Some(s.connections_limit),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let log = crate::tracing_init::Buf::default();
+        let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let pump = tokio::spawn(run(
+            path.clone(),
+            boot,
+            source,
+            registry,
+            rx,
+            log_handle,
+            metrics.clone(),
+        ));
+        let reload = || async {
+            tx.send(()).await.unwrap();
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+                if tx.capacity() == 1 {
+                    break;
+                }
+            }
+            assert_eq!(tx.capacity(), 1, "the pump took the reload");
+            tokio::task::yield_now().await;
+        };
+
+        reload().await;
+        assert_eq!(failures("log_filter").as_deref(), Some("1"));
+        assert_eq!(applies(), vec![Some(200)], "the rest of the reload applies");
+
+        std::fs::write(
+            &path,
+            format!(
+                "{TOP_LEVEL}connections_limit = 200\n\
+                 log_filter = \"torrentd_pool::apply=debug\"\n{PROFILE}"
+            ),
+        )
+        .unwrap();
+        reload().await;
+        reload().await;
+        drop(tx);
+        pump.await.unwrap();
+
+        assert_eq!(
+            failures("log_filter").as_deref(),
+            Some("1"),
+            "not counted again"
+        );
+        assert_eq!(failures("log_level"), None);
+        assert_eq!(
+            applies(),
+            vec![Some(200)],
+            "the settings are not applied again"
+        );
+        let log = log.text();
+        let count = |line: &str| log.matches(line).count();
+        assert_eq!(
+            count("SIGHUP: failed to apply log level; keeping the current log filter"),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("invalid log_filter"), "{log}");
+        assert!(
+            log.contains("torrentd=loud"),
+            "the directive is named: {log}"
+        );
+        assert_eq!(count("SIGHUP: log level applied"), 1, "{log}");
+        assert_eq!(count("SIGHUP: config unchanged"), 1, "{log}");
+    }
+
     /// Issue 455: a reload raising `connections_limit` past the open-file
     /// limit is refused, by the sum boot warns by, and the rest of the reload
     /// still applies. Two profiles at the key's maximum need over two million
@@ -1219,6 +1488,87 @@ listen_interfaces = "0.0.0.0:6882"
         assert!(
             log.contains(&reason),
             "the toml error's reason {reason:?} is logged: {log}"
+        );
+    }
+
+    /// The watch's baseline is the file as the pump starts, after boot's
+    /// bring-up. An edit made between boot's `Config::load` and that point is
+    /// in the baseline, so the watch never reports it: the pump has to catch
+    /// it up itself, with no event, signal, or API call. A file still holding
+    /// what boot loaded reloads nothing.
+    #[tokio::test]
+    async fn an_edit_made_while_the_daemon_started_is_reloaded_when_the_watch_starts() {
+        const TOP_LEVEL: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
+config_watch = true
+"#;
+        const PROFILE: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.toml");
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}shutdown_drain_secs = 60\n{PROFILE}"),
+        )
+        .unwrap();
+        let boot = Config::load(&path).unwrap();
+
+        let pump = |path: PathBuf, boot: Config| async move {
+            let registry = Arc::new(crate::profile_registry::ProfileRegistry::new(vec![]));
+            let source: Arc<dyn AlertSource> =
+                Arc::new(torrentd_engine::ProfileSource::new(vec![]));
+            let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+            let log = crate::tracing_init::Buf::default();
+            let (log_handle, subscriber) =
+                crate::tracing_init::for_tests(LogLevel::Info, log.clone());
+            let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+            // No reload is ever requested: the channel is closed, so the
+            // pump ends at its first wait for one.
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            run(
+                path,
+                boot,
+                source,
+                registry,
+                rx,
+                log_handle,
+                metrics.clone(),
+            )
+            .await;
+            (String::from_utf8(metrics.render()).unwrap(), log.text())
+        };
+        let pending = "torrentd_config_restart_pending{key=\"shutdown_drain_secs\"} ";
+
+        let (exported, log) = pump(path.clone(), boot.clone()).await;
+        assert!(!log.contains("SIGHUP"), "{log}");
+        assert!(
+            !exported.lines().any(|l| l.starts_with(pending)),
+            "{exported}"
+        );
+
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}shutdown_drain_secs = 120\n{PROFILE}"),
+        )
+        .unwrap();
+        let (exported, log) = pump(path, boot).await;
+        assert!(
+            log.contains("config_watch: the config file changed while the daemon started"),
+            "{log}",
+        );
+        assert_eq!(
+            exported.lines().find_map(|l| l.strip_prefix(pending)),
+            Some("1"),
+            "{exported}",
         );
     }
 

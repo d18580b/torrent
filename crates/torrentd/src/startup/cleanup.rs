@@ -105,7 +105,7 @@ impl BootCleanup {
         let (t, name) = self.tunnels.remove(i);
         let vpn_for = Arc::clone(&self.vpn_for);
         let run_dir = self.run_dir.clone();
-        tokio::task::spawn_blocking(move || vpn_for(t, &run_dir).bring_down(&name))
+        crate::startup::tasks::spawn_blocking(move || vpn_for(t, &run_dir).bring_down(&name))
             .await
             .context("vpn teardown task")?;
         Ok(())
@@ -142,7 +142,7 @@ impl BootCleanup {
         let iface = tunnel.interface.clone();
         let vpn = self.manager_for(t);
         self.note_tunnel(t, &iface);
-        let brought_up = tokio::task::spawn_blocking(move || vpn.bring_up(&tunnel))
+        let brought_up = crate::startup::tasks::spawn_blocking(move || vpn.bring_up(&tunnel))
             .await
             .context("vpn bring-up task")?;
         match &brought_up {

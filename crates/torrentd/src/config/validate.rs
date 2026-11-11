@@ -175,6 +175,13 @@ impl Config {
         if let Some(auth) = &self.auth {
             auth.validate()?;
         }
+        // Resolved against the environment the daemon reads it from, so a
+        // bad OTLP variable or an unreadable headers file is a refusal
+        // (exit 78) here, not a failed subscriber install later.
+        if let Some(telemetry) = &self.telemetry {
+            crate::telemetry::Export::resolve(telemetry, |k| std::env::var(k).ok())
+                .context("[telemetry]")?;
+        }
         if let Some(pool) = &self.pool {
             if pool.roots.is_empty() {
                 anyhow::bail!("[pool] is configured but `roots` is empty");

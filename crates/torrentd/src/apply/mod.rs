@@ -44,8 +44,14 @@ mod relocate;
 
 pub(crate) use delete::move_into_trash;
 use executor::apply_inner;
+pub(crate) use fsat::probe_mutations;
+pub(crate) use fsat::ProbeFailure;
 #[cfg(test)]
 pub(crate) use fsat::FAIL_FSYNC;
+#[cfg(test)]
+pub(crate) use fsat::FAIL_RENAME_NOREPLACE;
+#[cfg(test)]
+pub(crate) use fsat::PROBE_DIR;
 pub use recovery::spawn_resume_unfinished;
 pub use recovery::unfinished_at_boot;
 #[cfg(test)]

@@ -36,6 +36,40 @@ fn native_teardown_removes_the_link_before_its_rules() {
     );
 }
 
+/// Teardown's rule deletions end each family on a non-zero exit, which is
+/// not counted in `external_command_failures_total`; its other commands'
+/// non-zero exits are. `sh` stands in for `ip` (label `other`): `sh -c
+/// rule` has `rule` third, as `ip -4 rule del …` does, and exits 127. The
+/// series are per test thread, so the counts are exact.
+#[test]
+fn a_rule_deletions_non_zero_exit_is_not_counted_as_a_failure() {
+    let (failures, duration) = crate::metrics_sink::tests::external_command_series();
+    let runs = || duration.with_label_values(&["other"]).get_sample_count();
+    let failed = || failures.with_label_values(&["other"]).get();
+    assert_eq!((runs(), failed()), (0, 0.0));
+
+    super::super::route::del_rule(&["sh", "-c", "exit 2"]).unwrap_err();
+    assert_eq!(
+        (runs(), failed()),
+        (1, 0.0),
+        "del_rule's non-zero exit is recorded and not counted"
+    );
+
+    native::teardown_command(&["sh", "-c", "rule"]).unwrap_err();
+    assert_eq!(
+        (runs(), failed()),
+        (2, 0.0),
+        "teardown sends a rule command through del_rule"
+    );
+
+    native::teardown_command(&["sh", "-c", "exit 1"]).unwrap_err();
+    assert_eq!(
+        (runs(), failed()),
+        (3, 1.0),
+        "teardown's other commands' non-zero exits are failures"
+    );
+}
+
 #[test]
 fn a_missing_interface_is_a_probe_failure_not_a_missing_handshake() {
     // The distinction this enum exists for: an operator reading

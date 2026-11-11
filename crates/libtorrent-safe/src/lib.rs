@@ -10,6 +10,7 @@
 
 pub mod alert;
 pub mod error;
+pub mod ffi_errors;
 mod ffi_util;
 pub mod handle;
 pub mod metadata;

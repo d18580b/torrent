@@ -158,16 +158,37 @@ pub(crate) fn install(iface: &str, addresses: &[String], prefixes: &[String]) ->
 /// read while the link is still up — for OpenVPN, before the process that
 /// owns the link is signalled.
 pub(crate) fn remove(table: u32) {
-    remove_with(table, |args| {
-        exec::run_ok("ip", &args[1..], None, exec::CHANGE)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    });
+    remove_with(table, del_rule);
+}
+
+/// Run one of [`remove_with`]'s `ip rule del` command lines (`ip` first).
+///
+/// `Err` ends the loop. A non-zero exit is how `ip` says no rule is left for
+/// the table, which every teardown reaches once per family, so the command
+/// goes through [`exec::run`]: the exit is recorded on its span and is not
+/// counted in `external_command_failures_total` or logged at WARN. An `ip`
+/// that cannot start or does not finish is still counted there.
+pub(crate) fn del_rule(args: &[&str]) -> Result<(), String> {
+    let Some((program, rest)) = args.split_first() else {
+        return Ok(());
+    };
+    let out = exec::run(program, rest, None, exec::CHANGE).map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` exited {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
 }
 
 /// [`remove`] over a command runner, which is handed the whole command line
 /// (`ip` first), so a caller can order it against its other commands and a
-/// test can observe it.
+/// test can observe it. A runner that runs it for real uses [`del_rule`], so
+/// the `Err` that ends each family's loop is not counted as a failure.
 pub(crate) fn remove_with(table: u32, mut run: impl FnMut(&[&str]) -> Result<(), String>) {
     let table = table.to_string();
     for fam in ["-4", "-6"] {

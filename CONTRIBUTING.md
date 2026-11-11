@@ -10,10 +10,10 @@ non-goals are spelled out in [`README.md`](./README.md) and
 
 ### Supported host
 
-Linux x86_64 only. Verified on:
+Linux on x86_64 and arm64 (aarch64). Verified on:
 
-- Fedora 43 (kernel 6.18+), GCC 14
-- Ubuntu 24.04, GCC 13
+- Fedora 43 (kernel 6.18+), GCC 14, x86_64
+- Ubuntu 24.04, GCC 13, x86_64 and arm64 (CI's `arm64` job runs the tests and the daemon's lifecycle there)
 
 The binary is not supported on Windows or macOS.
 
@@ -228,6 +228,15 @@ trust it — is in [`docs/running.md`](docs/running.md).
 The pre-commit hook applies both automatically to staged changes. Do not commit code with
 `unwrap()` outside tests — return a `Result` or expect-with-context.
 
+- `mise run lint-tracing` — log field names, and discarded values
+
+A `let _ =` outside test code drops whatever it binds, and a dropped `Result` drops its error
+without a trace. Handle the value, or say why discarding it is right with
+`// ignore-result: <reason>` at the end of that line or in the comment lines directly above
+it; the task fails on a `let _ =` with neither. Test code is exempt: files under `tests/`,
+files named `tests.rs`, and items gated by `#[cfg(test)]`.
+[`scripts/lint-let-underscore`](./scripts/lint-let-underscore) holds the rules.
+
 - `mise run size-check` — file length
 
 No tracked source file (`.rs`, `.c`, `.cc`, `.cpp`, `.h`, `.hpp`, `.py`, `.sh`) may exceed
@@ -258,8 +267,12 @@ fields have **one** spelling each, because log queries depend on it:
 the field path are ambiguous to the parser. Put another field first.
 
 Levels: `error` needs an operator, `warn` is an anomaly the daemon handled,
-`info` is lifecycle, `debug` is per-alert detail. `RUST_LOG` overrides per
-crate, e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`.
+`info` is lifecycle, `debug` is per-alert detail. `log_level` sets every crate
+of the workspace, and the reloadable `log_filter` key lays `EnvFilter`
+directives over it, e.g. `log_filter = "torrentd_engine::handler::resume=debug"`.
+`RUST_LOG`, where set, stands in for `log_level` and wins over `log_filter` on
+any target both name, e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`;
+its directives are kept across every reload.
 
 ## Releasing
 
@@ -286,8 +299,9 @@ Open a GitHub issue with: kernel version, libtorrent submodule SHA, `cargo --ver
 (for a release, `torrentd --version` in place of both),
 and the JSON log output, at `debug` if it reproduces.
 [`docs/running.md` §12](docs/running.md#12-capturing-a-log) says how to take it
-from the running service and raise the level with `log_level` and a reload
-rather than a restart. `RUST_LOG` is read only at startup, so it applies to a
+from the running service and raise the level with `log_level`, or one
+subsystem's with `log_filter`, and a reload rather than a restart. `RUST_LOG`
+is read only at startup, so it applies to a
 daemon you are starting anyway, such as one under `cargo run`; do not start a
 second copy beside a running service to get a log.
 

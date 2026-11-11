@@ -615,6 +615,26 @@ pub(crate) fn recovery_check(
     evaluate(&observation, Duration::MAX)
 }
 
+/// The `vpn_monitor.check` span of one profile's poll: a root of its own,
+/// linked to the monitor's long-lived `monitor` span rather than under it,
+/// with the poll's `verdict` (`up`, or the reason it fenced) recorded once
+/// it is taken. A profile already fenced is not polled, and has none.
+fn check_span(
+    monitor: &tracing::Span,
+    profile_id: &torrentd_engine::ProfileId,
+    iface: &str,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        parent: None,
+        "vpn_monitor.check",
+        profile_id = %profile_id,
+        vpn_iface = iface,
+        verdict = tracing::field::Empty,
+    );
+    span.follows_from(monitor);
+    span
+}
+
 /// Watch every vpn profile's tunnel and fence the profile whose tunnel is
 /// lost, until `stop` says the shutdown is about to take the network down.
 pub async fn run(
@@ -658,6 +678,10 @@ async fn run_with(
     // its tunnel needs could not run. See `DownReason::ProbeUnavailable`.
     let mut unavailable: std::collections::HashMap<torrentd_engine::ProfileId, u32> =
         std::collections::HashMap::new();
+    // The monitor's own span, as long-lived as it is. Each check is a root
+    // span linked to it rather than a child of it: a child would make the
+    // daemon's whole uptime one trace that never ends.
+    let monitor = tracing::info_span!(parent: None, "vpn_monitor");
 
     loop {
         tokio::select! {
@@ -695,9 +719,11 @@ async fn run_with(
                 // A host profile has no tunnel to watch.
                 let iface = e.config.vpn_interface()?.to_string();
                 let is_wg = e.config.vpn_type() == Some(VpnType::Wireguard);
+                let check = check_span(&monitor, e.id(), &iface);
                 // The probes shell out: blocking work, off the runtime's
-                // worker threads.
-                let task = tokio::task::spawn_blocking({
+                // worker threads, inside the check's span so each tool run's
+                // `external_command` span is the check's child.
+                let task = crate::startup::tasks::spawn_blocking_in(check.clone(), {
                     let iface = iface.clone();
                     let probe = probe.clone();
                     let counters = counters.clone();
@@ -705,12 +731,15 @@ async fn run_with(
                 });
                 Some(async move {
                     let probed = tokio::time::timeout_at(deadline, task).await;
-                    (e, health, iface, is_wg, probed)
+                    (e, health, iface, is_wg, probed, check)
                 })
             })
             .collect();
 
-        while let Some((e, health, iface, is_wg, probed)) = polled.next().await {
+        while let Some((e, health, iface, is_wg, probed, check)) = polled.next().await {
+            // Judged inside the check's span, so the fence a verdict takes is
+            // in the same trace as the probes that led to it.
+            let _check = check.enter();
             let profile_id = e.id().clone();
             // A probe task that failed or did not return in time read
             // nothing: every probe it would have made is unavailable this
@@ -926,10 +955,12 @@ async fn run_with(
                             metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
                         }
                     });
+                    check.record("verdict", "up");
                     continue;
                 }
                 Err(reason) => reason,
             };
+            check.record("verdict", reason.as_str());
 
             // Tunnel down, IP changed, or handshake stale → pause the profile.
             // An unknown address keeps the one the profile was last seen

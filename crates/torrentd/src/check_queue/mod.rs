@@ -394,6 +394,7 @@ impl VerifyQueue {
     /// Persist the record of held adds in `holds`, which the boot loaded.
     /// Set once, before the boot's scans; a second call is ignored.
     pub fn set_holds(&self, holds: crate::profile_state::PacedHolds) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.holds.set(holds);
     }
 
@@ -405,6 +406,7 @@ impl VerifyQueue {
 
     /// Count started checks in `metrics`. Set once; a second call is ignored.
     pub fn set_metrics(&self, metrics: Arc<dyn MetricsSink>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.metrics.set(metrics);
     }
 

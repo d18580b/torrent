@@ -563,6 +563,8 @@ impl OpenvpnManager {
         for table in tables_to_clear(self.recorded_table(iface), live) {
             route::remove(table);
         }
+        // ignore-result: a record left behind only makes the next teardown
+        // clear an already-empty table again.
         let _ = std::fs::remove_file(self.table_file(iface));
     }
 
@@ -818,6 +820,8 @@ impl OpenvpnManager {
             return;
         }
         if self.wait_for_exit(iface, TERM_GRACE) {
+            // ignore-result: a stale pid file is harmless; `live_pid` checks
+            // the process's command line before trusting it.
             let _ = std::fs::remove_file(self.pid_file(iface));
             return;
         }
@@ -832,6 +836,8 @@ impl OpenvpnManager {
             return;
         }
         if self.wait_for_exit(iface, KILL_GRACE) {
+            // ignore-result: a stale pid file is harmless; `live_pid` checks
+            // the process's command line before trusting it.
             let _ = std::fs::remove_file(self.pid_file(iface));
         } else {
             // Unreachable short of an uninterruptible-sleep kernel wedge.
@@ -941,6 +947,8 @@ impl OpenvpnManager {
         if self.live_pid(iface).is_some() {
             return Released::LeftRunning;
         }
+        // ignore-result: a stale pid file is harmless; `live_pid` checks the
+        // process's command line before trusting it.
         let _ = std::fs::remove_file(self.pid_file(iface));
         if was_running {
             Released::Stopped

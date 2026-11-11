@@ -106,7 +106,7 @@ fn operation_ids_are_unique_snake_case() {
 fn every_api_path_is_versioned_and_kebab_case() {
     let doc = doc();
     for (method, path, _) in operations(&doc) {
-        if path == "/healthz" || path == "/metrics" {
+        if ["/livez", "/readyz", "/healthz", "/metrics"].contains(&path.as_str()) {
             continue;
         }
         assert!(path.starts_with("/v1/"), "{method} {path}: not under /v1");
@@ -134,9 +134,9 @@ fn every_error_is_a_problem_and_every_problem_type_is_catalogued() {
     for (method, path, op) in operations(&doc) {
         for (status, resp) in op["responses"].as_object().unwrap() {
             let code: u16 = status.parse().unwrap();
-            // `/healthz` answers 503 with the same report as its 200: a probe
-            // reads one shape whatever the verdict.
-            if code < 400 || path == "/healthz" {
+            // A probe answers 503 with the same report as its 200: it reads
+            // one shape whatever the verdict.
+            if code < 400 || ["/livez", "/readyz", "/healthz"].contains(&path.as_str()) {
                 continue;
             }
             let content = resp["content"].as_object();

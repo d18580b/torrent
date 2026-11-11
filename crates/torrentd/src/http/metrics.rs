@@ -145,17 +145,29 @@ impl MediaType for PrometheusText {
     const MEDIA_TYPE: &'static str = "text/plain; version=0.0.4";
 }
 
+/// Why a scrape was not answered.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum MetricsError {
+    /// The exposition could not be encoded; a partial one is never served.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
+}
+
 /// Scrape the daemon's metrics.
 ///
 /// Prometheus text format. Needs the `metrics` scope, which no other
 /// operation accepts and no session token carries, so a scrape credential can
 /// never reach the control plane. `deploy/metrics.md` catalogues every
-/// series.
+/// series. `500 internal` where the exposition cannot be encoded, rather
+/// than a partial one that reads as series having vanished; the failure is
+/// counted in `metrics_dropped_samples_total{reason="encode"}`.
 #[kynos::get("/metrics", tag = Operations)]
 pub async fn get_metrics(
     _caller: Scoped<Bearer, Metrics>,
     Inject(s): Inject<Arc<AppState>>,
-) -> Binary<PrometheusText> {
+) -> Result<Binary<PrometheusText>, MetricsError> {
     // Computed here rather than by a ticking task: a task could itself stall,
     // and the age read at scrape time is exactly the one `/healthz` would
     // report at that moment.
@@ -164,7 +176,12 @@ pub async fn get_metrics(
         torrentd_engine::heartbeat_age(&s.alert_heartbeat).as_secs_f64(),
         &[],
     );
-    Binary::new(s.metrics.render())
+    s.metrics
+        .try_render()
+        .map(Binary::new)
+        .map_err(|e| MetricsError::Internal {
+            detail: crate::http::v1::common::internal("encoding the metrics", e),
+        })
 }
 
 #[cfg(test)]

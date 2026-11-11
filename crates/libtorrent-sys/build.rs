@@ -181,7 +181,9 @@ fn main() {
                 build_libtorrent(&lt_src, &dst.join("libtorrent"), &boost_install);
                 // The cmake build trees are ~76 MB of the 193 MB and are never
                 // read again once the install step has run.
+                // ignore-result: only disk space; a tree left behind is unused.
                 let _ = std::fs::remove_dir_all(dst.join("boost").join("build"));
+                // ignore-result: only disk space; a tree left behind is unused.
                 let _ = std::fs::remove_dir_all(dst.join("libtorrent").join("build"));
                 // Panic rather than let ensure_prefix stamp an empty tree as
                 // authoritative: a stamped-but-broken prefix would fail every
@@ -719,6 +721,8 @@ where
             println!(
                 "cargo:warning=libtorrent-sys: waiting for a concurrent native build ({name})"
             );
+            // ignore-result: a failed wait is the no-flock case below; the
+            // atomic rename keeps the result correct.
             let _ = lock.lock();
         }
         // A filesystem without flock. Atomic rename still keeps this correct;
@@ -766,6 +770,8 @@ where
         // Lost the race to a process without flock: rename onto a non-empty
         // directory is ENOTEMPTY. Their tree is as good as ours.
         Err(_) if stamp_matches(&stamp, key) => {
+            // ignore-result: our staged copy is surplus; leaving it costs
+            // only disk space.
             let _ = std::fs::remove_dir_all(&staged);
         }
         Err(e) => panic!(
@@ -805,6 +811,8 @@ fn prune_to(dir: &Path, keep: &[&str]) {
             continue;
         }
         let path = entry.path();
+        // ignore-result: pruning is housekeeping; an entry left behind is
+        // never read.
         let _ = if path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {

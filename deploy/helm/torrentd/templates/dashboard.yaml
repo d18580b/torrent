@@ -1,0 +1,22 @@
+{{- if .Values.metrics.dashboard.enabled }}
+{{- /*
+files/dashboard.json is a copy of deploy/dashboard.json, kept in step the
+same way as files/torrentd.rules.yml (prometheusrule.yaml).
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-dashboard" (include "torrentd.fullname" .) }}
+  labels:
+    {{- include "torrentd.labels" . | nindent 4 }}
+    {{- with .Values.metrics.dashboard.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.metrics.dashboard.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  torrentd.json: |-
+    {{- .Files.Get "files/dashboard.json" | nindent 4 }}
+{{- end }}

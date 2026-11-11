@@ -116,6 +116,7 @@ impl AdoptPlan {
 ///
 /// `root_path_of` resolves a root id to its absolute path; the caller owns that
 /// mapping because roots come from config, not the index.
+#[tracing::instrument(name = "pool.adopt_plan", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
 pub fn plan(
     store: &PoolStore,
     infohash: &str,

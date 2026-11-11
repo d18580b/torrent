@@ -428,7 +428,7 @@ pub async fn scan_pool(
     // and not merely for this request: one transaction, which a kill would
     // roll back whole, but whose rollback is minutes of work thrown away.
     let guard = s.work.enter();
-    let summary = tokio::task::spawn_blocking(move || {
+    let summary = crate::startup::tasks::spawn_blocking(move || {
         let _guard = guard;
         pool.scan()
     })
@@ -493,7 +493,7 @@ pub async fn check_pool_drift(
     let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
     // Held by the task, as for a scan: the teardown waits for it.
     let guard = s.work.enter();
-    let report = tokio::task::spawn_blocking(move || {
+    let report = crate::startup::tasks::spawn_blocking(move || {
         let _guard = guard;
         pool.drift_check()
     })
@@ -2413,7 +2413,7 @@ pub async fn apply_plan(
     // teardown waits on before it closes the sessions a move goes through.
     let work = Arc::clone(&s.work);
     let guard = work.enter();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = crate::startup::tasks::spawn_blocking(move || {
         let _guard = guard;
         crate::apply::apply(&worker, &source, &state, id, &|| work.is_cancelled())
     })

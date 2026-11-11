@@ -23,6 +23,83 @@ use crate::config::Config;
 
 /// An fsync that fails after a delete step's move is not a step that did
 /// not happen either: the file is in the trash, not where it was.
+/// An apply is an exported `pool.apply` span with its plan_id. A delete
+/// plan's steps, one per orphan file, are DEBUG `pool.apply_step` spans,
+/// which are not exported: at INFO a large plan would be a span per file.
+#[test]
+fn an_apply_is_exported_and_a_delete_step_is_not() {
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, plan_id, _orphan, _other) = one_orphan_delete_plan(dir.path());
+    let (source, state) = engine_and_state();
+    static ERRORS: crate::telemetry::ExportErrors = crate::telemetry::ExportErrors::new();
+    let exporter = InMemorySpanExporter::default();
+    let telemetry = crate::telemetry::Telemetry::for_tests(exporter.clone(), &ERRORS);
+    let (_reload, subscriber) = crate::tracing_init::for_tests_traced(
+        crate::config::LogLevel::Debug,
+        crate::tracing_init::Buf::default(),
+        &telemetry,
+    );
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        fsat::FAIL_FSYNC.set(true);
+        let out = apply(&pool, &source, &state, plan_id, &|| false);
+        fsat::FAIL_FSYNC.set(false);
+        out.unwrap();
+    });
+    let spans = exporter.get_finished_spans().unwrap();
+    let attr = |s: &opentelemetry_sdk::trace::SpanData, k: &str| {
+        s.attributes
+            .iter()
+            .find(|a| a.key.as_str() == k)
+            .map(|a| a.value.to_string())
+    };
+    let applied = spans
+        .iter()
+        .find(|s| s.name == "pool.apply")
+        .expect("the apply's span");
+    assert_eq!(attr(applied, "plan_id"), Some(plan_id.to_string()));
+    assert!(
+        !spans.iter().any(|s| s.name == "pool.apply_step"),
+        "{spans:?}"
+    );
+}
+
+/// The step's span closes with what the journal records of it: its outcome,
+/// and the error where it did not succeed.
+#[test]
+fn a_step_span_closes_with_its_outcome_and_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, plan_id, _orphan, _other) = one_orphan_delete_plan(dir.path());
+    let (source, state) = engine_and_state();
+    let log = crate::tracing_init::Buf::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        fsat::FAIL_FSYNC.set(true);
+        let out = apply(&pool, &source, &state, plan_id, &|| false);
+        fsat::FAIL_FSYNC.set(false);
+        out.unwrap();
+    });
+    let text = log.text();
+    let closed = text
+        .lines()
+        // The step span's own close, not that of a span inside it.
+        .find(|l| {
+            l.contains("pool.apply_step{") && l.contains("}: torrentd::apply::executor: close")
+        })
+        .unwrap_or_else(|| panic!("the step span's close: {text}"));
+    assert!(closed.contains("DEBUG"), "{closed}");
+    assert!(closed.contains(&format!("plan_id={plan_id}")), "{closed}");
+    assert!(closed.contains("outcome=\"unknown\""), "{closed}");
+    assert!(closed.contains("fsync"), "the error: {closed}");
+}
+
 #[test]
 fn a_delete_whose_fsync_fails_after_the_move_is_an_unknown_outcome() {
     let dir = tempfile::tempdir().unwrap();

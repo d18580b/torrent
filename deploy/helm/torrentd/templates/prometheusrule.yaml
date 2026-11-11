@@ -1,0 +1,20 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+{{- /*
+files/torrentd.rules.yml is a copy of deploy/prometheus/torrentd.rules.yml,
+which a chart cannot read from outside its own directory. `mise run
+helm-sync` refreshes it, and `mise run helm-lint` fails while the two differ.
+*/}}
+{{- $rules := .Files.Get "files/torrentd.rules.yml" | fromYaml }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "torrentd.fullname" . }}
+  labels:
+    {{- include "torrentd.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    {{- toYaml $rules.groups | nindent 4 }}
+{{- end }}

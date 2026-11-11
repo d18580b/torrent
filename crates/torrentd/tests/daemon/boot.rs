@@ -139,6 +139,38 @@ fn unreadable_scan_files_are_exported_by_source_at_boot() {
     assert_exits_zero(&mut child, Duration::from_secs(30));
 }
 
+/// A booted daemon answers all three probes: `/livez` live with no failed
+/// check, and `/readyz` ready with `/healthz` giving the same report, once
+/// the boot is no longer `starting`.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_booted_daemon_is_live_and_ready_on_every_probe() {
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Running(spawn_daemon(dir.path(), free_port(), addr));
+    wait_healthy(addr);
+
+    let (code, body) = http(addr, "GET", "/livez", None);
+    assert_eq!(code, 200, "{body}");
+    let live: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(live["ok"], true, "{body}");
+    assert_eq!(live["failed"], serde_json::Value::Null, "{body}");
+    assert_eq!(live["batch_writer_deaths"], 0, "{body}");
+
+    let (code, body) = http(addr, "GET", "/readyz", None);
+    assert_eq!(code, 200, "{body}");
+    let ready: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(ready["reason"], serde_json::Value::Null, "{body}");
+    let (_, body) = http(addr, "GET", "/healthz", None);
+    let health: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&health), keys(&ready), "one report under both names");
+    assert_eq!(health["ok"], ready["ok"]);
+
+    daemon.stop();
+}
+
 /// A config that does not load exits 78 (`EX_CONFIG`), from the daemon and
 /// from `--check-config` alike, which is what `RestartPreventExitStatus=78`
 /// reads to leave the unit stopped.

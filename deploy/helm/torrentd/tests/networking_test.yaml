@@ -1,0 +1,155 @@
+suite: networking
+templates:
+  - templates/service.yaml
+  - templates/networkpolicy.yaml
+  - templates/ingress.yaml
+tests:
+  - it: serves the API on a ClusterIP Service
+    values: [values/host-only.yaml]
+    template: templates/service.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - equal:
+          path: spec.ports
+          value:
+            - name: http
+              port: 8080
+              targetPort: http
+              protocol: TCP
+
+  - it: exposes the peer ports on a LoadBalancer with externalTrafficPolicy Local
+    values: [values/multi-vpn.yaml]
+    template: templates/service.yaml
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - equal:
+          path: spec.externalTrafficPolicy
+          value: Local
+      - equal:
+          path: spec.ports
+          value:
+            - name: public-tcp
+              port: 6881
+              targetPort: 6881
+              protocol: TCP
+            - name: public-udp
+              port: 6881
+              targetPort: 6881
+              protocol: UDP
+
+  - it: admits the API port only from the ingress controller and Prometheus namespaces
+    values: [values/host-only.yaml]
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.ingressControllerPodSelector:
+        app.kubernetes.io/name: traefik
+    asserts:
+      - equal:
+          path: spec.ingress[0]
+          value:
+            ports:
+              - port: http
+                protocol: TCP
+            from:
+              - namespaceSelector:
+                  matchExpressions:
+                    - key: kubernetes.io/metadata.name
+                      operator: In
+                      values: [kube-system]
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: traefik
+              - namespaceSelector:
+                  matchExpressions:
+                    - key: kubernetes.io/metadata.name
+                      operator: In
+                      values: [monitoring]
+      - equal:
+          path: spec.ingress[1].ports
+          value:
+            - port: 6881
+              protocol: TCP
+            - port: 6881
+              protocol: UDP
+      - notExists:
+          path: spec.ingress[1].from
+
+  - it: leaves the API rule out, rather than open, with no namespace listed
+    values: [values/host-only.yaml]
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.ingressControllerNamespaces: []
+      networkPolicy.prometheusNamespaces: []
+    asserts:
+      - lengthEqual:
+          path: spec.ingress
+          count: 1
+      - notContains:
+          path: spec.ingress[0].ports
+          content:
+            port: http
+            protocol: TCP
+
+  - it: refuses an Ingress with no host
+    values: [values/host-only.yaml]
+    template: templates/ingress.yaml
+    set:
+      ingress.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: ingress.hosts is empty
+
+  - it: renders no NetworkPolicy when disabled
+    values: [values/host-only.yaml]
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: caps the body with a Traefik buffering Middleware
+    values: [values/kill-switch.yaml]
+    template: templates/ingress.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: Middleware
+        documentIndex: 0
+      - equal:
+          path: spec.buffering.maxRequestBodyBytes
+          value: 100663296
+        documentIndex: 0
+      - equal:
+          path: metadata.annotations["traefik.ingress.kubernetes.io/router.middlewares"]
+          value: NAMESPACE-RELEASE-NAME-torrentd-body-limit@kubernetescrd
+        documentIndex: 1
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service
+          value:
+            name: RELEASE-NAME-torrentd
+            port:
+              name: http
+        documentIndex: 1
+
+  - it: caps the body with the nginx annotation
+    values: [values/host-only.yaml]
+    template: templates/ingress.yaml
+    set:
+      ingress.enabled: true
+      ingress.className: nginx
+      ingress.hosts: [torrentd.example.com]
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/proxy-body-size"]
+          value: "100663296"

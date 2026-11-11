@@ -1,0 +1,36 @@
+# One WireGuard account behind the kill switch, with the cluster carve-outs
+# left to the chart's defaults, and the whole monitoring stack on.
+config:
+  settings:
+    network_kill_switch: true
+    auth:
+      password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo"
+    profile:
+      - id: acct_a
+        network: vpn
+        vpn_type: wireguard
+        vpn_config: /etc/wireguard/wg-acct-a.conf
+        vpn_interface: wg-acct-a
+        listen_port: 6891
+        peer_fingerprint: "-qB5030-"
+        user_agent: qBittorrent/5.0.3
+        allowed_tracker_domains: [tracker-a.example.com]
+vpn:
+  wireguardSecret: torrentd-wireguard
+ingress:
+  enabled: true
+  className: traefik
+  hosts: [torrentd.example.com]
+metrics:
+  serviceMonitor:
+    enabled: true
+    tokenSecret:
+      name: torrentd-metrics-token
+  prometheusRule:
+    enabled: true
+  dashboard:
+    enabled: true
+payloadVolumes:
+  - name: torrents
+    mountPath: /data/torrents
+    existingClaim: torrents

@@ -13,6 +13,9 @@ resume_dir        = "/var/lib/torrentd/resume"
 torrent_dir       = "/var/lib/torrentd/torrents"
 http_listen       = "127.0.0.1:8080"   # loopback by default
 log_level         = "info"   # error | warn | info | debug (reloadable)
+# EnvFilter directives laid over log_level, for one subsystem at a time
+# (reloadable). RUST_LOG, where set, wins on any target both name.
+# log_filter      = "torrentd_pool::apply=debug,torrentd::vpn=trace"
 
 # Or serve the API on a unix socket, and on no TCP port: connecting takes
 # write permission on the socket, so its mode and group decide who may call
@@ -133,6 +136,13 @@ enable_lsd = false
 # EXTEND_TIMEOUT_USEC the daemon sends while it stops, so TimeoutStopSec needs
 # raising only for a stop that must fit without those extensions.
 # shutdown_drain_secs = 60
+
+# Reload when this file changes, as SIGHUP does, by watching its directory
+# with inotify. Sees kubelet's `..data` symlink swap when a mounted ConfigMap
+# or Secret is updated, and an editor's save. Off by default; read once, at
+# startup. A change to a key only a restart applies is reported as
+# torrentd_config_restart_pending{key} = 1 either way.
+# config_watch = true
 
 # Defence-in-depth kill switch. When true, torrentd installs a fail-closed
 # nftables table (`torrentd_ks_<uid>`) confining the daemon's own egress to loopback
@@ -460,3 +470,39 @@ dht               = true
 # name   = "prometheus"
 # sha256 = "0870bd54c89de51c..."
 # scopes = ["metrics"]
+
+# --- Traces (optional) ------------------------------------------------------
+#
+# OpenTelemetry trace export over OTLP, to Grafana Alloy, Tempo, or any OTLP
+# collector. Off unless this section is present. Either way every JSON log
+# line inside a span carries `trace_id` and `span_id`, so a log line can be
+# joined to its trace. Restart-only.
+#
+# Each key left out falls back to the standard variable, then to the
+# OpenTelemetry default:
+#   otlp_endpoint  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT (used as is), then
+#                  OTEL_EXPORTER_OTLP_ENDPOINT, then localhost:4318 (or 4317
+#                  for grpc). A base URL: http/protobuf appends /v1/traces.
+#   protocol       OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, then
+#                  OTEL_EXPORTER_OTLP_PROTOCOL, then "http/protobuf".
+#   headers_file   OTEL_EXPORTER_OTLP_TRACES_HEADERS, then
+#                  OTEL_EXPORTER_OTLP_HEADERS. Setting both is refused.
+#   sample_ratio   1.0: every trace.
+#
+# headers_file holds `name=value` lines (`#` comments allowed), e.g.
+# `authorization=Basic <base64 of instance-id:token>` for Grafana Cloud, so
+# the credential stays out of this file; make it readable by the daemon's user
+# only. service.name is torrentd and service.version this build's; neither can
+# be set in resource_attributes. Every exported span is redacted as the log is.
+#
+# Under network_kill_switch the daemon reaches only loopback and its tunnels:
+# point otlp_endpoint at a collector on loopback (a sidecar in the same pod, or
+# Alloy on the host), or every export fails and is counted in
+# torrentd_telemetry_export_errors_total. See docs/running.md §9, "Traces".
+#
+# [telemetry]
+# otlp_endpoint = "http://127.0.0.1:4318"   # Alloy's otelcol.receiver.otlp
+# protocol      = "http/protobuf"           # or "grpc" (port 4317)
+# sample_ratio  = 1.0
+# headers_file  = "/etc/torrentd/otlp-headers"
+# resource_attributes = { "deployment.environment" = "prod" }

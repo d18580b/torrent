@@ -1,0 +1,31 @@
+# One host profile, its peer port on the node, a payload claim and host path.
+config:
+  settings:
+    log_level: info
+    connections_limit: 10000
+    upload_rate_limit: 10485760
+    auth:
+      password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo"
+      token:
+        - name: prometheus
+          sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+          scopes: [metrics]
+    profile:
+      - id: public
+        network: host
+        listen_interfaces: "0.0.0.0:6881"
+        dht: true
+peers:
+  ports:
+    - name: public
+      port: 6881
+  expose: hostPort
+payloadVolumes:
+  - name: torrents
+    mountPath: /data/torrents
+    existingClaim: torrents
+  - name: library
+    mountPath: /data/library
+    hostPath:
+      path: /srv/library
+      type: Directory

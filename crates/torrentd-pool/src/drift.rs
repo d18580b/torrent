@@ -170,6 +170,7 @@ fn probe(root_id: i64, root: &std::path::Path, report: &mut DriftReport) -> bool
 ///
 /// Only claimed files are stated: unclaimed bytes have no torrent to
 /// invalidate, and on a large pool they are the overwhelming majority.
+#[tracing::instrument(name = "pool.drift", level = "info", skip_all, err(level = "info"))]
 pub fn detect(
     store: &mut PoolStore,
     root_path_of: impl Fn(i64) -> Option<std::path::PathBuf>,
@@ -199,6 +200,7 @@ pub fn detect(
 /// planner may fast-path. An `adopted` torrent is refused by the adopt
 /// whatever its payload looks like, and marking it here would turn that
 /// refusal into a second add; the full [`detect`] is what covers it.
+#[tracing::instrument(name = "pool.drift", level = "info", skip_all, fields(torrents = infohashes.len()), err(level = "info"))]
 pub fn detect_before_adopt(
     store: &mut PoolStore,
     infohashes: &[String],

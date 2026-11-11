@@ -232,6 +232,7 @@ impl HeldCall {
 
     /// Let the held call go on.
     pub fn release(&self) {
+        // ignore-result: an engine already dropped has no held call to free.
         let _ = self.release.send(());
     }
 }
@@ -504,8 +505,10 @@ impl MockEngine {
 
     fn check_error(&self, op: &'static str) -> Result<(), EngineError> {
         if let Some((_, (entered, release))) = self.holds.remove(op) {
+            // ignore-result: a dropped `HeldCall` waits for nobody.
             let _ = entered.send(());
             // Returns on a release and on a dropped `HeldCall` alike.
+            // ignore-result: both mean the call goes on.
             let _ = release.lock().recv();
         }
         if self.panic_inject.remove(op).is_some() {

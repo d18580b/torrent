@@ -43,6 +43,18 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt",
 tracing-futures = "0.2"
 prometheus = { version = "0.13", default-features = false }
 
+# Traces (torrentd::telemetry): OpenTelemetry over OTLP, off by default.
+# Default features off throughout: no metrics or logs signal, and no
+# `internal-logs`, whose own lines would duplicate the daemon's rate-limited
+# export WARN. gRPC goes over tonic with rustls (ring, the provider reqwest
+# already uses) and the system's roots; http/protobuf goes over the reqwest
+# above, through `telemetry::BlockingHttp`, so no second reqwest is built.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "tls-ring", "tls-roots"] }
+opentelemetry-http = { version = "0.33", default-features = false }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+
 # Concurrency
 dashmap = "6"
 parking_lot = "0.12"
@@ -65,7 +77,7 @@ rand = "0.8"
 sha2 = "0.10"
 
 # Pool index
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 jwalk = "0.8"
 
 # Utility

@@ -475,6 +475,21 @@ impl Caller {
         }
     }
 
+    /// Record who this is on `span`, the request's (`http::headers::
+    /// RequestSpan`): `principal` and, for a static token, `token_name`.
+    /// Never the token itself.
+    fn record_on(&self, span: &tracing::Span) {
+        let principal = match self {
+            Caller::Anonymous => "anonymous",
+            Caller::Session { .. } => "session",
+            Caller::Token { name, .. } => {
+                span.record("token_name", name.as_str());
+                "token"
+            }
+        };
+        span.record("principal", principal);
+    }
+
     fn allows(&self, needed: Scope) -> bool {
         match self {
             Caller::Anonymous => true,
@@ -684,6 +699,7 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
         scopes: &[Scope],
         _context: &C,
     ) -> Result<(), AuthRejection> {
+        principal.record_on(&tracing::Span::current());
         if scopes.iter().all(|&scope| principal.allows(scope)) {
             return Ok(());
         }

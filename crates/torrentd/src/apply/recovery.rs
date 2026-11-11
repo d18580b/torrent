@@ -42,7 +42,7 @@ pub fn spawn_resume_unfinished(
     plans: Vec<PlanRow>,
 ) -> tokio::task::JoinHandle<()> {
     let guard = work.enter();
-    tokio::task::spawn_blocking(move || {
+    crate::startup::tasks::spawn_blocking(move || {
         let _guard = guard;
         let stop = || work.is_cancelled();
         redrive_once_loaded(

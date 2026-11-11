@@ -22,11 +22,15 @@ services:
       dockerfile: deploy/Containerfile
     image: torrentd:latest
     restart: unless-stopped
-    # A tini-style init as PID 1: it forwards SIGTERM to the daemon and reaps
-    # the `ip`/`wg`/`nft` children it execs. Without it the daemon is PID 1,
-    # which the kernel shields from signals it installed no handler for, and
-    # nothing reaps an orphaned child.
-    init: true
+    # No `init: true`: the image's ENTRYPOINT already runs tini as PID 1,
+    # which forwards SIGTERM to the daemon and reaps every orphaned child.
+    #
+    # A read-only root, as a pod's `readOnlyRootFilesystem: true` gives it.
+    # The daemon writes only to the volumes below and to /tmp, where SQLite
+    # keeps its temporary files (deploy/Containerfile lists every path).
+    read_only: true
+    tmpfs:
+      - /tmp
     # How long `stop` waits between SIGTERM and SIGKILL. The default is 10s;
     # a graceful shutdown flushes resume data for every torrent, which at tens
     # of thousands of torrents takes longer. A SIGKILL mid-drain leaves resume
@@ -75,9 +79,9 @@ services:
       # fails quietly. `http_listen` has a serde default, so omitting it is no
       # longer a parse error — the daemon starts, binds 127.0.0.1 *inside* the
       # namespace, and `proxy` reaches nothing. The Containerfile's
-      # HEALTHCHECK curls localhost:8080 from inside the same namespace, so it
-      # succeeds and the container reports healthy while the API is
-      # unreachable from `proxy`. Re-aiming the health check does not recover
+      # HEALTHCHECK curls localhost:8080/readyz from inside the same
+      # namespace, so it succeeds and the container reports healthy while the
+      # API is unreachable from `proxy`. Re-aiming the health check does not recover
       # the signal: it passes either way.
     networks:
       - front

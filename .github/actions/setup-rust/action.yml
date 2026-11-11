@@ -82,8 +82,10 @@ runs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', inputs.cache-key-file || 'rust-toolchain.toml') }}
-        restore-keys: ${{ inputs.cache-prefix }}-${{ runner.os }}-
+        # The runner's architecture is in the key: an arm64 job restoring an
+        # x64 job's target/ would rebuild everything and never save its own.
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', inputs.cache-key-file || 'rust-toolchain.toml') }}
+        restore-keys: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-
 
     # cargo-binstall lets mise fetch prebuilt convco and cargo-deny binaries
     # (no compile, no C build deps).

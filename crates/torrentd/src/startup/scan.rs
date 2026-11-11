@@ -183,7 +183,22 @@ fn relocated_save_path(
     ih: &libtorrent_safe::InfoHash,
 ) -> Option<String> {
     let pool = pool?;
-    let sidecar = store.read_save_path(profile, ih).ok().flatten()?;
+    let sidecar = match store.read_save_path(profile, ih) {
+        Ok(sidecar) => sidecar?,
+        Err(e) => {
+            // As if there were none: the resume file's directory stands,
+            // which is right for every torrent not caught mid-relocate.
+            warn!(
+                target: "torrentd::startup",
+                profile_id = %profile,
+                infohash = %ih,
+                error.cause = %e,
+                "could not read the torrent's .save_path sidecar; loading it where its \
+                 resume data says, which is stale only if a relocation was cut short",
+            );
+            return None;
+        }
+    };
     let sidecar_path = std::path::Path::new(&sidecar);
     if !sidecar_path.is_absolute() {
         return None;

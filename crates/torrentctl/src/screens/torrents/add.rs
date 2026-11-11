@@ -493,10 +493,12 @@ async fn post_metainfo(
         })?
         .json(&body);
     let exchange = async move {
-        let response = request.send().await.map_err(|e| AddFailure::Api {
-            failure: Failure::local("Cannot reach the daemon", Some(e.to_string())),
-            errors: Vec::new(),
-        })?;
+        let response = crate::api::send(request)
+            .await
+            .map_err(|e| AddFailure::Api {
+                failure: Failure::local("Cannot reach the daemon", Some(e.to_string())),
+                errors: Vec::new(),
+            })?;
         let status = response.status();
         if status.is_success() {
             return response

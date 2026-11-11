@@ -7,10 +7,29 @@
 //! `op`/`infohash` an `#[instrument]` attaches; those are nested there, not
 //! flat at the top (`with_current_span`). `with_span_list(false)` suppresses
 //! the separate `spans` array. Events outside any span have no `span` key.
-//! Filter level seeded from config + overridden by RUST_LOG if set.
+//! A line inside a span ends with `trace_id` and `span_id`, the
+//! OpenTelemetry ids of the innermost span at INFO or above, so it can be
+//! joined to its trace; they are there whether or not `[telemetry]` exports
+//! anything (`crate::telemetry`).
 //!
-//! The global filter is wrapped in a `reload::Layer` so SIGHUP can swap the
-//! log level at runtime without restarting the daemon (//! Management: `log_level` is reloadable).
+//! # The log filter
+//!
+//! Three sources of `EnvFilter` directives, each layered over the one
+//! before it, so a later source wins on a target both name and a more
+//! specific target wins over a less specific one ([`build_filter`]):
+//!
+//! 1. `log_level`: `info` for every target, and the level for every crate of
+//!    the workspace ([`WORKSPACE_TARGETS`]).
+//! 2. `log_filter`: the operator's own directives, e.g.
+//!    `torrentd_pool::apply=debug,torrentd::vpn=trace`.
+//! 3. `RUST_LOG`, read once at startup. Where it is set, it stands in for
+//!    `log_level`, as it always has, and its directives win over
+//!    `log_filter`'s on any target both name.
+//!
+//! The filter is wrapped in a `reload::Layer` so a reload rebuilds it from
+//! all three without restarting the daemon: `log_level` and `log_filter` are
+//! reloadable, and the `RUST_LOG` directives the daemon started with are kept
+//! across every reload rather than replaced by the first one.
 //!
 //! # Credential redaction
 //!
@@ -67,11 +86,20 @@
 //! then `target`, and the message passes through the same redaction. The
 //! operator subcommands do not use it; they keep their human stderr.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Write as _;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 
+use opentelemetry::trace::SpanId;
+use opentelemetry::trace::TraceContextExt as _;
+use opentelemetry::trace::TraceId;
+use opentelemetry_sdk::trace::SdkTracer;
+use tracing::dispatcher::WeakDispatch;
+use tracing::span;
+use tracing::Dispatch;
 use tracing::Event;
 use tracing::Level;
 use tracing::Subscriber;
@@ -93,6 +121,7 @@ use tracing_subscriber::Registry;
 use crate::config::LogLevel;
 use crate::redact::redact_urls;
 use crate::redact::redact_urls_host_only;
+use crate::telemetry::Telemetry;
 
 /// The targets whose lines quote tracker URLs verbatim, in whatever shape the
 /// tracker uses: libtorrent's own log messages
@@ -127,12 +156,119 @@ where
     ) -> fmt::Result {
         let mut line = String::new();
         self.0.format_event(ctx, Writer::new(&mut line), event)?;
-        let redacted = if HOST_ONLY_TARGETS.contains(&event.metadata().target()) {
-            redact_urls_host_only(&line)
-        } else {
-            redact_urls(&line)
+        // Not `ctx.event_scope()`: that scope is behind this layer's own
+        // `log_level` filter, which hides the INFO spans of a WARN line once
+        // `log_level` is warn or error. `EventTraceIds` reads the whole scope.
+        if let Some(ids) = EVENT_TRACE_IDS.take() {
+            ids.splice_into(&mut line);
+        }
+        writer.write_str(&redact_for_target(event.metadata().target(), &line))
+    }
+}
+
+/// `text` held to the redaction rule for lines under `target`: the
+/// fail-closed host-only rule for a [`HOST_ONLY_TARGETS`] target, the
+/// credential shapes for every other. The span exporter holds spans to it
+/// too (`crate::telemetry`).
+pub(crate) fn redact_for_target<'a>(target: &str, text: &'a str) -> Cow<'a, str> {
+    if HOST_ONLY_TARGETS.contains(&target) {
+        redact_urls_host_only(text)
+    } else {
+        redact_urls(text)
+    }
+}
+
+/// A span's OpenTelemetry trace and span id, kept in its extensions by
+/// [`RecordTraceIds`] so the formatter reads them without a dispatcher.
+#[derive(Clone, Copy, Debug)]
+struct TraceIds {
+    trace_id: TraceId,
+    span_id: SpanId,
+}
+
+impl TraceIds {
+    /// Add `trace_id` and `span_id` as the last two keys of `line`, one JSON
+    /// object and its newline as the JSON formatter writes it.
+    fn splice_into(self, line: &mut String) {
+        if let Some(close) = line.rfind('}') {
+            line.insert_str(
+                close,
+                &format!(
+                    ",\"trace_id\":\"{}\",\"span_id\":\"{}\"",
+                    self.trace_id, self.span_id
+                ),
+            );
+        }
+    }
+}
+
+/// Records each new span's OpenTelemetry ids into its extensions as
+/// [`TraceIds`], once the OpenTelemetry layer beneath it has given the span
+/// a context. That context is reachable only through the dispatcher, which
+/// an event's formatter cannot reach: `tracing` lends no dispatcher out
+/// while it dispatches the event.
+#[derive(Default)]
+struct RecordTraceIds {
+    dispatch: OnceLock<WeakDispatch>,
+}
+
+impl<S> Layer<S> for RecordTraceIds
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_register_dispatch(&self, subscriber: &Dispatch) {
+        // ignore-result: a layer registered with a second dispatcher keeps
+        // the first, which is the one `subscriber` installs.
+        let _ = self.dispatch.set(subscriber.downgrade());
+    }
+
+    fn on_new_span(&self, _attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        let Some(dispatch) = self.dispatch.get().and_then(WeakDispatch::upgrade) else {
+            return;
         };
-        writer.write_str(&redacted)
+        // Starts the OpenTelemetry span now rather than at its first use,
+        // which is when its ids are drawn.
+        let Some(cx) = tracing_opentelemetry::get_otel_context(id, &dispatch) else {
+            return;
+        };
+        let span_context = cx.span().span_context().clone();
+        if !span_context.is_valid() {
+            return;
+        }
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(TraceIds {
+                trace_id: span_context.trace_id(),
+                span_id: span_context.span_id(),
+            });
+        }
+    }
+}
+
+thread_local! {
+    /// The ids [`EventTraceIds`] found for the event this thread is
+    /// dispatching, for [`Redacting`] to take when it formats that event.
+    static EVENT_TRACE_IDS: std::cell::Cell<Option<TraceIds>> = const { std::cell::Cell::new(None) };
+}
+
+/// Finds each event's ids, those of the innermost span in its scope that has
+/// [`TraceIds`], and leaves them in [`EVENT_TRACE_IDS`] for the JSON layer.
+/// It has no filter of its own, so its scope holds every span, including the
+/// INFO spans the JSON layer's `log_level` filter hides at warn or error. It
+/// runs before the JSON layer only because [`subscriber`] composes the two
+/// with `and_then`, which calls it first.
+struct EventTraceIds;
+
+impl<S> Layer<S> for EventTraceIds
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let ids = ctx.event_scope(event).and_then(|scope| {
+            scope
+                .into_iter()
+                .find_map(|span| span.extensions().get::<TraceIds>().copied())
+        });
+        EVENT_TRACE_IDS.set(ids);
     }
 }
 
@@ -141,53 +277,193 @@ where
 #[derive(Clone)]
 pub struct LogReloadHandle {
     inner: reload::Handle<EnvFilter, Registry>,
+    /// The `RUST_LOG` directives the daemon started with, laid over every
+    /// filter a reload builds.
+    rust_log: Option<String>,
 }
 
-impl LogReloadHandle {
-    /// Replace the global filter with one derived from `level`. This wins over
-    /// any `RUST_LOG` that seeded the initial filter.
-    pub fn set_level(&self, level: LogLevel) -> anyhow::Result<()> {
-        self.inner
-            .reload(level_filter(level))
-            .map_err(|e| anyhow::anyhow!("reload log filter: {e}"))
+/// Why [`LogReloadHandle::set_filter`] kept the filter it had.
+#[derive(Debug)]
+pub enum LogFilterError {
+    /// `log_filter` holds a directive `EnvFilter` does not parse.
+    Invalid(String),
+    /// The filter was built and could not be swapped in.
+    Reload(String),
+}
+
+impl LogFilterError {
+    /// The `stage` of `config_reload_failures_total` this failure counts as.
+    pub fn stage(&self) -> &'static str {
+        match self {
+            LogFilterError::Invalid(_) => "log_filter",
+            LogFilterError::Reload(_) => "log_level",
+        }
     }
 }
 
-fn level_filter(level: LogLevel) -> EnvFilter {
-    EnvFilter::new(format!(
-        "info,torrentd={lvl},torrentd_engine={lvl},libtorrent_safe={lvl}",
-        lvl = level.as_str()
-    ))
+impl std::fmt::Display for LogFilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogFilterError::Invalid(e) => write!(f, "invalid log_filter: {e}"),
+            LogFilterError::Reload(e) => write!(f, "reload log filter: {e}"),
+        }
+    }
 }
 
-/// Install the global subscriber. An install that fails (a global subscriber
-/// or `log` logger already set) is an error rather than ignored: ignoring it
-/// lost every later log line without a word.
-pub fn init(level: LogLevel) -> anyhow::Result<LogReloadHandle> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| level_filter(level));
-    let (handle, subscriber) = subscriber(filter, std::io::stdout, &LOG_EVENTS);
+impl std::error::Error for LogFilterError {}
+
+impl LogReloadHandle {
+    /// Replace the global filter with one built from `level` and
+    /// `log_filter`, under the `RUST_LOG` directives the daemon started with
+    /// ([`build_filter`]). On an error the filter in place stays.
+    pub fn set_filter(
+        &self,
+        level: LogLevel,
+        log_filter: Option<&str>,
+    ) -> Result<(), LogFilterError> {
+        let filter = build_filter(level, log_filter, self.rust_log.as_deref())?;
+        self.inner
+            .reload(filter)
+            .map_err(|e| LogFilterError::Reload(e.to_string()))
+    }
+
+    /// Whether `RUST_LOG` was set at startup, and so stands in for
+    /// `log_level`.
+    pub fn rust_log_is_set(&self) -> bool {
+        self.rust_log.is_some()
+    }
+}
+
+/// The tracing target of every crate in the workspace, each of which
+/// `log_level` sets. A test holds it equal to the workspace's members.
+const WORKSPACE_TARGETS: &[&str] = &[
+    "libtorrent_sys",
+    "libtorrent_safe",
+    "torrentd_engine",
+    "torrentd_pool",
+    "torrentd",
+    "torrentd_bench",
+    "torrentctl",
+];
+
+/// `log_level`'s directives: `info` for every target, and `level` for every
+/// crate of the workspace.
+fn level_directives(level: LogLevel) -> String {
+    let mut dirs = String::from("info");
+    for target in WORKSPACE_TARGETS {
+        dirs.push_str(&format!(",{target}={}", level.as_str()));
+    }
+    dirs
+}
+
+/// Check that `log_filter` holds only directives `EnvFilter` parses. A
+/// blank or whitespace-only `log_filter` passes: it is unset, as
+/// [`build_filter`] treats it.
+pub fn check_log_filter(log_filter: &str) -> Result<(), LogFilterError> {
+    if log_filter.trim().is_empty() {
+        return Ok(());
+    }
+    EnvFilter::builder()
+        .parse(log_filter)
+        .map(drop)
+        .map_err(|e| LogFilterError::Invalid(format!("{e} in {log_filter:?}")))
+}
+
+/// The filter `level`, `log_filter` and `rust_log` make, each source's
+/// directives laid over the one before it: `log_level`'s, unless `rust_log`
+/// is set and stands in for them, then `log_filter`'s, then `rust_log`'s.
+/// `EnvFilter` keeps the last directive for a target named twice, and a more
+/// specific target wins over a less specific one whatever their order.
+fn build_filter(
+    level: LogLevel,
+    log_filter: Option<&str>,
+    rust_log: Option<&str>,
+) -> Result<EnvFilter, LogFilterError> {
+    let mut dirs = Vec::new();
+    if rust_log.is_none() {
+        dirs.push(level_directives(level));
+    }
+    if let Some(f) = log_filter.filter(|f| !f.trim().is_empty()) {
+        check_log_filter(f)?;
+        dirs.push(f.to_owned());
+    }
+    if let Some(r) = rust_log {
+        dirs.push(r.to_owned());
+    }
+    EnvFilter::builder()
+        .parse(dirs.join(","))
+        .map_err(|e| LogFilterError::Reload(e.to_string()))
+}
+
+/// `RUST_LOG`, where it is set to directives that parse. One that does not
+/// parse is ignored, as `EnvFilter::try_from_default_env` ignored it.
+fn rust_log_from_env() -> Option<String> {
+    std::env::var("RUST_LOG")
+        .ok()
+        .filter(|s| !s.trim().is_empty() && EnvFilter::builder().parse(s).is_ok())
+}
+
+/// Install the global subscriber, its spans traced by `telemetry`'s tracer.
+/// An install that fails (a global subscriber or `log` logger already set)
+/// is an error rather than ignored: ignoring it lost every later log line
+/// without a word. So is a `log_filter` that does not parse.
+pub fn init(
+    level: LogLevel,
+    log_filter: Option<&str>,
+    telemetry: &Telemetry,
+) -> anyhow::Result<LogReloadHandle> {
+    let rust_log = rust_log_from_env();
+    let filter = build_filter(level, log_filter, rust_log.as_deref())?;
+    let (handle, subscriber) = subscriber(
+        filter,
+        rust_log,
+        std::io::stdout,
+        &LOG_EVENTS,
+        telemetry.tracer(),
+    );
     subscriber
         .try_init()
         .map_err(|e| anyhow::anyhow!("install the tracing subscriber: {e}"))?;
     Ok(handle)
 }
 
-/// The daemon's subscriber: the JSON layer behind the reloadable `filter`,
-/// and beside it the layer counting WARN and ERROR events into `counts`,
-/// which `filter` does not hold back.
+/// The daemon's subscriber: the OpenTelemetry layer giving spans at INFO
+/// and above their ids (and exporting them, where `tracer`'s provider
+/// does), the JSON layer behind the reloadable `filter` writing those ids
+/// into each line, and beside them the layer counting WARN and ERROR events
+/// into `counts`, which `filter` does not hold back.
 fn subscriber<W>(
     filter: EnvFilter,
+    rust_log: Option<String>,
     writer: W,
     counts: &'static LogEventCounts,
+    tracer: SdkTracer,
 ) -> (LogReloadHandle, impl Subscriber + Send + Sync + 'static)
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
     let (filter, handle) = reload::Layer::new(filter);
+    // `RecordTraceIds` above the OpenTelemetry layer, whose `on_new_span`
+    // runs first and gives the span the context it reads. The JSON layer
+    // reads what it recorded only when an event is formatted, through
+    // `EventTraceIds`, which `and_then` runs before it on every event.
     let subscriber = tracing_subscriber::registry()
-        .with(fmt_layer(writer).with_filter(filter))
+        .with(EventTraceIds.and_then(fmt_layer(writer).with_filter(filter)))
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_tracked_inactivity(false)
+                .with_filter(LevelFilter::INFO),
+        )
+        .with(RecordTraceIds::default())
         .with(CountLogEvents(counts).with_filter(LevelFilter::WARN));
-    (LogReloadHandle { inner: handle }, subscriber)
+    (
+        LogReloadHandle {
+            inner: handle,
+            rust_log,
+        },
+        subscriber,
+    )
 }
 
 /// The `level` values of `torrentd_log_events_total`, in the order
@@ -205,6 +481,7 @@ pub const LOG_EVENT_TARGETS: &[&str] = &[
     "torrentd::auth",
     "torrentd::http",
     "torrentd::metrics",
+    "torrentd::panic_hook",
     "torrentd::pool",
     "torrentd::port_forward_monitor",
     "torrentd::profile_registry",
@@ -212,6 +489,7 @@ pub const LOG_EVENT_TARGETS: &[&str] = &[
     "torrentd::sd_notify",
     "torrentd::signals",
     "torrentd::startup",
+    "torrentd::telemetry",
     "torrentd::vpn",
     "torrentd::vpn_monitor",
     "torrentd_engine::alert_loop",
@@ -221,6 +499,7 @@ pub const LOG_EVENT_TARGETS: &[&str] = &[
     "torrentd_engine::store",
     "torrentd_pool::adopt",
     "torrentd_pool::drift",
+    "torrentd_pool::plan",
     "torrentd_pool::scan",
     "torrentd_pool::store",
     "other",
@@ -325,7 +604,9 @@ impl EarlyErrorKind {
 pub fn early_error(kind: EarlyErrorKind, message: &str) {
     let line = early_line(kind, message);
     let mut out = std::io::stdout().lock();
+    // ignore-result: there is nowhere left to report it (see above).
     let _ = writeln!(out, "{line}");
+    // ignore-result: as above.
     let _ = out.flush();
 }
 
@@ -334,7 +615,8 @@ fn early_line(kind: EarlyErrorKind, message: &str) -> String {
     use tracing_subscriber::fmt::time::FormatTime as _;
 
     let mut timestamp = String::new();
-    // `ChronoUtc` only fails where its writer does, and a `String` does not.
+    // ignore-result: `ChronoUtc` only fails where its writer does, and a
+    // `String` does not.
     let _ = ChronoUtc::rfc_3339().format_time(&mut Writer::new(&mut timestamp));
     let json = |s: &str| serde_json::Value::from(s).to_string();
     // Built by hand rather than from a `serde_json::Map`, which sorts its keys
@@ -363,8 +645,45 @@ pub(crate) fn for_tests<W>(
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
+    for_tests_traced(level, writer, &Telemetry::ids_only())
+}
+
+/// [`for_tests`], its spans traced by `telemetry`'s tracer.
+#[cfg(test)]
+pub(crate) fn for_tests_traced<W>(
+    level: LogLevel,
+    writer: W,
+    telemetry: &Telemetry,
+) -> (LogReloadHandle, impl Subscriber + Send + Sync)
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
     let counts: &'static LogEventCounts = Box::leak(Box::new(LogEventCounts::new()));
-    subscriber(level_filter(level), writer, counts)
+    let filter = build_filter(level, None, None).expect("log_level's directives parse");
+    subscriber(filter, None, writer, counts, telemetry.tracer())
+}
+
+/// [`for_tests`], with a `log_filter`, and `rust_log` standing in for the
+/// `RUST_LOG` the daemon read at startup.
+#[cfg(test)]
+pub(crate) fn for_tests_filtered<W>(
+    level: LogLevel,
+    log_filter: Option<&str>,
+    rust_log: Option<&str>,
+    writer: W,
+) -> (LogReloadHandle, impl Subscriber + Send + Sync)
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let counts: &'static LogEventCounts = Box::leak(Box::new(LogEventCounts::new()));
+    let filter = build_filter(level, log_filter, rust_log).expect("the test's filter parses");
+    subscriber(
+        filter,
+        rust_log.map(str::to_owned),
+        writer,
+        counts,
+        Telemetry::ids_only().tracer(),
+    )
 }
 
 /// An in-memory log a test hands to `fmt_layer` and reads back.
@@ -490,7 +809,13 @@ mod tests {
     fn warn_and_error_events_are_counted_by_module_whatever_the_log_level() {
         let counts: &'static LogEventCounts = Box::leak(Box::new(LogEventCounts::new()));
         let buf = Buf::default();
-        let (_handle, subscriber) = subscriber(level_filter(LogLevel::Error), buf.clone(), counts);
+        let (_handle, subscriber) = subscriber(
+            build_filter(LogLevel::Error, None, None).unwrap(),
+            None,
+            buf.clone(),
+            counts,
+            Telemetry::ids_only().tracer(),
+        );
         torrentd_engine::testing::with_subscriber(subscriber, || {
             tracing::warn!(target: "torrentd::vpn::wireguard", "w1");
             tracing::warn!(target: "torrentd::vpn", "w2");
@@ -521,6 +846,217 @@ mod tests {
             counts.snapshot().len(),
             LOG_EVENT_LEVELS.len() * LOG_EVENT_TARGETS.len()
         );
+    }
+
+    /// Emit one event per (target, level) the filter tests judge, each with
+    /// its label as the message.
+    fn emit_judged_events() {
+        use tracing::Level;
+        tracing::event!(target: "torrentd_pool::apply", Level::DEBUG, "pool_apply_debug");
+        tracing::event!(target: "torrentd_pool::scan", Level::DEBUG, "pool_scan_debug");
+        tracing::event!(target: "torrentd_pool", Level::INFO, "pool_info");
+        tracing::event!(target: "torrentd::vpn", Level::TRACE, "vpn_trace");
+        tracing::event!(target: "torrentd::http", Level::DEBUG, "torrentd_debug");
+        tracing::event!(target: "torrentd::http", Level::INFO, "torrentd_info");
+        tracing::event!(target: "torrentd_engine::handler", Level::DEBUG, "engine_debug");
+        tracing::event!(target: "hyper::proto", Level::DEBUG, "hyper_debug");
+        tracing::event!(target: "hyper::proto", Level::INFO, "hyper_info");
+    }
+
+    const JUDGED: &[&str] = &[
+        "pool_apply_debug",
+        "pool_scan_debug",
+        "pool_info",
+        "vpn_trace",
+        "torrentd_debug",
+        "torrentd_info",
+        "engine_debug",
+        "hyper_debug",
+        "hyper_info",
+    ];
+
+    /// The labels of the judged events a subscriber booted at `level`,
+    /// `log_filter` and `rust_log` passes, before and after `reload` runs
+    /// against its handle.
+    fn passed_across_reload(
+        level: LogLevel,
+        log_filter: Option<&str>,
+        rust_log: Option<&str>,
+        reload: impl FnOnce(&LogReloadHandle),
+    ) -> (Vec<&'static str>, Vec<&'static str>) {
+        let buf = Buf::default();
+        let (handle, subscriber) = for_tests_filtered(level, log_filter, rust_log, buf.clone());
+        let mut boundary = 0;
+        torrentd_engine::testing::with_subscriber(subscriber, || {
+            emit_judged_events();
+            reload(&handle);
+            boundary = buf.text().len();
+            emit_judged_events();
+        });
+        let text = buf.text();
+        let labels = |text: &str| {
+            JUDGED
+                .iter()
+                .copied()
+                .filter(|l| text.contains(&format!("\"message\":\"{l}\"")))
+                .collect::<Vec<_>>()
+        };
+        (labels(&text[..boundary]), labels(&text[boundary..]))
+    }
+
+    #[test]
+    fn log_level_sets_every_workspace_crate_torrentd_pool_included() {
+        let (before, after) = passed_across_reload(LogLevel::Info, None, None, |h| {
+            h.set_filter(LogLevel::Debug, None).unwrap();
+        });
+        assert_eq!(before, ["pool_info", "torrentd_info", "hyper_info"]);
+        assert_eq!(
+            after,
+            [
+                "pool_apply_debug",
+                "pool_scan_debug",
+                "pool_info",
+                "torrentd_debug",
+                "torrentd_info",
+                "engine_debug",
+                "hyper_info",
+            ],
+            "torrentd_pool follows log_level; a crate outside the workspace stays at info",
+        );
+    }
+
+    #[test]
+    fn log_filter_is_layered_over_log_level_and_applied_by_a_reload() {
+        let (_, after) = passed_across_reload(LogLevel::Info, None, None, |h| {
+            h.set_filter(
+                LogLevel::Info,
+                Some("torrentd_pool::apply=debug,torrentd::vpn=trace"),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            after,
+            [
+                "pool_apply_debug",
+                "pool_info",
+                "vpn_trace",
+                "torrentd_info",
+                "hyper_info"
+            ],
+        );
+        // A target `log_filter` names wins over `log_level` both ways.
+        let (_, after) = passed_across_reload(LogLevel::Info, None, None, |h| {
+            h.set_filter(LogLevel::Debug, Some("torrentd_pool=warn"))
+                .unwrap();
+        });
+        assert_eq!(
+            after,
+            [
+                "torrentd_debug",
+                "torrentd_info",
+                "engine_debug",
+                "hyper_info"
+            ],
+        );
+        // Deleting `log_filter` takes its directives away again.
+        let (before, after) = passed_across_reload(
+            LogLevel::Info,
+            Some("torrentd_pool::apply=debug"),
+            None,
+            |h| h.set_filter(LogLevel::Info, None).unwrap(),
+        );
+        assert_eq!(
+            before,
+            [
+                "pool_apply_debug",
+                "pool_info",
+                "torrentd_info",
+                "hyper_info"
+            ]
+        );
+        assert_eq!(after, ["pool_info", "torrentd_info", "hyper_info"]);
+    }
+
+    #[test]
+    fn rust_log_directives_survive_a_reload_and_win_over_log_filter() {
+        let rust_log = Some("warn,torrentd::vpn=trace");
+        let (before, after) = passed_across_reload(LogLevel::Info, None, rust_log, |h| {
+            assert!(h.rust_log_is_set());
+            h.set_filter(LogLevel::Debug, None).unwrap();
+        });
+        assert_eq!(before, ["vpn_trace"]);
+        assert_eq!(
+            after,
+            ["vpn_trace"],
+            "RUST_LOG stands in for log_level, and its directives are kept",
+        );
+        let (_, after) = passed_across_reload(LogLevel::Info, None, rust_log, |h| {
+            h.set_filter(
+                LogLevel::Debug,
+                Some("torrentd_pool::apply=debug,torrentd::vpn=error"),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            after,
+            ["pool_apply_debug", "vpn_trace"],
+            "log_filter adds a target RUST_LOG does not name, and loses one it does",
+        );
+    }
+
+    #[test]
+    fn an_invalid_log_filter_is_refused_and_the_filter_in_place_stays() {
+        let (before, after) = passed_across_reload(
+            LogLevel::Info,
+            Some("torrentd_pool::apply=debug"),
+            None,
+            |h| {
+                let e = h
+                    .set_filter(LogLevel::Debug, Some("torrentd=loud"))
+                    .expect_err("`loud` is no level");
+                assert_eq!(e.stage(), "log_filter");
+                assert!(e.to_string().contains("torrentd=loud"), "{e}");
+            },
+        );
+        assert_eq!(
+            before,
+            [
+                "pool_apply_debug",
+                "pool_info",
+                "torrentd_info",
+                "hyper_info"
+            ]
+        );
+        assert_eq!(after, before, "neither the level nor the filter moved");
+        assert!(check_log_filter("torrentd_pool::apply=debug,torrentd::vpn=trace").is_ok());
+        assert!(check_log_filter("").is_ok());
+        assert!(check_log_filter(" \t ").is_ok(), "blank is unset");
+        assert_eq!(check_log_filter("=").unwrap_err().stage(), "log_filter");
+    }
+
+    /// `WORKSPACE_TARGETS` is the workspace's members, so a crate added to
+    /// the workspace is not left at `info` whatever `log_level` says, as
+    /// `torrentd_pool` was.
+    #[test]
+    fn workspace_targets_are_the_workspace_members() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"),
+        )
+        .unwrap();
+        let manifest: toml::Value = toml::from_str(&manifest).unwrap();
+        let mut members: Vec<String> = manifest["workspace"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let path = m.as_str().unwrap();
+                path.rsplit('/').next().unwrap().replace('-', "_")
+            })
+            .collect();
+        members.sort();
+        let mut targets: Vec<String> = WORKSPACE_TARGETS.iter().map(|t| (*t).to_owned()).collect();
+        targets.sort();
+        assert_eq!(targets, members);
     }
 
     #[test]

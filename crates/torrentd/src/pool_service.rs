@@ -54,6 +54,9 @@ pub struct PoolService {
     pub(crate) verify: Arc<VerifyQueue>,
     /// `[pool] allow_mutations`. Every path that can destroy data checks this.
     allow_mutations: bool,
+    /// The roots whose filesystem failed the boot's mutation probe, each
+    /// with what failed: see [`PoolService::disable_root_mutations`].
+    mutations_disabled: Mutex<Vec<(PathBuf, String)>>,
     /// Set once by the daemon after opening; absent for `torrentd pool …`,
     /// which is a one-shot CLI with nothing to scrape it.
     metrics: std::sync::OnceLock<Arc<dyn MetricsSink>>,
@@ -109,6 +112,43 @@ impl PoolService {
         self.allow_mutations
     }
 
+    /// Refuse, for the life of the process, every plan with a step inside
+    /// `root`, whose filesystem failed the boot's mutation probe; `why` says
+    /// what failed. The other roots keep taking mutations.
+    pub(crate) fn disable_root_mutations(&self, root: PathBuf, why: String) {
+        self.mutations_disabled.lock().push((root, why));
+    }
+
+    /// Why a plan whose steps touch `paths` is refused: the first path
+    /// inside a root [`PoolService::disable_root_mutations`] disabled.
+    /// `None` where none is. Roots are compared by components.
+    pub(crate) fn root_mutation_refusal<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        let disabled = self.mutations_disabled.lock();
+        if disabled.is_empty() {
+            return None;
+        }
+        paths.into_iter().find_map(|p| {
+            let p = std::path::Path::new(p);
+            disabled
+                .iter()
+                .find(|(root, _)| p.starts_with(root))
+                .map(|(root, why)| {
+                    format!(
+                        "mutations are disabled for pool root {}, which this plan touches at \
+                         {}: its filesystem failed the boot's probe ({why}). Move the root to \
+                         a local filesystem that supports renameat2(RENAME_NOREPLACE) and \
+                         directory fsync, and restart; see docs/operations.md, \"Storage the \
+                         daemon runs on\"",
+                        root.display(),
+                        p.display(),
+                    )
+                })
+        })
+    }
+
     pub fn open(cfg: &Config) -> anyhow::Result<Option<Arc<Self>>> {
         let Some(pool_cfg) = cfg.pool.as_ref() else {
             return Ok(None);
@@ -144,6 +184,7 @@ impl PoolService {
             library_dir: pool_cfg.library_dir.clone(),
             verify: Arc::new(VerifyQueue::new(pool_cfg.max_concurrent_verify)),
             allow_mutations: pool_cfg.allow_mutations,
+            mutations_disabled: Mutex::new(Vec::new()),
             metrics: std::sync::OnceLock::new(),
             loaded: std::sync::OnceLock::new(),
             source: std::sync::OnceLock::new(),
@@ -157,6 +198,7 @@ impl PoolService {
     /// into a profile it fenced. The daemon sets this once after opening,
     /// where the kill switch is on; a second call is ignored.
     pub(crate) fn set_kill_switch(&self, fence: Arc<crate::fence::KillSwitchFence>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.kill_switch.set(fence);
     }
 
@@ -169,6 +211,7 @@ impl PoolService {
     /// owns and not only the ones a session loaded. The daemon sets this
     /// once after opening; a second call is ignored.
     pub fn set_registry(&self, registry: Arc<AssignmentRegistry>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.registry.set(registry);
     }
 
@@ -398,7 +441,20 @@ impl PoolService {
         }
         let stale = self.with_store(|st| {
             let mut out: Vec<(String, String, String)> = Vec::new();
-            for t in st.torrents().unwrap_or_default() {
+            let torrents = st.torrents().unwrap_or_else(|e| {
+                // Logged at WARN, which `log_events_total` counts under
+                // this target; there is no read-error series to add to.
+                warn!(
+                    target: "torrentd::startup",
+                    op = "reconcile_owners_at_boot",
+                    error.cause = %e,
+                    "could not read the pool index to check its owners against the \
+                     assignment registry; pool_index_profile_disagreements reads 0 \
+                     unchecked until the next start",
+                );
+                Vec::new()
+            });
+            for t in torrents {
                 let Some(indexed) = t.profile.as_deref() else {
                     continue;
                 };
@@ -435,6 +491,7 @@ impl PoolService {
     /// torrent's `.torrent` into. The daemon sets this once after opening; a
     /// second call is ignored.
     pub fn set_torrent_store(&self, torrents: Arc<dyn TorrentStore>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.torrents.set(torrents);
     }
 
@@ -613,6 +670,7 @@ impl PoolService {
     /// The sessions' state map, so a scan knows what is loaded. The daemon
     /// sets this once after opening; a second call is ignored.
     pub fn set_state(&self, state: Arc<StateMap>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.loaded.set(state);
     }
 
@@ -620,6 +678,7 @@ impl PoolService {
     /// holds it. The daemon sets this once after opening; a second call is
     /// ignored.
     pub fn set_source(&self, source: Arc<dyn AlertSource>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.source.set(source);
     }
 
@@ -669,6 +728,7 @@ impl PoolService {
     /// Where the pool's failures are counted. The daemon sets this once after
     /// opening; a second call is ignored.
     pub fn set_metrics(&self, metrics: Arc<dyn MetricsSink>) {
+        // ignore-result: a second call is ignored, as documented.
         let _ = self.metrics.set(metrics);
     }
 
@@ -938,6 +998,7 @@ impl PoolService {
     }
 
     /// Adopt `infohash` into `profile`: [`execute_adopt`] on this pool.
+    #[tracing::instrument(name = "pool.adopt", level = "info", skip_all, fields(infohash = infohash, profile_id = %profile, dry_run = dry_run, refused = tracing::field::Empty))]
     pub fn adopt(
         &self,
         source: &Arc<dyn AlertSource>,
@@ -946,7 +1007,9 @@ impl PoolService {
         profile: ProfileId,
         dry_run: bool,
     ) -> Result<Adopted, AdoptRefusal> {
-        execute_adopt(self, source, profiles, infohash, profile, dry_run)
+        execute_adopt(self, source, profiles, infohash, profile, dry_run).inspect_err(|e| {
+            tracing::Span::current().record("refused", e.reason.as_str());
+        })
     }
 
     /// The profile the pool index names as `infohash`'s owner, read on the
@@ -972,6 +1035,7 @@ impl PoolService {
     /// it is released, holding no lock: the index reads among them each
     /// take the reader for that read alone ([`ReaderIndex`]), so every other
     /// request that reads the index goes on meanwhile.
+    #[tracing::instrument(name = "pool.plan", level = "info", skip_all, fields(kind = spec.kind(), plan_id = tracing::field::Empty), err(level = "info"))]
     pub fn create_plan(
         &self,
         spec: &torrentd_pool::PlanSpec,
@@ -987,8 +1051,15 @@ impl PoolService {
             Ok(steps) => steps,
             Err(refused) => return Ok(Err(refused)),
         };
+        let touched = steps
+            .iter()
+            .flat_map(|s| std::iter::once(s.src.as_str()).chain(s.dst.as_deref()));
+        if let Some(why) = self.root_mutation_refusal(touched) {
+            return Ok(Err(torrentd_pool::plan::Refused(why)));
+        }
         let spec_json = serde_json::to_string(spec)?;
         let id = self.with_store(|st| st.create_plan(spec.kind(), &spec_json, now_secs()))?;
+        tracing::Span::current().record("plan_id", id);
         self.with_store_mut(|st| st.add_plan_steps(id, &steps))?;
         Ok(Ok(id))
     }
@@ -1036,6 +1107,7 @@ impl PoolService {
     /// holds back only adoptions' admission and verdicts and goes on
     /// starting re-hashes and held adds. Reads through
     /// [`PoolService::with_reader`] never wait.
+    #[tracing::instrument(name = "pool.scan", level = "info", skip_all, err(level = "info"))]
     pub fn scan(&self) -> anyhow::Result<ScanSummary> {
         // Each skipped entry was a `warn` line and a number in the API
         // response. An unreadable root, or subdirectory, keeps its previous

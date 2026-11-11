@@ -8,7 +8,7 @@
 //! consumers should depend on that crate, not this one, unless they need
 //! to extend the FFI surface.
 //!
-//! Linux x86_64 only.
+//! Linux on x86_64 and aarch64 only.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]

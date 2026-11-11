@@ -359,6 +359,8 @@ fn read_events(
         if rc < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::Interrupted {
+                // ignore-result: a closed receiver means the loop has ended,
+                // and this thread returns either way.
                 let _ = tx.send(Err(e));
                 return;
             }
@@ -373,6 +375,8 @@ fn read_events(
                 Ok(false) => break,
                 Ok(true) => had_event = true,
                 Err(e) => {
+                    // ignore-result: a closed receiver means the loop has
+                    // ended, and this thread returns either way.
                     let _ = tx.send(Err(e));
                     return;
                 }
@@ -652,6 +656,7 @@ where
 /// during the exit, aborts the process before the log is flushed.
 pub fn notify(line: &str) {
     use std::io::Write as _;
+    // ignore-result: a hung-up stderr has nowhere left to report to.
     let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
@@ -661,6 +666,8 @@ pub fn spawn(tx: &mpsc::UnboundedSender<Msg>, effects: Vec<Effect>) {
     for effect in effects {
         let reply = tx.clone();
         spawn_task(tx, "a request", async move {
+            // ignore-result: a closed receiver means the loop has ended and
+            // wants no more replies.
             let _ = reply.send(effect.0.await);
         });
     }
@@ -687,6 +694,8 @@ fn spawn_task(
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("a non-string payload");
+            // ignore-result: a closed receiver means the loop has already
+            // ended, so there is nothing left to stop.
             let _ = tx.send(Msg::Fatal(format!("{what} panicked: {said}")));
         }
     });

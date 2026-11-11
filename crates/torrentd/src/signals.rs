@@ -110,11 +110,13 @@ async fn dispatch<T, I, H>(
             Some(()) = term.next() => {
                 info!("received SIGTERM");
                 shutting_down = true;
+                // ignore-result: no receiver means nothing is left to stop.
                 let _ = shutdown_tx.send(ShutdownReason::Sigterm);
             }
             Some(()) = int_.next() => {
                 info!("received SIGINT");
                 shutting_down = true;
+                // ignore-result: no receiver means nothing is left to stop.
                 let _ = shutdown_tx.send(ShutdownReason::Sigint);
             }
             Some(()) = hup.next() => {
@@ -144,8 +146,11 @@ async fn dispatch<T, I, H>(
     }
 }
 
-/// Spawn the signal listener task. Holds open until all three signal streams
-/// hit EOF (effectively forever in practice).
+/// The signal listener: install the three handlers and forward signals until
+/// all three streams hit EOF (effectively forever in practice). `boot` runs
+/// it as the supervised task `signals`, so a listener that fails to install a
+/// handler, or panics, drops `task_up{task="signals"}` to 0 rather than
+/// leaving a daemon no signal can stop.
 ///
 /// Took a capacity and returned an `mpsc::Receiver<()>` that nothing could
 /// ever receive on: the sender half was dropped before the function returned,
@@ -158,26 +163,24 @@ pub async fn run(channels: SignalChannels) {
         reload_tx,
     } = channels;
 
-    tokio::spawn(async move {
-        let mut streams = Vec::new();
-        for (kind, name) in [
-            (SignalKind::terminate(), "SIGTERM"),
-            (SignalKind::interrupt(), "SIGINT"),
-            (SignalKind::hangup(), "SIGHUP"),
-        ] {
-            match signal(kind) {
-                Ok(s) => streams.push(s),
-                Err(e) => {
-                    warn!(error.cause = %e, "failed to install {name} handler");
-                    return;
-                }
+    let mut streams = Vec::new();
+    for (kind, name) in [
+        (SignalKind::terminate(), "SIGTERM"),
+        (SignalKind::interrupt(), "SIGINT"),
+        (SignalKind::hangup(), "SIGHUP"),
+    ] {
+        match signal(kind) {
+            Ok(s) => streams.push(s),
+            Err(e) => {
+                warn!(error.cause = %e, "failed to install {name} handler");
+                return;
             }
         }
-        let hup = streams.pop().expect("three streams installed");
-        let int_ = streams.pop().expect("three streams installed");
-        let term = streams.pop().expect("three streams installed");
-        dispatch(shutdown_tx, reload_tx, term, int_, hup).await;
-    });
+    }
+    let hup = streams.pop().expect("three streams installed");
+    let int_ = streams.pop().expect("three streams installed");
+    let term = streams.pop().expect("three streams installed");
+    dispatch(shutdown_tx, reload_tx, term, int_, hup).await;
 }
 
 #[cfg(test)]

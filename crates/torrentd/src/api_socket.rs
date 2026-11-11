@@ -112,7 +112,10 @@ pub fn bind(path: &Path, mode: u32, group: Option<&str>) -> anyhow::Result<ApiSo
     let (staging, temp) = staging_paths(path, std::process::id())
         .with_context(|| format!("{} names no file", path.display()))?;
     // A leftover from a run of this pid that died between bind and rename.
+    // ignore-result: usually there is none; one that stays fails the mkdir
+    // or bind below, which reports it.
     let _ = std::fs::remove_file(&temp);
+    // ignore-result: as above.
     let _ = std::fs::remove_dir(&staging);
 
     std::fs::DirBuilder::new()
@@ -134,6 +137,8 @@ pub fn bind(path: &Path, mode: u32, group: Option<&str>) -> anyhow::Result<ApiSo
             std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
         Ok((listener, meta))
     })();
+    // ignore-result: after the rename there is no temp to remove, and a
+    // failure before it is the error `placed` carries.
     let _ = std::fs::remove_file(&temp);
     if let Err(e) = std::fs::remove_dir(&staging) {
         warn!(path = %staging.display(), error.cause = %e, "remove the API socket's staging directory");
@@ -324,6 +329,7 @@ pub async fn serve(
     // Closed before the drain, so a client connecting now is refused at once
     // rather than queued on a listener nothing accepts from.
     drop(socket);
+    // ignore-result: no receiver left means no connection left to stop.
     let _ = stop_tx.send(true);
     let drained = tokio::time::timeout(limits.drain_timeout, async {
         while connections.join_next().await.is_some() {}

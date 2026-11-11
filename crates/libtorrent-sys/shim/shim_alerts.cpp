@@ -436,14 +436,14 @@ extern "C" void lt_post_torrent_updates(lt_session* s) {
     if (!s) return;
     LT_SHIM_TRY_VOID
     s->ses.post_torrent_updates();
-    LT_SHIM_CATCH_VOID
+    LT_SHIM_CATCH_VOID(LT_FFI_CALL_POST_TORRENT_UPDATES)
 }
 
 extern "C" void lt_post_session_stats(lt_session* s) {
     if (!s) return;
     LT_SHIM_TRY_VOID
     s->ses.post_session_stats();
-    LT_SHIM_CATCH_VOID
+    LT_SHIM_CATCH_VOID(LT_FFI_CALL_POST_SESSION_STATS)
 }
 
 extern "C" int lt_pop_alert(lt_session* s, lt_alert_union* out) {
@@ -471,6 +471,61 @@ extern "C" int lt_pop_alert(lt_session* s, lt_alert_union* out) {
 extern "C" uint64_t lt_alert_translate_errors(lt_session* s) {
     if (!s) return 0;
     return s->alert_translate_errors.load(std::memory_order_relaxed);
+}
+
+// -------------------------------------------------------------------------
+// Exceptions the void entry points swallowed
+// -------------------------------------------------------------------------
+
+namespace {
+
+// Process-wide, not per session: lt_session_destroy is one of the calls, and
+// its session is gone by the time anything could read a per-session count.
+struct Swallowed {
+    std::atomic<std::uint64_t> count{0};
+    std::mutex mutex;  // guards `what`
+    char what[256] = {};
+};
+
+Swallowed swallowed[LT_FFI_CALL_COUNT];
+
+bool ffi_call_in_range(int call) {
+    return call >= 0 && call < LT_FFI_CALL_COUNT;
+}
+
+}  // namespace
+
+void lt_shim::record_swallowed(int call, const char* what) noexcept {
+    if (!ffi_call_in_range(call)) return;
+    auto& s = swallowed[call];
+    try {
+        std::lock_guard<std::mutex> lk(s.mutex);
+        copy_utf8_truncated(s.what, sizeof(s.what), what, what ? std::strlen(what) : 0);
+    } catch (...) {
+        // Counted below all the same; only the message is lost.
+    }
+    // After the message, so a reader that sees the count rise reads it.
+    s.count.fetch_add(1, std::memory_order_release);
+}
+
+extern "C" uint64_t lt_ffi_errors(int call) {
+    if (!ffi_call_in_range(call)) return 0;
+    return swallowed[call].count.load(std::memory_order_acquire);
+}
+
+extern "C" size_t lt_ffi_last_error(int call, char* out, size_t cap) {
+    if (!ffi_call_in_range(call) || !out || cap == 0) return 0;
+    out[0] = '\0';
+    LT_SHIM_TRY
+    auto& s = swallowed[call];
+    std::lock_guard<std::mutex> lk(s.mutex);
+    copy_utf8_truncated(out, cap, s.what, std::strlen(s.what));
+    return std::strlen(out);
+    LT_SHIM_CATCH(nullptr, 0, 0)
+}
+
+extern "C" void lt_test_record_swallowed(int call, const char* what) {
+    lt_shim::record_swallowed(call, what);
 }
 
 extern "C" void lt_alert_payload_free(lt_alert_union* u) {

@@ -747,12 +747,15 @@ fn a_verify_tick_does_not_wait_on_a_scan_holding_the_writer() {
         let holder = s.spawn(move || {
             let _store = pool.hold_writer_for_tests();
             held_tx.send(()).unwrap();
+            // ignore-result: a release and a dropped sender both end the hold.
             let _ = release_rx.recv();
         });
         held_rx.recv().unwrap();
         let (ticked_tx, ticked_rx) = mpsc::channel();
         let ticker = s.spawn(move || {
             tick();
+            // ignore-result: a receiver that timed out has already failed
+            // the test.
             let _ = ticked_tx.send(());
         });
         let ticked = ticked_rx.recv_timeout(Duration::from_secs(5));

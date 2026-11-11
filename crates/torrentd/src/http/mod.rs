@@ -1,13 +1,14 @@
 //! The HTTP control plane, served by kynos.
 //!
-//! The API lives under `/v1`; the readiness probe and the Prometheus scrape
-//! keep their conventional root paths. Every route — those two included — is
+//! The API lives under `/v1`; the probes and the Prometheus scrape keep
+//! their conventional root paths. Every route — those included — is
 //! described in one OpenAPI 3.2 document derived from the handlers and their
 //! types, published at `GET /v1/openapi.json` and committed at
 //! `docs/api/openapi.json`, where CI fails if it goes stale.
 //!
 //! [`v1`] holds the versioned operations, and `healthz` and `metrics` the
-//! two root routes; `metrics` also holds the observer that counts and times
+//! root routes: the probes `/livez`, `/readyz` and `/healthz`, and the
+//! scrape `/metrics`; `metrics` also holds the observer that counts and times
 //! every request by route and logs every 5xx at `ERROR`. What every operation shares sits beside them: [`ctx`]
 //! is the context a handler runs against, [`security`] the bearer scheme and
 //! the unauthenticated posture's gate, [`forwarded`] the real client behind
@@ -21,7 +22,7 @@ pub mod ctx;
 pub(crate) mod fault_injection;
 pub mod forwarded;
 mod headers;
-mod healthz;
+pub(crate) mod healthz;
 mod metrics;
 pub(crate) mod page;
 pub mod security;
@@ -82,12 +83,17 @@ macro_rules! daemon_router {
             // included — carries them, and one id source serves every
             // request.
             .intercept(request_id)
+            // After `RequestId`, whose id it reads from the request; before
+            // everything else, so all of it runs in the span.
+            .intercept(crate::http::headers::RequestSpan)
             .intercept(crate::http::headers::ApiHeaders)
             .observe(trace)
             .not_found(FallbackPolicy::Problem)
             .method_not_allowed(FallbackPolicy::Problem)
             .trailing_slashes(TrailingSlashPolicy::Strict)
             .mount(kynos::routes![
+                healthz::get_live,
+                healthz::get_ready,
                 healthz::get_health,
                 metrics::get_metrics,
                 get_openapi
@@ -124,8 +130,8 @@ pub fn document() -> kynos::Result<Document> {
         "https://github.com/d18580b/torrent/blob/master/docs/api/README.md",
     ));
     // No document-level `security`: every operation declares its own, and a
-    // default would be inherited by the three that need no credential
-    // (`/healthz`, this document, `POST /v1/sessions`).
+    // default would be inherited by the ones that need no credential (the
+    // three probes, this document, `POST /v1/sessions`).
     Ok(doc)
 }
 

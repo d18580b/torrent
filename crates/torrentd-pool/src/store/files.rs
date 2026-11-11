@@ -26,6 +26,7 @@ impl PoolStore {
     /// in the index exactly while it is configured, and
     /// [`PoolStore::retain_roots`] drops the rest. The column stays so the
     /// schema does not change for it.
+    #[tracing::instrument(name = "pool_store.upsert_root", level = "debug", skip_all, fields(root = %path.display()), err(level = "debug"))]
     pub fn upsert_root(&self, path: &Path) -> Result<i64, PoolError> {
         let p = path.to_string_lossy();
         self.conn.execute(
@@ -47,6 +48,7 @@ impl PoolStore {
     /// its files still listed, its claims still "protecting" bytes the daemon
     /// no longer manages, and every torrent once matched there still placed
     /// on a root nothing resolves.
+    #[tracing::instrument(name = "pool_store.retain_roots", level = "debug", skip_all, fields(keep = keep.len()), err(level = "debug"))]
     pub fn retain_roots(&mut self, keep: &[PathBuf]) -> Result<usize, PoolError> {
         let keep: std::collections::HashSet<String> = keep
             .iter()
@@ -96,6 +98,7 @@ impl PoolStore {
     /// one savepoint: an error drops nothing. The caller is the one that
     /// knows `seen` is complete; an empty `seen` drops every torrent this
     /// keeps no reason for.
+    #[tracing::instrument(name = "pool_store.retain_torrents", level = "debug", skip_all, fields(seen = seen.len()), err(level = "debug"))]
     pub fn retain_torrents(
         &mut self,
         seen: &std::collections::HashSet<String>,
@@ -135,6 +138,12 @@ impl PoolStore {
         Ok(dropped)
     }
 
+    #[tracing::instrument(
+        name = "pool_store.roots",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn roots(&self) -> Result<Vec<(i64, PathBuf)>, PoolError> {
         let mut st = self
             .conn
@@ -145,6 +154,7 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    #[tracing::instrument(name = "pool_store.root_id", level = "debug", skip_all, fields(root = %path.display()), err(level = "debug"))]
     pub fn root_id(&self, path: &Path) -> Result<i64, PoolError> {
         self.conn
             .query_row(
@@ -163,6 +173,7 @@ impl PoolStore {
     /// Taken whole rather than incrementally because a partial index is worse
     /// than a stale one: the matcher would read absent files as deleted and
     /// mark healthy torrents `Missing`.
+    #[tracing::instrument(name = "pool_store.replace_root_files", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn replace_root_files(
         &mut self,
         root_id: i64,
@@ -182,6 +193,12 @@ impl PoolStore {
     /// The table is `TEMP`: private to this connection, never in the index
     /// file, and gone with the connection, so a walk that dies half way
     /// leaves nothing a reader or the next open could mistake for the index.
+    #[tracing::instrument(
+        name = "pool_store.begin_staging",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn begin_staging(&self) -> Result<(), PoolError> {
         self.conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS file_staging (
@@ -202,6 +219,7 @@ impl PoolStore {
     ///
     /// Each batch is one savepoint, so its inserts share a journal commit
     /// rather than paying one each outside a transaction.
+    #[tracing::instrument(name = "pool_store.stage_files", level = "debug", skip_all, fields(files = files.len()), err(level = "debug"))]
     pub fn stage_files(&mut self, files: &[PoolFile]) -> Result<(), PoolError> {
         let tx = self.conn.savepoint()?;
         {
@@ -233,6 +251,7 @@ impl PoolStore {
     /// the swap would otherwise drop that subtree's rows: the matcher would
     /// read every torrent over it as `missing`, though nothing on disk is
     /// known to have changed. A row the walk did stage is left as staged.
+    #[tracing::instrument(name = "pool_store.stage_previous_subtree", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn stage_previous_subtree(
         &mut self,
         root_id: i64,
@@ -258,6 +277,7 @@ impl PoolStore {
     /// Taken whole rather than incrementally because a partial index is worse
     /// than a stale one: the matcher would read absent files as deleted and
     /// mark healthy torrents `Missing`.
+    #[tracing::instrument(name = "pool_store.swap_staged_root", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn swap_staged_root(&mut self, root_id: i64, scanned_at: i64) -> Result<(), PoolError> {
         self.in_transaction(|st| -> Result<(), PoolError> {
             st.conn
@@ -273,6 +293,7 @@ impl PoolStore {
         })
     }
 
+    #[tracing::instrument(name = "pool_store.file", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn file(&self, root_id: i64, rel_path: &str) -> Result<Option<PoolFile>, PoolError> {
         Ok(self
             .conn
@@ -287,6 +308,12 @@ impl PoolStore {
 
     /// Files indexed across every root, from each root's materialised total
     /// rather than a count of the file table.
+    #[tracing::instrument(
+        name = "pool_store.file_count",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn file_count(&self) -> Result<u64, PoolError> {
         Ok(self.conn.query_row(
             "SELECT COALESCE(SUM(d.files_total), 0)
@@ -300,6 +327,7 @@ impl PoolStore {
     /// is exactly `size`, used as the matcher's anchor lookup. Paths only:
     /// every one has the size asked for. In no particular order, and empty
     /// for an unknown root or a size nothing has.
+    #[tracing::instrument(name = "pool_store.files_with_size", level = "debug", skip_all, fields(root_id = root_id), err(level = "debug"))]
     pub fn files_with_size(&self, root_id: i64, size: u64) -> Result<Vec<String>, PoolError> {
         let mut st = self
             .conn

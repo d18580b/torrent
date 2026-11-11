@@ -1504,7 +1504,7 @@ pub(crate) async fn watch(
         // and fencing pauses torrents under each session's lock. Aborting
         // the watch cannot cancel this closure, so its fences and installs
         // pass the stop's gate.
-        let ticked = tokio::task::spawn_blocking({
+        let ticked = crate::startup::tasks::spawn_blocking({
             let (installed, fence, metrics) = (installed.clone(), fence.clone(), metrics.clone());
             let gate = gate.clone();
             let span = tracing::error_span!("kill_switch_watch", table = %table);
