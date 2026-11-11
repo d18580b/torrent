@@ -277,7 +277,7 @@ daemon can write. Either path is refused outright if it carries a `..`
 component or a leading `.`, and containment is judged with symlinks resolved.
 
 **Configuration is not settable at runtime, deliberately.** Several keys are
-reloadable — `log_level`, `upload_rate_limit`, `connections_limit`,
+reloadable — `log_level`, `log_filter`, `upload_rate_limit`, `connections_limit`,
 `aio_threads`, `enable_lsd`, `max_concurrent_http_announces` — and every one
 belongs to the TOML file. A reloadable key is not always handed to every
 profile: `enable_lsd` is withheld from every `vpn` profile on reload, because

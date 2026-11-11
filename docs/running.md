@@ -265,7 +265,8 @@ authentication posture, and at least one `[[profile]]`:
 | `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `allowed_hosts` | `[]`, so a daemon without `[auth]` answers only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`). List the names a reverse proxy passes through as `Host`, as bare names or addresses with no scheme, port or path. Refused beside `[auth]` — §6. Read once, at startup. |
 | `allow_unsupported_state_fs` | `false`, so a state directory (that of `resume_dir`, `registry_path` or `[pool] db_path`) on overlayfs, NFS, CIFS/SMB or FUSE refuses the start with exit 78. `true` starts anyway, with a WARN and `torrentd_state_fs_unsupported` at 1 — [operations.md, Storage the daemon runs on](operations.md#storage-the-daemon-runs-on). Read once, at startup. |
-| `log_level` | `info` |
+| `log_level` | `info`. Sets every crate of the workspace, `torrentd_pool` included; every other target logs at `info`. Reloadable. |
+| `log_filter` | unset. `EnvFilter` directives laid over `log_level`, e.g. `"torrentd_pool::apply=debug,torrentd::vpn=trace"`: a target named here wins over `log_level`. Reloadable. One that does not parse refuses the boot with exit 78, and fails a reload with the filter in place kept, counted in `torrentd_config_reload_failures_total{stage="log_filter"}` — §12. |
 | `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
 | `vpn_handshake_max_age_secs` | `180` — how long a WireGuard profile with torrents that can send may go with no handshake answering them before it is fenced. An aged handshake fences only once the link has sent bytes that nothing answered for this long, so neither an idle profile nor a quiet seeding one is fenced on its handshake (§11, drill 5). |
@@ -2724,9 +2725,19 @@ A restart would throw away the state you are trying to capture.
    daemon reads at every start, so a level left at `debug` there survives the
    next restart too.
 
-The reload applies `log_level` only when it differs from the value the daemon
-last loaded, and the level it applies replaces any `RUST_LOG` the process was
-started with. Where there is no `systemctl` — the container in `deploy/` has no
+**One subsystem only.** `log_filter` takes `EnvFilter` directives laid over
+`log_level`, and is reloadable the same way: `log_filter =
+"torrentd_pool::apply=debug"` raises the pool's apply step to `debug` and
+leaves everything else where `log_level` puts it. Delete the key and reload to
+take it away again. A `log_filter` that does not parse fails the reload with
+`SIGHUP: failed to apply log level; keeping the current log filter`, naming the
+directive, and counts in `torrentd_config_reload_failures_total{stage="log_filter"}`;
+the filter in place stays, `log_level` included.
+
+The reload applies `log_level` and `log_filter` only when one differs from the
+value the daemon last loaded. `RUST_LOG`, read once at startup, keeps priority
+across every reload: where it is set it stands in for `log_level`, and its
+directives win over `log_filter`'s on any target both name. Where there is no `systemctl` — the container in `deploy/` has no
 unit, and its log is `docker compose logs torrentd` (or `podman logs`) rather
 than the journal — edit the mounted `torrentd.toml` and call `POST /v1/config/reload`
 (§8) instead: it does what `SIGHUP` does. §8's `curl localhost:8080/v1/config/reload`
