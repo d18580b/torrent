@@ -211,6 +211,12 @@ mod tests {
             1,
             "a bulk resume's paced run, which the request awaits",
         ),
+        (
+            "vpn/tracker_dns.rs",
+            2,
+            "a tunnel-DNS profile's tracker proxy, aborted when its owner drops it, \
+             and each connection it serves, which ends with that connection",
+        ),
     ];
 
     /// Every task the daemon spawns is either supervised, under a name in
