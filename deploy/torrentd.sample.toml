@@ -13,6 +13,9 @@ resume_dir        = "/var/lib/torrentd/resume"
 torrent_dir       = "/var/lib/torrentd/torrents"
 http_listen       = "127.0.0.1:8080"   # loopback by default
 log_level         = "info"   # error | warn | info | debug (reloadable)
+# EnvFilter directives laid over log_level, for one subsystem at a time
+# (reloadable). RUST_LOG, where set, wins on any target both name.
+# log_filter      = "torrentd_pool::apply=debug,torrentd::vpn=trace"
 
 # Or serve the API on a unix socket, and on no TCP port: connecting takes
 # write permission on the socket, so its mode and group decide who may call

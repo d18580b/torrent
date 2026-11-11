@@ -774,7 +774,7 @@ pub enum ReloadError {
 ///
 /// The same as `SIGHUP`. The file stays the single source of truth: a client
 /// can ask the daemon to re-read it, not tell the daemon what it says.
-/// Several keys are reloadable (`log_level`, `upload_rate_limit`,
+/// Several keys are reloadable (`log_level`, `log_filter`, `upload_rate_limit`,
 /// `connections_limit`, `aio_threads`, `enable_lsd`,
 /// `max_concurrent_http_announces`); the reload task logs what it applied and
 /// warns about anything that needs a restart. `202` means the request was

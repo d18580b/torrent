@@ -89,7 +89,7 @@ fn a_warn_line_carries_the_ids_of_spans_its_log_level_hides() {
         let _inner = inner.enter();
         tracing::error!(target: "torrentd", "error in inner");
         // As after a SIGHUP raising it from info.
-        handle.set_level(LogLevel::Error).expect("reload");
+        handle.set_filter(LogLevel::Error, None).expect("reload");
         tracing::warn!(target: "torrentd", "held back");
         tracing::error!(target: "torrentd", "error after reload");
     });

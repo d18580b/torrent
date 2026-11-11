@@ -470,9 +470,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
         Owner("each route, before the API serves") =>
         "Seconds from a request arriving to its response head being ready, by route and \
          method; a streamed body's delivery is not included.";
-    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings", "watch"]) Zero =>
+    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "log_filter", "apply_settings", "watch"]) Zero =>
         "Reloads (SIGHUP, POST /v1/config/reload, or a change config_watch saw) that failed, by \
-         the step that failed; watch counts config_watch failing to watch the config file's \
+         the step that failed; log_filter counts a log_filter that does not parse, which keeps \
+         the log filter in place; watch counts config_watch failing to watch the config file's \
          directory, at boot or later, after which only SIGHUP and the API reload.";
     "config_restart_pending" Gauge Daemon ("key": crate::config::RESTART_PENDING_KEYS) Zero =>
         "1 for each config key whose value in the file, at the last reload that read it, \
