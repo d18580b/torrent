@@ -94,6 +94,7 @@ hold.
 | `torrentd_boot_log_events` | gauge | `level`: `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::telemetry`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::plan`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot: always | log_events_total for these levels as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_panics` | gauge | `thread`: `main`, `torrentd-tokio`, `torrentd-alert-loop`, `torrentd-resume-writer`, `torrentd-torrent-writer`, `pool-release`, `other` | daemon | from boot: always | panics_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_ffi_errors` | gauge | `call`: `post_torrent_updates`, `post_session_stats`, `session_destroy` | daemon | from boot: always | ffi_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_external_command_failures` | gauge | `program`: `ip`, `wg`, `nft`, `openvpn`, `kill`, `other` | daemon | from boot: always | external_command_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |
@@ -162,6 +163,8 @@ hold.
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |
 | `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels`, `encode` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, an emission whose labels differ from the series' first use, or a whole scrape whose encoding failed (encode), which was answered 500. |
 | `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::telemetry`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::plan`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
+| `torrentd_external_command_failures_total` | counter | `program`: `ip`, `wg`, `nft`, `openvpn`, `kill`, `other` | daemon | from boot, at 0 | Host tools (ip, wg, nft, openvpn, kill; other for any other) that failed: could not start, did not finish within their bound, or exited non-zero where the caller required a zero exit. Each is logged at WARN, target torrentd::vpn::exec, with its redacted command line and stderr. |
+| `torrentd_external_command_duration_seconds` | histogram | `program`: `ip`, `wg`, `nft`, `openvpn`, `kill`, `other` | daemon | from boot: always | Seconds each host tool run took, from spawn to exit, timeout or refusal to start, by program. |
 | `torrentd_telemetry_export_errors_total` | counter | — | daemon | from boot, at 0 | OTLP span exports that failed, each dropping its batch: a collector that refused or did not answer within the timeout. Logged at WARN, target torrentd::telemetry, at most once a minute. Always 0 without [telemetry]. |
 | `torrentd_build_fault_injection` | gauge | — | daemon | from boot: always | 1 if this binary was built with the fault-injection feature, which mounts POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a deployment. |
 | `torrentd_build_info` | gauge | `version`; `revision`; `arch`; `features` | daemon | from boot: always | Always 1, labelled with this binary's version, the commit it was built from (TORRENTD_REVISION at build time, unknown where it was unset), its CPU architecture, and the cargo features beyond the default it was built with: fault-injection for the alert drill's build, empty on every deployment. |
@@ -260,6 +263,22 @@ daemon exits is counted after the last scrape, so that one is never seen.
 | Alert | Severity | Fires when |
 | --- | --- | --- |
 | `TorrentdFfiErrors` | warning | The shim swallowed an exception in the last 15 minutes, or during the boot (`torrentd_boot_ffi_errors`), by `call`. |
+
+## Host tools that failed
+
+The VPN subsystem runs `ip`, `wg`, `nft`, `openvpn` and `kill`, each in an
+`external_command` span and timed in
+`torrentd_external_command_duration_seconds` by `program`. A run that could
+not start, did not finish within its bound, or exited non-zero where its
+caller required a zero exit is logged at `WARN` (target
+`torrentd::vpn::exec`) with its redacted command line and stderr, and counted
+in `torrentd_external_command_failures_total`. A non-zero exit the caller
+reads as an answer (`ip link show` naming a link that does not exist) is
+neither.
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdExternalCommandFailures` | warning | A host tool failed in the last 15 minutes, or during the boot (`torrentd_boot_external_command_failures`), by `program`. |
 
 ## Config reloads
 

@@ -1757,6 +1757,38 @@ another task or thread stays inside it, so an engine line an adoption causes
 has the request's `trace_id`. A request carrying a W3C `traceparent` joins
 the caller's trace, and every response returns its own `traceparent`.
 
+The spans each layer opens, by name, to search for in the log's
+`span.name` or in Tempo. INFO spans are logged and exported; DEBUG spans
+appear only with `log_level = "debug"` and are never exported. Nothing
+that runs once per torrent on a recurring path opens an INFO span, so a
+10K-torrent daemon's trace volume does not grow with its torrents.
+
+| Layer | Span | Level | Fields |
+| --- | --- | --- | --- |
+| HTTP API | `request` | INFO | `request_id`, `method`, `route`, `status`, `principal` |
+| Startup | `startup`, and under it `startup.fs_check`, `startup.instance_lock`, `startup.table_lock`, `startup.preflight`, `startup.release_wireguard`, `startup.release_openvpn`, `startup.stale_kill_switch`, `startup.profiles`, `startup.pool_open`, `startup.listen_check`, `startup.resume_scan`, `startup.torrent_dir_scan`; then `startup.http_bind` | INFO | |
+| Reload | `reload`, one trace per reload | INFO | `trigger` (`request`, `watch`, `boot_catch_up`), `path` |
+| VPN monitor | `vpn_monitor.check`, one trace per profile per poll, linked to the long-lived `vpn_monitor` | INFO | `profile_id`, `vpn_iface`, `verdict` (`up` or the fence reason) |
+| Port-forward monitor | `port_forward_monitor.renew`, one trace per renewal, linked to the profile's long-lived `port_forward_monitor` | INFO | `profile_id`, `rebound`, `next_in_s` |
+| Host tools | `external_command` | INFO | `program`, `command` (redacted), `timeout_s`, `duration_ms`, `exit_status`, `error` |
+| Pool | `pool.scan`, `pool.scan_root`, `pool.scan_library`, `pool.match`, `pool.drift`, `pool.plan`, `pool.plan_prepare`, `pool.plan_finish`, `pool.adopt`, `pool.apply` | INFO | `root`, `kind`, `plan_id`, `infohash`, `profile_id`, `refused` |
+| Pool apply steps | `pool.apply_step`: INFO for a relocate's move, DEBUG for each delete | INFO / DEBUG | `plan_id`, `step`, `op`, `src`, `outcome`, `error` |
+| Check queue | `check_queue.verify_outcome` | INFO | `infohash`, `outcome` |
+| Check queue | `check_queue.tick`, `check_queue.admit` (`kind`: `adoption`, `recheck`, `add`), `pool.adopt_plan` | DEBUG | `infohash`, `profile_id`, `depth`, `in_flight` |
+| Pool index (SQLite) | `pool_store.<operation>` (`pool_store.transaction`, `pool_store.torrent`, `pool_store.set_step_status`, …) | DEBUG | `infohash`, `plan_id`, `step`, `root_id` |
+| libtorrent FFI | `ffi.<call>` (`ffi.add_torrent`, `ffi.torrent_statuses`, `ffi.pop_alerts`, `ffi.save_resume_data`, …) | DEBUG | `infohash`, `duration_us` |
+| Engine | one span per engine call, named for it, with `op` | INFO | `op`, `infohash` |
+
+A failed operation records its error on its span: as `error`, `refused` or
+`outcome`, or as an event logged inside it. A host tool that failed (could
+not start, timed out, or exited non-zero where its caller needed a zero
+exit) is also logged at WARN, target `torrentd::vpn::exec`, with its stderr
+redacted and cut at 512 bytes (withheld where the tool was fed stdin, which
+may hold a private key), and counted in
+`torrentd_external_command_failures_total{program}`;
+`torrentd_external_command_duration_seconds{program}` times every run, and
+`TorrentdExternalCommandFailures` alerts on a failure.
+
 A `[telemetry]` section exports the spans themselves over OTLP. It is off by
 default and restart-only; `deploy/torrentd.sample.toml` lists its keys and the
 `OTEL_EXPORTER_OTLP_*` variable each falls back to. Pointing it at Grafana

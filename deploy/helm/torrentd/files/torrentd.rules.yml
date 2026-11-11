@@ -85,6 +85,21 @@ groups:
         annotations:
           summary: "libtorrent threw in {{ $labels.call }} and the shim swallowed it; read the WARN line naming the exception"
 
+      - alert: TorrentdExternalCommandFailures
+        # A host tool (ip, wg, nft, openvpn, kill) could not start, did not
+        # finish within its bound, or exited non-zero where the caller
+        # required a zero exit. The WARN line (target torrentd::vpn::exec)
+        # carries the command and its stderr. The kill switch and the tunnels
+        # are set up by the boot, so one failing then is in the first
+        # sample, and the boot gauge carries it.
+        expr: >
+          increase(torrentd_external_command_failures_total[15m]) > 0
+          or torrentd_boot_external_command_failures > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.program }} failed; read the WARN line naming the command and its stderr"
+
       - alert: TorrentdMetricsDropped
         expr: >
           increase(torrentd_metrics_dropped_samples_total[15m]) > 0
