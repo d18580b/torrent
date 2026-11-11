@@ -7,6 +7,13 @@
 #
 # It prints the status an unauthenticated scrape gets, then the authenticated
 # scrape's body, and fails where the authenticated scrape fails.
+#
+# k3s enforces the chart's NetworkPolicy with kube-router, which admits a new
+# pod's address only once its policy sync has run: until then this pod's
+# connections to the API port are rejected, and curl sees connection refused
+# within a millisecond of the pod starting. Each curl retries a refused
+# connection for up to 60 s, as Prometheus would at its next interval; a
+# policy that never admits the monitoring namespace still fails the scrape.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -24,8 +31,9 @@ spec:
         - |
           set -euo pipefail
           url=http://@RELEASE@-torrentd.@NAMESPACE@.svc:8080/metrics
-          printf 'unauthenticated %s\n' "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url")"
-          curl -fsS --max-time 10 -H "Authorization: Bearer $TOKEN" "$url"
+          retry=(--retry 60 --retry-delay 1 --retry-max-time 60 --retry-connrefused)
+          printf 'unauthenticated %s\n' "$(curl -sS "${retry[@]}" -o /dev/null -w '%{http_code}' --max-time 10 "$url")"
+          curl -fsS "${retry[@]}" --max-time 10 -H "Authorization: Bearer $TOKEN" "$url"
       env:
         - name: TOKEN
           valueFrom:
