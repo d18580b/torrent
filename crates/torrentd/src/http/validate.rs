@@ -85,12 +85,16 @@ impl Invalid {
         }
     }
 
-    /// `Ok` when nothing was recorded.
-    pub fn finish(self) -> Result<(), Invalid> {
+    /// `Ok` when nothing was recorded, else the `422 validation-failed` every
+    /// recorded violation is reported in.
+    pub fn finish(self) -> Result<(), ValidationFailed> {
         if self.violations.is_empty() {
             Ok(())
         } else {
-            Err(self)
+            Err(ValidationFailed {
+                summary: self.summary(),
+                errors: self.violations,
+            })
         }
     }
 
@@ -109,31 +113,40 @@ impl Invalid {
     }
 }
 
-/// A request type whose schema declares constraints serde does not check.
-pub trait Validate {
-    fn validate(&self) -> Result<(), Invalid>;
+/// A request that broke at least one declared constraint.
+///
+/// An operation's error enum holds it as
+/// `#[problem(transparent)] ValidationFailed(#[from] ValidationFailed)`, so
+/// the `422` is declared here once and `?` reaches it from
+/// [`Invalid::finish`].
+#[derive(Debug, PartialEq, Eq, thiserror::Error, kynos::ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 422, title = "The request is invalid")]
+#[error("{summary}")]
+pub struct ValidationFailed {
+    summary: String,
+    /// Every violated constraint.
+    #[problem(extension)]
+    errors: Vec<Violation>,
 }
 
-/// Adds the `ValidationFailed` conversion to an error enum declaring
-///
-/// ```ignore
-/// #[error("{summary}")]
-/// #[problem(status = 422, title = "The request is invalid")]
-/// ValidationFailed { summary: String, #[problem(extension)] errors: Vec<Violation> },
-/// ```
-macro_rules! from_invalid {
-    ($($error:ty),+ $(,)?) => {$(
-        impl From<$crate::http::validate::Invalid> for $error {
-            fn from(invalid: $crate::http::validate::Invalid) -> Self {
-                Self::ValidationFailed {
-                    summary: invalid.summary(),
-                    errors: invalid.violations,
-                }
-            }
+impl ValidationFailed {
+    /// The one violation at `pointer`, for a check made outside a
+    /// [`Validate`] pass.
+    pub fn at(pointer: impl Into<String>, detail: impl Into<String>) -> Self {
+        let mut invalid = Invalid::new();
+        invalid.push(pointer, detail);
+        Self {
+            summary: invalid.summary(),
+            errors: invalid.violations,
         }
-    )+};
+    }
 }
-pub(crate) use from_invalid;
+
+/// A request type whose schema declares constraints serde does not check.
+pub trait Validate {
+    fn validate(&self) -> Result<(), ValidationFailed>;
+}
 
 /// Whether `s` is 40 hex digits, the only infohash form the API accepts.
 pub fn is_infohash_hex(s: &str) -> bool {

@@ -388,7 +388,7 @@ impl EventFeed {
 
 /// Why an event stream was not opened.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum EventsError {
     /// Every event-stream slot is taken.
     #[error(
@@ -757,7 +757,7 @@ pub fn reload_queue() -> (
 
 /// Why a reload was not queued.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ReloadError {
     /// A reload is already queued and has not run yet; this request would
     /// re-read the same file.

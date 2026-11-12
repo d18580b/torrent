@@ -119,18 +119,17 @@ pub struct TrackerList {
 
 /// Why a torrent's trackers could not be listed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListTrackersError {
-    /// No loaded torrent has this infohash.
-    #[error("no loaded torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    /// No loaded torrent has this infohash, or its profile has no session.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Lookup(#[from] Lookup),
     /// The session could not be asked.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_lookup!(ListTrackersError);
 
 /// List a torrent's trackers.
 ///
@@ -147,7 +146,7 @@ pub async fn list_torrent_trackers(
     let (st, engine) = loaded(&s, p.infohash.get())?;
     let trackers = match blocking(move || engine.torrent_trackers(st.handle)).await {
         Ok(trackers) => trackers,
-        Err(e) if is_gone(&e) => return Err(ListTrackersError::TorrentNotFound),
+        Err(e) if is_gone(&e) => return Err(Lookup::TorrentNotFound.into()),
         Err(e) => {
             return Err(ListTrackersError::Internal {
                 detail: internal("listing the torrent's trackers", e),

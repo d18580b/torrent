@@ -136,28 +136,39 @@ impl From<ProfileUnavailableReason> for serde_json::Value {
 }
 
 /// Why a request naming a profile cannot proceed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// An operation's error enum holds it as
+/// `#[problem(transparent)] Profile(#[from] ProfileProblem)`, so both
+/// failures are declared here once.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ProfileProblem {
     /// No profile with this id is configured.
-    NotFound,
+    #[error("unknown profile_id")]
+    #[problem(status = 404, title = "Profile not found")]
+    ProfileNotFound,
     /// The profile is configured and cannot take the request.
-    Unavailable {
-        reason: ProfileUnavailableReason,
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The profile is unavailable")]
+    ProfileUnavailable {
         detail: String,
+        /// `failed`, `vpn_down` or `offline`.
+        #[problem(extension)]
+        profile_status: ProfileUnavailableReason,
     },
 }
 
 impl ProfileProblem {
     fn failed(reason: &str) -> Self {
-        Self::Unavailable {
-            reason: ProfileUnavailableReason::Failed,
+        Self::ProfileUnavailable {
+            profile_status: ProfileUnavailableReason::Failed,
             detail: format!("profile failed to start: {reason}"),
         }
     }
 
     pub fn vpn_down() -> Self {
-        Self::Unavailable {
-            reason: ProfileUnavailableReason::VpnDown,
+        Self::ProfileUnavailable {
+            profile_status: ProfileUnavailableReason::VpnDown,
             detail: "profile vpn_down: the VPN monitor fenced it after its tunnel failed. Once \
                      the tunnel is back, set the profile online to lift the fence."
                 .to_owned(),
@@ -165,8 +176,8 @@ impl ProfileProblem {
     }
 
     pub fn offline() -> Self {
-        Self::Unavailable {
-            reason: ProfileUnavailableReason::Offline,
+        Self::ProfileUnavailable {
+            profile_status: ProfileUnavailableReason::Offline,
             detail: "profile offline: it is held off the network by its own state or by \
                      offline-all. Set it online first."
                 .to_owned(),
@@ -197,7 +208,7 @@ where
 
 /// The engine of a live profile, or why there is none.
 ///
-/// A failed profile is `Unavailable`, never `NotFound`: telling an operator
+/// A failed profile is `ProfileUnavailable`, never `ProfileNotFound`: telling an operator
 /// whose tunnel failed that their profile does not exist is the trace-less
 /// answer the failed list exists to end. Fencing is *not* checked here, since
 /// not every caller refuses a fenced profile; see [`unfenced_engine`].
@@ -211,7 +222,7 @@ pub fn engine_for(
     Err(match s.profiles.resolve(profile_id) {
         crate::profile_registry::Resolution::Failed(f) => ProfileProblem::failed(&f.reason),
         // `Active` does not reach here: a live profile has an engine.
-        _ => ProfileProblem::NotFound,
+        _ => ProfileProblem::ProfileNotFound,
     })
 }
 
@@ -237,35 +248,6 @@ pub fn unfenced_engine(
     }
     Ok(engine)
 }
-
-/// Adds `From<ProfileProblem>` to an error enum declaring
-///
-/// ```ignore
-/// #[error("unknown profile_id")]
-/// #[problem(status = 404, title = "Profile not found")]
-/// ProfileNotFound,
-/// #[error("{detail}")]
-/// #[problem(status = 409, title = "The profile is unavailable")]
-/// ProfileUnavailable { detail: String, #[problem(extension)] profile_status: ProfileUnavailableReason },
-/// ```
-macro_rules! from_profile_problem {
-    ($($error:ty),+ $(,)?) => {$(
-        impl From<$crate::http::v1::common::ProfileProblem> for $error {
-            fn from(p: $crate::http::v1::common::ProfileProblem) -> Self {
-                match p {
-                    $crate::http::v1::common::ProfileProblem::NotFound => Self::ProfileNotFound,
-                    $crate::http::v1::common::ProfileProblem::Unavailable { reason, detail } => {
-                        Self::ProfileUnavailable {
-                            detail,
-                            profile_status: reason,
-                        }
-                    }
-                }
-            }
-        }
-    )+};
-}
-pub(crate) use from_profile_problem;
 
 /// Log an internal failure with what was being attempted, and return the
 /// `detail` a `500 internal` carries: the attempt, never the cause.

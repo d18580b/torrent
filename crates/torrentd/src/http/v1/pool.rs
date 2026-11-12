@@ -10,11 +10,9 @@
 //! and `GET /v1/server` says so up front.
 
 use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use kynos::prelude::*;
-use kynos::schema::ParamValue;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
@@ -33,16 +31,16 @@ use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
+use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::server::count;
 use crate::http::v1::Pool;
-use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
+use crate::http::validate::ValidationFailed;
 use crate::pool_service::Adopted;
 use crate::pool_service::PoolService;
 use crate::registry::Claim;
@@ -57,7 +55,7 @@ const NO_POOL: &str = "no [pool] section is configured on this daemon";
 // ---------------------------------------------------------------------------
 
 /// Where a torrent in the library stands relative to the payload on disk.
-#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdoptionState {
     /// No file of this torrent was found under any managed root.
@@ -114,24 +112,6 @@ impl From<AdoptionState> for torrentd_pool::AdoptionState {
         }
     }
 }
-
-impl FromStr for AdoptionState {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        torrentd_pool::AdoptionState::parse(s)
-            .map(Self::from)
-            .ok_or("not an adoption state")
-    }
-}
-
-impl fmt::Display for AdoptionState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(torrentd_pool::AdoptionState::from(*self).as_str())
-    }
-}
-
-impl ParamValue for AdoptionState {}
 
 /// Byte accounting for one directory subtree — what makes the pool legible at
 /// petabyte scale, where a file listing is useless but "this subtree is 8 TB
@@ -230,7 +210,7 @@ fn check_infohashes(invalid: &mut Invalid, pointer: &str, infohashes: &[InfoHash
 
 /// Why an operation on the whole pool failed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum PoolFailure {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -521,7 +501,7 @@ pub async fn check_pool_drift(
 
 /// Why a directory listing failed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum TreeError {
     /// The cursor is not one this listing issued.
     #[error("the cursor is not one this listing issued; start again without one")]
@@ -536,20 +516,14 @@ pub enum TreeError {
     #[problem(status = 404, title = "Root not found")]
     RootNotFound,
     /// A query parameter breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(TreeError);
 
 impl From<InvalidCursor> for TreeError {
     fn from(_: InvalidCursor) -> Self {
@@ -792,7 +766,7 @@ pub async fn list_pool_orphans(
 
 /// Why a paged pool listing failed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListError {
     /// The cursor is not one this listing issued.
     #[error("the cursor is not one this listing issued; start again without one")]
@@ -803,20 +777,14 @@ pub enum ListError {
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
     /// A query parameter breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(ListError);
 
 impl From<InvalidCursor> for ListError {
     fn from(_: InvalidCursor) -> Self {
@@ -982,7 +950,7 @@ pub struct AdoptRequest {
 }
 
 impl Validate for AdoptRequest {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         if let AdoptSelector::Infohashes { infohashes } = &self.selector {
             check_infohashes(&mut invalid, "/selector/infohashes", infohashes);
@@ -1011,46 +979,30 @@ pub struct AdoptionResult {
 
 /// Why an adoption could not start.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum AdoptError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
-    /// No profile with this id is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
     /// The subtree selector names no managed root.
     #[error("unknown root_id")]
     #[problem(status = 404, title = "Root not found")]
     RootNotFound,
-    /// The profile failed to start, is fenced, or is set offline, so it
-    /// cannot receive torrents.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        /// `failed`, `vpn_down` or `offline`.
-        #[problem(extension)]
-        profile_status: crate::http::v1::common::ProfileUnavailableReason,
-    },
+    /// No profile with this id is configured; or it failed to start, is
+    /// fenced, or is set offline, so it cannot receive torrents.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Profile(#[from] ProfileProblem),
     /// The body breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(AdoptError);
-from_profile_problem!(AdoptError);
 
 /// Adopt existing payload.
 ///
@@ -1389,7 +1341,7 @@ pub struct VerifyRequest {
 }
 
 impl Validate for VerifyRequest {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         check_infohashes(&mut invalid, "/infohashes", &self.infohashes);
         invalid.finish()
@@ -1411,23 +1363,17 @@ pub struct VerifyResult {
 
 /// Why a verification could not start.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum VerifyError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
     /// The body breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
 }
-from_invalid!(VerifyError);
 
 /// Re-hash loaded torrents.
 ///
@@ -1474,11 +1420,13 @@ pub async fn verify_pool_torrents(
             // verify queue checks again when it starts the re-hash.
             match unfenced_engine(&s, &st.profile_id) {
                 Ok(_) => {}
-                Err(crate::http::v1::common::ProfileProblem::Unavailable { detail, .. }) => {
+                Err(crate::http::v1::common::ProfileProblem::ProfileUnavailable {
+                    detail, ..
+                }) => {
                     skip(&mut resp, detail);
                     continue;
                 }
-                Err(crate::http::v1::common::ProfileProblem::NotFound) => {
+                Err(crate::http::v1::common::ProfileProblem::ProfileNotFound) => {
                     skip(&mut resp, "engine missing".to_owned());
                     continue;
                 }
@@ -1546,7 +1494,7 @@ pub enum PlanKind {
 }
 
 /// Where a plan stands.
-#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     /// Computed and not applied; nothing on disk has changed.
@@ -1636,22 +1584,6 @@ wire_enum_from_str!(StepStatus {
     "failed" => Failed,
     "skipped" => Skipped,
 });
-
-impl FromStr for PlanStatus {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s).ok_or("not a plan status")
-    }
-}
-
-impl fmt::Display for PlanStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl ParamValue for PlanStatus {}
 
 /// A string the pool index holds that this build has no name for.
 fn unknown(what: &str, value: &str) -> String {
@@ -1972,7 +1904,7 @@ const MUTATIONS_DISABLED: &str = "pool mutations are disabled; set `allow_mutati
 
 /// Why a plan was not created.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum CreatePlanError {
     /// `[pool] allow_mutations` is off.
     #[error("{MUTATIONS_DISABLED}")]
@@ -2056,7 +1988,7 @@ fn create_plan_blocking(
 
 /// Why a plan could not be read.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetPlanError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -2094,7 +2026,7 @@ pub async fn get_plan(
 
 /// Why a plan's steps could not be listed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListPlanStepsError {
     /// The cursor is not one this plan's steps listing issued.
     #[error("the cursor is not one this listing issued; start again without one")]
@@ -2109,20 +2041,14 @@ pub enum ListPlanStepsError {
     #[problem(status = 404, title = "Plan not found")]
     PlanNotFound,
     /// A query parameter breaks a documented constraint.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The pool index failed; the daemon's log has the cause.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(ListPlanStepsError);
 
 impl From<InvalidCursor> for ListPlanStepsError {
     fn from(_: InvalidCursor) -> Self {
@@ -2206,7 +2132,7 @@ pub async fn list_plan_steps(
 
 /// Why a plan was not discarded.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum DeletePlanError {
     /// The daemon has no `[pool]` section.
     #[error("{NO_POOL}")]
@@ -2293,7 +2219,7 @@ pub struct ApplyOutcome {
 
 /// Why a plan was not applied.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ApplyPlanError {
     /// `[pool] allow_mutations` is off.
     #[error("{MUTATIONS_DISABLED}")]

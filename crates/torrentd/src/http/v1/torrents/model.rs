@@ -1,10 +1,6 @@
 //! The wire types a torrent is reported in, and the paths that name one.
 
-use std::fmt;
-use std::str::FromStr;
-
 use kynos::prelude::*;
-use kynos::schema::ParamValue;
 use libtorrent_safe::InfoHash;
 use serde::Serialize;
 use torrentd_engine::ProfileId;
@@ -16,7 +12,7 @@ use crate::http::page::page;
 use crate::http::v1::common::InfoHashHex;
 
 /// What a torrent is doing, as of the last state update libtorrent posted.
-#[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent is not seeding yet.
@@ -46,34 +42,6 @@ pub enum TorrentPhase {
 }
 
 impl TorrentPhase {
-    const ALL: [Self; 10] = [
-        Self::Checking,
-        Self::AwaitingMetadata,
-        Self::Incomplete,
-        Self::Idle,
-        Self::Seeding,
-        Self::Paused,
-        Self::DiskError,
-        Self::Errored,
-        Self::Removed,
-        Self::Unknown,
-    ];
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Checking => "checking",
-            Self::AwaitingMetadata => "awaiting_metadata",
-            Self::Incomplete => "incomplete",
-            Self::Idle => "idle",
-            Self::Seeding => "seeding",
-            Self::Paused => "paused",
-            Self::DiskError => "disk_error",
-            Self::Errored => "errored",
-            Self::Removed => "removed",
-            Self::Unknown => "unknown",
-        }
-    }
-
     pub(super) fn of(state: Option<&TorrentState>) -> Self {
         use torrentd_engine::TorrentPhase as P;
         match state.map(|s| s.phase) {
@@ -90,25 +58,6 @@ impl TorrentPhase {
         }
     }
 }
-
-impl fmt::Display for TorrentPhase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for TorrentPhase {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|p| p.as_str() == s)
-            .ok_or_else(|| format!("unknown phase {s:?}"))
-    }
-}
-
-impl ParamValue for TorrentPhase {}
 
 #[derive(Debug, Schema, Serialize)]
 /// One torrent, as a listing reports it: what the daemon's own state map
@@ -247,10 +196,22 @@ mod tests {
 
     #[test]
     fn every_phase_round_trips_through_its_query_form() {
-        for phase in TorrentPhase::ALL {
+        use TorrentPhase as P;
+        for phase in [
+            P::Checking,
+            P::AwaitingMetadata,
+            P::Incomplete,
+            P::Idle,
+            P::Seeding,
+            P::Paused,
+            P::DiskError,
+            P::Errored,
+            P::Removed,
+            P::Unknown,
+        ] {
             assert_eq!(phase.to_string().parse::<TorrentPhase>(), Ok(phase));
             let json = serde_json::to_value(phase).unwrap();
-            assert_eq!(json, phase.as_str());
+            assert_eq!(json, phase.to_string());
         }
         assert!("Seeding".parse::<TorrentPhase>().is_err());
     }

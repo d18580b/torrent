@@ -11,7 +11,6 @@ use kynos::extract::describe::Describe;
 use kynos::extract::FromRequestParts;
 use kynos::http::Parts;
 use kynos::prelude::*;
-use kynos::response::headers::WithHeaders;
 use kynos::router::operation::OperationCx;
 use kynos::security::auth::Scoped;
 use kynos::HeaderParams;
@@ -79,17 +78,16 @@ pub enum PrincipalKind {
 }
 
 /// `Retry-After`, on a throttled request.
-#[derive(HeaderParams)]
+#[derive(Debug, HeaderParams)]
 pub struct RetryAfter {
-    /// Seconds to wait before trying again. Sent only with
-    /// `429 login-throttled`.
+    /// Seconds to wait before trying again.
     #[header(rename = "Retry-After")]
-    retry_after: Option<u64>,
+    retry_after: u64,
 }
 
 /// Why a session was not issued.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum CreateSessionError {
     /// The password is wrong. Which part is never said.
     #[error("invalid password")]
@@ -113,6 +111,8 @@ pub enum CreateSessionError {
         /// Seconds until another attempt is admitted; also in `Retry-After`.
         #[problem(extension)]
         retry_after_secs: u64,
+        #[problem(headers)]
+        retry: RetryAfter,
     },
 }
 
@@ -158,10 +158,9 @@ pub async fn create_session(
     Inject(s): Inject<Arc<AppState>>,
     ClientAddr(client): ClientAddr,
     Json(body): Json<CreateSession>,
-) -> Result<Created<Json<SessionGrant>>, WithHeaders<CreateSessionError, RetryAfter>> {
-    let plain = |e| WithHeaders::new(e, RetryAfter { retry_after: None });
+) -> Result<Created<Json<SessionGrant>>, CreateSessionError> {
     let Some(auth) = s.auth.as_ref() else {
-        return Err(plain(CreateSessionError::AuthNotConfigured));
+        return Err(CreateSessionError::AuthNotConfigured);
     };
     let client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default();
     let refused = |reason: &str| {
@@ -170,15 +169,11 @@ pub async fn create_session(
     };
     let throttled = |detail: &'static str, wait: std::time::Duration| {
         let secs = wait.as_secs().max(1);
-        WithHeaders::new(
-            CreateSessionError::LoginThrottled {
-                detail,
-                retry_after_secs: secs,
-            },
-            RetryAfter {
-                retry_after: Some(secs),
-            },
-        )
+        CreateSessionError::LoginThrottled {
+            detail,
+            retry_after_secs: secs,
+            retry: RetryAfter { retry_after: secs },
+        }
     };
 
     // Argon2id costs ~50 ms of CPU on purpose. Unthrottled, an
@@ -254,7 +249,7 @@ pub async fn create_session(
         // No detail about which part was wrong, and no username to enumerate.
         warn!(target: "torrentd::auth", client_ip, "failed login attempt");
         refused("bad_password");
-        return Err(plain(CreateSessionError::InvalidCredentials));
+        return Err(CreateSessionError::InvalidCredentials);
     }
     auth.throttle.note_success(client.ip);
 
@@ -308,7 +303,7 @@ pub async fn get_current_session(caller: Scoped<Bearer, Read>) -> Json<Principal
 
 /// Why a credential could not be revoked.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum RevokeSessionError {
     /// The credential is a static token from the config (or authentication is
     /// disabled). A static token is revoked by removing it from the config and
