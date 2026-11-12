@@ -71,9 +71,8 @@ use crate::http::security::Write;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::Testing;
-use crate::http::validate::from_invalid;
-use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
+use crate::http::validate::ValidationFailed;
 
 /// The longest stall accepted. Long enough for `TorrentdAlertLoopStalled`
 /// (15 s, held for a minute) with room for scrape and evaluation; bounded so
@@ -327,17 +326,12 @@ pub enum Fault {
 
 /// Why a fault was not injected.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum FaultError {
     /// A value is outside what the fault accepts.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        /// Every violated constraint.
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// No live profile has this id.
     #[error("no live profile {0:?}")]
     #[problem(status = 404, title = "Profile not found")]
@@ -347,12 +341,9 @@ pub enum FaultError {
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_invalid!(FaultError);
 
 fn invalid(pointer: &str, detail: String) -> FaultError {
-    let mut invalid = Invalid::new();
-    invalid.push(pointer, detail);
-    invalid.into()
+    ValidationFailed::at(pointer, detail).into()
 }
 
 /// Inject a fault for the alert drill.

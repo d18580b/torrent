@@ -59,17 +59,16 @@ use crate::metrics_sink::PromSink;
 /// heading in `docs/api/problems.md`, so the URI resolves to its prose.
 ///
 /// A macro so it can be `concat!`ed into the `const` a scope set's
-/// `FORBIDDEN_TYPE` needs. `#[problem(base = …)]` takes only a literal, so the
-/// error enums spell it out; `tests::spec` holds every published `type` to
-/// this prefix.
+/// `FORBIDDEN_TYPE` needs; `tests::spec` holds every published `type` to this
+/// prefix.
 macro_rules! problem_base {
     () => {
         "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#"
     };
 }
 
-/// [`problem_base!`], as a value.
-#[cfg(test)]
+/// [`problem_base!`], as a value: every error enum names it as its
+/// `#[problem(base = …)]`.
 pub const PROBLEM_BASE: &str = problem_base!();
 
 /// The bearer scheme. Its carrier is [`Bearer`]'s own `Carries` impl

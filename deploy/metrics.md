@@ -94,6 +94,7 @@ hold.
 | `torrentd_boot_log_events` | gauge | `level`: `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::telemetry`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::plan`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot: always | log_events_total for these levels as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_panics` | gauge | `thread`: `main`, `torrentd-tokio`, `torrentd-alert-loop`, `torrentd-resume-writer`, `torrentd-torrent-writer`, `pool-release`, `other` | daemon | from boot: always | panics_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_ffi_errors` | gauge | `call`: `post_torrent_updates`, `post_session_stats`, `session_destroy` | daemon | from boot: always | ffi_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_external_command_failures` | gauge | `program`: `ip`, `wg`, `nft`, `openvpn`, `kill`, `other` | daemon | from boot: always | external_command_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |
@@ -136,7 +137,8 @@ hold.
 | `torrentd_auth_rejections_total` | counter | `reason`: `malformed`, `unknown`, `expired` | daemon | from boot, at 0 | Requests refused 401 for the bearer credential they carried: malformed when it is not a well-formed bearer token, unknown when no static or live session token matches it (a revoked session included), expired when it names a session past its lifetime. |
 | `torrentd_http_requests_total` | counter | `route`; `method`; `status_class`: `1xx`, `2xx`, `3xx`, `4xx`, `5xx` | daemon | from boot: each route, before the API serves | Responses the HTTP API sent, by route (the OpenAPI path template, or unmatched where no operation matched the request), method and status class. |
 | `torrentd_http_request_duration_seconds` | histogram | `route`; `method` | daemon | from boot: each route, before the API serves | Seconds from a request arriving to its response head being ready, by route and method; a streamed body's delivery is not included. |
-| `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings` | daemon | from boot, at 0 | Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed. |
+| `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `log_filter`, `apply_settings`, `watch` | daemon | from boot, at 0 | Reloads (SIGHUP, POST /v1/config/reload, or a change config_watch saw) that failed, by the step that failed; log_filter counts a log_filter that does not parse, which keeps the log filter in place; watch counts config_watch failing to watch the config file's directory, at boot or later, after which only SIGHUP and the API reload. |
+| `torrentd_config_restart_pending` | gauge | `key`: `default_save_path`, `resume_dir`, `torrent_dir`, `http_listen`, `http_socket_mode`, `http_socket_group`, `trusted_proxies`, `allow_unauthenticated`, `allowed_hosts`, `allow_unsupported_state_fs`, `registry_path`, `connections_limit`, `file_pool_size`, `enable_lsd`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit`, `unchoke_slots_limit`, `peer_fingerprint`, `user_agent`, `vpn_handshake_max_age_secs`, `shutdown_drain_secs`, `network_kill_switch`, `kill_switch_api_interfaces`, `kill_switch_dns_servers`, `config_watch`, `profile`, `auth`, `pool`, `telemetry` | daemon | from boot, at 0 | 1 for each config key whose value in the file, at the last reload that read it, differs from the one the daemon runs and only a restart applies: a non-reloadable key, profile for any [[profile]] change, or a reloadable settings key the file deleted. Back to 0 when a reload finds the file matching again; a restart boots with the file and starts every key at 0. |
 | `torrentd_kill_switch_active` | gauge | — | daemon | from boot: always | 1 while the daemon holds the nftables kill switch installed. |
 | `torrentd_kill_switch_dns_exempt` | gauge | — | daemon | from boot: always | 1 while the kill switch lets the daemon's DNS out to kill_switch_dns_servers outside the tunnels, so every tracker hostname it looks up is visible to those resolvers. |
 | `torrentd_kill_switch_table_present` | gauge | — | daemon | from boot: kill switch on | 1 if the kill switch's nftables table was present and matched the rendered ruleset at the last check; 0 if it was missing or had drifted. |
@@ -161,6 +163,8 @@ hold.
 | `torrentd_store_write_errors_total` | counter | `store`: `registry`, `pool_index` | daemon | from boot, at 0 | Writes to the assignment registry or the pool index that failed where nothing else reports them. |
 | `torrentd_metrics_dropped_samples_total` | counter | `reason`: `registration`, `labels`, `encode` | daemon | from boot, at 0 | Samples the exporter dropped: a series that could not be registered, an emission whose labels differ from the series' first use, or a whole scrape whose encoding failed (encode), which was answered 500. |
 | `torrentd_log_events_total` | counter | `level`: `warn`, `error`; `target`: `torrentd`, `torrentd::api_socket`, `torrentd::auth`, `torrentd::http`, `torrentd::metrics`, `torrentd::panic_hook`, `torrentd::pool`, `torrentd::port_forward_monitor`, `torrentd::profile_registry`, `torrentd::reload`, `torrentd::sd_notify`, `torrentd::signals`, `torrentd::startup`, `torrentd::telemetry`, `torrentd::vpn`, `torrentd::vpn_monitor`, `torrentd_engine::alert_loop`, `torrentd_engine::batch_writer`, `torrentd_engine::handler`, `torrentd_engine::registry`, `torrentd_engine::store`, `torrentd_pool::adopt`, `torrentd_pool::drift`, `torrentd_pool::plan`, `torrentd_pool::scan`, `torrentd_pool::store`, `other` | daemon | from boot, at 0 | Lines logged at WARN or ERROR, by level and by the crate and top-level module that logged them (the target's first two path segments; other for any target not listed here). Counted whatever log_level or RUST_LOG lets through to the log. |
+| `torrentd_external_command_failures_total` | counter | `program`: `ip`, `wg`, `nft`, `openvpn`, `kill`, `other` | daemon | from boot, at 0 | Host tools (ip, wg, nft, openvpn, kill; other for any other) that failed: could not start, did not finish within their bound, or exited non-zero where the caller required a zero exit. Each is logged at WARN, target torrentd::vpn::exec, with its redacted command line and stderr. |
+| `torrentd_external_command_duration_seconds` | histogram | `program`: `ip`, `wg`, `nft`, `openvpn`, `kill`, `other` | daemon | from boot: always | Seconds each host tool run took, from spawn to exit, timeout or refusal to start, by program. |
 | `torrentd_telemetry_export_errors_total` | counter | — | daemon | from boot, at 0 | OTLP span exports that failed, each dropping its batch: a collector that refused or did not answer within the timeout. Logged at WARN, target torrentd::telemetry, at most once a minute. Always 0 without [telemetry]. |
 | `torrentd_build_fault_injection` | gauge | — | daemon | from boot: always | 1 if this binary was built with the fault-injection feature, which mounts POST /v1/faults and runs only with TORRENTD_FAULT_INJECTION=1; never 1 on a deployment. |
 | `torrentd_build_info` | gauge | `version`; `revision`; `arch`; `features` | daemon | from boot: always | Always 1, labelled with this binary's version, the commit it was built from (TORRENTD_REVISION at build time, unknown where it was unset), its CPU architecture, and the cargo features beyond the default it was built with: fault-injection for the alert drill's build, empty on every deployment. |
@@ -259,6 +263,45 @@ daemon exits is counted after the last scrape, so that one is never seen.
 | Alert | Severity | Fires when |
 | --- | --- | --- |
 | `TorrentdFfiErrors` | warning | The shim swallowed an exception in the last 15 minutes, or during the boot (`torrentd_boot_ffi_errors`), by `call`. |
+
+## Host tools that failed
+
+The VPN subsystem runs `ip`, `wg`, `nft`, `openvpn` and `kill`, each in an
+`external_command` span and timed in
+`torrentd_external_command_duration_seconds` by `program`. A run that could
+not start, did not finish within its bound, or exited non-zero where its
+caller required a zero exit is logged at `WARN` (target
+`torrentd::vpn::exec`) with its redacted command line and stderr, and counted
+in `torrentd_external_command_failures_total`. A non-zero exit the caller
+reads as an answer (`ip link show` naming a link that does not exist) is
+neither.
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdExternalCommandFailures` | warning | A host tool failed in the last 15 minutes, or during the boot (`torrentd_boot_external_command_failures`), by `program`. |
+
+## Config reloads
+
+A reload reads the config file again and applies what it can without a
+restart. `SIGHUP` and `POST /v1/config/reload` start one, and so, with
+`config_watch = true`, does the file changing: its directory is watched with
+inotify, which sees kubelet's `..data` symlink swap when a mounted ConfigMap
+or Secret is updated. A reload that fails keeps the running settings and is
+counted in `torrentd_config_reload_failures_total` by `stage`; `watch` counts
+the watch itself failing, at boot or later, after which only `SIGHUP` and the
+API reload.
+
+Every reload that reads the file sets `torrentd_config_restart_pending` to 1
+for each `key` the file holds at a value the daemon is not running and only a
+restart applies, and back to 0 for each it finds matching again. A restart
+boots with the file and starts every key at 0. Without `config_watch` the
+gauge moves only when something triggers a reload, so a file edited and never
+reloaded is not seen here.
+
+| Alert | Severity | Fires when |
+| --- | --- | --- |
+| `TorrentdReloadFailed` | warning | A reload failed in the last 15 minutes, by `stage`; the daemon runs the settings it had. |
+| `TorrentdConfigRestartPending` | warning | A key (`key`) has been pending a restart for 30 minutes: the file and the running daemon disagree, and will until it restarts or the file is edited back. |
 
 ## The build and the process
 

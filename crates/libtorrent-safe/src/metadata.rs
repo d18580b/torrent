@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::ffi_util::fixed_c_str;
 use crate::ffi_util::sized_str;
+use crate::ffi_util::Timed;
 use crate::handle::InfoHash;
 
 /// A BitTorrent v2 info-hash (SHA-256 of the info dict).
@@ -159,7 +160,9 @@ impl TorrentMeta {
 /// - `files` lists BEP 47 padding files alongside the real ones, flagged by
 ///   [`TorrentMetaFile::pad_file`]; a caller looking for files on disk skips
 ///   them.
+#[tracing::instrument(name = "ffi.torrent_metadata", level = "debug", skip_all, fields(bytes = bytes.len(), duration_us = tracing::field::Empty), err(level = "debug"))]
 pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
+    let _timed = Timed::start();
     if bytes.is_empty() {
         return Err(Error::InvalidInput("empty .torrent buffer"));
     }

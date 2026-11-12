@@ -388,7 +388,7 @@ impl EventFeed {
 
 /// Why an event stream was not opened.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum EventsError {
     /// Every event-stream slot is taken.
     #[error(
@@ -757,7 +757,7 @@ pub fn reload_queue() -> (
 
 /// Why a reload was not queued.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ReloadError {
     /// A reload is already queued and has not run yet; this request would
     /// re-read the same file.
@@ -774,7 +774,7 @@ pub enum ReloadError {
 ///
 /// The same as `SIGHUP`. The file stays the single source of truth: a client
 /// can ask the daemon to re-read it, not tell the daemon what it says.
-/// Several keys are reloadable (`log_level`, `upload_rate_limit`,
+/// Several keys are reloadable (`log_level`, `log_filter`, `upload_rate_limit`,
 /// `connections_limit`, `aio_threads`, `enable_lsd`,
 /// `max_concurrent_http_announces`); the reload task logs what it applied and
 /// warns about anything that needs a restart. `202` means the request was

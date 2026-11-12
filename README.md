@@ -62,6 +62,7 @@ Each [release](https://github.com/d18580b/torrent/releases) carries:
 | `SHA256SUMS` | the SHA-256 of each file above |
 | `*.sigstore.json` | a Sigstore bundle signing each file above, `SHA256SUMS` included |
 | `ghcr.io/d18580b/torrent:X.Y.Z` | the container image of [`deploy/Containerfile`](deploy/Containerfile) for `linux/amd64` and `linux/arm64`, also tagged `X.Y` and `latest` |
+| `oci://ghcr.io/d18580b/charts/torrentd`, version `X.Y.Z` | the Helm chart of [`deploy/helm/torrentd`](deploy/helm/torrentd), whose version and `appVersion` are the release's, so it defaults to that release's image |
 
 Each architecture is built on a machine of that architecture, never
 emulated, and its `torrentd --version` is checked there before anything is
@@ -120,6 +121,21 @@ gh attestation verify oci://ghcr.io/d18580b/torrent:X.Y.Z --repo d18580b/torrent
 cosign verify ghcr.io/d18580b/torrent:X.Y.Z \
   --certificate-identity https://github.com/d18580b/torrent/.github/workflows/release-plz.yml@refs/heads/master \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The chart is public the same way, signed and attested by the same workflow,
+and pulled anonymously by it on every release before the release is
+published. Verify it by the same two routes, then install it, or point
+Flux's `OCIRepository` at the same URL with `verify.provider: cosign` and
+that identity:
+
+```bash
+gh attestation verify oci://ghcr.io/d18580b/charts/torrentd:X.Y.Z --repo d18580b/torrent \
+  --signer-workflow d18580b/torrent/.github/workflows/release-plz.yml
+cosign verify ghcr.io/d18580b/charts/torrentd:X.Y.Z \
+  --certificate-identity https://github.com/d18580b/torrent/.github/workflows/release-plz.yml@refs/heads/master \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+helm install torrentd oci://ghcr.io/d18580b/charts/torrentd --version X.Y.Z -f values.yaml
 ```
 
 `torrentd --version` and `torrentctl --version` print the release's version,
@@ -261,7 +277,7 @@ daemon can write. Either path is refused outright if it carries a `..`
 component or a leading `.`, and containment is judged with symlinks resolved.
 
 **Configuration is not settable at runtime, deliberately.** Several keys are
-reloadable — `log_level`, `upload_rate_limit`, `connections_limit`,
+reloadable — `log_level`, `log_filter`, `upload_rate_limit`, `connections_limit`,
 `aio_threads`, `enable_lsd`, `max_concurrent_http_announces` — and every one
 belongs to the TOML file. A reloadable key is not always handed to every
 profile: `enable_lsd` is withheld from every `vpn` profile on reload, because
@@ -343,7 +359,13 @@ token_file = "/home/me/.config/torrentctl/token"
 
 **Logs.** `$XDG_STATE_HOME/torrentctl/torrentctl.log`, never the terminal, at
 `info`. `TORRENTCTL_LOG` takes a `tracing` filter
-(`TORRENTCTL_LOG=debug`, or `torrentctl=debug`) for more.
+(`TORRENTCTL_LOG=debug`, or `torrentctl=debug`) for more, and
+`TORRENTCTL_LOG_FORMAT=json` writes one JSON object per line. Past 10 MiB the
+file rotates to `torrentctl.log.1`, keeping four rotated files. Every request
+carries a fresh W3C `traceparent`, and its log line records that and the
+daemon's `x-request-id`, which find it in the daemon's log and traces. A
+panic is logged with its backtrace. Where the log cannot be opened, torrentctl
+runs without one and says why on stderr as it exits.
 
 **Keys.** `?` lists the keys on every screen, `1` to `n` (or `Tab`) switch
 screens (Dashboard, Torrents, Profiles, then Pool, which appears only when the
@@ -546,6 +568,12 @@ Run torrentd as its own user. Setup is
 [`docs/running.md`](docs/running.md), whose §8 also brings up the compose
 stack, and §9 has the day-one runbook for WireGuard behind the kill switch.
 
+On Kubernetes, [`docs/kubernetes.md`](docs/kubernetes.md) lists what the
+cluster must provide (kernel, Pod Security level, storage, network and
+resources), then deploys the Helm chart of
+[`deploy/helm/torrentd`](deploy/helm/torrentd) through FluxCD, with example
+values for a host-only and a multi-account VPN deployment.
+
 ### The daemon's command line
 
 `--config <PATH>` comes first and is required by everything but `openapi`.
@@ -651,11 +679,21 @@ it is:
 
 A published release is immutable. Neither path changes one.
 
-When the `image (ghcr.io)` job fails at `Anyone can pull the release's
+When the `image manifest list (ghcr.io)` job fails at `Anyone can pull the release's
 image, with no login`, the image is pushed, but anonymous clients cannot
 pull it, and the release stays a draft. The usual cause is a private
 package: set the `torrent` package's visibility to public (the package's
 settings on GitHub, Danger Zone), then re-run the failed jobs.
+
+The `helm chart (ghcr.io)` job fails the same way at `Anyone can pull the
+release's chart, with no login`, and the release stays a draft. The first
+release that pushes the chart creates its package, `charts/torrentd`, and
+GitHub makes a new package private, so that release always stops here: set
+the `charts/torrentd` package's visibility to public the same way, then
+re-run the failed jobs. The job also refuses a chart whose `version` or
+`appVersion` in `deploy/helm/torrentd/Chart.yaml` is not the release's;
+the release pull request moves both, so that means the file was edited on
+`release-plz-next` or after it was refreshed.
 
 ## Contributing & license
 

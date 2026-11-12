@@ -27,6 +27,7 @@ mod validate;
 pub use diff::ConfigDiff;
 pub use diff::ProfileChange;
 pub use diff::ProfileChangeKind;
+pub use diff::RESTART_PENDING_KEYS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -202,6 +203,13 @@ pub struct Config {
     pub allow_unsupported_state_fs: bool,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
+    /// `EnvFilter` directives laid over `log_level`, e.g.
+    /// `torrentd_pool::apply=debug,torrentd::vpn=trace`. Reloadable. Where
+    /// `RUST_LOG` is set, its directives win on any target both name. One
+    /// that does not parse refuses the boot, and fails a reload with the
+    /// filter in place kept (`crate::tracing_init`).
+    #[serde(default)]
+    pub log_filter: Option<String>,
 
     /// Where the assignment registry database lives. Defaults to
     /// `<resume_dir parent>/registry.db`. A path ending in `.json` is a
@@ -279,6 +287,17 @@ pub struct Config {
     /// profile's `Address` prefixes or named by its `DNS` key.
     #[serde(default)]
     pub kill_switch_dns_servers: Vec<IpAddr>,
+
+    /// Reload when the config file changes, without a `SIGHUP`. The file's
+    /// directory is watched with inotify, which sees an in-place write, an
+    /// editor's rename over the file, and the `..data` symlink swap kubelet
+    /// makes when a mounted ConfigMap or Secret is updated. Once the
+    /// directory has been quiet for a moment and the file's bytes differ from
+    /// the last ones read, the reload runs exactly as a `SIGHUP` does. Off by
+    /// default. Restart-only. A file that is itself a symlink out of its
+    /// directory is not followed: its target changing is not seen.
+    #[serde(default)]
+    pub config_watch: bool,
 
     /// `[[profile]]` array. Empty is refused: `ProfileConfigError::NoProfiles`.
     /// There is no implicit profile, because the only thing an implicit one
@@ -639,6 +658,7 @@ impl Config {
             allowed_hosts: vec![],
             allow_unsupported_state_fs: false,
             log_level: Self::default_log_level(),
+            log_filter: None,
             registry_path: None,
             connections_limit: None,
             file_pool_size: None,
@@ -654,6 +674,7 @@ impl Config {
             network_kill_switch: false,
             kill_switch_api_interfaces: vec![],
             kill_switch_dns_servers: vec![],
+            config_watch: false,
             profile: vec![],
             auth: None,
             pool: Some(PoolConfig {

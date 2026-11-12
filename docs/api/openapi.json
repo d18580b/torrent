@@ -873,7 +873,7 @@
           "server"
         ],
         "summary": "Re-read the configuration file.",
-        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. One reload is queued at a time: a request made\nwhile one is queued and has not started is `409 reload-pending`, since the\nqueued reload will read the same file, and one made while a reload is\nrunning is queued behind it. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
+        "description": "The same as `SIGHUP`. The file stays the single source of truth: a client\ncan ask the daemon to re-read it, not tell the daemon what it says.\nSeveral keys are reloadable (`log_level`, `log_filter`, `upload_rate_limit`,\n`connections_limit`, `aio_threads`, `enable_lsd`,\n`max_concurrent_http_announces`); the reload task logs what it applied and\nwarns about anything that needs a restart. `202` means the request was\nqueued, not that it succeeded, and it is also the answer when nothing in\nthe file could be applied. One reload is queued at a time: a request made\nwhile one is queued and has not started is `409 reload-pending`, since the\nqueued reload will read the same file, and one made while a reload is\nrunning is queued behind it. `[auth]` is one of the restart-only sections:\na `[[auth.token]]` removed from the file keeps authenticating until the\ndaemon restarts.",
         "operationId": "reload_config",
         "responses": {
           "401": {
@@ -1797,7 +1797,7 @@
             }
           },
           "422": {
-            "description": "Unprocessable Entity; The request is invalid; Path not confined; Invalid metainfo; Tracker not allowed",
+            "description": "Unprocessable Entity; Path not confined; Invalid metainfo; Tracker not allowed; The request is invalid",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1848,31 +1848,6 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
-                            },
-                            "errors": {
-                              "items": {
-                                "$ref": "#/components/schemas/Violation"
-                              },
-                              "type": "array"
-                            }
-                          },
-                          "required": [
-                            "errors"
-                          ]
-                        }
-                      ],
-                      "title": "The request is invalid"
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
                               "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#path-not-confined"
                             }
                           }
@@ -1911,6 +1886,30 @@
                         }
                       ],
                       "title": "Tracker not allowed"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#validation-failed"
+                            },
+                            "errors": {
+                              "items": {
+                                "$ref": "#/components/schemas/Violation"
+                              },
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "errors"
+                          ]
+                        }
+                      ]
                     }
                   ]
                 }
@@ -1963,34 +1962,27 @@
               }
             }
           },
-          "404": {
-            "description": "Profile not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "409": {
-            "description": "The profile is unavailable; Torrent exists",
+            "description": "Torrent exists; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
                   "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-exists"
+                            }
+                          }
+                        }
+                      ]
+                    },
                     {
                       "allOf": [
                         {
@@ -2010,24 +2002,7 @@
                             "profile_status"
                           ]
                         }
-                      ],
-                      "title": "The profile is unavailable"
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-exists"
-                            }
-                          }
-                        }
-                      ],
-                      "title": "Torrent exists"
+                      ]
                     }
                   ]
                 }
@@ -2048,6 +2023,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
                         }
                       }
                     }
@@ -2856,28 +2853,6 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "500": {
             "description": "Internal error",
             "content": {
@@ -2892,6 +2867,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                         }
                       }
                     }
@@ -3085,8 +3082,8 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
+          "500": {
+            "description": "Internal error",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3098,7 +3095,7 @@
                       "properties": {
                         "type": {
                           "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
                         }
                       }
                     }
@@ -3135,8 +3132,8 @@
               }
             }
           },
-          "500": {
-            "description": "Internal error",
+          "404": {
+            "description": "Torrent not found",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3148,7 +3145,7 @@
                       "properties": {
                         "type": {
                           "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                         }
                       }
                     }
@@ -3342,8 +3339,8 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
+          "500": {
+            "description": "Internal error",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3355,7 +3352,7 @@
                       "properties": {
                         "type": {
                           "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
                         }
                       }
                     }
@@ -3392,8 +3389,8 @@
               }
             }
           },
-          "500": {
-            "description": "Internal error",
+          "404": {
+            "description": "Torrent not found",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3405,7 +3402,7 @@
                       "properties": {
                         "type": {
                           "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                         }
                       }
                     }
@@ -3599,8 +3596,8 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
+          "500": {
+            "description": "Internal error",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3612,7 +3609,7 @@
                       "properties": {
                         "type": {
                           "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
                         }
                       }
                     }
@@ -3649,8 +3646,8 @@
               }
             }
           },
-          "500": {
-            "description": "Internal error",
+          "404": {
+            "description": "Torrent not found",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3662,7 +3659,7 @@
                       "properties": {
                         "type": {
                           "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                         }
                       }
                     }
@@ -3903,28 +3900,6 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "409": {
             "description": "Metadata pending",
             "content": {
@@ -3939,6 +3914,50 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#metadata-pending"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                         }
                       }
                     }
@@ -3972,28 +3991,6 @@
                       "required": [
                         "errors"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }
@@ -4192,28 +4189,6 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "500": {
             "description": "Internal error",
             "content": {
@@ -4228,6 +4203,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                         }
                       }
                     }
@@ -6550,6 +6547,28 @@
               }
             }
           },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "422": {
             "description": "The request is invalid",
             "content": {
@@ -6575,28 +6594,6 @@
                       "required": [
                         "errors"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }
@@ -6888,6 +6885,28 @@
               }
             }
           },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "422": {
             "description": "The request is invalid",
             "content": {
@@ -6913,28 +6932,6 @@
                       "required": [
                         "errors"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }
@@ -7195,6 +7192,28 @@
               }
             }
           },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "422": {
             "description": "The request is invalid",
             "content": {
@@ -7220,28 +7239,6 @@
                       "required": [
                         "errors"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }
@@ -7870,6 +7867,28 @@
               }
             }
           },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "422": {
             "description": "The request is invalid",
             "content": {
@@ -7895,28 +7914,6 @@
                       "required": [
                         "errors"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }
@@ -9096,6 +9093,28 @@
               }
             }
           },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "422": {
             "description": "The request is invalid",
             "content": {
@@ -9121,28 +9140,6 @@
                       "required": [
                         "errors"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }
@@ -9336,17 +9333,6 @@
           },
           "401": {
             "description": "Invalid credentials",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
-                "required": false,
-                "schema": {
-                  "type": "integer",
-                  "minimum": 0.0,
-                  "format": "uint64"
-                }
-              }
-            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9369,17 +9355,6 @@
           },
           "409": {
             "description": "Authentication is not configured",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
-                "required": false,
-                "schema": {
-                  "type": "integer",
-                  "minimum": 0.0,
-                  "format": "uint64"
-                }
-              }
-            },
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9404,8 +9379,8 @@
             "description": "Too many login attempts",
             "headers": {
               "Retry-After": {
-                "description": "Seconds to wait before trying again. Sent only with\n`429 login-throttled`.",
-                "required": false,
+                "description": "Seconds to wait before trying again.",
+                "required": true,
                 "schema": {
                   "type": "integer",
                   "minimum": 0.0,
@@ -9767,28 +9742,6 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "500": {
             "description": "Internal error",
             "content": {
@@ -9803,6 +9756,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                         }
                       }
                     }
@@ -10157,7 +10132,7 @@
             }
           },
           "404": {
-            "description": "Torrent not found; File not found",
+            "description": "File not found; Torrent not found",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10171,12 +10146,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#file-not-found"
                             }
                           }
                         }
-                      ],
-                      "title": "Torrent not found"
+                      ]
                     },
                     {
                       "allOf": [
@@ -10187,12 +10161,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#file-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
                             }
                           }
                         }
-                      ],
-                      "title": "File not found"
+                      ]
                     }
                   ]
                 }
@@ -10886,7 +10859,7 @@
             }
           },
           "404": {
-            "description": "The pool is not configured; Profile not found; Root not found",
+            "description": "The pool is not configured; Root not found; Profile not found",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10916,12 +10889,12 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
                             }
                           }
                         }
                       ],
-                      "title": "Profile not found"
+                      "title": "Root not found"
                     },
                     {
                       "allOf": [
@@ -10932,12 +10905,33 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
                             }
                           }
                         }
-                      ],
-                      "title": "Root not found"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
                     }
                   ]
                 }
@@ -10966,28 +10960,6 @@
                       "required": [
                         "profile_status"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
                     }
                   ]
                 }

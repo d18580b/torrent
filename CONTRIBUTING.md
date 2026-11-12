@@ -269,8 +269,12 @@ fields have **one** spelling each, because log queries depend on it:
 the field path are ambiguous to the parser. Put another field first.
 
 Levels: `error` needs an operator, `warn` is an anomaly the daemon handled,
-`info` is lifecycle, `debug` is per-alert detail. `RUST_LOG` overrides per
-crate, e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`.
+`info` is lifecycle, `debug` is per-alert detail. `log_level` sets every crate
+of the workspace, and the reloadable `log_filter` key lays `EnvFilter`
+directives over it, e.g. `log_filter = "torrentd_engine::handler::resume=debug"`.
+`RUST_LOG`, where set, stands in for `log_level` and wins over `log_filter` on
+any target both name, e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`;
+its directives are kept across every reload.
 
 ## Releasing
 
@@ -297,8 +301,9 @@ Open a GitHub issue with: kernel version, libtorrent submodule SHA, `cargo --ver
 (for a release, `torrentd --version` in place of both),
 and the JSON log output, at `debug` if it reproduces.
 [`docs/running.md` §12](docs/running.md#12-capturing-a-log) says how to take it
-from the running service and raise the level with `log_level` and a reload
-rather than a restart. `RUST_LOG` is read only at startup, so it applies to a
+from the running service and raise the level with `log_level`, or one
+subsystem's with `log_filter`, and a reload rather than a restart. `RUST_LOG`
+is read only at startup, so it applies to a
 daemon you are starting anyway, such as one under `cargo run`; do not start a
 second copy beside a running service to get a log.
 

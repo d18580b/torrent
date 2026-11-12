@@ -149,6 +149,7 @@ impl PoolStore {
     /// Holds a shared lock on `pool.db.lock` for the life of the store, which
     /// is what makes [`PoolStore::open_exclusive`] refuse while the daemon
     /// runs. [`PoolError::Busy`] while an exclusive holder has it.
+    #[tracing::instrument(name = "pool_store.open", level = "debug", skip_all, fields(path = %path.display()), err(level = "debug"))]
     pub fn open(path: &Path) -> Result<Self, PoolError> {
         Self::open_held(path, false)
     }
@@ -162,6 +163,7 @@ impl PoolStore {
     /// journal, a verification's verdict, a released owner. So it refuses to
     /// start, with [`PoolError::Busy`], while any other [`PoolStore::open`]
     /// holds the index, and while it runs no other one can open it.
+    #[tracing::instrument(name = "pool_store.open_exclusive", level = "debug", skip_all, fields(path = %path.display()), err(level = "debug"))]
     pub fn open_exclusive(path: &Path) -> Result<Self, PoolError> {
         Self::open_held(path, true)
     }
@@ -226,6 +228,7 @@ impl PoolStore {
     /// this connection and none of them waits for the scan. It never
     /// migrates and cannot write: `query_only` refuses any statement that
     /// would.
+    #[tracing::instrument(name = "pool_store.open_read_only", level = "debug", skip_all, fields(path = %path.display()), err(level = "debug"))]
     pub fn open_read_only(path: &Path) -> Result<Self, PoolError> {
         use rusqlite::OpenFlags;
         let conn = Connection::open_with_flags(
@@ -262,6 +265,7 @@ impl PoolStore {
     /// `BEGIN DEFERRED` takes no lock and reads nothing, so it fails only on
     /// a connection that is already unusable; `f` then runs without the
     /// snapshot and its own statements report the failure.
+    #[tracing::instrument(name = "pool_store.read_snapshot", level = "debug", skip_all)]
     pub fn read_snapshot<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
         if self.tx_depth > 0
             || !self.conn.is_autocommit()
@@ -303,6 +307,7 @@ impl PoolStore {
     ///
     /// Re-entrant: a nested call becomes a savepoint, so callers can compose
     /// without knowing whether they are already inside one.
+    #[tracing::instrument(name = "pool_store.transaction", level = "debug", skip_all, fields(depth = self.tx_depth))]
     pub fn in_transaction<T, E>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, E>,

@@ -77,6 +77,7 @@ impl Placement {
 /// stale claims behind for torrents that no longer resolve, and a stale claim
 /// makes an orphaned file look protected — the one error that could get data
 /// deleted later.
+#[tracing::instrument(name = "pool.match", level = "info", skip_all, err(level = "info"))]
 pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     // One transaction for the whole rebuild. Between `clear_all_claims` and the
     // last `replace_claims` the claim table does not describe the pool, and a
@@ -107,6 +108,7 @@ pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
 /// root, is tried before its recorded base and kept while it is complete:
 /// the session reads from there whatever the index recorded, and the two
 /// disagree after a crash before a resume save or a half-done move.
+#[tracing::instrument(name = "pool.match", level = "info", skip_all, fields(loaded = loaded.len(), owned = owned.len()), err(level = "info"))]
 pub fn match_all_serving(
     store: &mut PoolStore,
     loaded: &HashMap<String, Option<PathBuf>>,

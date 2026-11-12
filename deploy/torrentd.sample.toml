@@ -13,6 +13,9 @@ resume_dir        = "/var/lib/torrentd/resume"
 torrent_dir       = "/var/lib/torrentd/torrents"
 http_listen       = "127.0.0.1:8080"   # loopback by default
 log_level         = "info"   # error | warn | info | debug (reloadable)
+# EnvFilter directives laid over log_level, for one subsystem at a time
+# (reloadable). RUST_LOG, where set, wins on any target both name.
+# log_filter      = "torrentd_pool::apply=debug,torrentd::vpn=trace"
 
 # Or serve the API on a unix socket, and on no TCP port: connecting takes
 # write permission on the socket, so its mode and group decide who may call
@@ -133,6 +136,13 @@ enable_lsd = false
 # EXTEND_TIMEOUT_USEC the daemon sends while it stops, so TimeoutStopSec needs
 # raising only for a stop that must fit without those extensions.
 # shutdown_drain_secs = 60
+
+# Reload when this file changes, as SIGHUP does, by watching its directory
+# with inotify. Sees kubelet's `..data` symlink swap when a mounted ConfigMap
+# or Secret is updated, and an editor's save. Off by default; read once, at
+# startup. A change to a key only a restart applies is reported as
+# torrentd_config_restart_pending{key} = 1 either way.
+# config_watch = true
 
 # Defence-in-depth kill switch. When true, torrentd installs a fail-closed
 # nftables table (`torrentd_ks_<uid>`) confining the daemon's own egress to loopback

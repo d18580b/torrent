@@ -38,7 +38,7 @@ pub struct DeleteTorrentQuery {
 
 /// Why a torrent was not removed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum DeleteTorrentError {
     /// `delete_files=true` without `[pool] allow_mutations`.
     #[error("deleting payload requires a [pool] section with `allow_mutations = true`")]

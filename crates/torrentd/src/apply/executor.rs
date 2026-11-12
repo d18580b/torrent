@@ -41,6 +41,7 @@ fn not_claimable(pool: &PoolService, plan_id: i64, read: &str) -> String {
     format!("plan is {now} and cannot be applied right now")
 }
 
+#[tracing::instrument(name = "pool.apply", level = "info", skip_all, fields(plan_id = plan_id, resume = resume), err(level = "info"))]
 pub(super) fn apply_inner(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
@@ -306,7 +307,8 @@ pub(super) fn apply_inner(
                 outcomes.extend(unrun.iter().map(|s| (s.seq, step_status::PENDING, None)));
                 break;
             }
-            let result = match step.op.as_str() {
+            let span = step_span(plan_id, step);
+            let result = span.in_scope(|| match step.op.as_str() {
                 ops::MOVE_TORRENT => move_torrent(pool, source, state, step, stop),
                 ops::DELETE_FILE => {
                     delete_file(pool, Path::new(&step.src), plan_id, &bucket, &mut guards)
@@ -314,6 +316,15 @@ pub(super) fn apply_inner(
                 other => Err(StepFailure::Failed(format!(
                     "unknown plan operation {other:?}"
                 ))),
+            });
+            match &result {
+                Ok(()) => span.record("outcome", "done"),
+                Err(StepFailure::Failed(e)) => {
+                    span.record("outcome", "failed").record("error", e.as_str())
+                }
+                Err(StepFailure::Unknown(e)) => span
+                    .record("outcome", "unknown")
+                    .record("error", e.as_str()),
             };
             match result {
                 Ok(()) => {
@@ -420,4 +431,31 @@ fn journal_batch_len(rest: &[PlanStepRow]) -> usize {
         .count()
         .max(1)
         .min(rest.len())
+}
+
+/// The `pool.apply_step` span one step runs in, with its `outcome` and
+/// `error` recorded once it ends. A delete plan's steps are DEBUG: one per
+/// orphan file, up to hundreds of thousands, which at INFO would be the
+/// per-item span on a hot path the metrics refuse too. Every other step (a
+/// relocate's one move) is INFO.
+fn step_span(plan_id: i64, step: &PlanStepRow) -> tracing::Span {
+    macro_rules! span_at {
+        ($level:expr) => {
+            tracing::span!(
+                $level,
+                "pool.apply_step",
+                plan_id,
+                step = step.seq,
+                op = %step.op,
+                src = %step.src,
+                outcome = tracing::field::Empty,
+                error = tracing::field::Empty,
+            )
+        };
+    }
+    if step.op == ops::DELETE_FILE {
+        span_at!(tracing::Level::DEBUG)
+    } else {
+        span_at!(tracing::Level::INFO)
+    }
 }

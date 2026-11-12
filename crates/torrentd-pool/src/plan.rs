@@ -98,6 +98,7 @@ pub fn build(
 /// stranger. Holding the writer lock across either would stall every scan
 /// and every other plan, and holding the reader's every request that reads
 /// the index, for as long as it takes.
+#[tracing::instrument(name = "pool.plan_prepare", level = "info", skip_all, fields(kind = spec.kind()), err(level = "info"))]
 pub fn prepare(
     store: &PoolStore,
     spec: &PlanSpec,
@@ -189,6 +190,12 @@ impl Prepared {
     /// plan reads here only leaves out a claimed file's twin, which the
     /// delete step would refuse, and that step checks every file again
     /// before it trashes it.
+    #[tracing::instrument(
+        name = "pool.plan_finish",
+        level = "info",
+        skip_all,
+        err(level = "info")
+    )]
     pub fn finish(self, index: &impl IndexReads) -> Result<BuildResult, PoolError> {
         // The index is a snapshot and the move is of the directory itself,
         // so the index checks see only what the last scan listed. The disk

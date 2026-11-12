@@ -24,7 +24,6 @@ use crate::http::security::Read;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::engine_for;
-use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
@@ -364,7 +363,7 @@ fn profile_list(s: &AppState) -> ProfileList {
 
 /// Why a profile could not be described.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetProfileError {
     /// No profile with this id is configured.
     #[error("unknown profile_id")]
@@ -425,7 +424,7 @@ pub struct SetProfileState {
 
 /// Why a profile's state was not set.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetProfileStateError {
     /// No profile with this id is configured.
     #[error("unknown profile_id")]
@@ -621,7 +620,7 @@ fn online_pace(s: &AppState) -> crate::fence::OnlinePace<'_> {
 
 /// Why offline-all or online-all did not fully apply.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum StateSwitchError {
     /// The switch could not be recorded, or a session refused it.
     #[error("{detail}")]
@@ -691,24 +690,15 @@ pub async fn set_online_all(
 
 /// Why a profile's torrents could not all be paused or resumed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ProfileBulkError {
-    /// No profile with this id is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
-    /// The profile is configured but has no session, or (for a resume) the
-    /// VPN monitor fenced it or the operator set it offline.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        /// `failed`, `vpn_down` or `offline`.
-        #[problem(extension)]
-        profile_status: ProfileUnavailableReason,
-    },
+    /// No profile with this id is configured; or it is configured but has
+    /// no session, or (for a resume) the VPN monitor fenced it or the
+    /// operator set it offline.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Profile(#[from] ProfileProblem),
 }
-from_profile_problem!(ProfileBulkError);
 
 /// What a bulk operation says of a profile that never got a session.
 fn no_session_detail(reason: &str) -> String {
@@ -726,13 +716,13 @@ fn no_session_detail(reason: &str) -> String {
 fn explain(s: &AppState, profile_id: &ProfileId, problem: ProfileProblem) -> ProfileProblem {
     match (problem, s.profiles.resolve(profile_id)) {
         (
-            ProfileProblem::Unavailable {
-                reason: ProfileUnavailableReason::Failed,
+            ProfileProblem::ProfileUnavailable {
+                profile_status: ProfileUnavailableReason::Failed,
                 ..
             },
             Resolution::Failed(f),
-        ) => ProfileProblem::Unavailable {
-            reason: ProfileUnavailableReason::Failed,
+        ) => ProfileProblem::ProfileUnavailable {
+            profile_status: ProfileUnavailableReason::Failed,
             detail: no_session_detail(&f.reason),
         },
         (problem, _) => problem,
@@ -1124,12 +1114,16 @@ pub async fn resume_all_torrents(
             None
         };
         if let Some(problem) = held {
-            let ProfileProblem::Unavailable { reason, detail } = problem else {
+            let ProfileProblem::ProfileUnavailable {
+                detail,
+                profile_status,
+            } = problem
+            else {
                 unreachable!("vpn_down and offline are unavailable profiles");
             };
             out.skipped_profiles.push(SkippedProfile {
                 profile_id: entry.id().as_str().to_owned(),
-                reason,
+                reason: profile_status,
                 detail,
             });
             continue;

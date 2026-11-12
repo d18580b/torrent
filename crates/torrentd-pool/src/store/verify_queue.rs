@@ -14,6 +14,7 @@ impl PoolStore {
     /// Record an adoption the verify queue now holds, at the back of the
     /// queue. An info-hash already recorded keeps its place and takes the new
     /// row's values.
+    #[tracing::instrument(name = "pool_store.enqueue_verify", level = "debug", skip_all, fields(infohash = %row.infohash), err(level = "debug"))]
     pub fn enqueue_verify(&self, row: &VerifyQueueRow) -> Result<(), PoolError> {
         use std::os::unix::ffi::OsStrExt;
         let trackers = serde_json::to_string(&row.trackers)
@@ -44,6 +45,7 @@ impl PoolStore {
 
     /// Forget a queued adoption: the queue added it to a session or dropped
     /// it. Forgetting one that is not recorded is not an error.
+    #[tracing::instrument(name = "pool_store.dequeue_verify", level = "debug", skip_all, fields(infohash = infohash), err(level = "debug"))]
     pub fn dequeue_verify(&self, infohash: &str) -> Result<(), PoolError> {
         self.conn.execute(
             "DELETE FROM verify_queue WHERE infohash = ?1",
@@ -53,6 +55,12 @@ impl PoolStore {
     }
 
     /// Every queued adoption, in queue order.
+    #[tracing::instrument(
+        name = "pool_store.verify_queue",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn verify_queue(&self) -> Result<Vec<VerifyQueueRow>, PoolError> {
         use std::os::unix::ffi::OsStrExt;
         let mut st = self.conn.prepare(
@@ -81,6 +89,12 @@ impl PoolStore {
     /// The index generation: bumped by every match, so anything bound to it
     /// — a destructive plan's confirm token — stops matching once the index
     /// it was computed from has been rebuilt.
+    #[tracing::instrument(
+        name = "pool_store.index_generation",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub fn index_generation(&self) -> Result<i64, PoolError> {
         Ok(self
             .conn
@@ -93,6 +107,12 @@ impl PoolStore {
             .unwrap_or(0))
     }
 
+    #[tracing::instrument(
+        name = "pool_store.bump_index_generation",
+        level = "debug",
+        skip_all,
+        err(level = "debug")
+    )]
     pub(crate) fn bump_index_generation(&self) -> Result<(), PoolError> {
         self.conn.execute(
             "INSERT INTO pool_meta(key, value) VALUES ('index_generation', 1)

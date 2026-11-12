@@ -357,6 +357,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_ffi_errors" Gauge Daemon ("call": libtorrent_safe::ffi_errors::CALLS) Owner("always") =>
         "ffi_errors_total as of the first scrape, which already holds what the boot counted; \
          fixed for the life of the process.";
+    "boot_external_command_failures" Gauge Daemon ("program": crate::vpn::exec::PROGRAMS)
+        Owner("always") =>
+        "external_command_failures_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -466,8 +470,17 @@ pub const CATALOGUE: &[Series] = catalogue! {
         Owner("each route, before the API serves") =>
         "Seconds from a request arriving to its response head being ready, by route and \
          method; a streamed body's delivery is not included.";
-    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings"]) Zero =>
-        "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
+    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "log_filter", "apply_settings", "watch"]) Zero =>
+        "Reloads (SIGHUP, POST /v1/config/reload, or a change config_watch saw) that failed, by \
+         the step that failed; log_filter counts a log_filter that does not parse, which keeps \
+         the log filter in place; watch counts config_watch failing to watch the config file's \
+         directory, at boot or later, after which only SIGHUP and the API reload.";
+    "config_restart_pending" Gauge Daemon ("key": crate::config::RESTART_PENDING_KEYS) Zero =>
+        "1 for each config key whose value in the file, at the last reload that read it, \
+         differs from the one the daemon runs and only a restart applies: a non-reloadable \
+         key, profile for any [[profile]] change, or a reloadable settings key the file \
+         deleted. Back to 0 when a reload finds the file matching again; a restart boots \
+         with the file and starts every key at 0.";
     // kill switch
     "kill_switch_active" Gauge Daemon Owner("always") => "1 while the daemon holds the nftables kill switch installed.";
     "kill_switch_dns_exempt" Gauge Daemon Owner("always") =>
@@ -559,6 +572,16 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Lines logged at WARN or ERROR, by level and by the crate and top-level module that \
          logged them (the target's first two path segments; other for any target not listed \
          here). Counted whatever log_level or RUST_LOG lets through to the log.";
+    // external commands
+    "external_command_failures_total" Counter Daemon ("program": crate::vpn::exec::PROGRAMS) Zero =>
+        "Host tools (ip, wg, nft, openvpn, kill; other for any other) that failed: could not \
+         start, did not finish within their bound, or exited non-zero where the caller required \
+         a zero exit. Each is logged at WARN, target torrentd::vpn::exec, with its redacted \
+         command line and stderr.";
+    "external_command_duration_seconds" Histogram Daemon ("program": crate::vpn::exec::PROGRAMS)
+        Owner("always") =>
+        "Seconds each host tool run took, from spawn to exit, timeout or refusal to start, by \
+         program.";
     // traces
     "telemetry_export_errors_total" Counter Daemon Zero =>
         "OTLP span exports that failed, each dropping its batch: a collector that refused or \
@@ -826,6 +849,11 @@ pub const BOOT_COUNTS: &[BootCount] = &[
         gauge: "boot_ffi_errors",
         only: None,
     },
+    BootCount {
+        counter: EXTERNAL_COMMAND_FAILURES,
+        gauge: "boot_external_command_failures",
+        only: None,
+    },
     // Last, so its gauge also holds any sample the rows above dropped as
     // they wrote theirs, which the first render's sample of the counter holds.
     BootCount {
@@ -915,6 +943,14 @@ static DAEMON_DIR_FSYNC_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub fn note_dir_fsync_error() {
     DAEMON_DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);
 }
+
+mod external_commands;
+
+use external_commands::external_commands;
+pub use external_commands::note_external_command;
+use external_commands::EXTERNAL_COMMAND_DURATION;
+use external_commands::EXTERNAL_COMMAND_FAILURES;
+
 const WRITER_DEATHS: &str = "batch_writer_deaths_total";
 const TELEMETRY_EXPORT_ERRORS: &str = "telemetry_export_errors_total";
 const BUILD_FAULT_INJECTION: &str = "build_fault_injection";
@@ -974,7 +1010,34 @@ impl PromSink {
         );
         // A property of the process, which every sink in it shares.
         sink.set_gauge(PROCESS_START_TIME, process_start_time(), &[]);
+        sink.register_external_commands();
         sink
+    }
+
+    /// Register the process-wide `external_command_*` vectors, with a
+    /// duration child for every program so the histogram exists from boot.
+    /// The failure counter is `Seed::Zero`, written by [`PromSink::seed`].
+    fn register_external_commands(&self) {
+        let (failures, duration) = external_commands();
+        match self.registry.register(Box::new(failures.clone())) {
+            Ok(()) => {
+                self.counters
+                    .lock()
+                    .insert(EXTERNAL_COMMAND_FAILURES.to_string(), failures.clone());
+            }
+            Err(e) => self.warn_registration("counter", EXTERNAL_COMMAND_FAILURES, &e),
+        }
+        match self.registry.register(Box::new(duration.clone())) {
+            Ok(()) => {
+                for program in crate::vpn::exec::PROGRAMS {
+                    duration.with_label_values(&[program]);
+                }
+                self.histos
+                    .lock()
+                    .insert(EXTERNAL_COMMAND_DURATION.to_string(), duration.clone());
+            }
+            Err(e) => self.warn_registration("histogram", EXTERNAL_COMMAND_DURATION, &e),
+        }
     }
 
     /// Write every [`Seed::Zero`] series at zero, for each profile in
@@ -1368,6 +1431,41 @@ pub(crate) mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// This test thread's `external_command_*` vectors, for `vpn::exec`'s
+    /// test of what a run records.
+    pub(crate) fn external_command_series() -> &'static (CounterVec, HistogramVec) {
+        external_commands()
+    }
+
+    /// Every sink exports the process-wide vectors: the failure counter at
+    /// zero for every program from the seed, the histogram from creation.
+    #[test]
+    fn every_sink_exports_the_external_command_series_from_boot() {
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        let text = String::from_utf8(sink.render()).unwrap();
+        for program in crate::vpn::exec::PROGRAMS {
+            assert!(
+                text.contains(&format!(
+                    "torrentd_external_command_failures_total{{program=\"{program}\"}}"
+                )),
+                "{program}: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "torrentd_external_command_duration_seconds_count{{program=\"{program}\"}}"
+                )),
+                "{program}"
+            );
+        }
+        // A second sink in the same process registers the same vectors in
+        // its own registry rather than failing.
+        let again = PromSink::new();
+        assert!(String::from_utf8(again.render())
+            .unwrap()
+            .contains("torrentd_external_command_duration_seconds_count"));
+    }
 
     fn deploy(file: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))

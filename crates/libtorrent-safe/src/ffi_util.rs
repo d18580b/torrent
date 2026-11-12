@@ -102,9 +102,82 @@ impl Drop for StatusListGuard {
     }
 }
 
+/// Records `duration_us`, the wall time from [`Timed::start`] to its drop, on
+/// the span current at the start: the DEBUG `ffi.*` span each entry point
+/// opens with `#[tracing::instrument]`, which declares the field empty.
+///
+/// Costs nothing past one check where that span is disabled, which is
+/// whenever DEBUG is off for this crate.
+pub(crate) struct Timed(Option<(tracing::Span, std::time::Instant)>);
+
+impl Timed {
+    pub(crate) fn start() -> Self {
+        let span = tracing::Span::current();
+        Self((!span.is_disabled()).then(|| (span, std::time::Instant::now())))
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        if let Some((span, started)) = self.0.take() {
+            let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            span.record("duration_us", micros);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shim call runs in its DEBUG `ffi.*` span, which closes carrying the
+    /// call's duration, with the error the call returned logged inside it.
+    /// Drop `Timed` and the span closes without `duration_us`; drop the
+    /// attribute's `err` and the refusal is never logged.
+    #[test]
+    fn a_shim_call_is_a_debug_span_with_its_duration_and_error() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            drop(Timed::start());
+            crate::probe::info_hashes_from_torrent(b"not bencode").unwrap_err();
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("DEBUG")
+                && l.contains("ffi.torrent_info_hashes")
+                && l.contains("error")),
+            "the refusal is logged in the span:\n{out}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("ffi.torrent_info_hashes")
+                && l.contains("duration_us=")
+                && l.contains("close")),
+            "the span closes with its duration:\n{out}"
+        );
+    }
 
     fn buf<const N: usize>(bytes: &[u8]) -> [c_char; N] {
         let mut out = [0 as c_char; N];

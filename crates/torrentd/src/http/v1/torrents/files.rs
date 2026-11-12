@@ -23,10 +23,10 @@ use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::internal;
 use crate::http::v1::Torrents;
-use crate::http::validate::from_invalid;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
 use crate::http::validate::Validate;
+use crate::http::validate::ValidationFailed;
 
 /// The listing name file cursors are bound to.
 const FILES_LISTING: &str = "files";
@@ -85,35 +85,29 @@ const FILE_KEY_WIDTH: usize = 10;
 
 /// Why a torrent's files could not be listed.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListFilesError {
     /// The cursor is not one this listing issued.
     #[error("the cursor is not one this listing issued; start again without it")]
     #[problem(status = 400, title = "Invalid cursor")]
     InvalidCursor,
-    /// No loaded torrent has this infohash.
-    #[error("no loaded torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    /// No loaded torrent has this infohash, or its profile has no session.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Lookup(#[from] Lookup),
     /// The torrent was added from a magnet and has no metadata yet.
     #[error("the torrent has no metadata yet; retry once it has a name")]
     #[problem(status = 409, title = "Metadata pending")]
     MetadataPending,
     /// A query parameter is out of range.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The session could not be asked.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_lookup!(ListFilesError);
-from_invalid!(ListFilesError);
 
 /// List a torrent's files.
 ///
@@ -158,7 +152,7 @@ pub async fn list_torrent_files(
     let files = match blocking_files(&engine, st.handle, start, limit).await {
         Ok(Some(files)) => files,
         Ok(None) => return Err(ListFilesError::MetadataPending),
-        Err(e) if e.is_gone() => return Err(ListFilesError::TorrentNotFound),
+        Err(e) if e.is_gone() => return Err(Lookup::TorrentNotFound.into()),
         Err(e) => {
             return Err(ListFilesError::Internal {
                 detail: internal("listing the torrent's files", e),
@@ -187,7 +181,7 @@ pub struct FilePriority {
 }
 
 impl Validate for FilePriority {
-    fn validate(&self) -> Result<(), Invalid> {
+    fn validate(&self) -> Result<(), ValidationFailed> {
         let mut invalid = Invalid::new();
         // Checked before it crosses the FFI boundary: libtorrent would read an
         // arbitrary byte however it happens to.
@@ -200,12 +194,12 @@ impl Validate for FilePriority {
 
 /// Why a file's priority was not set.
 #[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetFilePriorityError {
-    /// No loaded torrent has this infohash.
-    #[error("no loaded torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    /// No loaded torrent has this infohash, or its profile has no session.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Lookup(#[from] Lookup),
     /// The torrent has no file at this index.
     #[error("the torrent has no file at this index")]
     #[problem(status = 404, title = "File not found")]
@@ -215,20 +209,14 @@ pub enum SetFilePriorityError {
     #[problem(status = 409, title = "Metadata pending")]
     MetadataPending,
     /// A constraint the schema declares is broken.
-    #[error("{summary}")]
-    #[problem(status = 422, title = "The request is invalid")]
-    ValidationFailed {
-        summary: String,
-        #[problem(extension)]
-        errors: Vec<crate::http::validate::Violation>,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ValidationFailed(#[from] ValidationFailed),
     /// The session refused the request.
     #[error("{detail}")]
     #[problem(status = 500, title = "Internal error")]
     Internal { detail: String },
 }
-from_lookup!(SetFilePriorityError);
-from_invalid!(SetFilePriorityError);
 
 /// Set a file's download priority.
 ///
@@ -251,7 +239,7 @@ pub async fn set_file_priority(
     let count = match blocking_files(&engine, st.handle, 0, 0).await {
         Ok(Some(files)) => files.total as usize,
         Ok(None) => return Err(SetFilePriorityError::MetadataPending),
-        Err(e) if e.is_gone() => return Err(SetFilePriorityError::TorrentNotFound),
+        Err(e) if e.is_gone() => return Err(Lookup::TorrentNotFound.into()),
         Err(e) => {
             return Err(SetFilePriorityError::Internal {
                 detail: internal("listing the torrent's files", e),
@@ -266,7 +254,7 @@ pub async fn set_file_priority(
     match blocking(move || engine.set_file_priority(st.handle, index, priority)).await {
         Ok(()) => Ok(NoContent),
         // Removed between the count and the set.
-        Err(e) if is_gone(&e) => Err(SetFilePriorityError::TorrentNotFound),
+        Err(e) if is_gone(&e) => Err(Lookup::TorrentNotFound.into()),
         Err(e) => Err(SetFilePriorityError::Internal {
             detail: internal("setting the file's priority", e),
         }),
