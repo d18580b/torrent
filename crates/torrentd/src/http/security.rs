@@ -750,29 +750,12 @@ impl<R> Authorized<R> {
 /// with this mounted or not.
 pub struct Refused<R> {
     rejection: AuthRejection,
-    /// Whether `authorize` refused a scope, rather than `authenticate` the
-    /// credential.
-    scope: bool,
     _scopes: std::marker::PhantomData<fn() -> R>,
 }
 
 impl<R> kynos::response::IntoResponse for Refused<R> {
-    /// A scope refusal carries `Bearer`'s `insufficient_scope` challenge
-    /// (RFC 6750 section 3.1), as the guard's does. kynos attaches it only on
-    /// the guard's own path, and offers no public way to set it on an
-    /// `AuthRejection`, so it is added to the response here.
     fn into_response(self) -> kynos::http::Response {
-        let mut response = self.rejection.into_response();
-        let challenge = <Bearer as SecurityScheme>::insufficient_scope_challenge()
-            .and_then(|c| kynos::http::HeaderValue::from_str(c).ok());
-        if let (true, kynos::http::StatusCode::FORBIDDEN, Some(challenge)) =
-            (self.scope, response.status(), challenge)
-        {
-            response
-                .headers_mut()
-                .insert(kynos::http::header::WWW_AUTHENTICATE, challenge);
-        }
-        response
+        self.rejection.into_response()
     }
 }
 
@@ -843,29 +826,21 @@ impl<R: Scopes<Scope = Scope>> kynos::middleware::Interceptor<crate::http::ctx::
         context: &crate::http::ctx::AppCtx,
         next: kynos::middleware::Next<'_, crate::http::ctx::AppCtx>,
     ) -> Result<kynos::middleware::Continued<()>, Refused<R>> {
-        use kynos::security::Authenticates;
+        use kynos::security::requirement::ScopeCheckedBy;
 
-        let refusal = |scope: bool| {
-            move |rejection: AuthRejection| Refused {
-                rejection: rejection.with_challenge(<Bearer as SecurityScheme>::challenge()),
-                scope,
-                _scopes: std::marker::PhantomData,
-            }
+        let refused = |rejection: AuthRejection| Refused {
+            // The 401's challenge; a 403 refusing a scope already carries
+            // the `insufficient_scope` one `check_scoped` attached.
+            rejection: rejection.with_challenge(<Bearer as SecurityScheme>::challenge()),
+            _scopes: std::marker::PhantomData,
         };
-        let refused = refusal(false);
         let (parts, body) = request.into_parts();
-        let presented = Bearer::present(&parts)
+        // The scheme's default scopes joined with `R`'s, as `Scoped`
+        // demands them.
+        Bearer::check_scoped(&parts, context, R::REQUIRED)
+            .await
             .map_err(refused)?
             .ok_or_else(|| refused(AuthRejection::unauthenticated()))?;
-        let gate = context.authenticator();
-        let caller = Authenticator::<Bearer, _>::authenticate(gate, presented, context)
-            .await
-            .map_err(refused)?;
-        // `Scoped` demands the scheme's default scopes joined with `R`'s;
-        // `Bearer` declares none, so `R`'s are the whole demand.
-        Authenticator::<Bearer, _>::authorize(gate, &caller, R::REQUIRED, context)
-            .await
-            .map_err(refusal(true))?;
         Ok(next
             .run(kynos::http::Request::from_parts(parts, body))
             .await)
