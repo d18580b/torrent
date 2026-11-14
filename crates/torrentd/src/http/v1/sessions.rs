@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use kynos::di::Provides;
 use kynos::extract::connection::ConnectInfo;
 use kynos::extract::describe::Describe;
+use kynos::extract::link::Link;
 use kynos::extract::FromRequestParts;
 use kynos::http::Parts;
 use kynos::prelude::*;
@@ -157,6 +158,7 @@ impl Describe for ClientAddr {
 pub async fn create_session(
     Inject(s): Inject<Arc<AppState>>,
     ClientAddr(client): ClientAddr,
+    current: Link<get_current_session>,
     Json(body): Json<CreateSession>,
 ) -> Result<Created<Json<SessionGrant>>, CreateSessionError> {
     let Some(auth) = s.auth.as_ref() else {
@@ -261,7 +263,7 @@ pub async fn create_session(
         "session issued",
     );
     Ok(Created::at(
-        crate::http::v1::mounted(get_current_session::relative_uri()),
+        current.uri(()),
         Json(SessionGrant {
             token,
             token_type: "Bearer".to_owned(),

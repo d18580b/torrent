@@ -12,6 +12,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use kynos::extract::link::Link;
 use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
@@ -1942,6 +1943,7 @@ pub enum CreatePlanError {
 pub async fn create_plan(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
+    created: Link<get_plan>,
     Json(req): Json<CreatePlanRequest>,
 ) -> Result<Created<Json<Plan>>, CreatePlanError> {
     let pool = s.pool.clone().ok_or(CreatePlanError::PoolNotConfigured)?;
@@ -1950,12 +1952,13 @@ pub async fn create_plan(
     }
     // On the blocking pool: the plan is built and written on the writer,
     // which a running scan holds.
-    blocking(move || create_plan_blocking(&pool, torrentd_pool::PlanSpec::from(req))).await
+    blocking(move || create_plan_blocking(&pool, created, torrentd_pool::PlanSpec::from(req))).await
 }
 
 /// [`create_plan`] past its up-front checks.
 fn create_plan_blocking(
     pool: &PoolService,
+    created: Link<get_plan>,
     spec: torrentd_pool::PlanSpec,
 ) -> Result<Created<Json<Plan>>, CreatePlanError> {
     let kind = spec.kind();
@@ -1981,7 +1984,7 @@ fn create_plan_blocking(
         "plan created (nothing applied)",
     );
     Ok(Created::at(
-        crate::http::v1::mounted(get_plan::relative_uri(PlanPath { plan_id: id })),
+        created.uri(PlanPath { plan_id: id }),
         Json(plan),
     ))
 }

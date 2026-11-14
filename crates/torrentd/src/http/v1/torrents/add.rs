@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use kynos::extract::link::Link;
 use kynos::openapi::SchemaObject;
 use kynos::prelude::*;
 use kynos::security::auth::Scoped;
@@ -215,6 +216,7 @@ enum AddSource {
 pub async fn add_torrent(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
+    added: Link<get_torrent>,
     Json(Unenforced(body)): Json<Unenforced<AddTorrentRequest>>,
 ) -> Result<Created<Json<Torrent>>, AddTorrentError> {
     body.validate()?;
@@ -458,9 +460,9 @@ pub async fn add_torrent(
         .ok();
     let torrent = Torrent::build(&s, &infohash, &profile_id, details);
     Ok(Created::at(
-        crate::http::v1::mounted(get_torrent::relative_uri(TorrentPath {
+        added.uri(TorrentPath {
             infohash: InfoHashHex::new(infohash),
-        })),
+        }),
         Json(torrent),
     ))
 }
