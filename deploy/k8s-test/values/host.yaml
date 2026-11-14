@@ -1,0 +1,20 @@
+# A `host` profile, for the `seed` release that seeds the fixture to
+# leech.py. run.sh adds the image, `auth` (a
+# read-write token and a metrics token it mints for the run) and the release's
+# payload claim.
+persistence:
+  size: 256Mi
+config:
+  settings:
+    log_level: info
+    # Under the 60 s default, so a stop the run waits on is bounded sooner;
+    # terminationGracePeriodSeconds follows it.
+    shutdown_drain_secs: 30
+    profile:
+      - id: public
+        network: host
+        listen_interfaces: "0.0.0.0:6881"
+peers:
+  ports:
+    - name: public
+      port: 6881

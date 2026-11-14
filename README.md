@@ -618,7 +618,8 @@ mise run openapi         # regenerate docs/api/openapi.json after an API change
 mise run openapi-check   # fail if the committed document is stale
 mise run unit-check      # systemd-analyze verify deploy/torrentd.service and its safety directives
 mise run test-alerts     # promtool over deploy/prometheus (needs podman or docker)
-mise run test-all        # test and every test-* task above, in turn (so test-netns's namespaces too); not check, deny or openapi-check
+mise run test-k8s        # the Helm chart on k3s in k3d, driven end to end (needs docker and the image `mise run container` builds: CONTRIBUTING.md's test-k8s row)
+mise run test-all        # test and every test-* task above but test-k8s, in turn (so test-netns's namespaces too); not check, deny or openapi-check
 mise run bench -- memory-scaling --count 50000   # Layer 4: each subcommand fails on a breach of crates/torrentd-bench/budgets.toml
 mise run bench -- pool-scan --size ci            # the pool at the size CI runs; the default, full, takes minutes
 ```

@@ -427,6 +427,50 @@ jobs:
           fi
           sudo modprobe -a wireguard nf_tables
       - run: mise run image-check
+      # The k8s job installs this same image, handed over rather than built
+      # a second time. Plumbing between jobs, not a check, so not a task.
+      - name: Save the image for the k8s job
+        run: podman save --format docker-archive -o "$RUNNER_TEMP/torrentd-image.tar" localhost/torrentd:dev
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: torrentd-image
+          path: ${{ runner.temp }}/torrentd-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  k8s:
+    name: chart on k3s (k3d)
+    needs: container
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: false
+          persist-credentials: false
+      # mise provides k3d, kubectl and helm; k3d runs k3s on the runner's
+      # docker.
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ''
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: torrentd-image
+          path: ${{ runner.temp }}/image
+      # A pod shares the runner's kernel and cannot load a module: the vpn
+      # release's tunnel and kill switch, and the WireGuard peer, need these.
+      - name: Load wireguard and nf_tables
+        run: sudo modprobe -a wireguard nf_tables
+      # The chart on k3s with a host and a vpn release: probes, a metrics
+      # scrape, seeding to a peer, tracker DNS through the carve-out, no
+      # egress outside the tunnel, a clean restart and a config reload.
+      - run: mise run test-k8s localhost/torrentd:dev "$RUNNER_TEMP/image/torrentd-image.tar"
+      # run.sh prints these on a failure too; the artifact keeps them whole.
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: k8s-test-diagnostics
+          path: target/k8s-test
+          if-no-files-found: ignore
 
   alert-rules:
     name: alert rules (promtool)

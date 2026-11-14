@@ -1,0 +1,61 @@
+# The vpn profile's WireGuard peer, and the tracker its torrent announces to.
+# run.sh applies this with @IMAGE@ replaced by the image under test, which
+# carries the `wg` and `ip` this needs, then adds the daemon's public key as
+# the peer once it has minted it.
+#
+# Root with NET_ADMIN, to raise wg0: this pod is the test's provider, not the
+# deployment under test. Its address is the tunnel's endpoint.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wg-peer
+  labels:
+    app.kubernetes.io/name: wg-peer
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  # sleep ignores SIGTERM as PID 1, and holds nothing to save.
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: wg
+      image: "@IMAGE@"
+      imagePullPolicy: Never
+      command: [/bin/bash, -c]
+      args:
+        - |
+          set -euo pipefail
+          umask 077
+          wg genkey > /tmp/peer.key
+          ip link add wg0 type wireguard
+          wg set wg0 listen-port 51820 private-key /tmp/peer.key
+          ip address add 10.201.0.2/32 dev wg0
+          ip link set wg0 up
+          exec sleep infinity
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        runAsNonRoot: false
+        capabilities:
+          drop: [ALL]
+          add: [NET_ADMIN]
+      readinessProbe:
+        exec:
+          command: [wg, show, wg0, listen-port]
+        periodSeconds: 2
+---
+# Headless, so the name resolves to the pod's own address and the announce
+# ends at the peer itself, through the tunnel. Nothing listens on the port: a
+# refused connection is the proof that the name resolved and the tunnel
+# carried the connect and its reset.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wg-peer
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: wg-peer
+  ports:
+    - name: tracker
+      port: 6969
+      protocol: TCP

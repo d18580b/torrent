@@ -1,0 +1,29 @@
+# A `vpn` WireGuard profile behind the kill switch, with the chart's cluster
+# carve-outs (the API's replies on eth0, DNS to the cluster resolver). Its
+# peer is the `wg-peer` pod run.sh starts first; run.sh writes the profile's
+# config into the vpn-wireguard Secret, with that pod's address as the
+# endpoint, and adds the image, `auth` and the payload claim.
+#
+# The tracker's host is the peer pod's headless Service, which only the
+# cluster resolver can name: its announce resolves through the DNS carve-out
+# and connects through the tunnel.
+persistence:
+  size: 256Mi
+rpFilterLoose: true
+vpn:
+  wireguardSecret: vpn-wireguard
+config:
+  settings:
+    log_level: info
+    shutdown_drain_secs: 30
+    network_kill_switch: true
+    profile:
+      - id: tunnel
+        network: vpn
+        vpn_type: wireguard
+        vpn_config: /etc/wireguard/wg-e2e.conf
+        vpn_interface: wg-e2e
+        listen_port: 6891
+        peer_fingerprint: "-qB5030-"
+        user_agent: qBittorrent/5.0.3
+        allowed_tracker_domains: [wg-peer.torrentd-e2e.svc.cluster.local]
