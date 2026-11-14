@@ -4,6 +4,58 @@ Every release of torrentd and torrentctl, newest first. Both binaries share
 one version and one `vX.Y.Z` tag; README.md § *Install* says how to download
 a release and verify what you downloaded.
 
+## [0.2.1](https://github.com/d18580b/torrent/compare/v0.2.0...v0.2.1) - 2026-11-14
+
+### Added
+
+- **torrentctl:** Propagate traces, and keep a usable log ([#770](https://github.com/d18580b/torrent/pull/770))
+- **release:** Build and publish amd64 and arm64 ([#768](https://github.com/d18580b/torrent/pull/768))
+- **torrentd:** HTTP request metrics, and loud 5xx and rejected-token responses ([#736](https://github.com/d18580b/torrent/pull/736))
+- **vpn:** Run as non-root with CAP_NET_ADMIN from a file capability, and preflight every VPN requirement ([#737](https://github.com/d18580b/torrent/pull/737))
+- **observability:** Count every WARN and ERROR log event ([#738](https://github.com/d18580b/torrent/pull/738))
+- **vpn:** Kill-switch carve-outs for API replies on named interfaces and DNS to named resolvers ([#741](https://github.com/d18580b/torrent/pull/741))
+- **http:** Walk the trusted-proxy chain in X-Forwarded-For and Forwarded ([#742](https://github.com/d18580b/torrent/pull/742))
+- **startup:** Refuse state on unsupported filesystems and probe pool roots for mutations ([#743](https://github.com/d18580b/torrent/pull/743))
+- **observability:** Log and count every panic, and supervise every long-lived task ([#746](https://github.com/d18580b/torrent/pull/746))
+- **observability:** Build_info and process lifecycle metrics ([#748](https://github.com/d18580b/torrent/pull/748))
+- **http:** Add /livez and /readyz, keeping /healthz as /readyz's alias ([#750](https://github.com/d18580b/torrent/pull/750))
+- **observability:** Export traces over OTLP and put trace ids in every log line ([#759](https://github.com/d18580b/torrent/pull/759))
+- **observability:** A span per API request, W3C traceparent in and out, and context carried into spawned work ([#767](https://github.com/d18580b/torrent/pull/767))
+- **vpn:** Fail a vpn profile whose tunnel comes up with strict rp_filter ([#766](https://github.com/d18580b/torrent/pull/766))
+- **config:** Reload when the config file changes, and report restart-only changes as pending ([#773](https://github.com/d18580b/torrent/pull/773))
+- **observability:** Spans at every layer, including external commands, SQLite and the libtorrent FFI ([#776](https://github.com/d18580b/torrent/pull/776))
+- **observability:** Reloadable log_filter, torrentd_pool under log_level, RUST_LOG kept across reload ([#778](https://github.com/d18580b/torrent/pull/778))
+- **observability:** DEBUG spans for the assignment registry's SQLite operations ([#780](https://github.com/d18580b/torrent/pull/780))
+
+### Fixed
+
+- **torrentctl:** Stop the input thread before the terminal is handed back ([#697](https://github.com/d18580b/torrent/pull/697))
+- **observability:** Write refusals and errors before tracing starts as JSON ([#734](https://github.com/d18580b/torrent/pull/734))
+- **torrentd:** Refuse a request body whose transfer failed part-way ([#735](https://github.com/d18580b/torrent/pull/735))
+- **deps:** Bump rusqlite to 0.41 to clear RUSTSEC-2026-0459 ([#756](https://github.com/d18580b/torrent/pull/756))
+- **observability:** Stop swallowing errors on the paths that matter ([#752](https://github.com/d18580b/torrent/pull/752))
+- **telemetry:** Refuse an OTLP endpoint that does not parse as a URI ([#765](https://github.com/d18580b/torrent/pull/765))
+
+### Refactored
+
+- **torrentctl:** Split the oversized screens and give screens a contract module ([#698](https://github.com/d18580b/torrent/pull/698))
+- **torrentctl:** Drop spargen 0.6 leftovers in build.rs and request_failure ([#732](https://github.com/d18580b/torrent/pull/732))
+- **torrentd:** Adopt kynos' error and derive APIs in place of torrentd's workarounds ([#739](https://github.com/d18580b/torrent/pull/739))
+- **http:** Adopt the remaining kynos APIs that replace torrentd's workarounds ([#782](https://github.com/d18580b/torrent/pull/782))
+
+### Documentation
+
+- **torrentctl:** Make the doc comments match the code after the screens split ([#700](https://github.com/d18580b/torrent/pull/700))
+
+### Tests
+
+- **torrentd:** Check the netns leak counter after shutdown and across a crash ([#626](https://github.com/d18580b/torrent/pull/626))
+
+### Chores
+
+- **deps:** Migrate to kynos 0.5 and spargen 0.6 ([#702](https://github.com/d18580b/torrent/pull/702))
+- **lint:** Fail lint-tracing on an unannotated let _ = in non-test code ([#758](https://github.com/d18580b/torrent/pull/758))
+
 ## [0.2.0](https://github.com/d18580b/torrent/releases/tag/v0.2.0) - 2026-10-26
 
 ### Added

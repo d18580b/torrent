@@ -10,8 +10,8 @@ type: application
 # release pull request (release-plz.yml) moves both, and the release refuses
 # a chart whose version or appVersion is not the release's. appVersion is
 # also the image tag the chart defaults to.
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.2.1
+appVersion: "0.2.1"
 # fsGroupChangePolicy and a LoadBalancer Service mixing TCP and UDP ports are
 # both GA from 1.26; 1.29 is the oldest release still receiving patches when
 # the chart was written.
