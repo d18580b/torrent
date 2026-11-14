@@ -1777,7 +1777,7 @@ that runs once per torrent on a recurring path opens an INFO span, so a
 | Check queue | `check_queue.verify_outcome` | INFO | `infohash`, `outcome` |
 | Check queue | `check_queue.tick`, `check_queue.admit` (`kind`: `adoption`, `recheck`, `add`), `pool.adopt_plan` | DEBUG | `infohash`, `profile_id`, `depth`, `in_flight` |
 | Pool index (SQLite) | `pool_store.<operation>` (`pool_store.transaction`, `pool_store.torrent`, `pool_store.set_step_status`, …) | DEBUG | `infohash`, `plan_id`, `step`, `root_id` |
-| Assignment registry (SQLite) | `registry.open` (under it `registry.open_db`, and `registry.import` for a JSON import), `registry.assign` (under it `registry.insert`), `registry.remove` (under it `registry.delete`); a lookup, served from memory, opens none | DEBUG | `infohash`, `profile_id`, `path`, `entries`, `imported` |
+| Assignment registry (SQLite) | `registry.open` (under it `registry.open_db`, and `registry.import` for a JSON import), `registry.assign` (under it `registry.insert`), `registry.remove` (under it `registry.delete`); a lookup, served from memory, opens none | DEBUG | `infohash`, `profile_id`, `path`, `file`, `entries`, `imported` |
 | libtorrent FFI | `ffi.<call>` (`ffi.add_torrent`, `ffi.torrent_statuses`, `ffi.pop_alerts`, `ffi.save_resume_data`, …) | DEBUG | `infohash`, `duration_us` |
 | Engine | one span per engine call, named for it, with `op` | INFO | `op`, `infohash` |
 

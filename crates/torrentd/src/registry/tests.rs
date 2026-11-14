@@ -734,9 +734,11 @@ fn a_legacy_registry_read_under_the_new_name_still_names_the_old_profile_ids() {
 /// it, and each event's level with the span it was logged in.
 #[derive(Clone, Default)]
 struct Seen {
-    spans: std::sync::Arc<parking_lot::Mutex<Vec<(&'static str, BTreeMap<String, String>)>>>,
-    events: std::sync::Arc<parking_lot::Mutex<Vec<(tracing::Level, Option<&'static str>)>>>,
+    spans: Shared<(&'static str, BTreeMap<String, String>)>,
+    events: Shared<(tracing::Level, Option<&'static str>)>,
 }
+
+type Shared<T> = std::sync::Arc<parking_lot::Mutex<Vec<T>>>;
 
 struct Fields<'a>(&'a mut BTreeMap<String, String>);
 
