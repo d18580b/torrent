@@ -317,12 +317,11 @@ pub(crate) fn http_server(
 fn http_exit_code(outcome: kynos::Result<()>) -> i32 {
     match outcome {
         Ok(()) => 0,
-        Err(kynos::Error::Server(kynos::server::error::ServerError::ShutdownTimeout {
-            timeout,
-        })) => {
+        Err(kynos::Error::Server(e)) if e.is_requested_shutdown() => {
             warn!(
-                timeout_secs = timeout.as_secs(),
-                "HTTP drain timed out; the requests still open were cut off",
+                timeout_secs = HTTP_DRAIN_TIMEOUT.as_secs(),
+                error.cause = %e,
+                "HTTP drain did not complete; the requests still open were cut off",
             );
             0
         }
@@ -406,6 +405,14 @@ mod tests {
             },
         ));
         assert_eq!(http_exit_code(timed_out), 0);
+        let forced = Err(kynos::Error::Server(
+            kynos::server::error::ServerError::ShutdownForced,
+        ));
+        assert_eq!(
+            http_exit_code(forced),
+            0,
+            "a forced drain was asked for too"
+        );
         assert_eq!(http_exit_code(Ok(())), 0);
         let broken = Err(kynos::Error::Server(
             kynos::server::error::ServerError::NoListeners,
