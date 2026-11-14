@@ -126,6 +126,7 @@ fn vpn_profile() -> ProfileConfig {
             listen_port: Some(6881),
             port_forward: Default::default(),
             port_forward_gateway: None,
+            tracker_dns: torrentd_engine::TrackerDns::Host,
         },
         peer_fingerprint: Some("-AA1000-".into()),
         user_agent: Some("qB/5.0".into()),
@@ -1526,6 +1527,7 @@ fn a_kill_switch_with_a_vpn_profile_passes_the_pre_flight() {
             listen_port: Some(6891),
             port_forward: torrentd_engine::PortForwardMode::Static,
             port_forward_gateway: None,
+            tracker_dns: torrentd_engine::TrackerDns::Host,
         },
     );
     assert_eq!(profile.peer_fingerprint.as_deref(), Some("-AA1000-"));
@@ -1880,6 +1882,7 @@ fn an_http_listen_port_a_profile_listens_on_is_refused() {
             listen_port: Some(8080),
             port_forward: Default::default(),
             port_forward_gateway: None,
+            tracker_dns: torrentd_engine::TrackerDns::Host,
         },
         peer_fingerprint: Some("-AA1000-".into()),
         user_agent: Some("qB/5.0".into()),

@@ -260,6 +260,7 @@ mod tests {
                 listen_port: Some(6881),
                 port_forward: Default::default(),
                 port_forward_gateway: None,
+                tracker_dns: crate::TrackerDns::Host,
             },
             peer_fingerprint: Some("-AA1000-".into()),
             user_agent: Some("qB/5.0".into()),

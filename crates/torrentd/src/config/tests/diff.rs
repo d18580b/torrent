@@ -150,16 +150,26 @@ fn any_change_inside_the_network_block_is_one_identity_change() {
     // field it already has reaches the comparison, and if switching the
     // variant does too: which tunnel, which port, whether DHT runs.
     use torrentd_engine::ProfileNetwork;
+    use torrentd_engine::TrackerDns;
     let dir = tempdir().unwrap();
     let host = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
     let mut vpn = host.clone();
-    vpn.profile[0].network = ProfileNetwork::Vpn {
-        vpn_type: torrentd_engine::VpnType::Wireguard,
-        vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
-        vpn_interface: "wg0".into(),
-        listen_port: Some(6881),
-        port_forward: Default::default(),
-        port_forward_gateway: None,
+    // wg0, port 6881, static, the host's tracker DNS.
+    vpn.profile[0].network = vpn_profile().network;
+    // `vpn`'s network with one of its fields edited.
+    type Edit<'a> = &'a dyn Fn(&mut String, &mut Option<u16>, &mut TrackerDns);
+    let vpn_edit = |edit: Edit<'_>| {
+        let mut n = vpn.profile[0].network.clone();
+        if let ProfileNetwork::Vpn {
+            vpn_interface,
+            listen_port,
+            tracker_dns,
+            ..
+        } = &mut n
+        {
+            edit(vpn_interface, listen_port, tracker_dns);
+        }
+        n
     };
 
     let edits: Vec<(&str, &Config, ProfileNetwork)> = vec![
@@ -183,26 +193,17 @@ fn any_change_inside_the_network_block_is_one_identity_change() {
         (
             "vpn interface",
             &vpn,
-            ProfileNetwork::Vpn {
-                vpn_type: torrentd_engine::VpnType::Wireguard,
-                vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
-                vpn_interface: "wg1".into(),
-                listen_port: Some(6881),
-                port_forward: Default::default(),
-                port_forward_gateway: None,
-            },
+            vpn_edit(&|i, _, _| *i = "wg1".into()),
         ),
         (
             "vpn listen_port",
             &vpn,
-            ProfileNetwork::Vpn {
-                vpn_type: torrentd_engine::VpnType::Wireguard,
-                vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
-                vpn_interface: "wg0".into(),
-                listen_port: Some(51413),
-                port_forward: Default::default(),
-                port_forward_gateway: None,
-            },
+            vpn_edit(&|_, p, _| *p = Some(51413)),
+        ),
+        (
+            "vpn tracker_dns",
+            &vpn,
+            vpn_edit(&|_, _, d| *d = TrackerDns::Tunnel { servers: vec![] }),
         ),
         ("vpn to host", &vpn, host.profile[0].network.clone()),
     ];

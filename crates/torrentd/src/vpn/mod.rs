@@ -19,6 +19,7 @@ mod openvpn;
 pub mod preflight;
 pub mod route;
 mod shared_exit;
+pub mod tracker_dns;
 mod wireguard;
 
 use std::path::Path;
@@ -35,6 +36,7 @@ pub use openvpn::Released as ReleasedOpenvpn;
 pub use shared_exit::warn_if_exits_are_shared;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
+pub use wireguard::dns_servers as wireguard_dns_servers;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::release_recorded as release_recorded_wireguard;
 pub use wireguard::sweep_raised_records;
