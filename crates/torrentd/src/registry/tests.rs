@@ -800,9 +800,9 @@ impl Seen {
             .unwrap_or_else(|| panic!("no {name} span"))
     }
 
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
+    fn install(&self) -> torrentd_engine::testing::SubscriberGuard {
         use tracing_subscriber::layer::SubscriberExt as _;
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        torrentd_engine::testing::set_subscriber(tracing_subscriber::registry().with(self.clone()))
     }
 }
 
