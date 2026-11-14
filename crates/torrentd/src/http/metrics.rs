@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kynos::extract::body::binary::Binary;
+use kynos::extract::body::text_as::TextAs;
 use kynos::http::media::MediaType;
 use kynos::middleware::Observer;
 use kynos::openapi::Document;
@@ -137,7 +137,8 @@ impl<C> Observer<C> for HttpMetrics {
     }
 }
 
-/// The Prometheus text exposition format, version 0.0.4.
+/// The Prometheus text exposition format, version 0.0.4, sent as
+/// `text/plain; version=0.0.4; charset=utf-8`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PrometheusText;
 
@@ -167,7 +168,7 @@ pub enum MetricsError {
 pub async fn get_metrics(
     _caller: Scoped<Bearer, Metrics>,
     Inject(s): Inject<Arc<AppState>>,
-) -> Result<Binary<PrometheusText>, MetricsError> {
+) -> Result<TextAs<PrometheusText>, MetricsError> {
     // Computed here rather than by a ticking task: a task could itself stall,
     // and the age read at scrape time is exactly the one `/healthz` would
     // report at that moment.
@@ -176,9 +177,13 @@ pub async fn get_metrics(
         torrentd_engine::heartbeat_age(&s.alert_heartbeat).as_secs_f64(),
         &[],
     );
-    s.metrics
-        .try_render()
-        .map(Binary::new)
+    let encoded = s.metrics.try_render().map_err(|e| MetricsError::Internal {
+        detail: crate::http::v1::common::internal("encoding the metrics", e),
+    })?;
+    // The text encoder writes UTF-8; anything else is an encoding failure
+    // like any other, never a lossy exposition.
+    String::from_utf8(encoded)
+        .map(TextAs::new)
         .map_err(|e| MetricsError::Internal {
             detail: crate::http::v1::common::internal("encoding the metrics", e),
         })

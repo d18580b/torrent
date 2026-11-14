@@ -86,7 +86,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
         .await;
     resp.assert_status(kynos::http::StatusCode::OK);
-    resp.assert_header("content-type", "text/plain; version=0.0.4");
+    resp.assert_header("content-type", "text/plain; version=0.0.4; charset=utf-8");
     assert!(resp.text().contains("alert_loop_heartbeat_age_seconds"));
 
     // A scrape that cannot be encoded is a 500, never a partial exposition,
@@ -434,10 +434,15 @@ async fn every_response_carries_the_shared_headers_and_its_own_request_id() {
             Some("nosniff"),
             "{at}"
         );
+        assert_eq!(resp.header("referrer-policy"), Some("no-referrer"), "{at}");
         let id = resp
             .header("x-request-id")
             .unwrap_or_else(|| panic!("{at}: no id"));
         assert_eq!(id.len(), 32, "{at}: {id}");
+        assert!(
+            id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{at}: {id} is not lowercase hex"
+        );
         assert!(ids.insert(id.to_owned()), "{at}: id {id} repeated");
     }
 }

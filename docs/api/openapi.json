@@ -37,17 +37,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -98,17 +120,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -159,17 +203,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -302,23 +368,47 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
             "content": {
               "text/plain; version=0.0.4": {
-                "schema": {}
+                "schema": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -380,17 +470,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -511,17 +623,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -651,17 +785,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -791,17 +947,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -975,17 +1153,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -1152,17 +1352,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -1290,17 +1512,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -1546,17 +1790,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -1940,17 +2206,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -2245,17 +2533,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -2490,17 +2800,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -2838,17 +3170,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -3067,17 +3421,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -3324,17 +3700,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -3581,17 +3979,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -3878,17 +4298,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -4167,17 +4609,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -4351,17 +4815,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -4543,17 +5029,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -4853,17 +5361,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -5108,17 +5638,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -5270,17 +5822,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -5484,17 +6058,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -5726,17 +6322,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -5916,17 +6534,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -6056,17 +6696,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -6196,17 +6858,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -6482,17 +7166,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -6820,17 +7526,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -7148,17 +7876,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -7363,17 +8113,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -7547,17 +8319,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -7823,17 +8617,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -8178,17 +8994,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -8459,17 +9297,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -8715,17 +9575,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -9028,17 +9910,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -9309,17 +10213,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -9727,17 +10653,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -10116,17 +11064,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             }
@@ -10504,17 +11474,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -10836,17 +11828,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },
@@ -11308,17 +12322,39 @@
                 }
               },
               "Cache-Control": {
-                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "description": "No cache may store this response, per RFC 9111 section 5.2.2.5",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-store"
+                    }
+                  }
+                }
+              },
+              "Referrer-Policy": {
+                "description": "A request this response causes carries no `Referer`",
+                "required": true,
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "no-referrer"
+                    }
+                  }
                 }
               },
               "X-Content-Type-Options": {
-                "description": "Always `nosniff`.",
+                "description": "The response is not to be read as any type but its `Content-Type`",
                 "required": true,
-                "schema": {
-                  "type": "string"
+                "content": {
+                  "text/plain": {
+                    "schema": {
+                      "type": "string",
+                      "const": "nosniff"
+                    }
+                  }
                 }
               }
             },

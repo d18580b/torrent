@@ -262,9 +262,10 @@ fn the_problem_catalogue_says_what_the_handlers_do() {
 
 #[test]
 fn every_page_limit_publishes_its_bounds() {
-    // kynos describes a query parameter by its type alone, so a bound
-    // written on the field never reached the document: `limit` read as
-    // 0 to 4294967295 while the handler refused both ends.
+    // `limit`'s bound is `PageLimit`'s schema rather than a field
+    // constraint, which kynos would enforce as a `400` ahead of the
+    // handler's `422` (getkono/kynos#1139); every listing must still publish
+    // the range the handler enforces.
     let doc = doc();
     let mut seen = 0;
     for (method, path, op) in operations(&doc) {

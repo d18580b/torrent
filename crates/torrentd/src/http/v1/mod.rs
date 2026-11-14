@@ -18,15 +18,6 @@ pub mod torrents;
 /// The prefix every operation here is mounted under.
 pub const PREFIX: &str = "/v1";
 
-/// A `Created` response's `Location`: an operation's `relative_uri`, which
-/// knows the route but not the group it is mounted under, under [`PREFIX`].
-pub fn mounted(uri: kynos::http::Uri) -> kynos::response::status::Location {
-    // A URI holds no control character and no surrounding whitespace, and
-    // neither does PREFIX, so the joined string is always a field value.
-    kynos::response::status::Location::try_from(format!("{PREFIX}{uri}"))
-        .expect("PREFIX followed by a URI is a field value")
-}
-
 /// The largest request body any `/v1` operation but adding a torrent accepts.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 

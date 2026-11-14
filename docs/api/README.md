@@ -170,8 +170,10 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
 - **Every response** — the root endpoints included, and the `404` for an
   unknown path and the `405` for a wrong method — carries these headers:
   - `Cache-Control: no-store`
+  - `Referrer-Policy: no-referrer`
   - `X-Content-Type-Options: nosniff`
-  - `X-Request-Id`: 32 random hex digits, chosen by the daemon; one a
+  - `X-Request-Id`: 32 lowercase hex digits, chosen by the daemon and
+    unpredictable without a key it draws at startup; one a
     client sends is not adopted. The daemon's trace line for the response
     carries it with the operation, status and latency. Quote it when
     reporting a failure. (The line logged when the request arrives is

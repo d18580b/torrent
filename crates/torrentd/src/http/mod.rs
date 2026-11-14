@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use kynos::extract::body::binary::Binary;
 use kynos::http::media;
+use kynos::middleware::catch_panic::PanicPolicy;
 use kynos::openapi::Document;
 use kynos::openapi::ExternalDocumentation;
 use kynos::openapi::Info;
@@ -61,45 +62,50 @@ pub async fn get_openapi(Inject(doc): Inject<OpenApiJson>) -> Binary<media::Json
     Binary::new(bytes::Bytes::clone(&doc.0))
 }
 
-/// Every route the daemon serves, as one router.
-///
-/// A macro rather than a function: each group and interceptor changes the
-/// router's type, and the two consumers — the running service and the
-/// document — each need the whole of it.
-macro_rules! daemon_router {
-    () => {{
-        let request_id = kynos::middleware::request_id::RequestId::new()
-            .source(crate::http::headers::RandomRequestId);
-        // One event per request at each end, the closing one carrying the
-        // status, the latency and the request id: the line an operator
-        // quoting `X-Request-Id` is looking for. Read from the `RequestId`
-        // mounted below, so the two agree on the header and on whether an
-        // inbound id is echoed.
-        let trace = kynos::middleware::trace::Trace::new().correlating(&request_id);
-        let router = Router::<AppCtx>::new()
-            .info(info())
-            // On the router rather than a group, so every response — the
-            // root routes and the 404/405 for an unknown path or method
-            // included — carries them, and one id source serves every
-            // request.
-            .intercept(request_id)
-            // After `RequestId`, whose id it reads from the request; before
-            // everything else, so all of it runs in the span.
-            .intercept(crate::http::headers::RequestSpan)
-            .intercept(crate::http::headers::ApiHeaders)
-            .observe(trace)
-            .not_found(FallbackPolicy::Problem)
-            .method_not_allowed(FallbackPolicy::Problem)
-            .trailing_slashes(TrailingSlashPolicy::Strict)
-            .mount(kynos::routes![
-                healthz::get_live,
-                healthz::get_ready,
-                healthz::get_health,
-                metrics::get_metrics,
-                get_openapi
-            ]);
-        crate::http::v1::mount!(router)
-    }};
+/// Every route the daemon serves, as one router: the running service and
+/// the document are both built from it.
+fn router() -> Router<AppCtx, impl PanicPolicy, impl Sized, impl Sized> {
+    // 32 hex digits from a keyed hash of a counter, keyed afresh at
+    // startup: an id names one request across restarts too, and
+    // reveals nothing about how many requests the daemon has served.
+    let request_id = kynos::middleware::request_id::RequestId::new()
+        .source(kynos::middleware::request_id::Random::new());
+    // One event per request at each end, the closing one carrying the
+    // status, the latency and the request id: the line an operator
+    // quoting `X-Request-Id` is looking for. Read from the `RequestId`
+    // mounted below, so the two agree on the header and on whether an
+    // inbound id is echoed.
+    let trace = kynos::middleware::trace::Trace::new().correlating(&request_id);
+    let router = Router::<AppCtx>::new()
+        .info(info())
+        .external_docs(ExternalDocumentation::new(
+            "https://github.com/d18580b/torrent/blob/master/docs/api/README.md",
+        ))
+        // On the router rather than a group, so every response — the
+        // root routes and the 404/405 for an unknown path or method
+        // included — carries them, and one id source serves every
+        // request.
+        .intercept(request_id)
+        // After `RequestId`, whose id it reads from the request; before
+        // everything else, so all of it runs in the span.
+        .intercept(crate::http::headers::RequestSpan)
+        // `Cache-Control: no-store` (every response describes live
+        // daemon state, most of it readable only with a credential),
+        // `Referrer-Policy: no-referrer` and
+        // `X-Content-Type-Options: nosniff`.
+        .intercept(kynos::middleware::security_headers::SecurityHeaders::new())
+        .observe(trace)
+        .not_found(FallbackPolicy::Problem)
+        .method_not_allowed(FallbackPolicy::Problem)
+        .trailing_slashes(TrailingSlashPolicy::Strict)
+        .mount(kynos::routes![
+            healthz::get_live,
+            healthz::get_ready,
+            healthz::get_health,
+            metrics::get_metrics,
+            get_openapi
+        ]);
+    crate::http::v1::mount!(router)
 }
 
 /// The running service for `state`, serving `openapi` at
@@ -112,27 +118,23 @@ pub fn service(
     state: crate::app_state::AppState,
     openapi: OpenApiJson,
 ) -> kynos::Result<kynos::router::service::Service<AppCtx>> {
-    // Here rather than in `daemon_router!`, which the document shares: it
-    // holds the sink, and an observer describes nothing.
+    // Here rather than in `router()`, which the document shares: it holds
+    // the sink, and an observer describes nothing.
     let requests = metrics::HttpMetrics::new(Arc::clone(&state.metrics));
-    let service = daemon_router!()
+    let service = router()
         .observe(requests.clone())
         .build(AppCtx::new(state, openapi))?;
     requests.seed(service.openapi());
     Ok(service)
 }
 
-/// The published document, with the document-level members kynos has no
-/// setter for.
+/// The published document.
+///
+/// No document-level `security`: every operation declares its own, and a
+/// default would be inherited by the ones that need no credential (the three
+/// probes, this document, `POST /v1/sessions`).
 pub fn document() -> kynos::Result<Document> {
-    let mut doc = daemon_router!().openapi()?;
-    doc.external_docs = Some(ExternalDocumentation::new(
-        "https://github.com/d18580b/torrent/blob/master/docs/api/README.md",
-    ));
-    // No document-level `security`: every operation declares its own, and a
-    // default would be inherited by the ones that need no credential (the
-    // three probes, this document, `POST /v1/sessions`).
-    Ok(doc)
+    router().openapi()
 }
 
 /// The document as the bytes `docs/api/openapi.json` holds: pretty-printed,
