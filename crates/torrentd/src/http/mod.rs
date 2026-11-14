@@ -68,8 +68,11 @@ pub async fn get_openapi(Inject(doc): Inject<OpenApiJson>) -> Binary<media::Json
 /// document — each need the whole of it.
 macro_rules! daemon_router {
     () => {{
+        // 32 hex digits from a keyed hash of a counter, keyed afresh at
+        // startup: an id names one request across restarts too, and
+        // reveals nothing about how many requests the daemon has served.
         let request_id = kynos::middleware::request_id::RequestId::new()
-            .source(crate::http::headers::RandomRequestId);
+            .source(kynos::middleware::request_id::Random::new());
         // One event per request at each end, the closing one carrying the
         // status, the latency and the request id: the line an operator
         // quoting `X-Request-Id` is looking for. Read from the `RequestId`
@@ -86,7 +89,11 @@ macro_rules! daemon_router {
             // After `RequestId`, whose id it reads from the request; before
             // everything else, so all of it runs in the span.
             .intercept(crate::http::headers::RequestSpan)
-            .intercept(crate::http::headers::ApiHeaders)
+            // `Cache-Control: no-store` (every response describes live
+            // daemon state, most of it readable only with a credential),
+            // `Referrer-Policy: no-referrer` and
+            // `X-Content-Type-Options: nosniff`.
+            .intercept(kynos::middleware::security_headers::SecurityHeaders::new())
             .observe(trace)
             .not_found(FallbackPolicy::Problem)
             .method_not_allowed(FallbackPolicy::Problem)
