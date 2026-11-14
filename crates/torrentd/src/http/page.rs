@@ -27,15 +27,12 @@ const VERSION: &str = "v1";
 /// [`MAX_LIMIT`].
 ///
 /// A type rather than a `u32` field with `#[schema(minimum = 1, maximum =
-/// 1000)]`: kynos describes a query parameter by its type alone and drops a
-/// field's constraints, so the published document said `0` to `4294967295`.
-/// The bound is this type's schema, so every listing that takes a `limit`
-/// publishes it.
-///
-/// Parsing takes any `u32`, as the field did. An out-of-range value is then
-/// a `422 validation-failed` from [`PageRequest::parse`], reported beside the
-/// request's other violations, rather than the framework's `400` for a
-/// parameter that does not parse.
+/// 1000)]`: kynos publishes and enforces a query field's bounds, but refuses
+/// a value outside them with a `400`, before the handler runs
+/// (getkono/kynos#1139). This type's schema publishes the same bound, and
+/// parsing takes any `u32`, so an out-of-range value is a
+/// `422 validation-failed` from [`PageRequest::parse`], reported beside the
+/// request's other violations, as every other broken constraint is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageLimit(pub u32);
 
@@ -168,9 +165,12 @@ pub fn paginate<T>(
 
 /// A concrete, named page type.
 ///
-/// kynos inlines generic instantiations rather than naming them, so a
-/// `Page<T>` would reach every client as an anonymous schema. One named
-/// struct per collection keeps the document's components meaningful.
+/// kynos names a generic instantiation after its arguments, so a `Page<T>`
+/// would publish `Page_TorrentSummary` where the document has `TorrentPage`,
+/// renaming every page component
+/// the document already publishes and the clients generated from it. One
+/// struct per collection keeps those names, and gives each its own
+/// description.
 macro_rules! page {
     ($(#[$meta:meta])* $name:ident, $item:ty) => {
         $(#[$meta])*

@@ -13,6 +13,20 @@
 //! From a trusted peer the address chain is walked right to left, skipping
 //! every hop that is itself trusted, so a chain of proxies (a CDN, then an
 //! ingress controller) resolves to the client in front of the outermost one.
+//!
+//! Not kynos' `Router::trusted_proxies` and `Forwarded` extractor
+//! (`kynos::http::forwarded`), which answer the same question with different
+//! rules that would each change what an operator's deployment means:
+//!
+//! - kynos reads the one header it is configured with, where this reads
+//!   `X-Forwarded-For` and falls back to `Forwarded`, so a proxy sending
+//!   either works without a setting naming it;
+//! - kynos takes the scheme from the hop where trust stops, where `via_https`
+//!   accepts `https` anywhere in a readable chain (see [`Client::secure`]),
+//!   so a TLS edge in front of a plain inner proxy still reads as TLS;
+//! - kynos has no rule for an unspecified peer, which is what every request
+//!   on the unix-socket listener arrives from, so a `trusted_proxies` of
+//!   `0.0.0.0/0` would let any local process forge its client address there.
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
