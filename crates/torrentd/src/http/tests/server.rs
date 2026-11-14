@@ -86,7 +86,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
         .await;
     resp.assert_status(kynos::http::StatusCode::OK);
-    resp.assert_header("content-type", "text/plain; version=0.0.4");
+    resp.assert_header("content-type", "text/plain; version=0.0.4; charset=utf-8");
     assert!(resp.text().contains("alert_loop_heartbeat_age_seconds"));
 
     // A scrape that cannot be encoded is a 500, never a partial exposition,

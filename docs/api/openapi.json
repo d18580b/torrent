@@ -406,7 +406,9 @@
             },
             "content": {
               "text/plain; version=0.0.4": {
-                "schema": {}
+                "schema": {
+                  "type": "string"
+                }
               }
             }
           },
