@@ -729,3 +729,177 @@ fn a_legacy_registry_read_under_the_new_name_still_names_the_old_profile_ids() {
     let configured: HashSet<ProfileId> = [ProfileId::new("public")].into_iter().collect();
     assert_eq!(r.unknown_profiles(&configured).get("default"), Some(&1));
 }
+
+/// What a test subscriber saw: each span by name with the fields recorded on
+/// it, and each event's level with the span it was logged in.
+#[derive(Clone, Default)]
+struct Seen {
+    spans: Shared<(&'static str, BTreeMap<String, String>)>,
+    events: Shared<(tracing::Level, Option<&'static str>)>,
+}
+
+type Shared<T> = std::sync::Arc<parking_lot::Mutex<Vec<T>>>;
+
+struct Fields<'a>(&'a mut BTreeMap<String, String>);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for Seen
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = BTreeMap::new();
+        attrs.record(&mut Fields(&mut fields));
+        self.spans.lock().push((attrs.metadata().name(), fields));
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(name) = ctx.span(id).map(|s| s.name()) else {
+            return;
+        };
+        let mut spans = self.spans.lock();
+        if let Some((_, fields)) = spans.iter_mut().rev().find(|(n, _)| *n == name) {
+            values.record(&mut Fields(fields));
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let span = ctx.event_span(event).map(|s| s.name());
+        self.events.lock().push((*event.metadata().level(), span));
+    }
+}
+
+impl Seen {
+    /// The fields of the last span named `name`.
+    fn span(&self, name: &str) -> BTreeMap<String, String> {
+        self.spans
+            .lock()
+            .iter()
+            .rev()
+            .find(|(n, _)| *n == name)
+            .map(|(_, f)| f.clone())
+            .unwrap_or_else(|| panic!("no {name} span"))
+    }
+
+    fn install(&self) -> torrentd_engine::testing::SubscriberGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        torrentd_engine::testing::set_subscriber(tracing_subscriber::registry().with(self.clone()))
+    }
+}
+
+#[test]
+fn registry_writes_run_in_spans_naming_what_they_touch() {
+    let seen = Seen::default();
+    let _subscriber = seen.install();
+    let dir = tempdir().unwrap();
+    let r = AssignmentRegistry::new_empty(dir.path().join("registry.db"));
+    let ih = InfoHash([9u8; 20]);
+    r.assign(ih, ProfileId::new("a")).unwrap();
+    assert_eq!(r.remove(&ih).unwrap(), Some(ProfileId::new("a")));
+
+    for name in ["registry.open", "registry.open_db"] {
+        assert!(
+            seen.span(name).contains_key("path"),
+            "{name} names its path"
+        );
+    }
+    for name in [
+        "registry.assign",
+        "registry.insert",
+        "registry.remove",
+        "registry.delete",
+    ] {
+        let fields = seen.span(name);
+        assert_eq!(
+            fields.get("infohash").map(String::as_str),
+            Some(ih.to_hex().as_str()),
+            "{name}"
+        );
+        assert_eq!(
+            fields.get("profile_id").map(String::as_str),
+            Some("a"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_json_import_runs_in_a_span_counting_what_it_imported() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("assignments.json");
+    fs::write(
+        &file,
+        br#"{"0101010101010101010101010101010101010101":"a"}"#,
+    )
+    .unwrap();
+
+    let seen = Seen::default();
+    let _subscriber = seen.install();
+    AssignmentRegistry::open(dir.path().join("registry.db"), json(&file, false)).unwrap();
+
+    let fields = seen.span("registry.import");
+    assert_eq!(fields.get("entries").map(String::as_str), Some("1"));
+    assert_eq!(fields.get("imported").map(String::as_str), Some("1"));
+}
+
+#[test]
+fn a_refused_assign_is_logged_inside_its_span_at_debug_and_never_at_error() {
+    let dir = tempdir().unwrap();
+    let r = AssignmentRegistry::new_empty(dir.path().join("registry.db"));
+    let ih = InfoHash([10u8; 20]);
+    r.assign(ih, ProfileId::new("a")).unwrap();
+
+    let seen = Seen::default();
+    let _subscriber = seen.install();
+    r.assign(ih, ProfileId::new("b")).unwrap_err();
+
+    let events = seen.events.lock();
+    assert!(
+        events.contains(&(tracing::Level::DEBUG, Some("registry.assign"))),
+        "the conflict is logged inside registry.assign: {:?}",
+        *events
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(level, _)| *level == tracing::Level::ERROR),
+        "nothing is logged at ERROR: {:?}",
+        *events
+    );
+}
+
+#[test]
+fn lookups_served_from_memory_open_no_span() {
+    let dir = tempdir().unwrap();
+    let r = AssignmentRegistry::new_empty(dir.path().join("registry.db"));
+    let ih = InfoHash([11u8; 20]);
+    let profile = ProfileId::new("a");
+    r.assign(ih, profile.clone()).unwrap();
+
+    let seen = Seen::default();
+    let _subscriber = seen.install();
+    r.lookup(&ih);
+    r.entries();
+    r.for_profile(&profile);
+    r.for_each(|_, _| {});
+    assert!(seen.spans.lock().is_empty());
+}

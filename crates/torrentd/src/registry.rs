@@ -249,7 +249,18 @@ impl AssignmentRegistry {
         path: impl Into<PathBuf>,
         import: Option<JsonImport>,
     ) -> Result<Self, RegistryError> {
-        let path = path.into();
+        Self::open_at(path.into(), import)
+    }
+
+    /// [`Self::open`], once the path is a `PathBuf` its span can name.
+    #[tracing::instrument(
+        name = "registry.open",
+        level = "debug",
+        skip_all,
+        fields(path = %path.display(), import = import.is_some()),
+        err(level = "debug")
+    )]
+    fn open_at(path: PathBuf, import: Option<JsonImport>) -> Result<Self, RegistryError> {
         let parsed = match &import {
             Some(i) => Some(Self::read_json(i, &path)?),
             None => None,
@@ -447,6 +458,13 @@ impl AssignmentRegistry {
     /// Persisted before it is visible: a write that fails leaves the infohash
     /// unassigned in memory as on disk, so a caller that sees `Err` holds no
     /// claim to release.
+    #[tracing::instrument(
+        name = "registry.assign",
+        level = "debug",
+        skip_all,
+        fields(infohash = %ih, profile_id = %profile),
+        err(level = "debug")
+    )]
     pub fn assign(&self, ih: InfoHash, profile: ProfileId) -> Result<Claim, RegistryError> {
         let mut conn = self.writer.lock();
         if let Some(existing) = self.inner.read().get(&ih) {
@@ -470,13 +488,7 @@ impl AssignmentRegistry {
         // the statement is the answer.
         let hex = ih.to_hex();
         let tx = conn.transaction().map_err(|e| self.db_err(e))?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO assignment (infohash, profile_id) VALUES (?1, ?2) \
-                 ON CONFLICT (infohash) DO NOTHING",
-                params![hex, profile.as_str()],
-            )
-            .map_err(|e| self.db_err(e))?;
+        let inserted = self.insert_row(&tx, &ih, &profile)?;
         if inserted == 0 {
             let existing: String = tx
                 .query_row(
@@ -531,17 +543,17 @@ impl AssignmentRegistry {
     /// Like [`Self::assign`], persisted before it is visible: a write that
     /// fails leaves the assignment in place, so retrying the remove retries
     /// the write.
+    #[tracing::instrument(
+        name = "registry.remove",
+        level = "debug",
+        skip_all,
+        fields(infohash = %ih, profile_id = tracing::field::Empty),
+        err(level = "debug")
+    )]
     pub fn remove(&self, ih: &InfoHash) -> Result<Option<ProfileId>, RegistryError> {
         let mut conn = self.writer.lock();
         let tx = conn.transaction().map_err(|e| self.db_err(e))?;
-        let deleted: Option<String> = tx
-            .query_row(
-                "DELETE FROM assignment WHERE infohash = ?1 RETURNING profile_id",
-                params![ih.to_hex()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| self.db_err(e))?;
+        let deleted = self.delete_row(&tx, ih)?;
         tx.commit().map_err(|e| self.db_err(e))?;
         let prev = self.remove_entry(ih).or_else(|| {
             deleted
@@ -551,6 +563,7 @@ impl AssignmentRegistry {
         let Some(prev) = prev else {
             return Ok(None);
         };
+        tracing::Span::current().record("profile_id", tracing::field::display(&prev));
         drop(conn);
         debug!(
             target: "torrentd_engine::registry",
@@ -558,6 +571,57 @@ impl AssignmentRegistry {
             "removed",
         );
         Ok(Some(prev))
+    }
+
+    /// `assign`'s insert, inside `tx`: the rows it wrote, 0 where the table
+    /// already holds the infohash.
+    #[tracing::instrument(
+        name = "registry.insert",
+        level = "debug",
+        skip_all,
+        fields(infohash = %ih, profile_id = %profile),
+        err(level = "debug")
+    )]
+    fn insert_row(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        ih: &InfoHash,
+        profile: &ProfileId,
+    ) -> Result<usize, RegistryError> {
+        tx.execute(
+            "INSERT INTO assignment (infohash, profile_id) VALUES (?1, ?2) \
+             ON CONFLICT (infohash) DO NOTHING",
+            params![ih.to_hex(), profile.as_str()],
+        )
+        .map_err(|e| self.db_err(e))
+    }
+
+    /// `remove`'s delete, inside `tx`: the profile id the deleted row held,
+    /// unvalidated, or `None` where there was no row.
+    #[tracing::instrument(
+        name = "registry.delete",
+        level = "debug",
+        skip_all,
+        fields(infohash = %ih, profile_id = tracing::field::Empty),
+        err(level = "debug")
+    )]
+    fn delete_row(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        ih: &InfoHash,
+    ) -> Result<Option<String>, RegistryError> {
+        let deleted: Option<String> = tx
+            .query_row(
+                "DELETE FROM assignment WHERE infohash = ?1 RETURNING profile_id",
+                params![ih.to_hex()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| self.db_err(e))?;
+        if let Some(id) = &deleted {
+            tracing::Span::current().record("profile_id", id.as_str());
+        }
+        Ok(deleted)
     }
 
     /// Snapshot of every (infohash, profile) pair, sorted by profile for
@@ -617,6 +681,13 @@ impl AssignmentRegistry {
 }
 
 /// Open the database, creating it and its schema where absent.
+#[tracing::instrument(
+    name = "registry.open_db",
+    level = "debug",
+    skip_all,
+    fields(path = %path.display()),
+    err(level = "debug")
+)]
 fn open_db(path: &Path) -> Result<Connection, RegistryError> {
     let db = |source| RegistryError::Db {
         path: path.to_path_buf(),
@@ -712,6 +783,13 @@ fn read_all(conn: &Connection, path: &Path) -> Result<HashMap<InfoHash, ProfileI
 /// An entry the database already holds for the same profile is skipped; one
 /// it holds for a different profile refuses the whole import, which rolls
 /// back.
+#[tracing::instrument(
+    name = "registry.import",
+    level = "debug",
+    skip_all,
+    fields(file = %file.display(), entries = entries.len(), imported = tracing::field::Empty),
+    err(level = "debug")
+)]
 fn import_into(
     conn: &mut Connection,
     db: &Path,
@@ -754,6 +832,7 @@ fn import_into(
     }
     tx.commit().map_err(err)?;
     let n = fresh.len();
+    tracing::Span::current().record("imported", n);
     map.extend(fresh);
     Ok(n)
 }
