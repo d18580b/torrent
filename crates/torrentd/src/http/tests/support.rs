@@ -1,18 +1,15 @@
 //! Driving the whole router in-process, and recording which declared
 //! responses the tests produced.
 //!
-//! kynos' own `TestClient::assert_declared_responses_covered` checks one
-//! client against every operation, but the responses this API declares need
-//! different daemons to produce — authentication on and off, a pool configured
-//! and not, a profile fenced. So every request here goes through a
-//! [`Harness`], which records `(method, path template, status)` into a
-//! [`Coverage`] that outlives any one daemon, and `tests::spec` asserts over
-//! the union.
+//! The responses this API declares need different daemons to produce —
+//! authentication on and off, a pool configured and not, a profile fenced —
+//! so no one client sees them all. Every [`Harness`]'s client records into a
+//! [`Coverage`] that outlives any one daemon (kynos'
+//! `TestClient::with_coverage`), and `tests::spec` asserts over the union.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::Mutex;
 
+use kynos::http::Method;
 use kynos::http::StatusCode;
 use kynos::test::TestClient;
 use kynos::test::TestResponse;
@@ -28,79 +25,25 @@ use crate::http::OpenApiJson;
 /// The operator password every authenticated harness is configured with.
 pub const PASSWORD: &str = "correct-horse-battery";
 
-/// Every `(METHOD, path template, status)` a test has produced.
+/// Every response any harness's client received, held to the published
+/// document once every scenario has run.
 #[derive(Default)]
-pub struct Coverage {
-    seen: Mutex<BTreeSet<(String, String, u16)>>,
-}
+pub struct Coverage(kynos::test::Coverage);
 
 impl Coverage {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    fn saw(&self, method: &str, path: &str, status: StatusCode) {
-        let path = path.split('?').next().unwrap_or(path);
-        let template = template_of(path).unwrap_or_else(|| path.to_owned());
-        self.seen
-            .lock()
-            .unwrap()
-            .insert((method.to_owned(), template, status.as_u16()));
+    /// Every response the document declares was received by some harness.
+    ///
+    /// # Panics
+    ///
+    /// Listing every declared response nobody produced.
+    pub fn assert_declared_responses_covered(&self) {
+        self.0
+            .assert_declared_responses_covered(&crate::http::document().unwrap());
     }
-
-    /// Every declared `(METHOD, template, status)` nobody produced.
-    pub fn missing(&self) -> Vec<String> {
-        let doc: serde_json::Value = serde_json::from_str(&crate::http::document_json().unwrap())
-            .expect("the document is JSON");
-        let seen = self.seen.lock().unwrap();
-        let mut missing = Vec::new();
-        for (template, item) in doc["paths"].as_object().unwrap() {
-            for (method, op) in item.as_object().unwrap() {
-                for status in op["responses"].as_object().unwrap().keys() {
-                    let status: u16 = status.parse().expect("every declared status is exact");
-                    let key = (method.to_uppercase(), template.clone(), status);
-                    if !seen.contains(&key) {
-                        missing.push(format!("{} {} -> {}", key.0, key.1, key.2));
-                    }
-                }
-            }
-        }
-        missing
-    }
-}
-
-/// The document's path template matching a concrete `path`.
-fn template_of(path: &str) -> Option<String> {
-    static TEMPLATES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let templates = TEMPLATES.get_or_init(|| {
-        let doc: serde_json::Value =
-            serde_json::from_str(&crate::http::document_json().unwrap()).unwrap();
-        doc["paths"].as_object().unwrap().keys().cloned().collect()
-    });
-    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    // A literal segment beats a parameter, as the router's own matching does:
-    // `/v1/torrents/pause-all` is not `/v1/torrents/{infohash}`.
-    templates
-        .iter()
-        .filter_map(|t| {
-            let parts: Vec<&str> = t.trim_start_matches('/').split('/').collect();
-            if parts.len() != segments.len() {
-                return None;
-            }
-            let mut literals = 0;
-            for (p, s) in parts.iter().zip(&segments) {
-                if p.starts_with('{') {
-                    continue;
-                }
-                if p != s {
-                    return None;
-                }
-                literals += 1;
-            }
-            Some((literals, t))
-        })
-        .max_by_key(|(literals, _)| *literals)
-        .map(|(_, t)| t.clone())
 }
 
 /// Credentials a harness was configured with.
@@ -128,7 +71,6 @@ pub struct Harness {
     pub client: TestClient<AppCtx>,
     pub state: Arc<AppState>,
     pub tokens: Tokens,
-    coverage: Arc<Coverage>,
 }
 
 /// The `[auth] session_ttl_secs` an authenticated harness runs with, unless
@@ -183,12 +125,11 @@ impl Harness {
         // sees whatever a request changes.
         let shared = Arc::new(state.clone());
         let service = crate::http::service(state, openapi).expect("the router builds");
-        let client = TestClient::new(service);
+        let client = TestClient::new(service).with_coverage(&coverage.0);
         Self {
             client,
             state: shared,
             tokens,
-            coverage: Arc::clone(coverage),
         }
     }
 
@@ -244,39 +185,50 @@ impl Harness {
         body: Option<serde_json::Value>,
         headers: &[(&str, &str)],
     ) -> TestResponse {
-        let mut req = match method {
-            "GET" => self.client.get(path),
-            "POST" => self.client.post(path),
-            "PUT" => self.client.put(path),
-            "DELETE" => self.client.delete(path),
-            "PATCH" => self.client.patch(path),
-            other => panic!("unsupported method {other}"),
-        };
-        req = req.peer("192.0.2.10:40000".parse().unwrap());
-        if let Some(token) = token {
-            req = req.header("authorization", &format!("Bearer {token}"));
-        }
+        let mut req = self.request(method, path, token);
         for (name, value) in headers {
             req = req.header(name, value);
         }
         if let Some(body) = body {
             req = req.json(&body);
         }
-        let resp = req.send().await;
-        self.coverage.saw(method, path, resp.status());
-        resp
+        req.send().await
     }
 
-    /// Send `method path` over a real socket with a body that declares more
-    /// bytes than it sends and then stalls, and return the status the server
-    /// answers with and how long, on the tokio clock, it took to.
+    /// `method path` from this harness's client peer, with `token` as the
+    /// bearer credential, if any.
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> kynos::test::TestRequest<'_, AppCtx> {
+        let method = Method::from_bytes(method.as_bytes())
+            .unwrap_or_else(|_| panic!("{method:?} is not a method"));
+        let mut req = self
+            .client
+            .method(method, path)
+            .peer("192.0.2.10:40000".parse().unwrap());
+        if let Some(token) = token {
+            req = req.header("authorization", &format!("Bearer {token}"));
+        }
+        req
+    }
+
+    /// Send `method path` with a body that declares more bytes than it sends
+    /// and then stalls, and return the status it is answered with and how
+    /// long, on the tokio clock, that took.
     ///
-    /// The in-process client can only send a body it has in full, so this
-    /// serves a second router over `state` on a loopback listener — the same
-    /// `kynos::server::Server` the daemon runs — and writes the request by
-    /// hand. The clock is paused while it waits, so a deadline of minutes
-    /// elapses as soon as nothing else can run: the result is exact, and the
-    /// test does not wait for it.
+    /// The request is sent twice. The in-process client sends it as a stream
+    /// that never ends (`TestRequest::body_stream`), and its answer is the
+    /// one returned and recorded in the harness's [`Coverage`]. It is also
+    /// written by hand over a loopback socket to a second router over `state`,
+    /// served by the `kynos::server::Server` the daemon runs, which must
+    /// answer the same within a second: a server bound such as a request-body
+    /// idle timeout would otherwise answer first, and no in-process request
+    /// meets one. The clock is paused while each waits, so a deadline of
+    /// minutes elapses as soon as nothing else can run: the result is exact,
+    /// and the test does not wait for it.
     pub async fn slow_body(
         &self,
         method: &str,
@@ -302,10 +254,9 @@ impl Harness {
     }
 
     /// As [`slow_body`](Self::slow_body), with a request that declares a
-    /// `content-length` of `declared` bytes and sends none of them. The
-    /// in-process client always sends what it declares, so this is the only
-    /// way to show a body over the limit is refused from the head: a server
-    /// that read it before answering would wait out its deadline instead.
+    /// `content-length` of `declared` bytes and sends none of them, which
+    /// shows a body over the limit is refused from the head: a server that
+    /// read it before answering would wait out its deadline instead.
     pub async fn oversized_body(
         &self,
         method: &str,
@@ -318,6 +269,58 @@ impl Harness {
     }
 
     async fn stalled_body(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        framing: Framing,
+    ) -> (StatusCode, std::time::Duration) {
+        let (status, waited) = self.stalled_in_process(method, path, token, framing).await;
+        let (served, served_after) = self.stalled_on_server(method, path, token, framing).await;
+        assert_eq!(
+            served, status,
+            "{method} {path}: the daemon's server answers a stalled body other than the router does"
+        );
+        assert!(
+            served_after.abs_diff(waited) < std::time::Duration::from_secs(1),
+            "{method} {path}: the daemon's server answered after {served_after:?}, \
+             the router after {waited:?}"
+        );
+        (status, waited)
+    }
+
+    /// The stalled request of `framing` through the in-process client.
+    async fn stalled_in_process(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        framing: Framing,
+    ) -> (StatusCode, std::time::Duration) {
+        use futures_util::StreamExt as _;
+
+        let (first, declared): (&'static [u8], _) = match framing {
+            Framing::Declared => (b"{\"pad\": \"", Some(64)),
+            Framing::Chunked => (b"{\"pad\": \"", None),
+            Framing::Oversized(declared) => (b"", Some(declared)),
+        };
+        let chunks = futures_util::stream::iter(
+            Some(bytes::Bytes::from_static(first)).filter(|chunk| !chunk.is_empty()),
+        )
+        .chain(futures_util::stream::pending());
+        let mut req = self
+            .request(method, path, token)
+            .body_stream("application/json", chunks);
+        if let Some(declared) = declared {
+            req = req.content_length(declared);
+        }
+        let (resp, waited) = on_a_paused_clock(method, path, req.send()).await;
+        (resp.status(), waited)
+    }
+
+    /// The stalled request of `framing`, written by hand over a loopback
+    /// socket to the server the daemon runs.
+    async fn stalled_on_server(
         &self,
         method: &str,
         path: &str,
@@ -371,23 +374,6 @@ impl Harness {
         };
         stream.write_all(head.as_bytes()).await.unwrap();
 
-        // A request nothing bounds would otherwise wait forever. The guard is
-        // a thread on the real clock, not a tokio timer: a paused clock jumps
-        // to the earliest tokio timer the moment nothing can run, which may
-        // be before the server has armed its own deadline, and a guard timer
-        // would then be what fires.
-        let (done, done_rx) = std::sync::mpsc::channel::<()>();
-        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
-        std::thread::spawn(move || {
-            if done_rx.recv_timeout(std::time::Duration::from_secs(60))
-                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            {
-                let _ = fire.send(());
-            }
-        });
-
-        tokio::time::pause();
-        let started = tokio::time::Instant::now();
         let mut response = Vec::new();
         let mut buf = [0u8; 1024];
         let read = async {
@@ -400,17 +386,7 @@ impl Harness {
                 response.extend_from_slice(&buf[..n]);
             }
         };
-        let answered = tokio::select! {
-            () = read => true,
-            _ = fired => false,
-        };
-        let waited = started.elapsed();
-        drop(done);
-        tokio::time::resume();
-        assert!(
-            answered,
-            "{method} {path}: no response to a stalled body in a minute of real time"
-        );
+        let ((), waited) = on_a_paused_clock(method, path, read).await;
         server.abort();
 
         let line = String::from_utf8_lossy(&response);
@@ -419,9 +395,7 @@ impl Harness {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| panic!("{method} {path}: not a status line: {line}"));
-        let status = StatusCode::from_u16(status).unwrap();
-        self.coverage.saw(method, path, status);
-        (status, waited)
+        (StatusCode::from_u16(status).unwrap(), waited)
     }
 
     /// Shorthand for a request with the `write` token and no body.
@@ -440,6 +414,47 @@ impl Harness {
     pub fn assert_conformance(&self) {
         self.client.assert_conformance();
     }
+}
+
+/// Run `answer`, the wait for the response to a stalled `method path`, on a
+/// paused tokio clock, and return its output and how long it took on that
+/// clock.
+///
+/// # Panics
+///
+/// When it has not finished after a minute of real time: a request nothing
+/// bounds would otherwise wait forever. The guard is a thread on the real
+/// clock, not a tokio timer: a paused clock jumps to the earliest tokio timer
+/// the moment nothing can run, which may be before the server has armed its
+/// own deadline, and a guard timer would then be what fires.
+async fn on_a_paused_clock<T>(
+    method: &str,
+    path: &str,
+    answer: impl std::future::Future<Output = T>,
+) -> (T, std::time::Duration) {
+    let (done, done_rx) = std::sync::mpsc::channel::<()>();
+    let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        if done_rx.recv_timeout(std::time::Duration::from_secs(60))
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            let _ = fire.send(());
+        }
+    });
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let answered = tokio::select! {
+        output = answer => Some(output),
+        _ = fired => None,
+    };
+    let waited = started.elapsed();
+    drop(done);
+    tokio::time::resume();
+    let output = answered.unwrap_or_else(|| {
+        panic!("{method} {path}: no response to a stalled body in a minute of real time")
+    });
+    (output, waited)
 }
 
 /// Assert `resp` is a problem of `slug` with `status`.
