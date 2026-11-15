@@ -304,7 +304,7 @@ fn check_url(url: &str) -> anyhow::Result<()> {
             redact_for_target("torrentd::telemetry", url)
         );
     }
-    if let Err(e) = url.parse::<hyper::Uri>() {
+    if let Err(e) = url.parse::<kynos::http::Uri>() {
         anyhow::bail!(
             "{:?} is not a valid URL: {e}",
             redact_for_target("torrentd::telemetry", url)
