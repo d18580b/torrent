@@ -302,6 +302,7 @@ Every profile takes `id` plus `network`, and then:
 | `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client, so the two must name the same client: `"-qB5030-"` with `"qBittorrent/5.0.3"`, not a prefix of one client beside another's user agent. Nothing checks the pairing. Only the prefix and the strings change: the rest of the peer id, the extension handshake, the announce parameters and the rest of the wire behaviour stay libtorrent's. Name a client built on libtorrent 2.0, in a version that ships on it — qBittorrent, or Deluge (`"-DE211s-"` with `"Deluge/2.1.1 libtorrent/2.0.14.0"`) — never Transmission or rTorrent, whose identity a tracker comparing the wire with the claimed client sees through. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters — in the same form as the top-level key it overrides, and never libtorrent's own `-LT` code. |
 | `allowed_tracker_domains` | **required**, non-empty: the domains of this account's trackers — see [Account isolation](#account-isolation). |
 | `allowed_tracker_urls` | optional; **required** where another profile's `allowed_tracker_domains` overlaps this one's: announce-URL prefixes carrying this account's passkey — see [Account isolation](#account-isolation). |
+| `tracker_dns`, `tracker_dns_servers` | default `"host"`: tracker hostnames are looked up by the host's resolver. `"tunnel"` looks them up through this profile's own tunnel, asking `tracker_dns_servers` or, where that is not set, the WireGuard config's `DNS =` addresses (an OpenVPN profile must set it), and turns uTP off for the profile — see [Tracker lookups through a tunnel](#tracker-lookups-through-a-tunnel). |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
@@ -510,15 +511,64 @@ reporting are all read-only without it.
 
 ### Tracker lookups through a tunnel
 
-A `vpn` profile's announces leave by its tunnel, but **the tracker hostnames
-it looks up do not**, with or without `network_kill_switch`. The daemon
-resolves names with the host's resolver. Under the kill switch only a resolver
-on loopback is reachable (§11.6), and a local resolver forwards the query
-under its own uid by whatever interface its configuration picks, usually the
-physical one. So the host's upstream resolver, typically the ISP's, sees every
-tracker hostname the daemon looks up, even though no announce reaches it.
+A `vpn` profile's announces leave by its tunnel, but by default **the tracker
+hostnames it looks up do not**, with or without `network_kill_switch`.
+libtorrent resolves names with libc, through the one `/etc/resolv.conf` the
+process has. Under the kill switch only a resolver on loopback is reachable
+(§11.6), and a local resolver forwards the query under its own uid by
+whatever interface its configuration picks, usually the physical one. So the
+host's upstream resolver, typically the ISP's, sees every tracker hostname
+the daemon looks up, even though no announce reaches it.
 
-The supported way to keep those lookups inside a tunnel is to configure
+**`tracker_dns = "tunnel"`** keeps a profile's tracker lookups in its own
+tunnel, with nothing to configure on the host:
+
+```toml
+[[profile]]
+id = "acct_a"
+network = "vpn"
+# …
+tracker_dns = "tunnel"
+# Optional: the WireGuard config's `DNS = 10.2.0.1` is used without it.
+# tracker_dns_servers = ["10.2.0.1"]
+```
+
+The daemon then runs a SOCKS5 proxy for that profile's tracker connections
+on the tunnel's own address, and has libtorrent hand it each tracker's
+hostname rather than resolve it. The proxy asks the profile's resolvers over
+UDP from the tunnel address, through the tunnel, and connects to the tracker
+(or relays a UDP tracker's datagrams) from there too, so the question and
+the announce leave by the same tunnel, and each provider sees only its own
+account's tracker names. The kill switch's per-tunnel rule already lets
+both out: no `kill_switch_dns_servers` carve-out is needed, and none should
+be set for these lookups. Only that profile's session can use the proxy: it
+accepts connections from the tunnel address alone, with a username and
+password random per start. A tracker's HTTP redirect goes through the proxy
+like the announce.
+
+What it costs:
+
+- **uTP is off** for the profile, and its peers are reached over TCP alone.
+  libtorrent sends a UDP tracker's announces through the proxy, and while it
+  does, it ignores every datagram on the listen socket that does not come
+  from the proxy, uTP's included.
+- **Announces go over IPv4 only.** libtorrent names one proxy for every
+  listen socket, and the proxy is on the tunnel's IPv4 address, so the
+  announce from an IPv6 listen socket cannot reach it: a tracker learns the
+  profile's IPv4 address alone, and logs of tracker errors show the IPv6
+  endpoint failing. For the same reason the proxy asks only the IPv4
+  resolvers and connects only to a tracker's IPv4 addresses: an IPv6
+  resolver is passed over, and a tracker with no IPv4 address fails its
+  announce, rather than either leaving by the host's own route.
+- The resolvers must answer within 3 s over UDP. A name none of them knows
+  fails the announce; it is never handed to the host's resolver.
+- A profile with `tracker_dns = "tunnel"` and no resolver to ask (no
+  `tracker_dns_servers`, and no `DNS =` address in its WireGuard config), or
+  whose proxy cannot start, is failed at startup and its tunnel lowered, as
+  for any other bring-up failure. Changing either key takes a restart.
+
+The rest of this section is the alternative for a profile left at
+`tracker_dns = "host"`: configure
 **`systemd-resolved`** (the host's resolver, through its stub on `127.0.0.53`
 or `nss-resolve`) with a DNS server on each tunnel link and that profile's
 tracker domains as **routing domains** on the link. A lookup for a name under
@@ -2636,6 +2686,11 @@ On a scratch pool, not your real one.
    `torrentd_kill_switch_dns_exempt` is `1`, and `vpn check` and the
    `/healthz` body (`kill_switch_dns_exempt`) report it. `vpn check
    --as-uid` dry-runs both carve-outs in the ruleset it hands to `nft`.
+   Where every `vpn` profile sets `tracker_dns = "tunnel"` (§5, "Tracker
+   lookups through a tunnel"), the tracker lookups go through the tunnels
+   and the DNS carve-out is not needed for them; leave
+   `kill_switch_dns_servers` unset unless something else of the daemon's
+   must resolve through the cluster.
 8. **The kill switch's edges, and a fence during a renewal.** Four scripted
    drills, each in a private user, network and mount namespace that it
    creates and that disappears when it exits. None needs root, and none

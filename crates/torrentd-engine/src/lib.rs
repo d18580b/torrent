@@ -100,6 +100,7 @@ pub use profile::ProfileConfig;
 pub use profile::ProfileConfigError;
 pub use profile::ProfileId;
 pub use profile::ProfileNetwork;
+pub use profile::TrackerDns;
 pub use real::RealEngine;
 pub use resume_store::FsResumeStore;
 #[cfg(any(test, feature = "test-support"))]

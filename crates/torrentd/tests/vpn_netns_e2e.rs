@@ -77,6 +77,9 @@ const HOST_V6: &str = "2001:db8:9::1";
 const PEER_V6: &str = "2001:db8:9::2";
 const WG_PEER_PORT: u16 = 51820;
 const TRACKER_PORT: u16 = 6969;
+/// The hostname the tunnel-DNS test announces to, which only the resolver
+/// inside the tunnel knows.
+const TRACKER_NAME: &str = "tracker.e2e";
 /// Where the peer namespace listens for the daemon's peer connections.
 const SWARM_PORT: u16 = 6881;
 /// The static profile's listen port.
@@ -618,7 +621,7 @@ fn write_config_top(dir: &std::path::Path, top: &str, profile_extra: &str) -> st
                  vpn_interface = \"{WG}\"\n\
                  peer_fingerprint = \"-qB5030-\"\n\
                  user_agent = \"qBittorrent/5.0.3\"\n\
-                 allowed_tracker_domains = [\"{PEER_TUNNEL}\", \"{PEER_TUNNEL_V6}\"]\n\
+                 allowed_tracker_domains = [\"{PEER_TUNNEL}\", \"{PEER_TUNNEL_V6}\", \"{TRACKER_NAME}\"]\n\
                  {profile_extra}\n",
             d = dir.display(),
             wg = wg_config(),
@@ -1712,4 +1715,194 @@ fn vpn_netns_e2e_cluster_carve_outs_let_out_the_api_and_dns_and_nothing_else() {
 
     daemon.stop();
     assert!(!table_listed(), "the kill switch table is removed on stop");
+}
+
+/// The UDP port the tunnel-DNS test's UDP tracker answers on.
+const UDP_TRACKER_PORT: u16 = 6970;
+
+/// A DNS server in the peer namespace on `bind`:53, answering
+/// [`TRACKER_NAME`]'s A question with [`PEER_TUNNEL`] and every other
+/// question with no address; the source of each question it was asked.
+fn tunnel_dns(peer: &Peer, bind: &str) -> Arc<Mutex<Vec<SocketAddr>>> {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let recorded = asked.clone();
+    let bind: SocketAddr = format!("{bind}:53").parse().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    peer.spawn(move || {
+        let sock = UdpSocket::bind(bind);
+        tx.send(sock.as_ref().map(|_| ()).map_err(|e| e.to_string()))
+            .unwrap();
+        let Ok(sock) = sock else { return };
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            recorded.lock().unwrap().push(from);
+            let q = &buf[..n];
+            let Some(end) = q.iter().skip(12).position(|b| *b == 0).map(|i| i + 13) else {
+                continue;
+            };
+            let Some(qtail) = q.get(end..end + 4) else {
+                continue;
+            };
+            let mut name = Vec::new();
+            let mut at = 12;
+            while at < end - 1 {
+                let len = usize::from(q[at]);
+                name.push(String::from_utf8_lossy(&q[at + 1..at + 1 + len]).to_string());
+                at += 1 + len;
+            }
+            let found = name.join(".").eq_ignore_ascii_case(TRACKER_NAME) && qtail[..2] == [0, 1];
+            let mut out = q[..2].to_vec();
+            out.extend_from_slice(&[0x81, 0x80, 0, 1, 0, u8::from(found), 0, 0, 0, 0]);
+            out.extend_from_slice(&q[12..end + 4]);
+            if found {
+                out.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                out.extend_from_slice(&PEER_TUNNEL.parse::<std::net::Ipv4Addr>().unwrap().octets());
+            }
+            let _ = sock.send_to(&out, from);
+        }
+    });
+    rx.recv()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("bind {bind} in the peer namespace: {e}"));
+    asked
+}
+
+/// A UDP tracker (BEP 15) in the peer namespace on [`PEER_TUNNEL`]: it
+/// answers every connect and every announce, the latter with no peers; the
+/// source of each announce.
+fn udp_tracker(peer: &Peer) -> Arc<Mutex<Vec<SocketAddr>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let bind: SocketAddr = format!("{PEER_TUNNEL}:{UDP_TRACKER_PORT}").parse().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    peer.spawn(move || {
+        let sock = UdpSocket::bind(bind);
+        tx.send(sock.as_ref().map(|_| ()).map_err(|e| e.to_string()))
+            .unwrap();
+        let Ok(sock) = sock else { return };
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            if n < 16 {
+                continue;
+            }
+            let action = &buf[8..12];
+            let tid = &buf[12..16];
+            let mut out = Vec::new();
+            if action == [0, 0, 0, 0] {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out.extend_from_slice(tid);
+                out.extend_from_slice(&0x0e2e_0e2e_0e2e_0e2e_u64.to_be_bytes());
+            } else if action == [0, 0, 0, 1] && n >= 98 {
+                recorded.lock().unwrap().push(from);
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(tid);
+                // interval, leechers, seeders; no peers.
+                out.extend_from_slice(&[0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0]);
+            } else {
+                continue;
+            }
+            let _ = sock.send_to(&out, from);
+        }
+    });
+    rx.recv()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("bind udp {bind} in the peer namespace: {e}"));
+    seen
+}
+
+/// Add a magnet for `ih` announcing to `tracker` alone.
+fn add_magnet_to(ih: &str, tracker: &str) -> (u16, String) {
+    let tracker: String = tracker
+        .bytes()
+        .map(|b| match b {
+            b':' => "%3A".to_string(),
+            b'/' => "%2F".to_string(),
+            _ => char::from(b).to_string(),
+        })
+        .collect();
+    let magnet = format!("magnet:?xt=urn:btih:{ih}&dn=e2e&tr={tracker}");
+    http(
+        "POST",
+        "/v1/torrents",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"magnet\",\"uri\":\"{magnet}\"}}}}"
+        )),
+    )
+}
+
+/// `tracker_dns = "tunnel"` under the kill switch with no
+/// `kill_switch_dns_servers`: the profile's trackers are named by a hostname
+/// only the resolver inside the tunnel (the WireGuard config's `DNS =`)
+/// knows, and the host's own resolver is on the physical link, where it
+/// answers too. Both the HTTP and the UDP tracker are announced to through
+/// the tunnel, the tunnel's resolver is asked from the tunnel address, the
+/// host's resolver is asked nothing, and no packet, port 53 or other,
+/// reaches the physical link outside the tunnel.
+#[test]
+#[ignore = "needs ip, wg, nft, unshare and nsenter, and user namespaces; run by mise run test-netns"]
+fn vpn_netns_e2e_tracker_hostnames_resolve_through_the_tunnel() {
+    if !in_own_namespace("vpn_netns_e2e_tracker_hostnames_resolve_through_the_tunnel") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let peer = topology(p);
+    // The provider's resolver, inside the tunnel, named by the config.
+    let config = std::fs::read_to_string(wg_config()).unwrap();
+    std::fs::write(
+        wg_config(),
+        config.replacen("[Peer]", &format!("DNS = {PEER_TUNNEL}\n\n[Peer]"), 1),
+    )
+    .unwrap();
+    // The host's resolver, on the physical link: what libc would ask.
+    std::fs::write(p.join("resolv.conf"), format!("nameserver {PEER_V4}\n")).unwrap();
+    sh(&format!(
+        "mount --bind {} /etc/resolv.conf",
+        p.join("resolv.conf").display()
+    ));
+    let in_tunnel = tunnel_dns(&peer, PEER_TUNNEL);
+    let on_host = tunnel_dns(&peer, PEER_V4);
+    let announces = tracker(&peer);
+    let udp_announces = udp_tracker(&peer);
+    let base = peer.leaks();
+
+    let mut daemon = Daemon::start(
+        p,
+        &format!("listen_port = {LISTEN_PORT}\ntracker_dns = \"tunnel\""),
+    );
+    assert_eq!(metric("torrentd_kill_switch_active"), Some(1.0));
+
+    let (code, body) = add_magnet_to(
+        IH,
+        &format!("http://{TRACKER_NAME}:{TRACKER_PORT}/announce"),
+    );
+    assert_eq!(code, 201, "add the torrent: {body}");
+    let udp_ih = "5e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e";
+    let (code, body) = add_magnet_to(udp_ih, &format!("udp://{TRACKER_NAME}:{UDP_TRACKER_PORT}"));
+    assert_eq!(code, 201, "add the torrent: {body}");
+
+    poll(
+        "an HTTP announce to the tracker by name, through the tunnel",
+        Duration::from_secs(30),
+        || (tunnelled(&announces) > 0).then_some(()),
+    );
+    poll(
+        "a UDP announce to the tracker by name, through the tunnel",
+        Duration::from_secs(30),
+        || (tunnelled(&udp_announces) > 0).then_some(()),
+    );
+    let asked = in_tunnel.lock().unwrap().clone();
+    assert!(!asked.is_empty(), "the tunnel's resolver was asked");
+    assert!(
+        asked.iter().all(|a| a.ip().to_string() == TUNNEL),
+        "every question came from the tunnel address: {asked:?}"
+    );
+    assert!(
+        on_host.lock().unwrap().is_empty(),
+        "the host's resolver was asked nothing"
+    );
+    peer.assert_no_leak(base, "resolving and announcing through the tunnel");
+
+    daemon.stop();
+    peer.assert_no_leak(base, "across the clean stop");
 }

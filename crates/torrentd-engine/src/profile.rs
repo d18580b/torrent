@@ -125,6 +125,7 @@ mod validate;
 pub use config::bind_endpoint;
 pub use config::ProfileConfig;
 pub use config::ProfileNetwork;
+pub use config::TrackerDns;
 pub use id::ProfileId;
 pub use id::ID_CHARSET_RULE;
 pub use validate::ProfileConfigError;
@@ -190,6 +191,7 @@ mod props {
                 listen_port: (!matches!(flaw, Flaw::NoPort)).then_some(port),
                 port_forward: PortForwardMode::Static,
                 port_forward_gateway: None,
+                tracker_dns: crate::TrackerDns::Host,
             }
         } else {
             ProfileNetwork::Host {

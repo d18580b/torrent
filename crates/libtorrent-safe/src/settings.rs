@@ -88,6 +88,39 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub announce_ip: Option<String>,
 
+    // ---- Proxy ----
+    //
+    // A vpn profile with `tracker_dns = "tunnel"` sends its tracker
+    // connections through a SOCKS5 proxy the daemon runs on the tunnel
+    // address, handing it each tracker's hostname to resolve
+    // (`proxy_hostnames`), so libtorrent never resolves one through libc.
+    /// libtorrent's `proxy_type_t`: 0 none, 2 SOCKS5, 3 SOCKS5 with a
+    /// username and password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_type: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+    /// Hand hostnames to the proxy rather than resolving them first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_hostnames: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_peer_connections: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_tracker_connections: Option<bool>,
+    /// uTP. With a SOCKS5 UDP association standing, libtorrent drops every
+    /// datagram that does not come from the proxy, uTP's included, so a
+    /// session whose UDP trackers go through one runs its peers over TCP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_outgoing_utp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_incoming_utp: Option<bool>,
+
     // ---- Connection / pool sizing ----
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connections_limit: Option<u32>,

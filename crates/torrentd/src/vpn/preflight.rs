@@ -630,6 +630,7 @@ mod tests {
                 listen_port: Some(6881),
                 port_forward: Default::default(),
                 port_forward_gateway: None,
+                tracker_dns: torrentd_engine::TrackerDns::Host,
             },
         )
     }

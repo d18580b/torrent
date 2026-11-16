@@ -40,7 +40,13 @@
 //! destination of its own family ([`super::route`]), so a paired IPv6
 //! address needs an IPv6 route through the tunnel as its IPv4 one does.
 //!
-//! **It does not put DNS through the tunnel.** The ruleset matches sockets the
+//! **It does not put DNS through the tunnel; `tracker_dns` does.** A profile
+//! with `tracker_dns = "tunnel"` resolves its tracker hostnames through a
+//! proxy on its tunnel address that asks the profile's in-tunnel resolvers
+//! from that address ([`super::tracker_dns`]), so those queries are matched
+//! by the profile's own `ip saddr <tunnel address> oifname "<its
+//! interface>"` rule like its announces, and need no carve-out. For every
+//! other profile, the following holds. The ruleset matches sockets the
 //! daemon's uid owns. A tracker hostname is resolved by libc, and on a host
 //! with a local stub resolver — `systemd-resolved` on `127.0.0.53`, `dnsmasq`,
 //! `unbound` — the daemon's query goes to loopback, which the ruleset accepts,
