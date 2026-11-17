@@ -98,6 +98,7 @@ fn router() -> Router<AppCtx, impl PanicPolicy, impl Sized, impl Sized> {
         .not_found(FallbackPolicy::Problem)
         .method_not_allowed(FallbackPolicy::Problem)
         .trailing_slashes(TrailingSlashPolicy::Strict)
+        .map_openapi(unmerge_body_stall_408)
         .mount(kynos::routes![
             healthz::get_live,
             healthz::get_ready,
@@ -106,6 +107,41 @@ fn router() -> Router<AppCtx, impl PanicPolicy, impl Sized, impl Sized> {
             get_openapi
         ]);
     crate::http::v1::mount!(router)
+}
+
+/// What kynos prefixes to an operation's 408 description where it merges its
+/// own stalled-body 408 into the daemon's.
+const BODY_STALL_408: &str = "Request Timeout; ";
+
+/// Puts each operation's 408 back as the daemon declares it.
+///
+/// kynos declares a 408 on every operation that reads a body, for its
+/// request-body idle timer, and merges the daemon's 408 into it: the
+/// description gains a leading `Request Timeout; ` and the 408 moves into
+/// status order. The daemon turns that timer off
+/// (`startup::http_stage`), so the 408 such an operation can send is the
+/// daemon's own handler or body deadline; this drops the prefix and puts the
+/// 408 last again, where the daemon's interceptors declare it.
+fn unmerge_body_stall_408(document: &mut Document) {
+    for item in document.paths.items.values_mut() {
+        for operation in item.operations_mut() {
+            let responses = &mut operation.responses.responses;
+            let Some(kynos::openapi::RefOr::Item(response)) = responses.get_mut("408") else {
+                continue;
+            };
+            let Some(own) = response
+                .description
+                .as_deref()
+                .and_then(|description| description.strip_prefix(BODY_STALL_408))
+            else {
+                continue;
+            };
+            response.description = Some(own.to_owned());
+            if let Some(timed_out) = responses.shift_remove("408") {
+                responses.insert("408".to_owned(), timed_out);
+            }
+        }
+    }
 }
 
 /// The running service for `state`, serving `openapi` at
