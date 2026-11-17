@@ -1270,9 +1270,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
 dependencies = [
  "bytes",
  "itoa",
@@ -1779,9 +1779,9 @@ dependencies = [
 
 [[package]]
 name = "kynos"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e896f71dff9d3483fc25c62677e81607c68ebe08111744da7dc505991e282221"
+checksum = "b8a05e2b26bfc84ae8cbc98820760f6ba2fb345c382d9cb08e20c47bc47b03c1"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1797,6 +1797,7 @@ dependencies = [
  "matchit",
  "percent-encoding",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "socket2",
@@ -1807,9 +1808,9 @@ dependencies = [
 
 [[package]]
 name = "kynos-macros"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf80a4d2c595ef333863987ba9c09d6dc3f49ee824d7a7b54fc51d3b9a866e26"
+checksum = "403c03143a92050c671cf78330cbbc597b42a5dbdde71db05bfb4299ec213ce9"
 dependencies = [
  "kynos-openapi",
  "proc-macro2",
@@ -1819,9 +1820,9 @@ dependencies = [
 
 [[package]]
 name = "kynos-openapi"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9082c7cfae2a68c70bd279cd129aa2d9d86d2036df3ff3b8aa13d18871c27ec"
+checksum = "f40bced9d64389dcd3a77ce1982211e18de0021ed194a1e3708d672a906b7993"
 dependencies = [
  "http",
  "indexmap",

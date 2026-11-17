@@ -297,7 +297,10 @@ pub async fn serve(
                     peer.uid = cred.map(|c| c.uid()),
                     peer.pid = cred.and_then(|c| c.pid()),
                 );
-                let connection = match server.serve_io(stream, SOCKET_PEER) {
+                let connection = match server.serve_io(
+                    stream,
+                    kynos::extract::connection::Connection::from_peer(SOCKET_PEER, SOCKET_PEER),
+                ) {
                     Ok(connection) => connection,
                     Err(e) => {
                         // Only a refused configuration fails here, and the

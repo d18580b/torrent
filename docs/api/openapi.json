@@ -2018,6 +2018,28 @@
               }
             }
           },
+          "408": {
+            "description": "Request Timeout; the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
@@ -2333,28 +2355,6 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
                         }
                       }
                     }
@@ -5256,6 +5256,28 @@
               }
             }
           },
+          "408": {
+            "description": "Request Timeout; the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
@@ -5490,28 +5512,6 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
                         }
                       }
                     }
@@ -8882,6 +8882,28 @@
               }
             }
           },
+          "408": {
+            "description": "Request Timeout; the request body did not arrive within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
@@ -9096,28 +9118,6 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "the request body did not arrive within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
                         }
                       }
                     }
@@ -10101,6 +10101,28 @@
               }
             }
           },
+          "408": {
+            "description": "Request Timeout; the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "description": "Payload Too Large; the request body exceeds the configured limit",
             "content": {
@@ -10341,28 +10363,6 @@
                 }
               }
             }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         }
       }
@@ -10512,6 +10512,28 @@
                             ]
                           },
                           "type": "array"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request Timeout; the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
                         }
                       }
                     }
@@ -10733,28 +10755,6 @@
                 }
               }
             }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -10923,6 +10923,28 @@
                             ]
                           },
                           "type": "array"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request Timeout; the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
                         }
                       }
                     }
@@ -11185,28 +11207,6 @@
                 }
               }
             }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -11321,6 +11321,28 @@
           },
           "400": {
             "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request Timeout; the handler did not finish within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11539,28 +11561,6 @@
                 }
               }
             }
-          },
-          "408": {
-            "description": "the handler did not finish within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -11675,6 +11675,28 @@
           },
           "400": {
             "description": "Bad Request; the request body did not arrive whole",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request Timeout; the request body did not arrive within the configured limit",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11979,28 +12001,6 @@
                 }
               }
             }
-          },
-          "408": {
-            "description": "the request body did not arrive within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
           }
         },
         "security": [
@@ -12173,6 +12173,28 @@
                             ]
                           },
                           "type": "array"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request Timeout; the request body did not arrive within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
                         }
                       }
                     }
@@ -12466,28 +12488,6 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "the request body did not arrive within the configured limit",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "about:blank"
                         }
                       }
                     }

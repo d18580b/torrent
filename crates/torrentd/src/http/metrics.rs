@@ -304,9 +304,14 @@ mod tests {
             "{text}"
         );
         let log = log.text();
+        // kynos logs the failed operation's error and its cause at ERROR
+        // too, under its own target; the daemon's line is the one with the
+        // request id and route as fields.
         let errors: Vec<&str> = log
             .lines()
-            .filter(|l| l.contains("\"level\":\"ERROR\""))
+            .filter(|l| {
+                l.contains("\"level\":\"ERROR\"") && l.contains("\"target\":\"torrentd::http\"")
+            })
             .collect();
         assert_eq!(errors.len(), 1, "{log}");
         assert!(errors[0].contains("server error response"), "{log}");

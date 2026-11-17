@@ -126,11 +126,14 @@ impl<C: Provides<Arc<AppState>> + Sync> FromRequestParts<C> for ClientAddr {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, context: &C) -> Result<Self, Self::Rejection> {
-        let ConnectInfo(peer): ConnectInfo =
-            ConnectInfo::from_request_parts(parts, context).await?;
+        // A connection with no IP peer has no client address to resolve.
+        let peer: Option<SocketAddr> = ConnectInfo::from_request_parts(parts, context)
+            .await
+            .ok()
+            .map(|ConnectInfo(peer)| peer);
         let state = context.provide();
         Ok(Self(crate::http::forwarded::resolve(
-            Some::<SocketAddr>(peer),
+            peer,
             &parts.headers,
             &state.trusted_proxies,
         )))

@@ -260,6 +260,11 @@ async fn serve_once(
     work: &Arc<crate::app_state::WorkGate>,
 ) -> kynos::Result<()> {
     let work = Arc::clone(work);
+    // kynos takes the standard library's listener and registers it with the
+    // runtime itself.
+    let listener = listener
+        .into_std()
+        .map_err(|e| kynos::Error::Server(kynos::server::error::ServerError::Listener(e)))?;
     http_server(app)
         .listener(listener)
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
@@ -486,7 +491,10 @@ mod tests {
     fn accept_failure(errno: i32) -> kynos::Result<()> {
         Err(kynos::Error::Server(
             kynos::server::error::ServerError::Accept {
-                address: "127.0.0.1:1".parse().unwrap(),
+                address: "127.0.0.1:1"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
                 source: std::io::Error::from_raw_os_error(errno),
             },
         ))
@@ -628,7 +636,11 @@ mod http_bounds_tests {
         let addr = listener.local_addr().unwrap();
         (
             addr,
-            tokio::spawn(http_server(app).listener(listener).serve()),
+            tokio::spawn(
+                http_server(app)
+                    .listener(listener.into_std().unwrap())
+                    .serve(),
+            ),
         )
     }
 
@@ -843,6 +855,19 @@ mod http_bounds_tests {
             return;
         }
         let (addr, server) = serving().await;
+        // Answered once, so the server has prepared before the limit is
+        // lowered: kynos raises the soft limit to fit its connection cap as
+        // it prepares, which would undo the lowering below.
+        {
+            let mut ready = tokio::net::TcpStream::connect(addr).await.unwrap();
+            ready
+                .write_all(b"GET /healthz HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut head = [0u8; 12];
+            ready.read_exact(&mut head).await.unwrap();
+            assert!(head.starts_with(b"HTTP/1.1 "), "{head:?}");
+        }
 
         // A soft limit a few dozen above what is open, so filling the table
         // takes a few dozen descriptors rather than the whole hard limit.
