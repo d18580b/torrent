@@ -78,7 +78,6 @@ mod test_support;
 use cleanup::BootCleanup;
 use http_stage::announce_ready;
 use http_stage::bind_api_listener;
-#[cfg(test)]
 pub(crate) use http_stage::http_server;
 use http_stage::run_http_stage;
 use http_stage::serve_until_shutdown;

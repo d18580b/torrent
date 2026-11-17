@@ -281,9 +281,10 @@ async fn serve_once(
 }
 
 /// The server `serve_once` runs for `app`, with every connection and request
-/// bound it sets but the listener and the drain. Shared with the HTTP tests'
-/// stalled-body harness, so the bounds a stalled request meets there are the
-/// ones production sets.
+/// bound it sets but the listener and the drain. Shared with the unix-socket
+/// listener (`api_socket::serve`), so a socket connection is served under the
+/// same protocol settings, and with the HTTP tests' stalled-body harness, so
+/// the bounds a stalled request meets there are the ones production sets.
 pub(crate) fn http_server(
     app: kynos::router::service::Service<http::ctx::AppCtx>,
 ) -> kynos::server::Server<http::ctx::AppCtx> {

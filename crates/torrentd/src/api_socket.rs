@@ -1,24 +1,22 @@
 //! The control API on a unix socket: `http_listen = "unix:/path"`.
 //!
-//! kynos serves TCP only, so this module owns the accept loop and drives the
-//! same router through [`Service::call`], the embedding kynos documents for
-//! exactly this. It keeps the TCP server's limits: at most
-//! `max_connections` open at once, a header read timeout, and a bounded
-//! drain on shutdown.
+//! kynos' listeners are TCP only, so this module owns the accept loop and
+//! hands each accepted stream to [`Server::serve_io`], which serves it as a
+//! TCP connection is served: HTTP/1.1 or HTTP/2 (h2c) told apart from the
+//! first bytes, under the TCP server's protocol settings
+//! ([`crate::startup::http_server`]), with request bodies streamed to the
+//! route, which authorizes the request and then reads its body under its own
+//! cap and deadline.
 //!
-//! Two things differ from TCP, both because kynos' request body can be built
-//! only from bytes outside the crate:
+//! What `serve_io` leaves to the caller stays here: at most
+//! `max_connections` open at once, and a bounded drain on shutdown. Every
+//! request reaches the router from [`SOCKET_PEER`], an address no socket
+//! connects from, so no `trusted_proxies` entry admits a forwarding header
+//! sent over the socket. Who called is logged by uid and pid (`SO_PEERCRED`)
+//! on the connection's span instead.
 //!
-//! - A request body is read whole before the router sees it, and so before
-//!   the request is authorized, bounded by [`BODY_DEADLINE`] and capped at
-//!   [`MAX_ADD_BODY_BYTES`] for adding a torrent and [`MAX_BODY_BYTES`] for
-//!   everything else ([`body_cap`]). A route's own cap still answers `413`.
-//! - Every request reaches the router from [`SOCKET_PEER`], an address no
-//!   socket connects from, so no `trusted_proxies` entry admits a forwarding
-//!   header sent over the socket. Who called is logged by uid and pid
-//!   (`SO_PEERCRED`) on the connection's span instead.
+//! [`Server::serve_io`]: kynos::server::Server::serve_io
 
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -28,12 +26,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::BodyExt as _;
-use kynos::extract::connection::Connection;
-use kynos::http::body::Body;
 use kynos::router::service::Service;
 use tokio::sync::broadcast;
-use tokio::sync::watch;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use torrentd_engine::ShutdownReason;
@@ -41,10 +35,6 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 use tracing::Instrument as _;
-
-use crate::http::v1::BODY_DEADLINE;
-use crate::http::v1::MAX_ADD_BODY_BYTES;
-use crate::http::v1::MAX_BODY_BYTES;
 
 /// The peer address every request over the socket carries: unspecified, so
 /// it names no host and matches no `trusted_proxies` entry.
@@ -247,6 +237,8 @@ fn resolve_group(group: &str) -> anyhow::Result<u32> {
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_connections: usize,
+    /// How long a connection may take to send a request head: its first one
+    /// from accept, under either protocol, and each later HTTP/1 one.
     pub header_read_timeout: Duration,
     pub drain_timeout: Duration,
 }
@@ -255,9 +247,14 @@ pub struct Limits {
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Serve `app` on `socket` until a shutdown arrives on `shutdown_rx`, then
-/// run `on_shutdown`, stop accepting, ask every connection to finish its
-/// request, and wait up to `limits.drain_timeout` for them before cutting off
-/// the rest.
+/// run `on_shutdown`, stop accepting, and wait up to `limits.drain_timeout`
+/// for the open connections to end before cutting off the rest.
+///
+/// `serve_io` has no graceful shutdown of its own, so a connection is not
+/// asked to close: one with a request in flight ends once its client closes
+/// it, as a `Connection: close` request does once it is answered, and an
+/// idle one ends at its client's close, its next head's
+/// `header_read_timeout`, or the HTTP/2 idle timeout, whichever comes first.
 ///
 /// A failing accept is retried after a doubling backoff rather than ending
 /// the server: running out of descriptors passes as connections close, and
@@ -269,9 +266,11 @@ pub async fn serve(
     on_shutdown: impl FnOnce(),
     limits: Limits,
 ) {
-    let service = Arc::new(app);
+    let server = crate::startup::http_server(app).http1(
+        kynos::server::protocol::http1::Http1Config::default()
+            .header_read_timeout(Some(limits.header_read_timeout)),
+    );
     let permits = Arc::new(Semaphore::new(limits.max_connections));
-    let (stop_tx, stop_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut backoff = Duration::from_millis(10);
 
@@ -298,12 +297,22 @@ pub async fn serve(
                     peer.uid = cred.map(|c| c.uid()),
                     peer.pid = cred.and_then(|c| c.pid()),
                 );
-                let service = Arc::clone(&service);
-                let stop = stop_rx.clone();
+                let connection = match server.serve_io(stream, SOCKET_PEER) {
+                    Ok(connection) => connection,
+                    Err(e) => {
+                        // Only a refused configuration fails here, and the
+                        // server's is fixed at build time: unreachable unless
+                        // `http_server` sets a value kynos refuses.
+                        warn!(error.cause = %e, "the API socket's server configuration was refused");
+                        continue;
+                    }
+                };
                 connections.spawn(
                     async move {
                         let _permit = permit;
-                        serve_connection(stream, service, stop, limits.header_read_timeout).await;
+                        if let Err(e) = connection.await {
+                            debug!(error.cause = %e, "API socket connection ended with an error");
+                        }
                     }
                     .instrument(span),
                 );
@@ -329,8 +338,6 @@ pub async fn serve(
     // Closed before the drain, so a client connecting now is refused at once
     // rather than queued on a listener nothing accepts from.
     drop(socket);
-    // ignore-result: no receiver left means no connection left to stop.
-    let _ = stop_tx.send(true);
     let drained = tokio::time::timeout(limits.drain_timeout, async {
         while connections.join_next().await.is_some() {}
     })
@@ -339,117 +346,10 @@ pub async fn serve(
         warn!(
             timeout_secs = limits.drain_timeout.as_secs(),
             open = connections.len(),
-            "API socket drain timed out; the requests still open were cut off",
+            "API socket drain timed out; the connections still open were cut off",
         );
         connections.shutdown().await;
     }
-}
-
-/// Serve HTTP/1.1 on one accepted connection until it closes, or until `stop`
-/// turns true and its request in flight finishes.
-async fn serve_connection(
-    stream: tokio::net::UnixStream,
-    service: Arc<Service<crate::http::ctx::AppCtx>>,
-    mut stop: watch::Receiver<bool>,
-    header_read_timeout: Duration,
-) {
-    let connection = Connection::from_peer(SOCKET_PEER, SOCKET_PEER);
-    let handler =
-        hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-            let service = Arc::clone(&service);
-            let connection = connection.clone();
-            async move {
-                let (mut parts, body) = request.into_parts();
-                parts.extensions.insert(connection);
-                let body = match read_body(body, body_cap(&parts)).await {
-                    Ok(body) => body,
-                    Err((status, detail)) => return Ok::<_, Infallible>(problem(status, detail)),
-                };
-                let request = kynos::http::Request::from_parts(parts, Body::from_bytes(body));
-                Ok(service.call(request).await)
-            }
-        });
-    let mut builder = hyper::server::conn::http1::Builder::new();
-    builder
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(header_read_timeout);
-    let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), handler);
-    tokio::pin!(conn);
-    let result = tokio::select! {
-        result = conn.as_mut() => result,
-        // `map(drop)`: the borrow `wait_for` returns is not `Send`, and must
-        // not be alive across the await below.
-        _ = async { stop.wait_for(|stop| *stop).await.map(drop) } => {
-            conn.as_mut().graceful_shutdown();
-            conn.await
-        }
-    };
-    if let Err(e) = result {
-        debug!(error.cause = %e, "API socket connection ended with an error");
-    }
-}
-
-/// The most of a request's body read before it is routed: the
-/// [`MAX_ADD_BODY_BYTES`] of `POST /v1/torrents`, which adds a torrent, and
-/// the [`MAX_BODY_BYTES`] every other operation accepts.
-///
-/// The body is read before the router authorizes the request, so this is
-/// what bounds the memory a caller the socket's mode admits, signed in or
-/// not, can make the daemon hold: one add-torrent body per connection, and
-/// 64 KiB for anything else.
-fn body_cap(parts: &hyper::http::request::Parts) -> usize {
-    let add = parts.method == hyper::Method::POST
-        && parts.uri.path().strip_prefix(crate::http::v1::PREFIX) == Some("/torrents");
-    if add {
-        MAX_ADD_BODY_BYTES
-    } else {
-        MAX_BODY_BYTES
-    }
-}
-
-/// Read a request body whole, under [`BODY_DEADLINE`] and capped at `cap`,
-/// or the status and detail of the problem that refuses it: `413` and `408`
-/// as `TimedBody` answers them on TCP.
-async fn read_body(
-    body: hyper::body::Incoming,
-    cap: usize,
-) -> Result<bytes::Bytes, (kynos::http::StatusCode, String)> {
-    // A declared length over the cap is refused before a byte is read.
-    let too_large = || {
-        (
-            kynos::http::StatusCode::PAYLOAD_TOO_LARGE,
-            format!("the request body is larger than {cap} bytes"),
-        )
-    };
-    if usize::try_from(http_body::Body::size_hint(&body).lower())
-        .map_or(true, |declared| declared > cap)
-    {
-        return Err(too_large());
-    }
-    let limited = http_body_util::Limited::new(body, cap);
-    match tokio::time::timeout(BODY_DEADLINE, limited.collect()).await {
-        Ok(Ok(collected)) => Ok(collected.to_bytes()),
-        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => Err(too_large()),
-        Ok(Err(e)) => Err((
-            kynos::http::StatusCode::BAD_REQUEST,
-            format!("the request body could not be read: {e}"),
-        )),
-        Err(_) => Err((
-            kynos::http::StatusCode::REQUEST_TIMEOUT,
-            format!(
-                "the request body did not arrive within {} seconds",
-                BODY_DEADLINE.as_secs()
-            ),
-        )),
-    }
-}
-
-/// An `about:blank` problem document with `status` and `detail`.
-fn problem(status: kynos::http::StatusCode, detail: String) -> kynos::http::Response {
-    use kynos::response::IntoResponse as _;
-    kynos::error::problem::Problem::new(status)
-        .with_detail(detail)
-        .into_response()
 }
 
 #[cfg(test)]
@@ -458,6 +358,8 @@ mod tests {
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;
+    use crate::http::v1::MAX_ADD_BODY_BYTES;
+    use crate::http::v1::MAX_BODY_BYTES;
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::symlink_metadata(path)
@@ -624,13 +526,17 @@ mod tests {
     }
 
     fn start(limits: Limits) -> Running {
+        start_with(limits, crate::app_state::build_test_state(None))
+    }
+
+    fn start_with(limits: Limits, state: crate::app_state::AppState) -> Running {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
         let socket = bind(&path, 0o600, None).unwrap();
         let openapi = crate::http::OpenApiJson(Arc::new(bytes::Bytes::from(
             crate::http::document_json().unwrap(),
         )));
-        let app = crate::http::service(crate::app_state::build_test_state(None), openapi).unwrap();
+        let app = crate::http::service(state, openapi).unwrap();
         let (tx, rx) = broadcast::channel(1);
         let (hook_tx, hook_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
@@ -665,11 +571,11 @@ mod tests {
         )
     }
 
-    /// The pre-routing read is held to 64 KiB everywhere but the add-torrent
-    /// route, so a caller that is not signed in cannot make the daemon buffer
-    /// 96 MiB per connection.
+    /// Each route holds its body to its own cap, as over TCP: 64 KiB
+    /// everywhere but the add-torrent route, refused from the declared
+    /// length before a byte of it is read.
     #[tokio::test]
-    async fn a_body_over_the_small_cap_is_refused_before_routing_except_when_adding_a_torrent() {
+    async fn a_body_over_its_routes_cap_is_refused_from_the_head_except_when_adding_a_torrent() {
         let Running {
             _dir,
             path,
@@ -686,7 +592,7 @@ mod tests {
         .expect("refused at once");
         assert!(response.starts_with("HTTP/1.1 413"), "got: {response:.300}");
         assert!(
-            response.contains(&format!("larger than {MAX_BODY_BYTES} bytes")),
+            response.contains("application/problem+json"),
             "got: {response:.600}"
         );
 
@@ -706,6 +612,76 @@ mod tests {
             !response.starts_with("HTTP/1.1 413"),
             "got: {response:.300}"
         );
+
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        server.await.unwrap();
+    }
+
+    /// A request that is refused is refused before its body is read: with
+    /// `[auth]` on, an add-torrent request with no credential that declares
+    /// its whole cap and sends none of it is answered `401` at once, so the
+    /// socket holds no body for a caller that is not signed in.
+    #[tokio::test]
+    async fn an_unauthenticated_body_is_refused_without_being_read() {
+        let mut state = crate::app_state::build_test_state(None);
+        state.auth = Some(crate::auth::Auth::new(crate::auth::AuthConfig {
+            password_hash: crate::auth::hash_password("correct-horse-battery").unwrap(),
+            session_ttl_secs: 3600,
+            token: Vec::new(),
+        }));
+        let Running {
+            _dir,
+            path,
+            tx,
+            server,
+            ..
+        } = start_with(LIMITS, state);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            exchange(
+                &path,
+                &format!(
+                    "POST /v1/torrents HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+                     Content-Type: application/json\r\nContent-Length: {MAX_ADD_BODY_BYTES}\r\n\r\n"
+                ),
+            ),
+        )
+        .await
+        .expect("refused at once");
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response:.300}");
+
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        server.await.unwrap();
+    }
+
+    /// HTTP/2 with prior knowledge (h2c) is served on the socket, as on TCP:
+    /// the server answers the client preface with its own SETTINGS frame.
+    #[tokio::test]
+    async fn http2_is_served_on_the_socket() {
+        let Running {
+            _dir,
+            path,
+            tx,
+            server,
+            ..
+        } = start(LIMITS);
+
+        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        // The client connection preface, then an empty SETTINGS frame:
+        // length 0, type 0x4, no flags, stream 0.
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+            .await
+            .unwrap();
+        let mut frame_head = [0_u8; 9];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut frame_head))
+            .await
+            .expect("the server answered the preface")
+            .unwrap();
+        assert_eq!(frame_head[3], 0x4, "a SETTINGS frame: {frame_head:?}");
+        assert_eq!(&frame_head[5..], [0; 4], "on stream 0: {frame_head:?}");
+        drop(stream);
 
         tx.send(ShutdownReason::Sigterm).unwrap();
         server.await.unwrap();
@@ -812,7 +788,7 @@ mod tests {
         } = start(LIMITS);
 
         // A login whose body has not all arrived: the request is in the
-        // socket server's body read when the shutdown comes.
+        // route's body read when the shutdown comes.
         let body = "{\"password\":\"not-the-password\"}";
         let (head, tail) = body.split_at(5);
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();

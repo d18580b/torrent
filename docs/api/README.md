@@ -91,14 +91,12 @@ request to every operation, with or without a token; where that posture is
 safe is
 [running.md §6](../running.md#6-authentication--required-one-way-or-the-other).
 
-**Over a unix socket** the API is the same, spoken as HTTP/1.1 with any
-`Host` a loopback name (`curl --unix-socket /run/torrentd/api.sock
-http://localhost/v1/server`). Two things differ from TCP: a request carries no
-client address, so `trusted_proxies` never applies and the login throttle
-counts every caller as one client; and a request body is read whole before
-the operation sees it, and before the request is authorized, under the same
-deadline; a body over its limit (below) is answered `413` with an
-`about:blank` problem before routing.
+**Over a unix socket** the API is the same, spoken as HTTP/1.1 or HTTP/2
+with prior knowledge, as on TCP, with any `Host` a loopback name
+(`curl --unix-socket /run/torrentd/api.sock http://localhost/v1/server`).
+One thing differs from TCP: a request carries no client address, so
+`trusted_proxies` never applies and the login throttle counts every caller as
+one client.
 An `Authorization` header that is present but is not a well-formed bearer credential is still a `401`: a client that
 sent a credential nobody checked is not an anonymous one. That includes any
 other scheme — a `Basic` header a reverse proxy adds or passes through from

@@ -34,13 +34,7 @@ async fn every_declared_response_is_exercised() {
     super::pool::scenarios(&cov).await;
     #[cfg(feature = "fault-injection")]
     crate::http::fault_injection::scenarios(&cov).await;
-    let missing = cov.missing();
-    assert!(
-        missing.is_empty(),
-        "{} declared responses never exercised:\n  {}",
-        missing.len(),
-        missing.join("\n  ")
-    );
+    cov.assert_declared_responses_covered();
 }
 
 #[test]
