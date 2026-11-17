@@ -7,7 +7,6 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use kynos::extract::link::Link;
-use kynos::openapi::SchemaObject;
 use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use libtorrent_safe::info_hashes_from_magnet;
@@ -94,27 +93,13 @@ pub enum TorrentSource {
     Metainfo {
         /// The `.torrent`'s bytes, base64 (standard alphabet, padded). At most
         /// 64 MiB decoded.
-        data: Base64Metainfo,
+        #[schema(
+            content_encoding = "base64",
+            content_media_type = "application/x-bittorrent",
+            max_length = MAX_METAINFO_BASE64_LEN
+        )]
+        data: String,
     },
-}
-
-/// A `.torrent` in base64: standard alphabet, padded.
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-pub struct Base64Metainfo(pub String);
-
-impl kynos::schema::Schema for Base64Metainfo {
-    fn schema(_: &mut kynos::schema::registry::Registry) -> kynos::openapi::Schema {
-        kynos::openapi::Schema::Object(Box::new(SchemaObject {
-            ty: Some(kynos::openapi::model::schema::types::TypeSet::One(
-                kynos::openapi::model::schema::types::SchemaType::String,
-            )),
-            content_encoding: Some("base64".to_owned()),
-            content_media_type: Some("application/x-bittorrent".to_owned()),
-            max_length: Some(MAX_METAINFO_BASE64_LEN),
-            ..SchemaObject::default()
-        }))
-    }
 }
 
 impl Validate for AddTorrentRequest {
@@ -127,7 +112,7 @@ impl Validate for AddTorrentRequest {
                 })
             }
             TorrentSource::Metainfo { data } => invalid.check(
-                data.0.len() as u64 <= MAX_METAINFO_BASE64_LEN,
+                data.len() as u64 <= MAX_METAINFO_BASE64_LEN,
                 "/source/data",
                 || format!("must be at most {MAX_METAINFO_BASE64_LEN} characters (64 MiB decoded)"),
             ),
@@ -229,7 +214,7 @@ pub async fn add_torrent(
     // breaking a declared constraint, and says nothing about the profile.
     let source = match source {
         TorrentSource::Metainfo { data } => {
-            let bytes = STANDARD.decode(data.0.as_bytes()).map_err(|_| {
+            let bytes = STANDARD.decode(data.as_bytes()).map_err(|_| {
                 ValidationFailed::at("/source/data", "must be base64 (standard alphabet, padded)")
             })?;
             Ok(bytes)
