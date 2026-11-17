@@ -89,6 +89,21 @@ const UDP_PEERS_CAP: usize = 256;
 /// Each name looked up, with when its answer expires and the answer.
 type AnswerCache = HashMap<String, (Instant, Vec<IpAddr>)>;
 
+/// The resolvers in `servers` that a [`TunnelResolver`] bound to `bind` asks:
+/// those of `bind`'s family, in order. One of the other family is passed
+/// over, so a profile left with none of these can resolve no tracker.
+pub fn askable_from(bind: IpAddr, servers: &[IpAddr]) -> Vec<IpAddr> {
+    servers
+        .iter()
+        .copied()
+        .filter(|s| same_family(*s, bind))
+        .collect()
+}
+
+fn same_family(a: IpAddr, b: IpAddr) -> bool {
+    a.is_ipv4() == b.is_ipv4()
+}
+
 /// Where a profile's tracker lookups are sent, and from where.
 #[derive(Clone, Debug)]
 pub struct TunnelResolver {
@@ -138,7 +153,7 @@ impl TunnelResolver {
         'servers: for server in self
             .servers
             .iter()
-            .filter(|s| s.is_ipv4() == self.bind.is_ipv4())
+            .filter(|s| same_family(s.ip(), self.bind))
         {
             for qtype in [dns::TYPE_A, dns::TYPE_AAAA] {
                 match self.ask(*server, &key, qtype).await {

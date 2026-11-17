@@ -12,6 +12,7 @@ use tokio::net::TcpSocket;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 
+use super::askable_from;
 use super::dns;
 use super::parse_udp;
 use super::Target;
@@ -228,6 +229,21 @@ async fn a_resolver_or_tracker_of_the_other_family_is_never_reached_off_the_tunn
             .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
     }
+}
+
+#[test]
+fn only_resolvers_of_the_tunnel_address_family_are_askable() {
+    let v4 = IpAddr::from([10, 2, 0, 1]);
+    let v4b = IpAddr::from([10, 2, 0, 9]);
+    let v6: IpAddr = "fd00::1".parse().unwrap();
+    let all = [v6, v4, v6, v4b];
+    assert_eq!(
+        askable_from(IpAddr::from([10, 2, 0, 2]), &all),
+        vec![v4, v4b]
+    );
+    assert_eq!(askable_from("fd00::2".parse().unwrap(), &all), vec![v6, v6]);
+    assert!(askable_from(IpAddr::from([10, 2, 0, 2]), &[v6]).is_empty());
+    assert!(askable_from(IpAddr::from([10, 2, 0, 2]), &[]).is_empty());
 }
 
 /// Greet, authenticate and send `request` (`CMD RSV ATYP ADDR PORT`); the

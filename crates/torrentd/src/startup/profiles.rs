@@ -570,9 +570,11 @@ where
             // Tracker hostnames resolved through this tunnel rather than by
             // libc through the host's resolver (`vpn::tracker_dns`).
             if let torrentd_engine::TrackerDns::Tunnel { servers } = p.tracker_dns() {
-                let servers = match servers.as_slice() {
+                let (named, source) = match servers.as_slice() {
                     [] => match wireguard_dns(&vpn_config).await {
-                        Ok(servers) if !servers.is_empty() => servers,
+                        Ok(servers) if !servers.is_empty() => {
+                            (servers, "the WireGuard config's DNS = addresses")
+                        }
                         Ok(_) => {
                             error!(profile_id = %p.id, "tracker_dns = \"tunnel\" names no resolver and the WireGuard config has no DNS = address; profile disabled");
                             tear_down_or_warn!(iface);
@@ -589,8 +591,22 @@ where
                             ));
                         }
                     },
-                    named => named.to_vec(),
+                    named => (named.to_vec(), "tracker_dns_servers"),
                 };
+                // The resolver passes over every resolver of the other
+                // family, so a profile with only those would come up and
+                // then fail every hostname announce.
+                let servers = crate::vpn::tracker_dns::askable_from(ip, &named);
+                if servers.is_empty() {
+                    let family = if ip.is_ipv4() { "IPv4" } else { "IPv6" };
+                    error!(profile_id = %p.id, tunnel_ip = %ip, dns_servers = ?named, "tracker_dns = \"tunnel\" names no resolver of the tunnel address's family; profile disabled");
+                    tear_down_or_warn!(iface);
+                    fail_profile!(format!(
+                        "tracker_dns = \"tunnel\" needs an {family} resolver to ask from \
+                         tunnel address {ip}, and {source} hold none: set \
+                         tracker_dns_servers to one"
+                    ));
+                }
                 let resolver = crate::vpn::tracker_dns::TunnelResolver::new(
                     ip,
                     Some(iface.to_string()),
@@ -1267,6 +1283,82 @@ mod profile_construction_tests {
         let reason = &out.failed("acct_a").reason;
         assert!(reason.contains("DNS ="), "got {reason}");
         assert_eq!(mock.bring_down_calls(), vec!["wg-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_dns_profile_whose_named_resolvers_are_all_of_the_other_family_is_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = format!(
+            "{}tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"fd00::1\", \"fd00::2\"]\n",
+            vpn("acct_a", "wg-a", 1)
+        );
+        let cfg = cfg_with(dir.path(), &[profile]);
+        let mock = MockVpn::new();
+        mock.set_ip("wg-a", TUNNEL_IP);
+
+        let out = build(&cfg, &mock, &MockForwarder::new(), None).await;
+
+        assert!(out.up_ids().is_empty());
+        assert!(out.built.is_empty(), "no session was built");
+        let reason = &out.failed("acct_a").reason;
+        assert!(reason.contains("IPv4 resolver"), "got {reason}");
+        assert!(
+            reason.contains("tracker_dns_servers hold none"),
+            "got {reason}"
+        );
+        assert_eq!(mock.bring_down_calls(), vec!["wg-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_dns_profile_whose_dns_lines_are_all_of_the_other_family_is_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg = dir.path().join("wg-a.conf");
+        std::fs::write(
+            &wg,
+            "[Interface]\nPrivateKey = SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=\n\
+             Address = 10.2.0.2/32\nDNS = fd00::1, fd00::2\n\n[Peer]\n\
+             PublicKey = 9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=\n\
+             AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.7:51820\n",
+        )
+        .unwrap();
+        let profile = format!(
+            "{}tracker_dns = \"tunnel\"\n",
+            vpn("acct_a", "wg-a", 1).replace("/etc/wireguard/wg-a.conf", wg.to_str().unwrap())
+        );
+        let cfg = cfg_with(dir.path(), &[profile]);
+        let mock = MockVpn::new();
+        mock.set_ip("wg-a", TUNNEL_IP);
+
+        let out = build(&cfg, &mock, &MockForwarder::new(), None).await;
+
+        assert!(out.up_ids().is_empty());
+        assert!(out.built.is_empty(), "no session was built");
+        let reason = &out.failed("acct_a").reason;
+        assert!(reason.contains("IPv4 resolver"), "got {reason}");
+        assert!(reason.contains("DNS = addresses hold none"), "got {reason}");
+        assert_eq!(mock.bring_down_calls(), vec!["wg-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_dns_profile_with_one_resolver_of_its_family_among_others_comes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = format!(
+            "{}tracker_dns = \"tunnel\"\ntracker_dns_servers = [\"fd00::1\", \"10.2.0.1\"]\n",
+            vpn("acct_a", "wg-a", 1)
+        );
+        let cfg = cfg_with(dir.path(), &[profile]);
+        let mock = MockVpn::new();
+        // An address this host holds, so the proxy can bind it.
+        mock.set_ip("wg-a", IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        let out = build(&cfg, &mock, &MockForwarder::new(), None).await;
+
+        assert_eq!(out.up_ids(), vec!["acct_a"]);
+        assert!(
+            out.built[0].0.proxy_port.is_some(),
+            "the proxy is configured"
+        );
+        assert!(mock.bring_down_calls().is_empty());
     }
 
     #[tokio::test]
