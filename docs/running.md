@@ -563,8 +563,9 @@ What it costs:
 - The resolvers must answer within 3 s over UDP. A name none of them knows
   fails the announce; it is never handed to the host's resolver.
 - A profile with `tracker_dns = "tunnel"` and no resolver to ask (no
-  `tracker_dns_servers`, and no `DNS =` address in its WireGuard config), or
-  whose proxy cannot start, is failed at startup and its tunnel lowered, as
+  `tracker_dns_servers`, and no `DNS =` address in its WireGuard config, or
+  only resolvers of the other family from the tunnel address's), or whose
+  proxy cannot start, is failed at startup and its tunnel lowered, as
   for any other bring-up failure. Changing either key takes a restart.
 
 The rest of this section is the alternative for a profile left at
