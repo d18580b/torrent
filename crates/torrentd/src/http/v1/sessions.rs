@@ -126,11 +126,14 @@ impl<C: Provides<Arc<AppState>> + Sync> FromRequestParts<C> for ClientAddr {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, context: &C) -> Result<Self, Self::Rejection> {
-        let ConnectInfo(peer): ConnectInfo =
-            ConnectInfo::from_request_parts(parts, context).await?;
+        // A connection with no IP peer has no client address to resolve.
+        let peer: Option<SocketAddr> = ConnectInfo::from_request_parts(parts, context)
+            .await
+            .ok()
+            .map(|ConnectInfo(peer)| peer);
         let state = context.provide();
         Ok(Self(crate::http::forwarded::resolve(
-            Some::<SocketAddr>(peer),
+            peer,
             &parts.headers,
             &state.trusted_proxies,
         )))
@@ -345,7 +348,44 @@ pub(crate) fn timestamp(t: SystemTime) -> jiff::Timestamp {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use kynos::extract::connection::Connection;
+    use kynos::extract::FromRequestParts;
+
+    use super::ClientAddr;
     use super::RevokeSessionError;
+    use crate::app_state::AppState;
+
+    struct Ctx(Arc<AppState>);
+
+    impl kynos::di::Provides<Arc<AppState>> for Ctx {
+        fn provide(&self) -> Arc<AppState> {
+            Arc::clone(&self.0)
+        }
+    }
+
+    /// The property: a connection with no IP peer, which `ConnectInfo`
+    /// refuses, resolves to no client address rather than failing the
+    /// login, and its forwarding headers are not read.
+    #[tokio::test]
+    async fn a_connection_with_no_ip_peer_resolves_to_no_client_address() {
+        let unix = std::os::unix::net::SocketAddr::from_pathname("/run/torrentd/api.sock").unwrap();
+        let mut request = kynos::http::Request::new(kynos::http::body::Body::empty());
+        let headers = request.headers_mut();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        let (mut parts, _) = request.into_parts();
+        parts
+            .extensions
+            .insert(Connection::from_peer(unix.clone(), unix));
+        let ctx = Ctx(Arc::new(crate::app_state::build_test_state(None)));
+
+        let Ok(ClientAddr(client)) = ClientAddr::from_request_parts(&mut parts, &ctx).await;
+
+        assert_eq!(client.ip, None);
+        assert!(!client.secure);
+    }
 
     /// The `not-a-session` entry in docs/api/problems.md, heading excluded,
     /// with its line wrapping collapsed to single spaces.

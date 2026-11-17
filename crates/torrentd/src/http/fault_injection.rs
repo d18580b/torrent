@@ -595,6 +595,13 @@ pub(crate) async fn scenarios(cov: &Arc<crate::http::tests::support::Coverage>) 
     let huge = "x".repeat(crate::http::v1::MAX_BODY_BYTES + 1);
     let resp = post(json!({"fault": "portmap_error", "profile_id": huge})).await;
     assert_eq!(resp.status().as_u16(), 413);
+    // A stalled body is cut off at `BODY_DEADLINE`.
+    let (status, waited) = h.slow_body("POST", "/v1/faults", Some(&write)).await;
+    assert_eq!(status.as_u16(), 408);
+    assert!(
+        waited + std::time::Duration::from_secs(1) > crate::http::v1::BODY_DEADLINE,
+        "answered after {waited:?}"
+    );
 
     // `write` is needed.
     let resp = h

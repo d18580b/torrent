@@ -46,6 +46,7 @@ use kynos::security::auth::Scopes;
 use kynos::security::carrier;
 use kynos::security::carrier::Carries;
 use kynos::security::Authenticator;
+use kynos::security::Authorizer;
 use kynos::security::SecurityScheme;
 use torrentd_engine::MetricsSink;
 use tracing::warn;
@@ -119,7 +120,7 @@ impl Origin {
             }
         }
         Self {
-            peer: connection.map(|c| c.peer_addr()),
+            peer: connection.and_then(|c| c.peer_addr()),
             forwarding,
         }
     }
@@ -691,7 +692,9 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
         self.reject(reason, Some(&token), &presented.from);
         Err(AuthRejection::unauthenticated())
     }
+}
 
+impl<C: Sync> Authorizer<Bearer, C, Scope> for Gate {
     async fn authorize(
         &self,
         principal: &Caller,

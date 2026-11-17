@@ -276,25 +276,27 @@ async fn event_streams_share_one_feed_that_stops_with_the_last_and_free_their_sl
         let _ = shutdown.send(torrentd_engine::ShutdownReason::Sigterm);
     });
 
-    let h = Arc::new(h);
-    let streams: Vec<_> = tokens
-        .iter()
-        .map(|t| {
-            let (h, t) = (Arc::clone(&h), t.clone());
-            tokio::spawn(async move { h.send("GET", "/v1/events", Some(&t), None).await })
-        })
-        .collect();
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(h.state.events.open_streams(CAP), 2);
-    assert!(h.state.events.is_running(), "one feed serves both");
-    // The cap is reached: a third is refused while both are open.
-    assert_problem(&h.read("/v1/events").await, 503, "too-many-event-streams");
+    // Both streams are driven on this task, beside the checks made while
+    // they are open: the harness's client is not `Sync`, so it cannot be
+    // shared with spawned tasks.
+    let streams = futures_util::future::join_all(
+        tokens
+            .iter()
+            .map(|t| h.send("GET", "/v1/events", Some(t), None)),
+    );
+    let while_open = async {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(h.state.events.open_streams(CAP), 2);
+        assert!(h.state.events.is_running(), "one feed serves both");
+        // The cap is reached: a third is refused while both are open.
+        assert_problem(&h.read("/v1/events").await, 503, "too-many-event-streams");
 
-    for t in &tokens {
-        auth.sessions.revoke(t);
-    }
-    for s in streams {
-        let resp = s.await.unwrap();
+        for t in &tokens {
+            auth.sessions.revoke(t);
+        }
+    };
+    let (streams, ()) = tokio::join!(streams, while_open);
+    for resp in streams {
         resp.assert_status(kynos::http::StatusCode::OK);
         assert!(!resp.events().is_empty());
     }

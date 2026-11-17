@@ -314,17 +314,6 @@ macro_rules! v1_group {
                 deadline: crate::http::v1::BODY_DEADLINE,
             })
     };
-    // The alert drill's test surface: no deadline at all, which would add a
-    // `408` to it that only a drill could exercise.
-    (unbounded $max_body:expr) => {
-        v1_group!()
-            .intercept(crate::http::security::Authorized::<
-                crate::http::security::Write,
-            >::new())
-            .intercept(kynos::middleware::limits::body_size::BodySize::new(
-                $max_body as u64,
-            ))
-    };
     ($max_body:expr, $deadline:expr) => {
         v1_group!()
             .intercept(kynos::middleware::limits::timeout::Timeout::new($deadline))
@@ -370,10 +359,11 @@ macro_rules! mount {
             .group(long)
             .group(add);
         // The alert drill's fault injection, in a `fault-injection` build
-        // only.
+        // only. Its body is read under `BODY_DEADLINE`, so the `408` kynos
+        // declares on every operation that reads a body is one it can send.
         #[cfg(feature = "fault-injection")]
         let router = router.group(crate::http::fault_injection::fault_routes!(
-            v1_group!(unbounded MAX_BODY_BYTES)
+            v1_group!(untimed MAX_BODY_BYTES)
         ));
         router
     }};

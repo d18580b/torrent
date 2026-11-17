@@ -184,7 +184,12 @@ API serves: the counter at 0 for every status class, the histogram empty.
 
 Every 5xx is also logged at `ERROR` (`server error response`, target
 `torrentd::http`) with the `request_id` the client received in `X-Request-Id`;
-a 4xx stays at `INFO`. Every refusal `torrentd_auth_rejections_total` counts is
+a 4xx stays at `INFO`. A 5xx a handler answered with one of the API's errors is logged at
+`ERROR` a second time by the HTTP library (target `kynos::error`, carrying the
+error's cause chain), which `torrentd_log_events_total` counts under
+`target="other"`: such a 5xx raises `TorrentdErrorsLogged` for both
+`torrentd::http` and `other`, and a query counting every `ERROR` line counts it
+twice. Every refusal `torrentd_auth_rejections_total` counts is
 logged at `WARN` (target `torrentd::auth`) with its `reason`, the kind of token
 (`token_kind`: `static` or `session` by its prefix, `other` for a token with
 neither, and `none` where no token was read, which is every `malformed`

@@ -71,6 +71,28 @@ pub struct Harness {
     pub client: TestClient<AppCtx>,
     pub state: Arc<AppState>,
     pub tokens: Tokens,
+    /// What `client` records into, for the clients a stalled body is sent
+    /// with.
+    coverage: Arc<Coverage>,
+}
+
+/// `method path` on `client` from the harnesses' client peer, with `token`
+/// as the bearer credential, if any.
+fn request_on<'c>(
+    client: &'c TestClient<AppCtx>,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+) -> kynos::test::TestRequest<'c, AppCtx> {
+    let method = Method::from_bytes(method.as_bytes())
+        .unwrap_or_else(|_| panic!("{method:?} is not a method"));
+    let mut req = client
+        .method(method, path)
+        .peer("192.0.2.10:40000".parse().unwrap());
+    if let Some(token) = token {
+        req = req.header("authorization", &format!("Bearer {token}"));
+    }
+    req
 }
 
 /// The `[auth] session_ttl_secs` an authenticated harness runs with, unless
@@ -130,6 +152,7 @@ impl Harness {
             client,
             state: shared,
             tokens,
+            coverage: Arc::clone(coverage),
         }
     }
 
@@ -203,30 +226,39 @@ impl Harness {
         path: &str,
         token: Option<&str>,
     ) -> kynos::test::TestRequest<'_, AppCtx> {
-        let method = Method::from_bytes(method.as_bytes())
-            .unwrap_or_else(|_| panic!("{method:?} is not a method"));
-        let mut req = self
-            .client
-            .method(method, path)
-            .peer("192.0.2.10:40000".parse().unwrap());
-        if let Some(token) = token {
-            req = req.header("authorization", &format!("Bearer {token}"));
-        }
-        req
+        request_on(&self.client, method, path, token)
+    }
+
+    /// The server `startup::http_stage::serve_once` runs, over a second router
+    /// on this harness's state, so the operation's own deadline answers a
+    /// stalled body only where production lets it.
+    fn stall_server(&self) -> kynos::server::Server<AppCtx> {
+        let openapi = OpenApiJson(Arc::new(bytes::Bytes::from(
+            crate::http::document_json().unwrap(),
+        )));
+        let service = crate::http::service((*self.state).clone(), openapi).unwrap();
+        crate::startup::http_server(service)
+            // No head deadline: the paused clock would jump to it before the
+            // operation's deadline is armed, and arm that one late. Every
+            // head here is sent whole before the pause. kynos bounds a
+            // connection's first head by the earlier of HTTP/1's header-read
+            // timeout and HTTP/2's idle timeout, so both go.
+            .http1(kynos::server::protocol::http1::Http1Config::default().header_read_timeout(None))
+            .http2(kynos::server::protocol::http2::Http2Config::default().idle_timeout(None))
     }
 
     /// Send `method path` with a body that declares more bytes than it sends
     /// and then stalls, and return the status it is answered with and how
     /// long, on the tokio clock, that took.
     ///
-    /// The request is sent twice. The in-process client sends it as a stream
-    /// that never ends (`TestRequest::body_stream`), and its answer is the
-    /// one returned and recorded in the harness's [`Coverage`]. It is also
-    /// written by hand over a loopback socket to a second router over `state`,
-    /// served by the `kynos::server::Server` the daemon runs, which must
-    /// answer the same within a second: a server bound such as a request-body
-    /// idle timeout would otherwise answer first, and no in-process request
-    /// meets one. The clock is paused while each waits, so a deadline of
+    /// The request is sent twice, each time to a second router over `state`
+    /// served by the `kynos::server::Server` the daemon runs. A test client
+    /// sends it over an in-memory connection as a stream that never ends
+    /// (`TestRequest::body_stream`), and its answer is the one returned and
+    /// recorded in the harness's [`Coverage`]. It is also written by hand
+    /// over a loopback socket, which must be answered the same within a
+    /// second: a bound only a listener sets would otherwise answer first.
+    /// The clock is paused while each waits, so a deadline of
     /// minutes elapses as soon as nothing else can run: the result is exact,
     /// and the test does not wait for it.
     pub async fn slow_body(
@@ -289,7 +321,8 @@ impl Harness {
         (status, waited)
     }
 
-    /// The stalled request of `framing` through the in-process client.
+    /// The stalled request of `framing` through a test client over the
+    /// daemon's server.
     async fn stalled_in_process(
         &self,
         method: &str,
@@ -308,9 +341,13 @@ impl Harness {
             Some(bytes::Bytes::from_static(first)).filter(|chunk| !chunk.is_empty()),
         )
         .chain(futures_util::stream::pending());
-        let mut req = self
-            .request(method, path, token)
-            .body_stream("application/json", chunks);
+        // Through the daemon's server settings: a client over the router
+        // alone holds a body to kynos' default 30 s idle timeout, which the
+        // daemon turns off (`startup::http_server`).
+        let served =
+            TestClient::through_server(self.stall_server()).with_coverage(&self.coverage.0);
+        let mut req =
+            request_on(&served, method, path, token).body_stream("application/json", chunks);
         if let Some(declared) = declared {
             req = req.content_length(declared);
         }
@@ -330,27 +367,11 @@ impl Harness {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
 
-        let openapi = OpenApiJson(Arc::new(bytes::Bytes::from(
-            crate::http::document_json().unwrap(),
-        )));
-        let service = crate::http::service((*self.state).clone(), openapi).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(
-            // The server `startup::http_stage::serve_once` runs, so the operation's own
-            // deadline answers a stalled body only where production lets it.
-            crate::startup::http_server(service)
-                .listener(listener)
-                // No head deadline: the paused clock below would jump to it
-                // before the operation's deadline is armed, and arm that one
-                // late. Every head here is sent whole before the pause. kynos
-                // bounds a connection's first head by the earlier of HTTP/1's
-                // header-read timeout and HTTP/2's idle timeout, so both go.
-                .http1(
-                    kynos::server::protocol::http1::Http1Config::default()
-                        .header_read_timeout(None),
-                )
-                .http2(kynos::server::protocol::http2::Http2Config::default().idle_timeout(None))
+            self.stall_server()
+                .listener(listener.into_std().unwrap())
                 .serve(),
         );
 
