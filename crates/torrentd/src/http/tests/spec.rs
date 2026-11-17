@@ -300,15 +300,13 @@ fn only_operations_with_a_body_declare_a_deadline() {
     // one missing from a body-bearing operation is a slow body nothing
     // bounds. The plan apply and adopting or creating a plan wait for minutes
     // by design, so their deadline bounds the body read alone, and still
-    // declares the `408`; only the alert drill's test surface has none.
+    // declares the `408`, as does the alert drill's test surface.
     let doc = doc();
     for (method, path, op) in operations(&doc) {
         let has_body = op.get("requestBody").is_some();
         let has_deadline = op["responses"].get("408").is_some();
-        let unbounded = path == "/v1/faults";
         assert_eq!(
-            has_deadline,
-            has_body && !unbounded,
+            has_deadline, has_body,
             "{method} {path}: body {has_body}, 408 {has_deadline}"
         );
     }
