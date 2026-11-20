@@ -21,7 +21,7 @@
 //! 1. `log_level`: `info` for every target, and the level for every crate of
 //!    the workspace ([`WORKSPACE_TARGETS`]).
 //! 2. `log_filter`: the operator's own directives, e.g.
-//!    `torrentd_pool::apply=debug,torrentd::vpn=trace`.
+//!    `torrentd::pool::apply=debug,torrentd::vpn=trace`.
 //! 3. `RUST_LOG`, read once at startup. Where it is set, it stands in for
 //!    `log_level`, as it always has, and its directives win over
 //!    `log_filter`'s on any target both name.
