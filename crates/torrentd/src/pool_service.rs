@@ -86,12 +86,18 @@ pub struct PoolService {
 }
 
 /// An owner release waiting for the writer: [`PoolStore::release_owner`]'s
-/// arguments.
+/// arguments, and the span it is written in.
 #[derive(Debug)]
 struct DeferredRelease {
     infohash: String,
     profile: String,
     payload_deleted: bool,
+    /// A root span linked to the `DELETE` that queued the release, with the
+    /// subscriber current there. Not a child of the request's span: the
+    /// release can wait out a whole scan, and a child would hold the
+    /// request's span open, and its exported duration with it, until then.
+    /// The link carries the request's `request_id` on to its lines.
+    carried: crate::startup::tasks::Carried,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -823,16 +829,18 @@ impl PoolService {
     fn apply_deferred_releases(&self, store: &mut PoolStore) {
         let pending = std::mem::take(&mut *self.deferred_releases.lock());
         for r in pending {
-            match store.release_owner(&r.infohash, &r.profile, r.payload_deleted) {
-                Ok(_) => info!(
-                    target: "torrentd::pool",
-                    infohash = %r.infohash,
-                    profile_id = %r.profile,
-                    "released a deleted torrent's pool index owner record, deferred while the \
-                     writer was held",
-                ),
-                Err(e) => self.note_store_error("release_owner", &e),
-            }
+            r.carried.run(|| {
+                match store.release_owner(&r.infohash, &r.profile, r.payload_deleted) {
+                    Ok(_) => info!(
+                        target: "torrentd::pool",
+                        infohash = %r.infohash,
+                        profile_id = %r.profile,
+                        "released a deleted torrent's pool index owner record, deferred while \
+                         the writer was held",
+                    ),
+                    Err(e) => self.note_store_error("release_owner", &e),
+                }
+            });
         }
     }
 
@@ -877,10 +885,19 @@ impl PoolService {
         );
         let first = {
             let mut pending = self.deferred_releases.lock();
+            let span = tracing::info_span!(
+                target: "torrentd::pool",
+                parent: None,
+                "pool.release_owner_deferred",
+                infohash = %infohash,
+                profile_id = %profile,
+            );
+            span.follows_from(tracing::Span::current());
             pending.push(DeferredRelease {
                 infohash,
                 profile,
                 payload_deleted,
+                carried: crate::startup::tasks::Carried::in_span(span),
             });
             pending.len() == 1
         };

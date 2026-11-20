@@ -304,6 +304,57 @@ fn a_release_deferred_behind_the_writer_lands_before_the_next_takers_work() {
     assert!(pool.deferred_releases.lock().is_empty());
 }
 
+/// A release deferred behind the writer is logged, whenever and on whichever
+/// thread it lands, in a span of its own linked to the `DELETE` that queued
+/// it, carrying that request's `request_id`. It used to be logged in no span
+/// at all, on the pool-release thread, so nothing tied it to the request.
+#[test]
+fn a_deferred_release_is_logged_with_the_request_that_queued_it() {
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+    let dir = tempfile::tempdir().unwrap();
+    let ih = InfoHash([0x92; 20]);
+    let pool = std::sync::Arc::new(pool_with(dir.path(), ih, Some("p")));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let pool = std::sync::Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let _store = pool.store.lock();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+    };
+    held_rx.recv().unwrap();
+
+    let request = tracing::info_span!("request", request_id = "r-delete");
+    request.in_scope(|| pool.release_owner_soon(ih.to_hex(), "p".into(), false));
+    drop(request);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    // The pool-release thread or this taker applies it, whichever is first.
+    pool.with_store(|_| ());
+
+    let text = log.text();
+    let released: serde_json::Value = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|l: &serde_json::Value| {
+            l["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("released a deleted torrent's pool index owner"))
+        })
+        .unwrap_or_else(|| panic!("the deferred release is logged: {text}"));
+    assert_eq!(released["request_id"], "r-delete", "{released}");
+    assert_eq!(
+        released["span"]["name"], "pool.release_owner_deferred",
+        "{released}"
+    );
+    assert_eq!(released["span"]["profile_id"], "p", "{released}");
+}
+
 /// A pool index over `dir` holding one complete, adopted torrent owned by
 /// profile `p`, with a registry handed over as the daemon hands the
 /// boot's, assigning the torrent to `claim` or to nobody.

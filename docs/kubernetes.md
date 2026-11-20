@@ -160,6 +160,10 @@ holding `default_save_path` and any `[pool] roots`.
   ([running.md §11, *In a cluster*](running.md#11-drills-worth-doing-once-before-you-trust-it)).
   Where that exposure is unacceptable, use per-profile in-tunnel resolvers
   ([running.md, *Tracker lookups through a tunnel*](running.md#tracker-lookups-through-a-tunnel)).
+  The chart adds the carve-out whenever `kill_switch_dns_servers` is absent,
+  so once every `vpn` profile sets `tracker_dns: tunnel`, turn it off with
+  `kill_switch_dns_servers: []` in `config.settings`. The boot then has no
+  warning to log, and `torrentd_kill_switch_dns_exempt` is `0`.
 
 ### Resources
 
@@ -446,14 +450,17 @@ every other's ([running.md §5, *Account isolation*](running.md#account-isolatio
   `grafana_dashboard: "1"` holding [`deploy/dashboard.json`](../deploy/dashboard.json),
   for the Grafana chart's dashboard sidecar. Point the sidecar at the
   release's namespace, or at all of them.
-- **OTLP traces:** `config.settings.telemetry.otlp_endpoint`, as in the
-  host-only values: Grafana Alloy's OTLP receiver (`:4318`, http/protobuf), or
-  Tempo's own (`:4317` with `protocol: grpc`)
+- **OTLP traces:** `telemetry.otlpEndpoint`, which the chart writes as
+  `[telemetry]`'s `otlp_endpoint`, or `config.settings.telemetry.otlp_endpoint`
+  as in the host-only values. Set one of them; the render fails with both set.
+  Either points at Grafana Alloy's OTLP receiver (`:4318`, http/protobuf), or
+  at Tempo's own (`:4317` with `config.settings.telemetry.protocol: grpc`)
   ([running.md §9, *Traces*](running.md#traces-opentelemetry-over-otlp)).
   With the kill switch on, the daemon's only egress is loopback and its
   tunnels, so the collector must run in the same pod; the chart has no value
-  for a sidecar, so leave `[telemetry]` off there. Trace and span ids are in
-  every log line either way.
+  for a sidecar, so leave `[telemetry]` off there. Either way, every log line
+  inside a trace carries its trace and span ids, and every line inside an
+  API request carries that request's `request_id`.
 
 ### Operations
 
@@ -469,6 +476,23 @@ A port-forward reaches the API over the pod's loopback, so it works with the
 kill switch on and is not subject to the NetworkPolicy. Through the Ingress
 instead, `torrentctl --url https://torrentd.example.com`. Without a token it
 asks for the operator password ([README, Operator client](../README.md#operator-client)).
+
+**Changing the config.** The chart turns on `config_watch` unless
+`config.settings` sets it, and mounts the config Secret as a directory, so a
+changed value reaches the running pod in place and the daemon reloads it
+itself, as `POST /v1/config/reload` would. That applies what a reload can
+([running.md §8](running.md#8-start-it)) without the restart that
+drains every torrent's resume data. A key that only a restart applies is
+reported, not applied: `torrentd_config_restart_pending{key}` is `1`, and
+`TorrentdConfigRestartPending` fires after 30 minutes, until the pod restarts
+(`kubectl -n torrentd rollout restart statefulset torrentd`) or the file is
+edited back. A reload that fails keeps the running settings and counts in
+`torrentd_config_reload_failures_total{stage}`. `config.rollOnChange: true`
+also rolls the pod on every rendered change. With `config.existingSecret` the
+chart renders no config, so neither applies: set `config_watch = true` in
+your own `torrentd.toml` for an edited Secret to reload by itself, or the
+daemon (whose default is `false`) reads it only at the next reload or
+restart.
 
 **Backing up the state volume.** The image has no `sqlite3`, so the online
 backup of [operations.md, *Backing up*](operations.md#backing-up) is not to

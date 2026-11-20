@@ -266,7 +266,7 @@ authentication posture, and at least one `[[profile]]`:
 | `allowed_hosts` | `[]`, so a daemon without `[auth]` answers only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`). List the names a reverse proxy passes through as `Host`, as bare names or addresses with no scheme, port or path. Refused beside `[auth]` — §6. Read once, at startup. |
 | `allow_unsupported_state_fs` | `false`, so a state directory (that of `resume_dir`, `registry_path` or `[pool] db_path`) on overlayfs, NFS, CIFS/SMB or FUSE refuses the start with exit 78. `true` starts anyway, with a WARN and `torrentd_state_fs_unsupported` at 1 — [operations.md, Storage the daemon runs on](operations.md#storage-the-daemon-runs-on). Read once, at startup. |
 | `log_level` | `info`. Sets every crate of the workspace, `torrentd_pool` included; every other target logs at `info`. Reloadable. |
-| `log_filter` | unset. `EnvFilter` directives laid over `log_level`, e.g. `"torrentd_pool::apply=debug,torrentd::vpn=trace"`: a target named here wins over `log_level`. Reloadable. One that does not parse refuses the boot with exit 78, and fails a reload with the filter in place kept, counted in `torrentd_config_reload_failures_total{stage="log_filter"}` — §12. |
+| `log_filter` | unset. `EnvFilter` directives laid over `log_level`, e.g. `"torrentd::pool::apply=debug,torrentd::vpn=trace"`: a target named here wins over `log_level`. Reloadable. One that does not parse refuses the boot with exit 78, and fails a reload with the filter in place kept, counted in `torrentd_config_reload_failures_total{stage="log_filter"}` — §12. |
 | `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
 | `vpn_handshake_max_age_secs` | `180` — how long a WireGuard profile with torrents that can send may go with no handshake answering them before it is fenced. An aged handshake fences only once the link has sent bytes that nothing answered for this long, so neither an idle profile nor a quiet seeding one is fenced on its handshake (§11, drill 5). |
@@ -1347,8 +1347,10 @@ A configuration the daemon or `--check-config` refuses exits `78`
 statuses and exits `1` for a config it cannot load. The daemon's and
 `--check-config`'s reason is a JSON line on stdout, in the shape of every later
 log line, with `error.kind` set to `config_refused`; a usage error the daemon
-refuses exits `2` the same way with `usage`, and a logger that cannot be
-installed exits `70` with `tracing_init_failed`. Operator subcommands keep
+refuses exits `2` the same way with `usage`, a logger that cannot be
+installed exits `70` with `tracing_init_failed`, and an async runtime that
+cannot be built (a thread or memory limit hit at start) exits `70` with
+`runtime_build_failed`. Operator subcommands keep
 their human stderr. The unit's
 `RestartPreventExitStatus=78` leaves it stopped with the reason as the last
 journal line rather than restarting it every five seconds. That directive reads
@@ -1806,8 +1808,15 @@ Every API request runs in a span named `request`, carrying its
 `status`, and caller (`principal`: `session`, `token` or `anonymous`, and a
 static token's `token_name`, never the token). Work the request hands to
 another task or thread stays inside it, so an engine line an adoption causes
-has the request's `trace_id`. A request carrying a W3C `traceparent` joins
-the caller's trace, and every response returns its own `traceparent`.
+has the request's `trace_id`. Every line inside a request also has its
+`request_id` as a key of its own, just before `trace_id`, however deep the
+span it was logged in, so the id a client quotes finds them all. Work that
+outlives its request, such as a `DELETE`'s pool release deferred behind a
+scan, runs in a trace of its own, linked to the request's, and keeps the
+request's `request_id`. The `server error response` line a 5xx writes runs
+outside the request's span, so it names `request_id` and `trace_id` as
+fields. A request carrying a W3C `traceparent` joins the caller's trace, and
+every response returns its own `traceparent`.
 
 The spans each layer opens, by name, to search for in the log's
 `span.name` or in Tempo. INFO spans are logged and exported; DEBUG spans
@@ -2816,7 +2825,7 @@ A restart would throw away the state you are trying to capture.
 
 **One subsystem only.** `log_filter` takes `EnvFilter` directives laid over
 `log_level`, and is reloadable the same way: `log_filter =
-"torrentd_pool::apply=debug"` raises the pool's apply step to `debug` and
+"torrentd::pool::apply=debug"` raises the pool's apply step to `debug` and
 leaves everything else where `log_level` puts it. Delete the key and reload to
 take it away again. A `log_filter` that does not parse fails the reload with
 `SIGHUP: failed to apply log level; keeping the current log filter`, naming the

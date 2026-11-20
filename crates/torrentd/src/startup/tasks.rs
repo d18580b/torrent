@@ -39,7 +39,7 @@ impl Carried {
     }
 
     /// `span`, and the subscriber current here.
-    fn in_span(span: tracing::Span) -> Self {
+    pub(crate) fn in_span(span: tracing::Span) -> Self {
         Self {
             span,
             dispatch: tracing::dispatcher::get_default(tracing::Dispatch::clone),
@@ -180,11 +180,15 @@ mod tests {
     use crate::metrics_sink::tests::daemon_sources;
     use crate::metrics_sink::tests::literal;
 
-    /// Every task spawned in the daemon's source outside the supervisor
-    /// (`tasks::spawn` or `tasks::spawn_in`, or the `tokio::spawn` they
-    /// wrap), by file, with why it is not a long-lived task: each ends on its
-    /// own, or is awaited or aborted by what started it. A long-lived task
-    /// goes through `spawn_supervised` instead, and is in `TASKS`.
+    /// Every task or thread started in the daemon's source outside the
+    /// supervisor (`tasks::spawn` or `tasks::spawn_in`, the `tokio::spawn`
+    /// they wrap, a `JoinSet`, or a thread from `thread::spawn` or
+    /// `thread::Builder`; not a `thread::scope`'s, which cannot outlive the
+    /// call that made it, nor blocking work, which ends with its job), by
+    /// file, with why it is not a long-lived task the supervisor has to
+    /// watch: each ends on its own, is awaited or aborted by what started
+    /// it, or is watched by what started it. A long-lived task goes through
+    /// `spawn_supervised` instead, and is in `TASKS`.
     const UNSUPERVISED: &[(&str, usize, &str)] = &[
         (
             "startup/tasks.rs",
@@ -198,8 +202,41 @@ mod tests {
         ),
         (
             "port_forward_monitor.rs",
+            2,
+            "a rebind's paced reannounce, held and awaited or aborted by its profile's renewal; \
+             and the profiles' renewals, a JoinSet the supervised monitor joins as each ends, \
+             dropping task_up{task=\"port_forward_monitor\"} for a renewal that panicked",
+        ),
+        (
+            "api_socket.rs",
             1,
-            "a rebind's paced reannounce, held and awaited or aborted by its profile's renewal",
+            "the socket API's connections, a JoinSet each of whose tasks ends with its connection",
+        ),
+        (
+            "pool_service.rs",
+            1,
+            "a delete's pool-release thread, which ends once it has taken the writer",
+        ),
+        (
+            "telemetry.rs",
+            1,
+            "the thread that builds the OTLP HTTP client, joined at once",
+        ),
+        (
+            "batch_writer.rs",
+            1,
+            "the batch writer's thread, whose death is logged, counted in \
+             batch_writer_deaths_total and fails /livez",
+        ),
+        (
+            "vpn/exec.rs",
+            1,
+            "an external command's pipe drainers, one per pipe, each ending at the pipe's EOF",
+        ),
+        (
+            "alert_loop/builder.rs",
+            1,
+            "the alert loop's thread, whose heartbeat /livez reads and whose panic stops the daemon",
         ),
         (
             "http/v1/server.rs",
@@ -228,10 +265,16 @@ mod tests {
         let mut spawns: BTreeMap<String, usize> = BTreeMap::new();
         let mut supervised = BTreeSet::new();
         for (file, _, text) in daemon_sources() {
+            // A `JoinSet` is counted where it is made, and a thread where it
+            // is started: neither goes through `spawn_in`, and `clippy.toml`
+            // forbids neither.
             let n = text.matches("tokio::spawn(").count()
                 + text.matches("tasks::spawn(").count()
                 + text.matches("tasks::spawn_in(").count()
-                + text.matches("Handle::current().spawn(").count();
+                + text.matches("Handle::current().spawn(").count()
+                + text.matches("JoinSet::new()").count()
+                + text.matches("thread::spawn(").count()
+                + text.matches("thread::Builder::new()").count();
             if n > 0 {
                 spawns.insert(file.clone(), n);
             }

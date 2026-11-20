@@ -204,7 +204,7 @@ pub struct Config {
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
     /// `EnvFilter` directives laid over `log_level`, e.g.
-    /// `torrentd_pool::apply=debug,torrentd::vpn=trace`. Reloadable. Where
+    /// `torrentd::pool::apply=debug,torrentd::vpn=trace`. Reloadable. Where
     /// `RUST_LOG` is set, its directives win on any target both name. One
     /// that does not parse refuses the boot, and fails a reload with the
     /// filter in place kept (`crate::tracing_init`).

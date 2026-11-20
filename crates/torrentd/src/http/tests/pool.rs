@@ -1076,8 +1076,11 @@ async fn an_adoption_runs_in_the_callers_trace_down_to_the_engine() {
     // The lines inside the request: all of them but the observer's two,
     // which kynos emits outside every interceptor.
     let inside: Vec<&Value> = lines.iter().filter(|l| l["trace_id"].is_string()).collect();
+    // Each carries the request's id as a key of its own, however deep the
+    // span it was logged in: only the handler's line had it, under `span`.
     for line in &inside {
         assert_eq!(line["trace_id"], TRACE_ID, "{line}");
+        assert_eq!(line["request_id"], request_id.as_str(), "{line}");
     }
     let targets: std::collections::BTreeSet<&str> =
         inside.iter().filter_map(|l| l["target"].as_str()).collect();

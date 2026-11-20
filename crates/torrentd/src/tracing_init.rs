@@ -21,7 +21,7 @@
 //! 1. `log_level`: `info` for every target, and the level for every crate of
 //!    the workspace ([`WORKSPACE_TARGETS`]).
 //! 2. `log_filter`: the operator's own directives, e.g.
-//!    `torrentd_pool::apply=debug,torrentd::vpn=trace`.
+//!    `torrentd::pool::apply=debug,torrentd::vpn=trace`.
 //! 3. `RUST_LOG`, read once at startup. Where it is set, it stands in for
 //!    `log_level`, as it always has, and its directives win over
 //!    `log_filter`'s on any target both name.
@@ -159,7 +159,11 @@ where
         // Not `ctx.event_scope()`: that scope is behind this layer's own
         // `log_level` filter, which hides the INFO spans of a WARN line once
         // `log_level` is warn or error. `EventTraceIds` reads the whole scope.
-        if let Some(ids) = EVENT_TRACE_IDS.take() {
+        let found = EVENT_TRACE_IDS.take().unwrap_or_default();
+        if let Some(request_id) = found.request_id {
+            request_id.splice_into(&mut line);
+        }
+        if let Some(ids) = found.trace {
             ids.splice_into(&mut line);
         }
         writer.write_str(&redact_for_target(event.metadata().target(), &line))
@@ -244,16 +248,152 @@ where
     }
 }
 
+/// The `request_id` of the API request a span runs in, kept in its
+/// extensions by [`RecordRequestIds`].
+///
+/// A JSON line names only its innermost span, under `span`, so only a line
+/// logged in the request's own span had its id: one logged deeper, in a
+/// pool, engine or SQLite span the request entered, had a `trace_id` (with
+/// export on) but no `request_id`, which is the id a client holds and
+/// quotes. The formatter writes it as a key of every line logged inside the
+/// request.
+#[derive(Clone, Debug)]
+struct RequestId(String);
+
+impl RequestId {
+    /// The field a span or event carries the id in.
+    const FIELD: &'static str = "request_id";
+
+    /// Add `request_id` as the last key of `line`, as
+    /// [`TraceIds::splice_into`] adds its own.
+    fn splice_into(&self, line: &mut String) {
+        if let Some(close) = line.rfind('}') {
+            let value = serde_json::Value::from(self.0.as_str());
+            line.insert_str(close, &format!(",\"{}\":{value}", Self::FIELD));
+        }
+    }
+}
+
+/// Finds a `request_id` field among the fields visited: its value, where it
+/// has one that is not empty, and whether it was there at all. Notes a
+/// `trace_id` field too: an event naming its own (the 5xx line, written
+/// outside the request's span) is given no second from its scope, which on
+/// the API socket is the connection's span and may be another trace.
+#[derive(Default)]
+struct FindRequestId {
+    present: bool,
+    value: Option<String>,
+    trace_id: bool,
+}
+
+impl FindRequestId {
+    fn note(&mut self, value: String) {
+        self.present = true;
+        if !value.is_empty() {
+            self.value = Some(value);
+        }
+    }
+}
+
+impl tracing::field::Visit for FindRequestId {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            RequestId::FIELD => self.note(value.to_owned()),
+            "trace_id" => self.trace_id = true,
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        match field.name() {
+            RequestId::FIELD => self.note(format!("{value:?}")),
+            "trace_id" => self.trace_id = true,
+            _ => {}
+        }
+    }
+}
+
+/// Records the `request_id` a span is given, at its creation or later, into
+/// its extensions as [`RequestId`]. A span that follows from another (a
+/// root span linked to the request that started its work, rather than a
+/// child of it) takes on the `request_id` of the scope it follows, so its
+/// lines are found by the id the client quotes too. Needs no OpenTelemetry
+/// context, so it records with export off as well as on.
+struct RecordRequestIds;
+
+impl RecordRequestIds {
+    fn record<S>(span: &tracing_subscriber::registry::SpanRef<'_, S>, found: FindRequestId)
+    where
+        S: for<'a> LookupSpan<'a>,
+    {
+        if let Some(value) = found.value {
+            span.extensions_mut().replace(RequestId(value));
+        }
+    }
+}
+
+impl<S> Layer<S> for RecordRequestIds
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        let mut found = FindRequestId::default();
+        attrs.record(&mut found);
+        if let Some(span) = ctx.span(id) {
+            Self::record(&span, found);
+        }
+    }
+
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        let mut found = FindRequestId::default();
+        values.record(&mut found);
+        if let Some(span) = ctx.span(id) {
+            Self::record(&span, found);
+        }
+    }
+
+    fn on_follows_from(&self, id: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        if span.extensions().get::<RequestId>().is_some() {
+            return;
+        }
+        let inherited = ctx.span(follows).and_then(|follows| {
+            follows
+                .scope()
+                .find_map(|s| s.extensions().get::<RequestId>().cloned())
+        });
+        if let Some(request_id) = inherited {
+            span.extensions_mut().insert(request_id);
+        }
+    }
+}
+
+/// What [`EventTraceIds`] found for one event.
+#[derive(Debug, Default)]
+struct EventIds {
+    /// The ids of the innermost span in the event's scope that has them,
+    /// unless the event carries a `trace_id` of its own.
+    trace: Option<TraceIds>,
+    /// The `request_id` of the innermost span in the event's scope that has
+    /// one, unless the event carries a `request_id` of its own.
+    request_id: Option<RequestId>,
+}
+
 thread_local! {
     /// The ids [`EventTraceIds`] found for the event this thread is
     /// dispatching, for [`Redacting`] to take when it formats that event.
-    static EVENT_TRACE_IDS: std::cell::Cell<Option<TraceIds>> = const { std::cell::Cell::new(None) };
+    static EVENT_TRACE_IDS: std::cell::Cell<Option<EventIds>> = const { std::cell::Cell::new(None) };
 }
 
 /// Finds each event's ids, those of the innermost span in its scope that has
-/// [`TraceIds`], and leaves them in [`EVENT_TRACE_IDS`] for the JSON layer.
-/// It has no filter of its own, so its scope holds every span, including the
-/// INFO spans the JSON layer's `log_level` filter hides at warn or error. It
+/// [`TraceIds`] and of the innermost that has a [`RequestId`], and leaves
+/// them in [`EVENT_TRACE_IDS`] for the JSON layer. An event with a
+/// `request_id` or `trace_id` field of its own keeps it, and is given no
+/// second (nor, for a `trace_id`, a `span_id` beside it). It has
+/// no filter of its own, so its scope holds every span, including the INFO
+/// spans the JSON layer's `log_level` filter hides at warn or error. It
 /// runs before the JSON layer only because [`subscriber`] composes the two
 /// with `and_then`, which calls it first.
 struct EventTraceIds;
@@ -263,12 +403,26 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        let ids = ctx.event_scope(event).and_then(|scope| {
-            scope
-                .into_iter()
-                .find_map(|span| span.extensions().get::<TraceIds>().copied())
-        });
-        EVENT_TRACE_IDS.set(ids);
+        let mut own = FindRequestId::default();
+        event.record(&mut own);
+        let mut found = EventIds::default();
+        if let Some(scope) = ctx.event_scope(event) {
+            for span in scope {
+                let extensions = span.extensions();
+                if found.trace.is_none() && !own.trace_id {
+                    found.trace = extensions.get::<TraceIds>().copied();
+                }
+                if found.request_id.is_none() && !own.present {
+                    found.request_id = extensions.get::<RequestId>().cloned();
+                }
+                if (found.trace.is_some() || own.trace_id)
+                    && (found.request_id.is_some() || own.present)
+                {
+                    break;
+                }
+            }
+        }
+        EVENT_TRACE_IDS.set(Some(found));
     }
 }
 
@@ -456,6 +610,7 @@ where
                 .with_filter(LevelFilter::INFO),
         )
         .with(RecordTraceIds::default())
+        .with(RecordRequestIds)
         .with(CountLogEvents(counts).with_filter(LevelFilter::WARN));
     (
         LogReloadHandle {
@@ -585,6 +740,9 @@ pub enum EarlyErrorKind {
     Usage,
     /// The subscriber [`init`] installs could not be installed (exit 70).
     TracingInitFailed,
+    /// The tokio runtime, built before the subscriber, could not be built
+    /// (exit 70).
+    RuntimeBuildFailed,
 }
 
 impl EarlyErrorKind {
@@ -593,6 +751,7 @@ impl EarlyErrorKind {
             Self::ConfigRefused => "config_refused",
             Self::Usage => "usage",
             Self::TracingInitFailed => "tracing_init_failed",
+            Self::RuntimeBuildFailed => "runtime_build_failed",
         }
     }
 }
@@ -1080,6 +1239,7 @@ mod tests {
             (EarlyErrorKind::ConfigRefused, "config_refused"),
             (EarlyErrorKind::Usage, "usage"),
             (EarlyErrorKind::TracingInitFailed, "tracing_init_failed"),
+            (EarlyErrorKind::RuntimeBuildFailed, "runtime_build_failed"),
         ] {
             let v: serde_json::Value =
                 serde_json::from_str(&early_line(kind, "m")).expect("one JSON object");
