@@ -1,0 +1,36 @@
+name: Release gate
+
+# `master`'s ruleset requires the check `release gate`, so that the release
+# pull request merges only once its checks are green. That pull request gets
+# the check from release-plz.yml's approved dispatch on its branch: a pull
+# request this workflow's token opened triggers no `pull_request` run, so
+# this workflow never runs on it.
+#
+# Every other pull request gets the check here, passing in seconds, unless
+# its head is a `release-plz-*` branch of this repository. Merging such a
+# pull request releases (release-plz.yml), so its check has to come from the
+# approved release run too: `gh workflow run release-plz.yml --ref <branch>`,
+# then approve the run (README.md, Releasing).
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  release-gate:
+    name: release gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$HEAD_REPO" = "$REPO" ] && [[ $HEAD_REF == release-plz-* ]]; then
+            echo "::error::merging $HEAD_REF releases: dispatch release-plz.yml on it (gh workflow run release-plz.yml --ref $HEAD_REF) and approve that run; its release gate check is the one that counts"
+            exit 1
+          fi
+          echo "not a release pull request: nothing to gate"

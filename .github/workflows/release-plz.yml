@@ -22,7 +22,7 @@ name: Release
 #    It opens or updates the release pull request; where GitHub refuses this
 #    workflow's token a pull request (an organisation or repository
 #    setting), the run stays green and its summary links the comparison to
-#    open it from by hand. It dispatches ci.yml and this workflow on the branch, since
+#    open it from by hand. It dispatches this workflow on the branch, since
 #    anything this workflow's token pushes triggers no workflow of its own,
 #    and deletes the timestamped `release-plz-*` branches `release-plz
 #    release-pr` used to leave behind. With nothing to release it deletes
@@ -43,6 +43,17 @@ name: Release
 # `release-pr` makes on `release-plz-next`, the build jobs run without
 # uploading or pushing anything, so a broken release build fails that pull
 # request or the release pull request rather than the release itself.
+#
+# The dispatch is the release pull request's CI, and it costs a full ci.yml
+# run plus the multi-arch builds, so it starts only once someone approves it:
+# `approve` waits on the `release-ci` environment, whose required reviewer
+# approves the run (Review deployments). A waiting run takes no runner, and
+# the next push to `master` cancels it along with the branch it tested. Once
+# approved, `ci` runs ci.yml and the build jobs run their dry run, and
+# `release gate` passes only when all of them did. `master`'s ruleset
+# requires `release gate`, so the release pull request merges only green;
+# release-gate.yml reports the same check, passing, on every other pull
+# request.
 #
 # Every action is pinned to a commit SHA with its release in a comment, as in
 # ci.yml. Each job holds only the permissions it uses; the workflow holds
@@ -397,16 +408,16 @@ jobs:
           else
             gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" --silent
           fi
-      # Anything this workflow's token pushes triggers no workflow, so CI and
-      # the dry run of the build jobs (`dist`, `dist-musl`, `image`) are
-      # dispatched on the branch. Their checks land on its head commit, which
+      # Anything this workflow's token pushes triggers no workflow, so this
+      # workflow is dispatched on the branch: once approved, it runs ci.yml
+      # and the dry run of the build jobs (`dist`, `dist-musl`, `image`), and
+      # reports `release gate`. Their checks land on its head commit, which
       # is the release pull request's.
       - if: steps.update.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh workflow run ci.yml --repo "$REPO" --ref "$BRANCH"
           gh workflow run release-plz.yml --repo "$REPO" --ref "$BRANCH"
       # Opens the release pull request, or retitles an open one. Where GitHub
       # refuses this workflow's token a pull request (the setting that lets
@@ -446,7 +457,7 @@ jobs:
           {
             echo "## Open the release pull request by hand"
             echo
-            echo "GitHub refused this workflow's token a pull request. \`$BRANCH\` holds **$TITLE** as a verified commit on this push's \`master\`, and CI and the release dry run are dispatched on it."
+            echo "GitHub refused this workflow's token a pull request. \`$BRANCH\` holds **$TITLE** as a verified commit on this push's \`master\`, and its checks are dispatched on it, waiting for approval."
             echo
             echo "[Open the pull request from \`$BRANCH\`]($url), with the body below. Merging it releases v${TITLE##* v}."
             echo
@@ -493,13 +504,37 @@ jobs:
   # QEMU: the Boost and libtorrent build takes far too long emulated. A
   # matrix job's result is `success` only when every leg succeeded, which
   # is what the jobs below that need it read.
+  # The release pull request's checks start here, once the run is approved.
+  # Only a dispatch waits: on a push or a pull request this job is skipped,
+  # and the jobs below go ahead without it.
+  approve:
+    name: approve the release pull request's checks
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    environment: release-ci
+    steps:
+      - run: echo "approved"
+
+  # ci.yml, on the release pull request's head, as one of this run's jobs, so
+  # `release gate` can wait for it.
+  ci:
+    needs: approve
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   dist:
     name: dist (${{ matrix.arch }} glibc)
-    needs: release
+    needs: [release, approve]
     # `!cancelled()` because `release` is skipped on a dry run (a pull
     # request, or a dispatch), and a skipped need otherwise skips this job too.
+    # A dispatch builds only once `approve` passed.
     if: >-
-      !cancelled() && (github.event_name != 'push'
+      !cancelled()
+      && (github.event_name != 'workflow_dispatch' || needs.approve.result == 'success')
+      && (github.event_name != 'push'
       || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
     strategy:
       matrix:
@@ -537,9 +572,11 @@ jobs:
 
   dist-musl:
     name: dist (static torrentctl, ${{ matrix.arch }} musl)
-    needs: release
+    needs: [release, approve]
     if: >-
-      !cancelled() && (github.event_name != 'push'
+      !cancelled()
+      && (github.event_name != 'workflow_dispatch' || needs.approve.result == 'success')
+      && (github.event_name != 'push'
       || (needs.release.result == 'success' && needs.release.outputs.tag != ''))
     strategy:
       matrix:
@@ -773,6 +810,29 @@ jobs:
   # `cosign verify` and `gh attestation verify` pass on the tag as they did
   # when it named a single image. Only a release pushes anything, so a dry
   # run skips this job.
+  # The one check `master`'s ruleset requires: the release pull request's
+  # head passed ci.yml and the release dry run. Every other pull request gets
+  # it from release-gate.yml.
+  release-gate:
+    name: release gate
+    needs: [approve, ci, dist, dist-musl, image]
+    if: always() && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if jq -e 'all(. == "success")' <<< "$RESULTS" > /dev/null; then
+            echo "every check of the release pull request passed"
+          else
+            echo "::error::the release pull request is not green: approve this run, or fix and re-run what failed"
+            exit 1
+          fi
+
   image-manifest:
     name: image manifest list (ghcr.io)
     needs: [release, image]

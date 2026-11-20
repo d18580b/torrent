@@ -8,6 +8,9 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  # release-plz.yml runs this as the release pull request's CI, once that run
+  # is approved, so its `release gate` check can wait for every job here.
+  workflow_call:
 
 # Every job only reads the repository. The cache actions authenticate with the
 # runner's own cache token, not GITHUB_TOKEN, so they need no grant here.
