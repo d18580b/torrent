@@ -46,8 +46,8 @@ telemetry:
 config:
   # A Secret holding the whole torrentd.toml under existingSecretKey. Set, the
   # chart renders no config and `settings` is ignored; the chart's own defaults
-  # (http_listen, trusted_proxies, the kill-switch carve-outs) are then yours
-  # to write, and http_listen's port must equal api.port.
+  # (http_listen, trusted_proxies, config_watch, the kill-switch carve-outs)
+  # are then yours to write, and http_listen's port must equal api.port.
   existingSecret: ""
   existingSecretKey: torrentd.toml
   # Roll the pod when the rendered config changes. Off: the Secret is mounted

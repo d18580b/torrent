@@ -488,9 +488,11 @@ reported, not applied: `torrentd_config_restart_pending{key}` is `1`, and
 (`kubectl -n torrentd rollout restart statefulset torrentd`) or the file is
 edited back. A reload that fails keeps the running settings and counts in
 `torrentd_config_reload_failures_total{stage}`. `config.rollOnChange: true`
-rolls the pod on every rendered change instead; it has nothing to watch with
-`config.existingSecret`, whose changes reach the pod through `config_watch`
-alone.
+also rolls the pod on every rendered change. With `config.existingSecret` the
+chart renders no config, so neither applies: set `config_watch = true` in
+your own `torrentd.toml` for an edited Secret to reload by itself, or the
+daemon (whose default is `false`) reads it only at the next reload or
+restart.
 
 **Backing up the state volume.** The image has no `sqlite3`, so the online
 backup of [operations.md, *Backing up*](operations.md#backing-up) is not to
