@@ -106,7 +106,7 @@ use tracing::Subscriber;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::time::ChronoUtc;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::fmt::FormatEvent;
 use tracing_subscriber::fmt::FormatFields;
@@ -771,12 +771,10 @@ pub fn early_error(kind: EarlyErrorKind, message: &str) {
 
 /// The line [`early_error`] writes, without the newline.
 fn early_line(kind: EarlyErrorKind, message: &str) -> String {
-    use tracing_subscriber::fmt::time::FormatTime as _;
-
     let mut timestamp = String::new();
-    // ignore-result: `ChronoUtc` only fails where its writer does, and a
+    // ignore-result: `write_timestamp` only fails where its writer does, and a
     // `String` does not.
-    let _ = ChronoUtc::rfc_3339().format_time(&mut Writer::new(&mut timestamp));
+    let _ = write_timestamp(&mut timestamp, jiff::Timestamp::now());
     let json = |s: &str| serde_json::Value::from(s).to_string();
     // Built by hand rather than from a `serde_json::Map`, which sorts its keys
     // without the `preserve_order` feature. The order is the subscriber's for
@@ -876,6 +874,24 @@ impl<'w> MakeWriter<'w> for Buf {
     }
 }
 
+/// The subscriber's timer: [`write_timestamp`] of the current time.
+struct UtcTimer;
+
+impl FormatTime for UtcTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
+        write_timestamp(w, jiff::Timestamp::now())
+    }
+}
+
+/// Write `t` as every log line's `timestamp`: RFC 3339 in UTC, always with
+/// nine fractional digits and a `Z`, as in `2026-11-20T12:34:56.123456789Z`.
+/// A fixed width keeps lines in time order when sorted as plain text, which a
+/// trimmed fraction does not (`…56.12Z` sorts after `…56.123Z`), and `Z` is
+/// how the API's `date-time` fields write UTC too.
+pub(crate) fn write_timestamp(w: &mut impl fmt::Write, t: jiff::Timestamp) -> fmt::Result {
+    write!(w, "{t:.9}")
+}
+
 /// The JSON formatting layer, redaction included, writing to `writer`.
 fn fmt_layer<S, W>(writer: W) -> impl Layer<S>
 where
@@ -884,7 +900,7 @@ where
 {
     let format = tracing_subscriber::fmt::format()
         .json()
-        .with_timer(ChronoUtc::rfc_3339())
+        .with_timer(UtcTimer)
         .with_current_span(true)
         .with_span_list(false)
         .with_target(true)
@@ -948,19 +964,46 @@ mod tests {
         assert_eq!(v["message"], msg);
         assert_eq!(v["target"], "torrentd");
         assert_eq!(v["error.kind"], "config_refused");
-        // RFC3339 in UTC, `YYYY-MM-DDTHH:MM:SS[.frac]+00:00`, as the
+        // RFC 3339 in UTC, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`, as the
         // subscriber's own timer writes it.
         let ts = v["timestamp"].as_str().expect("timestamp");
         let b = ts.as_bytes();
         assert!(
-            b.len() >= 20
+            b.len() == 30
                 && b[4] == b'-'
                 && b[7] == b'-'
                 && b[10] == b'T'
                 && b[13] == b':'
                 && b[16] == b':'
-                && ts.ends_with("+00:00"),
+                && b[19] == b'.'
+                && ts.ends_with('Z'),
             "{ts}"
+        );
+        let real: serde_json::Value = serde_json::from_str(&real).expect("one JSON object");
+        let real_ts = real["timestamp"].as_str().expect("timestamp");
+        assert_eq!(real_ts.len(), ts.len(), "{real_ts}");
+        assert!(real_ts.ends_with('Z'), "{real_ts}");
+    }
+
+    #[test]
+    fn a_timestamp_is_rfc_3339_utc_with_nine_fractional_digits() {
+        let at = |s: &str| -> String {
+            let mut out = String::new();
+            write_timestamp(&mut out, s.parse().expect("a timestamp")).expect("a String");
+            out
+        };
+        assert_eq!(at("2026-11-20T12:34:56Z"), "2026-11-20T12:34:56.000000000Z");
+        assert_eq!(
+            at("2026-11-20T12:34:56.12Z"),
+            "2026-11-20T12:34:56.120000000Z"
+        );
+        assert_eq!(
+            at("2026-11-20T12:34:56.123456789+00:00"),
+            "2026-11-20T12:34:56.123456789Z"
+        );
+        assert_eq!(
+            at("2026-11-20T13:34:56.5+01:00"),
+            "2026-11-20T12:34:56.500000000Z"
         );
     }
 

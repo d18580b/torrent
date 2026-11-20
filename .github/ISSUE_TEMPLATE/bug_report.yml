@@ -91,7 +91,7 @@ body:
 
         A line looks like this:
 
-        `{"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567", …}`
+        `{"timestamp":"2026-09-21T09:14:02.881234567Z","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567", …}`
 
         That is an excerpt, not a whole line — the formatter emits more keys than
         these, and which ones it emits changes with the code. Paste the real lines
