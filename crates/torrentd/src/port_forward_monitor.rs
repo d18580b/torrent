@@ -28,6 +28,7 @@
 //! already marked `VpnDown` are skipped here.
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -247,21 +248,22 @@ async fn run_with(
     // free to re-create a mapping just after the release deleted it.
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
+    let mut renewing = HashMap::new();
     for id in natpmp {
-        tasks.spawn(renew_profile(
+        let task = tasks.spawn(renew_profile(
             profiles.clone(),
             state.clone(),
             metrics.clone() as Arc<dyn MetricsSink>,
             Arc::new(forwarder.clone()),
             listen.clone(),
-            id,
+            id.clone(),
             REANNOUNCE_PACE,
             stop_rx.clone(),
         ));
+        renewing.insert(task.id(), id);
     }
 
-    // ignore-result: a reason, a lag and a closed sender all mean shut down.
-    let _ = shutdown.recv().await;
+    watch_renewals(&mut tasks, &renewing, &mut shutdown, &metrics).await;
     // ignore-result: no receiver left means no task left to stop.
     let _ = stop_tx.send(true);
     while let Some(joined) = tasks.join_next().await {
@@ -291,6 +293,62 @@ async fn run_with(
         );
     }
     info!(target: "torrentd::port_forward_monitor", "port-forward monitor shutting down");
+}
+
+/// Wait for shutdown, joining each of `tasks`, the profiles' renewals, as it
+/// ends rather than only at shutdown: one that panicked has left its
+/// profile's mapping to lapse, and the monitor's `task_up` stayed 1 while it
+/// did. The other profiles' renewals keep running. With every renewal ended
+/// only shutdown is left to wait for.
+async fn watch_renewals(
+    tasks: &mut JoinSet<()>,
+    renewing: &HashMap<tokio::task::Id, ProfileId>,
+    shutdown: &mut broadcast::Receiver<ShutdownReason>,
+    metrics: &PromSink,
+) {
+    loop {
+        tokio::select! {
+            // A reason, a lag and a closed sender all mean shut down.
+            _ = shutdown.recv() => break,
+            Some(joined) = tasks.join_next_with_id() => {
+                note_renewal_ended(joined, renewing, metrics);
+            }
+        }
+    }
+}
+
+/// Note one profile's renewal ending before shutdown. One that returned did
+/// so because its profile left the registry, and is logged at `info`. One
+/// that panicked is logged at `error`, and drops the monitor's
+/// `task_up{task="port_forward_monitor"}` to 0: its profile's mapping now
+/// lapses unrenewed, which `TorrentdTaskDown` exists to say.
+fn note_renewal_ended(
+    joined: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+    renewing: &HashMap<tokio::task::Id, ProfileId>,
+    metrics: &PromSink,
+) {
+    let (task, err) = match joined {
+        Ok((task, ())) => (task, None),
+        Err(err) => (err.id(), Some(err)),
+    };
+    let profile_id = renewing.get(&task).map_or("", ProfileId::as_str);
+    match err {
+        None => info!(
+            target: "torrentd::port_forward_monitor",
+            profile_id,
+            "a profile's port-forward renewal ended: the profile is gone",
+        ),
+        Some(err) => {
+            tracing::error!(
+                target: "torrentd::port_forward_monitor",
+                profile_id,
+                task_panicked = err.is_panic(),
+                error.cause = %err,
+                "a profile's port-forward renewal died; its mapping is no longer renewed",
+            );
+            metrics.set_gauge("task_up", 0.0, &[("task", "port_forward_monitor")]);
+        }
+    }
 }
 
 /// One profile's renewal loop: renew now, then again half the granted lease
@@ -1868,5 +1926,70 @@ mod tests {
             during >= 10,
             "the runtime's worker was held by the release: {during} ticks",
         );
+    }
+
+    /// A renewal that panics mid-run is seen when it dies, not at shutdown:
+    /// logged at ERROR with its profile, and the monitor's `task_up` drops
+    /// to 0, while the other profile's renewal keeps running. Against the
+    /// monitor that only joined its renewals at shutdown, `task_up` stayed 1.
+    #[tokio::test]
+    async fn a_renewal_that_panics_drops_the_monitors_task_up_and_the_rest_run_on() {
+        let log = crate::tracing_init::Buf::default();
+        let (_handle, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = torrentd_engine::testing::set_subscriber(subscriber);
+        let metrics = PromSink::new();
+        metrics.set_gauge("task_up", 1.0, &[("task", "port_forward_monitor")]);
+        let up = || {
+            String::from_utf8(metrics.render())
+                .unwrap()
+                .lines()
+                .find(|l| {
+                    !l.starts_with('#')
+                        && l.contains("task_up{")
+                        && l.contains("task=\"port_forward_monitor\"")
+                })
+                .map(str::to_owned)
+                .expect("task_up is exported")
+        };
+
+        let mut tasks = JoinSet::new();
+        let mut renewing = HashMap::new();
+        let healthy = tasks.spawn(std::future::pending::<()>());
+        renewing.insert(healthy.id(), ProfileId::new("acct_a"));
+        let dying = tasks.spawn(async { panic!("injected renewal panic") });
+        renewing.insert(dying.id(), ProfileId::new("acct_b"));
+
+        let (shutdown_tx, mut shutdown) = broadcast::channel(1);
+        let watching = async {
+            watch_renewals(&mut tasks, &renewing, &mut shutdown, &metrics).await;
+        };
+        let checked = async {
+            for _ in 0..1_000 {
+                if up().ends_with(" 0") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let line = up();
+            assert!(line.ends_with(" 0"), "{line}");
+            shutdown_tx.send(ShutdownReason::Test).unwrap();
+        };
+        tokio::join!(watching, checked);
+
+        assert!(!healthy.is_finished(), "the other renewal was left running");
+        assert_eq!(tasks.len(), 1, "only the dead renewal was joined");
+        let text = log.text();
+        let died: serde_json::Value = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .find(|l: &serde_json::Value| {
+                l["message"]
+                    == "a profile's port-forward renewal died; its mapping is no longer renewed"
+            })
+            .unwrap_or_else(|| panic!("the dead renewal is logged: {text}"));
+        assert_eq!(died["level"], "ERROR", "{died}");
+        assert_eq!(died["profile_id"], "acct_b", "{died}");
+        assert_eq!(died["task_panicked"], true, "{died}");
     }
 }
