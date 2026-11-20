@@ -39,7 +39,7 @@ impl Carried {
     }
 
     /// `span`, and the subscriber current here.
-    fn in_span(span: tracing::Span) -> Self {
+    pub(crate) fn in_span(span: tracing::Span) -> Self {
         Self {
             span,
             dispatch: tracing::dispatcher::get_default(tracing::Dispatch::clone),

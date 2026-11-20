@@ -1808,8 +1808,15 @@ Every API request runs in a span named `request`, carrying its
 `status`, and caller (`principal`: `session`, `token` or `anonymous`, and a
 static token's `token_name`, never the token). Work the request hands to
 another task or thread stays inside it, so an engine line an adoption causes
-has the request's `trace_id`. A request carrying a W3C `traceparent` joins
-the caller's trace, and every response returns its own `traceparent`.
+has the request's `trace_id`. Every line inside a request also has its
+`request_id` as a key of its own, just before `trace_id`, however deep the
+span it was logged in, so the id a client quotes finds them all. Work that
+outlives its request, such as a `DELETE`'s pool release deferred behind a
+scan, runs in a trace of its own, linked to the request's, and keeps the
+request's `request_id`. The `server error response` line a 5xx writes runs
+outside the request's span, so it names `request_id` and `trace_id` as
+fields. A request carrying a W3C `traceparent` joins the caller's trace, and
+every response returns its own `traceparent`.
 
 The spans each layer opens, by name, to search for in the log's
 `span.name` or in Tempo. INFO spans are logged and exported; DEBUG spans

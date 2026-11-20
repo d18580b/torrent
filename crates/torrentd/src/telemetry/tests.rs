@@ -105,6 +105,96 @@ fn a_warn_line_carries_the_ids_of_spans_its_log_level_hides() {
     assert_eq!(l[2]["message"], "error after reload");
 }
 
+/// Every line inside a request carries its `request_id` as a key of its own,
+/// however deep the span it was logged in, and at a `log_level` that hides
+/// the spans. A line with a `request_id` field of its own keeps that one
+/// alone; a line outside every request has none.
+#[test]
+fn a_line_inside_a_request_carries_its_request_id_however_deep() {
+    let buf = Buf::default();
+    let (_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Warn, buf.clone());
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        tracing::warn!(target: "torrentd", "outside");
+        let request = tracing::info_span!(target: "torrentd", "request", request_id = "r-1");
+        let _request = request.enter();
+        tracing::warn!(target: "torrentd", "in the request");
+        let pool = tracing::info_span!(target: "torrentd_pool", "pool.scan_root");
+        let _pool = pool.enter();
+        let sqlite = tracing::debug_span!(target: "torrentd_pool", "sqlite");
+        let _sqlite = sqlite.enter();
+        tracing::warn!(target: "torrentd_pool", "two spans down");
+        tracing::warn!(target: "torrentd", request_id = "own", "with an id of its own");
+    });
+    let l = lines(&buf);
+    assert_eq!(l.len(), 4, "{}", buf.text());
+    assert!(l[0].get("request_id").is_none(), "{}", l[0]);
+    assert_eq!(l[1]["request_id"], "r-1", "{}", l[1]);
+    assert_eq!(l[2]["request_id"], "r-1", "{}", l[2]);
+    assert!(is_hex(&l[2]["trace_id"], 32), "{}", l[2]);
+    let own = buf.text().lines().nth(3).unwrap().to_owned();
+    assert_eq!(own.matches("\"request_id\"").count(), 1, "{own}");
+    assert_eq!(l[3]["request_id"], "own", "{own}");
+}
+
+/// A line naming its own `trace_id` (the 5xx line, inside the API socket's
+/// connection span but outside the request's) keeps it, and is given neither
+/// the enclosing span's `trace_id` nor its `span_id`: a duplicate key the
+/// last-wins JSON readers would have resolved to the connection's trace.
+#[test]
+fn a_line_with_its_own_trace_id_is_given_no_second() {
+    let buf = Buf::default();
+    let (_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, buf.clone());
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        let connection = tracing::info_span!("api_socket");
+        let _connection = connection.enter();
+        tracing::error!(
+            trace_id = "4bf92f3577b34da6a3ce929d0e0e4736",
+            request_id = "r-3",
+            "server error response"
+        );
+        tracing::error!(trace_id = Option::<&str>::None, "no trace of its own");
+    });
+    let text = buf.text();
+    let raw: Vec<&str> = text.lines().collect();
+    assert_eq!(raw.len(), 2, "{text}");
+    assert_eq!(raw[0].matches("\"trace_id\"").count(), 1, "{text}");
+    assert!(!raw[0].contains("\"span_id\""), "{text}");
+    let l = lines(&buf);
+    assert_eq!(l[0]["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    // A `None` field is not written, so the span's ids are.
+    assert!(is_hex(&l[1]["trace_id"], 32), "{}", l[1]);
+    assert!(is_hex(&l[1]["span_id"], 16), "{}", l[1]);
+}
+
+/// A root span linked to a request, as work that outlives the request runs
+/// in, takes on the request's `request_id`: its lines are in a trace of
+/// their own, and still found by the id the client quotes. A request whose
+/// id is empty (no `x-request-id`) gives its lines none.
+#[test]
+fn a_span_that_follows_from_a_request_takes_its_request_id() {
+    let buf = Buf::default();
+    let (_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, buf.clone());
+    torrentd_engine::testing::with_subscriber(subscriber, || {
+        let request = tracing::info_span!("request", request_id = "r-2");
+        let later = request.in_scope(|| {
+            let handler = tracing::info_span!("handler");
+            handler.in_scope(|| {
+                let later = tracing::info_span!(parent: None, "later");
+                later.follows_from(tracing::Span::current());
+                later
+            })
+        });
+        drop(request);
+        later.in_scope(|| tracing::info!("after the request"));
+        let unnamed = tracing::info_span!("request", request_id = "");
+        unnamed.in_scope(|| tracing::info!("no id"));
+    });
+    let l = lines(&buf);
+    assert_eq!(l.len(), 2, "{}", buf.text());
+    assert_eq!(l[0]["request_id"], "r-2", "{}", l[0]);
+    assert!(l[1].get("request_id").is_none(), "{}", l[1]);
+}
+
 /// Every credential shape `crate::redact`'s tests hold the log to: the
 /// shapes it recognises anywhere, and those it cuts only under a
 /// `HOST_ONLY_TARGETS` target.

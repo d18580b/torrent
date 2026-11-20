@@ -124,6 +124,17 @@ impl<C> Observer<C> for HttpMetrics {
                 .get("x-request-id")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default();
+            // This runs outside the request's span, so the request's trace
+            // is read from the `traceparent` the response carries, where
+            // the span has one. On the API socket the line is inside the
+            // connection's span, whose trace a caller's `traceparent` makes
+            // a different one; a `trace_id` field of the line's own keeps
+            // the formatter from adding the connection's beside it.
+            let trace_id = response
+                .headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .and_then(trace_id_of);
             tracing::error!(
                 target: "torrentd::http",
                 method,
@@ -131,10 +142,23 @@ impl<C> Observer<C> for HttpMetrics {
                 status = status.as_u16(),
                 latency = ?elapsed,
                 request_id,
+                trace_id,
                 "server error response",
             );
         }
     }
+}
+
+/// The trace id of a W3C `traceparent`, `version-traceid-spanid-flags`:
+/// thirty-two lowercase hex digits, not all zero.
+fn trace_id_of(traceparent: &str) -> Option<&str> {
+    let trace_id = traceparent.split('-').nth(1)?;
+    let valid = trace_id.len() == 32
+        && trace_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && trace_id.bytes().any(|b| b != b'0');
+    valid.then_some(trace_id)
 }
 
 /// The Prometheus text exposition format, version 0.0.4, sent as
@@ -193,6 +217,7 @@ pub async fn get_metrics(
 mod tests {
     use serde_json::json;
 
+    use super::trace_id_of;
     use crate::http::tests::support::Coverage;
     use crate::http::tests::support::Harness;
     use crate::http::tests::support::PASSWORD;
@@ -324,11 +349,39 @@ mod tests {
             "{log}"
         );
         assert!(errors[0].contains("\"status\":503"), "{log}");
+        // Written outside the request's span, it takes its trace from the
+        // response's `traceparent`, and has its own request id, once.
+        let traceparent = unavailable.header("traceparent").expect("a traceparent");
+        let trace_id = trace_id_of(traceparent).expect("a valid traceparent");
+        assert!(
+            errors[0].contains(&format!("\"trace_id\":\"{trace_id}\"")),
+            "{log}"
+        );
+        assert_eq!(errors[0].matches("\"request_id\"").count(), 1, "{log}");
         assert!(
             !log.lines()
                 .any(|l| l.contains(&missing_id) && !l.contains("\"level\":\"INFO\"")),
             "a 4xx stays at INFO:\n{log}"
         );
+    }
+
+    #[test]
+    fn a_traceparents_trace_id_is_read_only_where_it_is_valid() {
+        let id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        assert_eq!(
+            trace_id_of(&format!("00-{id}-00f067aa0ba902b7-01")),
+            Some(id)
+        );
+        for invalid in [
+            "",
+            "00",
+            "00-4bf92f3577b34da6a3ce929d0e0e47-00f067aa0ba902b7-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01",
+        ] {
+            assert_eq!(trace_id_of(invalid), None, "{invalid:?}");
+        }
     }
 
     #[tokio::test]
