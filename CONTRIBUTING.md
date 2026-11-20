@@ -62,6 +62,8 @@ Everyday tasks:
 | `mise run check`   | fmt + lint                                               |
 | `mise run msrv`    | Check the workspace compiles on the MSRV (`rust-version`) |
 | `mise run size-check` | Fail on a source file over 2689 lines not in `.size-baseline` (see Style) |
+| `mise run verify`  | Every CI check a stock dev machine can run, in CI's order — run before opening a PR |
+| `mise run verify-all` | `verify` plus the CI jobs needing clang, netns, podman/docker, k3d or musl-gcc |
 | `mise run test-all`| every automated test layer, including the ignored ones (not `deny` or `bench`) |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
 | `mise run native-clean` | Delete every cached native prefix                   |
@@ -94,7 +96,9 @@ mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
 - **commit-msg** — enforces [Conventional Commits](https://www.conventionalcommits.org)
   via `convco` **at commit time**. `feat:`, `fix:`, `chore:`, `build:`, `ci:`, `docs:`,
   `refactor:`, `style:`, `perf:`, `test:` (optionally scoped, e.g. `feat(engine):`).
-- **pre-push** — runs the full `fmt` + `lint` + `test` suite and `size-check` before a push.
+- **pre-push** — runs only the checks that compile nothing: `fmt`, `lint-tracing`, `size-check`,
+  and, when their files changed, `lint-workflows`, `helm-lint`/`helm-test` and `release-features`.
+  Clippy and the tests are left to `mise run verify` (and CI), so a push costs seconds.
 
 ### Submodules
 

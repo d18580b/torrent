@@ -6,6 +6,9 @@ amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.
 // here is orchestration — stashing so fixes run against the staged snapshot,
 // and re-staging the files its fix commands touch.
 //
+// pre-push builds nothing (see its comment); `mise run verify` is the full,
+// CI-equivalent suite.
+//
 // Every step that builds runs with GIT_DIR and GIT_WORK_TREE unset. git
 // exports both to its hooks, and in a linked worktree GIT_DIR is absolute, so
 // every `git -C <dir>` libtorrent-sys's build script runs answers for the
@@ -49,7 +52,10 @@ hooks {
     }
   }
 
-  // Gate pushes on the full suite — checks only, no fixing.
+  // Gate pushes on the checks that compile nothing, so a push costs seconds,
+  // not a workspace build. clippy, the test suites and every other check that
+  // builds the workspace are `mise run verify`'s job (and CI's): run it before
+  // opening a pull request. Checks only, no fixing.
   ["pre-push"] {
     fix = false
     steps {
@@ -57,17 +63,29 @@ hooks {
         glob = "**/*.rs"
         check = "mise run fmt"
       }
-      ["clippy"] {
-        glob = "**/*.rs"
-        check = nogit + "mise run lint"
-      }
-      ["test"] {
-        check = nogit + "mise run test"
+      ["lint-tracing"] {
+        glob = "crates/**/*.rs"
+        check = "mise run lint-tracing"
       }
       // No glob: deleting or shrinking any file can make a .size-baseline
       // entry stale, so this runs on every push.
       ["size-check"] {
         check = "mise run size-check"
+      }
+      ["lint-workflows"] {
+        glob = ".github/**"
+        check = "mise run lint-workflows"
+      }
+      // helm-lint also fails while the chart's copies of the alert rules or
+      // the dashboard differ from their sources, so those sources count too.
+      ["helm"] {
+        glob = List("deploy/helm/**", "deploy/prometheus/**", "deploy/dashboard.json")
+        check = "mise run helm-lint && mise run helm-test"
+      }
+      // `cargo tree` over the manifests: resolves features, builds nothing.
+      ["release-features"] {
+        glob = List("**/Cargo.toml", "Cargo.lock")
+        check = "mise run release-features"
       }
     }
   }

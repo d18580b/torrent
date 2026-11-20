@@ -605,6 +605,7 @@ restart guard and empty capability set are still there
 same file, so a local `mise run` denies warnings exactly as CI does.
 
 ```bash
+mise run verify          # every CI check a dev machine can run (verify-all: the rest)
 mise run check           # fmt + clippy, warnings denied
 mise run test            # unit + in-memory; no libtorrent, no network
 mise run test-fault-injection  # the same, in the alert drill's fault-injection build

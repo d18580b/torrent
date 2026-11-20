@@ -7,6 +7,7 @@
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|fmt-fix|lint|lint-fix|test|check|msrv|rustfmt-toolchain
+#   mise run verify|verify-all|commit-lint-branch [base]
 #   mise run test-shim|test-shim-asan|test-lifecycle|test-daemon|test-torrentctl|test-netns|test-all|test-alerts
 #   mise run openapi|openapi-check|test-fault-injection|release-features|deny
 #   mise run lint-tracing|lint-workflows|size-check|container|image-check|commit-lint <file-or-range>
@@ -390,6 +391,79 @@ run = [
   "mise run test-netns",
   "mise run test-alerts",
 ]
+
+# CI, locally: `verify` runs every check .github/workflows/ci.yml runs that a
+# stock development machine can (cargo, the [tools] above, systemd-analyze and
+# the native build's system packages); `verify-all` adds the jobs that need
+# more of the host — clang's ASan runtime, unprivileged network namespaces
+# with wireguard and nf_tables, podman or docker, k3d, musl-gcc. Only CI's
+# arm64 job, the same tests on another architecture, has no local equivalent.
+# A job added to ci.yml belongs in one of the two.
+#
+# Sequential `run` lists for test-all's reasons above: the members share
+# `target/` and some race wall-clock deadlines. The checks that build nothing
+# come first, so a formatting or lint slip fails in seconds rather than after
+# the workspace has compiled; the rest follow CI's jobs in its order.
+[tasks.verify]
+description = "Every CI check a stock dev machine can run (the CI suite minus host-dependent jobs)"
+run = [
+  "mise run fmt",
+  "mise run lint-tracing",
+  "mise run lint-workflows",
+  "mise run size-check",
+  "mise run release-features",
+  "mise run deny",
+  "mise run helm-lint",
+  "mise run helm-test",
+  "mise run commit-lint-branch",
+  "mise run lint",
+  "mise run test",
+  "mise run openapi-check",
+  "mise run test-fault-injection",
+  "mise run unit-check",
+  "mise run msrv",
+  "mise run test-shim",
+  "mise run test-lifecycle",
+  "mise run test-daemon",
+  "mise run test-torrentctl",
+]
+
+[tasks.verify-all]
+description = "verify, plus the CI jobs needing clang, network namespaces, podman/docker, k3d or musl-gcc"
+run = [
+  "mise run verify",
+  "mise run test-shim-asan",
+  "mise run test-netns",
+  "mise run test-alerts",
+  "mise run bench -- alert-throughput",
+  "mise run bench -- memory-scaling --count 10000",
+  "mise run bench -- pool-scan --size ci",
+  "mise run bench -- pool-match --size ci",
+  "mise run bench -- pool-adopt-preview --size ci",
+  "mise run bench -- pool-adopt --size ci",
+  "mise run dist-musl",
+  "mise run container",
+  "mise run image-check",
+  "mise run test-k8s",
+]
+
+# CI's commit-lint job checks a pull request's BASE..HEAD; locally that is the
+# current branch's commits since it left the base. Nothing to check (on the
+# base itself, or no commits yet) is a pass, not an error.
+[tasks.commit-lint-branch]
+description = "commit-lint every commit on this branch since it left the base (default origin/master)"
+usage = '''
+arg "[base]" default="origin/master" help="The branch this one is based on"
+'''
+run = '''
+set -eu
+range="$(git merge-base "$usage_base" HEAD)..HEAD"
+if [ -z "$(git rev-list "$range")" ]; then
+  echo "no commits since $usage_base; nothing to lint"
+  exit 0
+fi
+mise run commit-lint "$range"
+'''
 
 [tasks.bench]
 description = "Layer 4: alert throughput, memory per torrent, startup time, and the pool's scan, match, adopt preview and adoption through a running daemon; every budgeted one fails on a breach of crates/torrentd-bench/budgets.toml. CI's bench job runs it at --size ci; the default pool size, full, takes minutes. --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having. torrentd is built in release first, beside the bench, for pool-adopt to run."
