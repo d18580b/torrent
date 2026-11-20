@@ -632,7 +632,18 @@ mise run bench -- pool-scan --size ci            # the pool at the size CI runs;
 
 [`release-plz.yml`](.github/workflows/release-plz.yml) keeps one release
 pull request open, from the branch `release-plz-next`, and refreshes it on
-every push to `master`. Merging it cuts the release. Squash, rebase and
+every push to `master`. Merging it cuts the release.
+
+Each refresh dispatches the release pull request's checks, but they don't
+start until someone approves them. The run waits on the `release-ci`
+environment: open the `Release` run on `release-plz-next` (linked from the
+pull request's checks) and choose *Review deployments*, then *Approve*. The
+approved run runs CI and the dry run of the release builds, then reports
+`release gate`. `master` requires that check, so the pull request merges only
+once it's green. A waiting run takes no runner, and the next push to `master`
+cancels it and dispatches a new one. Approve only the run you mean to merge.
+
+Squash, rebase and
 "Create a merge commit" all release. With a merge commit, release-plz tags
 the pull request's head, and the workflow moves the tag to the merge commit
 only when that head is one of its parents and both have the same tree. So
@@ -673,9 +684,13 @@ it is:
   gh pr create --repo d18580b/torrent --base master \
     --head release-plz-retry-vX.Y.Z --title "chore: release vX.Y.Z" \
     --body "Releases vX.Y.Z, whose first tag was refused and deleted."
+  gh workflow run release-plz.yml --repo d18580b/torrent \
+    --ref release-plz-retry-vX.Y.Z
   ```
 
-  Squash-merge it. If the workflow did open a release pull request for
+  Its own `release gate` check fails, because the check from the dispatched
+  run is the one that counts. Approve that run, as for the release pull
+  request, then squash-merge it once `release gate` is green. If the workflow did open a release pull request for
   vX.Y.Z after all, merging that one releases it the same way.
 
 A published release is immutable. Neither path changes one.

@@ -287,8 +287,10 @@ Nobody tags or uploads a release by hand. Every push to `master` runs
 request open that moves every crate to the next version (one version for the
 workspace, from the Conventional Commits since the last tag) and adds those
 commits to [`CHANGELOG.md`](CHANGELOG.md), grouped by
-[`cliff.toml`](cliff.toml). CI runs on it like any pull request. Merging it
-is the release: the workflow tags `vX.Y.Z`, builds the tarballs and the
+[`cliff.toml`](cliff.toml). Its CI, which is full CI plus a dry run of the release
+builds, waits for a maintainer to approve the run. The pull request merges
+only once the resulting `release gate` check is green
+([README.md § *Releasing*](README.md#releasing)). Merging it is the release: the workflow tags `vX.Y.Z`, builds the tarballs and the
 image, signs and attests them, and publishes the release.
 [`release-plz.toml`](release-plz.toml) holds the settings, and
 [README.md § *Install*](README.md#install) what a release carries.
