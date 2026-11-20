@@ -271,14 +271,17 @@ tests:
       - notExists:
           path: spec.template.metadata.annotations
 
+  # An explicit tag: the default is Chart.yaml's appVersion, which every
+  # release pull request moves, so a test that relied on it would fail there.
   - it: pins the image by digest when one is given
     values: [values/host-only.yaml]
     set:
+      image.tag: "1.2.3"
       image.digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/d18580b/torrent:0.2.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          value: ghcr.io/d18580b/torrent:1.2.3@sha256:0000000000000000000000000000000000000000000000000000000000000000
 
   - it: refuses a payload volume that is neither a claim nor a host path
     values: [values/host-only.yaml]
