@@ -150,14 +150,10 @@ fn payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// subscriber's shape for the event the hook logs after it is, redacted the
 /// same way.
 fn early_line(thread: &str, location: &str, message: &str, backtrace: &str) -> String {
-    use tracing_subscriber::fmt::format::Writer;
-    use tracing_subscriber::fmt::time::ChronoUtc;
-    use tracing_subscriber::fmt::time::FormatTime as _;
-
     let mut timestamp = String::new();
-    // ignore-result: `ChronoUtc` only fails where its writer does, and a
+    // ignore-result: `write_timestamp` only fails where its writer does, and a
     // `String` does not.
-    let _ = ChronoUtc::rfc_3339().format_time(&mut Writer::new(&mut timestamp));
+    let _ = crate::tracing_init::write_timestamp(&mut timestamp, jiff::Timestamp::now());
     let json = |s: &str| serde_json::Value::from(s).to_string();
     // By hand, in the subscriber's key order: `message` first, then the
     // event's fields as written, then `target`.
@@ -237,6 +233,11 @@ mod tests {
             format!("bad {}", redacted(&url)).as_str()
         );
         assert!(!line.contains(PASSKEY), "{line}");
+        let ts = v["timestamp"].as_str().expect("timestamp");
+        assert!(
+            ts.len() == 30 && ts.ends_with('Z') && ts.parse::<jiff::Timestamp>().is_ok(),
+            "{ts}"
+        );
     }
 
     /// A thread that panics under the installed hook is logged as one JSON
