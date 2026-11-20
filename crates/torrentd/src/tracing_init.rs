@@ -585,6 +585,9 @@ pub enum EarlyErrorKind {
     Usage,
     /// The subscriber [`init`] installs could not be installed (exit 70).
     TracingInitFailed,
+    /// The tokio runtime, built before the subscriber, could not be built
+    /// (exit 70).
+    RuntimeBuildFailed,
 }
 
 impl EarlyErrorKind {
@@ -593,6 +596,7 @@ impl EarlyErrorKind {
             Self::ConfigRefused => "config_refused",
             Self::Usage => "usage",
             Self::TracingInitFailed => "tracing_init_failed",
+            Self::RuntimeBuildFailed => "runtime_build_failed",
         }
     }
 }
@@ -1080,6 +1084,7 @@ mod tests {
             (EarlyErrorKind::ConfigRefused, "config_refused"),
             (EarlyErrorKind::Usage, "usage"),
             (EarlyErrorKind::TracingInitFailed, "tracing_init_failed"),
+            (EarlyErrorKind::RuntimeBuildFailed, "runtime_build_failed"),
         ] {
             let v: serde_json::Value =
                 serde_json::from_str(&early_line(kind, "m")).expect("one JSON object");

@@ -720,12 +720,23 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Before the subscriber: a gRPC span exporter spawns its channel's task
-    // on the runtime it is built in.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    // on the runtime it is built in. So a runtime that cannot be built (a
+    // pod's thread or memory limit hit at once) is said the way a failed
+    // subscriber is below, as JSON and 70, not as a bare error and 1.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("torrentd-tokio")
         .build()
-        .context("build tokio runtime")?;
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing_init::early_error(
+                EarlyErrorKind::RuntimeBuildFailed,
+                &format!("build tokio runtime: {e}"),
+            );
+            std::process::exit(70);
+        }
+    };
 
     // A daemon whose subscriber did not install would run with every log
     // line lost, so it stops here, 70 (EX_SOFTWARE) as for any other startup

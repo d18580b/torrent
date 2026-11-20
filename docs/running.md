@@ -1347,8 +1347,10 @@ A configuration the daemon or `--check-config` refuses exits `78`
 statuses and exits `1` for a config it cannot load. The daemon's and
 `--check-config`'s reason is a JSON line on stdout, in the shape of every later
 log line, with `error.kind` set to `config_refused`; a usage error the daemon
-refuses exits `2` the same way with `usage`, and a logger that cannot be
-installed exits `70` with `tracing_init_failed`. Operator subcommands keep
+refuses exits `2` the same way with `usage`, a logger that cannot be
+installed exits `70` with `tracing_init_failed`, and an async runtime that
+cannot be built (a thread or memory limit hit at start) exits `70` with
+`runtime_build_failed`. Operator subcommands keep
 their human stderr. The unit's
 `RestartPreventExitStatus=78` leaves it stopped with the reason as the last
 journal line rather than restarting it every five seconds. That directive reads
