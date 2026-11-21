@@ -78,7 +78,7 @@ jobs = 1
 # pins. A dated nightly, not `nightly`, so a rustfmt change cannot reformat the
 # tree or fail `fmt` without a commit here; this is its only definition, and
 # `setup`, `rustfmt-toolchain`, `fmt` and `fmt-fix` all read it.
-RUSTFMT_TOOLCHAIN = "nightly-2026-10-22"
+RUSTFMT_TOOLCHAIN = "nightly-2026-11-20"
 # Warnings are errors everywhere a mise task builds, locally exactly as in CI,
 # so a warning fails a hook or a local `mise run test` instead of first
 # surfacing as a red CI run. It replaces, rather than extends, a RUSTFLAGS the
