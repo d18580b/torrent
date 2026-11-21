@@ -33,7 +33,7 @@ use argon2::PasswordHash;
 use argon2::PasswordVerifier;
 use argon2::Version;
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::Rng;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -201,7 +201,7 @@ impl SessionStore {
     /// Mint a session token, returning it and the wall-clock time it expires.
     pub fn create(&self) -> (String, SystemTime) {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let token = format!("{SESSION_TOKEN_PREFIX}{}", hex::encode(bytes));
         let now = Instant::now();
         // `AuthConfig::validate` bounds the TTL, but the store must not panic
@@ -815,7 +815,7 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 /// Generate a new API token and the hash to put in the config.
 pub fn generate_token() -> (String, String) {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let token = format!("{STATIC_TOKEN_PREFIX}{}", hex::encode(bytes));
     let digest = hex::encode(Sha256::digest(token.as_bytes()));
     (token, digest)
