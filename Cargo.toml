@@ -24,8 +24,8 @@ all = "deny"
 
 [workspace.dependencies]
 # Core
-tokio = { version = "1.42", features = ["full"] }
-kynos = { version = "=0.6.0",features = ["openapi32", "pattern", "time-jiff02"] }
+tokio = { version = "1.54", features = ["full"] }
+kynos = { version = "=0.6.1",features = ["openapi32", "pattern", "time-jiff02"] }
 jiff = { version = "0.2", features = ["serde"] }
 base64 = "0.22"
 
@@ -97,7 +97,7 @@ libc = "0.2"
 # these against its tested floors; reqwest keeps default features off.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 secrecy = "0.10.3"
-futures-core = "0.3.32"
+futures-core = "0.3.34"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
 spargen = "=0.6.0"
 
@@ -108,11 +108,11 @@ color-eyre = "0.6.5"
 etcetera = "0.11"
 tracing-appender = "0.2.5"
 tui-input = "0.15"
-insta = "1.48"
+insta = "1.49"
 
 # Property tests (dev-dependency only). `std` alone: no forking runner and no
 # per-case timeout, so a case runs in the test's own thread like any test.
-proptest = { version = "1.11", default-features = false, features = ["std"] }
+proptest = { version = "1.12", default-features = false, features = ["std"] }
 
 # Internal crates
 libtorrent-sys = { path = "crates/libtorrent-sys" }
