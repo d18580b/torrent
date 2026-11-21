@@ -22,6 +22,13 @@ pub use generated::types;
 /// `PlanStatus` component, which the filter parameter references directly.
 pub use generated::types::PlanStatus;
 pub use generated::Client;
+pub use generated::Nullable;
+
+/// An optional, nullable request member from an `Option`: `None` is left
+/// off the wire (`Absent`), never sent as `null`, as the client always did.
+pub fn absent_if_none<T>(value: Option<T>) -> Nullable<T> {
+    value.map_or(Nullable::Absent, Nullable::Value)
+}
 
 // `AsProblem` for every generated error enum; see build.rs.
 include!(concat!(env!("OUT_DIR"), "/problems.rs"));
@@ -147,11 +154,19 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
                 Failure::local("The daemon's answer was malformed", Some(e.to_string()))
             }
             Error::Redirect(e) => Failure::local("Too many redirects", Some(e.to_string())),
-            // Only spargen's `Link`-header paginator raises this; the API
-            // pages by cursor, so nothing here reaches it.
+            Error::BodyTooLarge { limit, status } => Failure::local(
+                "The daemon's answer was too large",
+                Some(format!("HTTP {} past {limit} bytes", status.as_u16())),
+            ),
+            // Only spargen's `Link`-header paginator raises these; the API
+            // pages by cursor, so nothing here reaches them.
             Error::PaginationCycle { url } => Failure::local(
                 "The daemon's pages led back to one already read",
                 Some(url.to_string()),
+            ),
+            Error::PaginationOriginChanged { from, to } => Failure::local(
+                "The daemon's pages led to another origin",
+                Some(format!("{from} to {to}")),
             ),
         }
     }
@@ -365,10 +380,7 @@ impl Api {
         let mut client = Client::with_backend(std::sync::Arc::new(backend), origin)
             .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?;
         if let Some(token) = token {
-            client = client.with_credential(
-                "bearer",
-                generated::Credential::Bearer(generated::SecretString::from(token.to_owned())),
-            );
+            client = client.with_bearer(generated::SecretString::from(token.to_owned()));
         }
         Ok(Self {
             client,

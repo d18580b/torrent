@@ -153,7 +153,8 @@ fn fetch(state: &State, ctx: &Ctx<'_>, request: PageRequest) -> Vec<Effect> {
         limit,
         generation,
     } = request;
-    let limit = Some(limit as i64);
+    // At most `caps::PAGE_MAX` (1000), so it always fits.
+    let limit = Some(u32::try_from(limit).unwrap_or(u32::MAX));
     vec![Effect::new(async move {
         let first = cursor.is_none();
         let path = (!dir.is_empty()).then_some(dir);
@@ -187,10 +188,12 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             first,
             result: Ok(page),
         } => {
-            match state
-                .entries
-                .receive(generation, first, page.items, page.next_cursor)
-            {
+            match state.entries.receive(
+                generation,
+                first,
+                page.items,
+                page.next_cursor.into_option(),
+            ) {
                 Received::Stale => return Vec::new(),
                 Received::Continue(request) => return fetch(state, ctx, request),
                 Received::Settled => {}

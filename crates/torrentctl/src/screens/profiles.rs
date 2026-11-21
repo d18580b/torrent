@@ -298,7 +298,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                     state: action.state(),
                 };
                 let result =
-                    crate::api::call(api.client.set_profile_state(profile_id.clone(), &body)).await;
+                    crate::api::call(api.client.set_profile_state(profile_id.clone(), body)).await;
                 crate::app::Msg::Profiles(Msg::Ran {
                     action,
                     profile_id,

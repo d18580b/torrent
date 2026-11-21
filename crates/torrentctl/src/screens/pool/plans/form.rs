@@ -110,27 +110,27 @@ impl Form {
                     self.fields[2].error = Some("a directory under the root".to_owned());
                 }
                 let dest_root_id = dest_root.filter(|_| hex && !dest_rel.is_empty())?;
-                Some(types::CreatePlanRequest::CreatePlanRequestVariant0(
-                    Box::new(types::CreatePlanRequestVariant0 {
-                        kind: types::CreatePlanRequestVariant0kind::Relocate,
+                Some(types::CreatePlanRequest::Relocate(Box::new(
+                    types::CreatePlanRequestRelocate {
+                        kind: types::CreatePlanRequestRelocateKind::Relocate,
                         infohash: infohash.to_ascii_lowercase(),
                         dest_root_id,
                         dest_rel,
-                    }),
-                ))
+                    },
+                )))
             }
             types::PlanKind::DeleteOrphans => {
                 let Some(root_id) = root(value(0)) else {
                     self.fields[0].error = Some("a root id, as the overview lists it".to_owned());
                     return None;
                 };
-                Some(types::CreatePlanRequest::CreatePlanRequestVariant1(
-                    Box::new(types::CreatePlanRequestVariant1 {
-                        kind: types::CreatePlanRequestVariant1kind::DeleteOrphans,
+                Some(types::CreatePlanRequest::DeleteOrphans(Box::new(
+                    types::CreatePlanRequestDeleteOrphans {
+                        kind: types::CreatePlanRequestDeleteOrphansKind::DeleteOrphans,
                         root_id,
                         prefix: value(1),
-                    }),
-                ))
+                    },
+                )))
             }
         }
     }
@@ -192,7 +192,7 @@ pub(super) fn form_key(state: &mut State, key: KeyEvent, ctx: &Ctx<'_>) -> Vec<E
             form.sending = true;
             let api = ctx.api.clone();
             return vec![Effect::new(async move {
-                let result = crate::api::call(api.client.create_plan(&body)).await;
+                let result = crate::api::call(api.client.create_plan(body)).await;
                 wrap(crate::screens::pool::Msg::Plans(Msg::Created(result)))
             })];
         }

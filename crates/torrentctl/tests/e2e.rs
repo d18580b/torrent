@@ -233,16 +233,13 @@ async fn a_daemon_on_a_unix_socket_serves_the_api_there_with_the_configured_mode
     // A login: the request body reaches the handler, and the throttle's
     // reading of the peer address holds for a socket peer.
     let grant = anonymous
-        .create_session(&types::CreateSession {
+        .create_session(types::CreateSession {
             password: PASSWORD.to_owned(),
         })
         .await
         .expect("sign in over the socket")
         .into_inner();
-    let client = socket_client(&sock).with_credential(
-        "bearer",
-        api::Credential::Bearer(api::SecretString::from(grant.token)),
-    );
+    let client = socket_client(&sock).with_bearer(api::SecretString::from(grant.token));
     let server = client.get_server().await.unwrap().into_inner();
     assert_eq!(server.api_version, "1");
 
@@ -253,7 +250,7 @@ async fn a_daemon_on_a_unix_socket_serves_the_api_there_with_the_configured_mode
         .expect("a tick within 15s")
         .expect("the stream stays open")
         .expect("a well-formed event");
-    assert!(matches!(first.kind, types::ServerEventkind::Tick));
+    assert!(matches!(first.kind, types::ServerEventKind::Tick));
     drop(events);
 
     drop(daemon);
@@ -277,17 +274,16 @@ async fn the_generated_client_drives_a_real_daemon() {
 
     // The password buys a session token.
     let grant = anonymous
-        .create_session(&types::CreateSession {
+        .create_session(types::CreateSession {
             password: PASSWORD.to_owned(),
         })
         .await
         .expect("sign in")
         .into_inner();
     assert!(grant.token.starts_with("tds_"), "{}", grant.token);
-    let client = api::Client::new(&base).unwrap().with_credential(
-        "bearer",
-        api::Credential::Bearer(api::SecretString::from(grant.token.clone())),
-    );
+    let client = api::Client::new(&base)
+        .unwrap()
+        .with_bearer(api::SecretString::from(grant.token.clone()));
 
     let server = client.get_server().await.unwrap().into_inner();
     assert_eq!(server.api_version, "1");
@@ -300,15 +296,13 @@ async fn the_generated_client_drives_a_real_daemon() {
 
     // Add a magnet and find it again.
     let added = client
-        .add_torrent(&types::AddTorrentRequest {
+        .add_torrent(types::AddTorrentRequest {
             profile_id: PROFILE.to_owned(),
-            save_path: None,
-            source: types::TorrentSource::TorrentSourceVariant0(Box::new(
-                types::TorrentSourceVariant0 {
-                    kind: types::TorrentSourceVariant0kind::Magnet,
-                    uri: format!("magnet:?xt=urn:btih:{MAGNET_HEX}&dn=e2e"),
-                },
-            )),
+            save_path: api::Nullable::Absent,
+            source: types::TorrentSource::Magnet(Box::new(types::TorrentSourceMagnet {
+                kind: types::TorrentSourceMagnetKind::Magnet,
+                uri: format!("magnet:?xt=urn:btih:{MAGNET_HEX}&dn=e2e"),
+            })),
         })
         .await
         .expect("add a magnet")
@@ -323,19 +317,17 @@ async fn the_generated_client_drives_a_real_daemon() {
         .unwrap()
         .into_inner();
     assert!(page.items.iter().any(|t| t.infohash == MAGNET_HEX));
-    assert!(page.next_cursor.is_none());
+    assert!(page.next_cursor.as_option().is_none());
 
     // A duplicate is a documented 409, carried as a problem document.
     let err = client
-        .add_torrent(&types::AddTorrentRequest {
+        .add_torrent(types::AddTorrentRequest {
             profile_id: PROFILE.to_owned(),
-            save_path: None,
-            source: types::TorrentSource::TorrentSourceVariant0(Box::new(
-                types::TorrentSourceVariant0 {
-                    kind: types::TorrentSourceVariant0kind::Magnet,
-                    uri: format!("magnet:?xt=urn:btih:{MAGNET_HEX}"),
-                },
-            )),
+            save_path: api::Nullable::Absent,
+            source: types::TorrentSource::Magnet(Box::new(types::TorrentSourceMagnet {
+                kind: types::TorrentSourceMagnetKind::Magnet,
+                uri: format!("magnet:?xt=urn:btih:{MAGNET_HEX}"),
+            })),
         })
         .await
         .unwrap_err();
@@ -357,7 +349,7 @@ async fn the_generated_client_drives_a_real_daemon() {
         .expect("a tick within 15s")
         .expect("the stream stays open")
         .expect("a well-formed event");
-    assert!(matches!(first.kind, types::ServerEventkind::Tick));
+    assert!(matches!(first.kind, types::ServerEventKind::Tick));
     assert_eq!(first.fingerprint.len(), 16);
 
     // Revoking the session ends it.
@@ -569,16 +561,15 @@ async fn a_session_does_not_survive_a_daemon_restart() {
         start_on(dir.path(), Some(&hash), RESTART_HTTP, RESTART_LISTEN_PORT).await;
     let grant = api::Client::new(&base)
         .unwrap()
-        .create_session(&types::CreateSession {
+        .create_session(types::CreateSession {
             password: PASSWORD.to_owned(),
         })
         .await
         .expect("sign in")
         .into_inner();
-    let client = api::Client::new(&base).unwrap().with_credential(
-        "bearer",
-        api::Credential::Bearer(api::SecretString::from(grant.token)),
-    );
+    let client = api::Client::new(&base)
+        .unwrap()
+        .with_bearer(api::SecretString::from(grant.token));
     client
         .get_current_session()
         .await
@@ -652,7 +643,7 @@ impl PtyRun {
 async fn minted_model(base: &str) -> Model {
     let grant = api::Client::new(base)
         .unwrap()
-        .create_session(&types::CreateSession {
+        .create_session(types::CreateSession {
             password: PASSWORD.to_owned(),
         })
         .await

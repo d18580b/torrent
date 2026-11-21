@@ -157,14 +157,14 @@ impl Detail {
     pub fn name(&self) -> Option<&str> {
         self.torrent
             .as_ref()
-            .and_then(|t| t.session.as_ref())
-            .and_then(|s| s.name.as_deref())
+            .and_then(|t| t.session.as_option())
+            .and_then(|s| s.name.as_option().map(String::as_str))
     }
 }
 
 /// Parse an upload limit: empty for none, else bytes per second in
 /// `1..=2147483647`.
-pub fn parse_limit(text: &str) -> Result<Option<i64>, String> {
+pub fn parse_limit(text: &str) -> Result<Option<u32>, String> {
     let digits: String = text
         .trim()
         .chars()
@@ -175,8 +175,10 @@ pub fn parse_limit(text: &str) -> Result<Option<i64>, String> {
     }
     let range = "between 1 and 2,147,483,647 bytes/s; empty removes the limit";
     match digits.parse::<u64>() {
-        Ok(n) if (1..=2_147_483_647).contains(&n) => Ok(Some(n as i64)),
-        Ok(_) => Err(range.to_owned()),
+        Ok(n) => match u32::try_from(n) {
+            Ok(n @ 1..=2_147_483_647) => Ok(Some(n)),
+            _ => Err(range.to_owned()),
+        },
         Err(_) if digits.starts_with('-') || digits.chars().all(|c| c.is_ascii_digit()) => {
             Err(range.to_owned())
         }
@@ -185,7 +187,7 @@ pub fn parse_limit(text: &str) -> Result<Option<i64>, String> {
 }
 
 /// A priority as libtorrent means it.
-pub fn priority_label(priority: i64) -> String {
+pub fn priority_label(priority: u8) -> String {
     match priority {
         0 => "0 skip".to_owned(),
         1 => "1 low".to_owned(),
@@ -370,7 +372,7 @@ fn overview(
         (Some(t), _) => types::TorrentSummary {
             infohash: t.infohash.clone(),
             profile_id: t.profile_id.clone(),
-            phase: t.phase.clone(),
+            phase: t.phase,
             progress: t.progress,
             upload_rate: t.upload_rate,
             download_rate: t.download_rate,
@@ -427,7 +429,7 @@ fn overview(
         format!("{:>16}", "session"),
         theme.title(),
     ))];
-    match detail.torrent.as_ref().map(|t| t.session.as_ref()) {
+    match detail.torrent.as_ref().map(|t| t.session.as_option()) {
         None => right.push(Line::from(Span::styled("loading…", theme.fg(Tone::Muted)))),
         Some(None) => right.push(Line::from(Span::styled(
             "○ not loaded in a session: still being added, its profile never came up, or the \
@@ -439,13 +441,18 @@ fn overview(
             right.push(kv(
                 theme,
                 "name",
-                session.name.clone().map_or_else(unknown, Span::raw),
+                session
+                    .name
+                    .clone()
+                    .into_option()
+                    .map_or_else(unknown, Span::raw),
             ));
             right.push(kv(
                 theme,
                 "size",
                 session
                     .total_size
+                    .into_option()
                     .map(fmt::bytes)
                     .map_or_else(unknown, Span::raw),
             ));
@@ -453,7 +460,7 @@ fn overview(
             right.push(kv(
                 theme,
                 "upload limit",
-                match session.upload_limit_bytes_per_sec {
+                match session.upload_limit_bytes_per_sec.into_option() {
                     Some(n) => Span::raw(fmt::rate(n)),
                     None => Span::styled("none of its own", theme.fg(Tone::Muted)),
                 },
@@ -461,7 +468,7 @@ fn overview(
             right.push(kv(
                 theme,
                 "added",
-                match session.added_at {
+                match session.added_at.into_option() {
                     Some(at) => Span::raw(format!("{} ({})", date(*at), fmt::relative(*at, now))),
                     None => Span::styled("unknown", theme.fg(Tone::Muted)),
                 },
@@ -529,7 +536,7 @@ fn files(detail: &Detail, theme: &Theme, tick: u64, frame: &mut Frame, area: Rec
         return;
     }
     let rows = files.items.iter().map(|f| {
-        let done = if f.size <= 0 {
+        let done = if f.size == 0 {
             1.0
         } else {
             f.downloaded as f64 / f.size as f64
@@ -636,10 +643,11 @@ fn trackers(
             Line::from(state_span(theme, &t.status.to_string())),
             Line::from(
                 t.next_announce_at
+                    .into_option()
                     .map_or_else(unknown, |at| fmt::relative(*at, now)),
             ),
-            Line::from(t.seeds.map_or_else(unknown, fmt::count)).right_aligned(),
-            Line::from(t.peers.map_or_else(unknown, fmt::count)).right_aligned(),
+            Line::from(t.seeds.into_option().map_or_else(unknown, fmt::count)).right_aligned(),
+            Line::from(t.peers.into_option().map_or_else(unknown, fmt::count)).right_aligned(),
         ];
         let tone = if matches!(t.status, types::TrackerStatus::Error) {
             Tone::Bad
@@ -647,7 +655,7 @@ fn trackers(
             Tone::Muted
         };
         cells.push(Line::from(Span::styled(
-            t.message.clone().unwrap_or_default(),
+            t.message.clone().into_option().unwrap_or_default(),
             theme.fg(tone),
         )));
         Row::new(cells)
@@ -721,8 +729,8 @@ fn actions(detail: &Detail, theme: &Theme, mutations: bool, frame: &mut Frame, a
             let current = detail
                 .torrent
                 .as_ref()
-                .and_then(|t| t.session.as_ref())
-                .and_then(|s| s.upload_limit_bytes_per_sec);
+                .and_then(|t| t.session.as_option())
+                .and_then(|s| s.upload_limit_bytes_per_sec.into_option());
             spans.push(Span::styled(
                 format!(
                     "  (now {})",
@@ -811,7 +819,8 @@ pub(super) fn fetch_files(api: &Api, hash: String, request: PageRequest) -> Effe
         let first = cursor.is_none();
         let params = crate::api::generated::ListTorrentFilesParams {
             cursor,
-            limit: Some(limit as i64),
+            // At most `caps::PAGE_MAX` (1000), so it always fits.
+            limit: Some(u32::try_from(limit).unwrap_or(u32::MAX)),
         };
         let result = crate::api::call(api.client.list_torrent_files(hash.clone(), params)).await;
         crate::app::Msg::Torrents(Msg::FilesPage {

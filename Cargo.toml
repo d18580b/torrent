@@ -46,12 +46,13 @@ prometheus = { version = "0.14", default-features = false }
 # Traces (torrentd::telemetry): OpenTelemetry over OTLP, off by default.
 # Default features off throughout: no metrics or logs signal, and no
 # `internal-logs`, whose own lines would duplicate the daemon's rate-limited
-# export WARN. gRPC goes over tonic with rustls (ring, the provider reqwest
-# already uses) and the system's roots; http/protobuf goes over the reqwest
-# above, through `telemetry::BlockingHttp`, so no second reqwest is built.
+# export WARN. gRPC goes over tonic with rustls (aws-lc-rs, the provider
+# reqwest's `rustls` feature uses, so only one is built) and the system's
+# roots; http/protobuf goes over the reqwest below, through
+# `telemetry::BlockingHttp`, so no second reqwest is built.
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "tls-ring", "tls-roots"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "tls-aws-lc", "tls-roots"] }
 opentelemetry-http = { version = "0.33", default-features = false }
 tracing-opentelemetry = { version = "0.34", default-features = false }
 
@@ -95,11 +96,12 @@ libc = "0.2"
 
 # torrentctl: the runtime the spargen-generated client needs. spargen audits
 # these against its tested floors; reqwest keeps default features off.
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+# rustls over aws-lc-rs, verifying against the platform's trust store.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
 secrecy = "0.10.3"
 futures-core = "0.3.34"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
-spargen = "=0.6.0"
+spargen = "=0.8.0"
 
 # torrentctl: the terminal UI
 ratatui = "0.30.2"

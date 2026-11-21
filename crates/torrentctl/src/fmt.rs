@@ -2,9 +2,9 @@
 
 /// `1.5 GiB`: bytes in binary units, one decimal past KiB. A value that
 /// would round up to 1024.0 of a unit reads in the next one instead.
-pub fn bytes(n: i64) -> String {
+pub fn bytes(n: impl Into<i128>) -> String {
     const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let n = n.max(0) as f64;
+    let n = n.into().max(0) as f64;
     let mut value = n;
     let mut unit = 0;
     // Compared at the one decimal shown: 1023.96 KiB would print as 1024.0.
@@ -20,7 +20,8 @@ pub fn bytes(n: i64) -> String {
 }
 
 /// `12.3 MiB/s`, or `—` for nothing moving.
-pub fn rate(bytes_per_sec: i64) -> String {
+pub fn rate(bytes_per_sec: impl Into<i128>) -> String {
+    let bytes_per_sec = bytes_per_sec.into();
     if bytes_per_sec <= 0 {
         "—".to_owned()
     } else {
@@ -37,7 +38,8 @@ pub fn percent(fraction: f64) -> String {
 }
 
 /// `1,234,567`.
-pub fn count(n: i64) -> String {
+pub fn count(n: impl Into<i128>) -> String {
+    let n = n.into();
     let digits = n.unsigned_abs().to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
     for (i, c) in digits.chars().enumerate() {
@@ -54,8 +56,8 @@ pub fn count(n: i64) -> String {
 }
 
 /// `3h 12m`, `45s`: a duration in the two largest units that matter.
-pub fn duration(secs: i64) -> String {
-    let secs = secs.max(0);
+pub fn duration(secs: impl Into<i128>) -> String {
+    let secs = secs.into().max(0);
     let (d, h, m, s) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
     match (d, h, m) {
         (0, 0, 0) => format!("{s}s"),
@@ -103,7 +105,7 @@ mod tests {
         assert_eq!(bytes(0), "0 B");
         assert_eq!(bytes(1023), "1023 B");
         assert_eq!(bytes(1536), "1.5 KiB");
-        assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        assert_eq!(bytes(3_i64 * 1024 * 1024 * 1024), "3.0 GiB");
         assert_eq!(bytes(1_048_575), "1.0 MiB", "not 1024.0 KiB");
         assert_eq!(bytes(1_048_524), "1023.9 KiB");
         assert_eq!(bytes(1024), "1.0 KiB");

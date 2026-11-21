@@ -22,7 +22,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
     let api = format!("{out_dir}/api.rs");
-    spargen::generate(&spargen::Spec::new(spec).build(&api)).expect_success();
+    // Closed string enums: a value the document does not list fails decoding,
+    // as it did before spargen 0.8 made enums open by default, so the screens
+    // keep matching every variant and an unknown event kind still surfaces as
+    // the `Decode` error the runtime skips (`runtime::unknown_kind`).
+    let spec = spargen::Spec::new(spec).with_closed_enums(spargen::StringEnums::Closed);
+    spargen::generate(&spec.build(&api)).expect_success();
 
     let generated = std::fs::read_to_string(&api).expect("read the generated client");
     std::fs::write(format!("{out_dir}/problems.rs"), problem_impls(&generated))

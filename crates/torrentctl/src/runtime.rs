@@ -901,7 +901,7 @@ fn unknown_kind<E>(e: &crate::api::generated::Error<E>) -> Option<String> {
     };
     let event: serde_json::Value = serde_json::from_slice(body).ok()?;
     let kind = event.as_object()?.get("kind")?;
-    let known = serde_json::from_value::<crate::api::types::ServerEventkind>(kind.clone()).is_ok();
+    let known = serde_json::from_value::<crate::api::types::ServerEventKind>(kind.clone()).is_ok();
     match kind {
         serde_json::Value::String(kind) if !known => Some(kind.clone()),
         _ => None,

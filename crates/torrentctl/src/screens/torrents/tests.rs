@@ -888,6 +888,7 @@ fn an_answer_for_another_torrent_is_dropped() {
             .as_ref()
             .unwrap()
             .session
+            .as_option()
             .is_none());
     });
 }
@@ -958,7 +959,10 @@ fn the_trackers_tab_polls_its_trackers_on_its_own_timer() {
         );
         let detail = state.detail.as_ref().unwrap();
         let trackers = detail.trackers.as_ref().unwrap();
-        assert_eq!(trackers[0].message.as_deref(), Some("connection refused"));
+        assert_eq!(
+            trackers[0].message.as_option().map(String::as_str),
+            Some("connection refused")
+        );
         assert_eq!(detail.trackers_selected, 1);
 
         // Only the Trackers tab polls.
@@ -1425,17 +1429,22 @@ fn a_local_torrent_over_64_mib_is_refused_before_sending() {
     }
 }
 
-/// Why a `.torrent` is sent by hand: the generated type puts its bytes on
-/// the wire as an array of numbers, not base64. When this fails, spargen
-/// has fixed it and `add::post_metainfo` can go.
+/// Up to spargen 0.6 the generated type put a `.torrent`'s bytes on the
+/// wire as an array of numbers, which is why `add::post_metainfo` sends it
+/// by hand. Since 0.8 it writes the same standard, padded base64 the hand
+/// path does, so `add::post_metainfo` can go in favour of `add_torrent`.
 #[test]
-fn the_generated_metainfo_source_does_not_serialize_as_base64() {
-    let source = types::TorrentSourceVariant2 {
-        kind: types::TorrentSourceVariant2kind::Metainfo,
-        data: bytes::Bytes::from_static(b"d4:infoe"),
+fn the_generated_metainfo_source_serializes_as_the_hand_built_base64() {
+    let source = types::TorrentSourceMetainfo {
+        kind: types::TorrentSourceMetainfoKind::Metainfo,
+        data: types::TorrentSourceMetainfoData(bytes::Bytes::from_static(b"d4:infoe")),
     };
     let value = serde_json::to_value(source).unwrap();
-    assert!(value["data"].is_array(), "{value}");
+    assert_eq!(
+        value["data"],
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"d4:infoe"),
+        "{value}"
+    );
 }
 
 // Keys.

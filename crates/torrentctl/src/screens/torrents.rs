@@ -120,7 +120,7 @@ pub enum Pending {
 pub enum Priority {
     Up,
     Down,
-    Set(i64),
+    Set(u8),
 }
 
 #[derive(Debug)]
@@ -184,16 +184,16 @@ pub enum Msg {
     PromptKey(KeyEvent),
     PrioritySet {
         hash: String,
-        index: i64,
-        previous: i64,
-        priority: i64,
+        index: u32,
+        previous: u8,
+        priority: u8,
         result: Result<(), Failure>,
     },
     OpenLimit,
     LimitKey(KeyEvent),
     LimitSet {
         hash: String,
-        value: Option<i64>,
+        value: Option<u32>,
         result: Result<(), Failure>,
     },
     /// `Enter` on the actions tab.
@@ -368,7 +368,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         }
         Msg::FilterProfile(profile) => {
             state.detail = None;
-            set_server_filter(state, profile, state.phase.clone(), ctx)
+            set_server_filter(state, profile, state.phase, ctx)
         }
         Msg::Page {
             generation,
@@ -380,15 +380,17 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             }
             match result {
                 Ok(page) => {
-                    match state
-                        .list
-                        .receive(generation, first, page.items, page.next_cursor)
-                    {
+                    match state.list.receive(
+                        generation,
+                        first,
+                        page.items,
+                        page.next_cursor.into_option(),
+                    ) {
                         Received::Stale => Vec::new(),
                         Received::Continue(request) => vec![fetch_page(
                             ctx.api,
                             state.profile.clone(),
-                            state.phase.clone(),
+                            state.phase,
                             request,
                         )],
                         Received::Settled => settle(state, ctx),
@@ -473,7 +475,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 None => ids.first().cloned(),
                 Some(at) => ids.get(at + 1).cloned(),
             };
-            set_server_filter(state, next, state.phase.clone(), ctx)
+            set_server_filter(state, next, state.phase, ctx)
         }
         Msg::CyclePhase => {
             let next = match state
@@ -481,7 +483,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 .as_ref()
                 .and_then(|p| PHASES.iter().position(|x| x == p))
             {
-                None => Some(PHASES[0].clone()),
+                None => Some(PHASES[0]),
                 Some(at) => PHASES.get(at + 1).cloned(),
             };
             set_server_filter(state, state.profile.clone(), next, ctx)
@@ -624,10 +626,12 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             match result {
                 Ok(page) => {
                     detail.metadata_pending = false;
-                    match detail
-                        .files
-                        .receive(generation, first, page.items, page.next_cursor)
-                    {
+                    match detail.files.receive(
+                        generation,
+                        first,
+                        page.items,
+                        page.next_cursor.into_option(),
+                    ) {
                         Received::Stale => Vec::new(),
                         Received::Continue(request) => {
                             vec![fetch_files(ctx.api, detail.hash.clone(), request)]
@@ -696,8 +700,9 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             };
             let previous = file.priority;
             let priority = match change {
-                Priority::Up => previous + 1,
-                Priority::Down => previous - 1,
+                // Saturating: `Down` from 0 stays 0, a no-op, as it was.
+                Priority::Up => previous.saturating_add(1),
+                Priority::Down => previous.saturating_sub(1),
                 Priority::Set(p) => p,
             }
             .clamp(0, 7);
@@ -711,8 +716,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             vec![Effect::new(async move {
                 let body = types::FilePriority { priority };
                 let result =
-                    crate::api::call(api.client.set_file_priority(hash.clone(), index, &body))
-                        .await;
+                    crate::api::call(api.client.set_file_priority(hash.clone(), index, body)).await;
                 crate::app::Msg::Torrents(Msg::PrioritySet {
                     hash,
                     index,
@@ -729,11 +733,9 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             Vec::new()
         }
         Msg::PromptKey(key) => match key.code {
-            KeyCode::Char(d @ '0'..='7') => update(
-                state,
-                Msg::Priority(Priority::Set(i64::from(d as u8 - b'0'))),
-                ctx,
-            ),
+            KeyCode::Char(d @ '0'..='7') => {
+                update(state, Msg::Priority(Priority::Set(d as u8 - b'0')), ctx)
+            }
             KeyCode::Esc => {
                 if let Some(detail) = state.detail.as_mut() {
                     detail.prompt = false;
@@ -779,8 +781,8 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 let current = detail
                     .torrent
                     .as_ref()
-                    .and_then(|t| t.session.as_ref())
-                    .and_then(|s| s.upload_limit_bytes_per_sec)
+                    .and_then(|t| t.session.as_option())
+                    .and_then(|s| s.upload_limit_bytes_per_sec.into_option())
                     .map(|n| n.to_string())
                     .unwrap_or_default();
                 detail.limit = Some(detail::LimitInput {
@@ -812,11 +814,14 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                         let hash = detail.hash.clone();
                         let api = ctx.api.clone();
                         vec![Effect::new(async move {
+                            // `None` (no limit) is left off the wire, as
+                            // it always was; the document reads absent as
+                            // `null`, removing the limit.
                             let body = types::UploadLimit {
-                                bytes_per_sec: value,
+                                bytes_per_sec: crate::api::absent_if_none(value),
                             };
                             let result =
-                                crate::api::call(api.client.set_upload_limit(hash.clone(), &body))
+                                crate::api::call(api.client.set_upload_limit(hash.clone(), body))
                                     .await;
                             crate::app::Msg::Torrents(Msg::LimitSet {
                                 hash,
@@ -914,7 +919,8 @@ fn added(
             let name = torrent
                 .session
                 .as_ref()
-                .and_then(|s| s.name.clone())
+                .as_option()
+                .and_then(|s| s.name.as_option().cloned())
                 .unwrap_or_else(|| "a magnet (name once metadata arrives)".to_owned());
             let text = format!(
                 "added {name} · {} to {}",

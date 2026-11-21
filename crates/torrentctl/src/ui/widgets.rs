@@ -457,16 +457,19 @@ pub fn title<'a>(
 /// each part drawn in its own character so it reads without colour.
 pub fn share_bar<'a>(
     theme: &Theme,
-    parts: &[(i64, char, Tone)],
-    total: i64,
+    parts: &[(u64, char, Tone)],
+    total: u64,
     width: u16,
 ) -> Line<'a> {
-    let width = width as i64;
+    let width = u64::from(width);
     let total = total.max(1);
     let mut spans = Vec::new();
     let mut used = 0;
     for (value, symbol, tone) in parts {
-        let mut cells = (value.max(&0) * width / total).min(width - used);
+        // In u128, where a byte count times the width cannot overflow; the
+        // quotient is at most `width` for a part within the total.
+        let share = u128::from(*value) * u128::from(width) / u128::from(total);
+        let mut cells = u64::try_from(share).unwrap_or(u64::MAX).min(width - used);
         // Anything present shows, however small its share.
         if cells == 0 && *value > 0 && used < width {
             cells = 1;

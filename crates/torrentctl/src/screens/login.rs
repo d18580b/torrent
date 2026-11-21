@@ -73,7 +73,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 password: state.password.value().to_owned(),
             };
             vec![Effect::new(async move {
-                let grant = crate::api::call(api.client.create_session(&body)).await;
+                let grant = crate::api::call(api.client.create_session(body)).await;
                 crate::app::Msg::Login(Msg::Answered(grant.map(|g| g.token)))
             })]
         }

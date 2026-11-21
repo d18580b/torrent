@@ -50,7 +50,7 @@ fn tunnel(status: &types::ProfileStatus, tunnel_ip: Option<&String>) -> String {
 
 /// The port-forward column: the mode, and the forwarded port where NAT-PMP
 /// has one.
-fn forward(mode: &types::PortForwardMode, forwarded: Option<i64>) -> String {
+fn forward(mode: &types::PortForwardMode, forwarded: Option<u16>) -> String {
     match (mode, forwarded) {
         (_, Some(port)) => format!("{mode} :{port}"),
         (types::PortForwardMode::Natpmp, None) => "natpmp —".to_owned(),
@@ -58,7 +58,7 @@ fn forward(mode: &types::PortForwardMode, forwarded: Option<i64>) -> String {
     }
 }
 
-fn port(port: Option<i64>) -> String {
+fn port(port: Option<u16>) -> String {
     port.map_or_else(|| "—".to_owned(), |p| p.to_string())
 }
 
@@ -110,13 +110,16 @@ fn list(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
             )),
             Line::from(state_span(theme, &shown_status(p))),
             Line::from(fmt::count(p.torrent_count)).right_aligned(),
-            Line::from(tunnel(&p.status, p.tunnel_ip.as_ref())),
-            Line::from(port(p.listen_port)).right_aligned(),
-            Line::from(forward(&p.port_forward, p.forwarded_port)),
+            Line::from(tunnel(&p.status, p.tunnel_ip.as_option())),
+            Line::from(port(p.listen_port.into_option())).right_aligned(),
+            Line::from(forward(&p.port_forward, p.forwarded_port.into_option())),
         ];
         if wide {
             cells.push(Line::from(Span::styled(
-                p.user_agent.clone().unwrap_or_else(|| "default".to_owned()),
+                p.user_agent
+                    .clone()
+                    .into_option()
+                    .unwrap_or_else(|| "default".to_owned()),
                 theme.fg(Tone::Muted),
             )));
         }
@@ -234,7 +237,8 @@ fn detail(state: &State, profile: &types::Profile, ctx: &Ctx<'_>, frame: &mut Fr
                             " — {}",
                             profile
                                 .failure_reason
-                                .as_deref()
+                                .as_option()
+                                .map(String::as_str)
                                 .unwrap_or("no reason given")
                         ),
                         theme.fg(Tone::Bad),
@@ -266,70 +270,77 @@ fn detail(state: &State, profile: &types::Profile, ctx: &Ctx<'_>, frame: &mut Fr
     };
     let plain = |s: String| Span::styled(s, theme.fg(Tone::Plain));
 
-    let mut facts =
-        vec![
-            kv(
-                theme,
-                "status",
-                state_span(theme, &profile.status.to_string()),
-            ),
-            kv(theme, "set to", plain(profile.desired_state.to_string())),
-            kv(theme, "torrents", plain(fmt::count(profile.torrent_count))),
-            kv(
-                theme,
-                "tunnel ip",
-                plain(tunnel(&profile.status, profile.tunnel_ip.as_ref())),
-            ),
-            kv(
-                theme,
-                "vpn interface",
-                match detail {
-                    Some(d) => plain(d.vpn_interface.clone().unwrap_or_else(
-                        || match profile.status {
-                            types::ProfileStatus::Failed => "—".to_owned(),
-                            _ => "none (host)".to_owned(),
-                        },
-                    )),
-                    None => waiting(),
-                },
-            ),
-            kv(theme, "listen port", plain(port(profile.listen_port))),
-            kv(
-                theme,
-                "port forward",
-                plain(forward(&profile.port_forward, profile.forwarded_port)),
-            ),
-            kv(
-                theme,
-                "forward health",
-                match detail {
-                    Some(d) if d.port_forward_ok => Span::styled("● ok", theme.fg(Tone::Good)),
-                    Some(_) => Span::styled("✖ not ok", theme.fg(Tone::Bad)),
-                    None => waiting(),
-                },
-            ),
-            kv(
-                theme,
-                "paused for vpn",
-                match detail {
-                    Some(d) if d.paused_for_vpn > 0 => {
-                        Span::styled(fmt::count(d.paused_for_vpn), theme.fg(Tone::Warn))
+    let mut facts = vec![
+        kv(
+            theme,
+            "status",
+            state_span(theme, &profile.status.to_string()),
+        ),
+        kv(theme, "set to", plain(profile.desired_state.to_string())),
+        kv(theme, "torrents", plain(fmt::count(profile.torrent_count))),
+        kv(
+            theme,
+            "tunnel ip",
+            plain(tunnel(&profile.status, profile.tunnel_ip.as_option())),
+        ),
+        kv(
+            theme,
+            "vpn interface",
+            match detail {
+                Some(d) => plain(d.vpn_interface.clone().into_option().unwrap_or_else(|| {
+                    match profile.status {
+                        types::ProfileStatus::Failed => "—".to_owned(),
+                        _ => "none (host)".to_owned(),
                     }
-                    Some(d) => plain(fmt::count(d.paused_for_vpn)),
-                    None => waiting(),
-                },
+                })),
+                None => waiting(),
+            },
+        ),
+        kv(
+            theme,
+            "listen port",
+            plain(port(profile.listen_port.into_option())),
+        ),
+        kv(
+            theme,
+            "port forward",
+            plain(forward(
+                &profile.port_forward,
+                profile.forwarded_port.into_option(),
+            )),
+        ),
+        kv(
+            theme,
+            "forward health",
+            match detail {
+                Some(d) if d.port_forward_ok => Span::styled("● ok", theme.fg(Tone::Good)),
+                Some(_) => Span::styled("✖ not ok", theme.fg(Tone::Bad)),
+                None => waiting(),
+            },
+        ),
+        kv(
+            theme,
+            "paused for vpn",
+            match detail {
+                Some(d) if d.paused_for_vpn > 0 => {
+                    Span::styled(fmt::count(d.paused_for_vpn), theme.fg(Tone::Warn))
+                }
+                Some(d) => plain(fmt::count(d.paused_for_vpn)),
+                None => waiting(),
+            },
+        ),
+        kv(
+            theme,
+            "user agent",
+            plain(
+                profile
+                    .user_agent
+                    .clone()
+                    .into_option()
+                    .unwrap_or_else(|| "default".to_owned()),
             ),
-            kv(
-                theme,
-                "user agent",
-                plain(
-                    profile
-                        .user_agent
-                        .clone()
-                        .unwrap_or_else(|| "default".to_owned()),
-                ),
-            ),
-        ];
+        ),
+    ];
 
     // Tracker domains: beside the facts where there is room, else inline.
     let trackers: Vec<Line> = match detail {

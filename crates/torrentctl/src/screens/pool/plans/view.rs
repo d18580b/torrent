@@ -130,8 +130,10 @@ fn draw_list(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
             Line::from(state_span(theme, &p.status.to_string())),
             Line::from(when(p.created_at.0)),
             Line::from(Span::styled(
-                p.applied_at.map_or("—".to_owned(), |at| when(at.0)),
-                theme.fg(if p.applied_at.is_some() {
+                p.applied_at
+                    .as_option()
+                    .map_or("—".to_owned(), |at| when(at.0)),
+                theme.fg(if p.applied_at.as_option().is_some() {
                     Tone::Plain
                 } else {
                     Tone::Muted
@@ -211,11 +213,12 @@ fn draw_detail(state: &State, detail: &Detail, ctx: &Ctx<'_>, frame: &mut Frame,
             Span::styled("   applied ", theme.fg(Tone::Muted)),
             Span::raw(
                 plan.applied_at
+                    .as_option()
                     .map_or("—".to_owned(), |at| format!("{} UTC", when(at.0))),
             ),
         ]),
     ];
-    if let Some(token) = &plan.confirm_token {
+    if let Some(token) = plan.confirm_token.as_option() {
         lines.push(Line::from(vec![
             label("confirm token"),
             strong(theme, token.clone(), Tone::Bad),
@@ -269,12 +272,12 @@ fn draw_detail(state: &State, detail: &Detail, ctx: &Ctx<'_>, frame: &mut Frame,
     );
 
     let rows = detail.steps.items.iter().map(|s| {
-        let path = match &s.dst {
+        let path = match s.dst.as_option() {
             Some(dst) => format!("{} → {dst}", s.src),
             None => s.src.clone(),
         };
         let mut place = vec![Line::from(path)];
-        if let Some(error) = &s.error {
+        if let Some(error) = s.error.as_option() {
             place.push(Line::from(Span::styled(
                 format!("✖ {error}"),
                 theme.fg(Tone::Bad),
