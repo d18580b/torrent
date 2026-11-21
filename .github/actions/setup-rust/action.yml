@@ -76,7 +76,7 @@ runs:
         rustc --version
 
     - if: inputs.cache-prefix != ''
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -89,10 +89,14 @@ runs:
 
     # cargo-binstall lets mise fetch prebuilt convco and cargo-deny binaries
     # (no compile, no C build deps).
-    - uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # v1.26.0
+    - uses: cargo-bins/cargo-binstall@5885714d0a40a14b2535c6ffc051fd8e49aa9665 # v1.27.0
     # The mise release every task is run on, so a new mise cannot change a
     # task's behaviour under CI. mise.toml's `min_version` names the same
     # release; move both together.
-    - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+    - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
       with:
-        version: 2026.10.17
+        version: 2026.11.11
+        # mise.toml's [env] (RUSTFLAGS, RUSTFMT_TOOLCHAIN, ...) applies to the
+        # tasks mise runs, not to every later step: v3 and later export it to
+        # the job by default, which v2 never did.
+        env: false

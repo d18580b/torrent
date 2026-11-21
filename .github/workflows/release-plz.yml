@@ -105,7 +105,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
           # release-plz reads the tags and the history since the last one.
@@ -254,7 +254,7 @@ jobs:
       BRANCH: release-plz-next
       REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
           fetch-depth: 0
@@ -548,7 +548,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
           persist-credentials: false
@@ -590,7 +590,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
           persist-credentials: false
@@ -644,7 +644,7 @@ jobs:
       PUBLISH: ${{ github.event_name == 'push' }}
       PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The build context carries the vendored sources (deploy/Containerfile).
           submodules: recursive
@@ -737,7 +737,7 @@ jobs:
             exit 1
           fi
       - if: env.PUBLISH == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -761,7 +761,7 @@ jobs:
           provenance: false
           sbom: false
       - if: env.PUBLISH == 'true'
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - if: env.PUBLISH == 'true'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -870,7 +870,7 @@ jobs:
           # Titled after the binary, as each platform's image is labelled.
           annotations: |
             org.opencontainers.image.title=torrentd
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -897,7 +897,7 @@ jobs:
           echo "$IMAGE:$VERSION is $digest"
           docker buildx imagetools inspect "$IMAGE@$digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - env:
           DIGEST: ${{ steps.list.outputs.digest }}
         run: cosign sign --yes "$IMAGE@$DIGEST"
@@ -970,7 +970,7 @@ jobs:
       VERSION: ${{ needs.release.outputs.version }}
       PUBLISH: ${{ github.event_name == 'push' }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
           persist-credentials: false
@@ -1000,7 +1000,7 @@ jobs:
           echo "package=$pkg" >> "$GITHUB_OUTPUT"
       # cosign and the attestation read the Docker login; helm reads its own.
       - if: env.PUBLISH == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1023,7 +1023,7 @@ jobs:
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - if: env.PUBLISH == 'true'
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - if: env.PUBLISH == 'true'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -1086,7 +1086,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       # The sources the tarballs were built from, for their SBOM.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
           persist-credentials: false
@@ -1117,7 +1117,7 @@ jobs:
         with:
           subject-path: ${{ runner.temp }}/assets/*.tar.gz
           sbom-path: ${{ runner.temp }}/assets/torrent-${{ needs.release.outputs.version }}.spdx.json
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - working-directory: ${{ runner.temp }}/assets
         run: |
           set -euo pipefail
