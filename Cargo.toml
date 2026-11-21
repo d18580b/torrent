@@ -74,7 +74,7 @@ futures-util = "0.3"
 # Auth
 argon2 = "0.5"
 rand = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Pool index
 rusqlite = { version = "0.41", features = ["bundled"] }
@@ -86,7 +86,7 @@ bytes = "1"
 # (`torrentd::http::v1::TimedBody`); already in the tree through kynos.
 http-body = "1"
 hex = { version = "0.4", features = ["serde"] }
-sha1 = "0.10"
+sha1 = "0.11"
 tempfile = "3"
 once_cell = "1"
 # `syncfs(2)` for the stores' batched writer and `getrlimit(2)` for the boot
