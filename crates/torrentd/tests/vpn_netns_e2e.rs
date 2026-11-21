@@ -1612,10 +1612,10 @@ fn vpn_netns_e2e_cluster_carve_outs_let_out_the_api_and_dns_and_nothing_else() {
         METRICS_TOKEN.as_bytes(),
     ));
     // A routable bind takes `[auth]`; no test logs in, so any password does.
-    let password_hash = argon2::PasswordHasher::hash_password(
+    let password_hash = argon2::PasswordHasher::hash_password_with_salt(
         &argon2::Argon2::default(),
         b"unused",
-        &argon2::password_hash::SaltString::from_b64("dnBuLW5ldG5zLWUyZQ").unwrap(),
+        b"vpn-netns-e2e",
     )
     .unwrap()
     .to_string();
