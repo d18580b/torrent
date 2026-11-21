@@ -1284,7 +1284,7 @@ impl PromSink {
                     let labels: Vec<(&str, &str)> = m
                         .get_label()
                         .iter()
-                        .map(|l| (l.get_name(), l.get_value()))
+                        .map(|l| (l.name(), l.value()))
                         .collect();
                     if let Some((name, values)) = b.only {
                         if !labels.iter().any(|(k, v)| *k == name && values.contains(v)) {

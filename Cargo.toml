@@ -41,7 +41,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
 tracing-futures = "0.2"
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # Traces (torrentd::telemetry): OpenTelemetry over OTLP, off by default.
 # Default features off throughout: no metrics or logs signal, and no
