@@ -27,7 +27,7 @@ all = "deny"
 tokio = { version = "1.54", features = ["full"] }
 kynos = { version = "=0.6.1",features = ["openapi32", "pattern", "time-jiff02"] }
 jiff = { version = "0.2", features = ["serde"] }
-base64 = "0.22"
+base64 = "0.23"
 
 # Serialization / config
 serde = { version = "1", features = ["derive"] }

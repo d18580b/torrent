@@ -3937,7 +3937,7 @@ dependencies = [
 name = "torrentctl"
 version = "0.2.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "color-eyre",
@@ -3975,7 +3975,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-stream",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "futures-util",
