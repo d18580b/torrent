@@ -34,7 +34,7 @@ shim-tests = []
 [build-dependencies]
 cc = "1.11"
 cmake = "0.1"
-bindgen = "0.70"
+bindgen = "0.73"
 # Keying and staging the native cache. Both are already in Cargo.lock, so no
 # new versions are resolved, but resolver v2 unifies build-dependencies
 # separately from the normal graph -- they are compiled once more for the
