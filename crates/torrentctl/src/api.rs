@@ -348,36 +348,73 @@ pub const UNIX_PREFIX: &str = "unix:";
 /// and `Host` reach the daemon; `localhost` is a `Host` every daemon answers.
 const UNIX_ORIGIN: &str = "http://localhost";
 
+/// The schemes the URL Standard calls special: their authority follows the
+/// scheme's colon after any run of `/` and `\`, and ends at `\` too.
+const SPECIAL_SCHEMES: [&str; 6] = ["ftp", "file", "http", "https", "ws", "wss"];
+
 /// Where `url` carries userinfo — `user:pass` in `http://user:pass@host` —
-/// found in the text as typed, so a URL that does not parse is covered too.
+/// found in the text as typed, so a URL that does not parse is covered too:
+/// the userinfo's span, and the end of the authority it opens.
 ///
-/// The authority is read as the URL Standard reads it: for `http` and
-/// `https`, after the scheme's colon and any run of `/` and `\`, up to the
-/// first `/`, `\`, `?` or `#`; otherwise after `://`, or from the start when
-/// there is none, up to the first `/`, `?` or `#`. The userinfo is the
+/// The authority is read as the URL Standard reads it: for a special scheme,
+/// after the scheme's colon and any run of `/` and `\`, up to the first `/`,
+/// `\`, `?` or `#`; for another scheme followed by `//`, after the `//`, up to
+/// the first `/`, `?` or `#`. With no scheme, or another scheme not followed
+/// by `//`, it is read from the start, as a URL typed without its scheme:
+/// in `user:pass@host` the "scheme" is the user name. The userinfo is the
 /// authority up to its last `@`.
-fn userinfo(url: &str) -> Option<std::ops::Range<usize>> {
+fn userinfo(url: &str) -> Option<(std::ops::Range<usize>, usize)> {
     let lead = url.len() - url.trim_start_matches(|c: char| c <= ' ').len();
-    let special = url[lead..].split_once(':').and_then(|(scheme, rest)| {
-        (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-            .then(|| url.len() - rest.trim_start_matches(['/', '\\']).len())
+    let text = &url[lead..];
+    let scheme = text.split_once(':').map(|(scheme, _)| scheme).filter(|s| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
     });
-    let start = special.unwrap_or_else(|| url.find("://").map_or(0, |i| i + 3));
+    let special = scheme.is_some_and(|s| SPECIAL_SCHEMES.iter().any(|x| s.eq_ignore_ascii_case(x)));
+    let start = match scheme {
+        Some(s) if special => url.len() - text[s.len() + 1..].trim_start_matches(['/', '\\']).len(),
+        Some(s) if text[s.len() + 1..].starts_with("//") => lead + s.len() + 3,
+        _ => lead,
+    };
     let authority = &url[start..];
     let end = authority
-        .find(|c| matches!(c, '/' | '?' | '#') || (special.is_some() && c == '\\'))
+        .find(|c| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
         .unwrap_or(authority.len());
     let at = authority[..end].rfind('@')?;
-    (at > 0).then_some(start..start + at)
+    (at > 0).then_some((start..start + at, start + end))
 }
 
-/// `text` with the userinfo `base_url` carries replaced by `***` wherever it
-/// appears in it.
-fn redact(text: &str, base_url: &str) -> String {
+/// `base_url` with its userinfo, where it carries one, replaced by `***`.
+fn redact_url(base_url: &str) -> String {
     match userinfo(base_url) {
-        Some(range) => text.replace(&base_url[range], "***"),
-        None => text.to_owned(),
+        Some((range, _)) => format!("{}***{}", &base_url[..range.start], &base_url[range.end..]),
+        None => base_url.to_owned(),
     }
+}
+
+/// `text` with the authority `base_url` carries userinfo in — `user:pass@host`
+/// — shown with that userinfo replaced by `***` wherever it appears in it,
+/// matched ignoring ASCII case as a parsed URL's host is lowercased. Only
+/// that text of `base_url` is matched, so a short user name does not mangle
+/// the words around it.
+fn redact(text: &str, base_url: &str) -> String {
+    let Some((range, end)) = userinfo(base_url) else {
+        return text.to_owned();
+    };
+    let authority = base_url[range.start..end].to_ascii_lowercase();
+    let shown = format!("***{}", &base_url[range.end..end]);
+    // ASCII lowercasing keeps every byte offset, so a match in the lowered
+    // copy is a match at the same offsets in `text`.
+    let mut redacted = String::with_capacity(text.len());
+    let mut last = 0;
+    for (i, _) in text.to_ascii_lowercase().match_indices(&authority) {
+        redacted.push_str(&text[last..i]);
+        redacted.push_str(&shown);
+        last = i + authority.len();
+    }
+    redacted.push_str(&text[last..]);
+    redacted
 }
 
 /// The message [`Api::new`] refuses `base_url` with, for `reason`. It names
@@ -387,7 +424,7 @@ fn redact(text: &str, base_url: &str) -> String {
 fn invalid(base_url: &str, reason: &str) -> String {
     format!(
         "invalid daemon URL {:?}: {}",
-        redact(base_url, base_url),
+        redact_url(base_url),
         redact(reason, base_url)
     )
 }
@@ -421,7 +458,7 @@ impl Api {
         if scheme != "http" && scheme != "https" {
             // The scheme is named only where the redacted URL still shows
             // it: in `user:pass@host` the "scheme" is the user name.
-            let named = redact(base_url, base_url)
+            let named = redact_url(base_url)
                 .trim_start_matches(|c: char| c <= ' ')
                 .get(..=scheme.len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&format!("{scheme}:")));
@@ -804,6 +841,28 @@ mod tests {
             err,
             r#"invalid daemon URL "https://***@host": cannot use https://***@host"#
         );
+        // A parsed URL lowercases its scheme and host, and adds a path.
+        let url = "HTTPS://alice:hunter2@HOST";
+        let err = invalid(url, "cannot use https://alice:hunter2@host/");
+        refused_without(&err, &["alice", "hunter2"]);
+        assert!(err.ends_with("cannot use https://***@HOST/"), "{err}");
+    }
+
+    #[test]
+    fn a_short_user_name_leaves_the_rest_of_the_message_alone() {
+        let err = Api::new("http://e@host:99999", None).unwrap_err();
+        assert!(
+            err.starts_with(r#"invalid daemon URL "http://***@host:99999": "#),
+            "{err}"
+        );
+        assert!(err.contains("invalid port number"), "{err}");
+
+        let url = "http://h@https-host";
+        assert_eq!(redact_url(url), "http://***@https-host");
+        assert_eq!(
+            redact(&format!("h: cannot reach {url}"), url),
+            "h: cannot reach http://***@https-host"
+        );
     }
 
     #[test]
@@ -814,12 +873,31 @@ mod tests {
             ("http:alice:hunter2@host", "http:***@host"),
             (r"http:\\alice:hunter2@host", r"http:\\***@host"),
             ("http://a@b:hunter2@host", "http://***@host"),
+            ("ftp:/alice:hunter2@host", "ftp:/***@host"),
+            ("wss:/alice:hunter2@h", "wss:/***@h"),
+            (r"WS:\alice:hunter2@h\p", r"WS:\***@h\p"),
+            ("file://alice:hunter2@host/p", "file://***@host/p"),
+            ("foo://alice:hunter2@host/p", "foo://***@host/p"),
+            ("alice:hunter2@host/p://q", "***@host/p://q"),
             ("http://host/a@b", "http://host/a@b"),
             ("http://@host", "http://@host"),
             ("unix:/run/a@b.sock", "unix:/run/a@b.sock"),
             ("localhost:8080", "localhost:8080"),
         ] {
-            assert_eq!(redact(url, url), shown, "{url}");
+            assert_eq!(redact_url(url), shown, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_special_scheme_without_its_slashes_is_refused_without_its_userinfo() {
+        for (url, shown) in [
+            ("ftp:/alice:hunter2@host", "ftp:/***@host"),
+            ("wss:/alice:hunter2@h", "wss:/***@h"),
+            ("alice:hunter2@host/p://q", "***@host/p://q"),
+        ] {
+            let err = Api::new(url, None).unwrap_err();
+            refused_without(&err, &["alice", "hunter2"]);
+            assert!(err.contains(&format!("{shown:?}")), "{err}");
         }
     }
 
