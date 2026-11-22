@@ -638,3 +638,54 @@ fn the_section_parses_validates_and_is_restart_only() {
     assert!(refused.contains("[telemetry]"), "{refused}");
     assert!(refused.contains("sample_ratio"), "{refused}");
 }
+
+/// Set in the process [`only_an_https_endpoint_needs_ca_certificates`]
+/// starts, the only one in which its half that empties the store runs.
+const NO_CA: &str = "TORRENTD_TEST_NO_CA";
+
+/// `SSL_CERT_FILE` and `SSL_CERT_DIR` are process-wide, so the half that
+/// empties the certificate store runs in a process of its own: this test
+/// binary again, filtered to that one test. `cargo test` itself exports
+/// `SSL_CERT_DIR` (cargo probes for OpenSSL's certificates), so it is
+/// removed, not inherited.
+#[test]
+fn only_an_https_endpoint_needs_ca_certificates() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty.pem");
+    std::fs::write(&empty, "").unwrap();
+    let name = "telemetry::tests::builds_the_http_client_with_an_empty_store";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(NO_CA, "1")
+        .env("SSL_CERT_FILE", &empty)
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the filter ran no test: {stdout}"
+    );
+}
+
+#[test]
+#[ignore = "run by only_an_https_endpoint_needs_ca_certificates"]
+fn builds_the_http_client_with_an_empty_store() {
+    if std::env::var_os(NO_CA).is_none() {
+        return;
+    }
+    // A plain http:// collector never reaches TLS.
+    BlockingHttp::new(false).expect("http:// needs no CA certificates");
+    // An https:// one does, and the error says what to do about it.
+    let err = format!("{:#}", BlockingHttp::new(true).unwrap_err());
+    assert!(err.contains("No CA certificates"), "got {err}");
+    assert!(err.contains("SSL_CERT_FILE"), "got {err}");
+}

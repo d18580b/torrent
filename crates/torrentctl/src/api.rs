@@ -344,6 +344,15 @@ impl std::fmt::Debug for Api {
 /// How a `base_url` names the daemon's unix socket: `unix:/run/torrentd/api.sock`.
 pub const UNIX_PREFIX: &str = "unix:";
 
+/// Whether a client for `origin` can ever do a TLS handshake: anything but
+/// a plain `http://` URL. A unix socket's requests are written against
+/// [`UNIX_ORIGIN`], so it lands here as `http`.
+fn speaks_tls(origin: &str) -> bool {
+    !origin
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+}
+
 /// The URL requests over a unix socket are written against. Only its path
 /// and `Host` reach the daemon; `localhost` is a `Host` every daemon answers.
 const UNIX_ORIGIN: &str = "http://localhost";
@@ -370,9 +379,21 @@ impl Api {
             }
             None => base_url,
         };
-        let http = builder
-            .build()
-            .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
+        let tls = speaks_tls(origin);
+        if !tls {
+            // Nothing here can reach TLS, so it needs no trust anchors: a host
+            // without a CA bundle still talks to the daemon in plain HTTP.
+            builder = builder.tls_certs_only(Vec::<reqwest::Certificate>::new());
+        }
+        let http = builder.build().map_err(|e| {
+            let hint = if tls {
+                "; https verifies against the system's CA certificates: install \
+                 them (ca-certificates), or point SSL_CERT_FILE at a PEM bundle"
+            } else {
+                ""
+            };
+            format!("cannot build the HTTP client: {}{hint}", root_cause(&e))
+        })?;
         let backend = generated::MiddlewareBackend::new(std::sync::Arc::new(
             generated::ReqwestBackend::new(http.clone()),
         ))
@@ -483,6 +504,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn an_unset_optional_member_stays_off_the_wire() {
+        // spargen 0.6 skipped a `None` member, so the wire never carried an
+        // explicit `null` for one; `absent_if_none` keeps it that way.
+        let unset = types::UploadLimit {
+            bytes_per_sec: absent_if_none(None),
+        };
+        assert_eq!(serde_json::to_value(&unset).unwrap(), json!({}));
+        let set = types::UploadLimit {
+            bytes_per_sec: absent_if_none(Some(1024)),
+        };
+        assert_eq!(
+            serde_json::to_value(&set).unwrap(),
+            json!({ "bytes_per_sec": 1024 })
+        );
+    }
 
     fn problem(slug: &str, status: u16) -> serde_json::Value {
         json!({

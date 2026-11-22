@@ -267,7 +267,7 @@ impl Export {
                     .with_http()
                     .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                     .with_endpoint(self.endpoint.clone())
-                    .with_http_client(BlockingHttp::new()?);
+                    .with_http_client(BlockingHttp::new(self.endpoint.starts_with("https://"))?);
                 if !self.headers.is_empty() {
                     builder = builder.with_headers(self.headers.iter().cloned().collect());
                 }
@@ -590,18 +590,34 @@ impl BlockingHttp {
     /// Built on a thread of its own: a blocking reqwest client refuses to be
     /// built where a tokio runtime is entered, and `main` enters one before
     /// the exporter is built.
-    fn new() -> anyhow::Result<Self> {
+    ///
+    /// A plain `http://` endpoint never reaches TLS, so `tls` false builds a
+    /// client with no trust anchors: a host without CA certificates exports
+    /// to a local collector all the same. An `https://` one verifies against
+    /// the system's store, and fails here when that store is empty.
+    fn new(tls: bool) -> anyhow::Result<Self> {
         let client = std::thread::Builder::new()
             .name("torrentd-otlp-init".into())
-            .spawn(|| {
-                reqwest::blocking::Client::builder()
-                    .timeout(HTTP_EXPORT_TIMEOUT)
-                    .build()
+            .spawn(move || {
+                let builder = reqwest::blocking::Client::builder().timeout(HTTP_EXPORT_TIMEOUT);
+                if tls {
+                    builder
+                } else {
+                    builder.tls_certs_only(Vec::<reqwest::Certificate>::new())
+                }
+                .build()
             })
             .context("spawn the thread that builds the OTLP HTTP client")?
             .join()
             .map_err(|_| anyhow::anyhow!("building the OTLP HTTP client panicked"))?
-            .context("build the OTLP HTTP client")?;
+            .with_context(|| {
+                if tls {
+                    "build the OTLP HTTP client (https verifies against the system's CA \
+                     certificates: install them, or point SSL_CERT_FILE at a PEM bundle)"
+                } else {
+                    "build the OTLP HTTP client"
+                }
+            })?;
         Ok(Self(client))
     }
 
