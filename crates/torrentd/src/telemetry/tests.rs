@@ -679,10 +679,11 @@ fn only_an_https_endpoint_needs_ca_certificates() {
 #[test]
 #[ignore = "run by only_an_https_endpoint_needs_ca_certificates"]
 fn builds_the_http_client_with_an_empty_store() {
-    assert!(
-        std::env::var_os(NO_CA).is_some(),
-        "run by only_an_https_endpoint_needs_ca_certificates, in a process of its own"
-    );
+    // The netns tasks run every ignored test in this binary; outside the
+    // process its parent starts, the store is the host's, so it passes.
+    if std::env::var_os(NO_CA).is_none() {
+        return;
+    }
     // A plain http:// collector never reaches TLS.
     BlockingHttp::new("http://localhost:4318/v1/traces").expect("http:// needs no CA certificates");
     // An https:// one does, and the error says what to do about it.

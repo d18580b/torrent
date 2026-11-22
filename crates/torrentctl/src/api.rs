@@ -366,10 +366,19 @@ impl Api {
             }
             None => (base_url, None),
         };
-        let plain = url::Url::parse(origin)
+        let scheme = url::Url::parse(origin)
             .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?
             .scheme()
-            == "http";
+            .to_owned();
+        // Refused here, before the client is built, so a mistyped URL such as
+        // `localhost:8080` (scheme `localhost`) is not reported as missing
+        // CA certificates on a host without them.
+        if scheme != "http" && scheme != "https" {
+            return Err(format!(
+                "invalid daemon URL {base_url:?}: use http://, https:// or unix:/path"
+            ));
+        }
+        let plain = scheme == "http";
         let builder = || {
             let builder = reqwest::Client::builder()
                 .user_agent(concat!("torrentctl/", env!("CARGO_PKG_VERSION")))

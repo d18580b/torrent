@@ -31,6 +31,10 @@ fn only_https_needs_ca_certificates() {
         );
     }
 
+    // A URL that is neither is refused as such, not as missing certificates.
+    let err = Api::new("localhost:8080", None).unwrap_err();
+    assert!(err.starts_with("invalid daemon URL"), "got {err}");
+
     // https does, and says what to do about it.
     let err = Api::new("https://torrentd.example", None).unwrap_err();
     assert!(err.contains("No CA certificates"), "got {err}");
