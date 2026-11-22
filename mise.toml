@@ -33,27 +33,27 @@ min_version = "2026.10.17"
 hk = "1.48.0"
 # convco is not in the mise/aqua registry; the cargo backend fetches a prebuilt
 # binary via cargo-binstall when available, else compiles from source.
-"cargo:convco" = "0.6.4"
+"cargo:convco" = "0.7.2"
 # Supply-chain policy (deny.toml): advisories, licenses, bans, sources. The
 # cargo backend fetches the prebuilt binary through cargo-binstall.
-"cargo:cargo-deny" = "0.20.2"
+"cargo:cargo-deny" = "0.22.0"
 # Mutation testing (the mutants tasks below, .cargo/mutants.toml). Prebuilt
 # through cargo-binstall like the two above.
 "cargo:cargo-mutants" = "27.1.0"
 # Releases (release-plz.toml, .github/workflows/release-plz.yml). The release
 # workflow runs this exact release, and so does a local `release-plz update`.
-"aqua:release-plz/release-plz" = "0.4.1"
+"aqua:release-plz/release-plz" = "0.4.3"
 # The workflow lint (`lint-workflows`): actionlint checks every workflow and
 # runs shellcheck over each `run:` script, and zizmor audits them for
 # injection, credential and permission mistakes.
 "aqua:rhysd/actionlint" = "1.7.12"
 "aqua:koalaman/shellcheck" = "0.11.0"
-"aqua:zizmorcore/zizmor" = "1.31.1"
+"aqua:zizmorcore/zizmor" = "1.32.0"
 # The Helm chart in deploy/helm/torrentd (`helm-lint`, `helm-test`): helm
 # lints and renders it, and helm-unittest's standalone `untt` binary runs the
 # chart's tests/ against the same rendering, with no helm plugin installed
 # into a helm home outside the checkout.
-"aqua:helm/helm" = "4.3.1"
+"aqua:helm/helm" = "4.3.2"
 "github:helm-unittest/helm-unittest" = { version = "1.2.1", bin = "untt" }
 # The chart installed for real (`test-k8s`): k3d runs a k3s cluster in a
 # container on the host's docker, and kubectl drives it. kubectl's minor

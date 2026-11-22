@@ -18,6 +18,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Every crate in the graph, not only workspace members: cargo-deny 0.22 narrowed
+# the default to `workspace`.
+unmaintained = "all"
 ignore = []
 
 [licenses]
