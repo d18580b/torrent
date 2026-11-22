@@ -125,7 +125,7 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
 /// Re-read as many rows as are loaded (see [`Paged`]).
 fn reload(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     let request = state.items.reload();
-    vec![fetch(ctx, state.filter.clone(), request)]
+    vec![fetch(ctx, state.filter, request)]
 }
 
 fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -133,7 +133,7 @@ fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     match state.items.begin_more() {
-        Some(request) => vec![fetch(ctx, state.filter.clone(), request)],
+        Some(request) => vec![fetch(ctx, state.filter, request)],
         None => Vec::new(),
     }
 }
@@ -150,7 +150,8 @@ fn fetch(ctx: &Ctx<'_>, filter: Option<types::AdoptionState>, request: PageReque
         let params = ListPoolTorrentsParams {
             state: filter,
             cursor,
-            limit: Some(limit as i64),
+            // At most `caps::PAGE_MAX` (1000), so it always fits.
+            limit: Some(u32::try_from(limit).unwrap_or(u32::MAX)),
         };
         let result = crate::api::call(api.client.list_pool_torrents(params)).await;
         wrap(super::Msg::Library(Msg::Page {
@@ -168,14 +169,14 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             first,
             result: Ok(page),
         } => {
-            match state
-                .items
-                .receive(generation, first, page.items, page.next_cursor)
-            {
+            match state.items.receive(
+                generation,
+                first,
+                page.items,
+                page.next_cursor.into_option(),
+            ) {
                 Received::Stale => return Vec::new(),
-                Received::Continue(request) => {
-                    return vec![fetch(ctx, state.filter.clone(), request)]
-                }
+                Received::Continue(request) => return vec![fetch(ctx, state.filter, request)],
                 Received::Settled => {}
             }
             if let Some(hash) = state.reselect.take() {
@@ -221,7 +222,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         }
         Msg::CycleFilter => {
             state.filter = match &state.filter {
-                None => Some(FILTERS[0].clone()),
+                None => Some(FILTERS[0]),
                 Some(f) => FILTERS
                     .iter()
                     .position(|x| x == f)
@@ -306,7 +307,7 @@ fn verify(state: &mut State, infohashes: Vec<String>, ctx: &Ctx<'_>) -> Vec<Effe
     let api = ctx.api.clone();
     vec![Effect::new(async move {
         let body = types::VerifyRequest { infohashes };
-        let result = crate::api::call(api.client.verify_pool_torrents(&body)).await;
+        let result = crate::api::call(api.client.verify_pool_torrents(body)).await;
         wrap(super::Msg::Library(Msg::Verified(result)))
     })]
 }
@@ -397,15 +398,18 @@ fn draw_table(
         }
         let state_name = t
             .state
-            .as_ref()
+            .as_option()
             .map_or("unmatched".to_owned(), |s| s.to_string());
         cells.push(Line::from(vec![
             Span::raw(" "),
             state_span(theme, &state_name),
         ]));
         cells.push(Line::from(Span::styled(
-            t.profile_id.clone().unwrap_or_else(|| "—".to_owned()),
-            theme.fg(if t.profile_id.is_some() {
+            t.profile_id
+                .clone()
+                .into_option()
+                .unwrap_or_else(|| "—".to_owned()),
+            theme.fg(if t.profile_id.as_option().is_some() {
                 Tone::Plain
             } else {
                 Tone::Muted

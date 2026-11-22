@@ -22,6 +22,13 @@ pub use generated::types;
 /// `PlanStatus` component, which the filter parameter references directly.
 pub use generated::types::PlanStatus;
 pub use generated::Client;
+pub use generated::Nullable;
+
+/// An optional, nullable request member from an `Option`: `None` is left
+/// off the wire (`Absent`), never sent as `null`, as the client always did.
+pub fn absent_if_none<T>(value: Option<T>) -> Nullable<T> {
+    value.map_or(Nullable::Absent, Nullable::Value)
+}
 
 // `AsProblem` for every generated error enum; see build.rs.
 include!(concat!(env!("OUT_DIR"), "/problems.rs"));
@@ -147,11 +154,19 @@ impl<E: AsProblem> From<generated::Error<E>> for Failure {
                 Failure::local("The daemon's answer was malformed", Some(e.to_string()))
             }
             Error::Redirect(e) => Failure::local("Too many redirects", Some(e.to_string())),
-            // Only spargen's `Link`-header paginator raises this; the API
-            // pages by cursor, so nothing here reaches it.
+            Error::BodyTooLarge { limit, status } => Failure::local(
+                "The daemon's answer was too large",
+                Some(format!("HTTP {} past {limit} bytes", status.as_u16())),
+            ),
+            // Only spargen's `Link`-header paginator raises these; the API
+            // pages by cursor, so nothing here reaches them.
             Error::PaginationCycle { url } => Failure::local(
                 "The daemon's pages led back to one already read",
                 Some(url.to_string()),
+            ),
+            Error::PaginationOriginChanged { from, to } => Failure::local(
+                "The daemon's pages led to another origin",
+                Some(format!("{from} to {to}")),
             ),
         }
     }
@@ -339,10 +354,7 @@ impl Api {
     ///
     /// `unix:/path` connects to the daemon's socket at `/path`.
     pub fn new(base_url: &str, token: Option<&str>) -> Result<Self, String> {
-        let mut builder = reqwest::Client::builder()
-            .user_agent(concat!("torrentctl/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(5));
-        let origin = match base_url.strip_prefix(UNIX_PREFIX) {
+        let (origin, socket) = match base_url.strip_prefix(UNIX_PREFIX) {
             Some(path) => {
                 if !path.starts_with('/') {
                     return Err(format!(
@@ -350,14 +362,51 @@ impl Api {
                          path, as in unix:/run/torrentd/api.sock"
                     ));
                 }
-                builder = builder.unix_socket(path);
-                UNIX_ORIGIN
+                (UNIX_ORIGIN, Some(path))
             }
-            None => base_url,
+            None => (base_url, None),
         };
-        let http = builder
-            .build()
-            .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
+        let scheme = url::Url::parse(origin)
+            .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?
+            .scheme()
+            .to_owned();
+        // Refused here, before the client is built, so a mistyped URL such as
+        // `localhost:8080` (scheme `localhost`) is not reported as missing
+        // CA certificates on a host without them.
+        if scheme != "http" && scheme != "https" {
+            return Err(format!(
+                "invalid daemon URL {base_url:?}: use http://, https:// or unix:/path"
+            ));
+        }
+        let plain = scheme == "http";
+        let builder = || {
+            let builder = reqwest::Client::builder()
+                .user_agent(concat!("torrentctl/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(5));
+            match socket {
+                Some(path) => builder.unix_socket(path),
+                None => builder,
+            }
+        };
+        let http = match builder().build() {
+            Ok(http) => http,
+            // The platform's CA certificates are missing. A plain-HTTP daemon
+            // needs none, so this host still reaches it, with no trust
+            // anchors: only an https proxy or a redirect to https could have
+            // used them, and those fail as they would on any such host.
+            Err(_) if plain => builder()
+                .tls_certs_only(Vec::<reqwest::Certificate>::new())
+                .build()
+                .map_err(|e| format!("cannot build the HTTP client: {}", root_cause(&e)))?,
+            Err(e) => {
+                return Err(format!(
+                    "cannot build the HTTP client: {}; https verifies against the system's \
+                     CA certificates: install them (ca-certificates), or point SSL_CERT_FILE \
+                     at a PEM bundle",
+                    root_cause(&e)
+                ))
+            }
+        };
         let backend = generated::MiddlewareBackend::new(std::sync::Arc::new(
             generated::ReqwestBackend::new(http.clone()),
         ))
@@ -365,10 +414,7 @@ impl Api {
         let mut client = Client::with_backend(std::sync::Arc::new(backend), origin)
             .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?;
         if let Some(token) = token {
-            client = client.with_credential(
-                "bearer",
-                generated::Credential::Bearer(generated::SecretString::from(token.to_owned())),
-            );
+            client = client.with_bearer(generated::SecretString::from(token.to_owned()));
         }
         Ok(Self {
             client,
@@ -471,6 +517,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn an_unset_optional_member_stays_off_the_wire() {
+        // spargen 0.6 skipped a `None` member, so the wire never carried an
+        // explicit `null` for one; `absent_if_none` keeps it that way.
+        let unset = types::UploadLimit {
+            bytes_per_sec: absent_if_none(None),
+        };
+        assert_eq!(serde_json::to_value(&unset).unwrap(), json!({}));
+        let set = types::UploadLimit {
+            bytes_per_sec: absent_if_none(Some(1024)),
+        };
+        assert_eq!(
+            serde_json::to_value(&set).unwrap(),
+            json!({ "bytes_per_sec": 1024 })
+        );
+    }
 
     fn problem(slug: &str, status: u16) -> serde_json::Value {
         json!({

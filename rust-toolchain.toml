@@ -4,6 +4,6 @@
 # moves only by editing this line. The oldest release the workspace must still
 # compile on is `rust-version` in Cargo.toml, which `mise run msrv` checks.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy", "rust-src"]
 profile = "minimal"

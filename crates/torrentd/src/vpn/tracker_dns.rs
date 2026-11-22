@@ -56,7 +56,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::Rng;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -186,7 +186,7 @@ impl TunnelResolver {
     async fn ask(&self, server: SocketAddr, name: &str, qtype: u16) -> io::Result<dns::Answer> {
         let sock = UdpSocket::bind(SocketAddr::new(self.bind, 0)).await?;
         bind_device(&sock, self.device.as_deref());
-        let id = rand::thread_rng().next_u32() as u16;
+        let id = rand::rng().next_u32() as u16;
         sock.send_to(&dns::query(id, name, qtype)?, server).await?;
         let mut buf = vec![0u8; 1500];
         tokio::time::timeout(DNS_TIMEOUT, async {
@@ -378,7 +378,7 @@ impl Drop for TrackerProxy {
 
 fn random_token() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 

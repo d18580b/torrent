@@ -44,7 +44,7 @@ opentelemetry-http = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # The http/protobuf exporter's client: the workspace's reqwest, blocking,
 # since the batch span processor exports from a thread of its own.
-reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"] }
+reqwest = { workspace = true, features = ["blocking"] }
 
 # Streams
 async-stream = { workspace = true }

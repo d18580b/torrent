@@ -93,7 +93,7 @@ pub(super) fn load_list(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     vec![fetch_page(
         ctx.api,
         state.profile.clone(),
-        state.phase.clone(),
+        state.phase,
         request,
     )]
 }
@@ -116,7 +116,8 @@ pub(super) fn fetch_page(
             profile_id: profile,
             phase,
             cursor,
-            limit: Some(limit as i64),
+            // At most `caps::PAGE_MAX` (1000), so it always fits.
+            limit: Some(u32::try_from(limit).unwrap_or(u32::MAX)),
         };
         let result = crate::api::call(api.client.list_torrents(params)).await;
         crate::app::Msg::Torrents(Msg::Page {
@@ -148,7 +149,7 @@ fn next_page(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         Some(request) => vec![fetch_page(
             ctx.api,
             state.profile.clone(),
-            state.phase.clone(),
+            state.phase,
             request,
         )],
         None => Vec::new(),

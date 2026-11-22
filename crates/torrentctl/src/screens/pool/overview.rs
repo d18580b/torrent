@@ -339,7 +339,8 @@ fn draw_states(pool: &types::PoolOverview, theme: &Theme, frame: &mut Frame, are
         ("missing", s.missing),
         ("drifted", s.drifted),
         ("overlap", s.overlap),
-        ("unmatched", (pool.torrents - known).max(0)),
+        // Unsigned now: saturating, as the signed `.max(0)` floored it.
+        ("unmatched", pool.torrents.saturating_sub(known)),
     ];
     let block = panel(theme, " adoption ", false);
     let inner = block.inner(area);

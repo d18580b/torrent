@@ -70,19 +70,19 @@ impl Selector {
 
     fn to_api(&self) -> types::AdoptSelector {
         match self {
-            Selector::Infohashes(hashes) => types::AdoptSelector::AdoptSelectorVariant0(Box::new(
-                types::AdoptSelectorVariant0 {
-                    kind: types::AdoptSelectorVariant0kind::Infohashes,
+            Selector::Infohashes(hashes) => {
+                types::AdoptSelector::Infohashes(Box::new(types::AdoptSelectorInfohashes {
+                    kind: types::AdoptSelectorInfohashesKind::Infohashes,
                     infohashes: hashes.clone(),
-                },
-            )),
-            Selector::Subtree { root_id, path, .. } => types::AdoptSelector::AdoptSelectorVariant1(
-                Box::new(types::AdoptSelectorVariant1 {
-                    kind: types::AdoptSelectorVariant1kind::Subtree,
+                }))
+            }
+            Selector::Subtree { root_id, path, .. } => {
+                types::AdoptSelector::Subtree(Box::new(types::AdoptSelectorSubtree {
+                    kind: types::AdoptSelectorSubtreeKind::Subtree,
                     root_id: *root_id,
                     path: path.clone(),
-                }),
-            ),
+                }))
+            }
         }
     }
 }
@@ -312,7 +312,7 @@ fn send(d: &mut Dialog, dry_run: bool, ctx: &Ctx<'_>) -> Vec<Effect> {
         // loads every target before answering, and giving up early would
         // report a failure for work that went on; the preview classifies
         // every target of a large subtree first, which can outlast it too.
-        let result = crate::api::call_unbounded(api.client.adopt_pool_torrents(&body)).await;
+        let result = crate::api::call_unbounded(api.client.adopt_pool_torrents(body)).await;
         wrap(super::Msg::Adopt(Msg::Answered {
             serial,
             dry_run,

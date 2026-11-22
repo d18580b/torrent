@@ -25,9 +25,7 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::PasswordHasher;
-use argon2::password_hash::SaltString;
 use argon2::Algorithm;
 use argon2::Argon2;
 use argon2::Params;
@@ -35,7 +33,7 @@ use argon2::PasswordHash;
 use argon2::PasswordVerifier;
 use argon2::Version;
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::Rng;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -203,7 +201,7 @@ impl SessionStore {
     /// Mint a session token, returning it and the wall-clock time it expires.
     pub fn create(&self) -> (String, SystemTime) {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let token = format!("{SESSION_TOKEN_PREFIX}{}", hex::encode(bytes));
         let now = Instant::now();
         // `AuthConfig::validate` bounds the TTL, but the store must not panic
@@ -808,9 +806,8 @@ fn argon2id() -> Argon2<'static> {
 
 /// Hash a password for the config file.
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
     argon2id()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("hash password: {e}"))
 }
@@ -818,7 +815,7 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 /// Generate a new API token and the hash to put in the config.
 pub fn generate_token() -> (String, String) {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let token = format!("{STATIC_TOKEN_PREFIX}{}", hex::encode(bytes));
     let digest = hex::encode(Sha256::digest(token.as_bytes()));
     (token, digest)
@@ -870,14 +867,21 @@ mod tests {
             Version::V0x13,
             Params::new(8 * 1024, 1, 1, None).unwrap(),
         );
-        let salt = SaltString::generate(&mut OsRng);
-        let h = cheap
-            .hash_password(b"correct horse", &salt)
-            .unwrap()
-            .to_string();
+        let h = cheap.hash_password(b"correct horse").unwrap().to_string();
         assert!(h.contains("m=8192,t=1,p=1"), "got {h}");
 
         let auth = Auth::new(cfg(h));
+        assert!(auth.verify_password("correct horse"));
+        assert!(!auth.verify_password("wrong horse"));
+    }
+
+    #[test]
+    fn a_hash_from_an_earlier_argon2_release_still_verifies() {
+        // Made by argon2 0.5.3, which this daemon hashed with before 0.6. A
+        // credential already in someone's config must survive the bump, so
+        // this is a literal, not a hash the current release produces.
+        let h = "$argon2id$v=19$m=8192,t=1,p=1$YXJnb24yLTAuNS4zLWZpeA$6GWh2vc+xm3ogaFjDwA55aFAB8gGGqT6jZ6Oncz6gHo";
+        let auth = Auth::new(cfg(h.to_string()));
         assert!(auth.verify_password("correct horse"));
         assert!(!auth.verify_password("wrong horse"));
     }

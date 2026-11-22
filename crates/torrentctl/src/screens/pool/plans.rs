@@ -173,7 +173,7 @@ pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
 /// Re-read as many plans as are loaded (see [`Paged`]).
 fn reload(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     let request = state.list.reload();
-    vec![fetch(ctx, state.filter.clone(), request)]
+    vec![fetch(ctx, state.filter, request)]
 }
 
 fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -181,7 +181,7 @@ fn more(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
         return Vec::new();
     }
     match state.list.begin_more() {
-        Some(request) => vec![fetch(ctx, state.filter.clone(), request)],
+        Some(request) => vec![fetch(ctx, state.filter, request)],
         None => Vec::new(),
     }
 }
@@ -198,7 +198,8 @@ fn fetch(ctx: &Ctx<'_>, filter: Option<PlanStatus>, request: PageRequest) -> Eff
         let params = ListPlansParams {
             status: filter,
             cursor,
-            limit: Some(limit as i64),
+            // At most `caps::PAGE_MAX` (1000), so it always fits.
+            limit: Some(u32::try_from(limit).unwrap_or(u32::MAX)),
         };
         let result = crate::api::call(api.client.list_plans(params)).await;
         wrap(super::Msg::Plans(Msg::Page {
@@ -232,7 +233,8 @@ fn fetch_steps(detail: &Detail, ctx: &Ctx<'_>, request: PageRequest) -> Effect {
         let first = cursor.is_none();
         let params = ListPlanStepsParams {
             cursor,
-            limit: Some(limit as i64),
+            // At most `caps::PAGE_MAX` (1000), so it always fits.
+            limit: Some(u32::try_from(limit).unwrap_or(u32::MAX)),
         };
         let result = crate::api::call(api.client.list_plan_steps(id, params)).await;
         wrap(super::Msg::Plans(Msg::StepsPage {
@@ -262,7 +264,7 @@ fn more_steps(detail: &mut Detail, ctx: &Ctx<'_>) -> Vec<Effect> {
 /// where it was.
 fn show(detail: &mut Detail, mut plan: types::Plan, ctx: &Ctx<'_>) -> Vec<Effect> {
     let inline = std::mem::take(&mut plan.steps);
-    let next = plan.steps_next_cursor.clone();
+    let next = plan.steps_next_cursor.clone().into_option();
     detail.plan = Some(plan);
     let loaded = detail.steps.items.len();
     if loaded > inline.len() && detail.steps.loading {
@@ -311,14 +313,14 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             first,
             result: Ok(page),
         } => {
-            match state
-                .list
-                .receive(generation, first, page.items, page.next_cursor)
-            {
+            match state.list.receive(
+                generation,
+                first,
+                page.items,
+                page.next_cursor.into_option(),
+            ) {
                 Received::Stale => return Vec::new(),
-                Received::Continue(request) => {
-                    return vec![fetch(ctx, state.filter.clone(), request)]
-                }
+                Received::Continue(request) => return vec![fetch(ctx, state.filter, request)],
                 Received::Settled => {}
             }
             if let Some(id) = state.reselect.take() {
@@ -359,7 +361,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         },
         Msg::CycleFilter => {
             state.filter = match &state.filter {
-                None => Some(FILTERS[0].clone()),
+                None => Some(FILTERS[0]),
                 Some(f) => FILTERS
                     .iter()
                     .position(|x| x == f)
@@ -412,10 +414,12 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
             };
             match result {
                 Ok(page) => {
-                    match detail
-                        .steps
-                        .receive(generation, first, page.items, page.next_cursor)
-                    {
+                    match detail.steps.receive(
+                        generation,
+                        first,
+                        page.items,
+                        page.next_cursor.into_option(),
+                    ) {
                         Received::Stale => Vec::new(),
                         Received::Continue(request) => vec![fetch_steps(detail, ctx, request)],
                         Received::Settled => settle_steps(detail, ctx),
@@ -576,7 +580,7 @@ fn ask_apply(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     let counts = &plan.step_counts;
     let pending = counts.total.saturating_sub(counts.done);
     let title = format!("Apply plan #{}", plan.id);
-    let confirm = match &plan.confirm_token {
+    let confirm = match plan.confirm_token.as_option() {
         // Only a `delete_orphans` plan carries a token, and its every step is
         // a `delete_file`, so each step still to do moves one file.
         Some(token) => Confirm::new(
@@ -601,7 +605,7 @@ fn ask_apply(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     };
     state.confirm = Some(Pending::Apply {
         id: plan.id,
-        token: plan.confirm_token.clone(),
+        token: plan.confirm_token.clone().into_option(),
         confirm,
     });
     Vec::new()
@@ -616,10 +620,10 @@ fn steps(n: usize) -> String {
     }
 }
 
-/// A step count from `step_counts`, for [`steps`]. The document declares
-/// them unsigned; the generated type is `i64`, so a negative one reads as 0.
-fn count(n: i64) -> usize {
-    usize::try_from(n.max(0)).unwrap_or(usize::MAX)
+/// A step count from `step_counts`, for [`steps`]: saturating where `usize`
+/// is narrower than the document's `uint64`.
+fn count(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 fn confirm_key(state: &mut State, key: KeyEvent, ctx: &Ctx<'_>) -> Vec<Effect> {
@@ -641,11 +645,13 @@ fn confirm_key(state: &mut State, key: KeyEvent, ctx: &Ctx<'_>) -> Vec<Effect> {
                 Some(Pending::Apply { id, token, .. }) => {
                     state.applying = Some(id);
                     vec![Effect::new(async move {
+                        // No token is left off the wire, as it always
+                        // was; the document reads absent as `null`.
                         let body = types::ApplyRequest {
-                            confirm_token: token,
+                            confirm_token: crate::api::absent_if_none(token),
                         };
                         let result =
-                            crate::api::call_unbounded(api.client.apply_plan(id, &body)).await;
+                            crate::api::call_unbounded(api.client.apply_plan(id, body)).await;
                         wrap(super::Msg::Plans(Msg::Applied { id, result }))
                     })]
                 }

@@ -127,7 +127,7 @@ fn draw_top(model: &Model, frame: &mut Frame, area: Rect) {
         Live::Reconnecting { .. } => ("◌", "polling".to_owned(), Tone::Warn),
     };
     let who = match &model.session {
-        Session::SignedIn { principal, .. } => match &principal.name {
+        Session::SignedIn { principal, .. } => match principal.name.as_option() {
             Some(name) => format!("{} {name}", principal.kind),
             None => principal.kind.to_string(),
         },

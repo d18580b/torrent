@@ -25,14 +25,16 @@ path = "src/main.rs"
 # rather than the lockfile — the workspace's plain `serde = "1"` would fail it.
 reqwest = { workspace = true, features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-bytes = { version = "1.12.1", features = ["serde"] }
+serde_json = "1.0.154"
+bytes = { version = "1.12.2", features = ["serde"] }
 secrecy = { workspace = true }
 futures-core = { workspace = true }
 time = { workspace = true }
-# spargen 0.6's client speaks `http::Request`/`http::Response` to its backend.
-http = "1.4.2"
-http-body = "1.0.1"
+# spargen 0.8's client speaks `http::Request`/`http::Response` to its backend.
+http = "1.5.0"
+http-body = "1.1.0"
+# The base URL the 0.8 client resolves each operation's path against.
+url = "2.5.9"
 
 # The terminal UI.
 ratatui = { workspace = true }

@@ -106,8 +106,8 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
         Msg::Loaded(Ok((status, profiles))) => {
             state.loading = false;
             state.error = None;
-            push(&mut state.up, status.upload_rate_total.max(0) as u64);
-            push(&mut state.down, status.download_rate_total.max(0) as u64);
+            push(&mut state.up, status.upload_rate_total);
+            push(&mut state.down, status.download_rate_total);
             state.status = Some(status);
             state.profiles = profiles;
             Vec::new()
@@ -273,13 +273,13 @@ pub fn view(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
     let [profiles_area, server_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(server_width)]).areas(lower);
     let rows = state.profiles.iter().map(|p| {
-        let note = match (&p.status, &p.failure_reason) {
+        let note = match (&p.status, p.failure_reason.as_option()) {
             (types::ProfileStatus::Failed, Some(reason)) => format!("never came up: {reason}"),
             (types::ProfileStatus::VpnDown, _) => "fenced: bring online in Profiles (r)".to_owned(),
             _ if p.effective_state == types::ProfileState::Offline => {
                 "offline: held off the network".to_owned()
             }
-            _ => match p.forwarded_port {
+            _ => match p.forwarded_port.into_option() {
                 Some(port) => format!("forwarded :{port}"),
                 None => p.port_forward.to_string(),
             },
@@ -288,7 +288,7 @@ pub fn view(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
             Line::from(p.profile_id.clone()),
             Line::from(state_span(theme, &p.status.to_string())),
             Line::from(fmt::count(p.torrent_count)),
-            Line::from(match (&p.status, &p.tunnel_ip) {
+            Line::from(match (&p.status, p.tunnel_ip.as_option()) {
                 (_, Some(ip)) => ip.clone(),
                 // A failed profile never got a tunnel; a live one without an
                 // address is a host profile.
@@ -322,7 +322,7 @@ pub fn view(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
         lines.push(kv(ctx, "daemon", format!("torrentd {}", server.version)));
         lines.push(kv(ctx, "api", format!("v{}", server.api_version)));
         lines.push(kv(ctx, "auth", server.auth.mode.to_string()));
-        if let Some(ttl) = server.auth.session_ttl_secs {
+        if let Some(ttl) = server.auth.session_ttl_secs.into_option() {
             lines.push(kv(ctx, "session ttl", fmt::duration(ttl)));
         }
         lines.push(kv(

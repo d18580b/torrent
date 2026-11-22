@@ -401,15 +401,13 @@ pub async fn submit(api: Api, request: Request) -> Result<types::Torrent, AddFai
         failure,
     };
     let source = match request.source {
-        Source::Magnet(uri) => {
-            types::TorrentSource::TorrentSourceVariant0(Box::new(types::TorrentSourceVariant0 {
-                kind: types::TorrentSourceVariant0kind::Magnet,
-                uri,
-            }))
-        }
+        Source::Magnet(uri) => types::TorrentSource::Magnet(Box::new(types::TorrentSourceMagnet {
+            kind: types::TorrentSourceMagnetKind::Magnet,
+            uri,
+        })),
         Source::ServerPath(path) => {
-            types::TorrentSource::TorrentSourceVariant1(Box::new(types::TorrentSourceVariant1 {
-                kind: types::TorrentSourceVariant1kind::ServerPath,
+            types::TorrentSource::ServerPath(Box::new(types::TorrentSourceServerPath {
+                kind: types::TorrentSourceServerPathKind::ServerPath,
                 path,
             }))
         }
@@ -421,10 +419,10 @@ pub async fn submit(api: Api, request: Request) -> Result<types::Torrent, AddFai
     };
     let body = types::AddTorrentRequest {
         profile_id: request.profile,
-        save_path: request.save_path,
+        save_path: crate::api::absent_if_none(request.save_path),
         source,
     };
-    crate::api::call(api.client.add_torrent(&body))
+    crate::api::call(api.client.add_torrent(body))
         .await
         .map_err(api_failure)
 }
@@ -460,11 +458,13 @@ async fn read_metainfo(path: &std::path::Path) -> Result<Vec<u8>, AddFailure> {
 
 /// `POST /v1/torrents` with a `metainfo` source, built by hand.
 ///
-/// The generated `TorrentSourceVariant2::data` is a `bytes::Bytes`, which
-/// serializes as a JSON array of numbers rather than the base64 string the
-/// API document declares, so the typed `add_torrent` cannot send a
-/// `.torrent`. This sends the same request with the data base64-encoded,
-/// through [`Api::post`].
+/// spargen up to 0.6 serialized the generated metainfo `data` as a JSON
+/// array of numbers rather than the base64 string the API document
+/// declares, so the typed `add_torrent` could not send a `.torrent`. This
+/// sends the same request with the data base64-encoded, through
+/// [`Api::post`]. spargen 0.8 encodes it as base64 too (see the
+/// `the_generated_metainfo_source_serializes_as_the_hand_built_base64`
+/// test), so this path is now redundant.
 #[allow(
     clippy::result_large_err,
     reason = "an AddFailure is built once per failed add and moved straight to the dialog"

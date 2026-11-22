@@ -120,7 +120,11 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
                 continue;
             }
         };
-        if let Some(e) = &entry.read_children_error {
+        if let Some(e) = entry
+            .read_children
+            .as_ref()
+            .and_then(jwalk::ReadChildren::error)
+        {
             note_unlistable(&mut stats, &entry.path(), e);
             if entry.depth == 0 {
                 root_unreadable = true;
@@ -297,7 +301,11 @@ pub fn scan_library(
             }
         };
         let path = entry.path();
-        if let Some(e) = &entry.read_children_error {
+        if let Some(e) = entry
+            .read_children
+            .as_ref()
+            .and_then(jwalk::ReadChildren::error)
+        {
             note_unlistable(&mut stats, &path, e);
         }
         if !entry.file_type().is_file() {
@@ -480,7 +488,7 @@ pub fn scan_library(
 /// Count a directory the walk could not list as a `walk` error.
 ///
 /// jwalk does not yield such a directory as an `Err`: it yields the
-/// directory's own `Ok` entry with the failure in `read_children_error`, and
+/// directory's own `Ok` entry with the failure in `read_children.error()`, and
 /// simply has no children to yield after it. Read only as an `Err`, an
 /// unreadable directory is indistinguishable from an empty one.
 fn note_unlistable(stats: &mut ScanStats, dir: &Path, e: &jwalk::Error) {

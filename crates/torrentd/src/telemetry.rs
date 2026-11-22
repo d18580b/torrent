@@ -267,7 +267,7 @@ impl Export {
                     .with_http()
                     .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                     .with_endpoint(self.endpoint.clone())
-                    .with_http_client(BlockingHttp::new()?);
+                    .with_http_client(BlockingHttp::new(&self.endpoint)?);
                 if !self.headers.is_empty() {
                     builder = builder.with_headers(self.headers.iter().cloned().collect());
                 }
@@ -590,18 +590,38 @@ impl BlockingHttp {
     /// Built on a thread of its own: a blocking reqwest client refuses to be
     /// built where a tokio runtime is entered, and `main` enters one before
     /// the exporter is built.
-    fn new() -> anyhow::Result<Self> {
+    ///
+    /// On a host without CA certificates the platform verifier cannot be
+    /// built. A plain `http://` endpoint (`check_url` admits only http:// and
+    /// https://) needs none, so it is then built with no trust anchors and a
+    /// local collector still receives traces; only an https proxy or a
+    /// redirect to https could have used them. An `https://` endpoint fails,
+    /// saying how to supply them.
+    fn new(endpoint: &str) -> anyhow::Result<Self> {
+        let plain = endpoint.starts_with("http://");
         let client = std::thread::Builder::new()
             .name("torrentd-otlp-init".into())
-            .spawn(|| {
-                reqwest::blocking::Client::builder()
-                    .timeout(HTTP_EXPORT_TIMEOUT)
-                    .build()
+            .spawn(move || {
+                let builder = || reqwest::blocking::Client::builder().timeout(HTTP_EXPORT_TIMEOUT);
+                match builder().build() {
+                    Err(_) if plain => builder()
+                        .tls_certs_only(Vec::<reqwest::Certificate>::new())
+                        .build(),
+                    built => built,
+                }
             })
             .context("spawn the thread that builds the OTLP HTTP client")?
             .join()
             .map_err(|_| anyhow::anyhow!("building the OTLP HTTP client panicked"))?
-            .context("build the OTLP HTTP client")?;
+            .with_context(|| {
+                if plain {
+                    "build the OTLP HTTP client"
+                } else {
+                    "build the OTLP HTTP client (https verifies against the system's CA \
+                     certificates: install them (ca-certificates), or point SSL_CERT_FILE \
+                     at a PEM bundle)"
+                }
+            })?;
         Ok(Self(client))
     }
 
