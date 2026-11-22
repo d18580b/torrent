@@ -223,9 +223,11 @@ fn permissions_do_not_bind(case: &str) {
     eprintln!("skipped: permissions do not bind for this user, so {case} cannot be built");
 }
 
-/// jwalk reports a directory it cannot list on the directory's own `Ok`
-/// entry, not as an `Err`, so a scan reading only `Err`s indexed an
-/// unreadable subdirectory as an empty one with `errors: 0`.
+/// A subdirectory that cannot be listed is a `walk` error, not an empty
+/// directory: the walk yields its own `Ok` entry, then an `Err` naming it,
+/// and the scan counts that once and indexes the readable rest. Under the
+/// earlier walker, which reported the failure on the `Ok` entry instead, a
+/// scan reading only `Err`s indexed it as empty with `errors: 0`.
 #[test]
 fn an_unlistable_subdirectory_is_a_walk_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -235,8 +237,8 @@ fn an_unlistable_subdirectory_is_a_walk_error() {
     let mut store = PoolStore::open_in_memory().unwrap();
     with_unlistable(&root.join("locked"), || {
         let stats = torrentd_pool::scan_root(&mut store, root).unwrap();
-        assert!(stats.errors >= 1, "{stats:?}");
-        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert_eq!(stats.errors, 1, "counted once: {stats:?}");
+        assert_eq!(stats.errors_by_kind.get("walk"), Some(&1), "{stats:?}");
         assert_eq!(stats.files_indexed, 1, "the readable rest is indexed");
     });
 }
@@ -324,7 +326,7 @@ fn an_unreadable_root_keeps_its_previous_index() {
     assert_eq!(store.file_count().unwrap(), 1);
 }
 
-/// The library walk reads the same field: an unlistable subdirectory of
+/// The library walk counts it the same way: an unlistable subdirectory of
 /// `library_dir` is a walk error, so the torrents under it are not pruned.
 #[test]
 fn an_unlistable_library_subdirectory_is_a_walk_error_and_prunes_nothing() {

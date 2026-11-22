@@ -101,16 +101,18 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
     // Paths below the root the walk could not read, each keeping its
     // previous rows through the swap.
     let mut unseen: Vec<String> = Vec::new();
+    let mut last_yielded: Option<std::path::PathBuf> = None;
 
-    for entry in jwalk::WalkDir::new(root_path)
-        .follow_links(false)
-        .sort(false)
-    {
+    for entry in walkdir::WalkDir::new(root_path).follow_links(false) {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                warn!(target: "torrentd_pool::scan", root = %root_path.display(), error.cause = %e, "walk error");
-                stats.note_error("walk");
+                if is_unlistable(&e, last_yielded.take().as_deref()) {
+                    note_unlistable(&mut stats, e.path().unwrap_or(root_path), &e);
+                } else {
+                    warn!(target: "torrentd_pool::scan", root = %root_path.display(), error.cause = %e, "walk error");
+                    stats.note_error("walk");
+                }
                 // An error that names no path below the root says nothing
                 // about which subtree went unseen, so it is the whole walk's.
                 match e.path().filter(|_| e.depth() > 0) {
@@ -120,21 +122,10 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
                 continue;
             }
         };
-        if let Some(e) = entry
-            .read_children
-            .as_ref()
-            .and_then(jwalk::ReadChildren::error)
-        {
-            note_unlistable(&mut stats, &entry.path(), e);
-            if entry.depth == 0 {
-                root_unreadable = true;
-            } else {
-                unseen.extend(rel_of(&entry.path(), root_path));
-            }
-        }
+        last_yielded = may_list(&entry).then(|| entry.path().to_path_buf());
         // Not followed (see above), but not silent either. The root itself
         // is what the operator configured, so only entries below it count.
-        if entry.depth > 0 && entry.file_type().is_symlink() {
+        if entry.depth() > 0 && entry.file_type().is_symlink() {
             let path = entry.path();
             let in_trash = path
                 .strip_prefix(root_path)
@@ -157,7 +148,7 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
                 // Unseen, not gone: dropping its row would read the torrent
                 // over it as `missing` though nothing is known to have
                 // changed.
-                unseen.extend(rel_of(&path, root_path));
+                unseen.extend(rel_of(path, root_path));
                 continue;
             }
         };
@@ -283,34 +274,33 @@ pub fn scan_library(
         return Ok(stats);
     }
 
+    let mut last_yielded: Option<std::path::PathBuf> = None;
     // Sorted, so that of two `.torrent` files holding one info-hash the
     // same one is met first, and indexed, on every scan. A library is
     // thousands of small files, so the sort costs nothing that matters.
-    for entry in jwalk::WalkDir::new(library_dir)
+    for entry in walkdir::WalkDir::new(library_dir)
         .follow_links(false)
-        .sort(true)
+        .sort_by_file_name()
     {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                // Counted and previously not logged at all, so the count had
-                // nothing in the journal to explain it.
-                warn!(target: "torrentd_pool::scan", path = %library_dir.display(), error.cause = %e, "walk error");
-                stats.note_error("walk");
+                if is_unlistable(&e, last_yielded.take().as_deref()) {
+                    note_unlistable(&mut stats, e.path().unwrap_or(library_dir), &e);
+                } else {
+                    // Counted and previously not logged at all, so the count
+                    // had nothing in the journal to explain it.
+                    warn!(target: "torrentd_pool::scan", path = %library_dir.display(), error.cause = %e, "walk error");
+                    stats.note_error("walk");
+                }
                 continue;
             }
         };
-        let path = entry.path();
-        if let Some(e) = entry
-            .read_children
-            .as_ref()
-            .and_then(jwalk::ReadChildren::error)
-        {
-            note_unlistable(&mut stats, &path, e);
-        }
+        last_yielded = may_list(&entry).then(|| entry.path().to_path_buf());
         if !entry.file_type().is_file() {
             continue;
         }
+        let path = entry.into_path();
         match path.extension().and_then(|e| e.to_str()) {
             Some("torrent") => {}
             Some("fastresume") => {
@@ -485,13 +475,26 @@ pub fn scan_library(
     Ok(stats)
 }
 
-/// Count a directory the walk could not list as a `walk` error.
+/// Whether `entry` is one the walk descends into, and so one whose listing can
+/// fail: a directory, or the root, which is followed even as a symlink.
+fn may_list(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() == 0 || entry.file_type().is_dir()
+}
+
+/// Whether the walk error `e` is the failure to list `last_dir`, the directory
+/// the walk yielded just before it.
 ///
-/// jwalk does not yield such a directory as an `Err`: it yields the
-/// directory's own `Ok` entry with the failure in `read_children.error()`, and
-/// simply has no children to yield after it. Read only as an `Err`, an
-/// unreadable directory is indistinguishable from an empty one.
-fn note_unlistable(stats: &mut ScanStats, dir: &Path, e: &jwalk::Error) {
+/// walkdir yields a directory it cannot list twice: first its own `Ok` entry,
+/// then, as the very next item, an `Err` naming that same path. Every other
+/// error names an entry the walk could not read, or no path at all.
+fn is_unlistable(e: &walkdir::Error, last_dir: Option<&Path>) -> bool {
+    e.path().is_some_and(|p| Some(p) == last_dir)
+}
+
+/// Count a directory the walk could not list as a `walk` error, and say which
+/// directory it was and that it could not be read: a `walk error` alone would
+/// not tell an unreadable directory from an entry that vanished mid-walk.
+fn note_unlistable(stats: &mut ScanStats, dir: &Path, e: &walkdir::Error) {
     warn!(target: "torrentd_pool::scan", path = %dir.display(), error.cause = %e, "directory could not be read");
     stats.note_error("walk");
 }
@@ -743,6 +746,39 @@ mod tests {
             stats.errors_by_kind,
             std::collections::BTreeMap::from([("parse", 1)])
         );
+    }
+
+    /// `is_unlistable` relies on walkdir yielding a directory it cannot list
+    /// as its `Ok` entry and then, next, an `Err` naming it. Were that order
+    /// to change, the error would still be counted, but logged as a bare
+    /// `walk error` rather than as the directory that could not be read.
+    #[test]
+    fn an_unlistable_directory_is_told_from_other_walk_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.bin");
+        write(root, "locked/b.bin");
+        with_unlistable(&root.join("locked"), || {
+            let mut last = None;
+            let mut unlistable = Vec::new();
+            for item in walkdir::WalkDir::new(root) {
+                match item {
+                    Ok(e) => last = may_list(&e).then(|| e.path().to_path_buf()),
+                    Err(e) => {
+                        assert!(is_unlistable(&e, last.take().as_deref()), "{e}");
+                        unlistable.extend(e.path().map(Path::to_path_buf));
+                    }
+                }
+            }
+            assert_eq!(unlistable, [root.join("locked")]);
+        });
+
+        let gone = root.join("gone");
+        let e = walkdir::WalkDir::new(&gone)
+            .into_iter()
+            .find_map(Result::err)
+            .unwrap();
+        assert!(!is_unlistable(&e, None), "a missing root is no listing");
     }
 
     #[test]

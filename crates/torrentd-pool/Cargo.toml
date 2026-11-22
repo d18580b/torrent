@@ -16,8 +16,9 @@ libtorrent-safe = { workspace = true }
 # the commit hook `PoolStore::count_commits` counts the writer's fsyncs with.
 rusqlite = { workspace = true, features = ["hooks"] }
 
-# Parallel filesystem walk — a managed root can hold millions of files.
-jwalk = { workspace = true }
+# Filesystem walk of the managed roots and the torrent library, one thread,
+# metadata only.
+walkdir = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
