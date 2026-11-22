@@ -34,7 +34,7 @@ time = { workspace = true }
 http = "1.5.0"
 http-body = "1.1.0"
 # The base URL the 0.8 client resolves each operation's path against.
-url = "2.5.8"
+url = "2.5.9"
 
 # The terminal UI.
 ratatui = { workspace = true }
