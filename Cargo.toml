@@ -25,8 +25,8 @@ all = "deny"
 [workspace.dependencies]
 # Core
 tokio = { version = "1.54", features = ["full"] }
-kynos = { version = "=0.6.1",features = ["openapi32", "pattern", "time-jiff02"] }
-jiff = { version = "0.2", features = ["serde"] }
+kynos = { version = "=0.6.2",features = ["openapi32", "pattern", "time-jiff1"] }
+jiff = { version = "1.0", features = ["serde"] }
 base64 = "0.23"
 
 # Serialization / config
