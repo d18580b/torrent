@@ -27,7 +27,7 @@
 # The oldest mise these tasks are run on: the version CI pins in
 # .github/actions/setup-rust. An older mise refuses this file rather than
 # running the tasks with behaviour nothing here was tested against.
-min_version = "2026.10.17"
+min_version = "2026.11.11"
 
 [tools]
 hk = "2.13.0"
