@@ -594,7 +594,7 @@ jobs:
         with:
           submodules: false
           persist-credentials: false
-      # musl-gcc compiles ring's C for the musl target; it comes with the
+      # musl-gcc compiles aws-lc-sys's C for the musl target; it comes with the
       # system deps, whose libtorrent half goes unused. torrentctl does not
       # link libtorrent, so the submodules are not fetched.
       - uses: ./.github/actions/setup-rust

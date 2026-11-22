@@ -892,7 +892,7 @@ async fn follow_once(
 
 /// The `kind` of an event that failed to decode only because this build
 /// does not know its kind: a JSON object whose `kind` is a string that is
-/// not a [`ServerEventkind`](crate::api::types::ServerEventkind). Anything
+/// not a [`ServerEventKind`](crate::api::types::ServerEventKind). Anything
 /// else that fails to decode, a known kind included, is `None`: a stream
 /// sending that is broken.
 fn unknown_kind<E>(e: &crate::api::generated::Error<E>) -> Option<String> {

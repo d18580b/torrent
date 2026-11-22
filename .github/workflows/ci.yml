@@ -161,7 +161,7 @@ jobs:
       # Every release ships this tarball (release-plz.yml's dist-musl job).
       # Built here too, so a dependency that cannot build for musl, or that
       # makes torrentctl dynamic, fails its own pull request rather than the
-      # next release. musl-tools brings musl-gcc for ring's C; torrentctl
+      # next release. musl-tools brings musl-gcc for aws-lc-sys's C; torrentctl
       # links no libtorrent, so nothing native is cached or fetched.
       - uses: ./.github/actions/setup-rust
         with:
