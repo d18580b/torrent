@@ -1,4 +1,4 @@
-amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.pkl"
+amends "package://github.com/jdx/hk/releases/download/v2.13.0/hk@2.13.0#/Config.pkl"
 
 // The fmt / lint / test commands live ONLY in mise.toml. hk deliberately does
 // not use its cargo_fmt / cargo_clippy / check_conventional_commit builtins:
@@ -96,6 +96,9 @@ hooks {
   }
   ["fix"] {
     fix = true
+    // hk 2 stages fixes only in pre-commit by default; `hk fix` staged them
+    // under hk 1, and still does here.
+    stage = true
     steps = rust
   }
 }

@@ -30,7 +30,7 @@
 min_version = "2026.10.17"
 
 [tools]
-hk = "1.48.0"
+hk = "2.13.0"
 # convco is not in the mise/aqua registry; the cargo backend fetches a prebuilt
 # binary via cargo-binstall when available, else compiles from source.
 "cargo:convco" = "0.7.2"
