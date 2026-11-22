@@ -344,15 +344,6 @@ impl std::fmt::Debug for Api {
 /// How a `base_url` names the daemon's unix socket: `unix:/run/torrentd/api.sock`.
 pub const UNIX_PREFIX: &str = "unix:";
 
-/// Whether a client for `origin` can ever do a TLS handshake: anything but
-/// a plain `http://` URL. A unix socket's requests are written against
-/// [`UNIX_ORIGIN`], so it lands here as `http`.
-fn speaks_tls(origin: &str) -> bool {
-    !origin
-        .get(..7)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
-}
-
 /// The URL requests over a unix socket are written against. Only its path
 /// and `Host` reach the daemon; `localhost` is a `Host` every daemon answers.
 const UNIX_ORIGIN: &str = "http://localhost";
@@ -363,10 +354,7 @@ impl Api {
     ///
     /// `unix:/path` connects to the daemon's socket at `/path`.
     pub fn new(base_url: &str, token: Option<&str>) -> Result<Self, String> {
-        let mut builder = reqwest::Client::builder()
-            .user_agent(concat!("torrentctl/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(5));
-        let origin = match base_url.strip_prefix(UNIX_PREFIX) {
+        let (origin, socket) = match base_url.strip_prefix(UNIX_PREFIX) {
             Some(path) => {
                 if !path.starts_with('/') {
                     return Err(format!(
@@ -374,26 +362,42 @@ impl Api {
                          path, as in unix:/run/torrentd/api.sock"
                     ));
                 }
-                builder = builder.unix_socket(path);
-                UNIX_ORIGIN
+                (UNIX_ORIGIN, Some(path))
             }
-            None => base_url,
+            None => (base_url, None),
         };
-        let tls = speaks_tls(origin);
-        if !tls {
-            // Nothing here can reach TLS, so it needs no trust anchors: a host
-            // without a CA bundle still talks to the daemon in plain HTTP.
-            builder = builder.tls_certs_only(Vec::<reqwest::Certificate>::new());
-        }
-        let http = builder.build().map_err(|e| {
-            let hint = if tls {
-                "; https verifies against the system's CA certificates: install \
-                 them (ca-certificates), or point SSL_CERT_FILE at a PEM bundle"
-            } else {
-                ""
-            };
-            format!("cannot build the HTTP client: {}{hint}", root_cause(&e))
-        })?;
+        let plain = url::Url::parse(origin)
+            .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?
+            .scheme()
+            == "http";
+        let builder = || {
+            let builder = reqwest::Client::builder()
+                .user_agent(concat!("torrentctl/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(5));
+            match socket {
+                Some(path) => builder.unix_socket(path),
+                None => builder,
+            }
+        };
+        let http = match builder().build() {
+            Ok(http) => http,
+            // The platform's CA certificates are missing. A plain-HTTP daemon
+            // needs none, so this host still reaches it, with no trust
+            // anchors: only an https proxy or a redirect to https could have
+            // used them, and those fail as they would on any such host.
+            Err(_) if plain => builder()
+                .tls_certs_only(Vec::<reqwest::Certificate>::new())
+                .build()
+                .map_err(|e| format!("cannot build the HTTP client: {}", root_cause(&e)))?,
+            Err(e) => {
+                return Err(format!(
+                    "cannot build the HTTP client: {}; https verifies against the system's \
+                     CA certificates: install them (ca-certificates), or point SSL_CERT_FILE \
+                     at a PEM bundle",
+                    root_cause(&e)
+                ))
+            }
+        };
         let backend = generated::MiddlewareBackend::new(std::sync::Arc::new(
             generated::ReqwestBackend::new(http.clone()),
         ))

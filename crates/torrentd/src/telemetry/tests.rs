@@ -679,13 +679,18 @@ fn only_an_https_endpoint_needs_ca_certificates() {
 #[test]
 #[ignore = "run by only_an_https_endpoint_needs_ca_certificates"]
 fn builds_the_http_client_with_an_empty_store() {
-    if std::env::var_os(NO_CA).is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os(NO_CA).is_some(),
+        "run by only_an_https_endpoint_needs_ca_certificates, in a process of its own"
+    );
     // A plain http:// collector never reaches TLS.
-    BlockingHttp::new(false).expect("http:// needs no CA certificates");
+    BlockingHttp::new("http://localhost:4318/v1/traces").expect("http:// needs no CA certificates");
     // An https:// one does, and the error says what to do about it.
-    let err = format!("{:#}", BlockingHttp::new(true).unwrap_err());
+    let err = format!(
+        "{:#}",
+        BlockingHttp::new("https://otlp.example/v1/traces").unwrap_err()
+    );
     assert!(err.contains("No CA certificates"), "got {err}");
+    assert!(err.contains("ca-certificates"), "got {err}");
     assert!(err.contains("SSL_CERT_FILE"), "got {err}");
 }
