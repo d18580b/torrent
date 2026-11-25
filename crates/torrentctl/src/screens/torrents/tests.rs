@@ -1430,11 +1430,12 @@ fn a_local_torrent_over_64_mib_is_refused_before_sending() {
 }
 
 /// Up to spargen 0.6 the generated type put a `.torrent`'s bytes on the
-/// wire as an array of numbers, which is why `add::post_metainfo` sends it
-/// by hand. Since 0.8 it writes the same standard, padded base64 the hand
-/// path does, so `add::post_metainfo` can go in favour of `add_torrent`.
+/// wire as an array of numbers, so a local `.torrent` was sent by a
+/// hand-built request. Since 0.8 it writes standard, padded base64, the
+/// form the API document declares, and `add::submit` sends a `.torrent`
+/// through the generated `add_torrent`.
 #[test]
-fn the_generated_metainfo_source_serializes_as_the_hand_built_base64() {
+fn the_generated_metainfo_source_serializes_as_standard_base64() {
     let source = types::TorrentSourceMetainfo {
         kind: types::TorrentSourceMetainfoKind::Metainfo,
         data: types::TorrentSourceMetainfoData(bytes::Bytes::from_static(b"d4:infoe")),

@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 
-use base64::Engine as _;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use ratatui::layout::Constraint;
@@ -400,6 +399,7 @@ pub async fn submit(api: Api, request: Request) -> Result<types::Torrent, AddFai
         errors: failure.errors.clone(),
         failure,
     };
+    let upload = matches!(request.source, Source::LocalFile(_));
     let source = match request.source {
         Source::Magnet(uri) => types::TorrentSource::Magnet(Box::new(types::TorrentSourceMagnet {
             kind: types::TorrentSourceMagnetKind::Magnet,
@@ -413,8 +413,10 @@ pub async fn submit(api: Api, request: Request) -> Result<types::Torrent, AddFai
         }
         Source::LocalFile(path) => {
             let data = read_metainfo(&path).await?;
-            return post_metainfo(&api, &request.profile, request.save_path.as_deref(), &data)
-                .await;
+            types::TorrentSource::Metainfo(Box::new(types::TorrentSourceMetainfo {
+                kind: types::TorrentSourceMetainfoKind::Metainfo,
+                data: types::TorrentSourceMetainfoData(data.into()),
+            }))
         }
     };
     let body = types::AddTorrentRequest {
@@ -422,9 +424,24 @@ pub async fn submit(api: Api, request: Request) -> Result<types::Torrent, AddFai
         save_path: crate::api::absent_if_none(request.save_path),
         source,
     };
-    crate::api::call(api.client.add_torrent(body))
-        .await
-        .map_err(api_failure)
+    let call = api.client.add_torrent(body);
+    if !upload {
+        return crate::api::call(call).await.map_err(api_failure);
+    }
+    match tokio::time::timeout(UPLOAD_TIMEOUT, crate::api::call_unbounded(call)).await {
+        Ok(result) => result.map_err(api_failure),
+        Err(_) => Err(AddFailure::Api {
+            failure: Failure::local(
+                "The daemon did not answer",
+                Some(format!(
+                    "no response within {}s; the torrent may still have been added — refresh \
+                     before retrying",
+                    UPLOAD_TIMEOUT.as_secs()
+                )),
+            ),
+            errors: Vec::new(),
+        }),
+    }
 }
 
 /// A local `.torrent`'s bytes, refused over [`MAX_METAINFO`].
@@ -456,98 +473,9 @@ async fn read_metainfo(path: &std::path::Path) -> Result<Vec<u8>, AddFailure> {
         .map_err(|e| local(format!("cannot read {shown}: {e}")))
 }
 
-/// `POST /v1/torrents` with a `metainfo` source, built by hand.
-///
-/// spargen up to 0.6 serialized the generated metainfo `data` as a JSON
-/// array of numbers rather than the base64 string the API document
-/// declares, so the typed `add_torrent` could not send a `.torrent`. This
-/// sends the same request with the data base64-encoded, through
-/// [`Api::post`]. spargen 0.8 encodes it as base64 too (see the
-/// `the_generated_metainfo_source_serializes_as_the_hand_built_base64`
-/// test), so this path is now redundant.
-#[allow(
-    clippy::result_large_err,
-    reason = "an AddFailure is built once per failed add and moved straight to the dialog"
-)]
-async fn post_metainfo(
-    api: &Api,
-    profile: &str,
-    save_path: Option<&str>,
-    data: &[u8],
-) -> Result<types::Torrent, AddFailure> {
-    let mut body = serde_json::json!({
-        "profile_id": profile,
-        "source": {
-            "kind": "metainfo",
-            "data": base64::engine::general_purpose::STANDARD.encode(data),
-        },
-    });
-    if let Some(save_path) = save_path {
-        body["save_path"] = serde_json::Value::from(save_path);
-    }
-    let request = api
-        .post(&["v1", "torrents"])
-        .map_err(|failure| AddFailure::Api {
-            failure,
-            errors: Vec::new(),
-        })?
-        .json(&body);
-    let exchange = async move {
-        let response = crate::api::send(request)
-            .await
-            .map_err(|e| AddFailure::Api {
-                failure: Failure::local("Cannot reach the daemon", Some(e.to_string())),
-                errors: Vec::new(),
-            })?;
-        let status = response.status();
-        if status.is_success() {
-            return response
-                .json::<types::Torrent>()
-                .await
-                .map_err(|e| AddFailure::Api {
-                    failure: Failure::local(
-                        "The daemon's answer did not match the API document",
-                        Some(e.to_string()),
-                    ),
-                    errors: Vec::new(),
-                });
-        }
-        let request_id = crate::api::request_id(response.headers());
-        let problem: serde_json::Value = response.json().await.unwrap_or_default();
-        Err(problem_failure(status.as_u16(), &problem, request_id))
-    };
-    match tokio::time::timeout(UPLOAD_TIMEOUT, exchange).await {
-        Ok(result) => result,
-        Err(_) => Err(AddFailure::Api {
-            failure: Failure::local(
-                "The daemon did not answer",
-                Some(format!(
-                    "no response within {}s; the torrent may still have been added — refresh \
-                     before retrying",
-                    UPLOAD_TIMEOUT.as_secs()
-                )),
-            ),
-            errors: Vec::new(),
-        }),
-    }
-}
-
 /// How long a `.torrent` upload may take: up to ~85 MiB of base64 on a slow
 /// link, far past the ordinary request timeout.
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// A problem document as a failure, with a `validation-failed`'s `errors`.
-fn problem_failure(
-    status: u16,
-    problem: &serde_json::Value,
-    request_id: Option<String>,
-) -> AddFailure {
-    let failure = crate::api::from_problem(status, problem, request_id);
-    AddFailure::Api {
-        errors: failure.errors.clone(),
-        failure,
-    }
-}
 
 /// Width of the label column.
 const LABEL: u16 = 14;
@@ -741,8 +669,32 @@ pub fn view(
 
 #[cfg(test)]
 mod wire_tests {
+    use base64::Engine as _;
+
     use super::*;
     use crate::testing::serve_once;
+
+    /// Add `bytes` as a local `.torrent` through [`submit`], keeping the
+    /// directory that holds it alive until the add is done.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the AddFailure is submit's own, handed straight to the assertion"
+    )]
+    async fn submit_file(
+        api: Api,
+        save_path: &str,
+        bytes: &[u8],
+    ) -> Result<types::Torrent, AddFailure> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.torrent");
+        std::fs::write(&path, bytes).unwrap();
+        let request = Request {
+            profile: "acct_a".into(),
+            save_path: Some(save_path.into()),
+            source: Source::LocalFile(path),
+        };
+        submit(api, request).await
+    }
 
     fn torrent_json() -> String {
         serde_json::json!({
@@ -760,7 +712,7 @@ mod wire_tests {
         let (url, server) = serve_once("201 Created", torrent_json()).await;
         let api = Api::new(&url, Some("tdp_wire")).unwrap();
         let bytes = b"d8:announce3:urle".to_vec();
-        let torrent = post_metainfo(&api, "acct_a", Some("/srv/data"), &bytes)
+        let torrent = submit_file(api, "/srv/data", &bytes)
             .await
             .unwrap_or_else(|_| panic!("the 201 decodes"));
         assert_eq!(torrent.infohash, "0808080808080808080808080808080808080808");
@@ -799,7 +751,7 @@ mod wire_tests {
         .to_string();
         let (url, server) = serve_once("422 Unprocessable Entity", problem).await;
         let api = Api::new(&url, Some("tdp_wire")).unwrap();
-        let failure = post_metainfo(&api, "acct_a", Some("rel"), b"x").await;
+        let failure = submit_file(api, "rel", b"x").await;
         server.await.unwrap();
         match failure {
             Err(AddFailure::Api { failure, errors }) => {
