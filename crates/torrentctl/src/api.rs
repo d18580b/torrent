@@ -348,18 +348,100 @@ pub const UNIX_PREFIX: &str = "unix:";
 /// and `Host` reach the daemon; `localhost` is a `Host` every daemon answers.
 const UNIX_ORIGIN: &str = "http://localhost";
 
+/// The schemes the URL Standard calls special: their authority follows the
+/// scheme's colon after any run of `/` and `\`, and ends at `\` too.
+const SPECIAL_SCHEMES: [&str; 6] = ["ftp", "file", "http", "https", "ws", "wss"];
+
+/// Where `url` carries userinfo — `user:pass` in `http://user:pass@host` —
+/// found in the text as typed, so a URL that does not parse is covered too:
+/// the userinfo's span, and the end of the authority it opens.
+///
+/// The authority is read as the URL Standard reads it: for a special scheme,
+/// after the scheme's colon and any run of `/` and `\`, up to the first `/`,
+/// `\`, `?` or `#`; for another scheme followed by `//`, after the `//`, up to
+/// the first `/`, `?` or `#`. With no scheme, or another scheme not followed
+/// by `//`, it is read from the start, as a URL typed without its scheme:
+/// in `user:pass@host` the "scheme" is the user name. The userinfo is the
+/// authority up to its last `@`.
+fn userinfo(url: &str) -> Option<(std::ops::Range<usize>, usize)> {
+    let lead = url.len() - url.trim_start_matches(|c: char| c <= ' ').len();
+    let text = &url[lead..];
+    let scheme = text.split_once(':').map(|(scheme, _)| scheme).filter(|s| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    let special = scheme.is_some_and(|s| SPECIAL_SCHEMES.iter().any(|x| s.eq_ignore_ascii_case(x)));
+    let start = match scheme {
+        Some(s) if special => url.len() - text[s.len() + 1..].trim_start_matches(['/', '\\']).len(),
+        Some(s) if text[s.len() + 1..].starts_with("//") => lead + s.len() + 3,
+        _ => lead,
+    };
+    let authority = &url[start..];
+    let end = authority
+        .find(|c| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(authority.len());
+    let at = authority[..end].rfind('@')?;
+    (at > 0).then_some((start..start + at, start + end))
+}
+
+/// `base_url` with its userinfo, where it carries one, replaced by `***`.
+fn redact_url(base_url: &str) -> String {
+    match userinfo(base_url) {
+        Some((range, _)) => format!("{}***{}", &base_url[..range.start], &base_url[range.end..]),
+        None => base_url.to_owned(),
+    }
+}
+
+/// `text` with the authority `base_url` carries userinfo in — `user:pass@host`
+/// — shown with that userinfo replaced by `***` wherever it appears in it,
+/// matched ignoring ASCII case as a parsed URL's host is lowercased. Only
+/// that text of `base_url` is matched, so a short user name does not mangle
+/// the words around it.
+fn redact(text: &str, base_url: &str) -> String {
+    let Some((range, end)) = userinfo(base_url) else {
+        return text.to_owned();
+    };
+    let authority = base_url[range.start..end].to_ascii_lowercase();
+    let shown = format!("***{}", &base_url[range.end..end]);
+    // ASCII lowercasing keeps every byte offset, so a match in the lowered
+    // copy is a match at the same offsets in `text`.
+    let mut redacted = String::with_capacity(text.len());
+    let mut last = 0;
+    for (i, _) in text.to_ascii_lowercase().match_indices(&authority) {
+        redacted.push_str(&text[last..i]);
+        redacted.push_str(&shown);
+        last = i + authority.len();
+    }
+    redacted.push_str(&text[last..]);
+    redacted
+}
+
+/// The message [`Api::new`] refuses `base_url` with, for `reason`. It names
+/// the URL with its userinfo redacted, and scrubs the userinfo from `reason`
+/// too, which may be the text of an error the URL was handed to: a
+/// credential typed into the URL must not reach a terminal or a log.
+fn invalid(base_url: &str, reason: &str) -> String {
+    format!(
+        "invalid daemon URL {:?}: {}",
+        redact_url(base_url),
+        redact(reason, base_url)
+    )
+}
+
 impl Api {
     /// A client for `base_url`, authenticating with `token` when given. Fails
     /// only locally — an unusable URL — so the error is a message.
     ///
     /// `unix:/path` connects to the daemon's socket at `/path`.
     pub fn new(base_url: &str, token: Option<&str>) -> Result<Self, String> {
+        let refuse = |reason: &str| invalid(base_url, reason);
         let (origin, socket) = match base_url.strip_prefix(UNIX_PREFIX) {
             Some(path) => {
                 if !path.starts_with('/') {
-                    return Err(format!(
-                        "invalid daemon URL {base_url:?}: a socket is named by an absolute \
-                         path, as in unix:/run/torrentd/api.sock"
+                    return Err(refuse(
+                        "a socket is named by an absolute path, as in \
+                         unix:/run/torrentd/api.sock",
                     ));
                 }
                 (UNIX_ORIGIN, Some(path))
@@ -367,16 +449,27 @@ impl Api {
             None => (base_url, None),
         };
         let scheme = url::Url::parse(origin)
-            .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?
+            .map_err(|e| refuse(&e.to_string()))?
             .scheme()
             .to_owned();
         // Refused here, before the client is built, so a mistyped URL such as
         // `localhost:8080` (scheme `localhost`) is not reported as missing
         // CA certificates on a host without them.
         if scheme != "http" && scheme != "https" {
-            return Err(format!(
-                "invalid daemon URL {base_url:?}: use http://, https:// or unix:/path"
-            ));
+            // The scheme is named only where the redacted URL still shows
+            // it: in `user:pass@host` the "scheme" is the user name.
+            let named = redact_url(base_url)
+                .trim_start_matches(|c: char| c <= ' ')
+                .get(..=scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&format!("{scheme}:")));
+            return Err(refuse(&if named {
+                format!(
+                    "the scheme `{scheme}` is not one torrentctl speaks; use http://, \
+                     https:// or unix:/path"
+                )
+            } else {
+                "use http://, https:// or unix:/path".to_owned()
+            }));
         }
         let plain = scheme == "http";
         let builder = || {
@@ -412,7 +505,7 @@ impl Api {
         ))
         .layer(std::sync::Arc::new(Traced));
         let mut client = Client::with_backend(std::sync::Arc::new(backend), origin)
-            .map_err(|e| format!("invalid daemon URL {base_url:?}: {e}"))?;
+            .map_err(|e| refuse(&e.to_string()))?;
         if let Some(token) = token {
             client = client.with_bearer(generated::SecretString::from(token.to_owned()));
         }
@@ -686,6 +779,126 @@ mod tests {
         assert_eq!(next.base_url, api.base_url);
         let err = Api::new("unix:run/api.sock", None).unwrap_err();
         assert!(err.contains("absolute path"), "{err}");
+    }
+
+    /// `err` refuses a URL, and carries none of `secrets`.
+    fn refused_without(err: &str, secrets: &[&str]) {
+        assert!(err.starts_with("invalid daemon URL "), "{err}");
+        for secret in secrets {
+            assert!(!err.contains(secret), "{secret:?} leaked into {err}");
+        }
+    }
+
+    #[test]
+    fn a_relative_socket_path_is_refused_without_its_userinfo() {
+        let err = Api::new("unix:alice:hunter2@run/api.sock", None).unwrap_err();
+        refused_without(&err, &["alice", "hunter2"]);
+        assert!(err.contains("absolute path"), "{err}");
+        assert!(err.contains(r#""***@run/api.sock""#), "{err}");
+    }
+
+    #[test]
+    fn an_unparseable_url_is_refused_without_its_userinfo() {
+        // An out-of-range port: the URL does not parse, but its userinfo is
+        // still found in the text as typed.
+        let err = Api::new("http://alice:hunter2@host:99999", None).unwrap_err();
+        refused_without(&err, &["alice", "hunter2"]);
+        assert!(err.contains(r#""http://***@host:99999""#), "{err}");
+        assert!(err.contains("invalid port number"), "{err}");
+    }
+
+    #[test]
+    fn a_url_with_another_scheme_is_refused_naming_that_scheme() {
+        let err = Api::new("localhost:8080", None).unwrap_err();
+        refused_without(&err, &[]);
+        assert!(err.contains("the scheme `localhost`"), "{err}");
+        assert!(err.contains("use http://, https:// or unix:/path"), "{err}");
+
+        let err = Api::new("ftp://alice:hunter2@host", None).unwrap_err();
+        refused_without(&err, &["alice", "hunter2"]);
+        assert!(err.contains(r#""ftp://***@host""#), "{err}");
+        assert!(err.contains("the scheme `ftp`"), "{err}");
+    }
+
+    #[test]
+    fn a_scheme_that_is_the_user_name_is_not_named() {
+        // `alice:hunter2@host:8080` parses with the scheme `alice`.
+        let err = Api::new("alice:hunter2@host:8080", None).unwrap_err();
+        refused_without(&err, &["alice", "hunter2"]);
+        assert!(err.contains(r#""***@host:8080""#), "{err}");
+        assert!(err.contains("use http://, https:// or unix:/path"), "{err}");
+    }
+
+    #[test]
+    fn a_wrapped_error_is_scrubbed_of_the_userinfo() {
+        // What `Client::with_backend` refuses, `Api::new` has refused first,
+        // so its message is checked through the one helper every refusal
+        // goes through, with an error that echoes the URL.
+        let url = "https://alice:hunter2@host";
+        let err = invalid(url, &format!("cannot use {url}"));
+        refused_without(&err, &["alice", "hunter2"]);
+        assert_eq!(
+            err,
+            r#"invalid daemon URL "https://***@host": cannot use https://***@host"#
+        );
+        // A parsed URL lowercases its scheme and host, and adds a path.
+        let url = "HTTPS://alice:hunter2@HOST";
+        let err = invalid(url, "cannot use https://alice:hunter2@host/");
+        refused_without(&err, &["alice", "hunter2"]);
+        assert!(err.ends_with("cannot use https://***@HOST/"), "{err}");
+    }
+
+    #[test]
+    fn a_short_user_name_leaves_the_rest_of_the_message_alone() {
+        let err = Api::new("http://e@host:99999", None).unwrap_err();
+        assert!(
+            err.starts_with(r#"invalid daemon URL "http://***@host:99999": "#),
+            "{err}"
+        );
+        assert!(err.contains("invalid port number"), "{err}");
+
+        let url = "http://h@https-host";
+        assert_eq!(redact_url(url), "http://***@https-host");
+        assert_eq!(
+            redact(&format!("h: cannot reach {url}"), url),
+            "h: cannot reach http://***@https-host"
+        );
+    }
+
+    #[test]
+    fn userinfo_is_found_where_the_url_standard_reads_it() {
+        for (url, shown) in [
+            ("http://alice:hunter2@host/a@b", "http://***@host/a@b"),
+            ("HTTPS://alice@host", "HTTPS://***@host"),
+            ("http:alice:hunter2@host", "http:***@host"),
+            (r"http:\\alice:hunter2@host", r"http:\\***@host"),
+            ("http://a@b:hunter2@host", "http://***@host"),
+            ("ftp:/alice:hunter2@host", "ftp:/***@host"),
+            ("wss:/alice:hunter2@h", "wss:/***@h"),
+            (r"WS:\alice:hunter2@h\p", r"WS:\***@h\p"),
+            ("file://alice:hunter2@host/p", "file://***@host/p"),
+            ("foo://alice:hunter2@host/p", "foo://***@host/p"),
+            ("alice:hunter2@host/p://q", "***@host/p://q"),
+            ("http://host/a@b", "http://host/a@b"),
+            ("http://@host", "http://@host"),
+            ("unix:/run/a@b.sock", "unix:/run/a@b.sock"),
+            ("localhost:8080", "localhost:8080"),
+        ] {
+            assert_eq!(redact_url(url), shown, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_special_scheme_without_its_slashes_is_refused_without_its_userinfo() {
+        for (url, shown) in [
+            ("ftp:/alice:hunter2@host", "ftp:/***@host"),
+            ("wss:/alice:hunter2@h", "wss:/***@h"),
+            ("alice:hunter2@host/p://q", "***@host/p://q"),
+        ] {
+            let err = Api::new(url, None).unwrap_err();
+            refused_without(&err, &["alice", "hunter2"]);
+            assert!(err.contains(&format!("{shown:?}")), "{err}");
+        }
     }
 
     /// A `unix:` client connects to that socket, and writes its requests
