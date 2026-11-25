@@ -15,7 +15,6 @@ edition = "2021"
 rust-version = "1.90"
 license = "Apache-2.0"
 authors = ["Justin Chung"]
-repository = "https://github.com/d18580b/torrent"
 
 # Centralized, inherited lint policy — each crate opts in via `[lints] workspace = true`.
 # One source of truth (merge-resilient) that mirrors the historical `-D warnings` gate.
@@ -40,7 +39,6 @@ clap = { version = "4", features = ["derive"] }
 # Logging / metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
-tracing-futures = "0.2"
 prometheus = { version = "0.14", default-features = false }
 
 # Traces (torrentd::telemetry): OpenTelemetry over OTLP, off by default.
@@ -89,7 +87,6 @@ http-body = "1"
 hex = { version = "0.4", features = ["serde"] }
 sha1 = "0.11"
 tempfile = "3"
-once_cell = "1"
 # `syncfs(2)` for the stores' batched writer and `getrlimit(2)` for the boot
 # descriptor check; std exposes neither. Already in the lockfile through tokio.
 libc = "0.2"
