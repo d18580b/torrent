@@ -63,7 +63,6 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
-sha1 = { workspace = true }
 
 # The assignment registry's database
 rusqlite = { workspace = true }
@@ -94,6 +93,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 kynos = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
+# Piece hashes for the metainfo the daemon tests build (tests/daemon).
+sha1 = { workspace = true }
 # The in-memory span exporter the redaction test exports to.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
