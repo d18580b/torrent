@@ -46,7 +46,6 @@ clap = { workspace = true }
 color-eyre = { workspace = true }
 etcetera = { workspace = true }
 toml = { workspace = true }
-base64 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
@@ -69,6 +68,8 @@ tempfile = { workspace = true }
 # 15-second request timeout without waiting for it.
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
+# The tests decode the metainfo the generated client sends to check its bytes.
+base64 = { workspace = true }
 
 [lints]
 workspace = true
