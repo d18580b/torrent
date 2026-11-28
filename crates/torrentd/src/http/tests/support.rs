@@ -76,8 +76,12 @@ pub struct Harness {
     coverage: Arc<Coverage>,
 }
 
-/// `method path` on `client` from the harnesses' client peer, with `token`
-/// as the bearer credential, if any.
+/// The address every harness client sends from.
+fn client_peer() -> std::net::SocketAddr {
+    "192.0.2.10:40000".parse().unwrap()
+}
+
+/// `method path` on `client`, with `token` as the bearer credential, if any.
 fn request_on<'c>(
     client: &'c TestClient<AppCtx>,
     method: &str,
@@ -86,11 +90,9 @@ fn request_on<'c>(
 ) -> kynos::test::TestRequest<'c, AppCtx> {
     let method = Method::from_bytes(method.as_bytes())
         .unwrap_or_else(|_| panic!("{method:?} is not a method"));
-    let mut req = client
-        .method(method, path)
-        .peer("192.0.2.10:40000".parse().unwrap());
+    let mut req = client.method(method, path);
     if let Some(token) = token {
-        req = req.header("authorization", &format!("Bearer {token}"));
+        req = req.bearer(token);
     }
     req
 }
@@ -147,7 +149,9 @@ impl Harness {
         // sees whatever a request changes.
         let shared = Arc::new(state.clone());
         let service = crate::http::service(state, openapi).expect("the router builds");
-        let client = TestClient::new(service).with_coverage(&coverage.0);
+        let client = TestClient::new(service)
+            .with_coverage(&coverage.0)
+            .with_peer(client_peer());
         Self {
             client,
             state: shared,
@@ -344,8 +348,9 @@ impl Harness {
         // Through the daemon's server settings: a client over the router
         // alone holds a body to kynos' default 30 s idle timeout, which the
         // daemon turns off (`startup::http_server`).
-        let served =
-            TestClient::through_server(self.stall_server()).with_coverage(&self.coverage.0);
+        let served = TestClient::through_server(self.stall_server())
+            .with_coverage(&self.coverage.0)
+            .with_peer(client_peer());
         let mut req =
             request_on(&served, method, path, token).body_stream("application/json", chunks);
         if let Some(declared) = declared {
@@ -478,16 +483,14 @@ async fn on_a_paused_clock<T>(
     (output, waited)
 }
 
-/// Assert `resp` is a problem of `slug` with `status`.
+/// Assert `resp` is a problem of `slug` with `status`: kynos'
+/// `assert_problem`, which also holds the `Content-Type` and the document's
+/// `status` member, with the type under this API's problem base.
 pub fn assert_problem(resp: &TestResponse, status: u16, slug: &str) {
-    assert_eq!(
-        resp.status().as_u16(),
+    resp.assert_problem(
         status,
-        "expected {status} {slug}, got {}: {}",
-        resp.status(),
-        resp.text()
+        &format!("{}{slug}", crate::http::security::PROBLEM_BASE),
     );
-    resp.assert_problem_type(&format!("{}{slug}", crate::http::security::PROBLEM_BASE));
 }
 
 /// Assert `resp` refused a valid credential for a scope it lacks: a `403`

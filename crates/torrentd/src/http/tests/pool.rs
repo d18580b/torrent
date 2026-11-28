@@ -964,8 +964,7 @@ async fn an_untimed_operation_refuses_a_body_that_did_not_arrive_whole() {
         let declared = u64::try_from(body.len()).unwrap() + 1;
         h.client
             .post(path)
-            .peer("192.0.2.10:40000".parse().unwrap())
-            .header("authorization", &format!("Bearer {w}"))
+            .bearer(&w)
             .body("application/json", body)
             .content_length(declared)
             .send()
