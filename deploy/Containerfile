@@ -29,8 +29,8 @@ RUN dnf install -y \
     && dnf clean all
 
 # Rust toolchain — rustup installs no toolchain here; the build below fetches
-# the exact release rust-toolchain.toml pins, so the image builds with the
-# same compiler as CI and a developer.
+# the latest stable release rust-toolchain.toml names, the same channel CI and
+# a developer build with.
 #
 # rustup-init itself is a pinned release, fetched from rustup's versioned
 # archive and checked against the SHA-256 recorded here before it runs: the

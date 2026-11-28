@@ -46,7 +46,7 @@ jobs:
           submodules: false
           persist-credentials: false
       # Nightly is required ONLY for rustfmt (imports_granularity / group_imports
-      # are unstable). mise.toml's RUSTFMT_TOOLCHAIN names the dated nightly;
+      # are unstable). mise.toml's RUSTFMT_TOOLCHAIN names the latest nightly;
       # `rustfmt-toolchain` installs it and `fmt` runs `cargo +` that nightly.
       - uses: ./.github/actions/setup-rust
         with:
@@ -102,7 +102,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # The pinned stable toolchain is installed too: mise's cargo tools build
+      # The stable toolchain is installed too: mise's cargo tools build
       # with it. `msrv` installs the rust-version release itself.
       - uses: ./.github/actions/setup-rust
         with:
@@ -120,7 +120,7 @@ jobs:
           path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
 
       # Cargo.toml's rust-version is a promise nothing else in CI tests: every
-      # other job builds on rust-toolchain.toml's newer release.
+      # other job builds on rust-toolchain.toml's latest stable.
       - run: mise run msrv
 
   deny:

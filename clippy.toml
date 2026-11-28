@@ -1,5 +1,5 @@
-# Keep clippy suggestions MSRV-safe and identical across contributors.
-msrv = "1.90"
+# Clippy keeps its suggestions MSRV-safe by reading `rust-version` from
+# Cargo.toml, so the MSRV has no second copy here.
 
 # A task or blocking job spawned bare starts with no span: its log lines
 # cannot be tied back to the request, pool job or check-queue job that
