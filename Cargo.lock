@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "libtorrent-safe"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bitflags 2.13.2",
  "hex",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "libtorrent-sys"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -4103,7 +4103,7 @@ dependencies = [
 
 [[package]]
 name = "torrentctl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4139,7 +4139,7 @@ dependencies = [
 
 [[package]]
 name = "torrentd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4181,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "torrentd-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "libtorrent-safe",
@@ -4195,7 +4195,7 @@ dependencies = [
 
 [[package]]
 name = "torrentd-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
  "dashmap",
@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "torrentd-pool"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libtorrent-safe",
  "proptest",
