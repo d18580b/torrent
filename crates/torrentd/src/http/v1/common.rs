@@ -276,6 +276,35 @@ impl Internal {
     }
 }
 
+/// Hold `log`, the daemon's log captured while `resp`'s request ran, to
+/// where a `500 internal`'s cause goes: [`internal`]'s line carries it, and
+/// neither the answer nor kynos' own line for the 5xx does.
+///
+/// kynos' line (target `kynos::error`) records the failure as an error
+/// field, and the daemon's JSON log writes only that error's message, never
+/// its `source()` chain, so a cause held as a `#[source]` would reach no
+/// line at all.
+#[cfg(test)]
+pub(crate) fn assert_cause_only_logged(resp: &kynos::test::TestResponse, log: &str) {
+    let detail = resp.problem().detail.unwrap();
+    let errors: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|l: &serde_json::Value| l["level"] == "ERROR")
+        .collect();
+    let attempt = errors
+        .iter()
+        .find(|l| l["target"] == "torrentd::http" && l["message"] == "internal failure")
+        .unwrap_or_else(|| panic!("no line names the attempt:\n{log}"));
+    let cause = attempt["error.cause"].as_str().unwrap();
+    assert!(!cause.is_empty() && !detail.contains(cause), "{log}");
+    let kynos = errors
+        .iter()
+        .find(|l| l["target"] == "kynos::error")
+        .unwrap_or_else(|| panic!("kynos logged no line for the 5xx:\n{log}"));
+    assert_eq!(kynos["error"], detail.as_str(), "{log}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
