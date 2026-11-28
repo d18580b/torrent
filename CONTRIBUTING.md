@@ -25,16 +25,18 @@ the package lists for Fedora and Ubuntu are in
 
 ### Rust toolchain
 
-Pinned to an exact stable release in [`rust-toolchain.toml`](./rust-toolchain.toml), which
-local builds, CI, and the container image all use. On first invocation `rustup` will fetch it
-automatically; if you don't have rustup yet:
+The latest stable release, named by the `stable` channel in
+[`rust-toolchain.toml`](./rust-toolchain.toml), which local builds, CI, and the container image
+all use. It floats: nothing is bumped by hand, and anything a new release breaks (usually a new
+clippy lint) is fixed in the tree when it lands. On first invocation `rustup` will fetch it
+automatically (`rustup update` moves you to a newer release); if you don't have rustup yet:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 The oldest release the workspace supports is `rust-version` in [`Cargo.toml`](./Cargo.toml)
-(clippy.toml's `msrv` must match it); `mise run msrv` checks that it still compiles there,
+(clippy reads it too); `mise run msrv` checks that it still compiles there,
 and so does CI.
 
 ### Developer tooling (mise + hk)
@@ -71,10 +73,10 @@ Everyday tasks:
 | `mise run vpn-check <config> [-- <flags>]` | Verify a real VPN configuration (see below) |
 
 Formatting requires **nightly rustfmt** (`imports_granularity`/`group_imports` are
-unstable). The dated nightly it runs on is `RUSTFMT_TOOLCHAIN` in `mise.toml`, its only
-definition: `mise run setup` installs it (rerun `mise run rustfmt-toolchain` after it moves),
+unstable). It runs on the latest nightly, `RUSTFMT_TOOLCHAIN` in `mise.toml`, its only
+definition: `mise run setup` installs it (rerun `mise run rustfmt-toolchain` to update it),
 and the `fmt` tasks invoke `cargo +$RUSTFMT_TOOLCHAIN fmt`. Everything else
-builds/lints/tests on the pinned stable toolchain.
+builds/lints/tests on the stable toolchain.
 
 `vpn-check` is deliberately outside every `test` task: it needs a real host
 with real tunnels and is meaningless in CI. It takes a config path, forwards

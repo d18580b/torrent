@@ -20,9 +20,9 @@ inputs:
   toolchain:
     description: >-
       `rust-toolchain.toml` installs the toolchain and components that file
-      pins, before anything builds. Empty installs none up front: a job that
+      names, before anything builds. Empty installs none up front: a job that
       builds nothing needs none, and any cargo run in the checkout still makes
-      rustup fetch the pinned one. Any other value is refused, so no job names
+      rustup fetch that one. Any other value is refused, so no job names
       a version that file would silently override. The rustfmt nightly and
       the MSRV are installed by their own mise tasks.
     required: false
@@ -37,10 +37,10 @@ inputs:
   cache-key-file:
     description: >-
       One more file pattern whose contents the cache key hashes, beside
-      Cargo.lock and rust-toolchain.toml, for a job whose compiler or build
-      those two do not determine (the msrv job's comes from Cargo.toml's
-      rust-version). An exact key hit is never re-saved, so whatever picks
-      the compiler has to be in the key.
+      Cargo.lock, rust-toolchain.toml and `rustc -V`, for a job whose
+      compiler or build those do not determine (the msrv job's comes from
+      Cargo.toml's rust-version). An exact key hit is never re-saved, so
+      whatever picks the compiler has to be in the key.
     required: false
     default: ''
 
@@ -75,6 +75,17 @@ runs:
         rustup toolchain install
         rustc --version
 
+    # rust-toolchain.toml names a channel, not a release, so its hash stays
+    # the same when a new stable ships; the compiler's own version is what
+    # tells a new release's target/ from the old one's. Running rustc here
+    # makes rustup install the channel if the toolchain step was skipped.
+    - if: inputs.cache-prefix != ''
+      id: rustc
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "version=$(rustc -V | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
     - if: inputs.cache-prefix != ''
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -84,7 +95,7 @@ runs:
           target
         # The runner's architecture is in the key: an arm64 job restoring an
         # x64 job's target/ would rebuild everything and never save its own.
-        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', inputs.cache-key-file || 'rust-toolchain.toml') }}
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', inputs.cache-key-file || 'rust-toolchain.toml') }}
         restore-keys: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-
 
     # cargo-binstall lets mise fetch prebuilt convco and cargo-deny binaries
