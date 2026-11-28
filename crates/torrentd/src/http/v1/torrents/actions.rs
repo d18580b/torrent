@@ -259,7 +259,7 @@ pub async fn reannounce_torrent(
 pub struct UploadLimit {
     /// Bytes per second, at least 1. `null` (or absent) removes the limit;
     /// the profile's and the daemon's limits still apply.
-    #[schema(minimum = 1, maximum = 2147483647)]
+    #[schema(minimum = 1, maximum = i32::MAX)]
     pub bytes_per_sec: Option<u32>,
 }
 

@@ -122,6 +122,7 @@ pub use add::*;
 pub use delete::*;
 pub use files::*;
 pub use list::*;
+pub use model::TorrentPage;
 pub use trackers::*;
 
 // ---------------------------------------------------------------------------

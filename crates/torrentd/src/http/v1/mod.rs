@@ -206,6 +206,14 @@ macro_rules! mount {
         let long = pool::long_body_routes!(v1_group!(untimed MAX_BODY_BYTES));
         let add = torrents::add_routes!(v1_group!(MAX_ADD_BODY_BYTES, ADD_REQUEST_DEADLINE));
         let router = $router
+            // Each page a listing answers with, under the component name its
+            // `kynos::name_instantiation!` declares rather than `Page_<item>`.
+            .name_instantiation::<torrents::TorrentPage>()
+            .name_instantiation::<torrents::TorrentFilePage>()
+            .name_instantiation::<pool::TreePage>()
+            .name_instantiation::<pool::PoolTorrentPage>()
+            .name_instantiation::<pool::PlanPage>()
+            .name_instantiation::<pool::PlanStepPage>()
             .group(bodyless)
             .group(open)
             .group(body)

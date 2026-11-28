@@ -291,7 +291,7 @@ pub enum Fault {
         /// The live profile whose alert drain stalls.
         profile_id: String,
         /// How long the drain blocks, in seconds: 1 to 600.
-        #[schema(minimum = 1, maximum = 600)]
+        #[schema(minimum = 1, maximum = MAX_STALL_SECS)]
         secs: u64,
     },
     /// Make the profile's next `apply_settings` panic.
