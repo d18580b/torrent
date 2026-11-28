@@ -856,8 +856,12 @@ start, a socket another process still answers on or a file that is not a
 socket refuses the start, and a clean stop removes it. `allow_unauthenticated`
 on a socket whose mode lets every user connect (an "other" write bit, as in
 `0o666`) is refused, as a routable address is. Requests over the socket carry
-no client address, so `trusted_proxies` never applies to them and the login
-throttle counts every socket caller as one client; each request's log lines
+no client address, so `trusted_proxies` never applies to them, and the login
+throttle counts every socket caller as one client with a bucket of its own:
+TCP clients that fill the throttle's per-client table do not lock the socket
+out, and a socket login clears only the socket's own record, earning socket
+callers the returning-client reserve as an address's login earns it that
+address; each request's log lines
 carry the caller's `peer.uid` and `peer.pid`, as the kernel reported them
 when it connected (`SO_PEERCRED`).
 
@@ -1073,9 +1077,9 @@ returning-client reserve` when it happens. The reserve is no help to an
 address that has never logged in, or to any address after a restart, which
 forgets them all; behind a proxy with `trusted_proxies` unset, every client
 is the proxy's address, so the reserve is shared with whoever else comes
-through it. A request over a unix socket has no address at all, so it never
-draws on the reserve: the socket's own mode and group already decide who may
-reach the login route.
+through it. Every caller on a unix socket counts as one client, so once any
+of them has logged in, all of them share the reserve; the socket's own mode
+and group already decide who may reach the login route.
 
 **Keep a static `write` token as the break-glass credential.** A
 `[[auth.token]]` entry with the `write` scope (§6) never touches

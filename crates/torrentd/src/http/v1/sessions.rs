@@ -7,6 +7,8 @@ use std::time::SystemTime;
 
 use kynos::di::Provides;
 use kynos::extract::connection::ConnectInfo;
+use kynos::extract::connection::Connection;
+use kynos::extract::connection::TransportAddress;
 use kynos::extract::describe::Describe;
 use kynos::extract::link::Link;
 use kynos::extract::FromRequestParts;
@@ -23,6 +25,7 @@ use tracing::warn;
 
 use crate::app_state::AppState;
 use crate::auth::Admission;
+use crate::auth::LoginClient;
 use crate::auth::Scope;
 use crate::http::forwarded::Client;
 use crate::http::security::Bearer;
@@ -120,7 +123,13 @@ pub enum CreateSessionError {
 /// The client behind a request, as far as `trusted_proxies` lets the daemon
 /// know it. Not a parameter: the headers it reads are the proxy's, and a
 /// client that sets them itself is ignored.
-pub struct ClientAddr(pub Client);
+pub struct ClientAddr {
+    pub client: Client,
+    /// Who the login throttle counts the request against: the client's
+    /// address, every unix-socket caller as one client of its own, or, where
+    /// neither is known, nobody in particular.
+    pub login: LoginClient,
+}
 
 impl<C: Provides<Arc<AppState>> + Sync> FromRequestParts<C> for ClientAddr {
     type Rejection = std::convert::Infallible;
@@ -131,12 +140,18 @@ impl<C: Provides<Arc<AppState>> + Sync> FromRequestParts<C> for ClientAddr {
             .await
             .ok()
             .map(|ConnectInfo(peer)| peer);
+        let over_socket = parts
+            .extensions
+            .get::<Connection>()
+            .is_some_and(|c| matches!(c.peer(), TransportAddress::Unix(_)));
         let state = context.provide();
-        Ok(Self(crate::http::forwarded::resolve(
-            peer,
-            &parts.headers,
-            &state.trusted_proxies,
-        )))
+        let client = crate::http::forwarded::resolve(peer, &parts.headers, &state.trusted_proxies);
+        let login = if over_socket {
+            LoginClient::Socket
+        } else {
+            LoginClient::from(client.ip)
+        };
+        Ok(Self { client, login })
     }
 }
 
@@ -160,10 +175,11 @@ impl Describe for ClientAddr {
 #[kynos::post("/sessions", tag = Sessions)]
 pub async fn create_session(
     Inject(s): Inject<Arc<AppState>>,
-    ClientAddr(client): ClientAddr,
+    addr: ClientAddr,
     current: Link<get_current_session>,
     Json(body): Json<CreateSession>,
 ) -> Result<Created<Json<SessionGrant>>, CreateSessionError> {
+    let ClientAddr { client, login } = addr;
     let Some(auth) = s.auth.as_ref() else {
         return Err(CreateSessionError::AuthNotConfigured);
     };
@@ -186,7 +202,7 @@ pub async fn create_session(
     // verification. kynos has already refused any body that is not a
     // well-formed `CreateSession`, and any body that took longer than
     // `REQUEST_DEADLINE` to arrive, so nothing malformed reaches this.
-    if let Some(wait) = auth.throttle.retry_after(client.ip) {
+    if let Some(wait) = auth.throttle.retry_after(login) {
         warn!(
             target: "torrentd::auth",
             client_ip,
@@ -207,7 +223,7 @@ pub async fn create_session(
     // the number of addresses. A client that has logged in before falls back
     // on a reserve once it is spent, so a few polling addresses cannot keep
     // a returning operator out. See `LoginThrottle`.
-    match auth.throttle.admit_verification(client.ip) {
+    match auth.throttle.admit_verification(login) {
         Ok(Admission::Shared) => {}
         Ok(Admission::Reserve) => {
             warn!(
@@ -250,13 +266,13 @@ pub async fn create_session(
                 false
             });
     if !verified {
-        auth.throttle.note_failure(client.ip);
+        auth.throttle.note_failure(login);
         // No detail about which part was wrong, and no username to enumerate.
         warn!(target: "torrentd::auth", client_ip, "failed login attempt");
         refused("bad_password");
         return Err(CreateSessionError::InvalidCredentials);
     }
-    auth.throttle.note_success(client.ip);
+    auth.throttle.note_success(login);
 
     let (token, expires_at) = auth.sessions.create();
     info!(
@@ -356,6 +372,7 @@ mod tests {
     use super::ClientAddr;
     use super::RevokeSessionError;
     use crate::app_state::AppState;
+    use crate::auth::LoginClient;
 
     struct Ctx(Arc<AppState>);
 
@@ -367,7 +384,8 @@ mod tests {
 
     /// The property: a connection with no IP peer, which `ConnectInfo`
     /// refuses, resolves to no client address rather than failing the
-    /// login, and its forwarding headers are not read.
+    /// login, and its forwarding headers are not read; the login throttle
+    /// still counts it as the socket's own client, not on the global bucket.
     #[tokio::test]
     async fn a_connection_with_no_ip_peer_resolves_to_no_client_address() {
         let unix = std::os::unix::net::SocketAddr::from_pathname("/run/torrentd/api.sock").unwrap();
@@ -381,10 +399,30 @@ mod tests {
             .insert(Connection::from_peer(unix.clone(), unix));
         let ctx = Ctx(Arc::new(crate::app_state::build_test_state(None)));
 
-        let Ok(ClientAddr(client)) = ClientAddr::from_request_parts(&mut parts, &ctx).await;
+        let Ok(ClientAddr { client, login }) =
+            ClientAddr::from_request_parts(&mut parts, &ctx).await;
 
         assert_eq!(client.ip, None);
         assert!(!client.secure);
+        assert_eq!(login, LoginClient::Socket);
+    }
+
+    /// A TCP connection's login is counted against its address, never as
+    /// the socket's client.
+    #[tokio::test]
+    async fn a_tcp_connection_is_counted_against_its_address() {
+        let peer: std::net::SocketAddr = "192.0.2.7:40000".parse().unwrap();
+        let local: std::net::SocketAddr = "192.0.2.1:9180".parse().unwrap();
+        let request = kynos::http::Request::new(kynos::http::body::Body::empty());
+        let (mut parts, _) = request.into_parts();
+        parts.extensions.insert(Connection::from_peer(peer, local));
+        let ctx = Ctx(Arc::new(crate::app_state::build_test_state(None)));
+
+        let Ok(ClientAddr { client, login }) =
+            ClientAddr::from_request_parts(&mut parts, &ctx).await;
+
+        assert_eq!(client.ip, Some(peer.ip()));
+        assert_eq!(login, LoginClient::Addr(peer.ip()));
     }
 
     /// The `not-a-session` entry in docs/api/problems.md, heading excluded,
