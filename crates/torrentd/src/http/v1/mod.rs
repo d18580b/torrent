@@ -124,9 +124,11 @@ pub(crate) type Timed = Group<AppCtx, Propagate, kynos::stack![Timeout, BodySize
 /// A `/v1` group whose body alone has a deadline.
 pub(crate) type Untimed = Group<AppCtx, Propagate, kynos::stack![BodySize<(), BodyTooSlow>]>;
 
-/// The `/v1` groups, by the body limit their operations admit, the deadline
-/// the body has to arrive by, and whether the credential is checked before it
-/// is read.
+/// A `/v1` group whose operations take no body.
+///
+/// It, [`open`], [`guarded`] and [`untimed`] are the `/v1` groups, by the
+/// body limit their operations admit, the deadline the body has to arrive by,
+/// and whether the credential is checked before it is read.
 ///
 /// The interceptors every routed response shares — the request id and the API
 /// headers — sit on the router, not here: per group they would give each
