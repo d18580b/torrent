@@ -17,11 +17,14 @@ use torrentd_engine::TorrentHandle;
 use tracing::warn;
 
 use super::model::TorrentPath;
+use super::TorrentNotFound;
 use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::Internal;
+use crate::http::v1::common::ProfileUnavailable;
+use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::Torrents;
 
 /// How to remove a torrent.
@@ -52,9 +55,9 @@ pub enum DeleteTorrentError {
     #[problem(status = 422, title = "The delete is not confirmed")]
     DeleteUnconfirmed { infohash: String },
     /// No torrent with this infohash is assigned to any profile.
-    #[error("no torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    TorrentNotFound(#[from] TorrentNotFound),
     /// The torrent is still being added to its session.
     #[error(
         "this torrent is still being added to its session; retry the delete once its phase \
@@ -90,13 +93,9 @@ pub enum DeleteTorrentError {
     TorrentUnloaded { detail: String },
     /// `delete_files=true` for a torrent whose profile has no running
     /// session: its payload is reachable only through one.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        #[problem(extension)]
-        profile_status: crate::http::v1::common::ProfileUnavailableReason,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileUnavailable(#[from] ProfileUnavailable),
     /// The session or a store could not complete the removal; `detail`
     /// says which half and whether to retry.
     #[error(transparent)]
@@ -173,10 +172,7 @@ pub async fn delete_torrent(
             refuse_co_claimants(pool.with_reader(|st| st.co_claimants(&hex)))?;
         }
     }
-    let profile = s
-        .registry
-        .lookup(&ih)
-        .ok_or(DeleteTorrentError::TorrentNotFound)?;
+    let profile = s.registry.lookup(&ih).ok_or(TorrentNotFound::UNASSIGNED)?;
     let Some(engine) = s.source.engine_for(&profile) else {
         return clear_sessionless(&s, &ih, &profile, delete_files);
     };
@@ -612,13 +608,14 @@ fn clear_sessionless(
     if delete_files {
         // Refuse rather than report success for a deletion that cannot
         // happen: the payload is reachable only through the session.
-        return Err(DeleteTorrentError::ProfileUnavailable {
+        return Err(ProfileUnavailable {
             detail: format!(
                 "profile {profile} has no running session, so its payload cannot be deleted; \
                  retry without `delete_files` to clear the assignment alone"
             ),
-            profile_status: crate::http::v1::common::ProfileUnavailableReason::Failed,
-        });
+            profile_status: ProfileUnavailableReason::Failed,
+        }
+        .into());
     }
     clear_unheld(s, ih, profile)?;
     warn!(

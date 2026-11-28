@@ -27,7 +27,9 @@ use crate::http::v1::common::engine_for;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::common::Internal;
+use crate::http::v1::common::ProfileNotFound;
 use crate::http::v1::common::ProfileProblem;
+use crate::http::v1::common::ProfileUnavailable;
 use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::server::count;
 use crate::http::v1::Profiles;
@@ -364,9 +366,9 @@ fn profile_list(s: &AppState) -> ProfileList {
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetProfileError {
     /// No profile with this id is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileNotFound(#[from] ProfileNotFound),
 }
 
 /// Describe one profile.
@@ -384,7 +386,7 @@ pub async fn get_profile(
     let profile_id = ProfileId::new(path.profile_id);
     detail_of(&s, &profile_id)
         .map(Json)
-        .ok_or(GetProfileError::ProfileNotFound)
+        .ok_or(ProfileNotFound.into())
 }
 
 /// What [`get_profile`] reports for `profile_id`, or `None` for an id no
@@ -425,19 +427,14 @@ pub struct SetProfileState {
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetProfileStateError {
     /// No profile with this id is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileNotFound(#[from] ProfileNotFound),
     /// The profile is fenced (`vpn_down`) and its tunnel still fails the
     /// health check, so it stays fenced and its state is unchanged.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        /// `vpn_down`.
-        #[problem(extension)]
-        profile_status: ProfileUnavailableReason,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileUnavailable(#[from] ProfileUnavailable),
     /// The profile is fenced (`vpn_down`) and the network kill switch did
     /// not last check in force, so the fence stays and its state is
     /// unchanged.
@@ -489,7 +486,7 @@ pub async fn set_profile_state(
 ) -> Result<Json<ProfileDetail>, SetProfileStateError> {
     let profile_id = ProfileId::new(path.profile_id);
     if matches!(s.profiles.resolve(&profile_id), Resolution::Unknown) {
-        return Err(SetProfileStateError::ProfileNotFound);
+        return Err(ProfileNotFound.into());
     }
     let desired = DesiredState::from(body.state);
     // On the blocking pool: the tunnel probe shells out, the record is
@@ -499,7 +496,7 @@ pub async fn set_profile_state(
     blocking(move || set_state(&state, &id, desired)).await?;
     detail_of(&s, &profile_id)
         .map(Json)
-        .ok_or(SetProfileStateError::ProfileNotFound)
+        .ok_or(ProfileNotFound.into())
 }
 
 /// [`set_profile_state`]'s work, on the blocking pool.
@@ -539,7 +536,7 @@ fn set_state(
                     "profile set online while fenced; its tunnel still fails the check, so it \
                      stays fenced",
                 );
-                return Err(SetProfileStateError::ProfileUnavailable {
+                return Err(ProfileUnavailable {
                     detail: format!(
                         "profile vpn_down: its tunnel still fails the health check \
                          ({}), so it stays fenced and its state is unchanged. Bring the \
@@ -547,7 +544,8 @@ fn set_state(
                         reason.as_str()
                     ),
                     profile_status: ProfileUnavailableReason::VpnDown,
-                });
+                }
+                .into());
             }
             Some(entry)
         }
@@ -701,15 +699,16 @@ fn no_session_detail(reason: &str) -> String {
 fn explain(s: &AppState, profile_id: &ProfileId, problem: ProfileProblem) -> ProfileProblem {
     match (problem, s.profiles.resolve(profile_id)) {
         (
-            ProfileProblem::ProfileUnavailable {
+            ProfileProblem::ProfileUnavailable(ProfileUnavailable {
                 profile_status: ProfileUnavailableReason::Failed,
                 ..
-            },
+            }),
             Resolution::Failed(f),
-        ) => ProfileProblem::ProfileUnavailable {
+        ) => ProfileUnavailable {
             profile_status: ProfileUnavailableReason::Failed,
             detail: no_session_detail(&f.reason),
-        },
+        }
+        .into(),
         (problem, _) => problem,
     }
 }
@@ -1092,20 +1091,17 @@ pub async fn resume_all_torrents(
         .collect();
     for (entry, gate) in gates {
         let held = if entry.health().status == ObservedStatus::VpnDown {
-            Some(ProfileProblem::vpn_down())
+            Some(ProfileUnavailable::vpn_down())
         } else if s.profile_offline(entry.id()) {
-            Some(ProfileProblem::offline())
+            Some(ProfileUnavailable::offline())
         } else {
             None
         };
-        if let Some(problem) = held {
-            let ProfileProblem::ProfileUnavailable {
-                detail,
-                profile_status,
-            } = problem
-            else {
-                unreachable!("vpn_down and offline are unavailable profiles");
-            };
+        if let Some(ProfileUnavailable {
+            detail,
+            profile_status,
+        }) = held
+        {
             out.skipped_profiles.push(SkippedProfile {
                 profile_id: entry.id().as_str().to_owned(),
                 reason: profile_status,

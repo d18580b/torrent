@@ -23,8 +23,8 @@ use tracing::info;
 
 use crate::app_state::AppState;
 use crate::bulk_adopt::in_parallel;
+use crate::http::page;
 use crate::http::page::paginate;
-use crate::http::page::InvalidCursor;
 use crate::http::page::Page;
 use crate::http::page::PageLimit;
 use crate::http::page::PageRequest;
@@ -36,7 +36,9 @@ use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::common::Internal;
+use crate::http::v1::common::InvalidCursor;
 use crate::http::v1::common::ProfileProblem;
+use crate::http::v1::common::ProfileUnavailable;
 use crate::http::v1::server::count;
 use crate::http::v1::Pool;
 use crate::http::validate::Invalid;
@@ -50,7 +52,25 @@ use crate::registry::Claim;
 /// The most infohashes one adoption or verification request may name.
 pub const MAX_INFOHASHES: usize = 1000;
 
-const NO_POOL: &str = "no [pool] section is configured on this daemon";
+/// The daemon has no `[pool]` section: `404`.
+///
+/// Every pool operation holds it as
+/// `#[problem(transparent)] PoolNotConfigured(#[from] PoolNotConfigured)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 404, title = "The pool is not configured")]
+#[error("no [pool] section is configured on this daemon")]
+pub struct PoolNotConfigured;
+
+/// No plan has this id: `404`.
+///
+/// Every operation on one plan holds it as
+/// `#[problem(transparent)] PlanNotFound(#[from] PlanNotFound)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 404, title = "Plan not found")]
+#[error("no such plan")]
+pub struct PlanNotFound;
 
 // ---------------------------------------------------------------------------
 // Shared wire types
@@ -215,9 +235,9 @@ fn check_infohashes(invalid: &mut Invalid, pointer: &str, infohashes: &[InfoHash
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum PoolFailure {
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// The pool index failed; the daemon's log has the cause.
     #[error(transparent)]
     #[problem(transparent)]
@@ -304,7 +324,7 @@ pub async fn get_pool(
     _caller: Scoped<Bearer, Read>,
     Inject(s): Inject<Arc<AppState>>,
 ) -> Result<Json<PoolOverview>, PoolFailure> {
-    let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     let fail = |e: torrentd_pool::PoolError| Internal::new("reading the pool index", e);
     let reader = Arc::clone(&pool);
     let (roots, torrents, files, by_state) = blocking(move || {
@@ -401,7 +421,7 @@ pub async fn scan_pool(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
 ) -> Result<Json<ScanSummary>, PoolFailure> {
-    let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     // Walking millions of paths is blocking work; keeping it off the async
     // runtime is what stops a scan from stalling every other request. The
     // guard moves into the task, so the teardown waits for the scan itself
@@ -466,7 +486,7 @@ pub async fn check_pool_drift(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
 ) -> Result<Json<DriftReport>, PoolFailure> {
-    let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     // Held by the task, as for a scan: the teardown waits for it.
     let guard = s.work.enter();
     let report = crate::startup::tasks::spawn_blocking(move || {
@@ -496,13 +516,13 @@ pub async fn check_pool_drift(
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum TreeError {
     /// The cursor is not one this listing issued.
-    #[error("the cursor is not one this listing issued; start again without one")]
-    #[problem(status = 400, title = "Invalid cursor")]
-    InvalidCursor,
+    #[error(transparent)]
+    #[problem(transparent)]
+    InvalidCursor(#[from] InvalidCursor),
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// No managed root has this id.
     #[error("unknown root_id")]
     #[problem(status = 404, title = "Root not found")]
@@ -517,9 +537,9 @@ pub enum TreeError {
     ValidationFailed(#[from] ValidationFailed),
 }
 
-impl From<InvalidCursor> for TreeError {
-    fn from(_: InvalidCursor) -> Self {
-        Self::InvalidCursor
+impl From<page::InvalidCursor> for TreeError {
+    fn from(e: page::InvalidCursor) -> Self {
+        Self::InvalidCursor(e.into())
     }
 }
 
@@ -599,7 +619,7 @@ async fn list_children(
     q: TreeQuery,
     orphans_only: bool,
 ) -> Result<TreePage, TreeError> {
-    let pool = s.pool.clone().ok_or(TreeError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     let prefix = q.path.as_deref().unwrap_or("").trim_matches('/').to_owned();
     // Scoped to the directory listed, so a cursor from another root or path
     // is refused rather than read as "nothing follows".
@@ -759,13 +779,13 @@ pub async fn list_pool_orphans(
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListError {
     /// The cursor is not one this listing issued.
-    #[error("the cursor is not one this listing issued; start again without one")]
-    #[problem(status = 400, title = "Invalid cursor")]
-    InvalidCursor,
+    #[error(transparent)]
+    #[problem(transparent)]
+    InvalidCursor(#[from] InvalidCursor),
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// The pool index failed; the daemon's log has the cause.
     #[error(transparent)]
     #[problem(transparent)]
@@ -776,9 +796,9 @@ pub enum ListError {
     ValidationFailed(#[from] ValidationFailed),
 }
 
-impl From<InvalidCursor> for ListError {
-    fn from(_: InvalidCursor) -> Self {
-        Self::InvalidCursor
+impl From<page::InvalidCursor> for ListError {
+    fn from(e: page::InvalidCursor) -> Self {
+        Self::InvalidCursor(e.into())
     }
 }
 
@@ -848,7 +868,7 @@ pub async fn list_pool_torrents(
     Query(q): Query<PoolTorrentQuery>,
 ) -> Result<Json<PoolTorrentPage>, ListError> {
     const LISTING: &str = "pool-torrents";
-    let pool = s.pool.clone().ok_or(ListError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     let mut invalid = Invalid::new();
     let page = PageRequest::parse(
         LISTING,
@@ -968,9 +988,9 @@ pub struct AdoptionResult {
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum AdoptError {
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// The subtree selector names no managed root.
     #[error("unknown root_id")]
     #[problem(status = 404, title = "Root not found")]
@@ -1028,7 +1048,7 @@ pub async fn adopt_pool_torrents(
     // moves or deletes payload. Adoption is not part of that surface: it
     // records an existing file's ownership in the index, so it is outside the
     // switch; `write` scope is what it needs.
-    let pool = s.pool.clone().ok_or(AdoptError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     req.validate()?;
     let profile = ProfileId::new(req.profile_id.as_str());
     // Configured-and-failed is not the same as unknown, and telling an
@@ -1350,9 +1370,9 @@ pub struct VerifyResult {
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum VerifyError {
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// The body breaks a documented constraint.
     #[error(transparent)]
     #[problem(transparent)]
@@ -1380,7 +1400,7 @@ pub async fn verify_pool_torrents(
     Inject(s): Inject<Arc<AppState>>,
     Json(Unenforced(req)): Json<Unenforced<VerifyRequest>>,
 ) -> Result<Accepted<Json<VerifyResult>>, VerifyError> {
-    let pool = s.pool.clone().ok_or(VerifyError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     req.validate()?;
     // On the blocking pool: each torrent reads the pool index, and a request
     // may name a thousand torrents.
@@ -1404,13 +1424,11 @@ pub async fn verify_pool_torrents(
             // verify queue checks again when it starts the re-hash.
             match unfenced_engine(&s, &st.profile_id) {
                 Ok(_) => {}
-                Err(crate::http::v1::common::ProfileProblem::ProfileUnavailable {
-                    detail, ..
-                }) => {
+                Err(ProfileProblem::ProfileUnavailable(ProfileUnavailable { detail, .. })) => {
                     skip(&mut resp, detail);
                     continue;
                 }
-                Err(crate::http::v1::common::ProfileProblem::ProfileNotFound) => {
+                Err(ProfileProblem::ProfileNotFound(_)) => {
                     skip(&mut resp, "engine missing".to_owned());
                     continue;
                 }
@@ -1771,7 +1789,7 @@ pub async fn list_plans(
     Query(q): Query<PlanQuery>,
 ) -> Result<Json<PlanPage>, ListError> {
     const LISTING: &str = "pool-plans";
-    let pool = s.pool.clone().ok_or(ListError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     let mut invalid = Invalid::new();
     let page = PageRequest::parse(
         LISTING,
@@ -1858,9 +1876,9 @@ pub enum CreatePlanError {
     #[problem(status = 403, title = "Pool mutations are disabled")]
     MutationsDisabled,
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// The planner refused; `detail` says why.
     #[error("{0}")]
     #[problem(status = 409, title = "The plan was refused")]
@@ -1892,7 +1910,7 @@ pub async fn create_plan(
     created: Link<get_plan>,
     Json(req): Json<CreatePlanRequest>,
 ) -> Result<Created<Json<Plan>>, CreatePlanError> {
-    let pool = s.pool.clone().ok_or(CreatePlanError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     if !pool.allow_mutations() {
         return Err(CreatePlanError::MutationsDisabled);
     }
@@ -1940,13 +1958,13 @@ fn create_plan_blocking(
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetPlanError {
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// No plan has this id.
-    #[error("no such plan")]
-    #[problem(status = 404, title = "Plan not found")]
-    PlanNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PlanNotFound(#[from] PlanNotFound),
     /// The pool index failed; the daemon's log has the cause.
     #[error(transparent)]
     #[problem(transparent)]
@@ -1965,11 +1983,11 @@ pub async fn get_plan(
     Inject(s): Inject<Arc<AppState>>,
     Path(p): Path<PlanPath>,
 ) -> Result<Json<Plan>, GetPlanError> {
-    let pool = s.pool.clone().ok_or(GetPlanError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     blocking(move || load_plan(&pool, p.plan_id))
         .await?
         .map(Json)
-        .ok_or(GetPlanError::PlanNotFound)
+        .ok_or(PlanNotFound.into())
 }
 
 /// Why a plan's steps could not be listed.
@@ -1977,17 +1995,17 @@ pub async fn get_plan(
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListPlanStepsError {
     /// The cursor is not one this plan's steps listing issued.
-    #[error("the cursor is not one this listing issued; start again without one")]
-    #[problem(status = 400, title = "Invalid cursor")]
-    InvalidCursor,
+    #[error(transparent)]
+    #[problem(transparent)]
+    InvalidCursor(#[from] InvalidCursor),
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// No plan has this id.
-    #[error("no such plan")]
-    #[problem(status = 404, title = "Plan not found")]
-    PlanNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PlanNotFound(#[from] PlanNotFound),
     /// The pool index failed; the daemon's log has the cause.
     #[error(transparent)]
     #[problem(transparent)]
@@ -1998,9 +2016,9 @@ pub enum ListPlanStepsError {
     ValidationFailed(#[from] ValidationFailed),
 }
 
-impl From<InvalidCursor> for ListPlanStepsError {
-    fn from(_: InvalidCursor) -> Self {
-        Self::InvalidCursor
+impl From<page::InvalidCursor> for ListPlanStepsError {
+    fn from(e: page::InvalidCursor) -> Self {
+        Self::InvalidCursor(e.into())
     }
 }
 
@@ -2026,10 +2044,7 @@ pub async fn list_plan_steps(
     Path(p): Path<PlanPath>,
     Query(q): Query<PlanStepQuery>,
 ) -> Result<Json<PlanStepPage>, ListPlanStepsError> {
-    let pool = s
-        .pool
-        .clone()
-        .ok_or(ListPlanStepsError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     let id = p.plan_id;
     let listing = plan_steps_listing(id);
     let mut invalid = Invalid::new();
@@ -2044,10 +2059,7 @@ pub async fn list_plan_steps(
     let after = page
         .after
         .as_deref()
-        .map(|k| {
-            k.parse::<i64>()
-                .map_err(|_| ListPlanStepsError::InvalidCursor)
-        })
+        .map(|k| k.parse::<i64>().map_err(|_| InvalidCursor))
         .transpose()?;
     // `limit + 1` rows off the primary key, on the read connection: one page
     // whatever the plan's size, and never waiting for a scan.
@@ -2066,7 +2078,7 @@ pub async fn list_plan_steps(
     })
     .await
     .map_err(|e| Internal::new("listing a plan's steps", e))?
-    .ok_or(ListPlanStepsError::PlanNotFound)?;
+    .ok_or(PlanNotFound)?;
     let items = rows
         .into_iter()
         .map(step_of)
@@ -2080,13 +2092,13 @@ pub async fn list_plan_steps(
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum DeletePlanError {
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// No plan has this id.
-    #[error("no such plan")]
-    #[problem(status = 404, title = "Plan not found")]
-    PlanNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PlanNotFound(#[from] PlanNotFound),
     /// The plan is `applying`: an apply is running it, or a crash left it
     /// for the next boot to re-drive.
     #[error(
@@ -2117,7 +2129,7 @@ pub async fn delete_plan(
     Inject(s): Inject<Arc<AppState>>,
     Path(p): Path<PlanPath>,
 ) -> Result<NoContent, DeletePlanError> {
-    let pool = s.pool.clone().ok_or(DeletePlanError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     let fail = |e: torrentd_pool::PoolError| Internal::new("discarding a plan", e);
     // One conditional statement on the writer: the status that refuses a plan
     // mid-apply is the one the delete acts on, with no window for an apply to
@@ -2126,7 +2138,7 @@ pub async fn delete_plan(
         use torrentd_pool::store::PlanDelete;
         match pool.discard_plan(p.plan_id).map_err(fail)? {
             PlanDelete::Deleted => Ok(NoContent),
-            PlanDelete::NotFound => Err(DeletePlanError::PlanNotFound),
+            PlanDelete::NotFound => Err(PlanNotFound.into()),
             PlanDelete::Applying => Err(DeletePlanError::PlanApplying),
         }
     })
@@ -2169,13 +2181,13 @@ pub enum ApplyPlanError {
     #[problem(status = 403, title = "Pool mutations are disabled")]
     MutationsDisabled,
     /// The daemon has no `[pool]` section.
-    #[error("{NO_POOL}")]
-    #[problem(status = 404, title = "The pool is not configured")]
-    PoolNotConfigured,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PoolNotConfigured(#[from] PoolNotConfigured),
     /// No plan has this id.
-    #[error("no such plan")]
-    #[problem(status = 404, title = "Plan not found")]
-    PlanNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    PlanNotFound(#[from] PlanNotFound),
     /// The plan is applying, applied or cancelled.
     #[error("{0}")]
     #[problem(status = 409, title = "The plan cannot be applied")]
@@ -2230,7 +2242,7 @@ pub async fn apply_plan(
     Path(p): Path<PlanPath>,
     Json(req): Json<ApplyRequest>,
 ) -> Result<Json<ApplyOutcome>, ApplyPlanError> {
-    let pool = s.pool.clone().ok_or(ApplyPlanError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolNotConfigured)?;
     if !pool.allow_mutations() {
         return Err(ApplyPlanError::MutationsDisabled);
     }
@@ -2238,7 +2250,7 @@ pub async fn apply_plan(
     let reader = Arc::clone(&pool);
     let plan = blocking(move || load_plan(&reader, id))
         .await?
-        .ok_or(ApplyPlanError::PlanNotFound)?;
+        .ok_or(PlanNotFound)?;
     if !applicable(plan.status) {
         return Err(ApplyPlanError::PlanNotDraft(format!(
             "plan is {}; only a draft or failed plan can be applied",
@@ -2303,7 +2315,7 @@ pub async fn apply_plan(
         // claim is told apart by the plan's status now; anything else is the
         // executor refusing or stopping.
         Err(reason) => match blocking(move || load_plan(&pool, id)).await {
-            Ok(None) => Err(ApplyPlanError::PlanNotFound),
+            Ok(None) => Err(PlanNotFound.into()),
             Ok(Some(now)) if !applicable(now.status) => Err(ApplyPlanError::PlanNotDraft(reason)),
             _ => Err(ApplyPlanError::ApplyFailed(reason)),
         },
