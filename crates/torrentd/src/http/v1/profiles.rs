@@ -24,9 +24,9 @@ use crate::http::security::Read;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::engine_for;
-use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
+use crate::http::v1::common::Internal;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::server::count;
@@ -445,9 +445,9 @@ pub enum SetProfileStateError {
     #[problem(status = 409, title = "The network kill switch is not in force")]
     KillSwitchNotInForce { detail: String },
     /// The state could not be recorded, or a session refused it.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 /// Set one profile online or offline.
@@ -555,9 +555,7 @@ fn set_state(
     };
     s.profiles
         .change_states(|r| r.set(profile_id, desired), &*s.metrics, &online_pace(s))
-        .map_err(|e| SetProfileStateError::Internal {
-            detail: internal("setting the profile's state", e),
-        })?;
+        .map_err(|e| Internal::new("setting the profile's state", e))?;
     if let Some(entry) = lift {
         lift_fence(s, entry);
     }
@@ -616,22 +614,11 @@ fn online_pace(s: &AppState) -> crate::fence::OnlinePace<'_> {
     }
 }
 
-/// Why offline-all or online-all did not fully apply.
-#[derive(Debug, thiserror::Error, ApiError)]
-#[problem(base = crate::http::security::PROBLEM_BASE)]
-pub enum StateSwitchError {
-    /// The switch could not be recorded, or a session refused it.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
-}
-
 /// [`set_offline_all`] and [`set_online_all`]: set the daemon-wide switch and
 /// apply it.
-async fn switch_all(
-    s: Arc<AppState>,
-    offline: bool,
-) -> Result<Json<ProfileList>, StateSwitchError> {
+///
+/// `Err` where the switch could not be recorded, or a session refused it.
+async fn switch_all(s: Arc<AppState>, offline: bool) -> Result<Json<ProfileList>, Internal> {
     let state = Arc::clone(&s);
     blocking(move || {
         state.profiles.change_states(
@@ -641,15 +628,15 @@ async fn switch_all(
         )
     })
     .await
-    .map_err(|e| StateSwitchError::Internal {
-        detail: internal(
+    .map_err(|e| {
+        Internal::new(
             if offline {
                 "taking every profile offline"
             } else {
                 "clearing offline-all"
             },
             e,
-        ),
+        )
     })?;
     info!(offline_all = offline, "daemon-wide profile state set");
     Ok(Json(profile_list(&s)))
@@ -666,7 +653,7 @@ async fn switch_all(
 pub async fn set_offline_all(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
-) -> Result<Json<ProfileList>, StateSwitchError> {
+) -> Result<Json<ProfileList>, Internal> {
     switch_all(s, true).await
 }
 
@@ -682,7 +669,7 @@ pub async fn set_offline_all(
 pub async fn set_online_all(
     _caller: Scoped<Bearer, Write>,
     Inject(s): Inject<Arc<AppState>>,
-) -> Result<Json<ProfileList>, StateSwitchError> {
+) -> Result<Json<ProfileList>, Internal> {
     switch_all(s, false).await
 }
 

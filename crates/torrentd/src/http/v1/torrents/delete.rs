@@ -21,7 +21,7 @@ use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::internal;
+use crate::http::v1::common::Internal;
 use crate::http::v1::Torrents;
 
 /// How to remove a torrent.
@@ -99,9 +99,9 @@ pub enum DeleteTorrentError {
     },
     /// The session or a store could not complete the removal; `detail`
     /// says which half and whether to retry.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 /// Remove a torrent.
@@ -263,9 +263,7 @@ pub async fn delete_torrent(
                 // the assignment is kept, and the boot spends it.
                 engine.remove_torrent(st.handle, false).map_err(|e| {
                     settler.state.abandon_removal(&profile, st.handle);
-                    DeleteTorrentError::Internal {
-                        detail: internal("removing the torrent from its session", e),
-                    }
+                    Internal::new("removing the torrent from its session", e)
                 })?;
                 // Deleted before the assignment is cleared, which is the
                 // first moment an add of the same info-hash can write files
@@ -295,18 +293,17 @@ pub async fn delete_torrent(
                 // every later delete `409 torrent-adding`.
                 clear_assignment(&settler, &ih, &profile, outcome.failed.is_none())?;
                 if let Some((path, why)) = outcome.failed {
-                    return Err(DeleteTorrentError::Internal {
-                        detail: format!(
-                            "{} The torrent was removed from its session and its assignment \
+                    return Err(Internal::new("moving the payload to the trash", why)
+                        .then(format_args!(
+                            "The torrent was removed from its session and its assignment \
                              cleared; {} of {} file(s) were moved to the trash before the \
                              move stopped at {}, and every file after it is where it was. \
                              Nothing was unlinked.",
-                            internal("moving the payload to the trash", why),
                             outcome.moved,
                             payload.file_count(),
                             path.display(),
-                        ),
-                    });
+                        ))
+                        .into());
                 }
                 report_unfinished_cleanup(&ih, resurrects)
             })
@@ -362,9 +359,7 @@ fn payload_to_trash(
         // Checked by the handler already; a pool is what holds the trash.
         return Err(DeleteTorrentError::MutationsDisabled);
     };
-    let session_err = |e| DeleteTorrentError::Internal {
-        detail: internal("reading the torrent's files from its session", e),
-    };
+    let session_err = |e| Internal::new("reading the torrent's files from its session", e);
     let details = engine.torrent_details(h).map_err(session_err)?;
     let files: Vec<String> = engine
         .torrent_files(h)
@@ -406,9 +401,7 @@ fn payload_to_trash(
 fn refuse_co_claimants(
     others: Result<Vec<String>, torrentd_pool::PoolError>,
 ) -> Result<(), DeleteTorrentError> {
-    let others = others.map_err(|e| DeleteTorrentError::Internal {
-        detail: internal("reading the pool index", e),
-    })?;
+    let others = others.map_err(|e| Internal::new("reading the pool index", e))?;
     if others.is_empty() {
         return Ok(());
     }
@@ -533,16 +526,14 @@ fn report_unfinished_cleanup(ih: &InfoHash, resurrects: bool) -> Result<(), Dele
     if !resurrects {
         return Ok(());
     }
-    Err(DeleteTorrentError::Internal {
-        detail: format!(
-            "torrent {ih} was removed from its session and its assignment cleared, but its \
-             resume file or .torrent could not be deleted and no tombstone could be written to \
-             stop the next start loading it again; see \
-             torrentd_torrent_remove_cleanup_errors_total and the daemon log. The daemon \
-             retries the delete as the session confirms the removal. If the torrent is listed \
-             after a restart, delete it again."
-        ),
-    })
+    Err(Internal::detailed(format!(
+        "torrent {ih} was removed from its session and its assignment cleared, but its resume \
+         file or .torrent could not be deleted and no tombstone could be written to stop the \
+         next start loading it again; see torrentd_torrent_remove_cleanup_errors_total and the \
+         daemon log. The daemon retries the delete as the session confirms the removal. If the \
+         torrent is listed after a restart, delete it again."
+    ))
+    .into())
 }
 
 /// Clear `ih`'s assignment to `profile` once no session holds it.
@@ -564,13 +555,12 @@ fn clear_assignment(
     // from an add whose alert has not landed, which a delete refuses.
     if let Err(e) = s.registry.remove(ih) {
         s.removed_unassigned.lock().insert(*ih, payload_deleted);
-        return Err(DeleteTorrentError::Internal {
-            detail: format!(
-                "{} The torrent was removed from its session; retry the delete to clear the \
+        return Err(Internal::new("clearing the torrent's assignment", e)
+            .then(
+                "The torrent was removed from its session; retry the delete to clear the \
                  assignment.",
-                internal("clearing the torrent's assignment", e)
-            ),
-        });
+            )
+            .into());
     }
     // Cleared, so a later add of the same info-hash is this process's own
     // and must not be mistaken for one the boot left unloaded, or for one an
@@ -653,15 +643,10 @@ fn refuse_unloaded_with_store_files(
     ih: &InfoHash,
     profile: &ProfileId,
 ) -> Result<(), DeleteTorrentError> {
-    let resume = s
-        .resume
-        .exists(profile, ih)
-        .map_err(|e| DeleteTorrentError::Internal {
-            detail: format!(
-                "{} Nothing was changed; retry the delete.",
-                internal("checking for the torrent's resume file", e)
-            ),
-        })?;
+    let resume = s.resume.exists(profile, ih).map_err(|e| {
+        Internal::new("checking for the torrent's resume file", e)
+            .then("Nothing was changed; retry the delete.")
+    })?;
     // A `.torrent` with no resume file that the pool index records `drifted`
     // is one the boot held back on purpose: its verification failed, no boot
     // loads it, and deleting it and adopting it again is how it is verified
@@ -730,12 +715,11 @@ fn clear_unheld(
     // Reported rather than warned: a clear that will resurrect is not a
     // clear. Both deletes are no-ops on a missing file, so an error here means
     // the filesystem, not a race.
-    let store_err = |what: &str, e: String| DeleteTorrentError::Internal {
-        detail: format!(
-            "{} The assignment has been left in place so this can be retried; until the file is \
+    let store_err = |what: &str, e: String| {
+        Internal::new(&format!("deleting the {what}"), e).then(
+            "The assignment has been left in place so this can be retried; until the file is \
              gone the startup scan will re-assign this infohash. Retry the delete.",
-            internal(&format!("deleting the {what}"), e)
-        ),
+        )
     };
     s.resume
         .delete(profile, ih)
@@ -743,16 +727,13 @@ fn clear_unheld(
     s.torrents
         .delete(profile, ih)
         .map_err(|e| store_err(".torrent file", e.to_string()))?;
-    s.registry
-        .remove(ih)
-        .map_err(|e| DeleteTorrentError::Internal {
-            detail: format!(
-                "{} The resume and .torrent files were deleted but the assignment could not be \
+    s.registry.remove(ih).map_err(|e| {
+        Internal::new("clearing the torrent's assignment", e).then(
+            "The resume and .torrent files were deleted but the assignment could not be \
                  cleared. Retry the delete; the two deletes are no-ops on a file that is already \
                  gone.",
-                internal("clearing the torrent's assignment", e)
-            ),
-        })?;
+        )
+    })?;
     s.unloaded_at_boot.lock().remove(ih);
     s.removed_unassigned.lock().remove(ih);
     release_index_owner(s, ih, profile, false);

@@ -51,14 +51,6 @@ pub struct Violation {
     pub detail: String,
 }
 
-/// The `errors` extension member's element, which kynos attaches as JSON.
-/// Through serde, so the wire and the `Schema` derive read the same shape.
-impl From<Violation> for serde_json::Value {
-    fn from(v: Violation) -> Self {
-        serde_json::to_value(v).expect("a Violation is two strings")
-    }
-}
-
 /// Every constraint a request violated.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Invalid {
@@ -166,7 +158,7 @@ mod tests {
         invalid.push("/b", "too small");
         assert_eq!(invalid.summary(), "/a: too big (and 1 more; see `errors`)");
         assert_eq!(
-            serde_json::Value::from(invalid.violations),
+            serde_json::to_value(&invalid.violations).unwrap(),
             serde_json::json!([
                 {"pointer": "/a", "detail": "too big"},
                 {"pointer": "/b", "detail": "too small"},

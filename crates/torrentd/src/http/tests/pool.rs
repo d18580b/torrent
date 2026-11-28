@@ -2622,7 +2622,14 @@ async fn internal_failures(cov: &Arc<Coverage>) {
         );
     };
 
-    assert_internal(&h.read("/v1/pool").await);
+    let log = crate::tracing_init::Buf::default();
+    let (_reload, subscriber) =
+        crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+    let guard = torrentd_engine::testing::set_subscriber(subscriber);
+    let overview = h.read("/v1/pool").await;
+    drop(guard);
+    assert_internal(&overview);
+    crate::http::v1::common::assert_cause_only_logged(&overview, &log.text());
     assert_internal(&h.read(&format!("/v1/pool/roots/{root_id}/tree")).await);
     assert_internal(&h.read(&format!("/v1/pool/roots/{root_id}/orphans")).await);
     assert_internal(&h.read("/v1/pool/torrents").await);

@@ -35,6 +35,7 @@ use crate::http::v1::common::blocking;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
+use crate::http::v1::common::Internal;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::server::count;
 use crate::http::v1::Pool;
@@ -172,19 +173,19 @@ pub struct PlanPath {
 /// A pool index infohash as the API spells it.
 ///
 /// The index only ever stores what libtorrent hashed, so a string that does
-/// not parse means the index is corrupt: `Err` is the `detail` of a
-/// `500 internal`. Leaving the row out instead would hide a torrent from the
-/// operator with no trace; a rescan rebuilds the library rows.
-fn hex(infohash: &str) -> Result<InfoHashHex, String> {
+/// not parse means the index is corrupt: a `500 internal`. Leaving the row
+/// out instead would hide a torrent from the operator with no trace; a rescan
+/// rebuilds the library rows.
+fn hex(infohash: &str) -> Result<InfoHashHex, Internal> {
     infohash.parse().map_err(|_| {
-        internal(
+        Internal::new(
             "reading the pool index",
             format!("the index holds {infohash:?}, which is not an infohash"),
         )
     })
 }
 
-fn hexes(infohashes: impl IntoIterator<Item = String>) -> Result<Vec<InfoHashHex>, String> {
+fn hexes(infohashes: impl IntoIterator<Item = String>) -> Result<Vec<InfoHashHex>, Internal> {
     infohashes.into_iter().map(|ih| hex(&ih)).collect()
 }
 
@@ -218,9 +219,9 @@ pub enum PoolFailure {
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
     /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 /// One managed root and what is under it.
@@ -304,9 +305,7 @@ pub async fn get_pool(
     Inject(s): Inject<Arc<AppState>>,
 ) -> Result<Json<PoolOverview>, PoolFailure> {
     let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
-    let fail = |e: torrentd_pool::PoolError| PoolFailure::Internal {
-        detail: internal("reading the pool index", e),
-    };
+    let fail = |e: torrentd_pool::PoolError| Internal::new("reading the pool index", e);
     let reader = Arc::clone(&pool);
     let (roots, torrents, files, by_state) = blocking(move || {
         reader.with_reader(|st| {
@@ -414,12 +413,8 @@ pub async fn scan_pool(
         pool.scan()
     })
     .await
-    .map_err(|e| PoolFailure::Internal {
-        detail: internal("the pool scan", e),
-    })?
-    .map_err(|e| PoolFailure::Internal {
-        detail: internal("the pool scan", format!("{e:#}")),
-    })?;
+    .map_err(|e| Internal::new("the pool scan", e))?
+    .map_err(|e| Internal::new("the pool scan", format!("{e:#}")))?;
     info!(
         target: "torrentd::http::pool",
         files = summary.files,
@@ -479,20 +474,16 @@ pub async fn check_pool_drift(
         pool.drift_check()
     })
     .await
-    .map_err(|e| PoolFailure::Internal {
-        detail: internal("the drift check", e),
-    })?
-    .map_err(|e| PoolFailure::Internal {
-        detail: internal("the drift check", e),
-    })?;
+    .map_err(|e| Internal::new("the drift check", e))?
+    .map_err(|e| Internal::new("the drift check", e))?;
     Ok(Json(DriftReport {
-        drifted: hexes(report.drifted).map_err(|detail| PoolFailure::Internal { detail })?,
+        drifted: hexes(report.drifted)?,
         files_changed: report.files_changed,
         files_vanished: report.files_vanished,
         files_unreadable: report.files_unreadable,
         unreadable_roots: lossy(report.unreadable_roots),
         unmounted_dirs: lossy(report.unmounted_dirs),
-        unchecked: hexes(report.unchecked).map_err(|detail| PoolFailure::Internal { detail })?,
+        unchecked: hexes(report.unchecked)?,
     }))
 }
 
@@ -516,14 +507,14 @@ pub enum TreeError {
     #[error("unknown root_id")]
     #[problem(status = 404, title = "Root not found")]
     RootNotFound,
+    /// The pool index failed; the daemon's log has the cause.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// A query parameter breaks a documented constraint.
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 impl From<InvalidCursor> for TreeError {
@@ -627,9 +618,8 @@ async fn list_children(
     if pool.root_path_of(root_id).is_none() {
         return Err(TreeError::RootNotFound);
     }
-    let fail = |e: torrentd_pool::PoolError| TreeError::Internal {
-        detail: internal("listing the pool index", e),
-    };
+    let fail =
+        |e: torrentd_pool::PoolError| TreeError::from(Internal::new("listing the pool index", e));
     blocking(move || {
         pool.with_reader(|st| {
             // `is_child_key` admitted the cursor, so it is `d` or `f` and a
@@ -776,14 +766,14 @@ pub enum ListError {
     #[error("{NO_POOL}")]
     #[problem(status = 404, title = "The pool is not configured")]
     PoolNotConfigured,
+    /// The pool index failed; the daemon's log has the cause.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// A query parameter breaks a documented constraint.
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 impl From<InvalidCursor> for ListError {
@@ -877,9 +867,7 @@ pub async fn list_pool_torrents(
         pool.with_reader(|st| st.torrents_page(after.as_deref(), want, limit.saturating_add(1)))
     })
     .await
-    .map_err(|e| ListError::Internal {
-        detail: internal("listing the pool index", e),
-    })?;
+    .map_err(|e| Internal::new("listing the pool index", e))?;
     let items = rows
         .into_iter()
         .map(|r| {
@@ -898,8 +886,7 @@ pub async fn list_pool_torrents(
                 has_fastresume: t.fastresume_path.is_some(),
             })
         })
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(|detail| ListError::Internal { detail })?;
+        .collect::<Result<Vec<_>, Internal>>()?;
     let (items, next_cursor) = paginate(
         LISTING,
         items,
@@ -988,6 +975,10 @@ pub enum AdoptError {
     #[error("unknown root_id")]
     #[problem(status = 404, title = "Root not found")]
     RootNotFound,
+    /// The pool index failed; the daemon's log has the cause.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// No profile with this id is configured; or it failed to start, is
     /// fenced, or is set offline, so it cannot receive torrents.
     #[error(transparent)]
@@ -997,10 +988,6 @@ pub enum AdoptError {
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// Adopt existing payload.
@@ -1068,9 +1055,7 @@ fn adopt_each(
     req: &AdoptRequest,
     profile: &ProfileId,
 ) -> Result<AdoptionResult, AdoptError> {
-    let fail = |e: torrentd_pool::PoolError| AdoptError::Internal {
-        detail: internal("reading the pool index", e),
-    };
+    let fail = |e: torrentd_pool::PoolError| Internal::new("reading the pool index", e);
     let targets: Vec<String> = match &req.selector {
         AdoptSelector::Infohashes { infohashes } => {
             infohashes.iter().map(InfoHashHex::to_string).collect()
@@ -1095,8 +1080,7 @@ fn adopt_each(
     let targets = targets
         .into_iter()
         .map(|ih| hex(&ih).map(|infohash| (ih, infohash)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|detail| AdoptError::Internal { detail })?;
+        .collect::<Result<Vec<_>, _>>()?;
 
     // The fast path trusts the previous client's "complete" only as far as
     // the index is fresh, and the scan may be weeks old: payload rewritten in
@@ -1107,9 +1091,7 @@ fn adopt_each(
     let selected: Vec<String> = targets.iter().map(|(ih, _)| ih.clone()).collect();
     let drift = pool
         .check_drift_before_adopt(&selected)
-        .map_err(|e| AdoptError::Internal {
-            detail: internal("the drift check before adopting", e),
-        })?;
+        .map_err(|e| Internal::new("the drift check before adopting", e))?;
     // What the pass could not see — an unreadable or unmounted root or disk,
     // or a file it could not stat — it leaves `matched`, which the planner
     // would fast-path on a claim nobody checked. Refused instead, until the
@@ -1544,8 +1526,8 @@ pub enum StepStatus {
 }
 
 /// A string the pool index holds that this build has no name for.
-fn unknown(what: &str, value: &str) -> String {
-    internal(
+fn unknown(what: &str, value: &str) -> Internal {
+    Internal::new(
         "reading a plan",
         format!("the pool index holds {what} {value:?}, which this build does not know"),
     )
@@ -1616,7 +1598,7 @@ pub struct StepCounts {
 impl StepCounts {
     /// The counts of `rows`, `(status, count)` pairs as the pool index holds
     /// them.
-    fn of(rows: Vec<(String, u64)>) -> Result<Self, String> {
+    fn of(rows: Vec<(String, u64)>) -> Result<Self, Internal> {
         let mut c = Self::default();
         for (status, n) in rows {
             let slot = match status
@@ -1646,7 +1628,7 @@ fn plan_steps_listing(id: i64) -> String {
 }
 
 /// A step row as the API shows it.
-fn step_of(s: torrentd_pool::model::PlanStepRow) -> Result<PlanStep, String> {
+fn step_of(s: torrentd_pool::model::PlanStepRow) -> Result<PlanStep, Internal> {
     Ok(PlanStep {
         op: s.op.parse().map_err(|_| unknown("step op", &s.op))?,
         status: s
@@ -1689,7 +1671,7 @@ fn unix(secs: i64) -> jiff::Timestamp {
     jiff::Timestamp::from_second(secs).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
 }
 
-fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, String> {
+fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, Internal> {
     Ok(PlanSummary {
         id: p.id,
         kind: p.kind.parse().map_err(|_| unknown("plan kind", &p.kind))?,
@@ -1704,7 +1686,7 @@ fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, String> 
 
 /// A plan as the API shows it, or `None` when there is no such plan.
 ///
-/// `Err` is the `detail` of a `500 internal`.
+/// `Err` is a `500 internal`.
 ///
 /// Read on the read connection, in one snapshot, so the counts, the inline
 /// steps, and the generation its confirm token binds are the same commit's; a
@@ -1712,8 +1694,8 @@ fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, String> 
 /// [`PLAN_STEPS_INLINE`] steps at most, whatever the plan's size; only a
 /// plan that deletes data reads every step, to derive its token, and none
 /// of them reaches the body. Blocking: call it on the blocking pool.
-fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
-    let fail = |e: torrentd_pool::PoolError| internal("reading a plan", e);
+fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, Internal> {
+    let fail = |e: torrentd_pool::PoolError| Internal::new("reading a plan", e);
     let read = pool
         .with_reader(|st| -> Result<_, torrentd_pool::PoolError> {
             let Some(row) = st.plan(id)? else {
@@ -1741,7 +1723,7 @@ fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
     let head = head
         .into_iter()
         .map(step_of)
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, Internal>>()?;
     let (steps, steps_next_cursor) = paginate(
         &plan_steps_listing(id),
         head,
@@ -1798,17 +1780,14 @@ pub async fn list_plans(
     invalid.finish()?;
     let mut rows = blocking(move || pool.with_reader(|st| st.plans()))
         .await
-        .map_err(|e| ListError::Internal {
-            detail: internal("listing plans", e),
-        })?;
+        .map_err(|e| Internal::new("listing plans", e))?;
     rows.sort_by_key(|p| p.id);
     let want = q.status.map(|status| status.to_string());
     let items = rows
         .iter()
         .filter(|p| want.as_deref().is_none_or(|want| p.status == want))
         .map(summary_of)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|detail| ListError::Internal { detail })?;
+        .collect::<Result<Vec<_>, _>>()?;
     let (items, next_cursor) = paginate(LISTING, items, |p| plan_key(p.id), &page);
     Ok(Json(PlanPage { items, next_cursor }))
 }
@@ -1884,9 +1863,9 @@ pub enum CreatePlanError {
     #[problem(status = 409, title = "The plan was refused")]
     PlanRefused(String),
     /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 /// Compute a mutation plan.
@@ -1926,9 +1905,7 @@ fn create_plan_blocking(
     spec: torrentd_pool::PlanSpec,
 ) -> Result<Created<Json<Plan>>, CreatePlanError> {
     let kind = spec.kind();
-    let fail = |e: &dyn fmt::Display| CreatePlanError::Internal {
-        detail: internal("creating a plan", e),
-    };
+    let fail = |e: &dyn fmt::Display| Internal::new("creating a plan", e);
 
     let id = match pool.create_plan(&spec).map_err(|e| fail(&e))? {
         Ok(id) => id,
@@ -1937,9 +1914,7 @@ fn create_plan_blocking(
         Err(refused) => return Err(CreatePlanError::PlanRefused(refused.to_string())),
     };
 
-    let plan = load_plan(pool, id)
-        .map_err(|detail| CreatePlanError::Internal { detail })?
-        .ok_or_else(|| fail(&"the plan vanished as it was created"))?;
+    let plan = load_plan(pool, id)?.ok_or_else(|| fail(&"the plan vanished as it was created"))?;
     info!(
         target: "torrentd::http::pool",
         plan_id = id,
@@ -1966,9 +1941,9 @@ pub enum GetPlanError {
     #[problem(status = 404, title = "Plan not found")]
     PlanNotFound,
     /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 /// Describe a mutation plan.
@@ -1985,8 +1960,7 @@ pub async fn get_plan(
 ) -> Result<Json<Plan>, GetPlanError> {
     let pool = s.pool.clone().ok_or(GetPlanError::PoolNotConfigured)?;
     blocking(move || load_plan(&pool, p.plan_id))
-        .await
-        .map_err(|detail| GetPlanError::Internal { detail })?
+        .await?
         .map(Json)
         .ok_or(GetPlanError::PlanNotFound)
 }
@@ -2007,14 +1981,14 @@ pub enum ListPlanStepsError {
     #[error("no such plan")]
     #[problem(status = 404, title = "Plan not found")]
     PlanNotFound,
+    /// The pool index failed; the daemon's log has the cause.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// A query parameter breaks a documented constraint.
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 impl From<InvalidCursor> for ListPlanStepsError {
@@ -2084,15 +2058,12 @@ pub async fn list_plan_steps(
         })
     })
     .await
-    .map_err(|e| ListPlanStepsError::Internal {
-        detail: internal("listing a plan's steps", e),
-    })?
+    .map_err(|e| Internal::new("listing a plan's steps", e))?
     .ok_or(ListPlanStepsError::PlanNotFound)?;
     let items = rows
         .into_iter()
         .map(step_of)
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(|detail| ListPlanStepsError::Internal { detail })?;
+        .collect::<Result<Vec<_>, Internal>>()?;
     let (items, next_cursor) = paginate(&listing, items, |s: &PlanStep| plan_key(s.seq), &page);
     Ok(Json(PlanStepPage { items, next_cursor }))
 }
@@ -2118,9 +2089,9 @@ pub enum DeletePlanError {
     #[problem(status = 409, title = "The plan is being applied")]
     PlanApplying,
     /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 /// Discard a mutation plan.
@@ -2140,9 +2111,7 @@ pub async fn delete_plan(
     Path(p): Path<PlanPath>,
 ) -> Result<NoContent, DeletePlanError> {
     let pool = s.pool.clone().ok_or(DeletePlanError::PoolNotConfigured)?;
-    let fail = |e: torrentd_pool::PoolError| DeletePlanError::Internal {
-        detail: internal("discarding a plan", e),
-    };
+    let fail = |e: torrentd_pool::PoolError| Internal::new("discarding a plan", e);
     // One conditional statement on the writer: the status that refuses a plan
     // mid-apply is the one the delete acts on, with no window for an apply to
     // claim the plan between a read and the delete.
@@ -2217,9 +2186,9 @@ pub enum ApplyPlanError {
     #[problem(status = 422, title = "The confirm token does not match")]
     ConfirmTokenMismatch,
     /// The pool index failed; the daemon's log has the cause.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 /// Whether a plan in `status` can be claimed for an apply.
@@ -2261,8 +2230,7 @@ pub async fn apply_plan(
     let id = p.plan_id;
     let reader = Arc::clone(&pool);
     let plan = blocking(move || load_plan(&reader, id))
-        .await
-        .map_err(|detail| ApplyPlanError::Internal { detail })?
+        .await?
         .ok_or(ApplyPlanError::PlanNotFound)?;
     if !applicable(plan.status) {
         return Err(ApplyPlanError::PlanNotDraft(format!(
@@ -2288,10 +2256,9 @@ pub async fn apply_plan(
         let expected = blocking(move || {
             writer
                 .confirm_token(id)
-                .map_err(|e| internal("reading a plan", e))
+                .map_err(|e| Internal::new("reading a plan", e))
         })
-        .await
-        .map_err(|detail| ApplyPlanError::Internal { detail })?;
+        .await?;
         if got != expected {
             return Err(ApplyPlanError::ConfirmTokenMismatch);
         }
@@ -2311,9 +2278,7 @@ pub async fn apply_plan(
         crate::apply::apply(&worker, &source, &state, id, &|| work.is_cancelled())
     })
     .await
-    .map_err(|e| ApplyPlanError::Internal {
-        detail: internal("applying a plan", e),
-    })?;
+    .map_err(|e| Internal::new("applying a plan", e))?;
 
     match outcome {
         Ok(o) => Ok(Json(ApplyOutcome {
@@ -2321,9 +2286,10 @@ pub async fn apply_plan(
             done: count(o.done),
             failed: count(o.failed),
             skipped: count(o.skipped),
-            status: o.status.parse().map_err(|_| ApplyPlanError::Internal {
-                detail: unknown("plan status", &o.status),
-            })?,
+            status: o
+                .status
+                .parse()
+                .map_err(|_| unknown("plan status", &o.status))?,
         })),
         // The executor reports every refusal as prose. Another request
         // claiming the plan between the check above and the executor's own

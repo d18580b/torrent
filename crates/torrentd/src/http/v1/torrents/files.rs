@@ -21,7 +21,7 @@ use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::internal;
+use crate::http::v1::common::Internal;
 use crate::http::v1::Torrents;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
@@ -90,6 +90,10 @@ pub enum ListFilesError {
     #[error("the cursor is not one this listing issued; start again without it")]
     #[problem(status = 400, title = "Invalid cursor")]
     InvalidCursor,
+    /// The session could not be asked.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// No loaded torrent has this infohash, or its profile has no session.
     #[error(transparent)]
     #[problem(transparent)]
@@ -102,10 +106,6 @@ pub enum ListFilesError {
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// The session could not be asked.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// List a torrent's files.
@@ -152,11 +152,7 @@ pub async fn list_torrent_files(
         Ok(Some(files)) => files,
         Ok(None) => return Err(ListFilesError::MetadataPending),
         Err(e) if e.is_gone() => return Err(Lookup::TorrentNotFound.into()),
-        Err(e) => {
-            return Err(ListFilesError::Internal {
-                detail: internal("listing the torrent's files", e),
-            })
-        }
+        Err(e) => return Err(Internal::new("listing the torrent's files", e).into()),
     };
     let next_cursor = files
         .files
@@ -195,6 +191,10 @@ impl Validate for FilePriority {
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetFilePriorityError {
+    /// The session refused the request.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// No loaded torrent has this infohash, or its profile has no session.
     #[error(transparent)]
     #[problem(transparent)]
@@ -211,10 +211,6 @@ pub enum SetFilePriorityError {
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// The session refused the request.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// Set a file's download priority.
@@ -239,11 +235,7 @@ pub async fn set_file_priority(
         Ok(Some(files)) => files.total as usize,
         Ok(None) => return Err(SetFilePriorityError::MetadataPending),
         Err(e) if e.is_gone() => return Err(Lookup::TorrentNotFound.into()),
-        Err(e) => {
-            return Err(SetFilePriorityError::Internal {
-                detail: internal("listing the torrent's files", e),
-            })
-        }
+        Err(e) => return Err(Internal::new("listing the torrent's files", e).into()),
     };
     let index = i32::try_from(p.index)
         .ok()
@@ -254,9 +246,7 @@ pub async fn set_file_priority(
         Ok(()) => Ok(NoContent),
         // Removed between the count and the set.
         Err(e) if is_gone(&e) => Err(Lookup::TorrentNotFound.into()),
-        Err(e) => Err(SetFilePriorityError::Internal {
-            detail: internal("setting the file's priority", e),
-        }),
+        Err(e) => Err(Internal::new("setting the file's priority", e).into()),
     }
 }
 

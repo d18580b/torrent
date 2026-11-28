@@ -103,24 +103,6 @@ pub enum ProfileUnavailableReason {
     Offline,
 }
 
-impl ProfileUnavailableReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Failed => "failed",
-            Self::VpnDown => "vpn_down",
-            Self::Offline => "offline",
-        }
-    }
-}
-
-/// The `profile_status` extension member, which kynos attaches as JSON.
-/// Through serde, so the wire and the `Schema` derive read the same spelling.
-impl From<ProfileUnavailableReason> for serde_json::Value {
-    fn from(r: ProfileUnavailableReason) -> Self {
-        serde_json::to_value(r).expect("a unit variant serializes")
-    }
-}
-
 /// Why a request naming a profile cannot proceed.
 ///
 /// An operation's error enum holds it as
@@ -239,10 +221,96 @@ pub fn unfenced_engine(
 /// `detail` a `500 internal` carries: the attempt, never the cause.
 ///
 /// The cause can name paths and engine state an API caller has no business
-/// reading; the log has it.
+/// reading; the log has it. A `500` is built with [`Internal::new`], which
+/// calls this; a refusal reported inside a successful answer calls it
+/// directly.
+///
+/// The cause is logged here rather than handed to kynos as a `#[source]`:
+/// kynos' own `ERROR` line for a 5xx (target `kynos::error`) records its
+/// error as one field, and the daemon's JSON log writes only that error's
+/// own message, never its `source()` chain.
 pub fn internal(attempt: &str, cause: impl fmt::Display) -> String {
     error!(target: "torrentd::http", attempt, error.cause = %cause, "internal failure");
     format!("{attempt} failed; the daemon's log has the cause")
+}
+
+/// A failure inside the daemon: `500 internal`.
+///
+/// Every operation that can fail this way holds it as
+/// `#[problem(transparent)] Internal(#[from] Internal)`, so the `500` is
+/// declared here once. The variant goes before any other transparent one:
+/// kynos describes a transparent variant's statuses after every declared
+/// variant's, in the order the variants are written, and that is where the
+/// `500` stood when each enum declared it itself.
+///
+/// The other failures several operations share (`PoolNotConfigured`,
+/// `PlanNotFound`, `InvalidCursor`, `ProfileNotFound`, `ProfileUnavailable`,
+/// `TorrentNotFound`) stay declared in each enum. By the same rule, holding
+/// one transparently would move its status, or its title, behind the
+/// operation's own variants on several operations, and changing that order
+/// changes the published document. Some also differ in their detail from one
+/// operation to the next.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 500, title = "Internal error")]
+#[error("{detail}")]
+pub struct Internal {
+    detail: String,
+}
+
+impl Internal {
+    /// The failure of `attempt`, its cause logged and kept out of the detail
+    /// (see [`internal`]).
+    pub fn new(attempt: &str, cause: impl fmt::Display) -> Self {
+        Self {
+            detail: internal(attempt, cause),
+        }
+    }
+
+    /// A failure whose detail is written for the caller in full, its causes
+    /// already logged or counted where they happened.
+    pub fn detailed(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+
+    /// This failure, its detail followed by `more`: what the request did
+    /// before it failed, and what to do about it.
+    pub fn then(self, more: impl fmt::Display) -> Self {
+        Self {
+            detail: format!("{} {more}", self.detail),
+        }
+    }
+}
+
+/// Hold `log`, the daemon's log captured while `resp`'s request ran, to
+/// where a `500 internal`'s cause goes: [`internal`]'s line carries it, and
+/// neither the answer nor kynos' own line for the 5xx does.
+///
+/// kynos' line (target `kynos::error`) records the failure as an error
+/// field, and the daemon's JSON log writes only that error's message, never
+/// its `source()` chain, so a cause held as a `#[source]` would reach no
+/// line at all.
+#[cfg(test)]
+pub(crate) fn assert_cause_only_logged(resp: &kynos::test::TestResponse, log: &str) {
+    let detail = resp.problem().detail.unwrap();
+    let errors: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|l: &serde_json::Value| l["level"] == "ERROR")
+        .collect();
+    let attempt = errors
+        .iter()
+        .find(|l| l["target"] == "torrentd::http" && l["message"] == "internal failure")
+        .unwrap_or_else(|| panic!("no line names the attempt:\n{log}"));
+    let cause = attempt["error.cause"].as_str().unwrap();
+    assert!(!cause.is_empty() && !detail.contains(cause), "{log}");
+    let kynos = errors
+        .iter()
+        .find(|l| l["target"] == "kynos::error")
+        .unwrap_or_else(|| panic!("kynos logged no line for the 5xx:\n{log}"));
+    assert_eq!(kynos["error"], detail.as_str(), "{log}");
 }
 
 #[cfg(test)]

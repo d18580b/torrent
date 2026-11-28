@@ -68,8 +68,8 @@ use torrentd_engine::TrackerEntry;
 use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Write;
-use crate::http::v1::common::internal;
 use crate::http::v1::common::InfoHashHex;
+use crate::http::v1::common::Internal;
 use crate::http::v1::Testing;
 use crate::http::validate::Unenforced;
 use crate::http::validate::ValidationFailed;
@@ -328,6 +328,10 @@ pub enum Fault {
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum FaultError {
+    /// The profile's session is not a fault engine.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// A value is outside what the fault accepts.
     #[error(transparent)]
     #[problem(transparent)]
@@ -336,10 +340,6 @@ pub enum FaultError {
     #[error("no live profile {0:?}")]
     #[problem(status = 404, title = "Profile not found")]
     ProfileNotFound(String),
-    /// The profile's session is not a fault engine.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 fn invalid(pointer: &str, detail: String) -> FaultError {
@@ -500,11 +500,12 @@ fn engine(state: &AppState, profile_id: &str) -> Result<Arc<FaultEngine>, FaultE
     let Some(engine) = state.source.engine_for(&ProfileId::new(profile_id)) else {
         return Err(FaultError::ProfileNotFound(profile_id.to_owned()));
     };
-    FaultEngine::find(&engine).ok_or_else(|| FaultError::Internal {
-        detail: internal(
+    FaultEngine::find(&engine).ok_or_else(|| {
+        Internal::new(
             "injecting a fault",
             format!("profile {profile_id:?} has no fault engine"),
-        ),
+        )
+        .into()
     })
 }
 

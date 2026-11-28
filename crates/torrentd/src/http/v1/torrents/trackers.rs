@@ -15,7 +15,7 @@ use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::internal;
+use crate::http::v1::common::Internal;
 use crate::http::v1::Torrents;
 
 /// Where a tracker stands.
@@ -121,14 +121,14 @@ pub struct TrackerList {
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListTrackersError {
+    /// The session could not be asked.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// No loaded torrent has this infohash, or its profile has no session.
     #[error(transparent)]
     #[problem(transparent)]
     Lookup(#[from] Lookup),
-    /// The session could not be asked.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// List a torrent's trackers.
@@ -147,11 +147,7 @@ pub async fn list_torrent_trackers(
     let trackers = match blocking(move || engine.torrent_trackers(st.handle)).await {
         Ok(trackers) => trackers,
         Err(e) if is_gone(&e) => return Err(Lookup::TorrentNotFound.into()),
-        Err(e) => {
-            return Err(ListTrackersError::Internal {
-                detail: internal("listing the torrent's trackers", e),
-            })
-        }
+        Err(e) => return Err(Internal::new("listing the torrent's trackers", e).into()),
     };
     Ok(Json(TrackerList {
         items: trackers.into_iter().map(Tracker::from).collect(),
