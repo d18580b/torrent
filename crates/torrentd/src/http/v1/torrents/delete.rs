@@ -172,7 +172,7 @@ pub async fn delete_torrent(
             refuse_co_claimants(pool.with_reader(|st| st.co_claimants(&hex)))?;
         }
     }
-    let profile = s.registry.lookup(&ih).ok_or(TorrentNotFound)?;
+    let profile = s.registry.lookup(&ih).ok_or(TorrentNotFound::UNASSIGNED)?;
     let Some(engine) = s.source.engine_for(&profile) else {
         return clear_sessionless(&s, &ih, &profile, delete_files);
     };

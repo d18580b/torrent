@@ -153,7 +153,7 @@ pub async fn list_torrent_files(
     let files = match blocking_files(&engine, st.handle, start, limit).await {
         Ok(Some(files)) => files,
         Ok(None) => return Err(ListFilesError::MetadataPending),
-        Err(e) if e.is_gone() => return Err(Lookup::from(TorrentNotFound).into()),
+        Err(e) if e.is_gone() => return Err(Lookup::from(TorrentNotFound::NOT_LOADED).into()),
         Err(e) => return Err(Internal::new("listing the torrent's files", e).into()),
     };
     let next_cursor = files
@@ -236,7 +236,7 @@ pub async fn set_file_priority(
     let count = match blocking_files(&engine, st.handle, 0, 0).await {
         Ok(Some(files)) => files.total as usize,
         Ok(None) => return Err(SetFilePriorityError::MetadataPending),
-        Err(e) if e.is_gone() => return Err(Lookup::from(TorrentNotFound).into()),
+        Err(e) if e.is_gone() => return Err(Lookup::from(TorrentNotFound::NOT_LOADED).into()),
         Err(e) => return Err(Internal::new("listing the torrent's files", e).into()),
     };
     let index = i32::try_from(p.index)
@@ -247,7 +247,7 @@ pub async fn set_file_priority(
     match blocking(move || engine.set_file_priority(st.handle, index, priority)).await {
         Ok(()) => Ok(NoContent),
         // Removed between the count and the set.
-        Err(e) if is_gone(&e) => Err(Lookup::from(TorrentNotFound).into()),
+        Err(e) if is_gone(&e) => Err(Lookup::from(TorrentNotFound::NOT_LOADED).into()),
         Err(e) => Err(Internal::new("setting the file's priority", e).into()),
     }
 }

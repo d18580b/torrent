@@ -213,7 +213,7 @@ pub async fn get_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Json<Torrent>, GetTorrentError> {
     let ih = p.infohash.get();
-    let profile = s.registry.lookup(&ih).ok_or(TorrentNotFound)?;
+    let profile = s.registry.lookup(&ih).ok_or(TorrentNotFound::UNASSIGNED)?;
     let details = match s.state.get(&ih) {
         Some(st) => details_of(&s, &profile, st.handle).await,
         None => None,

@@ -26,7 +26,7 @@ use crate::http::v1::common::ProfileUnavailable;
 /// Keyed on the state map: these act through a handle, and a torrent with no
 /// state entry has none.
 fn loaded(s: &AppState, ih: InfoHash) -> Result<(TorrentState, Arc<dyn TorrentEngine>), Lookup> {
-    let st = s.state.get(&ih).ok_or(TorrentNotFound)?;
+    let st = s.state.get(&ih).ok_or(TorrentNotFound::NOT_LOADED)?;
     let engine = engine_for(s, &st.profile_id).map_err(|_| Lookup::no_session())?;
     Ok((st, engine))
 }
@@ -42,7 +42,10 @@ fn loaded_unfenced(
     s: &AppState,
     ih: InfoHash,
 ) -> Result<(TorrentState, Arc<dyn TorrentEngine>), UnfencedLookup> {
-    let st = s.state.get(&ih).ok_or(Lookup::from(TorrentNotFound))?;
+    let st = s
+        .state
+        .get(&ih)
+        .ok_or(Lookup::from(TorrentNotFound::NOT_LOADED))?;
     let engine = unfenced_engine(s, &st.profile_id).map_err(|p| match p {
         ProfileProblem::ProfileNotFound(_) => UnfencedLookup::Lookup(Lookup::no_session()),
         ProfileProblem::ProfileUnavailable(p) => p.into(),
@@ -50,17 +53,32 @@ fn loaded_unfenced(
     Ok((st, engine))
 }
 
-/// No torrent with this infohash is assigned to any profile, or its session
-/// no longer holds it: `404`.
+/// No torrent with this infohash is assigned to any profile, or none is
+/// loaded in a session: `404`.
 ///
 /// An operation that can fail this way holds it as
 /// `#[problem(transparent)] TorrentNotFound(#[from] TorrentNotFound)`, or
-/// through [`Lookup`].
+/// through [`Lookup`]. Build it as [`TorrentNotFound::UNASSIGNED`] or
+/// [`TorrentNotFound::NOT_LOADED`], whichever the caller checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 #[problem(status = 404, title = "Torrent not found")]
-#[error("no torrent with this infohash")]
-pub struct TorrentNotFound;
+#[error("{detail}")]
+pub struct TorrentNotFound {
+    detail: &'static str,
+}
+
+impl TorrentNotFound {
+    /// The registry assigns no profile this infohash.
+    pub const UNASSIGNED: Self = Self {
+        detail: "no torrent with this infohash",
+    };
+    /// No session holds this infohash: unassigned, assigned but not yet (or
+    /// never) loaded, or dropped by its session mid-request.
+    pub const NOT_LOADED: Self = Self {
+        detail: "no loaded torrent with this infohash",
+    };
+}
 
 /// Why [`loaded`] found no torrent to act on.
 ///
@@ -69,7 +87,7 @@ pub struct TorrentNotFound;
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum Lookup {
-    /// No loaded torrent has this infohash.
+    /// No loaded torrent has this infohash: [`TorrentNotFound::NOT_LOADED`].
     #[error(transparent)]
     #[problem(transparent)]
     TorrentNotFound(#[from] TorrentNotFound),

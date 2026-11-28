@@ -147,7 +147,7 @@ pub async fn list_torrent_trackers(
     let (st, engine) = loaded(&s, p.infohash.get())?;
     let trackers = match blocking(move || engine.torrent_trackers(st.handle)).await {
         Ok(trackers) => trackers,
-        Err(e) if is_gone(&e) => return Err(Lookup::from(TorrentNotFound).into()),
+        Err(e) if is_gone(&e) => return Err(Lookup::from(TorrentNotFound::NOT_LOADED).into()),
         Err(e) => return Err(Internal::new("listing the torrent's trackers", e).into()),
     };
     Ok(Json(TrackerList {
