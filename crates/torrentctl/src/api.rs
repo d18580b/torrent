@@ -2,8 +2,6 @@
 
 use std::time::Duration;
 
-use generated::ExposeSecret as _;
-
 /// The client spargen generates from `docs/api/openapi.json` at build time.
 #[allow(
     clippy::all,
@@ -300,32 +298,10 @@ impl generated::Middleware for Traced {
     }
 }
 
-/// Send a request [`Api::post`] built, as the generated client sends its
-/// own: with a fresh [`traceparent`], and logged.
-pub async fn send(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
-    let (client, request) = request.build_split();
-    let mut request = request?;
-    let traceparent = stamp(request.headers_mut());
-    let method = request.method().clone();
-    let path = request.url().path().to_owned();
-    let started = std::time::Instant::now();
-    let outcome = client.execute(request).await;
-    let logged = match &outcome {
-        Ok(response) => Ok((response.status().as_u16(), request_id(response.headers()))),
-        Err(e) => Err(root_cause(e)),
-    };
-    record(&method, &path, &traceparent, started, logged);
-    outcome
-}
-
 /// Where the daemon is and how to authenticate to it.
 #[derive(Clone)]
 pub struct Api {
     pub client: Client,
-    /// The HTTP client the generated one executes on, for the requests
-    /// [`Api::post`] builds by hand: the generated client builds its own
-    /// requests on a default one.
-    http: reqwest::Client,
     /// The URL the client talks to, for the header.
     pub base_url: String,
     /// Bumped whenever the credential changes, so what holds a copy — the
@@ -501,7 +477,7 @@ impl Api {
             }
         };
         let backend = generated::MiddlewareBackend::new(std::sync::Arc::new(
-            generated::ReqwestBackend::new(http.clone()),
+            generated::ReqwestBackend::new(http),
         ))
         .layer(std::sync::Arc::new(Traced));
         let mut client = Client::with_backend(std::sync::Arc::new(backend), origin)
@@ -511,7 +487,6 @@ impl Api {
         }
         Ok(Self {
             client,
-            http,
             base_url: base_url.to_owned(),
             epoch: 0,
         })
@@ -522,34 +497,6 @@ impl Api {
         let mut api = Self::new(&self.base_url, Some(token))?;
         api.epoch = self.epoch + 1;
         Ok(api)
-    }
-
-    /// A `POST` to the path `segments` names under the daemon's URL, built
-    /// by hand through the generated client's own HTTP client, base URL and
-    /// credential, for a request the generated client cannot send. Fails
-    /// only when the URL cannot take a path. Send it with [`send`], so it
-    /// carries a `traceparent` and is logged.
-    #[allow(
-        clippy::result_large_err,
-        reason = "a Failure is built once per failed request and moved straight to the UI"
-    )]
-    pub fn post(&self, segments: &[&str]) -> Result<reqwest::RequestBuilder, Failure> {
-        let core = self.client.core();
-        let mut url = core.base_url().clone();
-        url.path_segments_mut()
-            .map_err(|()| {
-                Failure::local(
-                    "Invalid daemon URL",
-                    Some(format!("{} cannot take a path", core.base_url())),
-                )
-            })?
-            .pop_if_empty()
-            .extend(segments);
-        let mut request = self.http.post(url);
-        if let Some(generated::Credential::Bearer(token)) = core.credential("bearer") {
-            request = request.bearer_auth(token.expose_secret());
-        }
-        Ok(request)
     }
 }
 
@@ -1098,36 +1045,6 @@ mod tests {
                 "the token is never logged: {line}"
             );
         }
-    }
-
-    /// A request [`Api::post`] builds is sent the same way: traced, logged,
-    /// and on the same socket and credential.
-    #[tokio::test]
-    async fn a_hand_built_post_is_traced_and_logged_too() {
-        let log = Captured::default();
-        let _log = log.install();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("api.sock");
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let server = serve(listener, 1, "400 Bad Request", "{}".to_owned());
-
-        let api = Api::new(&format!("unix:{}", path.display()), Some("tdp_sock")).unwrap();
-        let response = send(api.post(&["v1", "torrents"]).unwrap().json(&json!({})))
-            .await
-            .expect("answered");
-        assert_eq!(response.status().as_u16(), 400);
-        let heads = server.await.unwrap();
-        let head = &heads[0];
-        assert!(head.starts_with("post /v1/torrents http/1.1\r\n"), "{head}");
-        assert_eq!(header(head, "authorization"), "bearer tdp_sock");
-        let traceparent = header(head, "traceparent");
-        let text = log.text();
-        let line = text
-            .lines()
-            .find(|l| l.contains(traceparent))
-            .unwrap_or_else(|| panic!("no log line for {traceparent}: {text}"));
-        assert!(line.contains("request_id=\"req-0\""), "{line}");
-        assert!(line.contains("status=400"), "{line}");
     }
 
     /// A request that never reached the daemon is logged with its cause.
