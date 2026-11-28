@@ -78,14 +78,15 @@ mod test_support;
 use cleanup::BootCleanup;
 use http_stage::announce_ready;
 use http_stage::bind_api_listener;
+#[cfg(test)]
 pub(crate) use http_stage::http_server;
 use http_stage::run_http_stage;
+#[cfg(test)]
+pub(crate) use http_stage::serve_on;
 use http_stage::serve_until_shutdown;
 use http_stage::unauthenticated_posture;
-use http_stage::ApiListener;
-use http_stage::HTTP_DRAIN_TIMEOUT;
-use http_stage::HTTP_HEADER_READ_TIMEOUT;
-use http_stage::HTTP_MAX_CONNECTIONS;
+#[cfg(test)]
+pub(crate) use http_stage::ApiListener;
 pub(crate) use limits::descriptors_needed;
 pub(crate) use limits::nofile_soft_limit;
 use limits::warn_if_descriptors_are_short;
@@ -1374,32 +1375,7 @@ impl DaemonHandle {
             app,
             |listener, app| async move {
                 announce_ready(&http_listen, posture, tx, alert, sink, boot);
-                match listener {
-                    ApiListener::Tcp(listener) => {
-                        serve_until_shutdown(listener, app, shutdown_rx, gate).await
-                    }
-                    ApiListener::Unix(socket) => {
-                        let work = Arc::clone(gate);
-                        crate::api_socket::serve(
-                            socket,
-                            app,
-                            shutdown_rx,
-                            move || {
-                                // As the TCP server's graceful-shutdown hook.
-                                work.cancel();
-                                sd_notify::stopping();
-                                sd_notify::status("draining HTTP requests");
-                            },
-                            crate::api_socket::Limits {
-                                max_connections: HTTP_MAX_CONNECTIONS.get(),
-                                header_read_timeout: HTTP_HEADER_READ_TIMEOUT,
-                                drain_timeout: HTTP_DRAIN_TIMEOUT,
-                            },
-                        )
-                        .await;
-                        0
-                    }
-                }
+                serve_until_shutdown(listener, app, shutdown_rx, gate).await
             },
             &shutdown_tx,
         )

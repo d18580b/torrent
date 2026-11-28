@@ -122,7 +122,7 @@ where
 /// between `boot`'s `disarm` and its teardown: a failure to bind skips this
 /// and nothing else.
 pub(super) async fn serve_until_shutdown(
-    listener: tokio::net::TcpListener,
+    listener: ApiListener,
     app: kynos::router::service::Service<http::ctx::AppCtx>,
     shutdown_rx: broadcast::Receiver<ShutdownReason>,
     work: &Arc<crate::app_state::WorkGate>,
@@ -148,7 +148,7 @@ pub(super) async fn serve_until_shutdown(
 
 /// The API's bound listener: a TCP socket, or a unix one.
 #[derive(Debug)]
-pub(super) enum ApiListener {
+pub(crate) enum ApiListener {
     Tcp(tokio::net::TcpListener),
     Unix(crate::api_socket::ApiSocket),
 }
@@ -254,41 +254,72 @@ pub(super) fn announce_ready(
 /// One run of the HTTP server on `listener`, to a signalled drain or its own
 /// failure.
 async fn serve_once(
-    listener: tokio::net::TcpListener,
+    listener: ApiListener,
     app: kynos::router::service::Service<http::ctx::AppCtx>,
-    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
+    shutdown_rx: broadcast::Receiver<ShutdownReason>,
     work: &Arc<crate::app_state::WorkGate>,
 ) -> kynos::Result<()> {
     let work = Arc::clone(work);
-    // kynos takes the standard library's listener and registers it with the
-    // runtime itself.
-    let listener = listener
-        .into_std()
-        .map_err(|e| kynos::Error::Server(kynos::server::error::ServerError::Listener(e)))?;
-    http_server(app)
-        .listener(listener)
+    serve_on(listener, http_server(app), shutdown_rx, move || {
+        // Latched first, so an apply still running stops at its next step
+        // and a `/v1/events` stream opened from here on ends at once.
+        work.cancel();
+        sd_notify::stopping();
+        sd_notify::status("draining HTTP requests");
+    })
+    .await
+}
+
+/// Serve `server` on `listener` until a shutdown arrives on `shutdown_rx`,
+/// then run `on_shutdown` and drain the open connections for up to
+/// [`HTTP_DRAIN_TIMEOUT`].
+///
+/// A TCP listener and a unix socket are served alike: kynos holds both to the
+/// server's connection cap and protocol settings, and asks both to close on
+/// the drain. A unix socket's file is removed once the server has stopped,
+/// so the configured path names the socket for as long as it is served.
+pub(crate) async fn serve_on(
+    listener: ApiListener,
+    server: kynos::server::Server<http::ctx::AppCtx>,
+    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
+    on_shutdown: impl FnOnce() + Send + 'static,
+) -> kynos::Result<()> {
+    let (server, socket_file) = match listener {
+        ApiListener::Tcp(listener) => {
+            // kynos takes the standard library's listener and registers it
+            // with the runtime itself.
+            let listener = listener.into_std().map_err(|e| {
+                kynos::Error::Server(kynos::server::error::ServerError::Listener(e))
+            })?;
+            (server.listener(listener), None)
+        }
+        ApiListener::Unix(socket) => {
+            let (listener, file) = socket.into_parts();
+            (server.unix_listener(listener), Some(file))
+        }
+    };
+    let served = server
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             // ignore-result: a reason, a lag and a closed sender all mean
             // shut down.
             let _ = shutdown_rx.recv().await;
-            // Latched first, so an apply still running stops at its next step
-            // and a `/v1/events` stream opened from here on ends at once.
-            work.cancel();
-            sd_notify::stopping();
-            sd_notify::status("draining HTTP requests");
+            on_shutdown();
         }))
         // Explicit rather than kynos's 25 s default: the drain is one stage
         // of a stop budget (`deploy/torrentd.service` `TimeoutStopSec`) that
         // the pool-work wait, the resume drain and the teardown share.
         .shutdown_timeout(HTTP_DRAIN_TIMEOUT)
         .serve()
-        .await
+        .await;
+    // The listener closed when the drain began, so nothing is left to
+    // connect to at the path.
+    drop(socket_file);
+    served
 }
 
 /// The server `serve_once` runs for `app`, with every connection and request
-/// bound it sets but the listener and the drain. Shared with the unix-socket
-/// listener (`api_socket::serve`), so a socket connection is served under the
-/// same protocol settings, and with the HTTP tests' stalled-body harness, so
+/// bound it sets but the listener and the drain, on a TCP listener and a
+/// unix socket alike. Shared with the HTTP tests' stalled-body harness, so
 /// the bounds a stalled request meets there are the ones production sets.
 pub(crate) fn http_server(
     app: kynos::router::service::Service<http::ctx::AppCtx>,

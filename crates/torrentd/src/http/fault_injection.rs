@@ -624,6 +624,8 @@ pub(crate) async fn scenarios(cov: &Arc<crate::http::tests::support::Coverage>) 
         )
         .await;
     assert_problem(&resp, 403, "insufficient-scope");
+    // ... and refused from the request head, ahead of the body limit.
+    crate::http::tests::support::assert_refused_before_body(&h, "POST", "/v1/faults").await;
     h.assert_conformance();
 
     // A profile whose session is not a fault engine is the daemon's fault.

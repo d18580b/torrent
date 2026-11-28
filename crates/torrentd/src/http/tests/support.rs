@@ -514,8 +514,8 @@ pub fn profile_status(resp: &TestResponse) -> String {
 
 /// Assert `resp` refused a valid credential for a scope it lacks: a `403`
 /// `insufficient-scope` carrying RFC 6750's `insufficient_scope` challenge,
-/// whether the operation's `Scoped` argument or the head-time
-/// `Authorized` interceptor refused it.
+/// whether the operation's `Scoped` argument refused it from the handler or,
+/// in a group that runs it first, from the request head.
 pub fn assert_scope_refused(resp: &TestResponse) {
     assert_problem(resp, 403, "insufficient-scope");
     assert_eq!(
@@ -523,4 +523,31 @@ pub fn assert_scope_refused(resp: &TestResponse) {
         Some("Bearer error=\"insufficient_scope\""),
         "a scope refusal carries the insufficient_scope challenge",
     );
+}
+
+/// Assert `method path` refuses a caller its guard does not admit from the
+/// request head, ahead of the body limit: a request declaring a body over
+/// every `/v1` limit, and sending none of it, is answered `401` with no
+/// credential and `403` with a `read` one, at once, rather than `413`.
+///
+/// A group that ran its body limit before the guard would answer `413` from
+/// the declared length; one that read the body first would wait out its
+/// deadline.
+pub async fn assert_refused_before_body(h: &Harness, method: &str, path: &str) {
+    let declared = u64::try_from(crate::http::v1::MAX_ADD_BODY_BYTES).unwrap() + 1;
+    for (token, expected, who) in [
+        (None, 401, "no credential"),
+        (Some(h.tokens.read.as_str()), 403, "a read credential"),
+    ] {
+        let (status, waited) = h.oversized_body(method, path, token, declared).await;
+        assert_eq!(
+            status.as_u16(),
+            expected,
+            "{method} {path}: oversized body with {who}, refused before the body limit",
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "{method} {path}: oversized body with {who} answered only after {waited:?}",
+        );
+    }
 }
