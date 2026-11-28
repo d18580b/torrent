@@ -37,13 +37,13 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // is listening.
     h.write("POST", "/v1/config/reload")
         .await
-        .assert_status(kynos::http::StatusCode::ACCEPTED);
+        .assert_status(202);
     let pending = h.write("POST", "/v1/config/reload").await;
     assert_problem(&pending, 409, "reload-pending");
     assert_eq!(rx.try_recv(), Ok(()), "the first request was queued");
     h.write("POST", "/v1/config/reload")
         .await
-        .assert_status(kynos::http::StatusCode::ACCEPTED);
+        .assert_status(202);
     assert_eq!(rx.try_recv(), Ok(()), "the third request was queued");
     rx.close();
     let _ = rx.recv().await;
@@ -85,7 +85,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     let resp = h
         .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
         .await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     resp.assert_header("content-type", "text/plain; version=0.0.4; charset=utf-8");
     assert!(resp.text().contains("alert_loop_heartbeat_age_seconds"));
 
@@ -99,7 +99,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     let resp = h
         .send("GET", "/metrics", Some(&h.tokens.metrics.clone()), None)
         .await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     assert!(resp
         .text()
         .contains("torrentd_metrics_dropped_samples_total{reason=\"encode\"} 1\n"));
@@ -107,25 +107,25 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // The document, unauthenticated and byte-identical to the committed one's
     // source.
     let resp = h.send("GET", "/v1/openapi.json", None, None).await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     assert_eq!(resp.text(), crate::http::document_json().unwrap());
 
     // The probes, unauthenticated: live and ready, then wedged and unready
     // once the heartbeat is stale, `/healthz` answering as `/readyz` does.
     for path in ["/livez", "/readyz", "/healthz"] {
         let resp = h.send("GET", path, None, None).await;
-        resp.assert_status(kynos::http::StatusCode::OK);
+        resp.assert_status(200);
     }
     h.state
         .alert_heartbeat
         .store(0, std::sync::atomic::Ordering::Relaxed);
     let resp = h.send("GET", "/livez", None, None).await;
-    resp.assert_status(kynos::http::StatusCode::SERVICE_UNAVAILABLE);
+    resp.assert_status(503);
     let body: serde_json::Value = resp.json();
     assert_eq!(body["failed"], "alert_loop_stalled");
     for path in ["/readyz", "/healthz"] {
         let resp = h.send("GET", path, None, None).await;
-        resp.assert_status(kynos::http::StatusCode::SERVICE_UNAVAILABLE);
+        resp.assert_status(503);
         let body: serde_json::Value = resp.json();
         assert_eq!(body["reason"], "alert_loop_stalled", "{path}");
     }
@@ -236,7 +236,7 @@ async fn events(cov: &Arc<Coverage>) {
         let _ = shutdown.send(torrentd_engine::ShutdownReason::Sigterm);
     });
     let resp = h.read("/v1/events").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let events = resp.events();
     let first = events.first().expect("at least one tick");
     assert_eq!(first.event.as_deref(), Some("tick"));
@@ -297,7 +297,7 @@ async fn event_streams_share_one_feed_that_stops_with_the_last_and_free_their_sl
     };
     let (streams, ()) = tokio::join!(streams, while_open);
     for resp in streams {
-        resp.assert_status(kynos::http::StatusCode::OK);
+        resp.assert_status(200);
         assert!(!resp.events().is_empty());
     }
     assert_eq!(h.state.events.open_streams(CAP), 0, "every slot is freed");
@@ -339,7 +339,7 @@ async fn an_event_stream_ends_when_its_session_is_revoked() {
 
     let started = std::time::Instant::now();
     let resp = h.send("GET", "/v1/events", Some(&token), None).await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
         "the stream ended with its session, not with the daemon: {:?}",
@@ -365,7 +365,7 @@ async fn an_event_stream_opened_with_a_static_token_is_not_ended_by_the_check() 
     });
     let started = std::time::Instant::now();
     let resp = h.read("/v1/events").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     assert!(started.elapsed() >= std::time::Duration::from_millis(2400));
 }
 
@@ -380,7 +380,7 @@ async fn an_events_stream_opened_after_the_shutdown_ends_at_once() {
     let resp = tokio::time::timeout(std::time::Duration::from_secs(5), h.read("/v1/events"))
         .await
         .expect("the stream must end without waiting for a broadcast");
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     assert!(resp.events().is_empty(), "nothing is sent once shut down");
 }
 
@@ -408,7 +408,7 @@ async fn the_probes_answer_a_foreign_host_without_a_credential() {
         let resp = h
             .send_with("GET", path, None, None, &[("host", "10.0.0.7:8080")])
             .await;
-        resp.assert_status(kynos::http::StatusCode::OK);
+        resp.assert_status(200);
     }
 }
 

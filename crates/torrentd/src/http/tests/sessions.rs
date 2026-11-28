@@ -46,7 +46,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
             Some(json!({"password": PASSWORD})),
         )
         .await;
-    resp.assert_status(kynos::http::StatusCode::CREATED);
+    resp.assert_status(201);
     resp.assert_header("location", "/v1/sessions/current");
     let grant: serde_json::Value = resp.json();
     let token = grant["token"].as_str().unwrap().to_owned();
@@ -72,7 +72,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
 
     h.send("DELETE", "/v1/sessions/current", Some(&token), None)
         .await
-        .assert_status(kynos::http::StatusCode::NO_CONTENT);
+        .assert_status(204);
     let resp = h
         .send("GET", "/v1/sessions/current", Some(&token), None)
         .await;
@@ -147,7 +147,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         &[("content-type", "text/plain")],
     )
     .await
-    .assert_status(kynos::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    .assert_status(415);
     let resp = h
         .client
         .post("/v1/sessions")
@@ -163,7 +163,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         &[("content-type", "application/json")],
     )
     .await
-    .assert_status(kynos::http::StatusCode::BAD_REQUEST);
+    .assert_status(400);
     let huge = "x".repeat(crate::http::v1::MAX_BODY_BYTES + 1);
     let resp = h
         .send(
@@ -308,7 +308,7 @@ async fn the_login_throttle_keys_on_the_client_a_trusted_proxy_names() {
             &from("203.0.113.8"),
         )
         .await;
-    resp.assert_status(kynos::http::StatusCode::CREATED);
+    resp.assert_status(201);
     // And the proxy's own address holds no bucket: the key was the client.
     let auth = h.state.auth.as_ref().unwrap();
     assert!(auth
@@ -366,7 +366,7 @@ async fn the_login_throttle_keys_on_the_client_behind_a_chain_of_trusted_proxies
             &[("x-forwarded-for", &format!("203.0.113.8, {edge}"))],
         )
         .await;
-    resp.assert_status(kynos::http::StatusCode::CREATED);
+    resp.assert_status(201);
     // Neither proxy, nor any spoofed entry, holds a bucket.
     let auth = h.state.auth.as_ref().unwrap();
     for addr in [ingress, edge, "198.51.100.1", "198.51.100.5"] {
@@ -400,9 +400,7 @@ async fn a_client_that_logged_in_before_gets_past_a_spent_verification_budget() 
         )
         .await
     };
-    login("203.0.113.7")
-        .await
-        .assert_status(kynos::http::StatusCode::CREATED);
+    login("203.0.113.7").await.assert_status(201);
 
     // Spend the shared budget the way an unidentified poller would.
     let throttle = &h.state.auth.as_ref().unwrap().throttle;
@@ -416,9 +414,7 @@ async fn a_client_that_logged_in_before_gets_past_a_spent_verification_budget() 
     // its own reason, not as a per-client throttle.
     assert_eq!(h.metric(&login_failures("verification_budget")).await, 1.0);
     assert_eq!(h.metric(&login_failures("throttled")).await, 0.0);
-    login("203.0.113.7")
-        .await
-        .assert_status(kynos::http::StatusCode::CREATED);
+    login("203.0.113.7").await.assert_status(201);
     assert_eq!(
         h.metric(&login_failures("verification_budget")).await,
         1.0,
@@ -440,14 +436,14 @@ async fn a_session_past_its_ttl_is_refused_over_http() {
             Some(json!({"password": PASSWORD})),
         )
         .await;
-    resp.assert_status(kynos::http::StatusCode::CREATED);
+    resp.assert_status(201);
     let token = resp.json::<serde_json::Value>()["token"]
         .as_str()
         .unwrap()
         .to_owned();
     h.send("GET", "/v1/status", Some(&token), None)
         .await
-        .assert_status(kynos::http::StatusCode::OK);
+        .assert_status(200);
 
     // The store reads the system clock, so the TTL is waited out for real.
     std::thread::sleep(std::time::Duration::from_millis(1100));

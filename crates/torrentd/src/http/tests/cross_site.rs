@@ -62,7 +62,7 @@ fn assert_refused(resp: &TestResponse, case: &str) {
     );
     // Not a scope refusal, so no `insufficient_scope` challenge: repeating
     // the request with any credential would not change the answer.
-    assert_eq!(resp.header("www-authenticate"), None, "{case}");
+    resp.assert_no_header("www-authenticate");
 }
 
 fn assert_admitted(resp: &TestResponse, case: &str) {
