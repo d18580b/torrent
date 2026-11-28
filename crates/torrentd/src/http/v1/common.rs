@@ -242,6 +242,14 @@ pub fn internal(attempt: &str, cause: impl fmt::Display) -> String {
 /// kynos describes a transparent variant's statuses after every declared
 /// variant's, in the order the variants are written, and that is where the
 /// `500` stood when each enum declared it itself.
+///
+/// The other failures several operations share (`PoolNotConfigured`,
+/// `PlanNotFound`, `InvalidCursor`, `ProfileNotFound`, `ProfileUnavailable`,
+/// `TorrentNotFound`) stay declared in each enum. By the same rule, holding
+/// one transparently would move its status, or its title, behind the
+/// operation's own variants on several operations, and changing that order
+/// changes the published document. Some also differ in their detail from one
+/// operation to the next.
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 #[problem(status = 500, title = "Internal error")]
