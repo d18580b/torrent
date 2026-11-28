@@ -13,6 +13,8 @@ use torrentd_pool::PoolTorrent;
 
 use super::support::assert_problem;
 use super::support::assert_scope_refused;
+use super::support::errors_at;
+use super::support::profile_status;
 use super::support::Coverage;
 use super::support::Harness;
 use crate::config::Config;
@@ -361,8 +363,7 @@ async fn reads(cov: &Arc<Coverage>) {
             .read(&format!("/v1/pool/roots/{root_id}/{listing}?limit=0"))
             .await;
         assert_problem(&resp, 422, "validation-failed");
-        let body: Value = resp.json();
-        assert_eq!(body["errors"][0]["pointer"], "#/query/limit");
+        assert_eq!(errors_at(&resp)[0], "#/query/limit");
         // A root id that is not a number never reaches the handler.
         let resp = h.read(&format!("/v1/pool/roots/abc/{listing}")).await;
         assert_eq!(resp.status().as_u16(), 400);
@@ -826,11 +827,11 @@ async fn adoption(cov: &Arc<Coverage>) {
     ))
     .await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "failed");
+    assert_eq!(profile_status(&resp), "failed");
     assert!(
-        body["detail"].as_str().unwrap().contains("did not come up"),
-        "{body}"
+        resp.problem().detail.unwrap().contains("did not come up"),
+        "{}",
+        resp.text()
     );
     let resp = post(adopt(
         "down",
@@ -839,8 +840,7 @@ async fn adoption(cov: &Arc<Coverage>) {
     ))
     .await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "vpn_down");
+    assert_eq!(profile_status(&resp), "vpn_down");
     // And one the operator set offline, refused the same way and for the
     // same reason: nothing it claimed could seed.
     let set_p = |state| {
@@ -862,7 +862,7 @@ async fn adoption(cov: &Arc<Coverage>) {
     ))
     .await;
     assert_problem(&resp, 409, "profile-unavailable");
-    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+    assert_eq!(profile_status(&resp), "offline");
     assert_eq!(h.state.registry.len(), claims, "nothing was claimed");
     set_p(crate::profile_state::DesiredState::Online);
 
@@ -883,8 +883,7 @@ async fn adoption(cov: &Arc<Coverage>) {
     ))
     .await;
     assert_problem(&resp, 422, "validation-failed");
-    let body: Value = resp.json();
-    assert_eq!(body["errors"][0]["pointer"], "/selector/infohashes");
+    assert_eq!(errors_at(&resp)[0], "/selector/infohashes");
     let many: Vec<String> = (0..1001).map(|i| format!("{i:040x}")).collect();
     let resp = post(adopt(
         "p",
@@ -964,8 +963,7 @@ async fn an_untimed_operation_refuses_a_body_that_did_not_arrive_whole() {
         let declared = u64::try_from(body.len()).unwrap() + 1;
         h.client
             .post(path)
-            .peer("192.0.2.10:40000".parse().unwrap())
-            .header("authorization", &format!("Bearer {w}"))
+            .bearer(&w)
             .body("application/json", body)
             .content_length(declared)
             .send()
@@ -981,13 +979,10 @@ async fn an_untimed_operation_refuses_a_body_that_did_not_arrive_whole() {
             resp.text()
         );
         resp.assert_problem_type("about:blank");
-        let detail: Value = resp.json();
         assert!(
-            detail["detail"]
-                .as_str()
-                .unwrap()
-                .contains("1 octet(s) short"),
-            "{method} {path}: {detail}"
+            resp.problem().detail.unwrap().contains("1 octet(s) short"),
+            "{method} {path}: {}",
+            resp.text()
         );
     }
 
@@ -1961,8 +1956,7 @@ async fn verification(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 422, "validation-failed");
-    let body: Value = resp.json();
-    assert_eq!(body["errors"][0]["pointer"], "/infohashes");
+    assert_eq!(errors_at(&resp)[0], "/infohashes");
     // Not an infohash: refused where it is parsed.
     let resp = h
         .send(
@@ -2063,10 +2057,10 @@ async fn plans(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 409, "plan-refused");
-    let body: Value = resp.json();
     assert!(
-        body["detail"].as_str().unwrap().contains("partial"),
-        "{body}"
+        resp.problem().detail.unwrap().contains("partial"),
+        "{}",
+        resp.text()
     );
 
     // Applying a delete takes its token: absent, then wrong, then right.
@@ -2175,10 +2169,10 @@ async fn plans(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 409, "apply-failed");
-    let body: Value = resp.json();
     assert!(
-        body["detail"].as_str().unwrap().contains("interrupted"),
-        "{body}"
+        resp.problem().detail.unwrap().contains("interrupted"),
+        "{}",
+        resp.text()
     );
 
     // A plan mid-apply is neither discarded nor applied again.
@@ -2617,13 +2611,13 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let w = h.tokens.write.clone();
     let assert_internal = |resp: &kynos::test::TestResponse| {
         assert_problem(resp, 500, "internal");
-        let body: Value = resp.json();
         assert!(
-            body["detail"]
-                .as_str()
+            resp.problem()
+                .detail
                 .unwrap()
                 .contains("the daemon's log has the cause"),
-            "{body}"
+            "{}",
+            resp.text()
         );
     };
 

@@ -19,38 +19,28 @@ fn open(cov: &Arc<Coverage>, allowed_hosts: &[&str]) -> Harness {
     Harness::new(cov, state, Default::default())
 }
 
-/// Send `method uri` with `headers`, as raw bytes, straight to a fresh router
-/// over a daemon without `[auth]` answering to `allowed_hosts`.
+/// Send `method target` with `headers` given as octets, through a fresh
+/// harness over a daemon without `[auth]` answering to `allowed_hosts`, and
+/// hold what it received to the document.
 ///
-/// The test client takes only an origin-form path and text header values, so
-/// it cannot send the two shapes this needs: a request target that carries
-/// its own authority (absolute-form, or what HTTP/2's `:authority` becomes),
-/// and a `Host` that is not text.
+/// For the two shapes [`Harness::send_with`] does not spell: a request target
+/// that carries its own authority (absolute-form, or what HTTP/2's
+/// `:authority` becomes), and a `Host` that is not text.
 async fn raw(
+    cov: &Arc<Coverage>,
     allowed_hosts: &[&str],
     method: &str,
-    uri: &str,
+    target: &str,
     headers: &[(&str, &[u8])],
 ) -> StatusCode {
-    use kynos::http::HeaderValue;
-    let mut state = crate::app_state::build_test_state(None);
-    let hosts: Vec<String> = allowed_hosts.iter().map(|h| (*h).to_owned()).collect();
-    state.allowed_hosts = HostAllowlist::parse(&hosts).unwrap();
-    let openapi = crate::http::OpenApiJson(Arc::new(bytes::Bytes::from(
-        crate::http::document_json().unwrap(),
-    )));
-    let service = crate::http::service(state, openapi).expect("the router builds");
-    let mut request =
-        kynos::http::Request::new(kynos::http::body::Body::from_bytes(bytes::Bytes::new()));
-    *request.method_mut() = method.parse().unwrap();
-    *request.uri_mut() = uri.parse().unwrap();
+    let h = open(cov, allowed_hosts);
+    let mut req = h.client.method(method.parse().unwrap(), target);
     for (name, value) in headers {
-        request.headers_mut().insert(
-            kynos::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-            HeaderValue::from_bytes(value).unwrap(),
-        );
+        req = req.header_bytes(name, value);
     }
-    service.call(request).await.status()
+    let status = req.send().await.status();
+    h.assert_conformance();
+    status
 }
 
 fn assert_refused(resp: &TestResponse, case: &str) {
@@ -62,7 +52,7 @@ fn assert_refused(resp: &TestResponse, case: &str) {
     );
     // Not a scope refusal, so no `insufficient_scope` challenge: repeating
     // the request with any credential would not change the answer.
-    assert_eq!(resp.header("www-authenticate"), None, "{case}");
+    resp.assert_no_header("www-authenticate");
 }
 
 fn assert_admitted(resp: &TestResponse, case: &str) {
@@ -320,6 +310,7 @@ async fn the_request_targets_authority_is_judged_ahead_of_host() {
     // request is for; RFC 9112 section 3.2.2 has a server ignore `Host` then.
     // A rebound page cannot choose either, but the check reads the one the
     // server routes by.
+    let cov = Coverage::new();
     for path in ["/v1/torrents", "/v1/torrents/pause-all"] {
         let method = if path.ends_with("pause-all") {
             "POST"
@@ -327,6 +318,7 @@ async fn the_request_targets_authority_is_judged_ahead_of_host() {
             "GET"
         };
         let status = raw(
+            &cov,
             &[],
             method,
             &format!("http://attacker.example:8080{path}"),
@@ -339,6 +331,7 @@ async fn the_request_targets_authority_is_judged_ahead_of_host() {
             "{method} {path}: a foreign target authority"
         );
         let status = raw(
+            &cov,
             &[],
             method,
             &format!("http://127.0.0.1:8080{path}"),
@@ -350,6 +343,7 @@ async fn the_request_targets_authority_is_judged_ahead_of_host() {
             "{method} {path}: a loopback target authority: {status}"
         );
         let status = raw(
+            &cov,
             &["torrentd.example.com"],
             method,
             &format!("https://torrentd.example.com{path}"),
@@ -365,9 +359,10 @@ async fn the_request_targets_authority_is_judged_ahead_of_host() {
 
 #[tokio::test]
 async fn a_host_that_is_not_text_is_refused() {
+    let cov = Coverage::new();
     for host in [&b"127.0.0.1\xff"[..], b"\xe2\x80\x8blocalhost:8080"] {
         for (method, path) in [("GET", "/v1/torrents"), ("POST", "/v1/torrents/pause-all")] {
-            let status = raw(&[], method, path, &[("host", host)]).await;
+            let status = raw(&cov, &[], method, path, &[("host", host)]).await;
             assert_eq!(
                 status,
                 StatusCode::FORBIDDEN,

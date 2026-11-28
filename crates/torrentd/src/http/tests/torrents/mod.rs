@@ -29,6 +29,8 @@ use torrentd_engine::TorrentState;
 use torrentd_engine::TrackerEntry;
 
 use super::support::assert_problem;
+use super::support::errors_at;
+use super::support::profile_status;
 use super::support::Coverage;
 use super::support::Harness;
 use crate::app_state::AppState;
@@ -166,18 +168,6 @@ fn injected(op: &'static str) -> EngineError {
     }
 }
 
-fn errors_at(resp: &TestResponse) -> Vec<String> {
-    let body: Value = resp.json();
-    body["errors"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|e| e["pointer"].as_str().unwrap().to_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// A request with the `write` token and a JSON body.
 trait WriteJson {
     async fn write_json(&self, method: &str, path: &str, body: Value) -> TestResponse;
@@ -246,7 +236,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
             .write("DELETE", &format!("/v1/torrents/{}?{query}", hex(LOADED)))
             .await;
         assert_problem(&resp, 422, "delete-unconfirmed");
-        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        let detail = resp.problem().detail.unwrap();
         assert!(detail.contains(&hex(LOADED)), "{detail}");
         assert!(h.state.registry.lookup(&LOADED).is_some());
     }
@@ -265,9 +255,8 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "failed");
-    let detail = body["detail"].as_str().unwrap();
+    assert_eq!(profile_status(&resp), "failed");
+    let detail = resp.problem().detail.unwrap();
     assert!(detail.contains("no running session"), "{detail}");
     assert!(detail.contains("delete_files"), "{detail}");
     assert!(
@@ -294,7 +283,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 409, "payload-untrashable");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(detail.contains("unloaded"), "{detail}");
     assert!(detail.contains("delete_files"), "{detail}");
     assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
@@ -404,10 +393,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     add(&shared_with).unwrap();
     let resp = h.write("DELETE", &delete_files).await;
     assert_problem(&resp, 409, "payload-shared");
-    assert!(resp.json::<Value>()["detail"]
-        .as_str()
-        .unwrap()
-        .contains(&shared_with));
+    assert!(resp.problem().detail.unwrap().contains(&shared_with));
     assert!(h.state.registry.lookup(&LOADED).is_some());
     pool.with_store_mut(|st| st.replace_claims(&shared_with, &[]))
         .unwrap();
@@ -432,7 +418,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     std::fs::write(&data, vec![5u8; 64]).unwrap();
     let resp = h.write("DELETE", &delete_files).await;
     assert_problem(&resp, 409, "payload-untrashable");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(detail.contains("not in the index"), "{detail}");
     assert!(data.exists());
     assert!(h.state.registry.lookup(&LOADED).is_some());
@@ -450,7 +436,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     add(&hex(LOADED)).unwrap();
     let untouched = |resp: &TestResponse, problem: &str, names: InfoHash| {
         assert_problem(resp, 409, problem);
-        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        let detail = resp.problem().detail.unwrap();
         assert!(detail.contains(&hex(names)), "{detail}");
         assert!(data.exists());
         assert!(h.state.registry.lookup(&LOADED).is_some());

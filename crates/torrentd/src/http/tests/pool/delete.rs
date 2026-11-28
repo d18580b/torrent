@@ -231,7 +231,7 @@ async fn a_co_claimant_committed_after_the_early_check_is_refused_before_the_tra
     commit.await.unwrap();
 
     assert_problem(&resp, 409, "payload-shared");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(
         detail.contains(IH_B) && detail.contains("pool index"),
         "{detail}"

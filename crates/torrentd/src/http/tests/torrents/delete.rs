@@ -71,7 +71,7 @@ pub(super) async fn deleting(h: &Harness, e: &Engines) {
             .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
             .await;
         assert_problem(&resp, 409, "torrent-unloaded");
-        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        let detail = resp.problem().detail.unwrap();
         for (held, name) in [
             (resume, format!("{}.resume", hex(ADDING))),
             (torrent, format!("{}.torrent", hex(ADDING))),
@@ -182,7 +182,7 @@ async fn a_store_delete_that_fails_leaves_the_assignment_for_the_retry() {
     std::fs::set_permissions(&profile_dir, original).unwrap();
 
     assert_problem(&resp, 500, "internal");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(
         detail.contains("resume file") && detail.contains("Retry the delete"),
         "{detail}"
@@ -256,7 +256,7 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
         .write("DELETE", &format!("/v1/torrents/{}", hex(LOADED)))
         .await;
     assert_problem(&resp, 500, "internal");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(
         detail.contains("assignment") && detail.contains("removed from its session"),
         "the operator has to know which half failed: {detail}"
@@ -737,7 +737,7 @@ async fn an_unloaded_delete_whose_resume_store_cannot_answer_answers_500_and_cha
         .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
         .await;
     assert_problem(&resp, 500, "internal");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(detail.contains("resume file"), "{detail}");
     assert!(detail.contains("Nothing was changed"), "{detail}");
     assert_eq!(h.state.registry.lookup(&ADDING), Some(p.clone()));
@@ -822,7 +822,7 @@ async fn an_unloaded_delete_whose_pool_index_cannot_be_read_keeps_a_resume_less_
         .write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
         .await;
     assert_problem(&resp, 409, "torrent-unloaded");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(
         detail.contains(&format!("{}.torrent", hex(ADDING))),
         "{detail}"

@@ -18,6 +18,7 @@ use torrentd_engine::TorrentHandle;
 use torrentd_engine::TorrentState;
 
 use super::support::assert_problem;
+use super::support::profile_status;
 use super::support::Coverage;
 use super::support::Harness;
 use crate::app_state::AppState;
@@ -112,7 +113,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
 
     // The list: live profiles in config order, then the failed one.
     let resp = h.read("/v1/profiles").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let list: Value = resp.json();
     let items = list["items"].as_array().unwrap();
     let ids: Vec<&str> = items
@@ -150,7 +151,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
 
     // One profile, live.
     let resp = h.read("/v1/profiles/acct_a").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let detail: Value = resp.json();
     assert_eq!(detail["profile_id"], "acct_a");
     assert_eq!(detail["status"], "active");
@@ -162,7 +163,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
 
     // One profile, failed: described, not denied.
     let resp = h.read("/v1/profiles/acct_c").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let detail: Value = resp.json();
     assert_eq!(detail["status"], "failed");
     assert_eq!(detail["failure_reason"], REASON);
@@ -178,7 +179,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
 
     // Per-profile pause: a fenced profile is paused too.
     let resp = h.write("POST", "/v1/profiles/acct_b/pause-all").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let out: Value = resp.json();
     assert_eq!(
         out,
@@ -193,7 +194,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     );
     // Per-profile resume of an active one.
     let resp = h.write("POST", "/v1/profiles/acct_a/resume-all").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     assert_eq!(resp.json::<Value>()["torrent_count"], 1);
     assert_eq!(
         calls(
@@ -206,8 +207,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // A fenced profile is not resumed.
     let resp = h.write("POST", "/v1/profiles/acct_b/resume-all").await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "vpn_down");
+    assert_eq!(profile_status(&resp), "vpn_down");
     assert_eq!(
         calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
         0,
@@ -219,9 +219,8 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     for op in ["pause-all", "resume-all"] {
         let resp = h.write("POST", &format!("/v1/profiles/acct_c/{op}")).await;
         assert_problem(&resp, 409, "profile-unavailable");
-        let body: Value = resp.json();
-        assert_eq!(body["profile_status"], "failed", "{op}");
-        let detail = body["detail"].as_str().unwrap();
+        assert_eq!(profile_status(&resp), "failed", "{op}");
+        let detail = resp.problem().detail.unwrap();
         assert!(
             detail.starts_with(&format!("profile has no session: {REASON}.")),
             "{op}: the bring-up reason is what says what to fix: {detail}"
@@ -240,7 +239,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // Daemon-wide pause: every live profile, fenced included; the failed one
     // reported.
     let resp = h.write("POST", "/v1/torrents/pause-all").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let out: Value = resp.json();
     assert_eq!(out["torrent_count"], 2);
     assert_eq!(out["failed_count"], 0);
@@ -269,7 +268,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // Daemon-wide resume: the fenced profile is skipped, not the request.
     let resume_b_before = calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_)));
     let resp = h.write("POST", "/v1/torrents/resume-all").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let out: Value = resp.json();
     assert_eq!(out["torrent_count"], 1);
     assert_eq!(out["failed_count"], 0);
@@ -385,7 +384,7 @@ async fn states(cov: &Arc<Coverage>) {
     // One profile offline: its session pauses, and nothing more may reach
     // the network through it.
     let resp = set("acct_a", "offline").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let detail: Value = resp.json();
     assert_eq!(detail["desired_state"], "offline");
     assert_eq!(detail["effective_state"], "offline");
@@ -411,7 +410,7 @@ async fn states(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 409, "profile-unavailable");
-    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+    assert_eq!(profile_status(&resp), "offline");
     assert_eq!(
         calls(&eng_a, |c| matches!(c, RecordedCall::AddTorrent(_))),
         0,
@@ -419,13 +418,13 @@ async fn states(cov: &Arc<Coverage>) {
     );
     let resp = h.write("POST", "/v1/profiles/acct_a/resume-all").await;
     assert_problem(&resp, 409, "profile-unavailable");
-    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+    assert_eq!(profile_status(&resp), "offline");
 
     // The daemon-wide resume skips it by name rather than refusing, and
     // resumes none of its torrents.
     load(&h.state, 3, "acct_a");
     let resp = h.write("POST", "/v1/torrents/resume-all").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let out: Value = resp.json();
     assert_eq!(out["torrent_count"], 0);
     let skipped: Vec<(&str, &str)> = out["skipped_profiles"]
@@ -453,24 +452,18 @@ async fn states(cov: &Arc<Coverage>) {
 
     // offline-all over one profile already offline on its own; online-all
     // gives back exactly that.
-    set("acct_a", "offline")
-        .await
-        .assert_status(kynos::http::StatusCode::OK);
-    set("acct_a", "online")
-        .await
-        .assert_status(kynos::http::StatusCode::OK);
-    set("acct_c", "offline")
-        .await
-        .assert_status(kynos::http::StatusCode::OK);
+    set("acct_a", "offline").await.assert_status(200);
+    set("acct_a", "online").await.assert_status(200);
+    set("acct_c", "offline").await.assert_status(200);
     let resp = h.write("POST", "/v1/profiles/offline-all").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let list: Value = resp.json();
     assert_eq!(list["offline_all"], true);
     assert_eq!(profile_of(&list, "acct_a")["desired_state"], "online");
     assert_eq!(profile_of(&list, "acct_a")["effective_state"], "offline");
     assert!(eng_a.session_paused().unwrap() && eng_b.session_paused().unwrap());
     let resp = h.write("POST", "/v1/profiles/online-all").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let list: Value = resp.json();
     assert_eq!(list["offline_all"], false);
     assert_eq!(profile_of(&list, "acct_a")["effective_state"], "online");
@@ -485,14 +478,14 @@ async fn states(cov: &Arc<Coverage>) {
     // fenced, and its state does not change.
     let resp = set("acct_b", "online").await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "vpn_down");
+    assert_eq!(profile_status(&resp), "vpn_down");
     assert!(
-        body["detail"]
-            .as_str()
+        resp.problem()
+            .detail
             .unwrap()
             .contains("ip_lost_or_changed"),
-        "{body}"
+        "{}",
+        resp.text()
     );
     assert_eq!(
         calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
@@ -505,7 +498,7 @@ async fn states(cov: &Arc<Coverage>) {
     // without a restart.
     healthy.store(true, Ordering::SeqCst);
     let resp = set("acct_b", "online").await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let detail: Value = resp.json();
     assert_eq!(detail["status"], "active");
     assert_eq!(detail["effective_state"], "online");
@@ -642,10 +635,7 @@ async fn a_fenced_profile_stays_fenced_while_the_kill_switch_is_not_in_force() {
     let resp = online().await;
     assert_problem(&resp, 409, "kill-switch-not-in-force");
     assert!(
-        resp.json::<Value>()["detail"]
-            .as_str()
-            .unwrap()
-            .contains("kill switch"),
+        resp.problem().detail.unwrap().contains("kill switch"),
         "{}",
         resp.text()
     );
@@ -661,7 +651,7 @@ async fn a_fenced_profile_stays_fenced_while_the_kill_switch_is_not_in_force() {
     // fence, so the watch's lift leaves it, and setting it online lifts it.
     fence.lift();
     let resp = online().await;
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     assert_eq!(resp.json::<Value>()["status"], "active");
     assert!(probes.load(Ordering::SeqCst) > 0, "the tunnel was checked");
 }
@@ -687,7 +677,7 @@ async fn bulk_operations_count_what_the_engine_refused() {
             },
         );
         let resp = h.write("POST", path).await;
-        resp.assert_status(kynos::http::StatusCode::OK);
+        resp.assert_status(200);
         let out: Value = resp.json();
         assert_eq!(out["torrent_count"], 0, "{path}");
         assert_eq!(
@@ -875,7 +865,7 @@ async fn a_pause_during_a_resume_all_is_not_undone_by_its_later_batches() {
             "{resume} / {pause}: {}",
             paused.status()
         );
-        out.assert_status(kynos::http::StatusCode::OK);
+        out.assert_status(200);
         let out: Value = out.json();
 
         assert_eq!(
@@ -977,9 +967,9 @@ async fn a_resume_that_races_a_fence_leaves_nothing_running() {
         );
         if path == "one torrent" {
             assert_problem(&resp, 409, "profile-unavailable");
-            assert_eq!(resp.json::<Value>()["profile_status"], "vpn_down");
+            assert_eq!(profile_status(&resp), "vpn_down");
         } else {
-            resp.assert_status(kynos::http::StatusCode::OK);
+            resp.assert_status(200);
             let out: Value = resp.json();
             assert_eq!(out["torrent_count"], 0, "{path}: nothing stayed resumed");
             assert_eq!(out["skipped_profiles"][0]["profile_id"], "acct_a", "{path}");
@@ -1020,7 +1010,7 @@ async fn a_lift_that_races_a_new_fence_leaves_nothing_running() {
         ),
         fence_during_next_resume(&h, &eng_b, "acct_b"),
     );
-    resp.assert_status(kynos::http::StatusCode::OK);
+    resp.assert_status(200);
     let entry = h
         .state
         .profiles
@@ -1200,7 +1190,7 @@ async fn setting_a_profile_online_starts_its_torrents_a_batch_per_pace() {
             let token = h.tokens.write.clone();
             h.send(method, path, Some(&token), body)
                 .await
-                .assert_status(kynos::http::StatusCode::OK);
+                .assert_status(200);
         }
         assert_eq!(
             h.state.profiles.holds().held(&id).len(),
@@ -1262,7 +1252,7 @@ async fn a_torrent_the_session_refuses_to_resume_stays_held() {
             Some(json!({ "state": state })),
         )
         .await
-        .assert_status(kynos::http::StatusCode::OK);
+        .assert_status(200);
     }
     tokio::time::sleep(2 * REANNOUNCE_PACE).await;
     let entry = h.state.profiles.resolve(&id).active().unwrap();
@@ -1296,7 +1286,7 @@ async fn a_torrent_the_session_refuses_to_resume_stays_held() {
         None,
     )
     .await
-    .assert_status(kynos::http::StatusCode::NO_CONTENT);
+    .assert_status(204);
     assert!(
         h.state.profiles.holds().held(&id).is_empty(),
         "a hand resume releases the hold",
@@ -1322,7 +1312,7 @@ async fn a_hand_resume_racing_a_set_online_leaves_its_pause_held() {
         async move {
             h.send("PATCH", "/v1/profiles/acct_a", Some(&token), Some(body))
                 .await
-                .assert_status(kynos::http::StatusCode::OK);
+                .assert_status(200);
         }
     };
 
@@ -1331,9 +1321,7 @@ async fn a_hand_resume_racing_a_set_online_leaves_its_pause_held() {
     let (online_tx, online_rx) = tokio::sync::oneshot::channel::<()>();
     let (hand_done_tx, hand_done_rx) = tokio::sync::oneshot::channel::<()>();
     let hand_resume = async {
-        h.write("POST", &uri)
-            .await
-            .assert_status(kynos::http::StatusCode::NO_CONTENT);
+        h.write("POST", &uri).await.assert_status(204);
         hand_done_tx.send(()).unwrap();
     };
     let set_online = async {
@@ -1432,7 +1420,7 @@ async fn a_hand_resume_that_does_not_leave_it_running_keeps_it_held() {
                 Some(json!({ "state": state })),
             )
             .await
-            .assert_status(kynos::http::StatusCode::OK);
+            .assert_status(200);
         }
         tokio::time::sleep(2 * REANNOUNCE_PACE).await;
         let held = eng
@@ -1494,7 +1482,7 @@ async fn a_stopped_run_does_not_release_what_a_newer_set_online_holds() {
         async move {
             h.send("PATCH", "/v1/profiles/acct_a", Some(&token), Some(body))
                 .await
-                .assert_status(kynos::http::StatusCode::OK);
+                .assert_status(200);
         }
     };
 
@@ -1537,7 +1525,7 @@ async fn setting_a_profile_offline_mid_pace_stops_it_and_holds_the_rest() {
         async move {
             h.send("PATCH", "/v1/profiles/acct_a", Some(&token), Some(body))
                 .await
-                .assert_status(kynos::http::StatusCode::OK);
+                .assert_status(200);
         }
     };
     let resumed = || calls(&eng, |c| matches!(c, RecordedCall::ResumeTorrent(_)));

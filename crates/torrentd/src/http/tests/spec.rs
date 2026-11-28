@@ -41,13 +41,19 @@ async fn every_declared_response_is_exercised() {
 fn the_document_is_openapi_3_2_and_uses_no_unchecked_route() {
     let doc = doc();
     assert_eq!(doc["openapi"], "3.2.0");
-    // An unchecked route marks the document non-authoritative; kynos records
-    // why under this extension.
+    // An opaque operation, or a route no path template expresses, makes the
+    // document non-authoritative.
+    assert!(
+        crate::http::document().unwrap().is_authoritative(),
+        "the document must stay authoritative"
+    );
+    // A schema a handler left unconstrained is not covered by that check, and
+    // kynos marks it with this annotation.
     assert!(
         !crate::http::document_json()
             .unwrap()
-            .contains("x-kynos-unchecked"),
-        "the document must stay authoritative"
+            .contains(kynos::openapi::annotation::UNCHECKED_SCHEMA_ANNOTATION),
+        "no schema may be left unchecked"
     );
 }
 
