@@ -28,37 +28,23 @@ use crate::app_state::AppState;
 /// in a body — before a handler sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Schema)]
 pub struct InfoHashHex(
-    #[schema(pattern = "^[0-9a-fA-F]{40}$", min_length = 40, max_length = 40)] HexString,
+    #[schema(
+        as = String,
+        via = InfoHash::to_hex,
+        pattern = "^[0-9a-fA-F]{40}$",
+        min_length = 40,
+        max_length = 40
+    )]
+    InfoHash,
 );
-
-/// The string form [`InfoHashHex`] is described as. Never constructed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HexString(InfoHash);
-
-impl kynos::schema::Schema for HexString {
-    fn schema(registry: &mut kynos::schema::registry::Registry) -> kynos::openapi::Schema {
-        String::schema(registry)
-    }
-}
-
-/// A string on the wire, so `InfoHashHex`'s string bounds may describe it.
-///
-/// It holds the parsed bytes, not the text, so it offers kynos none to check:
-/// the bounds are held where the text is parsed ([`InfoHashHex`]'s `FromStr`,
-/// which its `Deserialize` calls), the only way a request makes one.
-impl kynos::schema::constraints::Textual for HexString {
-    fn text(&self) -> Option<&str> {
-        None
-    }
-}
 
 impl InfoHashHex {
     pub fn new(ih: InfoHash) -> Self {
-        Self(HexString(ih))
+        Self(ih)
     }
 
     pub fn get(self) -> InfoHash {
-        self.0 .0
+        self.0
     }
 }
 
