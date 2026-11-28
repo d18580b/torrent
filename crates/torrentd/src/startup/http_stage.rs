@@ -306,10 +306,10 @@ pub(crate) fn http_server(
                 .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS),
         )
         // Off, rather than kynos's 30 s per-frame default: every operation
-        // that reads a body already bounds its arrival (`http::v1`'s group
-        // deadlines and `TimedBody`), as `docs/api/problems.md`'s `408` row
-        // states them, and the server's own 408 would replace the operation's
-        // response, request id and shared headers included.
+        // that reads a body already bounds its whole arrival (`http::v1`'s
+        // group deadlines, and `BodySize::deadline` on the untimed group), as
+        // `docs/api/problems.md`'s `408` row states them, where a per-frame
+        // idle timer bounds only the gap between two frames.
         .request_body_idle_timeout(None)
 }
 

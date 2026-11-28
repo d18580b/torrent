@@ -8861,7 +8861,7 @@
             }
           },
           "400": {
-            "description": "Bad Request; the request body did not arrive whole",
+            "description": "Bad Request",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11674,7 +11674,7 @@
             }
           },
           "400": {
-            "description": "Bad Request; the request body did not arrive whole",
+            "description": "Bad Request",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12141,7 +12141,7 @@
             }
           },
           "400": {
-            "description": "Bad Request; the request body did not arrive whole",
+            "description": "Bad Request",
             "content": {
               "application/problem+json": {
                 "schema": {
