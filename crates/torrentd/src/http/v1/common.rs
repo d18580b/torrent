@@ -103,24 +103,6 @@ pub enum ProfileUnavailableReason {
     Offline,
 }
 
-impl ProfileUnavailableReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Failed => "failed",
-            Self::VpnDown => "vpn_down",
-            Self::Offline => "offline",
-        }
-    }
-}
-
-/// The `profile_status` extension member, which kynos attaches as JSON.
-/// Through serde, so the wire and the `Schema` derive read the same spelling.
-impl From<ProfileUnavailableReason> for serde_json::Value {
-    fn from(r: ProfileUnavailableReason) -> Self {
-        serde_json::to_value(r).expect("a unit variant serializes")
-    }
-}
-
 /// Why a request naming a profile cannot proceed.
 ///
 /// An operation's error enum holds it as
