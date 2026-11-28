@@ -23,9 +23,9 @@ use tracing::info;
 
 use crate::app_state::AppState;
 use crate::bulk_adopt::in_parallel;
-use crate::http::page::page;
 use crate::http::page::paginate;
 use crate::http::page::InvalidCursor;
+use crate::http::page::Page;
 use crate::http::page::PageLimit;
 use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
@@ -564,12 +564,11 @@ pub struct TreeEntry {
     pub states: Vec<AdoptionState>,
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of a directory listing: directories first, then files, each
     /// in byte order of their path.
-    TreePage,
-    TreeEntry
-);
+    pub TreePage = Page<TreeEntry>;
+}
 
 /// Whether `key` could be a [`tree_key`] of an immediate child of `prefix`:
 /// `d` or `f`, then a path directly under the listed directory.
@@ -842,11 +841,10 @@ pub struct PoolTorrent {
     pub has_fastresume: bool,
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of library torrents, in infohash order.
-    PoolTorrentPage,
-    PoolTorrent
-);
+    pub PoolTorrentPage = Page<PoolTorrent>;
+}
 
 /// List the library's torrents.
 ///
@@ -922,7 +920,7 @@ pub enum AdoptSelector {
     /// These torrents.
     Infohashes {
         /// Between 1 and 1000 torrents from the library.
-        #[schema(min_items = 1, max_items = 1000)]
+        #[schema(min_items = 1, max_items = MAX_INFOHASHES)]
         infohashes: Vec<InfoHashHex>,
     },
     /// Every library torrent whose payload was matched under a directory.
@@ -1337,7 +1335,7 @@ fn release_claim(s: &AppState, infohash: InfoHashHex) {
 #[serde(deny_unknown_fields)]
 pub struct VerifyRequest {
     /// Between 1 and 1000 loaded torrents.
-    #[schema(min_items = 1, max_items = 1000)]
+    #[schema(min_items = 1, max_items = MAX_INFOHASHES)]
     pub infohashes: Vec<InfoHashHex>,
 }
 
@@ -1480,7 +1478,7 @@ pub async fn verify_pool_torrents(
 // ---------------------------------------------------------------------------
 
 /// What a plan does.
-#[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanKind {
     /// Move one torrent's payload to another directory under a managed root.
@@ -1514,7 +1512,7 @@ pub enum PlanStatus {
 }
 
 /// One filesystem operation of a plan.
-#[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepOp {
     /// Relocate an adopted torrent's payload; libtorrent performs the move so
@@ -1525,7 +1523,7 @@ pub enum StepOp {
 }
 
 /// Where one step stands.
-#[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Schema, Serialize, kynos::ParamValue, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     /// Not attempted.
@@ -1544,47 +1542,6 @@ pub enum StepStatus {
     /// Not attempted, deliberately.
     Skipped,
 }
-
-macro_rules! wire_enum_from_str {
-    ($ty:ty { $($s:literal => $v:ident),+ $(,)? }) => {
-        impl $ty {
-            /// The value the pool index stores, as the API spells it.
-            fn parse(s: &str) -> Option<Self> {
-                match s {
-                    $($s => Some(Self::$v),)+
-                    _ => None,
-                }
-            }
-
-            #[cfg_attr(not(test), allow(dead_code))]
-            fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$v => $s,)+
-                }
-            }
-        }
-    };
-}
-
-wire_enum_from_str!(PlanKind { "relocate" => Relocate, "delete_orphans" => DeleteOrphans });
-wire_enum_from_str!(PlanStatus {
-    "draft" => Draft,
-    "applying" => Applying,
-    "applied" => Applied,
-    "failed" => Failed,
-    "cancelled" => Cancelled,
-});
-wire_enum_from_str!(StepOp {
-    "move_torrent" => MoveTorrent,
-    "delete_file" => DeleteFile,
-});
-wire_enum_from_str!(StepStatus {
-    "pending" => Pending,
-    "in_progress" => InProgress,
-    "done" => Done,
-    "failed" => Failed,
-    "skipped" => Skipped,
-});
 
 /// A string the pool index holds that this build has no name for.
 fn unknown(what: &str, value: &str) -> String {
@@ -1662,14 +1619,16 @@ impl StepCounts {
     fn of(rows: Vec<(String, u64)>) -> Result<Self, String> {
         let mut c = Self::default();
         for (status, n) in rows {
-            let slot =
-                match StepStatus::parse(&status).ok_or_else(|| unknown("step status", &status))? {
-                    StepStatus::Pending => &mut c.pending,
-                    StepStatus::InProgress => &mut c.in_progress,
-                    StepStatus::Done => &mut c.done,
-                    StepStatus::Failed => &mut c.failed,
-                    StepStatus::Skipped => &mut c.skipped,
-                };
+            let slot = match status
+                .parse()
+                .map_err(|_| unknown("step status", &status))?
+            {
+                StepStatus::Pending => &mut c.pending,
+                StepStatus::InProgress => &mut c.in_progress,
+                StepStatus::Done => &mut c.done,
+                StepStatus::Failed => &mut c.failed,
+                StepStatus::Skipped => &mut c.skipped,
+            };
             *slot += n;
             c.total += n;
         }
@@ -1689,8 +1648,11 @@ fn plan_steps_listing(id: i64) -> String {
 /// A step row as the API shows it.
 fn step_of(s: torrentd_pool::model::PlanStepRow) -> Result<PlanStep, String> {
     Ok(PlanStep {
-        op: StepOp::parse(&s.op).ok_or_else(|| unknown("step op", &s.op))?,
-        status: StepStatus::parse(&s.status).ok_or_else(|| unknown("step status", &s.status))?,
+        op: s.op.parse().map_err(|_| unknown("step op", &s.op))?,
+        status: s
+            .status
+            .parse()
+            .map_err(|_| unknown("step status", &s.status))?,
         seq: s.seq,
         src: s.src,
         dst: s.dst,
@@ -1698,11 +1660,10 @@ fn step_of(s: torrentd_pool::model::PlanStepRow) -> Result<PlanStep, String> {
     })
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of a plan's steps, in the order an apply runs them.
-    PlanStepPage,
-    PlanStep
-);
+    pub PlanStepPage = Page<PlanStep>;
+}
 
 /// A plan without its steps, as a listing carries it.
 #[derive(Debug, Schema, Serialize)]
@@ -1719,11 +1680,10 @@ pub struct PlanSummary {
     pub applied_at: Option<jiff::Timestamp>,
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of plans, oldest first.
-    PlanPage,
-    PlanSummary
-);
+    pub PlanPage = Page<PlanSummary>;
+}
 
 fn unix(secs: i64) -> jiff::Timestamp {
     jiff::Timestamp::from_second(secs).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
@@ -1732,8 +1692,11 @@ fn unix(secs: i64) -> jiff::Timestamp {
 fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, String> {
     Ok(PlanSummary {
         id: p.id,
-        kind: PlanKind::parse(&p.kind).ok_or_else(|| unknown("plan kind", &p.kind))?,
-        status: PlanStatus::parse(&p.status).ok_or_else(|| unknown("plan status", &p.status))?,
+        kind: p.kind.parse().map_err(|_| unknown("plan kind", &p.kind))?,
+        status: p
+            .status
+            .parse()
+            .map_err(|_| unknown("plan status", &p.status))?,
         created_at: unix(p.created_at),
         applied_at: p.applied_at.map(unix),
     })
@@ -1839,9 +1802,10 @@ pub async fn list_plans(
             detail: internal("listing plans", e),
         })?;
     rows.sort_by_key(|p| p.id);
+    let want = q.status.map(|status| status.to_string());
     let items = rows
         .iter()
-        .filter(|p| q.status.is_none_or(|want| p.status == want.as_str()))
+        .filter(|p| want.as_deref().is_none_or(|want| p.status == want))
         .map(summary_of)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|detail| ListError::Internal { detail })?;
@@ -2357,7 +2321,7 @@ pub async fn apply_plan(
             done: count(o.done),
             failed: count(o.failed),
             skipped: count(o.skipped),
-            status: PlanStatus::parse(&o.status).ok_or_else(|| ApplyPlanError::Internal {
+            status: o.status.parse().map_err(|_| ApplyPlanError::Internal {
                 detail: unknown("plan status", &o.status),
             })?,
         })),
@@ -2511,7 +2475,7 @@ mod tests {
             ps::FAILED,
             ps::CANCELLED,
         ] {
-            assert_eq!(PlanStatus::parse(s).unwrap().as_str(), s);
+            assert_eq!(s.parse::<PlanStatus>().unwrap().to_string(), s);
         }
         for s in [
             ss::PENDING,
@@ -2520,10 +2484,10 @@ mod tests {
             ss::FAILED,
             ss::SKIPPED,
         ] {
-            assert_eq!(StepStatus::parse(s).unwrap().as_str(), s);
+            assert_eq!(s.parse::<StepStatus>().unwrap().to_string(), s);
         }
         for s in [ops::MOVE_TORRENT, ops::DELETE_FILE] {
-            assert_eq!(StepOp::parse(s).unwrap().as_str(), s);
+            assert_eq!(s.parse::<StepOp>().unwrap().to_string(), s);
         }
         for spec in [
             torrentd_pool::PlanSpec::Relocate {
@@ -2536,7 +2500,10 @@ mod tests {
                 prefix: String::new(),
             },
         ] {
-            assert_eq!(PlanKind::parse(spec.kind()).unwrap().as_str(), spec.kind());
+            assert_eq!(
+                spec.kind().parse::<PlanKind>().unwrap().to_string(),
+                spec.kind()
+            );
         }
     }
 }

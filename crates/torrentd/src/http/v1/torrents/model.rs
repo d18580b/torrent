@@ -8,7 +8,7 @@ use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentState;
 
 use crate::app_state::AppState;
-use crate::http::page::page;
+use crate::http::page::Page;
 use crate::http::v1::common::InfoHashHex;
 
 /// What a torrent is doing, as of the last state update libtorrent posted.
@@ -166,11 +166,10 @@ impl Torrent {
     }
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of torrents, ordered by infohash.
-    TorrentPage,
-    TorrentSummary
-);
+    pub TorrentPage = Page<TorrentSummary>;
+}
 
 /// The torrent `/{infohash}` names.
 #[derive(Schema, PathParams)]

@@ -14,7 +14,7 @@ use super::model::TorrentFilePath;
 use super::model::TorrentPath;
 use super::Lookup;
 use crate::app_state::AppState;
-use crate::http::page::page;
+use crate::http::page::Page;
 use crate::http::page::PageLimit;
 use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
@@ -59,11 +59,10 @@ impl From<torrentd_engine::TorrentFile> for TorrentFile {
     }
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of a torrent's files, in index order.
-    TorrentFilePage,
-    TorrentFile
-);
+    pub TorrentFilePage = Page<TorrentFile>;
+}
 
 /// Which page of files.
 #[derive(Schema, QueryParams)]
