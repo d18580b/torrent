@@ -1,65 +1,51 @@
 //! The control API on a unix socket: `http_listen = "unix:/path"`.
 //!
-//! kynos' listeners are TCP only, so this module owns the accept loop and
-//! hands each accepted stream to [`Server::serve_io`], which serves it as a
-//! TCP connection is served: HTTP/1.1 or HTTP/2 (h2c) told apart from the
-//! first bytes, under the TCP server's protocol settings
-//! ([`crate::startup::http_server`]), with request bodies streamed to the
-//! route, which authorizes the request and then reads its body under its own
-//! cap and deadline.
+//! This module places the socket: it binds it under a private staging path,
+//! sets its mode and group, renames it into place, and removes it once the
+//! server is done with it. kynos serves it ([`Server::unix_listener`]) as it
+//! serves a TCP listener: HTTP/1.1 or HTTP/2 (h2c) told apart from the first
+//! bytes, under the TCP server's protocol settings (`startup::http_server`),
+//! its connection cap and its graceful drain.
 //!
-//! What `serve_io` leaves to the caller stays here: at most
-//! `max_connections` open at once, and a bounded drain on shutdown. Every
-//! request reaches the router from [`SOCKET_PEER`], an address no socket
-//! connects from, so no `trusted_proxies` entry admits a forwarding header
-//! sent over the socket. Who called is logged by uid and pid (`SO_PEERCRED`)
-//! on the connection's span instead.
+//! A request over the socket has no IP peer (`Connection::peer_addr` is
+//! `None`), so it resolves to no client address and no `trusted_proxies`
+//! entry admits a forwarding header sent over it. Who called is logged by uid
+//! and pid instead, which kynos reads from the kernel once per connection
+//! (`Connection::peer_credentials`), on each request's span.
 //!
-//! [`Server::serve_io`]: kynos::server::Server::serve_io
+//! [`Server::unix_listener`]: kynos::server::Server::unix_listener
 
-use std::net::SocketAddr;
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
-use kynos::router::service::Service;
-use tokio::sync::broadcast;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use torrentd_engine::ShutdownReason;
-use tracing::debug;
 use tracing::info;
 use tracing::warn;
-use tracing::Instrument as _;
-
-/// The peer address every request over the socket carries: unspecified, so
-/// it names no host and matches no `trusted_proxies` entry.
-pub const SOCKET_PEER: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// A bound API socket. Dropping it closes the listener and removes the socket
 /// file.
 #[derive(Debug)]
 pub struct ApiSocket {
-    listener: tokio::net::UnixListener,
+    listener: std::os::unix::net::UnixListener,
     file: SocketFile,
 }
 
 impl ApiSocket {
-    /// The socket's path.
-    pub fn path(&self) -> &Path {
-        &self.file.path
+    /// The listener, for the server to accept on, and the file it is bound
+    /// at, which removes itself when dropped: hold it until the server has
+    /// stopped, so the configured path names the socket for as long as it is
+    /// served.
+    pub fn into_parts(self) -> (std::os::unix::net::UnixListener, SocketFile) {
+        (self.listener, self.file)
     }
 }
 
 /// The socket file a bind created. Dropping it removes the file, if the file
 /// at its path is still that one: a later run that replaced it keeps its own.
 #[derive(Debug)]
-struct SocketFile {
+pub struct SocketFile {
     path: PathBuf,
     /// `(st_dev, st_ino)` of the file.
     id: (u64, u64),
@@ -90,7 +76,7 @@ impl Drop for SocketFile {
 /// permissions. The directory is mode `0700` whatever the umask, so while the
 /// socket still has the umask's permissions only the daemon's own user can
 /// connect to it, and no connection another user queued then is accepted
-/// after the rename. Must run inside a tokio runtime.
+/// after the rename.
 pub fn bind(path: &Path, mode: u32, group: Option<&str>) -> anyhow::Result<ApiSocket> {
     use std::os::unix::fs::DirBuilderExt as _;
 
@@ -112,8 +98,8 @@ pub fn bind(path: &Path, mode: u32, group: Option<&str>) -> anyhow::Result<ApiSo
         .mode(0o700)
         .create(&staging)
         .with_context(|| format!("create the staging directory {}", staging.display()))?;
-    let placed = (|| -> anyhow::Result<(tokio::net::UnixListener, std::fs::Metadata)> {
-        let listener = tokio::net::UnixListener::bind(&temp)
+    let placed = (|| -> anyhow::Result<(std::os::unix::net::UnixListener, std::fs::Metadata)> {
+        let listener = std::os::unix::net::UnixListener::bind(&temp)
             .with_context(|| format!("bind the API socket at {}", temp.display()))?;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("chmod {mode:o} {}", temp.display()))?;
@@ -233,132 +219,15 @@ fn resolve_group(group: &str) -> anyhow::Result<u32> {
     }
 }
 
-/// Limits the socket server keeps; the TCP server's, passed in from startup.
-#[derive(Clone, Copy, Debug)]
-pub struct Limits {
-    pub max_connections: usize,
-    /// How long a connection may take to send a request head: its first one
-    /// from accept, under either protocol, and each later HTTP/1 one.
-    pub header_read_timeout: Duration,
-    pub drain_timeout: Duration,
-}
-
-/// The longest wait between two accepts that failed.
-const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// Serve `app` on `socket` until a shutdown arrives on `shutdown_rx`, then
-/// run `on_shutdown`, stop accepting, and wait up to `limits.drain_timeout`
-/// for the open connections to end before cutting off the rest.
-///
-/// `serve_io` has no graceful shutdown of its own, so a connection is not
-/// asked to close: one with a request in flight ends once its client closes
-/// it, as a `Connection: close` request does once it is answered, and an
-/// idle one ends at its client's close, its next head's
-/// `header_read_timeout`, or the HTTP/2 idle timeout, whichever comes first.
-///
-/// A failing accept is retried after a doubling backoff rather than ending
-/// the server: running out of descriptors passes as connections close, and
-/// stopping the daemon for it tears down every session to fix it.
-pub async fn serve(
-    socket: ApiSocket,
-    app: Service<crate::http::ctx::AppCtx>,
-    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
-    on_shutdown: impl FnOnce(),
-    limits: Limits,
-) {
-    let server = crate::startup::http_server(app).http1(
-        kynos::server::protocol::http1::Http1Config::default()
-            .header_read_timeout(Some(limits.header_read_timeout)),
-    );
-    let permits = Arc::new(Semaphore::new(limits.max_connections));
-    let mut connections = JoinSet::new();
-    let mut backoff = Duration::from_millis(10);
-
-    loop {
-        while connections.try_join_next().is_some() {}
-        let permit = tokio::select! {
-            biased;
-            _ = shutdown_rx.recv() => break,
-            permit = Arc::clone(&permits).acquire_owned() => {
-                permit.expect("the semaphore is never closed")
-            }
-        };
-        let accepted = tokio::select! {
-            biased;
-            _ = shutdown_rx.recv() => break,
-            accepted = socket.listener.accept() => accepted,
-        };
-        match accepted {
-            Ok((stream, _)) => {
-                backoff = Duration::from_millis(10);
-                let cred = stream.peer_cred().ok();
-                let span = tracing::info_span!(
-                    "api_socket",
-                    peer.uid = cred.map(|c| c.uid()),
-                    peer.pid = cred.and_then(|c| c.pid()),
-                );
-                let connection = match server.serve_io(
-                    stream,
-                    kynos::extract::connection::Connection::from_peer(SOCKET_PEER, SOCKET_PEER),
-                ) {
-                    Ok(connection) => connection,
-                    Err(e) => {
-                        // Only a refused configuration fails here, and the
-                        // server's is fixed at build time: unreachable unless
-                        // `http_server` sets a value kynos refuses.
-                        warn!(error.cause = %e, "the API socket's server configuration was refused");
-                        continue;
-                    }
-                };
-                connections.spawn(
-                    async move {
-                        let _permit = permit;
-                        if let Err(e) = connection.await {
-                            debug!(error.cause = %e, "API socket connection ended with an error");
-                        }
-                    }
-                    .instrument(span),
-                );
-            }
-            Err(e) => {
-                drop(permit);
-                warn!(
-                    path = %socket.path().display(),
-                    error.cause = %e,
-                    retry_in_ms = backoff.as_millis(),
-                    "accept on the API socket failed; retrying after a backoff",
-                );
-                tokio::select! {
-                    _ = shutdown_rx.recv() => break,
-                    () = tokio::time::sleep(backoff) => {}
-                }
-                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
-            }
-        }
-    }
-
-    on_shutdown();
-    // Closed before the drain, so a client connecting now is refused at once
-    // rather than queued on a listener nothing accepts from.
-    drop(socket);
-    let drained = tokio::time::timeout(limits.drain_timeout, async {
-        while connections.join_next().await.is_some() {}
-    })
-    .await;
-    if drained.is_err() {
-        warn!(
-            timeout_secs = limits.drain_timeout.as_secs(),
-            open = connections.len(),
-            "API socket drain timed out; the connections still open were cut off",
-        );
-        connections.shutdown().await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;
+    use tokio::sync::broadcast;
+    use torrentd_engine::ShutdownReason;
 
     use super::*;
     use crate::http::v1::MAX_ADD_BODY_BYTES;
@@ -467,7 +336,7 @@ mod tests {
             assert!(meta.file_type().is_socket());
             assert_eq!(mode_of(&path), mode, "{mode:o}");
             assert_eq!(meta.gid(), gid);
-            assert_eq!(socket.path(), path);
+            assert_eq!(socket.file.path, path);
             assert!(
                 leftovers(dir.path()).is_empty(),
                 "{:?}",
@@ -524,14 +393,24 @@ mod tests {
         _dir: tempfile::TempDir,
         path: PathBuf,
         tx: broadcast::Sender<ShutdownReason>,
-        server: tokio::task::JoinHandle<()>,
+        server: tokio::task::JoinHandle<kynos::Result<()>>,
         hook_rx: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    /// The bounds a test serves under in place of production's, which are
+    /// too wide to reach in a test.
+    #[derive(Clone, Copy)]
+    struct Limits {
+        max_connections: usize,
+        header_read_timeout: Duration,
     }
 
     fn start(limits: Limits) -> Running {
         start_with(limits, crate::app_state::build_test_state(None))
     }
 
+    /// The daemon's own serving path (`startup::serve_on`) on a socket from
+    /// [`bind`], with the production server's settings but `limits`.
     fn start_with(limits: Limits, state: crate::app_state::AppState) -> Running {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
@@ -540,16 +419,22 @@ mod tests {
             crate::http::document_json().unwrap(),
         )));
         let app = crate::http::service(state, openapi).unwrap();
+        let server = crate::startup::http_server(app)
+            .max_connections(std::num::NonZeroUsize::new(limits.max_connections).unwrap())
+            .http1(
+                kynos::server::protocol::http1::Http1Config::default()
+                    .header_read_timeout(Some(limits.header_read_timeout)),
+            );
         let (tx, rx) = broadcast::channel(1);
         let (hook_tx, hook_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve(
-            socket,
-            app,
+        let server = tokio::spawn(crate::startup::serve_on(
+            crate::startup::ApiListener::Unix(socket),
+            server,
             rx,
             move || {
+                // ignore-result: a test that stopped listening does not care.
                 let _ = hook_tx.send(());
             },
-            limits,
         ));
         Running {
             _dir: dir,
@@ -563,7 +448,6 @@ mod tests {
     const LIMITS: Limits = Limits {
         max_connections: 4,
         header_read_timeout: Duration::from_secs(5),
-        drain_timeout: Duration::from_secs(5),
     };
 
     /// A request head for `POST /v1/sessions` with a declared `length`.
@@ -617,7 +501,7 @@ mod tests {
         );
 
         tx.send(ShutdownReason::Sigterm).unwrap();
-        server.await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     /// A request that is refused is refused before its body is read: with
@@ -655,7 +539,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 401"), "got: {response:.300}");
 
         tx.send(ShutdownReason::Sigterm).unwrap();
-        server.await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     /// HTTP/2 with prior knowledge (h2c) is served on the socket, as on TCP:
@@ -687,7 +571,7 @@ mod tests {
         drop(stream);
 
         tx.send(ShutdownReason::Sigterm).unwrap();
-        server.await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     /// Past `max_connections`, a connection waits unaccepted until one closes.
@@ -729,7 +613,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response:.200}");
 
         tx.send(ShutdownReason::Sigterm).unwrap();
-        server.await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     /// A connection that never finishes its request head is closed after
@@ -745,7 +629,6 @@ mod tests {
         } = start(Limits {
             max_connections: 1,
             header_read_timeout: Duration::from_millis(200),
-            ..LIMITS
         });
         let mut stalled = tokio::net::UnixStream::connect(&path).await.unwrap();
         stalled
@@ -775,7 +658,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response:.200}");
 
         tx.send(ShutdownReason::Sigterm).unwrap();
-        server.await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     /// A shutdown that arrives while a request is in flight lets it finish
@@ -828,7 +711,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), server)
             .await
             .expect("the server stops once it is drained")
-            .unwrap();
+            .unwrap()
+            .expect("the drain completed in time");
     }
 
     #[tokio::test]
@@ -893,6 +777,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), server)
             .await
             .expect("the server stops on a shutdown")
+            .unwrap()
             .unwrap();
         hook_rx.await.expect("the shutdown hook ran");
         assert!(!path.exists(), "the socket file is removed on shutdown");

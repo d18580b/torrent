@@ -20,6 +20,8 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -277,9 +279,12 @@ pub struct Auth {
 /// ~50 ms of CPU on every attempt.
 ///
 /// Failures are counted per client where the client is established — the
-/// socket peer, or an address a trusted proxy supplied ([`throttle_key`]
+/// TCP peer, or an address a trusted proxy supplied ([`throttle_key`]
 /// keys IPv6 per /64) — and in one global bucket where it is not, or where
-/// the per-client map is full of live entries. Every verification also
+/// the per-client map is full of live entries. Every caller on the unix
+/// socket is one client of its own ([`LoginClient::Socket`]), counted in a
+/// bucket outside the map: TCP clients overflowing the map never reach it,
+/// and a socket login never clears the global bucket. Every verification also
 /// spends from one daemon-wide budget ([`KdfBudget`]), or, once that is
 /// empty and only for a client that has logged in before, from the reserve
 /// described below; together they bound how much Argon2 the route runs
@@ -318,6 +323,13 @@ pub struct LoginThrottle {
     /// and written only by a correct password, so a caller without it can
     /// neither join nor evict.
     known: Mutex<HashMap<IpAddr, Instant>>,
+    /// Every unix-socket caller's one bucket, apart from the per-client map
+    /// so that a map full of TCP clients cannot push socket logins onto the
+    /// global bucket.
+    socket: Mutex<ThrottleState>,
+    /// Whether a socket caller has logged in, which, as [`known`](Self::known)
+    /// does for an address, lets socket callers spend the reserve.
+    socket_known: AtomicBool,
     max_burst: u32,
     penalty: Duration,
     clock: Clock,
@@ -430,6 +442,24 @@ impl KdfBudget {
     }
 }
 
+/// Who a login attempt is counted against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginClient {
+    /// No client could be established: the global bucket, and no reserve.
+    Unknown,
+    /// An established client address, counted under its [`throttle_key`].
+    Addr(IpAddr),
+    /// A caller on the unix socket. Socket callers have no address, so they
+    /// share one bucket and one place in the reserve, both their own.
+    Socket,
+}
+
+impl From<Option<IpAddr>> for LoginClient {
+    fn from(ip: Option<IpAddr>) -> Self {
+        ip.map_or(Self::Unknown, Self::Addr)
+    }
+}
+
 /// The key a client's failures are counted under.
 ///
 /// An IPv4 address is its own key. An IPv6 address is keyed by its /64: a
@@ -522,6 +552,8 @@ impl LoginThrottle {
             kdf: Mutex::new(KdfBudget::new(KDF_BURST, KDF_REFILL, now)),
             reserve: Mutex::new(KdfBudget::new(RESERVE_BURST, RESERVE_REFILL, now)),
             known: Mutex::new(HashMap::new()),
+            socket: Mutex::new(ThrottleState::new(now)),
+            socket_known: AtomicBool::new(false),
             max_burst: 5,
             penalty: Duration::from_secs(30),
             clock,
@@ -574,15 +606,20 @@ impl LoginThrottle {
     /// empty, a client that has logged in before spends from the reserve
     /// instead, and is told the sooner of the two waits when both are empty;
     /// anyone else is refused with the shared budget's wait.
-    pub fn admit_verification(&self, client: Option<IpAddr>) -> Result<Admission, Duration> {
+    pub fn admit_verification(
+        &self,
+        client: impl Into<LoginClient>,
+    ) -> Result<Admission, Duration> {
         let now = self.clock.now();
         let Err(wait) = self.kdf.lock().take(now) else {
             return Ok(Admission::Shared);
         };
-        let Some(ip) = client.map(throttle_key) else {
-            return Err(wait);
+        let known = match client.into() {
+            LoginClient::Unknown => false,
+            LoginClient::Addr(ip) => self.known.lock().contains_key(&throttle_key(ip)),
+            LoginClient::Socket => self.socket_known.load(Ordering::Relaxed),
         };
-        if !self.known.lock().contains_key(&ip) {
+        if !known {
             return Err(wait);
         }
         match self.reserve.lock().take(now) {
@@ -595,10 +632,12 @@ impl LoginThrottle {
     ///
     /// Mirrors `note_failure`: a client with no bucket of its own once the map
     /// is full is read from the global bucket its failures are written to.
-    pub fn retry_after(&self, client: Option<IpAddr>) -> Option<Duration> {
+    pub fn retry_after(&self, client: impl Into<LoginClient>) -> Option<Duration> {
         let now = self.clock.now();
-        let Some(ip) = client.map(throttle_key) else {
-            return self.global.lock().retry_after(now);
+        let ip = match client.into() {
+            LoginClient::Unknown => return self.global.lock().retry_after(now),
+            LoginClient::Socket => return self.socket.lock().retry_after(now),
+            LoginClient::Addr(ip) => throttle_key(ip),
         };
         let mut g = self.per_client.lock();
         if let Some(state) = g.get_mut(&ip) {
@@ -612,13 +651,22 @@ impl LoginThrottle {
     }
 
     /// Record a failed attempt, locking out once the burst is spent.
-    pub fn note_failure(&self, client: Option<IpAddr>) {
+    pub fn note_failure(&self, client: impl Into<LoginClient>) {
         let now = self.clock.now();
-        let Some(ip) = client.map(throttle_key) else {
-            self.global
-                .lock()
-                .note_failure(self.max_burst, self.penalty, now);
-            return;
+        let ip = match client.into() {
+            LoginClient::Unknown => {
+                self.global
+                    .lock()
+                    .note_failure(self.max_burst, self.penalty, now);
+                return;
+            }
+            LoginClient::Socket => {
+                self.socket
+                    .lock()
+                    .note_failure(self.max_burst, self.penalty, now);
+                return;
+            }
+            LoginClient::Addr(ip) => throttle_key(ip),
         };
         let mut g = self.per_client.lock();
         if g.len() >= MAX_TRACKED_CLIENTS && !g.contains_key(&ip) {
@@ -648,15 +696,25 @@ impl LoginThrottle {
     ///
     /// The global bucket is not cleared by an identified client: one valid
     /// credential must not reset the shared bucket between guesses at another.
+    /// A socket caller is identified: its success clears the socket's bucket
+    /// and nothing else.
     ///
     /// An identified client is also remembered as one that has logged in,
     /// which is what lets it spend the reserve
     /// ([`admit_verification`](Self::admit_verification)) from then on.
-    pub fn note_success(&self, client: Option<IpAddr>) {
+    pub fn note_success(&self, client: impl Into<LoginClient>) {
         let now = self.clock.now();
-        let Some(ip) = client.map(throttle_key) else {
-            *self.global.lock() = ThrottleState::new(now);
-            return;
+        let ip = match client.into() {
+            LoginClient::Unknown => {
+                *self.global.lock() = ThrottleState::new(now);
+                return;
+            }
+            LoginClient::Socket => {
+                self.socket_known.store(true, Ordering::Relaxed);
+                *self.socket.lock() = ThrottleState::new(now);
+                return;
+            }
+            LoginClient::Addr(ip) => throttle_key(ip),
         };
         self.remember(ip, now);
         let mut g = self.per_client.lock();
@@ -1222,6 +1280,75 @@ mod tests {
         assert_eq!(t.per_client.lock().len(), MAX_TRACKED_CLIENTS);
     }
 
+    /// Socket callers have a bucket of their own: TCP clients overflowing a
+    /// full map onto the global bucket do not lock them out, their failures
+    /// lock out neither the global bucket nor any address, and their success
+    /// clears only their own bucket.
+    #[test]
+    fn socket_callers_are_one_client_of_their_own() {
+        let t = LoginThrottle::new();
+        fill(&t, 5);
+        for n in 0..5 {
+            t.note_failure(Some(filler(MAX_TRACKED_CLIENTS + n)));
+        }
+        assert!(t.retry_after(None).is_some(), "the global bucket is locked");
+        assert!(
+            t.retry_after(LoginClient::Socket).is_none(),
+            "an overflowing TCP attacker must not lock out the socket",
+        );
+
+        t.note_success(LoginClient::Socket);
+        assert!(
+            t.retry_after(None).is_some(),
+            "a socket login must not reset the global bucket",
+        );
+
+        let t = LoginThrottle::new();
+        for _ in 0..5 {
+            t.note_failure(LoginClient::Socket);
+        }
+        assert!(t.retry_after(LoginClient::Socket).is_some());
+        assert!(t.retry_after(None).is_none(), "the global bucket is apart");
+        assert!(t.retry_after(ip(1)).is_none(), "and so is every address");
+        t.note_success(LoginClient::Socket);
+        assert!(t.retry_after(LoginClient::Socket).is_none());
+    }
+
+    /// A socket caller that has logged in spends the reserve as a returning
+    /// address does, and failing does not earn it.
+    #[test]
+    fn a_socket_caller_that_has_logged_in_spends_the_reserve() {
+        let t = LoginThrottle::with_fake_clock();
+        assert_eq!(
+            attempt(&t, LoginClient::Socket, false),
+            Ok(Admission::Shared)
+        );
+        for n in 0..KDF_BURST - 1 {
+            assert_eq!(attempt(&t, ip(10 + n as u8), false), Ok(Admission::Shared));
+        }
+        assert!(
+            attempt(&t, LoginClient::Socket, true).is_err(),
+            "a failure earns no reserve",
+        );
+
+        let t = LoginThrottle::with_fake_clock();
+        assert_eq!(
+            attempt(&t, LoginClient::Socket, true),
+            Ok(Admission::Shared)
+        );
+        for n in 0..KDF_BURST - 1 {
+            assert_eq!(attempt(&t, ip(10 + n as u8), false), Ok(Admission::Shared));
+        }
+        assert_eq!(
+            attempt(&t, LoginClient::Socket, true),
+            Ok(Admission::Reserve)
+        );
+        assert!(
+            attempt(&t, None, true).is_err(),
+            "a socket login earns no reserve for an anonymous client",
+        );
+    }
+
     #[test]
     fn a_full_map_stays_bounded_and_overflows_to_the_shared_bucket() {
         let t = LoginThrottle::new();
@@ -1562,9 +1689,10 @@ mod tests {
     /// would reach. `Ok` names the budget that paid for a verification.
     fn attempt(
         t: &LoginThrottle,
-        client: Option<IpAddr>,
+        client: impl Into<LoginClient>,
         correct: bool,
     ) -> Result<Admission, Duration> {
+        let client = client.into();
         if let Some(wait) = t.retry_after(client) {
             return Err(wait);
         }
