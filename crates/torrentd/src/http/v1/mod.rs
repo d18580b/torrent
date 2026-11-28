@@ -6,7 +6,14 @@
 
 use std::time::Duration;
 
+use kynos::middleware::catch_panic::Propagate;
+use kynos::middleware::limits::body_size::BodySize;
+use kynos::middleware::limits::body_size::BodyTooSlow;
+use kynos::middleware::limits::timeout::Timeout;
+use kynos::router::group::Group;
 use kynos::Tag;
+
+use crate::http::ctx::AppCtx;
 
 pub mod common;
 pub mod pool;
@@ -111,8 +118,15 @@ pub struct Operations;
 )]
 pub struct Testing;
 
-/// A `/v1` group, with the body limit its operations admit, the deadline the
-/// body has to arrive by, and the credential checked before it is read.
+/// A `/v1` group whose body and handler share one deadline.
+pub(crate) type Timed = Group<AppCtx, Propagate, kynos::stack![Timeout, BodySize]>;
+
+/// A `/v1` group whose body alone has a deadline.
+pub(crate) type Untimed = Group<AppCtx, Propagate, kynos::stack![BodySize<(), BodyTooSlow>]>;
+
+/// The `/v1` groups, by the body limit their operations admit, the deadline
+/// the body has to arrive by, and whether the credential is checked before it
+/// is read.
 ///
 /// The interceptors every routed response shares — the request id and the API
 /// headers — sit on the router, not here: per group they would give each
@@ -120,63 +134,64 @@ pub struct Testing;
 /// groups share the prefix, differing only in what body they admit, how long
 /// it may take, and whether a credential is needed to send one: operations
 /// that take no body declare no `413` and no `408`, so the document does not
-/// promise a failure they cannot produce. A macro rather than a function
-/// because each interceptor changes the group's type.
+/// promise a failure they cannot produce. One function per shape, since each
+/// set of interceptors is a type of its own.
 ///
-/// Every group whose operations take a body and need `write` checks the
-/// credential first, with [`Authorized`](crate::http::security::Authorized),
-/// before anything reads the body. The handler's `Scoped` extractor runs only
-/// after every interceptor, and kynos' `BodySize` reads a body that declares
-/// no length whole, so without it an unauthenticated chunked body is buffered
-/// up to the group's limit — 96 MiB for `POST /v1/torrents` — and may stall
-/// for as long as the deadline allows before it is answered `401`.
+/// Every group whose operations take a body and need a credential runs each
+/// operation's own `Scoped` guard first, through kynos' `guard_first`, before
+/// anything reads the body. Without it the guard runs only after every
+/// interceptor, and kynos' `BodySize` reads a body that declares no length
+/// whole, so an unauthenticated chunked body is buffered up to the group's
+/// limit — 96 MiB for `POST /v1/torrents` — and may stall for as long as the
+/// deadline allows before it is answered `401`. Only when the guard runs
+/// moves: the document describes it as the handler declares it, either way.
 /// `POST /v1/sessions` is the one body operation that takes no credential,
-/// so it has a group of its own (`open`).
+/// so it has a group of its own ([`open`]).
 ///
 /// The deadline is kynos' `Timeout`, mounted *before* `BodySize` so that it
 /// wraps the body read as well as the handler — kynos runs interceptors in the
 /// order they are added, outermost first, and a timeout mounted after
-/// `BodySize` would bound the handler alone. It bounds the handler's awaits
-/// too, which is why the operations that may await minutes of work are
-/// mounted with `untimed`: applying a plan, and adopting or creating a plan,
-/// which wait on the pool index's writer that a scan holds for its whole run.
-/// A deadline there answers `408` while the work goes on to completion, and
-/// the client never learns its outcome. Their body still has one:
-/// `BodySize::deadline` bounds its arrival by [`BODY_DEADLINE`] and leaves
-/// the handler unbounded. A body whose transfer fails part-way is handed on
-/// as a failed read, so the handler's extractor refuses it with `400` rather
-/// than parse what arrived as a whole payload (issue #703).
-macro_rules! v1_group {
-    () => {
-        kynos::router::group::Group::new(crate::http::v1::PREFIX)
-    };
-    (open $max_body:expr, $deadline:expr) => {
-        v1_group!()
-            .intercept(kynos::middleware::limits::timeout::Timeout::new($deadline))
-            .intercept(kynos::middleware::limits::body_size::BodySize::new(
-                $max_body as u64,
-            ))
-    };
-    (untimed $max_body:expr) => {
-        v1_group!()
-            .intercept(crate::http::security::Authorized::<
-                crate::http::security::Write,
-            >::new())
-            .intercept(
-                kynos::middleware::limits::body_size::BodySize::new($max_body as u64)
-                    .deadline(crate::http::v1::BODY_DEADLINE),
-            )
-    };
-    ($max_body:expr, $deadline:expr) => {
-        v1_group!()
-            .intercept(kynos::middleware::limits::timeout::Timeout::new($deadline))
-            .intercept(crate::http::security::Authorized::<
-                crate::http::security::Write,
-            >::new())
-            .intercept(kynos::middleware::limits::body_size::BodySize::new(
-                $max_body as u64,
-            ))
-    };
+/// `BodySize` would bound the handler alone. The guard runs inside it, so a
+/// credential check is bounded too. It bounds the handler's awaits as well,
+/// which is why the operations that may await minutes of work are mounted
+/// [`untimed`]: applying a plan, and adopting or creating a plan, which wait
+/// on the pool index's writer that a scan holds for its whole run. A deadline
+/// there answers `408` while the work goes on to completion, and the client
+/// never learns its outcome. Their body still has one: `BodySize::deadline`
+/// bounds its arrival by [`BODY_DEADLINE`] and leaves the handler unbounded.
+/// A body whose transfer fails part-way is handed on as a failed read, so the
+/// handler's extractor refuses it with `400` rather than parse what arrived
+/// as a whole payload (issue #703).
+pub(crate) fn bodyless() -> Group<AppCtx> {
+    Group::new(PREFIX)
+}
+
+/// A group taking a body of up to `max_body` bytes under `deadline`, from
+/// anyone: see [`bodyless`].
+pub(crate) fn open(max_body: usize, deadline: Duration) -> Timed {
+    bodyless().intercept_all((Timeout::new(deadline), body_limit(max_body)))
+}
+
+/// A group taking a body of up to `max_body` bytes under `deadline`, from a
+/// caller its operations' guard admits first: see [`bodyless`].
+pub(crate) fn guarded(max_body: usize, deadline: Duration) -> Timed {
+    bodyless()
+        .intercept(Timeout::new(deadline))
+        .guard_first()
+        .intercept(body_limit(max_body))
+}
+
+/// A group taking a body of up to `max_body` bytes, which has
+/// [`BODY_DEADLINE`] to arrive, from a caller its operations' guard admits
+/// first, and leaving the handler unbounded: see [`bodyless`].
+pub(crate) fn untimed(max_body: usize) -> Untimed {
+    bodyless()
+        .guard_first()
+        .intercept(body_limit(max_body).deadline(BODY_DEADLINE))
+}
+
+fn body_limit(max_body: usize) -> BodySize {
+    BodySize::new(max_body as u64)
 }
 
 /// Mount every `/v1` operation on `$router`.
@@ -187,7 +202,7 @@ macro_rules! v1_group {
 macro_rules! mount {
     ($router:expr) => {{
         use crate::http::v1::*;
-        let bodyless = v1_group!().mount(kynos::routes![
+        let bodyless = bodyless().mount(kynos::routes![
             server::get_server,
             server::get_status,
             server::stream_events,
@@ -198,13 +213,14 @@ macro_rules! mount {
         let bodyless = pool::bodyless_routes!(profiles::bodyless_routes!(
             torrents::bodyless_routes!(bodyless)
         ));
-        let open = v1_group!(open MAX_BODY_BYTES, REQUEST_DEADLINE)
-            .mount(kynos::routes![sessions::create_session]);
-        let body = pool::body_routes!(profiles::body_routes!(torrents::body_routes!(
-            v1_group!(MAX_BODY_BYTES, REQUEST_DEADLINE)
-        )));
-        let long = pool::long_body_routes!(v1_group!(untimed MAX_BODY_BYTES));
-        let add = torrents::add_routes!(v1_group!(MAX_ADD_BODY_BYTES, ADD_REQUEST_DEADLINE));
+        let open =
+            open(MAX_BODY_BYTES, REQUEST_DEADLINE).mount(kynos::routes![sessions::create_session]);
+        let body = pool::body_routes!(profiles::body_routes!(torrents::body_routes!(guarded(
+            MAX_BODY_BYTES,
+            REQUEST_DEADLINE
+        ))));
+        let long = pool::long_body_routes!(untimed(MAX_BODY_BYTES));
+        let add = torrents::add_routes!(guarded(MAX_ADD_BODY_BYTES, ADD_REQUEST_DEADLINE));
         let router = $router
             .group(bodyless)
             .group(open)
@@ -215,11 +231,10 @@ macro_rules! mount {
         // only. Its body is read under `BODY_DEADLINE`, so the `408` kynos
         // declares on every operation that reads a body is one it can send.
         #[cfg(feature = "fault-injection")]
-        let router = router.group(crate::http::fault_injection::fault_routes!(
-            v1_group!(untimed MAX_BODY_BYTES)
-        ));
+        let router = router.group(crate::http::fault_injection::fault_routes!(untimed(
+            MAX_BODY_BYTES
+        )));
         router
     }};
 }
 pub(crate) use mount;
-pub(crate) use v1_group;

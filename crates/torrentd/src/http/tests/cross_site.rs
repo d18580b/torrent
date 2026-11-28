@@ -106,7 +106,7 @@ async fn a_foreign_host_is_refused_on_every_operation() {
             assert_refused(&resp, &format!("POST {path} with Host {host}"));
         }
         // An operation with a body is refused from its head, by
-        // `security::Authorized`, before the handler's own guard.
+        // the handler's own guard, which its group runs first.
         let resp = h
             .send_with("POST", "/v1/torrents", None, None, &[("host", host)])
             .await;

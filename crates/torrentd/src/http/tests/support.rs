@@ -492,8 +492,8 @@ pub fn assert_problem(resp: &TestResponse, status: u16, slug: &str) {
 
 /// Assert `resp` refused a valid credential for a scope it lacks: a `403`
 /// `insufficient-scope` carrying RFC 6750's `insufficient_scope` challenge,
-/// whether the operation's `Scoped` argument or the head-time
-/// `Authorized` interceptor refused it.
+/// whether the operation's `Scoped` argument refused it from the handler or,
+/// in a group that runs it first, from the request head.
 pub fn assert_scope_refused(resp: &TestResponse) {
     assert_problem(resp, 403, "insufficient-scope");
     assert_eq!(
