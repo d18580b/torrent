@@ -9,7 +9,6 @@
 //! on every daemon; without `[pool]` each answers `404 pool-not-configured`,
 //! and `GET /v1/server` says so up front.
 
-use std::fmt;
 use std::sync::Arc;
 
 use kynos::extract::link::Link;
@@ -19,6 +18,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
+use tracing::error;
 use tracing::info;
 
 use crate::app_state::AppState;
@@ -1169,7 +1169,9 @@ fn adopt_one(
     let plan = match pool.adopt_plan(ih) {
         Ok(plan) => plan,
         Err(e) => {
-            return Outcome::Refused(internal("reading the pool index for this torrent", e));
+            let attempt = "reading the pool index for this torrent";
+            error!(target: "torrentd::http", attempt, error.cause = %e, "internal failure");
+            return Outcome::Refused(internal(attempt));
         }
     };
 
@@ -1289,10 +1291,11 @@ fn check_index_owner(pool: &PoolService, ih: &str, profile: &ProfileId) -> Resul
             "the pool index assigns this torrent to profile {owner}"
         )),
         Ok(_) => Ok(()),
-        Err(e) => Err(internal(
-            "reading the pool index's owner of this torrent",
-            e,
-        )),
+        Err(e) => {
+            let attempt = "reading the pool index's owner of this torrent";
+            error!(target: "torrentd::http", attempt, error.cause = %e, "internal failure");
+            Err(internal(attempt))
+        }
     }
 }
 
@@ -1905,16 +1908,20 @@ fn create_plan_blocking(
     spec: torrentd_pool::PlanSpec,
 ) -> Result<Created<Json<Plan>>, CreatePlanError> {
     let kind = spec.kind();
-    let fail = |e: &dyn fmt::Display| Internal::new("creating a plan", e);
+    let attempt = "creating a plan";
 
-    let id = match pool.create_plan(&spec).map_err(|e| fail(&e))? {
+    let id = match pool
+        .create_plan(&spec)
+        .map_err(|e| Internal::new(attempt, e))?
+    {
         Ok(id) => id,
         // A refusal is the expected outcome for overlap, drift, or an occupied
         // destination — a 409 with the reason, not a 500.
         Err(refused) => return Err(CreatePlanError::PlanRefused(refused.to_string())),
     };
 
-    let plan = load_plan(pool, id)?.ok_or_else(|| fail(&"the plan vanished as it was created"))?;
+    let plan = load_plan(pool, id)?
+        .ok_or_else(|| Internal::new(attempt, "the plan vanished as it was created"))?;
     info!(
         target: "torrentd::http::pool",
         plan_id = id,

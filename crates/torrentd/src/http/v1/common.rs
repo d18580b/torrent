@@ -13,7 +13,6 @@ use serde::Serialize;
 use serde::Serializer;
 use torrentd_engine::ProfileId;
 use torrentd_engine::TorrentEngine;
-use tracing::error;
 
 use crate::app_state::AppState;
 
@@ -217,21 +216,23 @@ pub fn unfenced_engine(
     Ok(engine)
 }
 
-/// Log an internal failure with what was being attempted, and return the
-/// `detail` a `500 internal` carries: the attempt, never the cause.
+/// The `detail` a `500 internal` carries for a failure of `attempt`: the
+/// attempt, never the cause.
 ///
 /// The cause can name paths and engine state an API caller has no business
 /// reading; the log has it. A `500` is built with [`Internal::new`], which
-/// calls this; a refusal reported inside a successful answer calls it
-/// directly.
-///
-/// The cause is logged here, on a line naming the attempt, rather than
-/// handed to kynos as a `#[source]`, which kynos' own `ERROR` line for a 5xx
-/// (target `kynos::error`) would carry as `error.sources`.
-pub fn internal(attempt: &str, cause: impl fmt::Display) -> String {
-    error!(target: "torrentd::http", attempt, error.cause = %cause, "internal failure");
+/// holds the cause as its `#[source]`: kynos' own `ERROR` line for a 5xx
+/// (target `kynos::error`) writes the detail as `error` and the cause as
+/// `error.sources`. A refusal reported inside a successful answer is no 5xx
+/// and gets no such line, so its caller logs the cause itself and calls this
+/// for the reason.
+pub fn internal(attempt: &str) -> String {
     format!("{attempt} failed; the daemon's log has the cause")
 }
+
+/// What a `500 internal` was caused by: an error, or a message where the
+/// failure is not one.
+type Cause = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// A failure inside the daemon: `500 internal`.
 ///
@@ -249,20 +250,26 @@ pub fn internal(attempt: &str, cause: impl fmt::Display) -> String {
 /// operation's own variants on several operations, and changing that order
 /// changes the published document. Some also differ in their detail from one
 /// operation to the next.
+///
+/// The cause is the `#[source]`, never part of the detail: it reaches the
+/// daemon's log on kynos' line for the 5xx, and nothing the caller reads.
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 #[problem(status = 500, title = "Internal error")]
 #[error("{detail}")]
 pub struct Internal {
     detail: String,
+    #[source]
+    cause: Option<Cause>,
 }
 
 impl Internal {
-    /// The failure of `attempt`, its cause logged and kept out of the detail
-    /// (see [`internal`]).
-    pub fn new(attempt: &str, cause: impl fmt::Display) -> Self {
+    /// The failure of `attempt`, its cause held as the source and kept out of
+    /// the detail (see [`internal`]).
+    pub fn new(attempt: &str, cause: impl Into<Cause>) -> Self {
         Self {
-            detail: internal(attempt, cause),
+            detail: internal(attempt),
+            cause: Some(cause.into()),
         }
     }
 
@@ -271,46 +278,41 @@ impl Internal {
     pub fn detailed(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
+            cause: None,
         }
     }
 
     /// This failure, its detail followed by `more`: what the request did
-    /// before it failed, and what to do about it.
+    /// before it failed, and what to do about it. The cause stays the
+    /// source.
     pub fn then(self, more: impl fmt::Display) -> Self {
         Self {
             detail: format!("{} {more}", self.detail),
+            ..self
         }
     }
 }
 
 /// Hold `log`, the daemon's log captured while `resp`'s request ran, to
-/// where a `500 internal`'s cause goes: [`internal`]'s line carries it, and
-/// neither the answer nor kynos' own line for the 5xx does.
+/// where a `500 internal`'s cause goes: kynos' line for the 5xx carries it,
+/// and the answer does not.
 ///
 /// kynos' line (target `kynos::error`) records the failure as an error
-/// field: the daemon's JSON log writes its message as `error` and its
-/// `source()` chain, where it has one, as `error.sources`. [`Internal`] holds
-/// no source, so that line has the detail and no chain.
+/// field: the daemon's JSON log writes its message, the detail, as `error`
+/// and its `source()` chain, the cause nearest, as `error.sources`.
 #[cfg(test)]
 pub(crate) fn assert_cause_only_logged(resp: &kynos::test::TestResponse, log: &str) {
     let detail = resp.problem().detail.unwrap();
-    let errors: Vec<serde_json::Value> = log
+    let kynos = log
         .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .filter(|l: &serde_json::Value| l["level"] == "ERROR")
-        .collect();
-    let attempt = errors
-        .iter()
-        .find(|l| l["target"] == "torrentd::http" && l["message"] == "internal failure")
-        .unwrap_or_else(|| panic!("no line names the attempt:\n{log}"));
-    let cause = attempt["error.cause"].as_str().unwrap();
-    assert!(!cause.is_empty() && !detail.contains(cause), "{log}");
-    let kynos = errors
-        .iter()
-        .find(|l| l["target"] == "kynos::error")
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|l| l["level"] == "ERROR" && l["target"] == "kynos::error")
         .unwrap_or_else(|| panic!("kynos logged no line for the 5xx:\n{log}"));
     assert_eq!(kynos["error"], detail.as_str(), "{log}");
-    assert!(kynos.get("error.sources").is_none(), "{log}");
+    let cause = kynos["error.sources"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("kynos' line carries no cause:\n{log}"));
+    assert!(!cause.is_empty() && !detail.contains(cause), "{log}");
 }
 
 #[cfg(test)]

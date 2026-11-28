@@ -190,7 +190,9 @@ message as `error` and its cause chain, where it has one, as `error.sources`,
 an array nearest cause first), which `torrentd_log_events_total` counts under
 `target="other"`: such a 5xx raises `TorrentdErrorsLogged` for both
 `torrentd::http` and `other`, and a query counting every `ERROR` line counts it
-twice. Every refusal `torrentd_auth_rejections_total` counts is
+twice. A `500 internal` keeps its cause out of its `detail`, which names only
+what failed: the cause is on that `kynos::error` line, in `error.sources`,
+rather than on a `torrentd::http` line of its own. Every refusal `torrentd_auth_rejections_total` counts is
 logged at `WARN` (target `torrentd::auth`) with its `reason`, the kind of token
 (`token_kind`: `static` or `session` by its prefix, `other` for a token with
 neither, and `none` where no token was read, which is every `malformed`
