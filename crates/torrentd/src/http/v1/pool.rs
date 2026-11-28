@@ -922,7 +922,7 @@ pub enum AdoptSelector {
     /// These torrents.
     Infohashes {
         /// Between 1 and 1000 torrents from the library.
-        #[schema(min_items = 1, max_items = 1000)]
+        #[schema(min_items = 1, max_items = MAX_INFOHASHES)]
         infohashes: Vec<InfoHashHex>,
     },
     /// Every library torrent whose payload was matched under a directory.
@@ -1337,7 +1337,7 @@ fn release_claim(s: &AppState, infohash: InfoHashHex) {
 #[serde(deny_unknown_fields)]
 pub struct VerifyRequest {
     /// Between 1 and 1000 loaded torrents.
-    #[schema(min_items = 1, max_items = 1000)]
+    #[schema(min_items = 1, max_items = MAX_INFOHASHES)]
     pub infohashes: Vec<InfoHashHex>,
 }
 
