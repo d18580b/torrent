@@ -163,27 +163,22 @@ pub fn paginate<T>(
     (out, next)
 }
 
-/// A concrete, named page type.
+/// One page of a collection.
 ///
-/// kynos names a generic instantiation after its arguments, so a `Page<T>`
-/// would publish `Page_TorrentSummary` where the document has `TorrentPage`,
-/// renaming every page component
-/// the document already publishes and the clients generated from it. One
-/// struct per collection keeps those names, and gives each its own
-/// description.
-macro_rules! page {
-    ($(#[$meta:meta])* $name:ident, $item:ty) => {
-        $(#[$meta])*
-        #[derive(Debug, kynos::Schema, serde::Serialize)]
-        pub struct $name {
-            /// This page's items, in the collection's order.
-            pub items: Vec<$item>,
-            /// Pass as `cursor` to fetch the next page; `null` on the last one.
-            pub next_cursor: Option<String>,
-        }
-    };
+/// kynos names a generic instantiation after its arguments, so each
+/// collection names its own with `kynos::name_instantiation!` (`TorrentPage =
+/// Page<TorrentSummary>`), whose doc comment is the component's description,
+/// and the router registers that name with `Router::name_instantiation`.
+/// Without it the document would publish `Page_TorrentSummary` where it has
+/// `TorrentPage`, renaming every page component the clients generated from it
+/// know.
+#[derive(Debug, kynos::Schema, serde::Serialize)]
+pub struct Page<T> {
+    /// This page's items, in the collection's order.
+    pub items: Vec<T>,
+    /// Pass as `cursor` to fetch the next page; `null` on the last one.
+    pub next_cursor: Option<String>,
 }
-pub(crate) use page;
 
 #[cfg(test)]
 mod tests {

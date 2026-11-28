@@ -23,9 +23,9 @@ use tracing::info;
 
 use crate::app_state::AppState;
 use crate::bulk_adopt::in_parallel;
-use crate::http::page::page;
 use crate::http::page::paginate;
 use crate::http::page::InvalidCursor;
+use crate::http::page::Page;
 use crate::http::page::PageLimit;
 use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
@@ -564,12 +564,11 @@ pub struct TreeEntry {
     pub states: Vec<AdoptionState>,
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of a directory listing: directories first, then files, each
     /// in byte order of their path.
-    TreePage,
-    TreeEntry
-);
+    pub TreePage = Page<TreeEntry>;
+}
 
 /// Whether `key` could be a [`tree_key`] of an immediate child of `prefix`:
 /// `d` or `f`, then a path directly under the listed directory.
@@ -842,11 +841,10 @@ pub struct PoolTorrent {
     pub has_fastresume: bool,
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of library torrents, in infohash order.
-    PoolTorrentPage,
-    PoolTorrent
-);
+    pub PoolTorrentPage = Page<PoolTorrent>;
+}
 
 /// List the library's torrents.
 ///
@@ -1698,11 +1696,10 @@ fn step_of(s: torrentd_pool::model::PlanStepRow) -> Result<PlanStep, String> {
     })
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of a plan's steps, in the order an apply runs them.
-    PlanStepPage,
-    PlanStep
-);
+    pub PlanStepPage = Page<PlanStep>;
+}
 
 /// A plan without its steps, as a listing carries it.
 #[derive(Debug, Schema, Serialize)]
@@ -1719,11 +1716,10 @@ pub struct PlanSummary {
     pub applied_at: Option<jiff::Timestamp>,
 }
 
-page!(
+kynos::name_instantiation! {
     /// One page of plans, oldest first.
-    PlanPage,
-    PlanSummary
-);
+    pub PlanPage = Page<PlanSummary>;
+}
 
 fn unix(secs: i64) -> jiff::Timestamp {
     jiff::Timestamp::from_second(secs).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
