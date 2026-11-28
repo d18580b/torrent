@@ -276,9 +276,8 @@ async fn event_streams_share_one_feed_that_stops_with_the_last_and_free_their_sl
         let _ = shutdown.send(torrentd_engine::ShutdownReason::Sigterm);
     });
 
-    // Both streams are driven on this task, beside the checks made while
-    // they are open: the harness's client is not `Sync`, so it cannot be
-    // shared with spawned tasks.
+    // Both streams are driven on this task, joined with the checks made while
+    // they are open.
     let streams = futures_util::future::join_all(
         tokens
             .iter()
