@@ -221,10 +221,59 @@ pub fn unfenced_engine(
 /// `detail` a `500 internal` carries: the attempt, never the cause.
 ///
 /// The cause can name paths and engine state an API caller has no business
-/// reading; the log has it.
+/// reading; the log has it. A `500` is built with [`Internal::new`], which
+/// calls this; a refusal reported inside a successful answer calls it
+/// directly.
+///
+/// The cause is logged here rather than handed to kynos as a `#[source]`:
+/// kynos' own `ERROR` line for a 5xx (target `kynos::error`) records its
+/// error as one field, and the daemon's JSON log writes only that error's
+/// own message, never its `source()` chain.
 pub fn internal(attempt: &str, cause: impl fmt::Display) -> String {
     error!(target: "torrentd::http", attempt, error.cause = %cause, "internal failure");
     format!("{attempt} failed; the daemon's log has the cause")
+}
+
+/// A failure inside the daemon: `500 internal`.
+///
+/// Every operation that can fail this way holds it as
+/// `#[problem(transparent)] Internal(#[from] Internal)`, so the `500` is
+/// declared here once. The variant goes before any other transparent one:
+/// kynos describes a transparent variant's statuses after every declared
+/// variant's, in the order the variants are written, and that is where the
+/// `500` stood when each enum declared it itself.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 500, title = "Internal error")]
+#[error("{detail}")]
+pub struct Internal {
+    detail: String,
+}
+
+impl Internal {
+    /// The failure of `attempt`, its cause logged and kept out of the detail
+    /// (see [`internal`]).
+    pub fn new(attempt: &str, cause: impl fmt::Display) -> Self {
+        Self {
+            detail: internal(attempt, cause),
+        }
+    }
+
+    /// A failure whose detail is written for the caller in full, its causes
+    /// already logged or counted where they happened.
+    pub fn detailed(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+
+    /// This failure, its detail followed by `more`: what the request did
+    /// before it failed, and what to do about it.
+    pub fn then(self, more: impl fmt::Display) -> Self {
+        Self {
+            detail: format!("{} {more}", self.detail),
+        }
+    }
 }
 
 #[cfg(test)]

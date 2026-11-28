@@ -28,9 +28,9 @@ use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
+use crate::http::v1::common::Internal;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::Torrents;
 use crate::http::validate::Invalid;
@@ -126,6 +126,11 @@ impl Validate for AddTorrentRequest {
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum AddTorrentError {
+    /// The session refused the torrent, or the assignment registry could
+    /// not record it.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// A member of the request breaks a constraint the schema declares.
     #[error(transparent)]
     #[problem(transparent)]
@@ -158,11 +163,6 @@ pub enum AddTorrentError {
     #[error("{0}")]
     #[problem(status = 409, title = "Torrent exists")]
     TorrentExists(String),
-    /// The session refused the torrent, or the assignment registry could
-    /// not record it.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// The add source once read: what the infohash is computed from, and what
@@ -270,9 +270,7 @@ pub async fn add_torrent(
                 read_local_torrent(&state, FsPath::new(&path))
             })
             .await
-            .map_err(|e| AddTorrentError::Internal {
-                detail: internal("reading the server_path .torrent", e),
-            })?;
+            .map_err(|e| Internal::new("reading the server_path .torrent", e))?;
             AddSource::File(read?)
         }
         Err(TorrentSource::Metainfo { .. }) => unreachable!("decoded above"),
@@ -401,9 +399,9 @@ pub async fn add_torrent(
         // happened.
         Err(e) => {
             registry_error();
-            return Err(AddTorrentError::Internal {
-                detail: internal("writing the torrent's assignment to the registry", e),
-            });
+            return Err(
+                Internal::new("writing the torrent's assignment to the registry", e).into(),
+            );
         }
     }
 
@@ -426,9 +424,7 @@ pub async fn add_torrent(
         )
     })
     .await
-    .map_err(|e| AddTorrentError::Internal {
-        detail: internal("adding the torrent", e),
-    })?;
+    .map_err(|e| Internal::new("adding the torrent", e))?;
 
     // The state map learns of the torrent only with its `AddTorrent` alert,
     // so the details come from the handle the session just returned.

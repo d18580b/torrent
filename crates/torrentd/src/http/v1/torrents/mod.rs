@@ -16,8 +16,8 @@ use torrentd_engine::TorrentState;
 
 use crate::app_state::AppState;
 use crate::http::v1::common::engine_for;
-use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
+use crate::http::v1::common::Internal;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::common::ProfileUnavailableReason;
 
@@ -68,16 +68,14 @@ pub enum Lookup {
     #[problem(status = 404, title = "Torrent not found")]
     TorrentNotFound,
     /// A state entry whose profile has no engine: a bug, not a request error.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
 }
 
 impl Lookup {
     fn no_session() -> Self {
-        Self::Internal {
-            detail: internal("finding the torrent's session", "no engine for its profile"),
-        }
+        Internal::new("finding the torrent's session", "no engine for its profile").into()
     }
 }
 

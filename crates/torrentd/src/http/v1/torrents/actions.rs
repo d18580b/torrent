@@ -18,7 +18,7 @@ use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
-use crate::http::v1::common::internal;
+use crate::http::v1::common::Internal;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::Torrents;
 use crate::http::validate::Invalid;
@@ -30,6 +30,10 @@ use crate::http::validate::ValidationFailed;
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum SetUploadLimitError {
+    /// The session refused the request.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// No loaded torrent has this infohash, or its profile has no session.
     #[error(transparent)]
     #[problem(transparent)]
@@ -38,24 +42,20 @@ pub enum SetUploadLimitError {
     #[error(transparent)]
     #[problem(transparent)]
     ValidationFailed(#[from] ValidationFailed),
-    /// The session refused the request.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// Why a torrent was not paused.
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum PauseTorrentError {
+    /// The session refused the request.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// No loaded torrent has this infohash, or its profile has no session.
     #[error(transparent)]
     #[problem(transparent)]
     Lookup(#[from] Lookup),
-    /// The session refused the request.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// Pause a torrent.
@@ -76,9 +76,7 @@ pub async fn pause_torrent(
     if let (Err(_), Some(e), Some(before)) = (&paused, entry, before) {
         e.restore_noted(st.handle, before);
     }
-    paused.map_err(|e| PauseTorrentError::Internal {
-        detail: internal("pausing the torrent", e),
-    })?;
+    paused.map_err(|e| Internal::new("pausing the torrent", e))?;
     // A `.torrent` held paused for its first check is the operator's to
     // resume from here on: the check queue no longer resumes it, and the
     // next boot keeps it paused.
@@ -93,15 +91,15 @@ pub async fn pause_torrent(
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum UnfencedControlError {
+    /// The session refused the request.
+    #[error(transparent)]
+    #[problem(transparent)]
+    Internal(#[from] Internal),
     /// No loaded torrent has this infohash, its profile has no session, or
     /// the VPN monitor fenced the profile or the operator set it offline.
     #[error(transparent)]
     #[problem(transparent)]
     Lookup(#[from] UnfencedLookup),
-    /// The session refused the request.
-    #[error("{detail}")]
-    #[problem(status = 500, title = "Internal error")]
-    Internal { detail: String },
 }
 
 /// Resume a torrent.
@@ -152,9 +150,7 @@ pub async fn resume_torrent(
         resumed
     })
     .await
-    .map_err(|e| UnfencedControlError::Internal {
-        detail: internal("resuming the torrent", e),
-    })?;
+    .map_err(|e| Internal::new("resuming the torrent", e))?;
     if resumed == crate::fence::SingleResume::Resumed {
         return Ok(NoContent);
     }
@@ -226,9 +222,7 @@ pub async fn recheck_torrent(
         crate::check_queue::force_recheck_marking_checking(engine.as_ref(), &state.state, st.handle)
     })
     .await
-    .map_err(|e| UnfencedControlError::Internal {
-        detail: internal("rechecking the torrent", e),
-    })?;
+    .map_err(|e| Internal::new("rechecking the torrent", e))?;
     Ok(Accepted::new(()))
 }
 
@@ -247,9 +241,7 @@ pub async fn reannounce_torrent(
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
     blocking(move || engine.force_reannounce(st.handle))
         .await
-        .map_err(|e| UnfencedControlError::Internal {
-            detail: internal("reannouncing the torrent", e),
-        })?;
+        .map_err(|e| Internal::new("reannouncing the torrent", e))?;
     Ok(Accepted::new(()))
 }
 
@@ -296,8 +288,6 @@ pub async fn set_upload_limit(
     let rate = body.bytes_per_sec.map_or(0, |r| r as i32);
     blocking(move || engine.set_upload_limit(st.handle, rate))
         .await
-        .map_err(|e| SetUploadLimitError::Internal {
-            detail: internal("setting the torrent's upload limit", e),
-        })?;
+        .map_err(|e| Internal::new("setting the torrent's upload limit", e))?;
     Ok(NoContent)
 }
