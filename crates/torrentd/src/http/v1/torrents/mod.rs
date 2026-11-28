@@ -19,14 +19,14 @@ use crate::http::v1::common::engine_for;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::Internal;
 use crate::http::v1::common::ProfileProblem;
-use crate::http::v1::common::ProfileUnavailableReason;
+use crate::http::v1::common::ProfileUnavailable;
 
 /// A loaded torrent's state and its session, or why there is none.
 ///
 /// Keyed on the state map: these act through a handle, and a torrent with no
 /// state entry has none.
 fn loaded(s: &AppState, ih: InfoHash) -> Result<(TorrentState, Arc<dyn TorrentEngine>), Lookup> {
-    let st = s.state.get(&ih).ok_or(Lookup::TorrentNotFound)?;
+    let st = s.state.get(&ih).ok_or(TorrentNotFound::NOT_LOADED)?;
     let engine = engine_for(s, &st.profile_id).map_err(|_| Lookup::no_session())?;
     Ok((st, engine))
 }
@@ -42,18 +42,42 @@ fn loaded_unfenced(
     s: &AppState,
     ih: InfoHash,
 ) -> Result<(TorrentState, Arc<dyn TorrentEngine>), UnfencedLookup> {
-    let st = s.state.get(&ih).ok_or(Lookup::TorrentNotFound)?;
+    let st = s
+        .state
+        .get(&ih)
+        .ok_or(Lookup::from(TorrentNotFound::NOT_LOADED))?;
     let engine = unfenced_engine(s, &st.profile_id).map_err(|p| match p {
-        ProfileProblem::ProfileNotFound => UnfencedLookup::Lookup(Lookup::no_session()),
-        ProfileProblem::ProfileUnavailable {
-            detail,
-            profile_status,
-        } => UnfencedLookup::ProfileUnavailable {
-            detail,
-            profile_status,
-        },
+        ProfileProblem::ProfileNotFound(_) => UnfencedLookup::Lookup(Lookup::no_session()),
+        ProfileProblem::ProfileUnavailable(p) => p.into(),
     })?;
     Ok((st, engine))
+}
+
+/// No torrent with this infohash is assigned to any profile, or none is
+/// loaded in a session: `404`.
+///
+/// An operation that can fail this way holds it as
+/// `#[problem(transparent)] TorrentNotFound(#[from] TorrentNotFound)`, or
+/// through [`Lookup`]. Build it as [`TorrentNotFound::UNASSIGNED`] or
+/// [`TorrentNotFound::NOT_LOADED`], whichever the caller checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 404, title = "Torrent not found")]
+#[error("{detail}")]
+pub struct TorrentNotFound {
+    detail: &'static str,
+}
+
+impl TorrentNotFound {
+    /// The registry assigns no profile this infohash.
+    pub const UNASSIGNED: Self = Self {
+        detail: "no torrent with this infohash",
+    };
+    /// No session holds this infohash: unassigned, assigned but not yet (or
+    /// never) loaded, or dropped by its session mid-request.
+    pub const NOT_LOADED: Self = Self {
+        detail: "no loaded torrent with this infohash",
+    };
 }
 
 /// Why [`loaded`] found no torrent to act on.
@@ -63,10 +87,10 @@ fn loaded_unfenced(
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum Lookup {
-    /// No loaded torrent has this infohash.
-    #[error("no loaded torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    /// No loaded torrent has this infohash: [`TorrentNotFound::NOT_LOADED`].
+    #[error(transparent)]
+    #[problem(transparent)]
+    TorrentNotFound(#[from] TorrentNotFound),
     /// A state entry whose profile has no engine: a bug, not a request error.
     #[error(transparent)]
     #[problem(transparent)]
@@ -89,13 +113,9 @@ pub enum UnfencedLookup {
     /// The VPN monitor fenced the torrent's profile, or the operator set
     /// it offline; nothing may put its torrents back on the network until
     /// the profile is set online.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        #[problem(extension)]
-        profile_status: ProfileUnavailableReason,
-    },
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileUnavailable(#[from] ProfileUnavailable),
 }
 
 /// Whether `e` says the session no longer knows the handle.

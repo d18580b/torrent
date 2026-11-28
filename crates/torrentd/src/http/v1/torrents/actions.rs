@@ -19,7 +19,7 @@ use crate::http::security::Bearer;
 use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::Internal;
-use crate::http::v1::common::ProfileProblem;
+use crate::http::v1::common::ProfileUnavailable;
 use crate::http::v1::Torrents;
 use crate::http::validate::Invalid;
 use crate::http::validate::Unenforced;
@@ -154,18 +154,7 @@ pub async fn resume_torrent(
     if resumed == crate::fence::SingleResume::Resumed {
         return Ok(NoContent);
     }
-    let ProfileProblem::ProfileUnavailable {
-        detail,
-        profile_status,
-    } = ProfileProblem::vpn_down()
-    else {
-        unreachable!("vpn_down is an unavailable profile");
-    };
-    Err(UnfencedLookup::ProfileUnavailable {
-        detail,
-        profile_status,
-    }
-    .into())
+    Err(UnfencedLookup::from(ProfileUnavailable::vpn_down()).into())
 }
 
 /// Re-verify a torrent's payload.

@@ -31,6 +31,7 @@ use crate::http::v1::common::blocking;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::common::Internal;
+use crate::http::v1::common::ProfileNotFound;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::Torrents;
 use crate::http::validate::Invalid;
@@ -249,7 +250,7 @@ pub async fn add_torrent(
         }
     };
     let Some(profile_cfg) = s.profile_config(&profile_id) else {
-        return Err(ProfileProblem::ProfileNotFound.into());
+        return Err(ProfileProblem::from(ProfileNotFound).into());
     };
 
     let source = match source {

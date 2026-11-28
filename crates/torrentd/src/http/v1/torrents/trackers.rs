@@ -11,6 +11,7 @@ use super::is_gone;
 use super::loaded;
 use super::model::TorrentPath;
 use super::Lookup;
+use super::TorrentNotFound;
 use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
@@ -146,7 +147,7 @@ pub async fn list_torrent_trackers(
     let (st, engine) = loaded(&s, p.infohash.get())?;
     let trackers = match blocking(move || engine.torrent_trackers(st.handle)).await {
         Ok(trackers) => trackers,
-        Err(e) if is_gone(&e) => return Err(Lookup::TorrentNotFound.into()),
+        Err(e) if is_gone(&e) => return Err(Lookup::from(TorrentNotFound::NOT_LOADED).into()),
         Err(e) => return Err(Internal::new("listing the torrent's trackers", e).into()),
     };
     Ok(Json(TrackerList {

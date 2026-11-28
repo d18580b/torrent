@@ -15,6 +15,7 @@ use super::model::TorrentPage;
 use super::model::TorrentPath;
 use super::model::TorrentPhase;
 use super::model::TorrentSummary;
+use super::TorrentNotFound;
 use crate::app_state::AppState;
 use crate::http::page::paginate;
 use crate::http::page::PageLimit;
@@ -22,6 +23,8 @@ use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::v1::common::blocking;
+use crate::http::v1::common::InvalidCursor;
+use crate::http::v1::common::ProfileNotFound;
 use crate::http::v1::Torrents;
 use crate::http::validate::Invalid;
 use crate::http::validate::ValidationFailed;
@@ -49,13 +52,13 @@ pub struct ListTorrentsQuery {
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum ListTorrentsError {
     /// The cursor is not one this listing issued.
-    #[error("the cursor is not one this listing issued; start again without it")]
-    #[problem(status = 400, title = "Invalid cursor")]
-    InvalidCursor,
+    #[error(transparent)]
+    #[problem(transparent)]
+    InvalidCursor(#[from] InvalidCursor),
     /// No profile with this `profile_id` is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileNotFound(#[from] ProfileNotFound),
     /// A query parameter is out of range.
     #[error(transparent)]
     #[problem(transparent)]
@@ -84,7 +87,7 @@ pub async fn list_torrents(
         crate::http::validate::is_infohash_hex,
         &mut invalid,
     )
-    .map_err(|_| ListTorrentsError::InvalidCursor)?;
+    .map_err(InvalidCursor::from)?;
     invalid.finish()?;
 
     let profile_id = match q.profile_id {
@@ -96,7 +99,7 @@ pub async fn list_torrents(
                 s.profiles.resolve(&profile_id),
                 crate::profile_registry::Resolution::Unknown
             ) {
-                return Err(ListTorrentsError::ProfileNotFound);
+                return Err(ProfileNotFound.into());
             }
             Some(profile_id)
         }
@@ -191,9 +194,9 @@ fn first_after(
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 pub enum GetTorrentError {
     /// No torrent with this infohash is assigned to any profile.
-    #[error("no torrent with this infohash")]
-    #[problem(status = 404, title = "Torrent not found")]
-    TorrentNotFound,
+    #[error(transparent)]
+    #[problem(transparent)]
+    TorrentNotFound(#[from] TorrentNotFound),
 }
 
 /// Read one torrent.
@@ -210,10 +213,7 @@ pub async fn get_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Json<Torrent>, GetTorrentError> {
     let ih = p.infohash.get();
-    let profile = s
-        .registry
-        .lookup(&ih)
-        .ok_or(GetTorrentError::TorrentNotFound)?;
+    let profile = s.registry.lookup(&ih).ok_or(TorrentNotFound::UNASSIGNED)?;
     let details = match s.state.get(&ih) {
         Some(st) => details_of(&s, &profile, st.handle).await,
         None => None,

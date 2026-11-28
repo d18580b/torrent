@@ -2859,28 +2859,6 @@
               }
             }
           },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "409": {
             "description": "The torrent is still being added; The payload is shared; The payload cannot be trashed; The torrent did not load; The profile is unavailable",
             "content": {
@@ -2970,8 +2948,29 @@
                             "profile_status"
                           ]
                         }
-                      ],
-                      "title": "The profile is unavailable"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                        }
+                      }
                     }
                   ]
                 }
@@ -3480,6 +3479,28 @@
               }
             }
           },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "409": {
             "description": "The profile is unavailable",
             "content": {
@@ -3502,28 +3523,6 @@
                       "required": [
                         "profile_status"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
                     }
                   ]
                 }
@@ -3759,6 +3758,28 @@
               }
             }
           },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "409": {
             "description": "The profile is unavailable",
             "content": {
@@ -3781,28 +3802,6 @@
                       "required": [
                         "profile_status"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
                     }
                   ]
                 }
@@ -4038,6 +4037,28 @@
               }
             }
           },
+          "404": {
+            "description": "Torrent not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "409": {
             "description": "The profile is unavailable",
             "content": {
@@ -4060,28 +4081,6 @@
                       "required": [
                         "profile_status"
                       ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Torrent not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#torrent-not-found"
-                        }
-                      }
                     }
                   ]
                 }
@@ -5405,34 +5404,27 @@
               }
             }
           },
-          "404": {
-            "description": "Profile not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "409": {
-            "description": "The profile is unavailable; The network kill switch is not in force",
+            "description": "The network kill switch is not in force; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
                   "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#kill-switch-not-in-force"
+                            }
+                          }
+                        }
+                      ]
+                    },
                     {
                       "allOf": [
                         {
@@ -5452,24 +5444,29 @@
                             "profile_status"
                           ]
                         }
-                      ],
-                      "title": "The profile is unavailable"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
                     },
                     {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#kill-switch-not-in-force"
-                            }
-                          }
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
                         }
-                      ],
-                      "title": "The network kill switch is not in force"
+                      }
                     }
                   ]
                 }
@@ -7211,7 +7208,7 @@
             }
           },
           "404": {
-            "description": "The pool is not configured; Root not found",
+            "description": "Root not found; The pool is not configured",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7225,12 +7222,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
                             }
                           }
                         }
-                      ],
-                      "title": "The pool is not configured"
+                      ]
                     },
                     {
                       "allOf": [
@@ -7241,12 +7237,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
                             }
                           }
                         }
-                      ],
-                      "title": "Root not found"
+                      ]
                     }
                   ]
                 }
@@ -7571,7 +7566,7 @@
             }
           },
           "404": {
-            "description": "The pool is not configured; Root not found",
+            "description": "Root not found; The pool is not configured",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7585,12 +7580,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
                             }
                           }
                         }
-                      ],
-                      "title": "The pool is not configured"
+                      ]
                     },
                     {
                       "allOf": [
@@ -7601,12 +7595,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
                             }
                           }
                         }
-                      ],
-                      "title": "Root not found"
+                      ]
                     }
                   ]
                 }
@@ -9038,28 +9031,6 @@
               }
             }
           },
-          "404": {
-            "description": "The pool is not configured",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "409": {
             "description": "The plan was refused",
             "content": {
@@ -9074,6 +9045,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#plan-refused"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The pool is not configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
                         }
                       }
                     }
@@ -9360,8 +9353,7 @@
                             }
                           }
                         }
-                      ],
-                      "title": "The pool is not configured"
+                      ]
                     },
                     {
                       "allOf": [
@@ -9376,8 +9368,7 @@
                             }
                           }
                         }
-                      ],
-                      "title": "Plan not found"
+                      ]
                     }
                   ]
                 }
@@ -9612,6 +9603,28 @@
               }
             }
           },
+          "409": {
+            "description": "The plan is being applied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#plan-applying"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "404": {
             "description": "The pool is not configured; Plan not found",
             "content": {
@@ -9631,8 +9644,7 @@
                             }
                           }
                         }
-                      ],
-                      "title": "The pool is not configured"
+                      ]
                     },
                     {
                       "allOf": [
@@ -9647,30 +9659,7 @@
                             }
                           }
                         }
-                      ],
-                      "title": "Plan not found"
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "The plan is being applied",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "allOf": [
-                    {
-                      "$ref": "#/components/schemas/Problem"
-                    },
-                    {
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#plan-applying"
-                        }
-                      }
+                      ]
                     }
                   ]
                 }
@@ -9973,8 +9962,7 @@
                             }
                           }
                         }
-                      ],
-                      "title": "The pool is not configured"
+                      ]
                     },
                     {
                       "allOf": [
@@ -9989,8 +9977,7 @@
                             }
                           }
                         }
-                      ],
-                      "title": "Plan not found"
+                      ]
                     }
                   ]
                 }
@@ -11873,7 +11860,7 @@
             }
           },
           "404": {
-            "description": "The pool is not configured; Root not found; Profile not found",
+            "description": "Root not found; The pool is not configured; Profile not found",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11887,12 +11874,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
                             }
                           }
                         }
-                      ],
-                      "title": "The pool is not configured"
+                      ]
                     },
                     {
                       "allOf": [
@@ -11903,12 +11889,11 @@
                           "properties": {
                             "type": {
                               "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#root-not-found"
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
                             }
                           }
                         }
-                      ],
-                      "title": "Root not found"
+                      ]
                     },
                     {
                       "allOf": [
@@ -12366,49 +12351,6 @@
               }
             }
           },
-          "404": {
-            "description": "The pool is not configured; Plan not found",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "oneOf": [
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
-                            }
-                          }
-                        }
-                      ],
-                      "title": "The pool is not configured"
-                    },
-                    {
-                      "allOf": [
-                        {
-                          "$ref": "#/components/schemas/Problem"
-                        },
-                        {
-                          "properties": {
-                            "type": {
-                              "type": "string",
-                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#plan-not-found"
-                            }
-                          }
-                        }
-                      ],
-                      "title": "Plan not found"
-                    }
-                  ]
-                }
-              }
-            }
-          },
           "409": {
             "description": "The plan cannot be applied; Applying the plan failed",
             "content": {
@@ -12446,6 +12388,47 @@
                         }
                       ],
                       "title": "Applying the plan failed"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The pool is not configured; Plan not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#plan-not-found"
+                            }
+                          }
+                        }
+                      ]
                     }
                   ]
                 }

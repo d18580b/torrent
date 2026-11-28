@@ -103,39 +103,42 @@ pub enum ProfileUnavailableReason {
     Offline,
 }
 
-/// Why a request naming a profile cannot proceed.
+/// No profile with this id is configured: `404`.
 ///
-/// An operation's error enum holds it as
-/// `#[problem(transparent)] Profile(#[from] ProfileProblem)`, so both
-/// failures are declared here once.
+/// An operation that can fail this way, and not as [`ProfileUnavailable`],
+/// holds it as `#[problem(transparent)] ProfileNotFound(#[from]
+/// ProfileNotFound)`; one that can fail both ways holds [`ProfileProblem`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 404, title = "Profile not found")]
+#[error("unknown profile_id")]
+pub struct ProfileNotFound;
+
+/// The profile is configured and cannot take the request: `409`.
+///
+/// Its `detail` says why and what to do about it; `profile_status` names the
+/// state behind it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
-pub enum ProfileProblem {
-    /// No profile with this id is configured.
-    #[error("unknown profile_id")]
-    #[problem(status = 404, title = "Profile not found")]
-    ProfileNotFound,
-    /// The profile is configured and cannot take the request.
-    #[error("{detail}")]
-    #[problem(status = 409, title = "The profile is unavailable")]
-    ProfileUnavailable {
-        detail: String,
-        /// `failed`, `vpn_down` or `offline`.
-        #[problem(extension)]
-        profile_status: ProfileUnavailableReason,
-    },
+#[problem(status = 409, title = "The profile is unavailable")]
+#[error("{detail}")]
+pub struct ProfileUnavailable {
+    pub detail: String,
+    /// `failed`, `vpn_down` or `offline`.
+    #[problem(extension)]
+    pub profile_status: ProfileUnavailableReason,
 }
 
-impl ProfileProblem {
+impl ProfileUnavailable {
     fn failed(reason: &str) -> Self {
-        Self::ProfileUnavailable {
+        Self {
             profile_status: ProfileUnavailableReason::Failed,
             detail: format!("profile failed to start: {reason}"),
         }
     }
 
     pub fn vpn_down() -> Self {
-        Self::ProfileUnavailable {
+        Self {
             profile_status: ProfileUnavailableReason::VpnDown,
             detail: "profile vpn_down: the VPN monitor fenced it after its tunnel failed. Once \
                      the tunnel is back, set the profile online to lift the fence."
@@ -144,12 +147,45 @@ impl ProfileProblem {
     }
 
     pub fn offline() -> Self {
-        Self::ProfileUnavailable {
+        Self {
             profile_status: ProfileUnavailableReason::Offline,
             detail: "profile offline: it is held off the network by its own state or by \
                      offline-all. Set it online first."
                 .to_owned(),
         }
+    }
+}
+
+/// Why a request naming a profile cannot proceed.
+///
+/// An operation's error enum holds it as
+/// `#[problem(transparent)] Profile(#[from] ProfileProblem)`.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+pub enum ProfileProblem {
+    /// No profile with this id is configured.
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileNotFound(#[from] ProfileNotFound),
+    /// The profile is configured and cannot take the request.
+    #[error(transparent)]
+    #[problem(transparent)]
+    ProfileUnavailable(#[from] ProfileUnavailable),
+}
+
+/// The cursor is not one this listing issued: `400`.
+///
+/// A paged listing's error enum holds it as
+/// `#[problem(transparent)] InvalidCursor(#[from] InvalidCursor)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, ApiError)]
+#[problem(base = crate::http::security::PROBLEM_BASE)]
+#[problem(status = 400, title = "Invalid cursor")]
+#[error("the cursor is not one this listing issued; start again without it")]
+pub struct InvalidCursor;
+
+impl From<crate::http::page::InvalidCursor> for InvalidCursor {
+    fn from(_: crate::http::page::InvalidCursor) -> Self {
+        Self
     }
 }
 
@@ -188,9 +224,11 @@ pub fn engine_for(
         return Ok(engine);
     }
     Err(match s.profiles.resolve(profile_id) {
-        crate::profile_registry::Resolution::Failed(f) => ProfileProblem::failed(&f.reason),
+        crate::profile_registry::Resolution::Failed(f) => {
+            ProfileUnavailable::failed(&f.reason).into()
+        }
         // `Active` does not reach here: a live profile has an engine.
-        _ => ProfileProblem::ProfileNotFound,
+        _ => ProfileNotFound.into(),
     })
 }
 
@@ -209,10 +247,10 @@ pub fn unfenced_engine(
 ) -> Result<Arc<dyn TorrentEngine>, ProfileProblem> {
     let engine = engine_for(s, profile_id)?;
     if s.profile_vpn_down(profile_id) {
-        return Err(ProfileProblem::vpn_down());
+        return Err(ProfileUnavailable::vpn_down().into());
     }
     if s.profile_offline(profile_id) {
-        return Err(ProfileProblem::offline());
+        return Err(ProfileUnavailable::offline().into());
     }
     Ok(engine)
 }
@@ -237,18 +275,15 @@ pub fn internal(attempt: &str, cause: impl fmt::Display) -> String {
 ///
 /// Every operation that can fail this way holds it as
 /// `#[problem(transparent)] Internal(#[from] Internal)`, so the `500` is
-/// declared here once. The variant goes before any other transparent one:
-/// kynos describes a transparent variant's statuses after every declared
-/// variant's, in the order the variants are written, and that is where the
-/// `500` stood when each enum declared it itself.
+/// declared here once.
 ///
-/// The other failures several operations share (`PoolNotConfigured`,
-/// `PlanNotFound`, `InvalidCursor`, `ProfileNotFound`, `ProfileUnavailable`,
-/// `TorrentNotFound`) stay declared in each enum. By the same rule, holding
-/// one transparently would move its status, or its title, behind the
-/// operation's own variants on several operations, and changing that order
-/// changes the published document. Some also differ in their detail from one
-/// operation to the next.
+/// The other failures several operations share are declared once each in the
+/// same way: [`InvalidCursor`], [`ProfileNotFound`] and [`ProfileUnavailable`]
+/// here, `PoolNotConfigured` and `PlanNotFound` in `pool`, and
+/// `TorrentNotFound` in `torrents`. kynos describes a transparent variant's
+/// statuses after every declared variant's, in the order the variants are
+/// written, and where one answers with a status another variant also
+/// answers with, the status's `oneOf` branches carry no `title`.
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = crate::http::security::PROBLEM_BASE)]
 #[problem(status = 500, title = "Internal error")]
