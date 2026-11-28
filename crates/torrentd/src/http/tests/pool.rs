@@ -2514,6 +2514,7 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
             waited < std::time::Duration::from_secs(1),
             "{method} {path}: declared oversized body answered only after {waited:?}"
         );
+        crate::http::tests::support::assert_refused_before_body(&h, method, path).await;
     }
     h.assert_conformance();
 }
