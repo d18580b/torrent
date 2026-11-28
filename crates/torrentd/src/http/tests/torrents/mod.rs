@@ -665,6 +665,7 @@ pub(super) async fn body_framework_rejections(
         waited < Duration::from_secs(1),
         "{method} {path}: answered only after {waited:?}"
     );
+    crate::http::tests::support::assert_refused_before_body(h, method, path).await;
 }
 
 fn file(index: u32, path: &str) -> TorrentFile {
