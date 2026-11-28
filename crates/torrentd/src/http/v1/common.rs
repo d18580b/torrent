@@ -225,10 +225,9 @@ pub fn unfenced_engine(
 /// calls this; a refusal reported inside a successful answer calls it
 /// directly.
 ///
-/// The cause is logged here rather than handed to kynos as a `#[source]`:
-/// kynos' own `ERROR` line for a 5xx (target `kynos::error`) records its
-/// error as one field, and the daemon's JSON log writes only that error's
-/// own message, never its `source()` chain.
+/// The cause is logged here, on a line naming the attempt, rather than
+/// handed to kynos as a `#[source]`, which kynos' own `ERROR` line for a 5xx
+/// (target `kynos::error`) would carry as `error.sources`.
 pub fn internal(attempt: &str, cause: impl fmt::Display) -> String {
     error!(target: "torrentd::http", attempt, error.cause = %cause, "internal failure");
     format!("{attempt} failed; the daemon's log has the cause")
@@ -289,9 +288,9 @@ impl Internal {
 /// neither the answer nor kynos' own line for the 5xx does.
 ///
 /// kynos' line (target `kynos::error`) records the failure as an error
-/// field, and the daemon's JSON log writes only that error's message, never
-/// its `source()` chain, so a cause held as a `#[source]` would reach no
-/// line at all.
+/// field: the daemon's JSON log writes its message as `error` and its
+/// `source()` chain, where it has one, as `error.sources`. [`Internal`] holds
+/// no source, so that line has the detail and no chain.
 #[cfg(test)]
 pub(crate) fn assert_cause_only_logged(resp: &kynos::test::TestResponse, log: &str) {
     let detail = resp.problem().detail.unwrap();
@@ -311,6 +310,7 @@ pub(crate) fn assert_cause_only_logged(resp: &kynos::test::TestResponse, log: &s
         .find(|l| l["target"] == "kynos::error")
         .unwrap_or_else(|| panic!("kynos logged no line for the 5xx:\n{log}"));
     assert_eq!(kynos["error"], detail.as_str(), "{log}");
+    assert!(kynos.get("error.sources").is_none(), "{log}");
 }
 
 #[cfg(test)]

@@ -3,6 +3,10 @@
 //! JSON lines on stdout, one object per event, keys in this order:
 //! `timestamp` (RFC3339), `level`, the event's own fields (including
 //! `message`) flat at the top (`flatten_event`), `target`, then `span`.
+//! An error-typed field (`error = &e as &dyn Error`) is written as its own
+//! message, and its `source()` chain, where it has one, follows the event's
+//! fields as `<field>.sources`: an array of each source's message, nearest
+//! first ([`ErrorSources`]).
 //! `span` is an object holding the current span's `name` and fields, e.g. the
 //! `op`/`infohash` an `#[instrument]` attaches; those are nested there, not
 //! flat at the top (`with_current_span`). `with_span_list(false)` suppresses
@@ -156,6 +160,9 @@ where
     ) -> fmt::Result {
         let mut line = String::new();
         self.0.format_event(ctx, Writer::new(&mut line), event)?;
+        let mut sources = ErrorSources::default();
+        event.record(&mut sources);
+        sources.splice_into(&mut line);
         // Not `ctx.event_scope()`: that scope is behind this layer's own
         // `log_level` filter, which hides the INFO spans of a WARN line once
         // `log_level` is warn or error. `EventTraceIds` reads the whole scope.
@@ -168,6 +175,60 @@ where
         }
         writer.write_str(&redact_for_target(event.metadata().target(), &line))
     }
+}
+
+/// The `source()` chain of each error-typed field of an event, which the JSON
+/// formatter does not write: it records an error field as its own message
+/// alone (`tracing::field::Visit::record_error`'s default).
+#[derive(Default)]
+struct ErrorSources {
+    /// Each error field with at least one source, as the field's name and
+    /// the messages of its sources, nearest first.
+    fields: Vec<(&'static str, Vec<String>)>,
+}
+
+impl ErrorSources {
+    /// Add `<field>.sources`, an array of the source messages, for each error
+    /// field that has any, after the event's own fields and before `target`,
+    /// where the JSON formatter ends the fields `flatten_event` writes.
+    /// Nothing is added to a line with no error field that has a source.
+    fn splice_into(self, line: &mut String) {
+        if self.fields.is_empty() {
+            return;
+        }
+        // A string value escapes its quotes, so `,"target":` is matched only
+        // by the top-level key, which precedes the `span` object.
+        let Some(at) = line.find(",\"target\":") else {
+            return;
+        };
+        let mut keys = String::new();
+        for (name, sources) in self.fields {
+            let key = serde_json::Value::from(format!("{name}.sources"));
+            let value = serde_json::Value::from(sources);
+            keys.push_str(&format!(",{key}:{value}"));
+        }
+        line.insert_str(at, &keys);
+    }
+}
+
+impl tracing::field::Visit for ErrorSources {
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        let mut sources = Vec::new();
+        let mut next = value.source();
+        while let Some(source) = next {
+            sources.push(source.to_string());
+            next = source.source();
+        }
+        if !sources.is_empty() {
+            self.fields.push((field.name(), sources));
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn fmt::Debug) {}
 }
 
 /// `text` held to the redaction rule for lines under `target`: the
@@ -1376,5 +1437,76 @@ mod tests {
             line["message"],
             format!("==> TRACKER_REQUEST [ url: {redacted_url} ]").as_str()
         );
+    }
+
+    /// An error with a message and an optional source, as a `#[source]`
+    /// field gives one.
+    #[derive(Debug)]
+    struct Failure(String, Option<Box<Failure>>);
+
+    impl fmt::Display for Failure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl std::error::Error for Failure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|source| source as _)
+        }
+    }
+
+    fn failure(messages: &[&str]) -> Failure {
+        messages
+            .iter()
+            .rev()
+            .fold(None, |source, message| {
+                Some(Failure((*message).to_owned(), source.map(Box::new)))
+            })
+            .expect("at least one message")
+    }
+
+    #[test]
+    fn an_error_fields_source_chain_follows_the_events_fields() {
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::registry().with(fmt_layer(buf.clone()));
+        let url = format!("https://t.example/announce?passkey={PASSKEY}");
+        let reading = format!("reading {url}");
+        let error = failure(&["operation failed", &reading, "disk full"]);
+        torrentd_engine::testing::with_subscriber(subscriber, || {
+            let span = tracing::info_span!("request");
+            let _enter = span.enter();
+            tracing::error!(
+                target: "kynos::error",
+                status = 500,
+                error = &error as &(dyn std::error::Error + 'static),
+                "operation failed",
+            );
+            tracing::error!(
+                alone = &failure(&["no cause"]) as &(dyn std::error::Error + 'static),
+                "no source"
+            );
+        });
+        let out = buf.text();
+        assert!(!out.contains(PASSKEY), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        let line: serde_json::Value = serde_json::from_str(lines[0]).expect("a JSON line");
+        assert_eq!(line["error"], "operation failed", "{out}");
+        assert_eq!(
+            line["error.sources"],
+            serde_json::json!([format!("reading {}", redacted(&url)), "disk full"]),
+            "{out}"
+        );
+        assert_eq!(line["target"], "kynos::error", "{out}");
+        assert_eq!(line["span"]["name"], "request", "{out}");
+        // The raw line, since a parsed `serde_json::Map` sorts its keys.
+        let at = |key: &str| lines[0].find(&format!("\"{key}\":")).expect(key);
+        assert!(at("error") < at("error.sources"), "{out}");
+        assert!(at("error.sources") < at("target"), "{out}");
+        assert!(at("target") < at("span"), "{out}");
+        let alone: serde_json::Value = serde_json::from_str(lines[1]).expect("a JSON line");
+        assert_eq!(alone["alone"], "no cause", "{out}");
+        assert!(alone.get("alone.sources").is_none(), "{out}");
     }
 }
