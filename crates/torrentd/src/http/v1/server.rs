@@ -452,6 +452,13 @@ pub async fn stream_events(
             // send it missed never arrives, and the stream held the drain to
             // its timeout. The latch is set once the shutdown is seen and
             // stays set, so it is checked on every pass, the first included.
+            //
+            // Not kynos' `Sse::end_on_shutdown(Draining)`: a `Draining` only
+            // resolves for a request a kynos listener accepted. The unix API
+            // socket serves through `Server::serve_io` and the tests through
+            // `TestClient`, and both read one that never resolves, so a
+            // stream there would hold the socket's drain to its timeout. The
+            // daemon's own signal reaches every transport.
             if s.work.is_cancelled() {
                 break;
             }
