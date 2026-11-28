@@ -857,8 +857,9 @@ socket refuses the start, and a clean stop removes it. `allow_unauthenticated`
 on a socket whose mode lets every user connect (an "other" write bit, as in
 `0o666`) is refused, as a routable address is. Requests over the socket carry
 no client address, so `trusted_proxies` never applies to them and the login
-throttle counts every socket caller as one client; each connection's log span
-carries the caller's `peer.uid` and `peer.pid`, read with `SO_PEERCRED`.
+throttle counts every socket caller as one client; each request's log lines
+carry the caller's `peer.uid` and `peer.pid`, as the kernel reported them
+when it connected (`SO_PEERCRED`).
 
 A socket serves only the API: Prometheus cannot scrape `/metrics` over one,
 and the `[[auth.token]]` with the `metrics` scope has nothing to reach it
@@ -1072,7 +1073,9 @@ returning-client reserve` when it happens. The reserve is no help to an
 address that has never logged in, or to any address after a restart, which
 forgets them all; behind a proxy with `trusted_proxies` unset, every client
 is the proxy's address, so the reserve is shared with whoever else comes
-through it.
+through it. A request over a unix socket has no address at all, so it never
+draws on the reserve: the socket's own mode and group already decide who may
+reach the login route.
 
 **Keep a static `write` token as the break-glass credential.** A
 `[[auth.token]]` entry with the `write` scope (§6) never touches
@@ -1242,10 +1245,9 @@ The daemon sets none of these itself.
   low for the load. Any other accept error stops that listener and is a
   listen failure. An API that runs out of descriptors accepting a connection
   keeps listening too: its open requests carry on, and it accepts again after
-  10 ms, doubling to 1 s on TCP and to 30 s on a unix socket, logging a
-  warning each time: `retrying failed accept` with `local_addr` on TCP (the
-  server library's own line), `accept on the API socket failed; retrying
-  after a backoff` with `path` on a unix socket. That warning is the only
+  10 ms, doubling to 1 s, logging a warning each time: `retrying failed
+  accept` with `local_addr` (the server library's own line, on TCP and on a
+  unix socket alike). That warning is the only
   signal: no metric counts it and the systemd status does not change, so
   search the journal for it when the API stops answering while the daemon
   still reports healthy. The daemon does not restart. The

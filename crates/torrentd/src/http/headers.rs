@@ -94,9 +94,17 @@ fn request_span(request: &http::Request, route: Option<&str>) -> tracing::Span {
         .get("x-request-id")
         .and_then(|id| id.to_str().ok())
         .unwrap_or_default();
+    // Who called over the unix socket, as the kernel reported it when the
+    // connection was accepted; `None`, and so not written, over TCP.
+    let peer = request
+        .extensions()
+        .get::<kynos::extract::connection::Connection>()
+        .and_then(kynos::extract::connection::Connection::peer_credentials);
     tracing::info_span!(
         "request",
         request_id,
+        peer.uid = peer.map(|p| p.uid()),
+        peer.pid = peer.and_then(|p| p.pid()),
         method = %request.method(),
         route = route.unwrap_or(UNMATCHED),
         status = tracing::field::Empty,
@@ -113,4 +121,50 @@ fn traceparent_of(span: &tracing::Span) -> Option<String> {
     let mut fields = std::collections::HashMap::new();
     TraceContextPropagator::new().inject_context(&span.context(), &mut fields);
     fields.remove("traceparent")
+}
+
+#[cfg(test)]
+mod tests {
+    use kynos::extract::connection::Connection;
+    use kynos::extract::connection::PeerCredentials;
+    use kynos::http;
+
+    use super::request_span;
+    use crate::config::LogLevel;
+    use crate::tracing_init::Buf;
+
+    /// The line a request on `connection` logs inside its span.
+    fn logged_on(connection: Connection) -> String {
+        let mut request = http::Request::new(http::body::Body::empty());
+        request.extensions_mut().insert(connection);
+        let buf = Buf::default();
+        let (_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, buf.clone());
+        torrentd_engine::testing::with_subscriber(subscriber, || {
+            let span = request_span(&request, Some("/v1/server"));
+            let _entered = span.enter();
+            tracing::info!("handled");
+        });
+        buf.text()
+    }
+
+    /// The property: who called over the unix socket is on every line its
+    /// request logs, by the uid and pid the kernel reported, and a TCP
+    /// request, which has no such caller, carries neither field.
+    #[test]
+    fn a_unix_socket_request_logs_its_callers_uid_and_pid() {
+        let unix = std::os::unix::net::SocketAddr::from_pathname("/run/torrentd/api.sock").unwrap();
+        let text = logged_on(
+            Connection::from_peer(unix.clone(), unix)
+                .with_peer_credentials(PeerCredentials::new(1000, 1000).with_pid(4242)),
+        );
+        let line: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert!(line.to_string().contains("\"peer.uid\":1000"), "{line}");
+        assert!(line.to_string().contains("\"peer.pid\":4242"), "{line}");
+
+        let tcp: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let text = logged_on(Connection::from_peer(tcp, tcp));
+        assert!(text.contains("handled"), "{text}");
+        assert!(!text.contains("peer.uid"), "{text}");
+        assert!(!text.contains("peer.pid"), "{text}");
+    }
 }

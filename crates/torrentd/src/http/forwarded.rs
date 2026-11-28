@@ -24,9 +24,12 @@
 //! - kynos takes the scheme from the hop where trust stops, where `via_https`
 //!   accepts `https` anywhere in a readable chain (see [`Client::secure`]),
 //!   so a TLS edge in front of a plain inner proxy still reads as TLS;
-//! - kynos has no rule for an unspecified peer, which is what every request
-//!   on the unix-socket listener arrives from, so a `trusted_proxies` of
-//!   `0.0.0.0/0` would let any local process forge its client address there.
+//! - kynos has no rule for an unspecified address, which no peer connects
+//!   from and no honest hop names, so a `trusted_proxies` entry covering
+//!   `0.0.0.0` would let a chain be walked past a hop that names it.
+//!
+//! A request with no IP peer at all - every request on the unix-socket
+//! listener - resolves to no client, and its forwarding headers are not read.
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -204,11 +207,10 @@ impl TrustedProxies {
 
     /// Whether `ip` is a proxy whose forwarding headers are believed: listed,
     /// and not the unspecified address. No TCP peer connects from an
-    /// unspecified address, and it is the address every unix-socket request
-    /// carries (`api_socket::SOCKET_PEER`), so it is refused here rather than
-    /// in the trust list: no entry - `0.0.0.0`, `0.0.0.0/8`, `::` - lets a
-    /// socket caller forge a forwarding header past the login throttle, or
-    /// lets an unspecified hop in a chain be walked past.
+    /// unspecified address and no honest hop names one, so it is refused here
+    /// rather than in the trust list: no entry - `0.0.0.0`, `0.0.0.0/8`,
+    /// `::` - makes such a peer a proxy, or lets an unspecified hop in a chain
+    /// be walked past.
     fn is_proxy(&self, ip: IpAddr) -> bool {
         !ip.is_unspecified() && self.trusts(ip)
     }
@@ -802,8 +804,9 @@ mod tests {
         assert_eq!(c.ip, Some(PEER.parse().unwrap()));
     }
 
-    /// The unspecified address a unix-socket request carries is never a
-    /// proxy, whatever trust entry would match it.
+    /// An unspecified peer is never a proxy, whatever trust entry would match
+    /// it; a request with no IP peer, as every unix-socket request is, has
+    /// its forwarding headers ignored under any trust list.
     #[test]
     fn an_unspecified_peer_is_never_trusted() {
         let headers = [(XFF, "198.51.100.9"), ("x-forwarded-proto", "https")];
@@ -821,17 +824,30 @@ mod tests {
             );
             assert!(!c.secure, "{peer} {trust:?}");
         }
-        let socket = super::resolve(
-            Some(crate::api_socket::SOCKET_PEER),
-            &[(
+        let headers: HeaderMap = [
+            (
                 HeaderName::from_static(XFF),
                 HeaderValue::from_static("198.51.100.9"),
-            )]
-            .into_iter()
-            .collect(),
-            &TrustedProxies::parse(&["0.0.0.0/8".to_owned()]).unwrap(),
-        );
-        assert_eq!(socket.ip, Some(crate::api_socket::SOCKET_PEER.ip()));
+            ),
+            (
+                HeaderName::from_static(XFP),
+                HeaderValue::from_static("https"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        for trust in [&["0.0.0.0/8"][..], &["10.0.0.0/8", "::/8"][..], &[][..]] {
+            let trust: Vec<String> = trust.iter().map(|s| s.to_string()).collect();
+            let socket = super::resolve(None, &headers, &TrustedProxies::parse(&trust).unwrap());
+            assert_eq!(
+                socket,
+                Client {
+                    ip: None,
+                    secure: false
+                },
+                "{trust:?}"
+            );
+        }
     }
 
     /// A quoted string is structure in `Forwarded` alone, and `param` and

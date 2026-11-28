@@ -208,11 +208,6 @@ mod tests {
              dropping task_up{task=\"port_forward_monitor\"} for a renewal that panicked",
         ),
         (
-            "api_socket.rs",
-            1,
-            "the socket API's connections, a JoinSet each of whose tasks ends with its connection",
-        ),
-        (
             "pool_service.rs",
             1,
             "a delete's pool-release thread, which ends once it has taken the writer",
