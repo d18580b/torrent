@@ -65,7 +65,7 @@ pub(super) async fn controls(h: &Harness, e: &Engines) {
             .write("POST", &format!("/v1/torrents/{}/{verb}", hex(FENCED)))
             .await;
         assert_problem(&resp, 409, "profile-unavailable");
-        assert_eq!(resp.json::<Value>()["profile_status"], "vpn_down");
+        assert_eq!(profile_status(&resp), "vpn_down");
     }
     let fenced_calls = e.f.calls();
     assert!(

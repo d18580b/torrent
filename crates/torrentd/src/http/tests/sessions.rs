@@ -207,8 +207,10 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // The 30 s penalty, in whole seconds rounded down: the lockout began a
     // moment before this request read the clock.
     assert!((29..=30).contains(&wait), "retry-after {wait}");
-    let body: serde_json::Value = resp.json();
-    assert_eq!(body["retry_after_secs"], wait);
+    assert_eq!(
+        resp.problem().extension::<u64>("retry_after_secs"),
+        Some(wait)
+    );
     assert_eq!(h.metric(&login_failures("throttled")).await, 1.0);
     assert_eq!(
         h.metric(&login_failures("bad_password")).await,

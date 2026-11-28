@@ -18,6 +18,7 @@ use torrentd_engine::TorrentHandle;
 use torrentd_engine::TorrentState;
 
 use super::support::assert_problem;
+use super::support::profile_status;
 use super::support::Coverage;
 use super::support::Harness;
 use crate::app_state::AppState;
@@ -206,8 +207,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // A fenced profile is not resumed.
     let resp = h.write("POST", "/v1/profiles/acct_b/resume-all").await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "vpn_down");
+    assert_eq!(profile_status(&resp), "vpn_down");
     assert_eq!(
         calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
         0,
@@ -219,9 +219,8 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     for op in ["pause-all", "resume-all"] {
         let resp = h.write("POST", &format!("/v1/profiles/acct_c/{op}")).await;
         assert_problem(&resp, 409, "profile-unavailable");
-        let body: Value = resp.json();
-        assert_eq!(body["profile_status"], "failed", "{op}");
-        let detail = body["detail"].as_str().unwrap();
+        assert_eq!(profile_status(&resp), "failed", "{op}");
+        let detail = resp.problem().detail.unwrap();
         assert!(
             detail.starts_with(&format!("profile has no session: {REASON}.")),
             "{op}: the bring-up reason is what says what to fix: {detail}"
@@ -411,7 +410,7 @@ async fn states(cov: &Arc<Coverage>) {
         )
         .await;
     assert_problem(&resp, 409, "profile-unavailable");
-    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+    assert_eq!(profile_status(&resp), "offline");
     assert_eq!(
         calls(&eng_a, |c| matches!(c, RecordedCall::AddTorrent(_))),
         0,
@@ -419,7 +418,7 @@ async fn states(cov: &Arc<Coverage>) {
     );
     let resp = h.write("POST", "/v1/profiles/acct_a/resume-all").await;
     assert_problem(&resp, 409, "profile-unavailable");
-    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+    assert_eq!(profile_status(&resp), "offline");
 
     // The daemon-wide resume skips it by name rather than refusing, and
     // resumes none of its torrents.
@@ -485,14 +484,14 @@ async fn states(cov: &Arc<Coverage>) {
     // fenced, and its state does not change.
     let resp = set("acct_b", "online").await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "vpn_down");
+    assert_eq!(profile_status(&resp), "vpn_down");
     assert!(
-        body["detail"]
-            .as_str()
+        resp.problem()
+            .detail
             .unwrap()
             .contains("ip_lost_or_changed"),
-        "{body}"
+        "{}",
+        resp.text()
     );
     assert_eq!(
         calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
@@ -642,10 +641,7 @@ async fn a_fenced_profile_stays_fenced_while_the_kill_switch_is_not_in_force() {
     let resp = online().await;
     assert_problem(&resp, 409, "kill-switch-not-in-force");
     assert!(
-        resp.json::<Value>()["detail"]
-            .as_str()
-            .unwrap()
-            .contains("kill switch"),
+        resp.problem().detail.unwrap().contains("kill switch"),
         "{}",
         resp.text()
     );
@@ -977,7 +973,7 @@ async fn a_resume_that_races_a_fence_leaves_nothing_running() {
         );
         if path == "one torrent" {
             assert_problem(&resp, 409, "profile-unavailable");
-            assert_eq!(resp.json::<Value>()["profile_status"], "vpn_down");
+            assert_eq!(profile_status(&resp), "vpn_down");
         } else {
             resp.assert_status(kynos::http::StatusCode::OK);
             let out: Value = resp.json();

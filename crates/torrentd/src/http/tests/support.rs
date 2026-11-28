@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use kynos::error::problem::PointerError;
 use kynos::http::Method;
 use kynos::http::StatusCode;
 use kynos::test::TestClient;
@@ -491,6 +492,24 @@ pub fn assert_problem(resp: &TestResponse, status: u16, slug: &str) {
         status,
         &format!("{}{slug}", crate::http::security::PROBLEM_BASE),
     );
+}
+
+/// The JSON Pointers of a validation problem's `errors`, in order; empty
+/// where the problem carries none.
+pub fn errors_at(resp: &TestResponse) -> Vec<String> {
+    resp.problem()
+        .extension::<Vec<PointerError>>("errors")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.pointer)
+        .collect()
+}
+
+/// The `profile_status` member of a `profile-unavailable` problem.
+pub fn profile_status(resp: &TestResponse) -> String {
+    resp.problem()
+        .extension("profile_status")
+        .expect("a profile-unavailable problem names the profile's status")
 }
 
 /// Assert `resp` refused a valid credential for a scope it lacks: a `403`

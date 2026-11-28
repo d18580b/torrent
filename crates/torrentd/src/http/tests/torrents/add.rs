@@ -48,15 +48,15 @@ pub(super) async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     assert_problem(&resp, 404, "profile-not-found");
     let resp = h.write_json("POST", "/v1/torrents", magnet("down")).await;
     assert_problem(&resp, 409, "profile-unavailable");
-    let body: Value = resp.json();
-    assert_eq!(body["profile_status"], "failed");
-    assert!(body["detail"]
-        .as_str()
+    assert_eq!(profile_status(&resp), "failed");
+    assert!(resp
+        .problem()
+        .detail
         .unwrap()
         .contains("wg-down did not come up"));
     let resp = h.write_json("POST", "/v1/torrents", magnet("f")).await;
     assert_problem(&resp, 409, "profile-unavailable");
-    assert_eq!(resp.json::<Value>()["profile_status"], "vpn_down");
+    assert_eq!(profile_status(&resp), "vpn_down");
     assert!(
         e.f.calls().is_empty(),
         "a fenced profile takes no new torrent"
@@ -97,8 +97,9 @@ pub(super) async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     body["save_path"] = json!("/etc");
     let resp = h.write_json("POST", "/v1/torrents", body).await;
     assert_problem(&resp, 422, "path-not-confined");
-    assert!(resp.json::<Value>()["detail"]
-        .as_str()
+    assert!(resp
+        .problem()
+        .detail
         .unwrap()
         .contains("save_path must be inside"));
     // A missing directory followed by `..`: the non-existent tail used to be
@@ -121,7 +122,7 @@ pub(super) async fn adding(h: &Harness, e: &Engines, dir: &Path) {
             )
             .await;
         assert_problem(&resp, 422, "path-not-confined");
-        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        let detail = resp.problem().detail.unwrap();
         assert!(detail.contains("must be inside"), "{detail}");
         assert!(!detail.contains("No such file"), "{detail}");
     }
@@ -149,10 +150,7 @@ pub(super) async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         )
         .await;
     assert_problem(&resp, 422, "invalid-metainfo");
-    assert!(resp.json::<Value>()["detail"]
-        .as_str()
-        .unwrap()
-        .contains("implausibly large"));
+    assert!(resp.problem().detail.unwrap().contains("implausibly large"));
     let resp = h
         .write_json("POST", "/v1/torrents", metainfo("p", b"not bencode"))
         .await;
@@ -676,7 +674,7 @@ async fn an_add_whose_registry_write_fails_answers_500_and_assigns_nothing() {
 
     let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
     assert_problem(&resp, 500, "internal");
-    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    let detail = resp.problem().detail.unwrap();
     assert!(
         detail.contains("registry"),
         "the detail names what failed: {detail}"
@@ -1020,7 +1018,7 @@ async fn another_accounts_passkey_is_refused_on_every_api_source() {
     });
     let foreign_account = |resp: &TestResponse| {
         assert_problem(resp, 422, "tracker-not-allowed");
-        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        let detail = resp.problem().detail.unwrap();
         assert!(detail.contains("allowed_tracker_urls"), "{detail}");
     };
 
@@ -1209,10 +1207,7 @@ async fn a_magnet_without_a_v1_infohash_is_refused() {
         )
         .await;
     assert_problem(&resp, 422, "invalid-metainfo");
-    assert!(resp.json::<Value>()["detail"]
-        .as_str()
-        .unwrap()
-        .contains("xt=urn:btih"));
+    assert!(resp.problem().detail.unwrap().contains("xt=urn:btih"));
     assert_eq!(
         h.state
             .registry
