@@ -944,10 +944,10 @@ async fn adoption_ignores_allow_mutations() {
     assert_eq!(r["queued_for_verification"], json!([IH_A]));
 }
 
-/// Issue #703: `TimedBody` reads the body of the three untimed operations
-/// itself, and a read that failed part-way — a connection closed
-/// mid-message, a reset stream, a `Content-Length` not met — is refused,
-/// not handed on as a whole body. Every body here is complete JSON declared
+/// Issue #703: under `BodySize::deadline` on the three untimed operations, a
+/// read that failed part-way — a connection closed mid-message, a reset
+/// stream, a `Content-Length` not met — is refused, not handed on as a whole
+/// body. Every body here is complete JSON declared
 /// one octet longer than what is sent, so a server that passed on what
 /// arrived would parse it and run the operation.
 #[tokio::test]
@@ -2501,8 +2501,8 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
         // A body that declares more than the limit is refused from the head,
         // before a byte of it is read: none is sent, so a server that read it
         // first would answer 408 at the deadline rather than 413 at once.
-        // For the untimed three this is `TimedBody`'s own check, since the
-        // in-process client's oversized body above declares no length.
+        // The in-process client's oversized body above declares no length,
+        // so only this reaches `BodySize`'s check of the declared one.
         let declared = u64::try_from(crate::http::v1::MAX_BODY_BYTES).unwrap() + 1;
         let (status, waited) = h.oversized_body(method, path, Some(&w), declared).await;
         assert_eq!(

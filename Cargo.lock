@@ -4149,7 +4149,6 @@ dependencies = [
  "clap",
  "futures-util",
  "hex",
- "http-body",
  "inotify",
  "jiff",
  "kynos",

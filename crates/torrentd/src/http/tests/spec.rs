@@ -314,9 +314,10 @@ fn only_operations_with_a_body_declare_a_deadline() {
 
 #[test]
 fn an_untimed_operation_declares_the_400_for_a_body_that_did_not_arrive_whole() {
-    // `TimedBody` reads the body of these three itself and refuses one whose
-    // transfer failed part-way (issue #703); the document and the catalogue
-    // both say so.
+    // kynos' `BodySize` hands a body whose transfer failed part-way on as a
+    // failed read, and the JSON extractor refuses it with `400` (issue #703):
+    // the document declares the `400` on these three, and the catalogue says
+    // what it covers.
     let doc = doc();
     let paths = [
         "/v1/pool/adoptions",
@@ -324,12 +325,9 @@ fn an_untimed_operation_declares_the_400_for_a_body_that_did_not_arrive_whole() 
         "/v1/pool/plans/{plan_id}/apply",
     ];
     for path in paths {
-        let described = doc["paths"][path]["post"]["responses"]["400"]["description"]
-            .as_str()
-            .unwrap_or_default();
         assert!(
-            described.contains("did not arrive whole"),
-            "POST {path}: 400 is {described:?}"
+            doc["paths"][path]["post"]["responses"].get("400").is_some(),
+            "POST {path}: no 400 declared"
         );
     }
     let catalogue = reference("problems.md");
